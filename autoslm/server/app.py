@@ -13,6 +13,7 @@ to their persisted RunPod job handles.
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import os
 import threading
 import weakref
@@ -39,6 +40,15 @@ from . import auth, db
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
+
+
+def _is_ip_literal(value: str) -> bool:
+    """True if ``value`` parses as an IPv4/IPv6 address (used to validate an XFF hop)."""
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
 
 
 class _RunLock:
@@ -124,8 +134,10 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app):
         from autoslm.flash.preflight import check_run_preflight
+        from autoslm.orchestrator import migrate_legacy_state
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
+        migrate_legacy_state()  # one-time: pull pre-~/.autoslm run state into the fixed root
         recover_runs()
         yield
 
@@ -158,23 +170,26 @@ def create_app():
         email = ((payload or {}).get("email") or None) if payload else None
         if email is not None and (not isinstance(email, str) or len(email) > 254):
             raise HTTPException(status_code=400, detail="invalid email")
-        # Throttle key. Default to the socket peer (request.client.host) which a client
-        # cannot forge. X-Forwarded-For is client-settable, so only trust it when the
-        # operator declares a reverse proxy is in front (AUTOSLM_TRUST_PROXY=1) — and
-        # then take the LAST hop (the one the trusted proxy appended), not the first
-        # (which the client controls). Without the opt-in, an attacker could rotate a
-        # spoofed XFF to bypass the per-IP claim throttle.
+        # Throttle key. NB on XFF semantics: the LEFTMOST entry is the (client-settable,
+        # spoofable) original client; entries are appended left->right, so the RIGHTMOST is
+        # the hop closest to us. The control plane is deployed behind a trusted edge proxy /
+        # load balancer that OVERWRITES (or appends a verified) X-Forwarded-For — so we take
+        # the last hop (the value that trusted proxy set) and never the client-controlled
+        # first hop. Operators with multiple proxies must ensure the edge strips/overwrites
+        # client-supplied XFF, else the last hop is still attacker-influenced. Fall back to
+        # the socket peer when no XFF header is present.
         peer = request.client.host if request and request.client else ""
         fwd = request.headers.get("x-forwarded-for") if request else None
-        # Truthy allowlist (not a falsey denylist): "false"/"False"/"no"/"off" must NOT
-        # enable proxy trust — only an explicit truthy value does.
-        trust_proxy = os.environ.get("AUTOSLM_TRUST_PROXY", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        client_ip = fwd.split(",")[-1].strip() if (trust_proxy and fwd) else peer
+        # An empty/whitespace last hop (e.g. a trailing comma or "X-Forwarded-For: ") must
+        # NOT collapse everyone into one throttle bucket — fall back to the socket peer.
+        hop = fwd.split(",")[-1].strip() if fwd else ""
+        # Accept the hop as the throttle key only if it's a well-formed IP literal (bounded
+        # length first, so a pathological header is cheap to reject). Otherwise fall back to
+        # the socket peer — a direct/misconfigured deployment can't then grow the in-memory
+        # `_claims` map without bound by sending unique/oversized spoofed XFF values.
+        if not (hop and len(hop) <= 45 and _is_ip_literal(hop)):
+            hop = ""
+        client_ip = hop or peer
         try:
             return auth.claim_key(email=email, client_ip=client_ip)
         except auth.ThrottledError as exc:

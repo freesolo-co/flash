@@ -114,11 +114,13 @@ def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
 
 
 def _fresh_orchestrator(tmp_path, monkeypatch):
-    monkeypatch.setenv("AUTOSLM_RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setenv("RESULTS_DIR", str(tmp_path / "results"))
     import autoslm.orchestrator as orchestrator
 
-    return importlib.reload(orchestrator)
+    importlib.reload(orchestrator)
+    # Storage roots are fixed constants now; redirect to tmp for isolation.
+    monkeypatch.setattr(orchestrator, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(tmp_path / "results"))
+    return orchestrator
 
 
 def test_runs_file_path_rejects_traversal(tmp_path, monkeypatch) -> None:

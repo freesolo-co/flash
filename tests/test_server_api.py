@@ -15,6 +15,9 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from autoslm import orchestrator as _orch
+from autoslm.server import db as _db_mod
+
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
@@ -33,15 +36,18 @@ def _bearer(key: str) -> dict:
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    monkeypatch.setenv("AUTOSLM_DB_PATH", str(tmp_path / "server.db"))
-    monkeypatch.setenv("AUTOSLM_RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setenv("RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
     monkeypatch.setenv("HF_REPO", "org/test-runs")
     monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf-test")
     import autoslm.orchestrator as orchestrator
+    import autoslm.server.db as db_mod
 
     importlib.reload(orchestrator)
+    # The storage roots are fixed constants (not env-configurable); redirect them to tmp for
+    # test isolation by patching the module attributes after reload.
+    monkeypatch.setattr(orchestrator, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
     import autoslm.server.app as app_mod
 
     importlib.reload(app_mod)
@@ -91,7 +97,7 @@ def test_internal_key_authenticates_as_service_identity(api, monkeypatch):
     # a token that is neither a minted key nor the configured internal key is rejected
     assert api.get(f"/v1/runs/{run_id}", headers=_bearer("wrong-internal")).status_code == 401
     # the internal key is stored hashed, like any other (never persisted in the clear)
-    with sqlite3.connect(os.environ["AUTOSLM_DB_PATH"]) as conn:
+    with sqlite3.connect(_db_mod.db_path()) as conn:
         prefixes = [row[0] for row in conn.execute("SELECT key_prefix FROM api_keys").fetchall()]
     assert "internal" in prefixes
 
@@ -104,13 +110,13 @@ def test_internal_key_rejected_when_unconfigured(api):
 
 def test_keys_are_hashed_at_rest(api):
     key = _claim(api)
-    with sqlite3.connect(os.environ["AUTOSLM_DB_PATH"]) as conn:
+    with sqlite3.connect(_db_mod.db_path()) as conn:
         rows = conn.execute("SELECT key_hash, key_prefix FROM api_keys").fetchall()
     assert rows
     for key_hash, _prefix in rows:
         assert key_hash != key
         assert len(key_hash) == 64  # sha256 hex
-    with open(os.environ["AUTOSLM_DB_PATH"], "rb") as f:
+    with open(_db_mod.db_path(), "rb") as f:
         raw = f.read()
     assert key.encode() not in raw
 
@@ -138,7 +144,7 @@ def test_logs_offset_paging(api):
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    log_path = os.path.join(os.environ["AUTOSLM_RUNS_DIR"], f"{run_id}.log")
+    log_path = os.path.join(_orch.RUNS_DIR, f"{run_id}.log")
     with open(log_path, "w") as f:
         f.write("line one\n")
     page = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
@@ -184,11 +190,11 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     # A finished run (state="done") MUST be deployable: mark_deployed has to record the
     # deployment and flip to "deployed". But a cancelled/failed run must never be flipped
     # to "deployed" (a /cancel racing always-on provisioning persisted the terminal state).
-    monkeypatch.setenv("AUTOSLM_RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setenv("RESULTS_DIR", str(tmp_path / "results"))
     import autoslm.orchestrator as orchestrator
 
     importlib.reload(orchestrator)
+    monkeypatch.setattr(orchestrator, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(tmp_path / "results"))
 
     spec = {"model": "Qwen/Qwen3-4B-Instruct-2507", "algorithm": "grpo", "run_id": "dep-1"}
     orchestrator._save_status(
@@ -213,11 +219,11 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     # Redeploy finalization must NOT clobber an undeploy that raced in mid-warmup: the
     # undeploy wrote `done`/undeployed and deleted the endpoint, so a final mark_deployed
     # that still expects "deployed" must refuse to re-advertise the deleted endpoint.
-    monkeypatch.setenv("AUTOSLM_RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setenv("RESULTS_DIR", str(tmp_path / "results"))
     import autoslm.orchestrator as orchestrator
 
     importlib.reload(orchestrator)
+    monkeypatch.setattr(orchestrator, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(tmp_path / "results"))
 
     spec = {"model": "Qwen/Qwen3-4B-Instruct-2507", "algorithm": "grpo", "run_id": "dep-3"}
     orchestrator._save_status(
@@ -270,12 +276,13 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
     # A recoverable run with no persisted handle (crash between endpoint
     # registration and on_handle) must have its reconstructable RunPod endpoint
     # GC'd before being failed, so it doesn't hold worker quota until manual cleanup.
-    monkeypatch.setenv("AUTOSLM_DB_PATH", str(tmp_path / "s.db"))
-    monkeypatch.setenv("AUTOSLM_RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setenv("RESULTS_DIR", str(tmp_path / "results"))
     import autoslm.orchestrator as orchestrator
+    import autoslm.server.db as db_mod
 
     importlib.reload(orchestrator)
+    monkeypatch.setattr(orchestrator, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
     import autoslm.server.app as app_mod
 
     importlib.reload(app_mod)
@@ -298,3 +305,77 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
 
     assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint"
     assert orchestrator.get_status("nohandle-1").state == "failed"
+
+
+def test_valid_last_xff_hop_is_its_own_throttle_bucket(api):
+    # A well-formed IP in the last X-Forwarded-For hop keys the throttle, so distinct trusted
+    # client IPs each get their own claim budget rather than sharing one bucket.
+    for i in range(3):
+        r = api.post("/v1/keys", json={}, headers={"x-forwarded-for": f"203.0.113.{i}"})
+        assert r.status_code == 200, r.text
+
+
+def test_invalid_xff_hop_falls_back_to_peer_bucket(api):
+    # Garbage / non-IP last hops are rejected and collapse to the socket-peer bucket, so a
+    # client can't dodge the per-IP throttle by rotating spoofed XFF values.
+    for i in range(5):
+        r = api.post("/v1/keys", json={}, headers={"x-forwarded-for": f"not-an-ip-{i}"})
+        assert r.status_code == 200, r.text
+    r = api.post("/v1/keys", json={}, headers={"x-forwarded-for": "still-not-an-ip"})
+    assert r.status_code == 429
+
+
+def test_oversized_xff_hop_is_rejected(api):
+    # An absurdly long last hop is bounded out before parsing (can't be a real IP literal) and
+    # falls back to the peer bucket — no unbounded growth of the in-memory claims map.
+    for _ in range(5):
+        r = api.post("/v1/keys", json={}, headers={"x-forwarded-for": "9" * 4000})
+        assert r.status_code == 200, r.text
+    r = api.post("/v1/keys", json={}, headers={"x-forwarded-for": "8" * 4000})
+    assert r.status_code == 429
+
+
+def test_migrate_legacy_state_moves_into_state_root(monkeypatch, tmp_path):
+    # An upgrade must pull pre-consolidation run/result dirs into the fixed ~/.autoslm root so
+    # existing runs don't 404 (their SQLite ownership rows survive).
+    import autoslm.orchestrator as orchestrator
+
+    importlib.reload(orchestrator)
+    state = tmp_path / ".autoslm"
+    monkeypatch.setattr(orchestrator, "_STATE_DIR", str(state))
+    monkeypatch.setattr(orchestrator, "RUNS_DIR", str(state / "runs"))
+    monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(state / "results"))
+    legacy_runs = tmp_path / "legacy" / "runs"
+    legacy_runs.mkdir(parents=True)
+    (legacy_runs / "r1.json").write_text("{}")
+    monkeypatch.setattr(orchestrator, "_LEGACY_RUNS_DIRS", (str(legacy_runs),))
+    monkeypatch.setattr(orchestrator, "_LEGACY_RESULTS_DIRS", ())
+
+    orchestrator.migrate_legacy_state()
+
+    assert (state / "runs" / "r1.json").read_text() == "{}"
+    assert not legacy_runs.exists(), "legacy dir should have been moved, not copied"
+
+
+def test_migrate_legacy_state_never_clobbers_populated_dest(monkeypatch, tmp_path):
+    # If the destination already holds state, the legacy dir is left untouched (newer wins).
+    import autoslm.orchestrator as orchestrator
+
+    importlib.reload(orchestrator)
+    state = tmp_path / ".autoslm"
+    runs = state / "runs"
+    runs.mkdir(parents=True)
+    (runs / "current.json").write_text("{}")
+    monkeypatch.setattr(orchestrator, "_STATE_DIR", str(state))
+    monkeypatch.setattr(orchestrator, "RUNS_DIR", str(runs))
+    monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(state / "results"))
+    legacy_runs = tmp_path / "legacy" / "runs"
+    legacy_runs.mkdir(parents=True)
+    (legacy_runs / "old.json").write_text("{}")
+    monkeypatch.setattr(orchestrator, "_LEGACY_RUNS_DIRS", (str(legacy_runs),))
+    monkeypatch.setattr(orchestrator, "_LEGACY_RESULTS_DIRS", ())
+
+    orchestrator.migrate_legacy_state()
+
+    assert legacy_runs.exists(), "populated destination must not be clobbered"
+    assert not (runs / "old.json").exists()

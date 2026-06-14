@@ -55,12 +55,13 @@ def test_environment_registry():
         load_environment("")
 
 
-def test_orchestrator_dry_run():
+def test_orchestrator_dry_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        os.environ["AUTOSLM_RUNS_DIR"] = tmp
         import autoslm.orchestrator as orchestrator
 
         importlib.reload(orchestrator)
+        # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
+        monkeypatch.setattr(orchestrator, "RUNS_DIR", tmp)
         from autoslm.worker_spec import JobSpec
 
         spec = JobSpec(run_id="dry", model="Qwen/Qwen3-4B-Instruct-2507", algorithm="grpo")
@@ -69,13 +70,14 @@ def test_orchestrator_dry_run():
         assert orchestrator.get_status("dry").spec["model"] == "Qwen/Qwen3-4B-Instruct-2507"
 
 
-def test_mcp_handler_dry_run():
+def test_mcp_handler_dry_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        os.environ["AUTOSLM_RUNS_DIR"] = tmp
         import autoslm.mcp.server as mcp
         import autoslm.orchestrator as orchestrator
 
         importlib.reload(orchestrator)
+        # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
+        monkeypatch.setattr(orchestrator, "RUNS_DIR", tmp)
         importlib.reload(mcp)
         result = mcp.handle(
             {
