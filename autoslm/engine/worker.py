@@ -576,8 +576,25 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     epochs = int(os.environ.get("SFT_EPOCHS", str(default_epochs)))
+    # SDK [train] knobs override the recipe default; an operator env var still wins last.
+    _t = JOB_SPEC.train if JOB_SPEC else None
     per_device_bs = int(os.environ.get("SFT_PER_DEVICE_BS", "4"))
-    grad_accum = max(1, RECIPE.sft.effective_batch // per_device_bs)
+    # batch_size is the GLOBAL/effective batch: grad-accum is sized to reach it. Cap the
+    # per-device micro-batch at the target (so a target < per_device doesn't overshoot) and
+    # use CEIL division so the realized global batch is never BELOW the requested one (floor
+    # would undershoot when target isn't a multiple of per_device, e.g. 16/6 -> 12).
+    effective_batch = (
+        _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
+    )
+    per_device_bs = max(1, min(per_device_bs, effective_batch))
+    grad_accum = max(1, -(-effective_batch // per_device_bs))
+    sft_lr = _t.learning_rate if _t and _t.learning_rate is not None else RECIPE.sft.learning_rate
+    sft_max_len = (
+        _t.max_length
+        if _t and _t.max_length is not None
+        else (RECIPE.sft.max_seq_len_thinking if THINKING else RECIPE.sft.max_seq_len)
+    )
+    sft_save_default = _t.save_every if _t and _t.save_every is not None else 50
     out_dir = f"/tmp/sft_seed{SEED}"
     resume_ckpt = hf_resume_checkpoint()
 
@@ -588,12 +605,12 @@ def run_sft():
         "num_train_epochs": epochs,
         "per_device_train_batch_size": per_device_bs,
         "gradient_accumulation_steps": grad_accum,
-        "learning_rate": RECIPE.sft.learning_rate,
+        "learning_rate": sft_lr,
         "warmup_ratio": RECIPE.sft.warmup_frac,
         "logging_steps": 10,
-        "save_steps": int(os.environ.get("SFT_SAVE_STEPS", "50")),
+        "save_steps": int(os.environ.get("SFT_SAVE_STEPS", str(sft_save_default))),
         "save_total_limit": 1,
-        "max_length": RECIPE.sft.max_seq_len_thinking if THINKING else RECIPE.sft.max_seq_len,
+        "max_length": sft_max_len,
         "bf16": True,
         "report_to": [],
         "seed": SEED,
@@ -762,16 +779,25 @@ def make_reward_heartbeat_callback():
 
 def grpo_overrides() -> dict:
     """The freesolo SDK's GRPO knobs (datums parity), read off the job spec's
-    ``[environment.params] grpo_config``. Missing -> recipe defaults apply.
+    ``[train]`` (``TrainSpec``). Missing (None) -> recipe defaults apply.
 
     Same parameters the deleted client-side datums.py used, now honored server-side:
     group_size, temperature, max_tokens (completion budget), kl_penalty_coef (the KL
     beta), advantage_clip (centered-advantage clip), and thinking_length_penalty_coef
-    (a per-<think>-token reward deduction)."""
+    (a per-<think>-token reward deduction). The SDK ships these in [train] (they are
+    TrainSpec fields), so only forward the ones actually set."""
     if not JOB_SPEC:
         return {}
-    cfg = (JOB_SPEC.environment.params or {}).get("grpo_config") or {}
-    return dict(cfg) if isinstance(cfg, dict) else {}
+    t = JOB_SPEC.train
+    pairs = {
+        "group_size": t.group_size,
+        "temperature": t.temperature,
+        "max_tokens": t.max_tokens,
+        "kl_penalty_coef": t.kl_penalty_coef,
+        "advantage_clip": t.advantage_clip,
+        "thinking_length_penalty_coef": t.thinking_length_penalty_coef,
+    }
+    return {k: v for k, v in pairs.items() if v is not None}
 
 
 def think_token_count(completion: str | None, tokenizer) -> int:
@@ -836,9 +862,15 @@ def run_rl():
     # disable it (RL_VLLM_SLEEP=0) with a higher RL_VLLM_GPU_UTIL when both fit resident.
     # SDK-supplied GRPO knobs (datums parity) override the recipe; env vars still win.
     gcfg = grpo_overrides()
-    prompts_per_step = int(os.environ.get("RL_PROMPTS_PER_STEP", rl.prompts_per_step))
+    _t = JOB_SPEC.train if JOB_SPEC else None
+    # batch_size = prompts per optimizer step for GRPO.
+    _pps_default = _t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step
+    prompts_per_step = int(os.environ.get("RL_PROMPTS_PER_STEP", str(_pps_default)))
     group_size = int(os.environ.get("RL_GROUP_SIZE", gcfg.get("group_size") or rl.group_size))
-    _temperature = float(gcfg.get("temperature") or rl.sampling_temperature)
+    # temperature: explicit None check, NOT `or` — a configured 0.0 (greedy/deterministic
+    # rollouts) must be honored, not fall back to the recipe sampling temperature.
+    _gcfg_temp = gcfg.get("temperature")
+    _temperature = float(_gcfg_temp if _gcfg_temp is not None else rl.sampling_temperature)
     _kl_beta = float(gcfg.get("kl_penalty_coef") or 0.0)
     _adv_clip = float(gcfg.get("advantage_clip") or 0.0)
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
@@ -851,6 +883,52 @@ def run_rl():
     rng = random.Random(SEED)
     rng.shuffle(train)
     prompts = [{"prompt": render_prompt(tok, ex), "example": ex} for ex in train]
+    # The colocated vLLM engine's model length is the hard cap on prompt+completion at
+    # rollout. Size it (honoring RL_VLLM_MAX_LEN) and derive the prompt budget from it so a
+    # bigger engine or a smaller completion automatically admits longer prompts (rather than
+    # a fixed rl.max_prompt_len that no env override could lift).
+    _max_completion = int(
+        os.environ.get(
+            "RL_MAX_COMPLETION",
+            gcfg.get("max_tokens")
+            or (rl.max_completion_len_thinking if THINKING else rl.max_completion_len),
+        )
+    )
+    vllm_max_len = int(
+        os.environ.get("RL_VLLM_MAX_LEN", str(max(1024, rl.max_prompt_len + _max_completion)))
+    )
+    # The engine must fit completion + at least some prompt. If RL_VLLM_MAX_LEN is set below
+    # the completion budget, no prompt can ever fit — fail fast here rather than passing a
+    # 1-token budget that lets prompts through and then OOMs/overflows mid-rollout.
+    if vllm_max_len <= _max_completion:
+        raise ValueError(
+            f"RL_VLLM_MAX_LEN={vllm_max_len} leaves no room for the {_max_completion}-token "
+            "completion; raise RL_VLLM_MAX_LEN or lower RL_MAX_COMPLETION"
+        )
+    prompt_budget = vllm_max_len - _max_completion
+    # TRL 1.5's GRPOConfig has no max_prompt_length and does NOT truncate prompts, so a prompt
+    # that leaves no room for the completion within the engine length would fail mid-rollout
+    # AFTER the paid worker is provisioned. Drop prompts that don't fit the budget up front.
+    # render_prompt returns an apply_chat_template(tokenize=False) string that already carries
+    # the special tokens, so tokenize with add_special_tokens=False (the default re-adds
+    # BOS/EOS and over-counts).
+    kept = [
+        p
+        for p in prompts
+        if len(tok(p["prompt"], add_special_tokens=False).input_ids) <= prompt_budget
+    ]
+    if len(kept) < len(prompts):
+        print(
+            f"[rl] dropped {len(prompts) - len(kept)} prompts over the {prompt_budget}-token "
+            f"prompt budget (engine {vllm_max_len} - completion {_max_completion})"
+        )
+    if not kept:
+        raise ValueError(
+            f"every training prompt exceeds the {prompt_budget}-token prompt budget (engine "
+            f"{vllm_max_len} - completion {_max_completion}); raise RL_VLLM_MAX_LEN, lower "
+            "RL_MAX_COMPLETION, or shorten the environment's prompts"
+        )
+    prompts = kept
     ds = Dataset.from_list(prompts)
 
     def reward_fn(completions, **kwargs):
@@ -880,35 +958,30 @@ def run_rl():
         f"unique_prompts/step={batching['unique_prompts_per_step']} "
         f"(target prompts/step={prompts_per_step}, group={group_size}, sleep={sleep_mode})"
     )
-    _max_completion = int(
-        os.environ.get(
-            "RL_MAX_COMPLETION",
-            gcfg.get("max_tokens")
-            or (rl.max_completion_len_thinking if THINKING else rl.max_completion_len),
-        )
-    )
     out_dir = f"/tmp/rl_seed{SEED}"
     resume_ckpt = hf_resume_checkpoint()
 
     grpo_kwargs = {
         "output_dir": out_dir,
-        "learning_rate": rl.learning_rate,
+        "learning_rate": (
+            _t.learning_rate if _t and _t.learning_rate is not None else rl.learning_rate
+        ),
         "per_device_train_batch_size": batching["per_device_train_batch_size"],
         "gradient_accumulation_steps": batching["gradient_accumulation_steps"],
         "num_generations": group_size,
-        "max_prompt_length": rl.max_prompt_len,
+        # NB: GRPOConfig has no max_prompt_length field (TRL 1.5) and does not truncate
+        # prompts; the dataset is pre-filtered above to prompts that fit prompt_budget
+        # (vllm_max_len - completion), so every prompt fits the engine sized here.
         "max_completion_length": _max_completion,
         "max_steps": steps,
         "temperature": _temperature,
         "top_p": rl.sampling_top_p,
         "use_vllm": True,
         "vllm_mode": "colocate",
-        # Bound the colocated engine's KV allocation to what GRPO actually needs.
-        # Without this, vLLM sizes its KV cache for the model's FULL context (262k for
-        # Qwen3-4B-Instruct-2507) and refuses to start on a consumer GPU.
-        "vllm_max_model_length": int(
-            os.environ.get("RL_VLLM_MAX_LEN", str(max(1024, rl.max_prompt_len + _max_completion)))
-        ),
+        # Bound the colocated engine's KV allocation to what GRPO actually needs (computed
+        # above as vllm_max_len). Without this, vLLM sizes its KV cache for the model's FULL
+        # context (262k for Qwen3-4B-Instruct-2507) and refuses to start on a consumer GPU.
+        "vllm_max_model_length": vllm_max_len,
         # Colocate shares one GPU between the policy model and the vLLM rollout engine; on a
         # 32 GB RTX 5090 a 4B policy (~8 GB) + vLLM weights/KV easily OOMs. RL_VLLM_GPU_UTIL
         # sizes vLLM's pool; RL_VLLM_SLEEP offloads its weights between steps (saves memory
@@ -916,7 +989,11 @@ def run_rl():
         "vllm_gpu_memory_utilization": float(os.environ.get("RL_VLLM_GPU_UTIL", "0.45")),
         "vllm_enable_sleep_mode": sleep_mode,
         "logging_steps": 1,
-        "save_steps": int(os.environ.get("RL_SAVE_STEPS", "20")),
+        "save_steps": int(
+            os.environ.get(
+                "RL_SAVE_STEPS", str(_t.save_every if _t and _t.save_every is not None else 20)
+            )
+        ),
         "save_total_limit": 1,
         "bf16": True,
         "report_to": [],
@@ -941,6 +1018,11 @@ def run_rl():
     init_model, init_peft = _init_adapter_model(model_id, tok)
     if init_peft is not None:
         grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
+    # stop_sequences: TRL forwards generation_kwargs to the (vLLM) sampler, whose
+    # SamplingParams.stop truncates each rollout at the requested delimiter — so the reward
+    # sees the same completion the config intends, instead of generating to max_completion.
+    if _t and _t.stop_sequences:
+        grpo_kwargs["generation_kwargs"] = {"stop": list(_t.stop_sequences)}
     # advantage_clip>0 is the datums centered-advantage clamp; TRL has no advantage-value
     # clip knob (it clips the importance ratio), so honor the default (clip off ==
     # centered) and surface a note when a config asks for an explicit clamp.

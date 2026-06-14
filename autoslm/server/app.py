@@ -15,16 +15,17 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
+import weakref
 
 from autoslm import __version__
 from autoslm.catalog import public_model_rows
 from autoslm.config_schema import ConfigError, spec_from_dict
 from autoslm.orchestrator import (
-    _save_status,
     adapter_prefix,
     cancel_run,
     get_status,
     mark_deployed,
+    mark_undeployed,
     new_run_id,
     runs_file_path,
     submit_job,
@@ -38,6 +39,47 @@ from . import auth, db
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
+
+
+class _RunLock:
+    """A weak-referenceable mutex usable as a context manager.
+
+    ``threading.Lock()`` returns a ``_thread.lock`` that does NOT support weak references,
+    so it can't live in a WeakValueDictionary directly — wrap it in a tiny object that does
+    (and acquire/release via ``with``).
+    """
+
+    __slots__ = ("__weakref__", "_lock")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> _RunLock:
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.release()
+
+
+# Per-run lock serializing deploy vs undeploy: always-on provisioning is slow and runs
+# OUTSIDE the status lock, so without this the two could interleave — a racing undeploy
+# could leave a billable endpoint unrecorded, or a deploy's rollback could clobber another.
+# WeakValueDictionary so an entry is dropped once no request holds the lock — the map
+# can't grow unboundedly with one entry per distinct run_id over the server's lifetime.
+_DEPLOY_LOCKS: weakref.WeakValueDictionary[str, _RunLock] = weakref.WeakValueDictionary()
+_DEPLOY_LOCKS_GUARD = threading.Lock()
+
+
+def _deploy_lock(run_id: str) -> _RunLock:
+    # The returned lock must be held by the caller (a `with` block) to keep it alive; once
+    # released and unreferenced, the weak entry is garbage-collected.
+    with _DEPLOY_LOCKS_GUARD:
+        lk = _DEPLOY_LOCKS.get(run_id)
+        if lk is None:
+            lk = _RunLock()
+            _DEPLOY_LOCKS[run_id] = lk
+        return lk
 
 
 def recover_runs(log=None) -> None:
@@ -238,95 +280,124 @@ def create_app():
     @app.post("/v1/runs/{run_id}/deploy")
     def deploy(run_id: str, payload: dict | None = None, key: dict = Depends(require_key)):
         payload = payload or {}
-        status = owned_run(run_id, key)
-        spec = JobSpec.from_dict(status.spec)
-        dry_run = bool(payload.get("dry_run", False))
-        if not dry_run and status.state not in _DEPLOYABLE_STATES:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"run {run_id} is {status.state!r}; only finished runs with "
-                    "trained adapter artifacts can be deployed"
-                ),
-            )
-        mode = payload.get("mode", "dev")
-        # always-on provisions AND warms a billable 1-worker endpoint inside
-        # deploy_adapter before returning. Persist a provisional deployment record
-        # FIRST (keyed to the class actually served) so a crash between warmup and the
-        # final mark_deployed can't orphan a billing endpoint with no record —
-        # /v1/deployments, undeploy, and cancel all key off the deployment record.
-        # (dev mode is scale-to-zero: nothing bills until the first chat, so no
-        # provisional record is needed.)
-        provisional = not dry_run and mode == "always-on"
-        if provisional:
-            mark_deployed(
-                run_id,
-                {
-                    "state": "provisioning",
-                    "mode": mode,
-                    "gpu": servable_gpu(spec.gpu.type, spec.model),
-                },
-            )
-        try:
-            dep = deploy_adapter(
-                run_id=run_id,
-                model=spec.model,
-                hf_repo=os.environ.get("HF_REPO", ""),
-                adapter_prefix=adapter_prefix(spec),
-                gpu_name=spec.gpu.type,
-                mode=mode,
-                idle_timeout_s=int(payload.get("idle_timeout_s", 300)),
-                dry_run=dry_run,
-                lora_rank=spec.train.lora_rank,
-                # a run trained with thinking serves with thinking (per-run parity)
-                thinking=spec.thinking,
-            )
-        except Exception as exc:
-            # The always-on provisional mark_deployed flipped the run to `deployed`
-            # before provisioning. If provisioning/warmup fails (QLoRA rejection,
-            # adapter download, vLLM boot), roll it back to the pre-deploy snapshot so
-            # /v1/deployments and /chat don't treat a non-existent endpoint as active.
-            # deploy_adapter already tears down any endpoint it actually provisioned;
-            # this only restores the control-plane record. `status` still holds the
-            # pre-deploy snapshot; rollback_deploy re-applies it under the status lock and
-            # skips if a concurrent cancel already wrote a terminal state.
+        # Serialize deploy vs undeploy (and a second deploy) for this run: provisioning is
+        # slow and runs outside the status lock, so without this they could interleave and
+        # leave a billable endpoint unrecorded, or let rollback clobber a concurrent deploy.
+        with _deploy_lock(run_id):
+            status = owned_run(run_id, key)
+            spec = JobSpec.from_dict(status.spec)
+            dry_run = bool(payload.get("dry_run", False))
+            if not dry_run and status.state not in _DEPLOYABLE_STATES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"run {run_id} is {status.state!r}; only finished runs with "
+                        "trained adapter artifacts can be deployed"
+                    ),
+                )
+            mode = payload.get("mode", "dev")
+            # always-on provisions AND warms a billable 1-worker endpoint inside
+            # deploy_adapter before returning. Persist a provisional deployment record
+            # FIRST (keyed to the class actually served) so a crash between warmup and the
+            # final mark_deployed can't orphan a billing endpoint with no record —
+            # /v1/deployments, undeploy, and cancel all key off the deployment record.
+            # (dev mode is scale-to-zero: nothing bills until the first chat, so no
+            # provisional record is needed.)
+            # The state the run must still be in for this deploy to proceed — a CAS guard so
+            # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't
+            # be silently overwritten.
+            prev_state = status.state
+            provisional = not dry_run and mode == "always-on"
             if provisional:
-                from autoslm.orchestrator import rollback_deploy
+                marked = mark_deployed(
+                    run_id,
+                    {
+                        "state": "provisioning",
+                        "mode": mode,
+                        "gpu": servable_gpu(spec.gpu.type, spec.model),
+                    },
+                    expect_state=prev_state,
+                )
+                # The CAS no-ops if a /cancel raced in first; don't provision a paid
+                # endpoint for a run that's no longer deployable.
+                if marked.state != "deployed":
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"run {run_id} is {marked.state!r}; deploy aborted",
+                    )
+            try:
+                dep = deploy_adapter(
+                    run_id=run_id,
+                    model=spec.model,
+                    hf_repo=os.environ.get("HF_REPO", ""),
+                    adapter_prefix=adapter_prefix(spec),
+                    gpu_name=spec.gpu.type,
+                    mode=mode,
+                    idle_timeout_s=int(payload.get("idle_timeout_s", 300)),
+                    dry_run=dry_run,
+                    lora_rank=spec.train.lora_rank,
+                    # a run trained with thinking serves with thinking (per-run parity)
+                    thinking=spec.thinking,
+                )
+            except Exception as exc:
+                # The always-on provisional mark_deployed flipped the run to `deployed`
+                # before provisioning. If provisioning/warmup fails (QLoRA rejection,
+                # adapter download, vLLM boot), roll it back to the pre-deploy snapshot so
+                # /v1/deployments and /chat don't treat a non-existent endpoint as active.
+                # deploy_adapter already tears down any endpoint it actually provisioned;
+                # this only restores the control-plane record. `status` still holds the
+                # pre-deploy snapshot; rollback_deploy re-applies it under the status lock
+                # and skips if a concurrent cancel already wrote a terminal state.
+                if provisional:
+                    from autoslm.orchestrator import rollback_deploy
 
-                rollback_deploy(run_id, status)
-            if isinstance(exc, ValueError):
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            raise
-        if not dry_run:
-            mark_deployed(run_id, dep.to_dict())
-        return dep.to_dict()
+                    rollback_deploy(run_id, status)
+                if isinstance(exc, ValueError):
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                raise
+            if not dry_run:
+                # always-on's provisional mark already flipped the run to `deployed`; dev
+                # never marked it, so it's still the pre-deploy state. The CAS no-ops only if
+                # a /cancel raced finalization — then the endpoint we just warmed is orphaned,
+                # so tear it down and report the conflict instead of a bogus 200.
+                marked = mark_deployed(
+                    run_id, dep.to_dict(), expect_state="deployed" if provisional else prev_state
+                )
+                if marked.state != "deployed":
+                    with contextlib.suppress(Exception):
+                        undeploy_adapter(run_id, gpu_name=servable_gpu(spec.gpu.type, spec.model))
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
+                    )
+            return dep.to_dict()
 
     @app.delete("/v1/runs/{run_id}/deploy")
     def undeploy(run_id: str, key: dict = Depends(require_key)):
-
-        status = owned_run(run_id, key)
-        spec = JobSpec.from_dict(status.spec)
-        # The deployment record carries the class actually served (a Vast-only
-        # training class falls back to a RunPod class at deploy time).
-        deployed_gpu = (status.deployment or {}).get("gpu") or spec.gpu.type
-        deleted = undeploy_adapter(run_id, gpu_name=deployed_gpu)
-        # dev mode is scale-to-zero: the serve endpoint is created only on the first
-        # chat, so an empty deletion just means it was never warmed — still a clean
-        # undeploy. always-on provisions the endpoint at deploy time, so an empty
-        # deletion there is a transient RunPod failure that must NOT hide a
-        # still-billable endpoint (surface 502 so the user retries).
-        dev_mode = (status.deployment or {}).get("mode", "dev") == "dev"
-        if status.deployment and (deleted or dev_mode):
-            status.deployment = {**status.deployment, "state": "undeployed"}
-            status.state = "done"
-            _save_status(status)
-        elif status.deployment and not deleted:
-            raise HTTPException(
-                status_code=502,
-                detail=f"could not delete the serving endpoint for {run_id}; it may still "
-                "be running — retry `slm undeploy`",
-            )
-        return {"run_id": run_id, "deleted_endpoints": deleted}
+        # Same per-run lock as deploy: an undeploy must not interleave with an in-flight
+        # deploy's provisioning/finalization.
+        with _deploy_lock(run_id):
+            status = owned_run(run_id, key)
+            spec = JobSpec.from_dict(status.spec)
+            # The deployment record carries the class actually served (a Vast-only
+            # training class falls back to a RunPod class at deploy time).
+            deployed_gpu = (status.deployment or {}).get("gpu") or spec.gpu.type
+            deleted = undeploy_adapter(run_id, gpu_name=deployed_gpu)
+            # dev mode is scale-to-zero: the serve endpoint is created only on the first
+            # chat, so an empty deletion just means it was never warmed — still a clean
+            # undeploy. always-on provisions the endpoint at deploy time, so an empty
+            # deletion there is a transient RunPod failure that must NOT hide a
+            # still-billable endpoint (surface 502 so the user retries).
+            dev_mode = (status.deployment or {}).get("mode", "dev") == "dev"
+            if status.deployment and (deleted or dev_mode):
+                mark_undeployed(run_id)
+            elif status.deployment and not deleted:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"could not delete the serving endpoint for {run_id}; it may still "
+                    "be running — retry `slm undeploy`",
+                )
+            return {"run_id": run_id, "deleted_endpoints": deleted}
 
     @app.get("/v1/deployments")
     def deployments(key: dict = Depends(require_key)):
