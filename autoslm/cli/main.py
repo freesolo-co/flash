@@ -88,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("name")
     init.set_defaults(func=cmd_env_init)
 
-    env_list = env_sub.add_parser("list", help="list built-in + installed environments")
+    env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
     env_install = env_sub.add_parser("install", help="install a verifiers / Prime Hub environment")
@@ -244,19 +244,57 @@ def cmd_whoami(args) -> int:
     return 0
 
 
+_STARTER_ENV_PY = '''\
+"""Starter LOCAL verifiers environment.
+
+`slm train` loads this via [environment] path (no install needed). Replace the dataset and
+rubric with your task. See https://github.com/PrimeIntellect-ai/verifiers for the full API.
+To use a published Prime Hub env instead, run `slm env install owner/name` and set
+[environment] id = "owner/name" in the config (drop the `path`).
+"""
+
+import verifiers as vf
+from datasets import Dataset
+
+
+def load_environment(**kwargs) -> vf.Environment:
+    dataset = Dataset.from_list(
+        [
+            {"prompt": [{"role": "user", "content": "What is 2 + 2?"}], "answer": "4"},
+            {"prompt": [{"role": "user", "content": "What is 3 + 5?"}], "answer": "8"},
+        ]
+    )
+
+    def correct_answer(completion, answer, **_):
+        """Reward 1.0 when the gold answer appears in the model's final message."""
+        text = completion[-1]["content"] if isinstance(completion, list) else str(completion)
+        return 1.0 if str(answer) in text else 0.0
+
+    rubric = vf.Rubric(funcs=[correct_answer], weights=[1.0])
+    return vf.SingleTurnEnv(dataset=dataset, rubric=rubric, **kwargs)
+'''
+
+
 def cmd_lab_setup(args) -> int:
     Path("environments").mkdir(exist_ok=True)
     Path("configs").mkdir(exist_ok=True)
     Path("configs/endpoints.toml").write_text(
         "# OpenAI-compatible endpoints returned by `slm deploy` can be stored here.\n"
     )
-    sample = Path("configs/gsm8k_grpo.toml")
+    starter_env = Path("environments/starter_env.py")
+    if not starter_env.exists():
+        starter_env.write_text(_STARTER_ENV_PY)
+    sample = Path("configs/verifiers_grpo.toml")
     if not sample.exists():
         sample.write_text(
             'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
             'algorithm = "grpo"\n\n'
+            "# Environment: either a Prime Hub slug (install it first with\n"
+            '#   `slm env install owner/name`  then set  id = "owner/name")\n'
+            "# or a LOCAL verifiers env module via `path` (scaffolded below).\n"
             "[environment]\n"
-            'id = "gsm8k"\n\n'
+            'path = "environments/starter_env.py"\n'
+            '# id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
@@ -265,7 +303,10 @@ def cmd_lab_setup(args) -> int:
             "[gpu]\n"
             'type = "RTX 5090"\n'
         )
-    print("created environments/, configs/, configs/gsm8k_grpo.toml, configs/endpoints.toml")
+    print(
+        "created environments/, environments/starter_env.py, configs/, "
+        "configs/verifiers_grpo.toml, configs/endpoints.toml"
+    )
     return 0
 
 
@@ -324,37 +365,49 @@ def cmd_env_init(args) -> int:
     mod = args.name.replace("-", "_")
     root = Path("environments") / mod
     root.mkdir(parents=True, exist_ok=True)
+    # Verifiers-only: scaffold a real verifiers env whose load_environment returns a
+    # vf.Environment (here a SingleTurnEnv + Rubric over a datasets.Dataset). This is what
+    # the local-`path` loader (registry.load_environment -> VerifiersEnvironment) and a Hub
+    # push both expect, so a freshly scaffolded env actually loads.
     (root / f"{mod}.py").write_text(
-        "from autoslm.envs.base import BaseEnvironment\n\n\n"
-        f"class {''.join(part.title() for part in mod.split('_'))}Environment(BaseEnvironment):\n"
-        "    def __init__(self, **kwargs):\n"
-        f'        super().__init__(id="{args.name}")\n\n'
-        "    def dataset(self, split: str) -> list[dict]:\n"
-        "        return []\n\n"
-        "    def prompt_messages(self, example: dict) -> list[dict]:\n"
-        '        return [{"role": "user", "content": example["prompt"]}]\n\n'
-        "    def sft_target(self, example: dict) -> str:\n"
-        '        return example.get("target", "")\n\n'
-        "    def grade(self, completion: str, example: dict) -> bool:\n"
-        '        return example.get("expected", "") in completion\n\n\n'
-        "def load_environment(**kwargs):\n"
-        f"    return {''.join(part.title() for part in mod.split('_'))}Environment(**kwargs)\n"
+        f'"""Custom LOCAL verifiers environment ({args.name}).\n\n'
+        'Run it locally via [environment] path = "environments/'
+        f'{mod}/{mod}.py" in your config.\n'
+        "Replace the dataset and rubric with your task, then publish to the Prime Hub with\n"
+        "`slm env push` to reference it by id on the managed service.\n"
+        "See https://github.com/PrimeIntellect-ai/verifiers for the full API.\n"
+        '"""\n\n'
+        "import verifiers as vf\n"
+        "from datasets import Dataset\n\n\n"
+        "def load_environment(**kwargs) -> vf.Environment:\n"
+        "    dataset = Dataset.from_list(\n"
+        "        [\n"
+        '            {"prompt": [{"role": "user", "content": "What is 2 + 2?"}], "answer": "4"},\n'
+        '            {"prompt": [{"role": "user", "content": "What is 3 + 5?"}], "answer": "8"},\n'
+        "        ]\n"
+        "    )\n\n"
+        "    def correct_answer(completion, answer, **_):\n"
+        '        """Reward 1.0 when the gold answer appears in the model\'s final message."""\n'
+        "        text = (\n"
+        '            completion[-1]["content"] if isinstance(completion, list) else str(completion)\n'
+        "        )\n"
+        "        return 1.0 if str(answer) in text else 0.0\n\n"
+        "    rubric = vf.Rubric(funcs=[correct_answer], weights=[1.0])\n"
+        "    return vf.SingleTurnEnv(dataset=dataset, rubric=rubric, **kwargs)\n"
     )
-    (root / "README.md").write_text(f"# {args.name}\n\nCustom AutoSLM environment.\n")
+    (root / "README.md").write_text(f"# {args.name}\n\nCustom verifiers environment for AutoSLM.\n")
     print(f"created {root}")
     print(
-        "note: the managed service runs built-in and Prime Hub environments; "
-        "publish local environments with `slm env push` before training with them."
+        f'run it locally:  [environment]\\npath = "environments/{mod}/{mod}.py"\n'
+        "or publish it to the Prime Hub with `slm env push` and reference it by id "
+        "(required on the managed service)."
     )
     return 0
 
 
 def cmd_env_list(args) -> int:
-    from autoslm.envs.registry import list_environments, list_installed_verifiers_envs
+    from autoslm.envs.registry import list_installed_verifiers_envs
 
-    print("built-in:")
-    for env_id in list_environments():
-        print(f"  {env_id}")
     installed = list_installed_verifiers_envs()
     if installed:
         print("installed (verifiers / Prime Hub):")
@@ -362,11 +415,27 @@ def cmd_env_list(args) -> int:
             print(f"  {env_id}")
     local = Path("environments")
     if local.is_dir():
-        dirs = [p.name for p in local.iterdir() if p.is_dir() and not p.name.startswith("__")]
-        if dirs:
-            print("local (environments/):")
-            for name in sorted(dirs):
-                print(f"  {name}")
+        # Both directory envs (environments/<name>/<name>.py) and top-level single-file
+        # modules (environments/<name>.py, e.g. the `slm lab` starter env). Print the
+        # actual path so it can be pasted straight into [environment] path.
+        paths: list[str] = []
+        for p in local.iterdir():
+            if p.name.startswith("__"):
+                continue
+            if p.is_dir():
+                # The loader (and `slm env init`) maps a hyphenated dir to an underscored
+                # inner module file (my-env/ -> my-env/my_env.py). List that exact path, and
+                # only when it actually exists (an empty/incomplete folder isn't loadable).
+                stem = p.name.replace("-", "_")
+                module = p / f"{stem}.py"
+                if module.is_file():
+                    paths.append(f"environments/{p.name}/{stem}.py")
+            elif p.suffix == ".py":
+                paths.append(f"environments/{p.name}")
+        if paths:
+            print("local (set [environment] path to one of):")
+            for path in sorted(paths):
+                print(f"  {path}")
     return 0
 
 
@@ -442,7 +511,7 @@ def _check_managed_spec(spec: JobSpec) -> None:
         raise ClientError(
             "local environment paths ([environment] path = ...) are not supported on the "
             "managed service; publish the environment with `slm env push` and reference it "
-            "by id, or use a built-in environment"
+            'by id ([environment] id = "owner/name")'
         )
 
 
@@ -453,15 +522,17 @@ def cmd_train(args) -> int:
         overrides=getattr(args, "overrides", None),
         extra_configs=getattr(args, "extra_configs", None),
     )
-    _check_managed_spec(spec)
     if args.dry_run:
-        # Fully local: validate the config without credentials, a server, or a GPU.
+        # Fully local: validate the config without credentials, a server, or a GPU. A local
+        # [environment] path is legitimate here (the env runs client-side) — only a real
+        # managed submit rejects it, so the managed check stays out of this branch.
         print(
             json.dumps(
                 {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}, indent=2
             )
         )
         return 0
+    _check_managed_spec(spec)
     client = client_from_config()
     status = client.create_run(spec_payload(spec))
     run_id = status["run_id"]

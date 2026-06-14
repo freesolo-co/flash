@@ -334,6 +334,7 @@ def test_config_provider_fields(monkeypatch):
         "model": "Qwen/Qwen3-4B-Instruct-2507",
         "algorithm": "sft",
         "train": {"epochs": 1, "seeds": [0]},
+        "environment": {"id": "owner/env"},
     }
     # omitted gpu.type -> smart-allocation default, original request preserved
     spec = spec_from_dict(dict(base), run_id="x")

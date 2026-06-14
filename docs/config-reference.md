@@ -11,12 +11,14 @@ thinking = false              # opt-in reasoning mode for thinking-capable model
 algorithm = "grpo"            # "sft" | "grpo"
 
 [environment]
-id = "gsm8k"                  # built-in (gsm8k|math|tests_pass) or a verifiers/Prime Hub env id
+id = "owner/name"            # a verifiers / Prime Hub env slug (install first: `slm env install owner/name`)
 # pip = ["verifiers", "my-env-wheel"]  # optional: explicit worker pip requirements for the
 #                                      # environment (default: derived from `slm env install`'s
 #                                      # local manifest and shipped with the run)
-# path = "environments/my_env"         # local custom env dir — NOT supported on the managed
-#                                      # service (publish with `slm env push` instead)
+# path = "environments/my_env"         # local custom verifiers env (dir or *.py) — LOCAL runs
+#                                      # only; NOT supported on the managed service (Flash ships
+#                                      # only the autoslm package, not your project tree —
+#                                      # publish with `slm env push` and use `id` instead)
 [environment.params]          # optional kwargs forwarded to load_environment(**params)
 
 [train]
@@ -25,6 +27,15 @@ epochs = 2                    # SFT epochs
 lora_rank = 32
 lora_alpha = 64
 seeds = [0, 1]                # one dedicated GPU per seed
+# GRPO recipe knobs (all optional; omit one to use the worker's recipe default). These
+# belong in [train], NOT [environment.params] (which is forwarded verbatim to the
+# verifiers env's load_environment(**params)):
+# group_size = 8                      # completions sampled per prompt
+# temperature = 0.6                   # rollout sampling temperature
+# max_tokens = 320                    # per-completion generation budget
+# kl_penalty_coef = 0.0               # KL-to-reference coefficient (GRPO beta)
+# advantage_clip = 5.0                # centered-advantage clamp
+# thinking_length_penalty_coef = 0.0  # per-<think>-token reward deduction (0–1)
 
 [gpu]
 # type = "RTX 5090"          # pin a GPU class; OMIT (or "cheapest") for smart allocation
@@ -102,8 +113,8 @@ and the volume bills monthly while it exists. Most useful for repeated 35B-class
 | `grpo` | TRL `GRPOTrainer` + colocated vLLM | env prompts + `reward` | verifiable-reward RL |
 
 See [algorithms.md](algorithms.md) for a how-to-choose guide, the data each one
-needs, and per-algorithm tuning knobs. Ready-to-run configs for both live in
-[`examples/gsm8k/`](../examples/gsm8k/).
+needs, and per-algorithm tuning knobs. `slm lab setup` scaffolds a starter local
+verifiers env plus a ready-to-run `configs/verifiers_grpo.toml`.
 
 ## Thinking mode (`thinking = true`)
 

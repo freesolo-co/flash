@@ -44,15 +44,56 @@ PHASE = os.environ.get(
     "PHASE",
     JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl") else "sft"),
 )
-ACTIVE_ENV = (
-    load_environment(
-        JOB_SPEC.environment.id,
-        JOB_SPEC.environment.params,
-        JOB_SPEC.environment.path,
-    )
-    if JOB_SPEC
-    else load_environment("gsm8k")
-)
+
+
+def _load_active_env():
+    """Load the run's verifiers environment from the JobSpec; require an explicit env.
+
+    There is no default/builtin environment (verifiers-only): a run MUST name a verifiers/
+    Prime Hub env id or a local env path. Failing here (instead of falling back to some
+    default) prevents a paid worker from training/evaluating the wrong task.
+    """
+    if JOB_SPEC is None:
+        # No JobSpec at all (e.g. the module imported for a non-run path / a unit test). There
+        # is nothing to select; defer the hard requirement to the JobSpec-present branch so the
+        # module stays importable. A real run always carries a JobSpec.
+        return None
+    env_id = JOB_SPEC.environment.id
+    env_path = JOB_SPEC.environment.path
+    if not env_id and not env_path:
+        # Every supported algorithm (sft/grpo) trains/evaluates against a verifiers env, so a
+        # missing env is always a misconfigured spec. Fail loudly rather than fall back to a
+        # default and burn a paid worker on the wrong task.
+        raise RuntimeError(
+            "JobSpec sets no environment: provide [environment] id (a verifiers/Prime Hub "
+            "slug, e.g. 'owner/name') or [environment] path (a local verifiers env module)."
+        )
+    return load_environment(env_id, JOB_SPEC.environment.params, env_path)
+
+
+ACTIVE_ENV = _load_active_env()
+
+
+def require_active_env():
+    """Return the run's loaded environment, or raise a CLEAR error when there is none.
+
+    ``ACTIVE_ENV`` is None on the no-JobSpec path (the module is imported with no
+    AUTOSLM_JOB_SPEC_JSON/PATH, e.g. a misconfigured worker launch). Every train/eval consumer
+    needs a real env; without this guard the first ``ACTIVE_ENV.<attr>`` access dies with an
+    opaque ``AttributeError: 'NoneType' object has no attribute ...``. Fail loudly with an
+    actionable message instead — mirrors the explicit RuntimeError raised when a JobSpec is
+    present but names no environment.
+    """
+    if ACTIVE_ENV is None:
+        raise RuntimeError(
+            "no environment is loaded: this worker was started without a JobSpec "
+            "(AUTOSLM_JOB_SPEC_JSON / AUTOSLM_JOB_SPEC_PATH is unset). A train/eval run must "
+            "carry a JobSpec naming [environment] id (a verifiers/Prime Hub slug, e.g. "
+            "'owner/name') or [environment] path (a local verifiers env module)."
+        )
+    return ACTIVE_ENV
+
+
 # Thinking/reasoning mode: one flag per run, consumed identically by SFT rendering,
 # RL rollouts, and serving. The env fallback serves the bench/no-JobSpec path.
 THINKING = (
@@ -280,7 +321,7 @@ def heartbeat(stage: str, **kw):
 # ---------------------------------------------------------------------------
 def render_prompt(tokenizer, item) -> str:
     item = item if isinstance(item, dict) else {"question": item}
-    msgs = ACTIVE_ENV.prompt_messages(item)
+    msgs = require_active_env().prompt_messages(item)
     return tokenizer.apply_chat_template(
         msgs, tokenize=False, add_generation_prompt=True, enable_thinking=THINKING
     )
@@ -525,8 +566,19 @@ def run_sft():
     from trl import SFTConfig as TRLSFTConfig
     from trl import SFTTrainer
 
+    require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
     heartbeat("sft_start")
+    # SFT only fits the single assistant `sft_target` per row; a multi-turn/ToolEnv env's
+    # tool/env turns are not represented, so SFT on one would silently mis-train (imitating a
+    # collapsed single-turn target). Warn loudly so it is not mistaken for proper multi-turn SFT.
+    if getattr(ACTIVE_ENV, "multi_turn", False):
+        print(
+            "[sft][warn] this is a multi-turn / tool verifiers environment, but SFT only fits "
+            "the single assistant target per row (tool/env turns are ignored). The model will be "
+            "trained on collapsed single-turn targets; multi-turn SFT is not supported. Use a "
+            "single-turn environment, or expect a single-turn-only fit."
+        )
     wait_for_gpu()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
     # QLoRA tier may load a pre-quantized export (~3.5x smaller download/disk);
@@ -778,26 +830,25 @@ def make_reward_heartbeat_callback():
 
 
 def grpo_overrides() -> dict:
-    """The freesolo SDK's GRPO knobs (datums parity), read off the job spec's
-    ``[train]`` (``TrainSpec``). Missing (None) -> recipe defaults apply.
+    """The GRPO recipe knobs, read off the job spec's ``[train]`` table (``TrainSpec``).
+    A field left unset (None) is omitted here so the recipe default applies downstream.
 
-    Same parameters the deleted client-side datums.py used, now honored server-side:
-    group_size, temperature, max_tokens (completion budget), kl_penalty_coef (the KL
+    Knobs: group_size, temperature, max_tokens (completion budget), kl_penalty_coef (the KL
     beta), advantage_clip (centered-advantage clip), and thinking_length_penalty_coef
-    (a per-<think>-token reward deduction). The SDK ships these in [train] (they are
-    TrainSpec fields), so only forward the ones actually set."""
+    (a per-<think>-token reward deduction). These live in ``[train]`` — NOT in
+    ``[environment.params]``, which is forwarded verbatim to the verifiers env loader."""
     if not JOB_SPEC:
         return {}
-    t = JOB_SPEC.train
-    pairs = {
-        "group_size": t.group_size,
-        "temperature": t.temperature,
-        "max_tokens": t.max_tokens,
-        "kl_penalty_coef": t.kl_penalty_coef,
-        "advantage_clip": t.advantage_clip,
-        "thinking_length_penalty_coef": t.thinking_length_penalty_coef,
+    train = JOB_SPEC.train
+    cfg = {
+        "group_size": train.group_size,
+        "temperature": train.temperature,
+        "max_tokens": train.max_tokens,
+        "kl_penalty_coef": train.kl_penalty_coef,
+        "advantage_clip": train.advantage_clip,
+        "thinking_length_penalty_coef": train.thinking_length_penalty_coef,
     }
-    return {k: v for k, v in pairs.items() if v is not None}
+    return {k: v for k, v in cfg.items() if v is not None}
 
 
 def think_token_count(completion: str | None, tokenizer) -> int:
@@ -849,8 +900,24 @@ def run_rl():
     from transformers import AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
 
+    require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
     heartbeat("rl_start")
+    # TODO(multi-turn-grpo): wiring a verifiers multi-turn/tool rollout into TRL's
+    # GRPOTrainer is invasive (TRL drives single-shot generation; a turn loop with
+    # env_response/is_completed between model turns has no clean hook in the colocated
+    # vLLM path). Until that lands, refuse multi-turn GRPO LOUDLY rather than silently
+    # train on a degenerate single-shot rollout (which would mis-score every reward func
+    # that reads multi-turn `state`). Single-turn GRPO is fully supported. A multi-turn EVAL
+    # path is NOT wired either: the adapter exposes rollout helpers
+    # (new_rollout_state/record_model_turn/env_reply/rollout_done) for a future driver, but
+    # nothing here calls them yet.
+    if getattr(ACTIVE_ENV, "multi_turn", False):
+        raise NotImplementedError(
+            "multi-turn / tool verifiers environments are not yet supported for GRPO "
+            "training on AutoSLM (the TRL GRPO rollout loop is single-shot). Use a "
+            "single-turn environment for GRPO, or run eval-only for multi-turn envs."
+        )
     wait_for_gpu()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
     download_seconds = prefetch_model(model_id)

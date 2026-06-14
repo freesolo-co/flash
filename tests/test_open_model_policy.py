@@ -78,7 +78,12 @@ def test_grpo_needs_more_than_sft():
 # Config schema plumbing
 # ---------------------------------------------------------------------------
 def _raw(model="Qwen/Qwen3-0.6B", **kw):
-    d = {"model": model, "algorithm": "sft", "train": {"epochs": 1}}
+    d = {
+        "model": model,
+        "algorithm": "sft",
+        "train": {"epochs": 1},
+        "environment": {"id": "owner/env"},  # any verifiers/Hub slug (not loaded here)
+    }
     d.update(kw)
     return d
 

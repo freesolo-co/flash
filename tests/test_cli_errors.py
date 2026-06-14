@@ -83,11 +83,17 @@ def test_local_env_path_rejected_client_side():
             f.write(
                 'model = "Qwen/Qwen3-4B-Instruct-2507"\nalgorithm = "grpo"\n'
                 '[environment]\nid = "custom"\npath = "envs/custom.py"\n'
-                "[train]\nsteps = 1\nseeds = [0]\n"
+                "[train]\nseeds = [0]\n"
             )
-        proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
-    assert proc.returncode == 1
-    assert "not supported on the managed service" in proc.stderr
+        # A real managed submit rejects a local [environment] path before any network call.
+        submit = _run(["train", cfg], env=_logged_out_env(tmp))
+        assert submit.returncode == 1
+        assert "not supported on the managed service" in submit.stderr
+        # ...but --dry-run validates a local-path config fully offline (the env runs
+        # client-side there), so the drafter's `slm train <cfg> --dry-run` check can pass.
+        dry = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
+        assert dry.returncode == 0, dry.stdout + dry.stderr
+        assert '"state": "dry_run"' in dry.stdout
 
 
 def test_dry_run_needs_no_credentials_or_server():

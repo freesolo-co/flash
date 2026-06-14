@@ -20,6 +20,7 @@ dependencies = [
     "runpod-flash",
     "huggingface-hub>=0.25",
     "datasets>=2.19",
+    "verifiers>=0.1.10",
 ]
 
 [project.optional-dependencies]
@@ -49,10 +50,6 @@ build-backend = "hatchling.build"
 packages = ["autoslm"]
 # Ship the PEP 561 marker so downstream type checkers pick up AutoSLM's type hints.
 artifacts = ["autoslm/py.typed"]
-# Ship the built-in example environments (gsm8k/math) as a sibling of the package so
-# upload_code() finds them on wheel/pipx installs (not just source checkouts) — the
-# worker resolves default runs from code/examples next to the package.
-force-include = { "examples" = "examples" }
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

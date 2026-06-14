@@ -1,80 +1,27 @@
-"""Environment registry used by specs, worker, CLI, and server."""
+"""Environment registry used by specs, worker, CLI, and server.
+
+Verifiers-only: every environment is a Prime Intellect ``verifiers`` env. There are no
+built-in task environments. ``load_environment`` resolves an env from one of two sources:
+
+  * a LOCAL verifiers env module (``path``) — a directory or ``*.py`` exposing
+    ``load_environment(**kwargs) -> verifiers.Environment``; or
+  * an INSTALLED / Hub verifiers env (``env_id``) resolvable by ``verifiers``
+    (installed via ``slm env install owner/name``, recorded in the manifest below).
+"""
 
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import json
 import os
-import sys
 from pathlib import Path
 
-from .base import Environment, load_environment_from_path
-from .freesolo import load_environment as load_freesolo
-from .tests_pass import load_environment as load_tests_pass
-
-# Example environments live next to the package (examples/<name>/), outside the
-# importable package tree so the core package carries no task-specific code. The
-# wheel force-includes examples/ (see pyproject.toml), so they are present in wheel
-# installs too. They are loaded by path and *lazily* — importing the registry must
-# not import the examples, which would cycle back through
-# envs.base -> envs/__init__ -> registry.
-_EXAMPLES_ROOT = Path(__file__).resolve().parents[2] / "examples"
-_EXAMPLE_ENVS = ("gsm8k", "math")
-
-
-def _example_loader(name: str):
-    """Return a loader that path-imports examples/<name>/ as a package on demand."""
-
-    def _load(**params) -> Environment:
-        mod_name = f"autoslm_example_{name}"
-        mod = sys.modules.get(mod_name)
-        if mod is None:
-            pkg_dir = _EXAMPLES_ROOT / name
-            init = pkg_dir / "__init__.py"
-            if not init.exists():
-                raise FileNotFoundError(
-                    f"example environment {name!r} not found at {pkg_dir}; the examples/ "
-                    "tree should be present in source checkouts and wheel installs alike "
-                    "(force-included) — this likely means an incomplete install/build"
-                )
-            spec = importlib.util.spec_from_file_location(
-                mod_name, init, submodule_search_locations=[str(pkg_dir)]
-            )
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[mod_name] = mod
-            spec.loader.exec_module(mod)
-        return mod.load_environment(**params)
-
-    return _load
-
-
-_BUILTINS = {
-    "freesolo": load_freesolo,
-    "tests_pass": load_tests_pass,
-    **{name: _example_loader(name) for name in _EXAMPLE_ENVS},
-}
-
-
-def _freesolo_worker_pip(params: dict) -> list[str]:
-    """The freesolo bridge needs the freesolo package on the worker only when it
-    reconstructs an environment for scoring (GRPO); SFT jobs are self-contained."""
-    return [] if (params or {}).get("mode") == "sft" else ["freesolo[full]"]
-
-
-# Built-ins whose worker-side execution needs extra pip packages.
-_BUILTIN_WORKER_PIP = {
-    "freesolo": _freesolo_worker_pip,
-}
+from .base import Environment
 
 # Manifest of installed verifiers / Prime Hub environments (written by `slm env install`).
 INSTALLED_MANIFEST = Path(
     os.environ.get("AUTOSLM_ENVS_MANIFEST", str(Path.home() / ".autoslm" / "envs.json"))
 )
-
-
-def list_environments() -> list[str]:
-    return sorted(_BUILTINS)
 
 
 def load_installed_manifest() -> dict:
@@ -87,6 +34,11 @@ def load_installed_manifest() -> dict:
 def list_installed_verifiers_envs() -> list[str]:
     """Names of verifiers/Hub environments installed via `slm env install`."""
     return sorted(load_installed_manifest())
+
+
+def list_environments() -> list[str]:
+    """All known environments — just the installed verifiers/Hub envs (no builtins)."""
+    return list_installed_verifiers_envs()
 
 
 def record_installed_env(env_id: str, package: str, extras: dict | None = None) -> None:
@@ -111,34 +63,40 @@ def _bare_wheel_name(env_ref: str) -> str:
 
 
 def worker_pip_for_env(env_id: str, params: dict | None = None) -> list[str]:
-    """Pip requirements the GPU worker needs to run ``env_id`` (verifiers Hub envs).
+    """Pip requirements the GPU worker needs to run ``env_id`` (a verifiers/Hub env).
 
-    Installs ``verifiers`` + the recorded env wheel, and carries any ``extra_index_url``
-    recorded at ``slm env install`` time (e.g. the Prime Intellect Hub index) through to
-    the worker's ``pip install``.
+    Always installs ``verifiers``; the env wheel is added only for an env RECORDED in the
+    local install manifest (``slm env install`` captures its package name and the Prime
+    Intellect ``extra_index_url``). An unrecorded Hub id ships ``verifiers`` only — to run a
+    published Hub env on the managed worker, ``slm env install`` it first (so the wheel +
+    index are known) or set ``[environment] pip`` explicitly. Also installs a separate
+    **eval** Hub env (``[environment.params] eval_env_id``, alias ``eval_env``) when
+    configured, and carries any recorded ``extra_index_url`` through to the worker's
+    ``pip install``.
 
-    A non-built-in env MUST be recorded (``slm env install <env>``) so the wheel name and
-    index are known. We deliberately do NOT guess a wheel name from an ``owner/name`` slug
-    — that could install an unrelated PyPI package on a name collision and hides the real
-    requirement; callers that want to bypass the manifest set ``[environment] pip`` instead
-    (the caller prefers ``spec.environment.pip`` over this function).
+    A local-path env is for LOCAL runs only — it is NOT uploaded to a managed worker (Flash
+    ships only the ``autoslm`` package, not the client project tree), so the managed CLI
+    rejects ``[environment] path`` before submit and managed runs must reference a published
+    Hub ``id``. For local execution it just needs ``verifiers`` installed.
     """
     params = params or {}
-    if env_id in _BUILTINS:
-        extra = _BUILTIN_WORKER_PIP.get(env_id)
-        return list(extra(params)) if callable(extra) else list(extra or [])
     manifest = load_installed_manifest()
-    entry = manifest.get(env_id)
-    if entry is None:
-        raise ValueError(
-            f"environment {env_id!r} is not a built-in and is not recorded as installed. "
-            f"Run `slm env install {env_id}` first, or set [environment] pip = [...] in "
-            "the config to declare the worker requirements explicitly."
-        )
-    deps = ["verifiers", entry.get("package") or _bare_wheel_name(env_id)]
+    refs = [env_id]
+    eval_ref = params.get("eval_env_id") or params.get("eval_env")
+    if eval_ref:
+        refs.append(str(eval_ref))
+    deps = ["verifiers"]
+    indexes: list[str] = []
+    for ref in refs:
+        entry = manifest.get(ref) or {}
+        pkg = entry.get("package") or (_bare_wheel_name(ref) if ref in manifest else None)
+        if pkg:
+            deps.append(pkg)
+        idx = entry.get("extra_index_url")
+        if idx and idx not in indexes:
+            indexes.append(idx)
     out = list(dict.fromkeys(deps))  # dedupe, preserve order
-    idx = entry.get("extra_index_url")
-    if idx:
+    for idx in indexes:
         out += ["--extra-index-url", idx]
     return out
 
@@ -146,22 +104,22 @@ def worker_pip_for_env(env_id: str, params: dict | None = None) -> list[str]:
 def load_environment(
     env_id: str, params: dict | None = None, path: str | None = None
 ) -> Environment:
-    params = params or {}
-    if path:
-        return load_environment_from_path(path, **params)
-    if env_id in _BUILTINS:
-        return _BUILTINS[env_id](**params)
-    # Fall through to a verifiers / Prime Hub environment (installed via `slm env install`
-    # or resolvable by verifiers). This is the verifiers/Hub interop path.
-    from .verifiers_adapter import load_verifiers_environment
+    """Load a verifiers environment and wrap it in AutoSLM's protocol.
 
-    try:
-        return load_verifiers_environment(env_id, **params)
-    except ImportError:
-        raise
-    except Exception as exc:
-        allowed = ", ".join(list_environments())
+    ``path`` -> a LOCAL verifiers env module (dir or ``*.py``); otherwise ``env_id`` is
+    resolved as an installed / Prime Hub verifiers env.
+    """
+    params = params or {}
+    from .verifiers_adapter import (
+        load_local_verifiers_environment,
+        load_verifiers_environment,
+    )
+
+    if path:
+        return load_local_verifiers_environment(path, env_id=env_id or path, **params)
+    if not env_id:
         raise ValueError(
-            f"could not load environment {env_id!r} as a built-in ({allowed}), a verifiers/Hub "
-            f"env, or a path: {exc}"
-        ) from exc
+            "no environment specified: set [environment] id to a verifiers/Prime Hub env "
+            "slug (e.g. 'owner/name'), or [environment] path to a local verifiers env module"
+        )
+    return load_verifiers_environment(env_id, **params)

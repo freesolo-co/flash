@@ -13,16 +13,6 @@ from .catalog import DEFAULT_MODEL, normalize_algorithm
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 
 
-def _opt_int(value: Any) -> int | None:
-    """int(value) or None — an omitted optional knob stays None (recipe default)."""
-    return None if value is None else int(value)
-
-
-def _opt_float(value: Any) -> float | None:
-    """float(value) or None — an omitted optional knob stays None (recipe default)."""
-    return None if value is None else float(value)
-
-
 def _str_tuple(value: Any) -> tuple[str, ...]:
     """Normalize a string-or-list knob (e.g. stop_sequences) to a tuple of strings.
 
@@ -47,9 +37,38 @@ def _coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _opt_int(value: Any) -> int | None:
+    """Parse an optional int from a loosely-typed spec source; None stays None.
+
+    Rejects JSON booleans: ``bool`` is an ``int`` subclass in Python, so ``int(True)`` would
+    silently coerce a stray boolean train knob to 1 (and ``False`` to 0). Mirrors
+    config_schema._opt_num — a bool is a type error, not a number.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f"expected a number, got bool {value!r}")
+    return int(value)
+
+
+def _opt_float(value: Any) -> float | None:
+    """Parse an optional float from a loosely-typed spec source; None stays None.
+
+    Rejects JSON booleans (``bool`` is an ``int`` subclass) so a stray boolean train knob is
+    not silently coerced to 0.0/1.0; mirrors config_schema._opt_num.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f"expected a number, got bool {value!r}")
+    return float(value)
+
+
 @dataclass(frozen=True)
 class EnvironmentSpec:
-    id: str = "gsm8k"
+    # Verifiers/Prime Hub env slug ("owner/name") or installed/local env id. No default:
+    # a run must name an environment explicitly (validated in config_schema / the worker).
+    id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     path: str | None = None
     # Pip requirements the GPU worker needs for this environment (verifiers/Hub envs).
@@ -76,11 +95,12 @@ class TrainSpec:
     batch_size: int | None = None
     max_length: int | None = None
     save_every: int | None = None
-    # GRPO recipe knobs (datums parity), shipped by the SDK in [train]. None/() -> recipe
-    # default. group_size = completions per prompt; temperature = rollout sampling temp;
-    # max_tokens = completion budget; kl_penalty_coef = KL beta; advantage_clip = centered-
-    # advantage clamp; thinking_length_penalty_coef = per-<think>-token reward deduction;
-    # stop_sequences = rollout stop strings.
+    # GRPO recipe knobs (datums parity), shipped by the SDK in [train] (NOT in
+    # [environment.params], which is forwarded verbatim to the verifiers env loader).
+    # None/() -> recipe default. group_size = completions per prompt; temperature = rollout
+    # sampling temp; max_tokens = completion budget; kl_penalty_coef = KL beta;
+    # advantage_clip = centered-advantage clamp; thinking_length_penalty_coef =
+    # per-<think>-token reward deduction; stop_sequences = rollout stop strings.
     group_size: int | None = None
     temperature: float | None = None
     max_tokens: int | None = None
@@ -150,14 +170,14 @@ class JobSpec:
             model=data.get("model", cls.model),
             algorithm=normalize_algorithm(data.get("algorithm", cls.algorithm)),
             environment=EnvironmentSpec(
-                id=env.get("id", "gsm8k"),
+                id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
                 path=env.get("path"),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
             ),
             train=TrainSpec(
-                steps=train.get("steps"),
-                epochs=train.get("epochs"),
+                steps=_opt_int(train.get("steps")),
+                epochs=_opt_int(train.get("epochs")),
                 lora_rank=int(train.get("lora_rank", 32)),
                 lora_alpha=int(train.get("lora_alpha", 64)),
                 seeds=tuple(int(s) for s in train.get("seeds", (0,))),

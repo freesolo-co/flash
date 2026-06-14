@@ -217,8 +217,8 @@ def create_app():
             raise HTTPException(
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
-                "publish the environment to the Prime Hub (`slm env push`) or use a "
-                "built-in environment",
+                "publish the environment to the Prime Hub (`slm env push`), then reference it "
+                'by its Hub id (`[environment] id = "owner/name"`)',
             )
         params = env_raw.get("params") or {}
         local = [p for p in _LOCAL_PATH_PARAMS if params.get(p)]
