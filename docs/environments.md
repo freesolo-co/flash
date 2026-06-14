@@ -1,7 +1,7 @@
 # Authoring & using environments
 
-AutoSLM environments define the task: the dataset, how prompts are rendered, the SFT target, the
-RL reward, and the eval grader.
+AutoSLM environments define the task: the dataset, how prompts are rendered, the SFT target, and
+the RL reward.
 
 ## The interface
 
@@ -10,14 +10,20 @@ Each environment exposes `load_environment(**kwargs)` returning an object implem
 ```python
 class Environment:
     id: str
-    def dataset(self, split: str) -> list[dict]: ...        # "train" | "eval"
+    def dataset(self, split: str) -> list[dict]: ...         # training rows ("train")
     def prompt_messages(self, example: dict) -> list[dict]:  # chat messages
     def sft_target(self, example: dict) -> str: ...          # assistant text for SFT
     def reward(self, completion: str, example: dict) -> float: ...  # RL reward
-    def grade(self, completion: str, example: dict) -> bool: ...    # eval correctness
+    def grade(self, completion: str, example: dict) -> bool: ...    # optional bool scorer reward can build on
 ```
 
 Subclass `autoslm.envs.base.BaseEnvironment` for sensible defaults.
+
+> **Worked example.** [`examples/gsm8k/`](../examples/gsm8k/) is the smallest
+> complete implementation of this interface and the recommended template — env +
+> grader + data split across three files, with a ready-to-run config for every
+> algorithm. See its [README](../examples/gsm8k/README.md) and
+> [algorithms.md](algorithms.md).
 
 ## Scaffold a custom environment
 
@@ -57,7 +63,7 @@ uv run slm env install owner/my-env     # via the prime CLI or pip; recorded in 
 id = "owner/my-env"
 ```
 
-The adapter maps verifiers `dataset`/`eval_dataset`, `system_prompt`, `parser`, and the
+The adapter maps the verifiers `dataset`, `system_prompt`, `parser`, and the
 weighted `rubric` reward funcs (sync or async) onto AutoSLM's interface. The GPU worker
 auto-installs `verifiers` + the env package for that run. Multi-turn/tool environments
 (`ToolEnv`/`MultiTurnEnv`) are a roadmap item (they need the rollout loop in the worker).

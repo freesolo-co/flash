@@ -29,9 +29,6 @@ class RunMetrics:
     # Cost
     cost_usd: float = 0.0
     gpu_seconds: float = 0.0  # GPU-rental wall seconds
-    # Quality
-    base_eval_acc: float | None = None  # baseline (no adapter) on this substrate
-    trained_eval_acc: float | None = None
     # Misc / friction
     notes: dict = field(default_factory=dict)
 

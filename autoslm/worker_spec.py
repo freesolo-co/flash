@@ -10,6 +10,19 @@ from typing import Any
 from .catalog import ALGORITHMS as ALGORITHMS  # re-exported for spec consumers
 from .catalog import DEFAULT_MODEL, normalize_algorithm
 
+_FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Parse a bool from loosely-typed spec sources (JSON/env/persisted dicts).
+
+    bool(...) on a string is truthy for ANY non-empty string, so "false"/"0" would
+    wrongly become True; treat the usual falsey strings as False.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSE_STRINGS
+    return bool(value)
+
 
 @dataclass(frozen=True)
 class EnvironmentSpec:
@@ -29,25 +42,9 @@ class TrainSpec:
     lora_rank: int = 32
     lora_alpha: int = 64
     seeds: tuple[int, ...] = (0,)
-    eval_examples: int = 300
     # Artifact-store adapter prefix (``<phase>/<run_id>/seed<N>``) to initialize the
     # LoRA from instead of training fresh — e.g. a GRPO run continuing an SFT adapter.
     init_from_adapter: str = ""
-
-
-@dataclass(frozen=True)
-class DistillSpec:
-    """On-policy distillation settings (algorithm = "opd").
-
-    The student generates rollouts and the teacher provides dense token-level
-    supervision (TRL DistillationTrainer). The teacher loads IN-PROCESS on the same
-    GPU by default — choose a teacher that fits alongside the student.
-    """
-
-    teacher: str = ""
-    lmbda: float = 1.0  # fraction of on-policy (student-generated) batches
-    max_completion: int = 320
-    temperature: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -56,10 +53,10 @@ class GpuSpec:
     # GPU substrate: "auto" (cheapest across providers at submit time), "runpod", or
     # "vast" (verified datacenters only).
     provider: str = "auto"
-    # The raw user gpu.type input ("", "cheapest", "auto", or a concrete class). The
-    # orchestrator re-allocates at submit time iff this is a policy word/empty —
-    # ``type`` then is just the parse-time provisional; a concrete ``requested`` pins
-    # the class and the allocator only picks the provider.
+    # The raw user gpu.type input ("cheapest"/"auto" or a concrete class), always set
+    # by config parsing. The orchestrator re-allocates the class at submit time iff
+    # this is a policy word — ``type`` is then just the parse-time provisional; a
+    # concrete ``requested`` pins the class and the allocator only picks the provider.
     requested: str = ""
     # Carried into the submit-time allocator (None -> AUTOSLM_GPU_ALLOW_UNVALIDATED).
     allow_unvalidated: bool | None = None
@@ -88,9 +85,8 @@ class JobSpec:
     # "catalog" (curated models only) or "allow" (any HF model that fits the GPU).
     model_policy: str = "catalog"
     # Thinking/reasoning mode (thinking-capable models only). One flag per run, consumed
-    # identically by SFT rendering, RL rollouts, eval, and serving (decoding parity).
+    # identically by SFT rendering, RL rollouts, and serving (decoding parity).
     thinking: bool = False
-    distill: DistillSpec = field(default_factory=DistillSpec)
 
     @property
     def phase(self) -> str:
@@ -122,7 +118,6 @@ class JobSpec:
                 lora_rank=int(train.get("lora_rank", 32)),
                 lora_alpha=int(train.get("lora_alpha", 64)),
                 seeds=tuple(int(s) for s in train.get("seeds", (0,))),
-                eval_examples=int(train.get("eval_examples", 300)),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
             ),
             gpu=GpuSpec(
@@ -139,13 +134,7 @@ class JobSpec:
             ),
             run_id=data.get("run_id", "local"),
             model_policy=data.get("model_policy", "catalog"),
-            thinking=bool(data.get("thinking", False)),
-            distill=DistillSpec(
-                teacher=(data.get("distill") or {}).get("teacher", ""),
-                lmbda=float((data.get("distill") or {}).get("lmbda", 1.0)),
-                max_completion=int((data.get("distill") or {}).get("max_completion", 320)),
-                temperature=float((data.get("distill") or {}).get("temperature", 1.0)),
-            ),
+            thinking=_coerce_bool(data.get("thinking", False)),
         )
 
     @classmethod

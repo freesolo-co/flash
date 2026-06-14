@@ -1,17 +1,31 @@
-model = "Qwen/Qwen3-4B-Instruct-2507"
+# GRPO (verifiable-reward RL) on GSM8K.
+#
+# The student generates several completions per prompt through a colocated vLLM
+# engine; the environment's `reward` (correct answer + clean \boxed{} format)
+# scores each, and GRPO shifts probability mass toward the higher-reward samples.
+# Needs a grader, NOT a teacher.
+#
+#   slm train examples/gsm8k/gsm8k_grpo.toml
+#
+# Tuning the per-step memory/throughput of colocated GRPO on a single 24-32 GB
+# card (RL_VLLM_SLEEP, RL_VLLM_GPU_UTIL, RL_PER_DEVICE_PROMPTS, ...) is documented
+# in docs/config-reference.md ("Colocated GRPO on one consumer GPU").
+# See docs/algorithms.md#grpo for when to choose GRPO.
+
+model     = "Qwen/Qwen3-4B-Instruct-2507"
 algorithm = "grpo"
 
 [environment]
-id = "gsm8k"
+id = "gsm8k"           # supplies prompts + the verifiable reward + the eval grader
 
 [train]
-steps = 150
-lora_rank = 32
-seeds = [0]
-eval_examples = 300
+steps      = 150       # GRPO is step-driven (SFT is epoch-driven)
+lora_rank  = 32
+lora_alpha = 64
+seeds      = [0]
 
 [gpu]
-type = "RTX 5090"
-disk_gb = 60
-# Optional spend guard: stop launching further seeds once accrued cost crosses this (USD).
-# max_cost_usd = 10.0
+# Fully managed: omit gpu.type (defaults to "cheapest"). The allocator sizes for
+# GRPO (trainer + colocated rollout engine — >= 24 GB for this 4B run) and picks the
+# cheapest fitting class across providers. Disk is auto-managed.
+max_wall_seconds = 86400        # per-seed execution cap — the real spend guard

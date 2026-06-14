@@ -42,16 +42,8 @@ def _invoke_handler(handler, payload: dict) -> dict:
     return asyncio.run(_call())
 
 
-# Serving deps follow the active worker stack (legacy/modern) minus the trainer bits.
-SERVE_DEPS_LEGACY = [
-    "torch==2.8.0",
-    "vllm<0.11",
-    "transformers>=4.55,<5",
-    "huggingface_hub>=0.25",
-    "peft",
-    "accelerate",
-]
-SERVE_DEPS_MODERN = [
+# Serving deps mirror the worker stack minus the trainer bits.
+SERVE_DEPS = [
     "torch==2.10.0",
     "vllm==0.19.1",
     "transformers>=5.6,<5.11",
@@ -100,14 +92,7 @@ def resolve_serve_deps() -> list[str]:
             deps = [d for d in shlex.split(explicit) if d.strip()]
         if deps:
             return deps
-    stack = (os.environ.get("AUTOSLM_WORKER_STACK") or "").strip().lower()
-    if stack == "modern":
-        return SERVE_DEPS_MODERN
-    if stack == "legacy":
-        return SERVE_DEPS_LEGACY
-    from autoslm.flash.train import WORKER_DEPS, WORKER_DEPS_MODERN
-
-    return SERVE_DEPS_MODERN if WORKER_DEPS is WORKER_DEPS_MODERN else SERVE_DEPS_LEGACY
+    return SERVE_DEPS
 
 
 @dataclass
@@ -324,9 +309,9 @@ def _serve_body(input_data: dict) -> dict:
         out = post(body)
     except urllib.error.HTTPError as e:
         if e.code == 400:
-            # Older vLLM rejects the kwarg; the chat template's own default applies
-            # (thinking ON for hybrid Qwen3 — correct for thinking runs, a logged
-            # degradation for non-thinking ones on the legacy stack).
+            # A vLLM build that rejects the kwarg falls back to the chat template's own
+            # default (thinking ON for hybrid Qwen3 — correct for thinking runs, a logged
+            # degradation for non-thinking ones).
             body.pop("chat_template_kwargs", None)
             print("vLLM rejected chat_template_kwargs; retrying without enable_thinking")
             out = post(body)

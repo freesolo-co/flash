@@ -55,7 +55,7 @@ class GpuInfo:
     vast_name: str | None = None
 
     @property
-    def validated(self) -> bool:  # back-compat: validated on ANY provider
+    def validated(self) -> bool:  # validated on ANY provider
         return bool(self.validated_on)
 
 
@@ -164,7 +164,7 @@ GPU_INFO: dict[str, GpuInfo] = {
         ),
         # L40S exists at RunPod but not in the Flash SDK's GpuType enum -> Vast-only.
         GpuInfo("L40S", None, 48, "l40s", "sm89", 0.87, vast_name="L40S"),
-        # ---- big-VRAM tier (large-MoE QLoRA, OPD teachers, future >9B bf16) ----
+        # ---- big-VRAM tier (large-MoE QLoRA, future >9B bf16) ----
         # 40 GB SXM4 boards share Vast's "A100 SXM4" name with the 80 GB variant;
         # offers are split by gpu_ram (vast_gpu_for_offer). Not a RunPod Flash class.
         GpuInfo("A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 0.89, vast_name="A100 SXM4"),
@@ -318,7 +318,14 @@ def unvalidated_allowed(explicit: bool | None = None) -> bool:
     """Whether configs may target a non-``validated`` GPU class."""
     if explicit is not None:
         return explicit
-    return os.environ.get("AUTOSLM_GPU_ALLOW_UNVALIDATED", "") not in ("", "0", "false")
+    # Truthy allowlist (not a falsey denylist): only an explicit truthy value opts in, so
+    # "false"/"False"/"no"/"off"/"0"/"" all correctly leave unvalidated GPUs disabled.
+    return os.environ.get("AUTOSLM_GPU_ALLOW_UNVALIDATED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def flash_gpu(name: str):

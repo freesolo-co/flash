@@ -165,28 +165,6 @@ def test_bad_spec_is_400(api):
     assert "model" in r.json()["detail"]
 
 
-def test_eval_with_owned_adapter(api):
-    key_a, key_b = _claim(api), _claim(api)
-    train_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key_a)
-    ).json()["run_id"]
-    r = api.post(
-        "/v1/evals",
-        json={"spec": SPEC, "adapter_run_id": train_id, "dry_run": True},
-        headers=_bearer(key_a),
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["state"] == "dry_run"
-    assert r.json()["run_id"].startswith("eval-")
-    # Another tenant cannot eval against a run it doesn't own.
-    stolen = api.post(
-        "/v1/evals",
-        json={"spec": SPEC, "adapter_run_id": train_id, "dry_run": True},
-        headers=_bearer(key_b),
-    )
-    assert stolen.status_code == 404
-
-
 def test_deploy_dry_run(api):
     key = _claim(api)
     run_id = api.post(
@@ -200,24 +178,6 @@ def test_deploy_dry_run(api):
     assert dep.json()["mode"] == "dev"
     # Dry-run deploys never show up as active deployments.
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
-
-
-def test_deploy_rejects_standalone_eval(api):
-    # A standalone eval (eval- run_id) never trains an adapter; deploying it must be
-    # rejected up front rather than provisioning an endpoint that fails on first chat.
-    key = _claim(api)
-    train_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    eval_id = api.post(
-        "/v1/evals",
-        json={"spec": SPEC, "adapter_run_id": train_id, "dry_run": True},
-        headers=_bearer(key),
-    ).json()["run_id"]
-    assert eval_id.startswith("eval-")
-    dep = api.post(f"/v1/runs/{eval_id}/deploy", json={"mode": "dev"}, headers=_bearer(key))
-    assert dep.status_code == 409
-    assert "standalone eval" in dep.text
 
 
 def test_claim_throttle(api):

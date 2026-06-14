@@ -66,17 +66,6 @@ def test_build_target_text():
     assert "Tom has 3 apples" in t
 
 
-def test_eval_subset_determinism():
-    a = d.eval_subset_indices(300, 12345, 1319)
-    b = d.eval_subset_indices(300, 12345, 1319)
-    assert a == b
-    assert len(a) == 300
-    assert len(set(a)) == 300
-    # different seed -> different selection
-    c = d.eval_subset_indices(300, 999, 1319)
-    assert a != c
-
-
 if __name__ == "__main__":
     import traceback
 

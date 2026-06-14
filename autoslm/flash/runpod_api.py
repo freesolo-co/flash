@@ -8,6 +8,7 @@ whole-dict, last-writer-wins and therefore unreliable across processes).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -65,7 +66,13 @@ def request_with_retries(
             return _request(url, method=method, body=body)
         except urllib.error.HTTPError as e:
             if e.code < 500 and e.code != 429:
-                raise RunpodApiError(f"{method} {url} -> HTTP {e.code}: {e.reason}") from e
+                # The response body usually carries the actionable error detail; e.reason
+                # alone (e.g. "Bad Request") is rarely enough to debug a 4xx.
+                detail = ""
+                with contextlib.suppress(Exception):
+                    detail = e.read().decode("utf-8", "replace")[:500].strip()
+                suffix = f": {detail}" if detail else ""
+                raise RunpodApiError(f"{method} {url} -> HTTP {e.code}: {e.reason}{suffix}") from e
             last = e
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             last = e

@@ -44,7 +44,6 @@ class FreesoloEnvironment:
         *,
         contract_text: str,
         records: list[dict],
-        eval_records: list[dict] | None = None,
         mode: str = "grpo",
         environment: str | None = None,
         environment_bundle: dict[str, str] | None = None,
@@ -59,12 +58,6 @@ class FreesoloEnvironment:
             raise ValueError(f'mode must be "sft" or "grpo", got {mode!r}')
         self.contract_text = contract_text
         self.records = list(records)
-        # Held-out eval set. Without one, eval does NOT fall back to the training
-        # records (that measures accuracy on the training set and leaks labels) —
-        # it returns empty so the worker reports a base/trained eval over 0 held-out
-        # examples instead of a misleading train-set score. The SDK should ship a
-        # held-out split as eval_records for a real post-train eval.
-        self.eval_records = list(eval_records) if eval_records else []
         self.mode = mode
         self.environment_name = environment
         self.environment_bundle = environment_bundle
@@ -119,6 +112,17 @@ class FreesoloEnvironment:
                 reference.split(":", 1)[1] if reference and ":" in reference else "load_environment"
             )
             reference = f"{os.path.join(workdir, entry)}:{factory}"
+        if not reference:
+            # GRPO needs the environment to compute the reward. With neither an
+            # `environment` reference nor an `environment_bundle`, load_environment(None)
+            # would fall back to a non-existent freesolo/environment.py and fail deep in
+            # the loader — surface the real cause here instead.
+            raise ValueError(
+                "freesolo GRPO bridge requires an environment: set [environment] "
+                "environment to a 'freesolo/environment.py:load_environment' reference, "
+                "or ship the environment via environment_bundle. Without one there is no "
+                "reward function to train against."
+            )
         env = load_environment(
             reference,
             reward_command=self.reward_command,
@@ -148,10 +152,6 @@ class FreesoloEnvironment:
     # -- AutoSLM environment protocol -----------------------------------------
 
     def dataset(self, split: str) -> list[dict]:
-        # Eval reads the held-out set (empty unless the SDK supplied one) so
-        # post-train accuracy is never measured on the training records.
-        if split in ("eval", "validation", "test"):
-            return self.eval_records
         return self.records
 
     def prompt_messages(self, example: dict) -> list[dict]:

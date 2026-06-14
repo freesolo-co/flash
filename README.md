@@ -1,16 +1,16 @@
 # AutoSLM
 
-Managed LoRA post-training service: SFT, GRPO, on-policy distillation, and DPO
-on dedicated consumer GPUs (RunPod Flash, RTX 4090/5090 classes). The Freesolo
-SDK submits training jobs here instead of running Tinker loops client-side.
+Managed LoRA post-training service: SFT and GRPO on dedicated consumer GPUs
+(RunPod Flash, RTX 4090/5090 classes). The Freesolo SDK submits training jobs here
+instead of running Tinker loops client-side.
 
 ## Scope
 
 - `slm train <cfg.toml>` / control-plane `POST /runs` — submit a training job;
   one dedicated GPU per run, supervised server-side (stall watchdog, bounded
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
-- `slm eval`, `slm deploy` (scale-to-zero or always-on), `slm chat`,
-  `slm serve-proxy` — eval and serving for trained adapters.
+- `slm deploy` (scale-to-zero or always-on), `slm chat`, `slm serve-proxy` —
+  serving for trained adapters.
 - The `freesolo` built-in environment (`autoslm/envs/freesolo.py`) bridges
   freesolo SDK contracts/datasets onto the worker: the SDK passes contract text
   and dataset records as environment params; the worker pip-installs
@@ -28,15 +28,16 @@ SDK submits training jobs here instead of running Tinker loops client-side.
   retries, cost guard, endpoint GC)
 - `autoslm/flash/` — RunPod Flash provisioning, durable submit/poll, pricing
 - `autoslm/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
-  shared recipe; SFT targets, RL rewards, and evals all route through the active
-  environment so every arm scores identically (task-specific grading lives with
-  its example, not in the engine)
+  shared recipe; SFT targets and RL rewards route through the active environment
+  (task-specific grading lives with its example, not in the engine)
 - `autoslm/envs/` — environment machinery: registry, base loader, `freesolo`
   bridge, `tests_pass` built-in + verifiers/Prime Hub interop
 - `examples/` — repo-root example task environments, each a self-contained folder
   (`examples/gsm8k/`, `examples/math/`: env + grader + data + ready-to-run TOMLs).
-  The registry path-loads them as the `gsm8k`/`math` built-ins; they ship with the
-  source checkout rather than the installed package.
+  `examples/gsm8k/` carries a config for every algorithm (SFT/GRPO) and is
+  the recommended starting point — see `examples/README.md`. The registry
+  path-loads them as the `gsm8k`/`math` built-ins; the wheel force-includes the
+  `examples/` tree (see `pyproject.toml`), so they ship with the installed package too.
 - `autoslm/serve/`, `autoslm/server/` — adapter serving and the FastAPI control
   plane (`slm server`, see `docs/self-hosting.md`)
 - `autoslm/mcp/` — stdio MCP bridge for coding agents
@@ -56,5 +57,7 @@ uv run slm server                          # control plane (operator-side)
 
 The control plane owns provider credentials (`RUNPOD_API_KEY`,
 `HUGGINGFACE_TOKEN`, `HF_REPO`); clients authenticate with a claimed AutoSLM
-key (`slm login`). See `docs/config-reference.md` for the run TOML schema and
-`docs/self-hosting.md` for operating the service.
+key (`slm login`). See `docs/config-reference.md` for the run TOML schema,
+`docs/algorithms.md` for choosing and tuning SFT/GRPO,
+`docs/environments.md` for authoring a task, and `docs/self-hosting.md` for
+operating the service.

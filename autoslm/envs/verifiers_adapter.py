@@ -8,7 +8,7 @@ follow-up — they require the rollout loop in ``autoslm.engine.worker`` (tracke
 verifiers contract (docs):
   * ``vf.load_environment(env_id, **kwargs) -> Environment``
   * rows have ``prompt`` (chat messages) + ``answer`` (+ optional ``info``)
-  * ``env.dataset`` / ``env.get_dataset(n, seed)``, ``env.eval_dataset`` / ``get_eval_dataset``
+  * ``env.dataset`` / ``env.get_dataset(n, seed)``
   * ``env.system_prompt``, ``env.parser``, ``env.rubric`` (weighted reward funcs that take
     ``completion``/``prompt``/``answer``/``info``/``state``/``parser`` by name; sync or async)
 
@@ -16,10 +16,7 @@ Hub conveniences handled here so the *documented* flow (``slm env install owner/
 ``[environment] id = "owner/name"``) actually works on real Prime Intellect envs:
   * the ``owner/name`` Hub slug is mapped to the bare ``verifiers`` load id;
   * a ``RubricGroup`` (rubrics-of-rubrics, e.g. ``MathRubric`` + a monitor rubric) is
-    flattened so the real reward funcs are found and zero-weight/monitor funcs are skipped;
-  * an optional separate **eval** Hub env (``eval_env_id``) + a fixed eval subset
-    (``eval_examples`` / ``eval_seed``) let you train on one env and evaluate on another
-    (e.g. train ``primeintellect/hendrycks-math`` → eval ``primeintellect/math500``).
+    flattened so the real reward funcs are found and zero-weight/monitor funcs are skipped.
 """
 
 from __future__ import annotations
@@ -27,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import random
 
 from .base import BaseEnvironment
 
@@ -63,41 +59,27 @@ def vf_load_id(env_ref: str) -> str:
     return env_ref.split("/", 1)[1] if "/" in env_ref else env_ref
 
 
-def _call_first(obj, method_names, *args):
-    for name in method_names:
-        fn = getattr(obj, name, None)
-        if callable(fn):
-            try:
-                return fn(*args)
-            except Exception:
-                continue
-    return None
-
-
-def _call_dataset_getter(obj, method_names, *, seed: int):
+def _call_dataset_getter(obj, method_name, *, seed: int):
     """Call a verifiers dataset getter, binding (n, seed) when it declares them.
 
-    verifiers exposes get_dataset/get_eval_dataset as get_X(n=-1, seed=0); some Hub
-    envs declare them WITHOUT defaults, so a no-arg call raised TypeError, which got
-    swallowed into an empty dataset (a paid run over no data). Bind n=-1 (all rows —
-    the adapter does its own fixed-subset selection) and the seed when the signature
-    declares them; a genuine failure propagates (fail loudly) instead of silently
-    emptying the split."""
-    for name in method_names:
-        fn = getattr(obj, name, None)
-        if not callable(fn):
-            continue
-        try:
-            param_names = set(inspect.signature(fn).parameters)
-        except (TypeError, ValueError):
-            param_names = set()
-        kwargs = {}
-        if "n" in param_names:
-            kwargs["n"] = -1
-        if "seed" in param_names:
-            kwargs["seed"] = seed
-        return fn(**kwargs)
-    return None
+    verifiers exposes get_dataset as get_dataset(n=-1, seed=0); some Hub envs declare it
+    WITHOUT defaults, so a no-arg call raised TypeError, which got swallowed into an empty
+    dataset (a paid run over no data). Bind n=-1 (all rows — the adapter does its own
+    fixed-subset selection) and the seed when the signature declares them; a genuine
+    failure propagates (fail loudly) instead of silently emptying the split."""
+    fn = getattr(obj, method_name, None)
+    if not callable(fn):
+        return None
+    try:
+        param_names = set(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        param_names = set()
+    kwargs = {}
+    if "n" in param_names:
+        kwargs["n"] = -1
+    if "seed" in param_names:
+        kwargs["seed"] = seed
+    return fn(**kwargs)
 
 
 def _rows_to_list(ds) -> list[dict]:
@@ -155,23 +137,10 @@ def _invoke_reward(func, available: dict) -> float:
 class VerifiersEnvironment(BaseEnvironment):
     """AutoSLM environment backed by a verifiers ``Environment`` instance (single-turn)."""
 
-    def __init__(
-        self,
-        vf_env,
-        env_id: str,
-        eval_vf_env=None,
-        eval_env_id: str | None = None,
-        eval_examples: int | None = None,
-        eval_seed: int = 12345,
-    ):
+    def __init__(self, vf_env, env_id: str):
         super().__init__(id=env_id)
         self._env = vf_env
-        self._eval_env = eval_vf_env  # optional separate eval Hub env
-        self._eval_env_id = eval_env_id
-        self._eval_examples = int(eval_examples) if eval_examples else 0
-        self._eval_seed = int(eval_seed)
-        # The shared scorer is the TRAIN env's (flattened) rubric + parser, so the reward
-        # used for RL and the grader used at eval are byte-for-byte identical.
+        # The scorer is the env's (flattened) rubric + parser.
         self._reward_pairs = (
             _flatten_rubric(getattr(vf_env, "rubric", None))
             if getattr(vf_env, "rubric", None) is not None
@@ -196,29 +165,10 @@ class VerifiersEnvironment(BaseEnvironment):
 
     # -- data -------------------------------------------------------------
     def dataset(self, split: str) -> list[dict]:
-        is_eval = split in {"eval", "validation", "test"}
-        if is_eval:
-            src = self._eval_env or self._env
-            ds = _call_dataset_getter(src, ["get_eval_dataset"], seed=self._eval_seed) or getattr(
-                src, "eval_dataset", None
-            )
-            if ds is None:  # fall back to the (eval) env's train split if no eval split exists
-                ds = _call_dataset_getter(src, ["get_dataset"], seed=self._eval_seed) or getattr(
-                    src, "dataset", None
-                )
-            rows = _rows_to_list(ds)
-            return self._fixed_subset(rows)
-        ds = _call_dataset_getter(self._env, ["get_dataset"], seed=0) or getattr(
+        ds = _call_dataset_getter(self._env, "get_dataset", seed=0) or getattr(
             self._env, "dataset", None
         )
         return _rows_to_list(ds)
-
-    def _fixed_subset(self, rows: list[dict]) -> list[dict]:
-        n = self._eval_examples
-        if n <= 0 or n >= len(rows):
-            return rows
-        idx = sorted(random.Random(self._eval_seed).sample(range(len(rows)), n))
-        return [rows[i] for i in idx]
 
     # -- task interface ---------------------------------------------------
     def prompt_messages(self, example: dict) -> list[dict]:
@@ -279,26 +229,15 @@ class VerifiersEnvironment(BaseEnvironment):
     def describe(self) -> dict:
         return {
             "environment": self.id,
-            "eval_env": self._eval_env_id,
             "reward_funcs": [getattr(f, "__name__", str(f)) for f, w in self._reward_pairs if w],
         }
 
 
-def load_verifiers_environment(
-    env_id: str,
-    eval_env_id: str | None = None,
-    eval_env: str | None = None,
-    eval_examples: int | None = None,
-    eval_seed: int = 12345,
-    **kwargs,
-) -> VerifiersEnvironment:
+def load_verifiers_environment(env_id: str, **kwargs) -> VerifiersEnvironment:
     """Load a verifiers/Hub environment by id and wrap it for AutoSLM.
 
     ``env_id`` may be a Hub slug (``owner/name``); it is mapped to the bare verifiers load
-    id. Pass ``eval_env_id`` (alias ``eval_env``) to evaluate on a *different* Hub env
-    (e.g. train ``primeintellect/hendrycks-math`` → eval ``primeintellect/math500``), with
-    ``eval_examples`` / ``eval_seed`` selecting a fixed eval subset. Remaining ``kwargs`` are
-    forwarded to the train env's ``vf.load_environment``.
+    id. Remaining ``kwargs`` are forwarded to ``vf.load_environment``.
     """
     try:
         import verifiers as vf
@@ -325,13 +264,4 @@ def load_verifiers_environment(
             "AutoSLM worker only runs single-turn rollouts (multi-turn reward functions "
             "would be scored 0.0). Use a single-turn environment."
         )
-    eval_ref = eval_env_id or eval_env
-    eval_vf_env = vf.load_environment(vf_load_id(eval_ref)) if eval_ref else None
-    return VerifiersEnvironment(
-        vf_env,
-        env_id,
-        eval_vf_env=eval_vf_env,
-        eval_env_id=eval_ref,
-        eval_examples=eval_examples,
-        eval_seed=eval_seed,
-    )
+    return VerifiersEnvironment(vf_env, env_id)

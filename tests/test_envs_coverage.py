@@ -65,6 +65,56 @@ def test_load_environment_from_directory_uses_stem_module(tmp_path) -> None:
     assert load_environment_from_path(str(pkg)).id == "dir-env"
 
 
+def test_directory_envs_do_not_shadow_each_others_siblings(tmp_path) -> None:
+    # Two directory envs that each ship a `config.py` must each see their OWN sibling —
+    # the first-loaded config must not be cached and reused for the second.
+    def _make(name: str, env_id: str) -> str:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "config.py").write_text(f"ENV_ID = {env_id!r}\n", encoding="utf-8")
+        (d / f"{name}.py").write_text(
+            "from autoslm.envs.base import BaseEnvironment\n"
+            "from config import ENV_ID\n"
+            "def load_environment(**kw):\n"
+            "    return BaseEnvironment(id=ENV_ID)\n",
+            encoding="utf-8",
+        )
+        return str(d)
+
+    a = _make("env_a", "from-a")
+    b = _make("env_b", "from-b")
+    assert load_environment_from_path(a).id == "from-a"
+    assert load_environment_from_path(b).id == "from-b"  # not shadowed by env_a's config
+    assert load_environment_from_path(a).id == "from-a"  # and reloadable
+
+
+def test_directory_env_sibling_wins_over_app_module(tmp_path, monkeypatch) -> None:
+    # A top-level `config` already cached (e.g. the control plane's own cli/src/config.py)
+    # must NOT shadow the env's sibling `config.py`: sys.modules wins over sys.path, so
+    # the loader has to evict the app module for the load and restore it afterwards.
+    import sys
+    import types
+
+    app_config = types.ModuleType("config")
+    app_config.ENV_ID = "from-app"
+    monkeypatch.setitem(sys.modules, "config", app_config)
+
+    d = tmp_path / "env_x"
+    d.mkdir()
+    (d / "config.py").write_text("ENV_ID = 'from-env-x'\n", encoding="utf-8")
+    (d / "env_x.py").write_text(
+        "from autoslm.envs.base import BaseEnvironment\n"
+        "from config import ENV_ID\n"
+        "def load_environment(**kw):\n"
+        "    return BaseEnvironment(id=ENV_ID)\n",
+        encoding="utf-8",
+    )
+    assert load_environment_from_path(str(d)).id == "from-env-x"  # env sibling, not app
+    # the app's own `config` module is restored untouched after the load
+    assert sys.modules["config"] is app_config
+    assert sys.modules["config"].ENV_ID == "from-app"
+
+
 # ---------------------------------------------------------------------------
 # gsm8k (no dataset download: prompt/target/reward wiring only)
 # ---------------------------------------------------------------------------
@@ -90,17 +140,6 @@ def test_gsm8k_prompt_target_and_grading() -> None:
     assert env.reward("no numbers here at all", example) == 0.0
 
 
-def test_gsm8k_eval_examples_defaults_to_env(monkeypatch) -> None:
-    # A config that sets only [train] eval_examples (worker exports EVAL_NUM) must
-    # build the seeded N-row subset directly, not slice [:N] off a fixed 300-sample.
-    monkeypatch.setenv("EVAL_NUM", "500")
-    assert GSM8KEnvironment().eval_examples == 500
-    # an explicit environment.params.eval_examples still wins over the env default
-    assert GSM8KEnvironment(eval_examples=42).eval_examples == 42
-    monkeypatch.delenv("EVAL_NUM", raising=False)
-    assert GSM8KEnvironment().eval_examples == 300  # falls back to the recipe default
-
-
 # ---------------------------------------------------------------------------
 # tests_pass (real subprocess grading in a temp repo)
 # ---------------------------------------------------------------------------
@@ -110,7 +149,14 @@ def test_gsm8k_eval_examples_defaults_to_env(monkeypatch) -> None:
     subprocess.run(["git", "--version"], capture_output=True).returncode != 0,
     reason="git unavailable",
 )
-def test_tests_pass_applies_diff_and_runs_test_command(tmp_path) -> None:
+def test_tests_pass_requires_code_exec_opt_in(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("AUTOSLM_ALLOW_CODE_EXEC", raising=False)
+    with pytest.raises(ValueError, match="AUTOSLM_ALLOW_CODE_EXEC"):
+        TestsPassEnvironment(workspace_path=str(tmp_path))
+
+
+def test_tests_pass_applies_diff_and_runs_test_command(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("AUTOSLM_ALLOW_CODE_EXEC", "1")
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "value.txt").write_text("wrong\n", encoding="utf-8")
@@ -201,7 +247,12 @@ GRPO_RECORDS = [{"record": {"q": "2+2"}, "task": "What is 2+2?", "expected_outpu
 
 
 def test_grpo_prompts_and_scoring_via_freesolo(fake_freesolo) -> None:
-    env = FreesoloEnvironment(contract_text="# contract", records=GRPO_RECORDS, mode="grpo")
+    env = FreesoloEnvironment(
+        contract_text="# contract",
+        records=GRPO_RECORDS,
+        mode="grpo",
+        environment="freesolo/environment.py:load_environment",
+    )
     messages = env.prompt_messages(GRPO_RECORDS[0])
     assert messages[0] == {"role": "system", "content": "# contract"}
     assert "2+2" in messages[1]["content"]
@@ -315,6 +366,11 @@ def test_multi_turn_freesolo_environment_rejected(fake_freesolo, monkeypatch) ->
         pass
 
     monkeypatch.setattr(base, "load_environment", lambda *a, **k: _MultiEnv())
-    env = FreesoloEnvironment(contract_text="# c", records=GRPO_RECORDS, mode="grpo")
+    env = FreesoloEnvironment(
+        contract_text="# c",
+        records=GRPO_RECORDS,
+        mode="grpo",
+        environment="freesolo/environment.py:load_environment",
+    )
     with pytest.raises(ValueError, match="multi-turn"):
         env.reward("x", GRPO_RECORDS[0])

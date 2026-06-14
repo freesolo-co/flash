@@ -5,18 +5,17 @@ post-train task:
 
   * train split  -> ``agentica-org/DeepScaleR-Preview-Dataset`` (~40k AIME/AMC/
     Omni-MATH problems with LaTeX answers) by default
-  * eval split   -> ``HuggingFaceH4/MATH-500`` (the standard 500-problem MATH eval)
 
-Both datasets live on the Hugging Face Hub and are also mirrored on the Prime
+The dataset lives on the Hugging Face Hub and is also mirrored on the Prime
 Intellect Environments Hub, so the *same* task can interoperate with prime-rl.
 
 Scoring uses this example's dependency-free math grader (``grading.py``):
-``\\boxed{...}`` extraction + LaTeX/numeric equivalence. The same grader backs the
-SFT target check, the RL reward, and the eval so every arm is scored identically.
+``\\boxed{...}`` extraction + LaTeX/numeric equivalence, backing both the SFT target
+check and the GRPO reward.
 
-Dataset loading is lazy (``datasets`` is only imported inside ``dataset()``),
-and ``train_path`` / ``eval_path`` JSONL overrides let the environment run fully
-offline (used by the unit tests and by air-gapped smoke runs).
+Dataset loading is lazy (``datasets`` is only imported inside ``dataset()``), and
+the ``train_path`` JSONL override lets the environment run fully offline (used by
+the unit tests and by air-gapped smoke runs).
 """
 
 from __future__ import annotations
@@ -41,18 +40,12 @@ class MathEnvironment(BaseEnvironment):
     train_config: str | None = None
     train_configs: list | None = None
     train_split: str = "train"
-    eval_dataset: str = "HuggingFaceH4/MATH-500"
-    eval_config: str | None = None
-    eval_split: str = "test"
     question_key: str = "problem"
     answer_key: str = "answer"
     solution_key: str = "solution"
     correct_reward: float = 1.0
     format_reward: float = 0.1
-    eval_examples: int = 300
-    eval_seed: int = 12345
     train_path: str | None = None
-    eval_path: str | None = None
 
     def __init__(self, **kwargs):
         super().__init__(id="math")
@@ -61,28 +54,15 @@ class MathEnvironment(BaseEnvironment):
             "train_config",
             "train_configs",
             "train_split",
-            "eval_dataset",
-            "eval_config",
-            "eval_split",
             "question_key",
             "answer_key",
             "solution_key",
             "train_path",
-            "eval_path",
         ):
             if field in kwargs and kwargs[field] is not None:
                 setattr(self, field, kwargs[field])
         self.correct_reward = float(kwargs.get("correct_reward", 1.0))
         self.format_reward = float(kwargs.get("format_reward", 0.1))
-        # Default to the run's [train] eval_examples (the worker exports it as
-        # EVAL_NUM) so MATH-500 configs that set only train.eval_examples=500 are
-        # not pre-truncated to 300 before the worker slices. An explicit
-        # environment.params.eval_examples still wins.
-        import os
-
-        default_eval = int(os.environ.get("EVAL_NUM") or 300)
-        self.eval_examples = int(kwargs.get("eval_examples", default_eval))
-        self.eval_seed = int(kwargs.get("eval_seed", 12345))
 
     # -- data -------------------------------------------------------------
     def _normalize_rows(self, rows) -> list[dict]:
@@ -121,35 +101,16 @@ class MathEnvironment(BaseEnvironment):
         return [dict(ex) for ex in ds]
 
     def dataset(self, split: str) -> list[dict]:
-        is_eval = split in {"eval", "validation", "test"}
-        path = self.eval_path if is_eval else self.train_path
-        if path:
-            rows = self._normalize_rows(self._load_jsonl(path))
-        elif is_eval:
-            rows = self._normalize_rows(
-                self._load_hf(self.eval_dataset, self.eval_config, self.eval_split)
-            )
-        elif self.train_configs:
+        if self.train_path:
+            return self._normalize_rows(self._load_jsonl(self.train_path))
+        if self.train_configs:
             raw = []
             for cfg in self.train_configs:
                 raw.extend(self._load_hf(self.train_dataset, cfg, self.train_split))
-            rows = self._normalize_rows(raw)
-        else:
-            rows = self._normalize_rows(
-                self._load_hf(self.train_dataset, self.train_config, self.train_split)
-            )
-        if is_eval:
-            rows = self._fixed_subset(rows)
-        return rows
-
-    def _fixed_subset(self, rows: list[dict]) -> list[dict]:
-        import random
-
-        n = min(self.eval_examples, len(rows))
-        if n <= 0 or n >= len(rows):
-            return rows
-        idx = sorted(random.Random(self.eval_seed).sample(range(len(rows)), n))
-        return [rows[i] for i in idx]
+            return self._normalize_rows(raw)
+        return self._normalize_rows(
+            self._load_hf(self.train_dataset, self.train_config, self.train_split)
+        )
 
     # -- task interface ---------------------------------------------------
     def prompt_messages(self, example: dict) -> list[dict]:

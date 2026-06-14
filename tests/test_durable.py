@@ -154,7 +154,6 @@ def _fresh_orchestrator(tmp):
     os.environ["AUTOSLM_RUNS_DIR"] = os.path.join(tmp, "runs")
     os.environ["RESULTS_DIR"] = os.path.join(tmp, "results")
     os.environ.pop("AUTOSLM_SKIP_NET", None)
-    os.environ.pop("AUTOSLM_LEGACY_SUBMIT", None)
     import autoslm.orchestrator as orch
 
     importlib.reload(orch)

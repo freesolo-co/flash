@@ -50,13 +50,10 @@ def test_deploy_rejects_unknown_mode():
     assert set(MODES) == {"dev", "always-on"}
 
 
-def test_resolve_serve_deps_stacks(monkeypatch):
+def test_resolve_serve_deps(monkeypatch):
     monkeypatch.delenv("AUTOSLM_SERVE_DEPS", raising=False)
-    monkeypatch.setenv("AUTOSLM_WORKER_STACK", "modern")
-    assert any("vllm==0.19" in d for d in resolve_serve_deps())
-    monkeypatch.setenv("AUTOSLM_WORKER_STACK", "legacy")
-    assert any("vllm<0.11" in d for d in resolve_serve_deps())
-    monkeypatch.setenv("AUTOSLM_SERVE_DEPS", "vllm==9.9")
+    assert any("vllm==0.19" in d for d in resolve_serve_deps())  # the single pinned stack
+    monkeypatch.setenv("AUTOSLM_SERVE_DEPS", "vllm==9.9")  # explicit override wins
     assert resolve_serve_deps() == ["vllm==9.9"]
 
 

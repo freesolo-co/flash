@@ -1,6 +1,6 @@
 """Durable run primitives: explicit deploy -> submit -> poll with a persisted job handle.
 
-The legacy path (`runpod_flash`'s all-in-one blocking handler call) ties a run's life to
+Calling `runpod_flash`'s all-in-one blocking handler directly would tie a run's life to
 one client process and one HTTP poll loop: a client crash/network blip orphans an
 otherwise-healthy GPU job (no job id is ever persisted), and any SDK polling bug kills
 the run. This module owns the lifecycle instead:
@@ -10,9 +10,6 @@ the run. This module owns the lifecycle instead:
   submit + poll_job()      -> REST queue API with hardened retries; the job handle
                               {endpoint_id, job_id} is persisted by the orchestrator so
                               any process can re-attach (`slm attach`).
-
-Worker compatibility is preserved exactly: the same `_train_body` source is shipped,
-the same dependencies are installed, and the same metrics dict is returned.
 """
 
 from __future__ import annotations

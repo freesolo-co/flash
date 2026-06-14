@@ -67,7 +67,7 @@ def _smoke_spec(gpu: str):
             "model": "Qwen/Qwen3-0.6B",
             "algorithm": "sft",
             "run_id": f"autoslm-{int(time.time())}-smk{gpu_short(gpu)}",
-            "train": {"epochs": 1, "seeds": [0], "eval_examples": 20},
+            "train": {"epochs": 1, "seeds": [0]},
             "gpu": {
                 "type": gpu,
                 "provider": "vast",
@@ -117,8 +117,8 @@ def test_vast_smoke_train_eval(gpu):
 
     assert res.ok, f"{gpu} smoke failed: {res.failure}: {res.detail}"
     metrics = res.metrics
-    assert "trained_eval_acc" in metrics
-    assert "base_eval_acc" in metrics
+    assert metrics["wall_seconds"] > 0
+    assert metrics["train_tokens"] > 0
     assert 0 < metrics["cost_usd"] < 1.0, f"smoke cost out of bounds: {metrics['cost_usd']}"
     assert metrics["notes"]["provider"] == "vast"
     assert metrics["notes"]["vast_gpu"] == gpu
@@ -131,8 +131,8 @@ def test_vast_smoke_train_eval(gpu):
         inst = vast_api.get_instance(int(handles[-1]["instance_id"]))
     assert inst is None, f"instance {handles[-1]['instance_id']} still exists after the run"
     print(
-        f"[smoke {gpu}] OK: acc {metrics['base_eval_acc']}->{metrics['trained_eval_acc']}, "
-        f"cost ${metrics['cost_usd']:.4f}",
+        f"[smoke {gpu}] OK: {metrics['train_tokens']} train tokens in "
+        f"{metrics['wall_seconds']:.0f}s, cost ${metrics['cost_usd']:.4f}",
         flush=True,
     )
 

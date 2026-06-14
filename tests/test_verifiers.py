@@ -7,6 +7,8 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
@@ -43,8 +45,6 @@ def test_verifiers_adapter_mapping():
 
     train = env.dataset("train")
     assert train[0]["answer"] == "4"
-    ev = env.dataset("eval")
-    assert ev[0]["answer"] == "6"
 
     msgs = env.prompt_messages(train[0])
     assert msgs[0]["role"] == "system"
@@ -72,6 +72,10 @@ def test_install_manifest_and_worker_deps():
         assert "owner/math" in registry.list_installed_verifiers_envs()
         assert registry.worker_pip_for_env("owner/math") == ["verifiers", "vf-math"]
 
+        # An unrecorded Hub env fails fast (no guessing a wheel name from the slug).
+        with pytest.raises(ValueError, match="not recorded as installed"):
+            registry.worker_pip_for_env("owner/never-installed")
+
         os.environ.pop("AUTOSLM_ENVS_MANIFEST", None)
         importlib.reload(registry)
 
@@ -89,7 +93,7 @@ def test_vf_load_id_strips_owner_slug():
 
 
 def test_load_verifiers_environment_uses_bare_ids(monkeypatch):
-    """DEFECT: load must hand verifiers the BARE id (train + optional eval env)."""
+    """DEFECT: load must hand verifiers the BARE id (owner stripped)."""
     import sys
     import types as _types
 
@@ -105,10 +109,8 @@ def test_load_verifiers_environment_uses_bare_ids(monkeypatch):
     fake_vf.load_environment = lambda env_id, **kw: (seen.append(env_id), _Env())[1]
     monkeypatch.setitem(sys.modules, "verifiers", fake_vf)
 
-    va.load_verifiers_environment(
-        "primeintellect/hendrycks-math", eval_env_id="primeintellect/math500"
-    )
-    assert seen == ["hendrycks-math", "math500"]  # owner stripped for both
+    va.load_verifiers_environment("primeintellect/hendrycks-math")
+    assert seen == ["hendrycks-math"]  # owner stripped
 
 
 def test_rubric_group_is_flattened_and_zero_weight_skipped():
@@ -241,40 +243,8 @@ def test_dataset_getter_requiring_args_is_called_correctly():
     assert train[0]["answer"] == "a"
 
 
-def test_separate_eval_env_and_fixed_subset():
-    """DEFECT: no way to eval on a different Hub env. eval_env_id + a fixed-size subset."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
-
-    class _Train:
-        rubric = None
-        parser = None
-        dataset = tuple(
-            {"prompt": [{"role": "user", "content": f"t{i}"}], "answer": str(i)} for i in range(50)
-        )
-
-    class _Eval:
-        eval_dataset = tuple(
-            {"prompt": [{"role": "user", "content": f"e{i}"}], "answer": str(i)} for i in range(40)
-        )
-
-    env = VerifiersEnvironment(
-        _Train(),
-        "owner/train",
-        eval_vf_env=_Eval(),
-        eval_env_id="owner/eval",
-        eval_examples=8,
-        eval_seed=123,
-    )
-    train_rows = env.dataset("train")
-    eval_rows = env.dataset("eval")
-    assert len(train_rows) == 50  # train from the train env
-    assert len(eval_rows) == 8  # fixed subset from the eval env
-    assert all(r["prompt"][0]["content"].startswith("e") for r in eval_rows)
-
-
-def test_worker_pip_installs_train_and_eval_wheels_with_index():
-    """DEFECT: the Flash worker must install verifiers + train AND eval Hub wheels + the
-    recorded extra index."""
+def test_worker_pip_installs_env_wheel_with_index():
+    """The Flash worker must install verifiers + the Hub env wheel + the recorded index."""
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["AUTOSLM_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
         import autoslm.envs.registry as registry
@@ -286,17 +256,10 @@ def test_worker_pip_installs_train_and_eval_wheels_with_index():
             package="hendrycks-math",
             extras={"extra_index_url": idx},
         )
-        registry.record_installed_env(
-            "primeintellect/math500", package="math500", extras={"extra_index_url": idx}
-        )
 
-        deps = registry.worker_pip_for_env(
-            "primeintellect/hendrycks-math",
-            {"eval_env_id": "primeintellect/math500", "eval_examples": 500},
-        )
+        deps = registry.worker_pip_for_env("primeintellect/hendrycks-math")
         assert "verifiers" in deps
         assert "hendrycks-math" in deps
-        assert "math500" in deps
         assert "--extra-index-url" in deps
         assert idx in deps
 

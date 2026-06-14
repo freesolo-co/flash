@@ -96,14 +96,6 @@ class ApiClient:
     def cancel_run(self, run_id: str) -> dict:
         return self._request("POST", f"/v1/runs/{run_id}/cancel")
 
-    def create_eval(
-        self, spec: dict, adapter_run_id: str | None = None, dry_run: bool = False
-    ) -> dict:
-        body: dict = {"spec": spec, "dry_run": dry_run}
-        if adapter_run_id:
-            body["adapter_run_id"] = adapter_run_id
-        return self._request("POST", "/v1/evals", body=body)
-
     # -- serving -----------------------------------------------------------------------
     def deploy(
         self,

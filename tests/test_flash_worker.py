@@ -24,7 +24,7 @@ def _spec():
     return JobSpec(
         model="Qwen/Qwen3-4B-Instruct-2507",
         algorithm="grpo",
-        train=TrainSpec(steps=10, seeds=(0,), eval_examples=8),
+        train=TrainSpec(steps=10, seeds=(0,)),
     )
 
 
@@ -42,7 +42,6 @@ def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
         "RL_MAX_COMPLETION": "512",
         "VLLM_USE_V1": "0",
         "SFT_PER_DEVICE_BS": "4",
-        "EVAL_MAX_NEW_TOKENS": "1024",
     }
     for k, v in knobs.items():
         monkeypatch.setenv(k, v)
@@ -93,12 +92,11 @@ def test_serve_execution_timeout_default_and_override(monkeypatch):
 
 
 def test_error_artifact_name_is_per_phase():
-    """DEFECT: a crashed train phase's error was clobbered when the eval phase also failed.
-    Per-phase error files keep the root-cause train traceback."""
+    """Per-phase error files keep the root-cause train traceback under a stable name."""
     from autoslm.engine.worker import error_artifact_name
 
-    names = {error_artifact_name(m) for m in ("sft", "rl", "eval_after", "eval_only")}
-    assert len(names) == 4  # distinct per phase -> no clobber
+    names = {error_artifact_name(m) for m in ("sft", "rl")}
+    assert len(names) == 2  # distinct per phase -> no clobber
     assert error_artifact_name("rl") == "error_rl.txt"
 
 

@@ -60,18 +60,6 @@ def deploy_adapter_tool(args: dict) -> dict:
     )
 
 
-def evaluate(args: dict) -> dict:
-    spec = _spec_from_args(args, run_id=args.get("run_id"))
-    # dry_run defaults to False, matching create_train_run / deploy_adapter and the CLI
-    # `slm eval` (which submits unless --dry-run): an omitted flag runs a real eval, not
-    # silent local validation.
-    if args.get("dry_run", False):
-        return {"run_id": spec.run_id, "mode": "eval", "state": "dry_run", "spec": spec.to_dict()}
-    return client_from_config().create_eval(
-        spec_payload(spec), adapter_run_id=args.get("adapter_run_id")
-    )
-
-
 CREATE_RUN_TOOL = "create_" + "train" + "ing_run"
 
 
@@ -81,7 +69,6 @@ TOOLS: dict[str, Callable[[dict], dict]] = {
     "get_run_status": get_run_status,
     "get_run_logs": get_run_logs,
     "deploy_adapter": deploy_adapter_tool,
-    "evaluate": evaluate,
 }
 
 

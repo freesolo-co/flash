@@ -18,7 +18,7 @@ from autoslm import __version__
 from autoslm._logging import configure_logging, get_logger
 from autoslm.catalog import public_model_rows
 from autoslm.client import ApiClient, ClientError, client_from_config, save_credentials
-from autoslm.client.config import DEFAULT_API_URL, load_credentials
+from autoslm.client.config import load_credentials
 from autoslm.client.specs import spec_payload
 from autoslm.config_schema import ConfigError, spec_from_file
 from autoslm.orchestrator import TERMINAL_STATES, new_run_id
@@ -130,15 +130,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     train.set_defaults(func=cmd_train)
 
-    eval_cmd = sub.add_parser("eval")
-    eval_cmd.add_argument("config")
-    eval_cmd.add_argument("--adapter", help="run_id of a trained adapter to eval (else base only)")
-    eval_cmd.add_argument(
-        "--set", dest="overrides", action="append", default=[], metavar="key=value"
-    )
-    eval_cmd.add_argument("--dry-run", action="store_true")
-    eval_cmd.set_defaults(func=cmd_eval)
-
     status = sub.add_parser("status")
     status.add_argument("run_id")
     status.set_defaults(func=cmd_status)
@@ -238,11 +229,10 @@ def cmd_login(args) -> int:
     else:
         claimed = ApiClient(api_url).claim_key(email=args.email)
         api_key = claimed["api_key"]
-    # Persist the resolved api_url (which may have come from AUTOSLM_API_URL), not
-    # just args.api_url — otherwise a self-hosting login via the env var stores
-    # only the key and later commands fall back to the default control plane.
-    stored_url = api_url if api_url != DEFAULT_API_URL else args.api_url
-    path = save_credentials(api_key, api_url=stored_url)
+    # Persist the plane we actually authenticated against (it may have come from
+    # AUTOSLM_API_URL). save_credentials clears the stored url when it's the default, so
+    # logging into default also drops a stale custom url from a previous self-hosted login.
+    path = save_credentials(api_key, api_url=api_url)
     # Never echo the key itself; the stored file is the single source of truth.
     print(f"logged in: key saved to {path}")
     print("you're ready to train — try `slm train <config.toml>`")
@@ -491,29 +481,6 @@ def cmd_train(args) -> int:
         file=sys.stderr,
     )
     return _follow_run(client, run_id)
-
-
-def cmd_eval(args) -> int:
-    spec = spec_from_file(
-        args.config,
-        run_id=new_run_id("eval") if args.dry_run else None,
-        overrides=getattr(args, "overrides", None),
-    )
-    _check_managed_spec(spec)
-    if args.dry_run:
-        print(
-            json.dumps(
-                {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}, indent=2
-            )
-        )
-        return 0
-    client = client_from_config()
-    status = client.create_eval(spec_payload(spec), adapter_run_id=args.adapter)
-    run_id = status["run_id"]
-    print(f"eval {run_id} submitted; waiting for results", file=sys.stderr)
-    rc = _follow_run(client, run_id, final_status=False)
-    print(json.dumps(client.get_run(run_id), indent=2))
-    return rc
 
 
 def _follow_run(client: ApiClient, run_id: str, final_status: bool = True) -> int:
