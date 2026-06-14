@@ -11,11 +11,12 @@ instead of running Tinker loops client-side.
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
 - `slm deploy` (scale-to-zero or always-on), `slm chat`, `slm serve-proxy` —
   serving for trained adapters.
-- The `freesolo` built-in environment (`autoslm/envs/freesolo.py`) bridges
-  freesolo SDK contracts/datasets onto the worker: the SDK passes contract text
-  and dataset records as environment params; the worker pip-installs
-  `freesolo[full]` and reconstructs the environment for prompting and scoring.
-  Single-turn environments only.
+- **Verifiers-only environments.** Every run names a Prime Intellect `verifiers`
+  environment — a published Hub slug (`[environment] id = "owner/name"`) or, for
+  local runs, a local verifiers env module (`[environment] path`). The worker
+  wraps it via `autoslm/envs/verifiers_adapter.py`. There are no built-in task
+  environments and no freesolo bridge. Single-turn environments are fully
+  supported (SFT/GRPO/eval).
 
 ## Layout
 
@@ -30,14 +31,11 @@ instead of running Tinker loops client-side.
 - `autoslm/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
   shared recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
-- `autoslm/envs/` — environment machinery: registry, base loader, `freesolo`
-  bridge, `tests_pass` built-in + verifiers/Prime Hub interop
-- `examples/` — repo-root example task environments, each a self-contained folder
-  (`examples/gsm8k/`, `examples/math/`: env + grader + data + ready-to-run TOMLs).
-  `examples/gsm8k/` carries a config for every algorithm (SFT/GRPO) and is
-  the recommended starting point — see `examples/README.md`. The registry
-  path-loads them as the `gsm8k`/`math` built-ins; the wheel force-includes the
-  `examples/` tree (see `pyproject.toml`), so they ship with the installed package too.
+- `autoslm/envs/` — environment machinery: registry, local-path loader
+  (`base.py`), and the `verifiers_adapter` that wraps Prime Intellect / Hub
+  `verifiers` environments onto the worker's interface
+- `slm lab setup` / `slm env init` — scaffold a starter local verifiers env and a
+  ready-to-run config to start from
 - `autoslm/serve/`, `autoslm/server/` — adapter serving and the FastAPI control
   plane (`slm server`, see `docs/self-hosting.md`)
 - `autoslm/mcp/` — stdio MCP bridge for coding agents

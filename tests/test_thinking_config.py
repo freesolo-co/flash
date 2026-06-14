@@ -19,7 +19,12 @@ from autoslm.worker_spec import JobSpec
 
 
 def _raw(model="Qwen/Qwen3-0.6B", **kw):
-    d = {"model": model, "algorithm": "sft", "train": {"epochs": 1}}
+    d = {
+        "model": model,
+        "algorithm": "sft",
+        "train": {"epochs": 1},
+        "environment": {"id": "owner/env"},  # any verifiers/Hub slug (not loaded here)
+    }
     d.update(kw)
     return d
 
@@ -95,6 +100,9 @@ def test_thinking_roundtrips_through_dict():
 
 def test_thinking_set_override(tmp_path):
     cfg = tmp_path / "cfg.toml"
-    cfg.write_text('model = "Qwen/Qwen3-0.6B"\nalgorithm = "sft"\n\n[train]\nepochs = 1\n')
+    cfg.write_text(
+        'model = "Qwen/Qwen3-0.6B"\nalgorithm = "sft"\n\n'
+        '[environment]\nid = "owner/env"\n\n[train]\nepochs = 1\n'
+    )
     spec = spec_from_file(str(cfg), overrides=["thinking=true"])
     assert spec.thinking is True

@@ -30,8 +30,12 @@ def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
     v = train_raw.get(key)
     if v is None:
         return None
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or float(v) != int(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise ConfigError(f"train.{key} must be an integer")
+    # Check finiteness BEFORE int(v): int(inf) raises OverflowError and int(nan) ValueError
+    # (the former would be a 500); reject both as a clean 400.
+    if not math.isfinite(v) or float(v) != int(v):
+        raise ConfigError(f"train.{key} must be a finite integer")
     v = int(v)
     if v < minimum:
         raise ConfigError(f"train.{key} must be >= {minimum}")
@@ -232,7 +236,7 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
         model=model,
         algorithm=algorithm,
         environment=EnvironmentSpec(
-            id=env_raw.get("id", "gsm8k"),
+            id=str(env_raw.get("id") or ""),
             params=dict(env_raw.get("params") or {}),
             path=env_path,
             pip=tuple(str(p) for p in env_raw.get("pip") or ()),
@@ -292,8 +296,32 @@ def _validate_spec(spec: JobSpec) -> None:
         raise ConfigError("train.steps must be positive for GRPO")
     if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
         raise ConfigError("train.epochs must be positive for SFT")
+    # Verifiers-only: every run must name an environment (a verifiers/Prime Hub slug via
+    # [environment] id, or a local verifiers env module via [environment] path). There is
+    # no default environment.
+    if not (spec.environment.id or spec.environment.path):
+        raise ConfigError(
+            "config must set [environment] id (a verifiers/Prime Hub env slug, e.g. "
+            '"owner/name") or [environment] path (a local verifiers env module)'
+        )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")
+    # GRPO recipe knobs (optional): validate the ones that are set. A None means
+    # "the worker applies its recipe default", so only constrain explicit values.
+    if spec.train.group_size is not None and spec.train.group_size <= 0:
+        raise ConfigError("train.group_size must be positive")
+    if spec.train.temperature is not None and spec.train.temperature < 0:
+        raise ConfigError("train.temperature must be non-negative")
+    if spec.train.max_tokens is not None and spec.train.max_tokens <= 0:
+        raise ConfigError("train.max_tokens must be positive")
+    if spec.train.kl_penalty_coef is not None and spec.train.kl_penalty_coef < 0:
+        raise ConfigError("train.kl_penalty_coef must be non-negative")
+    if spec.train.advantage_clip is not None and spec.train.advantage_clip < 0:
+        raise ConfigError("train.advantage_clip must be non-negative")
+    if spec.train.thinking_length_penalty_coef is not None and not (
+        0.0 <= spec.train.thinking_length_penalty_coef <= 1.0
+    ):
+        raise ConfigError("train.thinking_length_penalty_coef must be between 0 and 1")
     # lora_alpha scales the adapter contribution; 0 (or negative) trains a paid run
     # that produces a no-op adapter (zero scaling at serve). Reject up front.
     if spec.train.lora_alpha <= 0:

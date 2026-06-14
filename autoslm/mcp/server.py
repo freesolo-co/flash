@@ -25,7 +25,8 @@ def _spec_from_args(args: dict, run_id: str | None = None):
     if spec.environment.path:
         raise ValueError(
             "local environment paths are not supported on the managed service; "
-            "publish the environment with `slm env push` or use a built-in environment"
+            "publish the environment with `slm env push`, then reference it by its Hub id "
+            '(`[environment] id = "owner/name"`)'
         )
     return spec
 

@@ -59,22 +59,84 @@ def test_verifiers_adapter_mapping():
     assert env.sft_target({"answer": "4"}) == "4"
 
 
+def test_eval_split_uses_eval_dataset_not_train():
+    """A populated eval_dataset is returned for the eval split (not the train split)."""
+    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+
+    env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
+    eval_rows = env.dataset("eval")
+    assert [r["answer"] for r in eval_rows] == ["6"]  # the eval_dataset, not the train "4"
+
+
+def test_empty_eval_dataset_does_not_fall_back_to_train():
+    """An empty-but-configured eval split ([]) is honored as an empty eval set; it must NOT
+    fall back to the TRAIN split (the `or` -> `is None` fix). Falling back would evaluate on
+    training data."""
+    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+
+    class _Env(_FakeVfEnv):
+        def __init__(self):
+            super().__init__()
+            self.eval_dataset = []  # configured but empty -> falsy, must NOT fall through
+
+    env = VerifiersEnvironment(_Env(), "fake/env")
+    assert env.dataset("eval") == []  # honored as empty, NOT the train rows
+    assert env.dataset("train")[0]["answer"] == "4"  # train split still works
+
+
+def test_eval_get_eval_dataset_empty_does_not_fall_back():
+    """An empty list from get_eval_dataset() (not the attr) is likewise honored as empty and
+    must not fall through to get_dataset/train."""
+    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+
+    class _Env:
+        rubric = None
+        parser = None
+
+        def __init__(self):
+            self.dataset = [{"prompt": [{"role": "user", "content": "q"}], "answer": "train"}]
+
+        def get_eval_dataset(self, n=-1, seed=0):
+            return []  # explicit empty eval set
+
+    env = VerifiersEnvironment(_Env(), "fake/env")
+    assert env.dataset("eval") == []  # honored, not the "train" row
+
+
+def test_missing_eval_dataset_falls_back_to_train():
+    """When NO eval split is configured at all (genuinely absent / None), the eval split falls
+    back to the env's train split — the only legitimate fallback case."""
+    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+
+    class _Env:
+        rubric = None
+        parser = None
+        eval_dataset = None  # genuinely absent
+
+        def __init__(self):
+            self.dataset = [{"prompt": [{"role": "user", "content": "q"}], "answer": "train"}]
+
+    env = VerifiersEnvironment(_Env(), "fake/env")
+    assert [r["answer"] for r in env.dataset("eval")] == ["train"]
+
+
 def test_install_manifest_and_worker_deps():
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["AUTOSLM_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
         import autoslm.envs.registry as registry
 
         importlib.reload(registry)
-        assert registry.worker_pip_for_env("gsm8k") == []  # builtin
+        # An unrecorded env (no manifest entry) needs only verifiers — its module either
+        # travels with a local [environment] path or fails loudly at load time.
+        assert registry.worker_pip_for_env("owner/env") == ["verifiers"]
         assert registry.list_installed_verifiers_envs() == []
 
         registry.record_installed_env("owner/math", package="vf-math")
         assert "owner/math" in registry.list_installed_verifiers_envs()
         assert registry.worker_pip_for_env("owner/math") == ["verifiers", "vf-math"]
 
-        # An unrecorded Hub env fails fast (no guessing a wheel name from the slug).
-        with pytest.raises(ValueError, match="not recorded as installed"):
-            registry.worker_pip_for_env("owner/never-installed")
+        # An unrecorded Hub slug: no wheel is guessed from the slug; just verifiers.
+        assert registry.worker_pip_for_env("owner/never-installed") == ["verifiers"]
 
         os.environ.pop("AUTOSLM_ENVS_MANIFEST", None)
         importlib.reload(registry)
@@ -144,8 +206,11 @@ def test_rubric_group_is_flattened_and_zero_weight_skipped():
     assert env.reward("nope", {"answer": "4"}) == 0.0
 
 
-def test_reward_guards_crashing_nonzero_weight_func():
-    """A reward func that raises must score 0.0, not crash the whole reward."""
+def test_reward_from_weighted_func_propagates_exception():
+    """A WEIGHTED reward func that raises must PROPAGATE (fail loudly), not be swallowed as
+    0.0 — a raise in a weighted func is a real reward failure (e.g. judge API error) that would
+    otherwise train/score on an all-zero signal. (Zero-weight funcs run with guarded exceptions
+    instead — see test_reward_zero_weight_crashing_func_runs_with_guarded_exception.)"""
     from autoslm.envs.verifiers_adapter import VerifiersEnvironment
 
     def boom(**kwargs):
@@ -160,14 +225,108 @@ def test_reward_guards_crashing_nonzero_weight_func():
         parser = None
 
     env = VerifiersEnvironment(_Env(), "owner/x")
-    assert env.reward("anything", {"answer": "4"}) == 0.0
+    with pytest.raises(RuntimeError, match="kaboom"):
+        env.reward("anything", {"answer": "4"})
+
+
+def test_reward_zero_weight_crashing_func_runs_with_guarded_exception():
+    """Per verifiers semantics a zero-weight monitor func RUNS (it may mutate shared state /
+    be logged), but its exceptions are GUARDED (swallowed) — a thrown monitor must not fail the
+    run — and it contributes 0 to the reward."""
+    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+
+    calls = []
+
+    def good(completion, answer, **kwargs):
+        return 1.0 if str(answer) in completion[-1]["content"] else 0.0
+
+    def boom(**kwargs):
+        calls.append("boom")  # observed -> it actually ran
+        raise RuntimeError("kaboom")
+
+    class _Rubric:
+        funcs = (good, boom)
+        weights = (1.0, 0.0)  # boom is zero-weight -> runs, guarded, contributes 0
+
+    class _Env:
+        rubric = _Rubric()
+        parser = None
+
+    env = VerifiersEnvironment(_Env(), "owner/x")
+    # The crashing zero-weight func runs (its exception is swallowed) and contributes nothing.
+    assert env.reward("the answer is 4", {"answer": "4"}) == 1.0
+    assert calls == ["boom"]
+
+
+def test_zero_weight_func_runs_and_can_mutate_shared_state():
+    """A zero-weight func runs BEFORE a later weighted func and may set shared ``state`` the
+    weighted func then reads. It still contributes 0 itself and is absent from the breakdown."""
+    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+
+    def monitor(state, **kwargs):  # zero-weight: seeds shared state, returns nothing useful
+        state["seen"] = True
+        return 0.0
+
+    def scored(state, **kwargs):  # weighted: rewards iff the monitor ran first
+        return 1.0 if state.get("seen") else 0.0
+
+    class _Rubric:
+        funcs = (monitor, scored)  # monitor first so it can prepare state
+        weights = (0.0, 1.0)
+
+    class _Env:
+        rubric = _Rubric()
+        parser = None
+
+    env = VerifiersEnvironment(_Env(), "owner/x")
+    state = {}
+    breakdown = env.scores_breakdown("anything", {"answer": "4"}, state)
+    assert breakdown["total"] == 1.0  # weighted func saw the monitor's state mutation
+    assert breakdown == {"scored": 1.0, "total": 1.0}  # zero-weight monitor not in breakdown
+    assert state["seen"] is True
+
+
+def test_reward_available_uses_state_transcript_in_multi_turn():
+    """In multi-turn mode, `completion`/`prompt` passed to reward funcs come from the
+    accumulated `state` transcript (full message list), not the scalar completion wrapped as a
+    lone assistant message. Single-turn keeps the scalar-wrapping behavior."""
+    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+
+    class _Env:
+        rubric = None
+        parser = None
+
+    env = VerifiersEnvironment(_Env(), "owner/x")
+    example = {"prompt": [{"role": "user", "content": "hi"}], "answer": "a"}
+
+    # Single-turn: scalar completion wrapped as one assistant message.
+    single = env._reward_available("the reply", example, None)
+    assert single["completion"] == [{"role": "assistant", "content": "the reply"}]
+    assert single["prompt"] == example["prompt"]
+
+    # Multi-turn: full transcript from state is used.
+    env.multi_turn = True
+    state = {
+        "prompt": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+        "completion": [
+            {"role": "assistant", "content": "call tool"},
+            {"role": "tool", "content": "result"},
+            {"role": "assistant", "content": "final"},
+        ],
+    }
+    multi = env._reward_available("final", example, state)
+    assert multi["completion"] == state["completion"]
+    assert multi["completion"] is not state["completion"]  # copied, not aliased
+    assert multi["prompt"] == state["prompt"]
+
+    # Multi-turn with no transcript yet falls back to scalar wrapping.
+    fallback = env._reward_available("solo", example, {"turn": 0})
+    assert fallback["completion"] == [{"role": "assistant", "content": "solo"}]
 
 
 def test_group_reward_func_is_rejected_at_construction():
     """A weighted group/batch reward func (plural required arg the single-turn worker
     can't supply) must fail fast, not silently score 0.0 on a paid run."""
-    import pytest
-
     from autoslm.envs.verifiers_adapter import VerifiersEnvironment
 
     def group_reward(completions, answers):  # plural batch args — unsupported

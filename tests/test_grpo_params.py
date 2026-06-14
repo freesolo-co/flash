@@ -2,10 +2,11 @@
 
 The SDK ships the GRPO recipe knobs (group_size/temperature/advantage_clip/
 kl_penalty_coef/thinking_length_penalty_coef) plus the optimizer/batching knobs
-(learning_rate/batch_size/max_length/save_every) in the job spec's ``[train]``
-(TrainSpec) and an optional ``train.init_from_adapter``; these tests cover the pure
-plumbing the worker uses to honor them (the GPU trainer wiring itself is exercised by
-the live smokes).
+(learning_rate/batch_size/max_length/save_every) in the job spec's ``[train]`` table
+(TrainSpec) — NOT ``[environment.params]``, which is forwarded verbatim to the verifiers
+env's ``load_environment`` — and an optional ``train.init_from_adapter``; these tests
+cover the pure plumbing the worker uses to honor them (the GPU trainer wiring itself is
+exercised by the live smokes).
 """
 
 from __future__ import annotations
@@ -46,11 +47,12 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     knobs = {
         "group_size": 4,
         "temperature": 0.7,
+        "max_tokens": 256,
         "advantage_clip": 1.5,
         "kl_penalty_coef": 0.02,
         "thinking_length_penalty_coef": 0.001,
     }
-    # The SDK ships the GRPO recipe knobs in [train] (TrainSpec fields), not env params.
+    # GRPO knobs live in [train]/TrainSpec, NOT [environment.params].
     spec = JobSpec.from_dict(
         {
             "model": "Qwen/Qwen3-0.6B",
@@ -61,9 +63,32 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     )
     monkeypatch.setattr(w, "JOB_SPEC", spec)
     assert w.grpo_overrides() == knobs
-    # only the knobs actually set are returned (max_tokens omitted here)
-    assert "max_tokens" not in w.grpo_overrides()
-    # no knobs -> empty (recipe defaults apply downstream)
+    # A leftover grpo_config in environment.params must NOT be read by the worker.
+    poisoned = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3-0.6B",
+            "algorithm": "grpo",
+            "environment": {"id": "owner/env", "params": {"grpo_config": knobs}},
+            "train": {"seeds": [0]},
+        }
+    )
+    monkeypatch.setattr(w, "JOB_SPEC", poisoned)
+    assert w.grpo_overrides() == {}
+    # only the knobs actually set are returned (a partial set omits the rest)
+    monkeypatch.setattr(
+        w,
+        "JOB_SPEC",
+        JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3-0.6B",
+                "algorithm": "grpo",
+                "environment": {"id": "owner/env"},
+                "train": {"seeds": [0], "group_size": 2},
+            }
+        ),
+    )
+    assert w.grpo_overrides() == {"group_size": 2}
+    # no [train] knobs -> empty (recipe defaults apply downstream)
     monkeypatch.setattr(
         w,
         "JOB_SPEC",
@@ -74,11 +99,119 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     assert w.grpo_overrides() == {}
 
 
+def test_train_grpo_knobs_parse_and_roundtrip() -> None:
+    from autoslm.config_schema import spec_from_dict
+
+    raw = {
+        "model": "Qwen/Qwen3-0.6B",
+        "algorithm": "grpo",
+        "model_policy": "allow",
+        "environment": {"id": "owner/env"},
+        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "train": {
+            "seeds": [0],
+            "steps": 10,
+            "group_size": 4,
+            "temperature": 0.7,
+            "max_tokens": 256,
+            "kl_penalty_coef": 0.02,
+            "advantage_clip": 1.5,
+            "thinking_length_penalty_coef": 0.001,
+        },
+    }
+    spec = spec_from_dict(raw, run_id="grpo-x")
+    assert spec.train.group_size == 4
+    assert spec.train.temperature == 0.7
+    assert spec.train.max_tokens == 256
+    assert spec.train.kl_penalty_coef == 0.02
+    assert spec.train.advantage_clip == 1.5
+    assert spec.train.thinking_length_penalty_coef == 0.001
+    # survives the JSON round-trip the worker reconstructs from
+    rt = JobSpec.from_dict(spec.to_dict()).train
+    assert rt.group_size == 4
+    assert rt.thinking_length_penalty_coef == 0.001
+    # GRPO knobs are NOT in environment.params (that goes verbatim to load_environment)
+    assert spec.environment.params == {}
+
+
+def test_opt_int_float_reject_bools() -> None:
+    """A JSON boolean must NOT silently coerce to a numeric train knob: bool is an int
+    subclass in Python, so ``int(True)`` would become 1. JobSpec.from_dict (via
+    _opt_int/_opt_float) rejects it, matching config_schema._opt_num."""
+    import pytest
+
+    from autoslm.worker_spec import _opt_float, _opt_int
+
+    for bad in (True, False):
+        with pytest.raises(TypeError):
+            _opt_int(bad)
+        with pytest.raises(TypeError):
+            _opt_float(bad)
+
+    # Genuine numbers (and None) still parse.
+    assert _opt_int(None) is None
+    assert _opt_int(4) == 4
+    assert _opt_float(None) is None
+    assert _opt_float(0.7) == 0.7
+
+    # A bool train knob propagates through JobSpec.from_dict as an error, not a 0/1 coercion.
+    with pytest.raises(TypeError):
+        JobSpec.from_dict(
+            {
+                "model": "Qwen/Qwen3-0.6B",
+                "algorithm": "grpo",
+                "environment": {"id": "owner/env"},
+                "train": {"steps": 10, "group_size": True},
+            }
+        )
+
+
+def test_verifiers_adapter_forwards_only_env_kwargs(monkeypatch) -> None:
+    # environment.params is forwarded to vf.load_environment WITHOUT autoslm-reserved
+    # keys (a stray grpo_config/mode/records/eval_* must be dropped, not passed through).
+    import sys
+    import types
+
+    captured = {}
+
+    def fake_load_environment(env_id, **kwargs):
+        captured["env_id"] = env_id
+        captured["kwargs"] = kwargs
+        return object()
+
+    fake_vf = types.SimpleNamespace(
+        load_environment=fake_load_environment,
+        ToolEnv=type("ToolEnv", (), {}),
+        MultiTurnEnv=type("MultiTurnEnv", (), {}),
+        SingleTurnEnv=type("SingleTurnEnv", (), {}),
+        JudgeRubric=type("JudgeRubric", (), {}),
+    )
+    monkeypatch.setitem(sys.modules, "verifiers", fake_vf)
+
+    from autoslm.envs import registry
+
+    registry.load_environment(
+        "owner/env",
+        params={
+            "difficulty": "hard",  # a real verifiers-env kwarg -> forwarded
+            "grpo_config": {"group_size": 4},  # reserved -> dropped
+            "mode": "train",  # reserved -> dropped
+            "records": [1, 2],  # reserved -> dropped
+            "eval_seed": 99,  # adapter-consumed -> not forwarded
+        },
+    )
+    assert captured["env_id"] == "env"
+    assert captured["kwargs"] == {"difficulty": "hard"}
+    for forbidden in ("grpo_config", "mode", "records", "eval_seed"):
+        assert forbidden not in captured["kwargs"]
+
+
 def test_init_from_adapter_parses_and_roundtrips() -> None:
     raw = {
         "model": "Qwen/Qwen3-0.6B",
         "algorithm": "grpo",
         "model_policy": "allow",
+        "environment": {"id": "owner/env"},
         "gpu": {"type": "cheapest", "allow_unvalidated": True},
         "train": {"seeds": [0], "steps": 10, "init_from_adapter": "sft/run-x/seed0"},
     }
@@ -99,6 +232,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "model": "Qwen/Qwen3-0.6B",
         "algorithm": "grpo",
         "model_policy": "allow",
+        "environment": {"id": "owner/env"},
         "gpu": {"type": "cheapest", "allow_unvalidated": True},
         "train": {
             "seeds": [0],
@@ -147,6 +281,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         "model": "Qwen/Qwen3-0.6B",
         "algorithm": "grpo",
         "model_policy": "allow",
+        "environment": {"id": "owner/env"},
         "gpu": {"type": "cheapest", "allow_unvalidated": True},
     }
     bad_cases = [
@@ -167,6 +302,8 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         {"learning_rate": float("nan")},  # non-finite -> 400, not a silent NaN to the optimizer
         {"learning_rate": float("inf")},
         {"temperature": float("inf")},
+        {"batch_size": float("inf")},  # int knob: must 400, not OverflowError(500) from int(inf)
+        {"max_tokens": float("nan")},
     ]
     for bad in bad_cases:
         with pytest.raises(ConfigError):

@@ -19,9 +19,19 @@ def test_unknown_algorithm_rejected():
 
 def test_grpo_capability_still_enforced():
     # Qwen3.5-9B is SFT-class only; grpo (which needs the colocated engine) is rejected.
-    raw = {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo", "train": {"steps": 1}}
+    raw = {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "grpo",
+        "environment": {"id": "owner/env"},
+        "train": {"steps": 1},
+    }
     with pytest.raises(ConfigError):
         spec_from_dict(raw, run_id="x")
     # SFT on the same model is allowed.
-    raw_sft = {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft", "train": {"epochs": 1}}
+    raw_sft = {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "sft",
+        "environment": {"id": "owner/env"},
+        "train": {"epochs": 1},
+    }
     assert spec_from_dict(raw_sft, run_id="x").algorithm == "sft"

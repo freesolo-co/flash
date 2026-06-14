@@ -49,9 +49,10 @@ def test_config_to_job_spec():
 def test_environment_registry():
     from autoslm.envs.registry import load_environment
 
-    env = load_environment("tests_pass", {"expected": "unused"})
-    assert env.id == "tests_pass"
-    assert env.grade("the expected-token is here", {"expected": "expected-token"})
+    # Verifiers-only: there are no builtin envs and no default — an empty id with no
+    # path is a hard error (env loading itself is covered in test_envs_coverage).
+    with pytest.raises(ValueError, match="no environment specified"):
+        load_environment("")
 
 
 def test_orchestrator_dry_run():

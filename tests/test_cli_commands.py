@@ -170,23 +170,15 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     from autoslm.client.specs import spec_payload
     from autoslm.worker_spec import EnvironmentSpec, JobSpec
 
-    # Built-in envs ship no extra pip...
-    spec = JobSpec(model="Qwen/Qwen3-0.6B", environment=EnvironmentSpec(id="gsm8k"))
-    assert "pip" not in spec_payload(spec)["environment"] or not (
-        spec_payload(spec)["environment"].get("pip")
-    )
-
-    # ...the freesolo bridge resolves its GRPO worker deps client-side...
-    spec = JobSpec(
-        model="Qwen/Qwen3-0.6B",
-        environment=EnvironmentSpec(id="freesolo", params={"mode": "grpo"}),
-    )
-    assert spec_payload(spec)["environment"]["pip"] == ["freesolo[full]"]
+    # An unrecorded env resolves to just verifiers (the worker installs verifiers; the env
+    # module travels with a local path, or is a recorded Hub wheel).
+    spec = JobSpec(model="Qwen/Qwen3-0.6B", environment=EnvironmentSpec(id="owner/env"))
+    assert spec_payload(spec)["environment"]["pip"] == ["verifiers"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
         model="Qwen/Qwen3-0.6B",
-        environment=EnvironmentSpec(id="freesolo", params={"mode": "grpo"}, pip=("custom==1",)),
+        environment=EnvironmentSpec(id="owner/env", pip=("custom==1",)),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
 

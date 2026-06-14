@@ -2,14 +2,14 @@
 
 AutoSLM trains a **LoRA adapter** on a single GPU with one of two algorithms,
 selected by `algorithm = "..."` in the run TOML. Both share the same machinery
-around them — the active [environment](environments.md) supplies the data and the
-grader, and both produce a LoRA adapter uploaded to the artifact repo. They differ
-only in the training signal.
+around them — the active [verifiers environment](environments.md) supplies the data
+and the reward `Rubric`, and both produce a LoRA adapter uploaded to the artifact
+repo. They differ only in the training signal.
 
 | algorithm | engine | training signal | driven by | needs |
 |---|---|---|---|---|
-| [`sft`](#sft) | TRL `SFTTrainer` | imitate reference completions | `train.epochs` | env `sft_target` |
-| [`grpo`](#grpo) | TRL `GRPOTrainer` + colocated vLLM | verifiable reward on the model's own samples | `train.steps` | env `reward` (a grader) |
+| [`sft`](#sft) | TRL `SFTTrainer` | imitate reference completions | `train.epochs` | env rows with an answer/target |
+| [`grpo`](#grpo) | TRL `GRPOTrainer` + colocated vLLM | verifiable reward on the model's own samples | `train.steps` | env `Rubric` (reward funcs) |
 
 > **Step- vs epoch-driven.** GRPO consumes `train.steps` (optimizer steps); SFT
 > consumes `train.epochs`. The config validator rejects a non-positive count for
@@ -29,25 +29,24 @@ A common sequence is **SFT then GRPO**: SFT to teach the format and basic
 competence, then RL to push capability. Chain them by pointing the GRPO run at the
 SFT adapter via `train.init_from_adapter`.
 
-Both are illustrated on one task in [`examples/gsm8k/`](../examples/gsm8k/), which
-ships a ready-to-run config for each.
+`slm lab setup` scaffolds a starter verifiers env plus a ready-to-run GRPO config to
+illustrate both arms.
 
 ---
 
 ## SFT
 
-Supervised fine-tuning: the model is trained to reproduce the environment's
-`sft_target(example)` for each training example (for GSM8K, the gold
-chain-of-thought reformatted to end in `\boxed{ANSWER}`). No reward, no generation
-during training — a plain LoRA fit, so it is the cheapest arm and fits the smallest
-GPUs.
+Supervised fine-tuning: the model is trained to reproduce the assistant target the
+adapter derives from each env row (its `answer`/`completion` field). No reward, no
+generation during training — a plain LoRA fit, so it is the cheapest arm and fits the
+smallest GPUs.
 
 ```toml
 model     = "Qwen/Qwen3-0.6B"
 algorithm = "sft"
 
 [environment]
-id = "gsm8k"
+id = "owner/my-env"   # a verifiers / Prime Hub env slug
 
 [train]
 epochs     = 3
@@ -62,23 +61,25 @@ lora_alpha = 64
 - **Knobs** (env-var passthrough): `SFT_EPOCHS`, `SFT_PER_DEVICE_BS` (default 4;
   grad-accum fills the recipe's effective batch), `SFT_MAX_STEPS` /
   `SFT_MAX_EXAMPLES` (caps, used by the pre-flight smoke), `SFT_PACKING=1` (pack
-  short examples into full sequences — useful for GSM8K, whose targets are far
-  shorter than the sequence length, so unpacked batches are mostly padding),
+  short examples into full sequences — useful when targets are far shorter than the
+  sequence length, so unpacked batches are mostly padding),
   `SFT_LIGER=1` (Liger fused kernels; needs `AUTOSLM_WORKER_EXTRA_DEPS=liger-kernel`).
+  Packing helps most when targets are far shorter than the sequence length (unpacked
+  batches are mostly padding).
 
 ## GRPO
 
 Group-Relative Policy Optimization — verifiable-reward RL. Per step the model
 samples a group of completions per prompt through a **colocated vLLM engine**, the
-environment's `reward(completion, example)` scores each, and GRPO shifts
-probability mass toward the higher-reward completions in each group. Needs a grader.
+environment's `Rubric` reward funcs score each, and GRPO shifts probability mass
+toward the higher-reward completions in each group. Needs a reward `Rubric`.
 
 ```toml
 model     = "Qwen/Qwen3-4B-Instruct-2507"
 algorithm = "grpo"
 
 [environment]
-id = "gsm8k"
+id = "owner/my-env"   # a verifiers / Prime Hub env slug
 
 [train]
 steps     = 150
@@ -94,11 +95,21 @@ lora_rank = 32
   [config-reference.md → Colocated GRPO on one consumer GPU](config-reference.md#colocated-grpo-on-one-consumer-gpu).
 - **Reward shaping lives in the environment** (`reward`), so scoring is defined in
   one place alongside the task.
-- **Knobs**: `RL_PROMPTS_PER_STEP` (unique prompts per step, default 64),
-  `RL_GROUP_SIZE` (completions per prompt, default 8), `RL_PER_DEVICE_PROMPTS`
-  (completion micro-batch; 8 fastest for 4B on a 5090, 2 under `thinking`),
-  `RL_MAX_COMPLETION` (320 non-thinking / 1536 thinking), `RL_VLLM_SLEEP`,
-  `RL_VLLM_GPU_UTIL`, `RL_VLLM_MAX_LEN`.
+- **Recipe knobs (config, under `[train]`)**: the GRPO recipe hyperparameters live
+  in the `[train]` table (NOT `[environment.params]`, which is forwarded verbatim to
+  the verifiers env's `load_environment`). All are optional — omit one to apply the
+  worker's recipe default:
+  - `group_size` — completions sampled per prompt (default 8).
+  - `temperature` — rollout sampling temperature.
+  - `max_tokens` — per-completion generation budget.
+  - `kl_penalty_coef` — KL-to-reference coefficient (the GRPO `beta`).
+  - `advantage_clip` — centered-advantage clamp.
+  - `thinking_length_penalty_coef` — per-`<think>`-token reward deduction (0–1).
+- **Env-var overrides** (highest precedence, for one-off tuning): `RL_PROMPTS_PER_STEP`
+  (unique prompts per step, default 64), `RL_GROUP_SIZE` (completions per prompt,
+  default 8), `RL_PER_DEVICE_PROMPTS` (completion micro-batch; 8 fastest for 4B on a
+  5090, 2 under `thinking`), `RL_MAX_COMPLETION` (320 non-thinking / 1536 thinking),
+  `RL_VLLM_SLEEP`, `RL_VLLM_GPU_UTIL`, `RL_VLLM_MAX_LEN`.
 - **Cost note:** rollout cost scales linearly with completion length — `thinking`
   runs generate roughly 5× the tokens per step.
 

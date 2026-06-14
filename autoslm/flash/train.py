@@ -101,12 +101,17 @@ _ENDPOINT_CACHE: dict[str, Any] = {}
 
 
 def upload_code() -> str:
-    """Upload the ``autoslm`` package (+ the sibling ``examples/`` tree) to ``HF_REPO``.
+    """Upload the ``autoslm`` package to ``HF_REPO``.
 
-    The worker downloads ``code/**`` to ``/runcode`` and the registry resolves
-    built-in example environments (gsm8k/math) from ``code/examples`` next to
-    the package, so the examples tree must travel with the code or those runs
-    fail with FileNotFoundError after provisioning.
+    The worker downloads ``code/**`` to ``/runcode``. Verifiers-only: there are no built-in
+    example environments to ship — Hub/installed envs are pip-installed on the worker (see
+    ``registry.worker_pip_for_env``).
+
+    Only the ``autoslm`` package is uploaded, NOT the client's project tree, so a LOCAL
+    verifiers env (``[environment] path``) does NOT reach the worker. Managed runs must
+    reference a published Hub env by ``id`` (``slm env push`` to publish first); local
+    ``path`` envs are for LOCAL runs only. ``cli.main._check_managed_spec`` rejects a managed
+    ``path`` before submit.
     """
     from huggingface_hub import HfApi
 
@@ -126,15 +131,6 @@ def upload_code() -> str:
         repo_type="dataset",
         ignore_patterns=["__pycache__/*", "*.pyc"],
     )
-    examples_dir = os.path.join(os.path.dirname(pkg_dir), "examples")
-    if os.path.isdir(examples_dir):
-        api.upload_folder(
-            folder_path=examples_dir,
-            path_in_repo="code/examples",
-            repo_id=repo,
-            repo_type="dataset",
-            ignore_patterns=["__pycache__/*", "*.pyc"],
-        )
     return repo
 
 
