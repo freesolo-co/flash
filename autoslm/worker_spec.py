@@ -113,8 +113,7 @@ class TrainSpec:
 @dataclass(frozen=True)
 class GpuSpec:
     type: str = "RTX 5090"
-    # GPU substrate: "auto" (cheapest across providers at submit time), "runpod", or
-    # "vast" (verified datacenters only).
+    # GPU substrate: "auto" (cheapest RunPod class at submit time) or "runpod".
     provider: str = "auto"
     # The raw user gpu.type input ("cheapest"/"auto" or a concrete class), always set
     # by config parsing. The orchestrator re-allocates the class at submit time iff

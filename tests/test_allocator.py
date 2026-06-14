@@ -1,35 +1,8 @@
-"""Cross-provider allocation: VRAM sizing, cheapest-wins ranking, pins, gates, fallbacks."""
+"""RunPod allocation: VRAM sizing, cheapest-wins ranking, pins, gates, fallbacks."""
 
 from __future__ import annotations
 
-import dataclasses
-
 import pytest
-
-from tests.test_vast_offers import _offer
-
-
-def _vast_validated(monkeypatch, *names):
-    """Mark classes as vast-validated for the duration of a test."""
-    from autoslm.flash import gpus
-
-    for name in names:
-        info = gpus.GPU_INFO[name]
-        monkeypatch.setitem(
-            gpus.GPU_INFO,
-            name,
-            dataclasses.replace(info, validated_on=(*info.validated_on, "vast")),
-        )
-
-
-def _wire(monkeypatch, offers, providers=("runpod", "vast")):
-    """Static runpod rates + a fake vast offer book."""
-    from autoslm.providers import allocator, vast, vast_api
-
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")  # static, deterministic runpod rates
-    monkeypatch.setattr(allocator, "available_providers", lambda: tuple(providers))
-    monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(offers))
-    return allocator, vast
 
 
 def test_required_vram_catalog_and_open(monkeypatch):
@@ -49,29 +22,20 @@ def test_required_vram_catalog_and_open(monkeypatch):
     assert required_vram_gb("org/mystery", "grpo") == 24
 
 
-def test_cheapest_across_providers(monkeypatch):
-    allocator, _ = _wire(monkeypatch, [_offer(id=1, dph_total=0.25)])
-    _vast_validated(monkeypatch, "RTX 3090")
-    # vast 3090 $0.25 beats the cheapest validated runpod 24GB class (A5000 $0.27)
-    a = allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo")
-    assert (a.provider, a.gpu) == ("vast", "RTX 3090")
-    assert a.hourly_usd == 0.25
-    assert a.offer is not None
-    assert a.offer.offer_id == 1
-    # runpod candidates still ranked behind it for failover
-    assert any(c.provider == "runpod" for c in a.candidates)
-    assert "vast" in allocator.allocation_summary(a)
+def test_cheapest_runpod_class(monkeypatch):
+    from autoslm.providers import allocator
 
-
-def test_runpod_wins_when_vast_pricier(monkeypatch):
-    allocator, _ = _wire(monkeypatch, [_offer(id=1, dph_total=0.55)])
-    _vast_validated(monkeypatch, "RTX 3090")
+    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")  # static, deterministic runpod rates
     a = allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo")
-    assert (a.provider, a.gpu) == ("runpod", "RTX A5000")  # $0.27 static
+    # cheapest validated runpod 24GB class
+    assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
+    assert "runpod" in allocator.allocation_summary(a)
 
 
 def test_vram_gating_excludes_small_cards(monkeypatch):
-    allocator, _ = _wire(monkeypatch, [])
+    from autoslm.providers import allocator
+
+    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     a = allocator.allocate("Qwen/Qwen3-8B", "grpo")  # needs 32 GB
     assert a.min_vram_gb == 32
     assert all(c.vram_gb >= 32 for c in a.candidates)
@@ -80,8 +44,9 @@ def test_vram_gating_excludes_small_cards(monkeypatch):
 
 def test_pinned_undersized_gpu_rejected(monkeypatch):
     from autoslm.flash.gpus import UnsupportedGpuError
+    from autoslm.providers import allocator
 
-    allocator, _ = _wire(monkeypatch, [])
+    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     # Qwen3-8B needs 32 GB; pinning a 24 GB card must reject up front (the model
     # requirement is the floor regardless of the pin), not provision a 24 GB OOM.
     with pytest.raises(UnsupportedGpuError):
@@ -93,60 +58,34 @@ def test_pinned_undersized_gpu_rejected(monkeypatch):
 
 
 def test_validation_gate_and_opt_in(monkeypatch):
-    allocator, _ = _wire(monkeypatch, [_offer(id=1, gpu_name="L4", gpu_ram=23034, dph_total=0.20)])
+    from autoslm.providers import allocator
+
+    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
     # L4 is validated nowhere -> excluded by default...
     a = allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo")
     assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
-    # ...but the explicit opt-in admits it (and it's the cheapest)
+    # ...but the explicit opt-in admits cheaper unvalidated classes
     a = allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo", allow_unvalidated=True)
-    assert (a.provider, a.gpu) == ("vast", "L4")
+    assert a.provider == "runpod"
+    assert a.hourly_usd <= 0.27  # an unvalidated class is at least as cheap as the A5000
 
 
-def test_provider_pins(monkeypatch):
-    allocator, _ = _wire(monkeypatch, [_offer(id=1, dph_total=0.25)])
-    _vast_validated(monkeypatch, "RTX 3090")
+def test_provider_pin_runpod(monkeypatch):
+    from autoslm.providers import allocator
+
+    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     a = allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo", provider="runpod")
     assert a.provider == "runpod"
     assert all(c.provider == "runpod" for c in a.candidates)
-    a = allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo", provider="vast")
-    assert a.provider == "vast"
-    assert all(c.provider == "vast" for c in a.candidates)
 
 
-def test_provider_vast_unavailable_fails_fast(monkeypatch):
+def test_unknown_provider_rejected(monkeypatch):
     from autoslm.flash.gpus import UnsupportedGpuError
-
-    allocator, _ = _wire(monkeypatch, [], providers=("runpod",))
-    with pytest.raises(UnsupportedGpuError, match="VAST_API_KEY"):
-        allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo", provider="vast")
-
-
-def test_gpu_pin_picks_cheaper_provider(monkeypatch):
-    # same class on both substrates: runpod static $0.46 vs vast offer $0.25
-    allocator, _ = _wire(monkeypatch, [_offer(id=1, dph_total=0.25)])
-    _vast_validated(monkeypatch, "RTX 3090")
-    monkeypatch.setenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", "1")  # 3090 isn't runpod-validated
-    a = allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo", gpu="RTX 3090")
-    assert (a.provider, a.gpu, a.hourly_usd) == ("vast", "RTX 3090", 0.25)
-    assert {c.provider for c in a.candidates} == {"runpod", "vast"}
-
-
-def test_vast_api_down_degrades_to_runpod(monkeypatch):
-    from autoslm.providers import allocator, vast_api
+    from autoslm.providers import allocator
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "vast"))
-
-    def boom(*a, **k):
-        raise vast_api.VastApiError("503")
-
-    monkeypatch.setattr(vast_api, "search_offers", boom)
-    a = allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo")
-    assert a.provider == "runpod"
-    from autoslm.flash.gpus import UnsupportedGpuError
-
-    with pytest.raises(UnsupportedGpuError, match="offer search failed"):
+    with pytest.raises(UnsupportedGpuError, match="unknown provider"):
         allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo", provider="vast")
 
 

@@ -22,23 +22,13 @@ user ──slm login / slm train──> control plane (this guide) ──> RunPo
 | variable | required | meaning |
 |---|---|---|
 | `RUNPOD_API_KEY` | yes | RunPod key used to provision Flash GPUs |
-| `VAST_API_KEY` | no | Vast.ai key — enables the second GPU substrate (verified datacenter offers in cross-provider cheapest allocation). Absent = runpod-only; a bad key fails preflight |
 | `HUGGINGFACE_TOKEN` | yes | HF token with write access to `HF_REPO` |
 | `HF_REPO` | yes | HF *dataset* repo for adapters/checkpoints/heartbeats, e.g. `your-org/autoslm-runs` |
 | `AUTOSLM_DB_PATH` | no | SQLite path for keys + run ownership (default `~/.autoslm/server.db`) |
 | `AUTOSLM_RUNS_DIR` | no | run status/log files (default `.autoslm/runs`) |
 | `RESULTS_DIR` | no | metrics output (default `results`) |
-| `AUTOSLM_PROVIDERS` | no | pin the substrate set, e.g. `runpod` to disable vast without unsetting its key |
 | `AUTOSLM_TRUST_PROXY` | no | set truthy when a reverse proxy (nginx/Caddy) fronts the server, so the per-IP `POST /v1/keys` claim throttle keys on the last `X-Forwarded-For` hop instead of the proxy's TCP peer. **Without it, all proxied clients share one peer IP and the throttle becomes per-deployment, not per-IP.** Only enable behind a proxy that strips client-supplied XFF. |
-| `AUTOSLM_VAST_MIN_RELIABILITY` | no | Vast offer reliability floor (default `0.95`) |
-| `AUTOSLM_VAST_MIN_INET_MBPS` | no | Vast offer download-bandwidth floor (default `200`) |
-| `AUTOSLM_VAST_MAX_DPH` | no | hard $/hr ceiling on Vast offers |
-| `AUTOSLM_VAST_LOAD_TIMEOUT_S` | no | give up on a Vast instance stuck pulling its image (default `900`) |
-| `AUTOSLM_VAST_IMAGE` | no | Vast worker docker image (default `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel`; CUDA-13 build auto-selected for Blackwell classes) |
 | `AUTOSLM_VRAM_HEADROOM` | no | open-model VRAM sizing headroom for smart allocation (default `1.15`) |
-
-On startup the server also destroys any **orphaned Vast instances** (AutoSLM-labeled
-instances no recoverable run owns) — they bill until destroyed.
 
 The server fails fast at startup if a required variable is missing. Provider credentials
 are **env-only by design** — they are never read from `~/.autoslm/config.json` (that

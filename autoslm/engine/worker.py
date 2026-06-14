@@ -125,10 +125,9 @@ def hf_prefix() -> str:
 def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False):
     """Upload one file to the run's HF prefix.
 
-    ``required=True`` (the Vast completion artifacts DONE/metrics.json) retries and
-    finally raises: on Vast there is no queue return value, so poll_vast_job decides
-    success purely from these artifacts — a swallowed upload failure would make the
-    control plane mark a finished run failed or retry already-completed work.
+    ``required=True`` (the completion artifacts DONE/metrics.json) retries and finally
+    raises: a swallowed upload failure would make the control plane mark a finished run
+    failed or retry already-completed work.
     """
     if not HF_REPO:
         return
@@ -1307,8 +1306,7 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
 
 def _finalize(metrics: RunMetrics, adapter_dir: str):
     metrics.save("/tmp/metrics.json")
-    # Required: on Vast these two artifacts ARE the success signal (no queue return),
-    # so a swallowed upload would make the control plane fail/retry a finished run.
+    # Required: a swallowed upload would make the control plane fail/retry a finished run.
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
     # DONE sentinel so the controller knows it's safe to tear down
     with open("/tmp/DONE", "w") as f:

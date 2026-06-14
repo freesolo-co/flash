@@ -179,12 +179,11 @@ def cancel_run(run_id: str) -> RunStatus:
     if status.state in TERMINAL_STATES:
         return status
     spec = JobSpec.from_dict(status.spec)
-    remote = status.remote or {}
     # A deployed run also owns a serving endpoint (autoslm-serve-*) that the
     # training-endpoint GC below does not touch; tear it down too so a
-    # cancelled run can't leave a billable deployment registered. Serving is
-    # RunPod-only, so use the class actually deployed (a Vast-only training class
-    # falls back to a RunPod class at deploy time).
+    # cancelled run can't leave a billable deployment registered. Use the class
+    # actually deployed (an unvalidated training class falls back to a RunPod-validated
+    # class at deploy time).
     if status.state == "deployed":
         try:
             from autoslm.serve.deploy import undeploy_adapter
@@ -205,19 +204,9 @@ def cancel_run(run_id: str) -> RunStatus:
             # Best-effort serving teardown: a failure here must not block the cancel
             # below (the run still flips to cancelled and the training endpoint is GC'd).
             pass
-    # Durable path first: stop the exact remote worker via the provider's REST API
-    # (works from any process); endpoint/instance teardown is shared with the GC.
-    if remote.get("provider") == "vast":
-        try:
-            from autoslm.providers import vast as vast_provider
-
-            vast_provider.cancel(remote)
-            # Belt and suspenders: catch any instance of this run the handle missed.
-            vast_provider.destroy_run_instances(run_id)
-        except Exception:
-            # Best-effort remote stop; the orphan sweep / endpoint GC are the backstop.
-            pass
-    elif status.remote:
+    # Durable path first: stop the exact remote worker via the RunPod REST API
+    # (works from any process); endpoint teardown is shared with the GC.
+    if status.remote:
         try:
             from autoslm.flash import runpod_api
 
@@ -225,10 +214,7 @@ def cancel_run(run_id: str) -> RunStatus:
         except Exception:
             # Best-effort remote stop; _gc_run_endpoints below still tears the endpoint down.
             pass
-    # RunPod endpoint GC only — the vast branch above already destroyed its instance
-    # (calling terminate_endpoint for a vast run would be a no-op against RunPod).
-    if remote.get("provider") != "vast":
-        _gc_run_endpoints(spec)
+    _gc_run_endpoints(spec)
     _update(run_id, "cancelled")
     return get_status(run_id)
 
@@ -256,20 +242,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     log = log_stream or sys.stderr
     hf_repo = os.environ.get("HF_REPO", "")
     reader = make_hf_heartbeat_reader(hf_repo, adapter_prefix(spec, seed)) if hf_repo else None
-    if remote.get("provider") == "vast":
-        from autoslm.providers.vast import VastJobHandle, poll_vast_job
+    from autoslm.flash.durable import JobHandle, poll_job
 
-        vhandle = VastJobHandle.from_dict(remote)
-        print(f"attaching to {run_id}: vast instance={vhandle.instance_id}", file=log)
-        res = poll_vast_job(vhandle, spec, seed, log=log, heartbeat_reader=reader)
-    else:
-        from autoslm.flash.durable import JobHandle, poll_job
-
-        handle = JobHandle.from_dict(remote)
-        print(
-            f"attaching to {run_id}: job={handle.job_id} endpoint={handle.endpoint_name}", file=log
-        )
-        res = poll_job(handle, log=log, heartbeat_reader=reader)
+    handle = JobHandle.from_dict(remote)
+    print(f"attaching to {run_id}: job={handle.job_id} endpoint={handle.endpoint_name}", file=log)
+    res = poll_job(handle, log=log, heartbeat_reader=reader)
     try:
         # A best-effort cancel deletes the job/instance, which the poller reports as a
         # failure (or a late worker may still succeed) — either way, re-read the state
@@ -322,17 +299,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
     finally:
-        if remote.get("provider") == "vast":
-            # Vast bills until destroyed: kill the exact instance this handle owns.
-            try:
-                from autoslm.providers import vast_api
-
-                vast_api.destroy_instance(int(remote["instance_id"]))
-            except Exception:
-                # Best-effort teardown; the vast orphan sweep reaps anything left behind.
-                pass
-        else:
-            _gc_run_endpoints(spec)
+        _gc_run_endpoints(spec)
     return get_status(run_id)
 
 
@@ -370,9 +337,8 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
     finally:
-        # Mirror _run_job: the resume path also marked this run active in recover_runs, so
-        # the startup orphan sweep skipped its instances — GC any endpoint a transient
-        # destroy left behind rather than leaking a billable Vast instance.
+        # Mirror _run_job: GC any endpoint a transient destroy left behind rather than
+        # leaking a billable RunPod endpoint.
         _gc_run_endpoints(spec)
     return get_status(run_id)
 
@@ -475,17 +441,14 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
 def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     """Run one seed with the durable submit/poll path + bounded auto-retry.
 
-    Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
-    live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
-    fresh per attempt because offers are a live market. A policy ``gpu.requested``
+    Each attempt first ALLOCATES the GPU: the cheapest RunPod class (live pricing) that
+    fits the model — re-resolved fresh per attempt. A policy ``gpu.requested``
     ("cheapest"/"auto") lets the allocator pick the class; a concrete ``gpu.requested``
-    pins the class (the allocator then only picks the provider); ``gpu.provider`` pins
-    the substrate.
+    pins the class.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF
     checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
-    client polling breakdown, or a platform TIMED_OUT/worker-loss. Sick Vast
-    machines are blacklisted for the run; failover naturally crosses providers.
+    client polling breakdown, or a platform TIMED_OUT/worker-loss.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
     immediately. The offline test/CI marker AUTOSLM_SKIP_NET takes the blocking
     in-process submit instead (the durable poll path is network-only).
@@ -497,7 +460,6 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         return submit_train(spec, seed, log=log)
 
     from autoslm.flash.gpus import POLICY_NAMES
-    from autoslm.providers import vast as vast_provider
     from autoslm.providers.allocator import allocate, allocation_summary
 
     last_handle: dict = {}
@@ -525,7 +487,6 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
 
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
-    bad_machines: set[int] = set()
     # Re-allocate freely for policy requests ("cheapest"/"auto"); honor a concrete
     # user pin by passing it through as the only candidate class.
     requested = (spec.gpu.requested or "").strip().lower()
@@ -534,20 +495,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
-            if last_handle.get("provider") == "vast":
-                from autoslm.providers import vast_api
-
-                vast_api.destroy_instance(int(last_handle.get("instance_id") or 0))
-                if last_handle.get("machine_id"):
-                    bad_machines.add(int(last_handle["machine_id"]))
-                print(
-                    f"retry {attempt}: destroyed vast instance "
-                    f"{last_handle.get('instance_id')} (machine "
-                    f"{last_handle.get('machine_id')} blacklisted for this run)",
-                    file=log,
-                    flush=True,
-                )
-            elif last_handle.get("endpoint_id"):
+            if last_handle.get("endpoint_id"):
                 try:
                     from autoslm.flash import runpod_api
 
@@ -587,7 +535,6 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 provider=spec.gpu.provider,
                 disk_gb=spec.gpu.disk_gb,
                 allow_unvalidated=spec.gpu.allow_unvalidated,
-                exclude_machine_ids=frozenset(bad_machines),
             )
         except Exception as exc:
             from autoslm.flash.gpus import UnsupportedGpuError
@@ -605,31 +552,13 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             print(allocation_summary(alloc), file=log, flush=True)
             run_spec = _spec_with_gpu(spec, alloc.gpu)
             try:
-                if alloc.provider == "vast":
-                    # Offer book for the live-market walk: the chosen class first,
-                    # then other allocator-approved classes by price.
-                    ok_classes = {c.gpu for c in alloc.candidates if c.provider == "vast"}
-                    offers = sorted(
-                        (o for o in alloc.vast_offers if o.gpu in ok_classes),
-                        key=lambda o: (o.gpu != alloc.gpu, o.dph_total),
-                    )
-                    res = vast_provider.submit_train_durable_vast(
-                        run_spec,
-                        seed,
-                        log=log,
-                        on_handle=on_handle,
-                        attempt=attempt,
-                        offers=offers,
-                    )
-                else:
-                    res = durable.submit_train_durable(
-                        run_spec, seed, log=log, on_handle=on_handle, attempt=attempt
-                    )
+                res = durable.submit_train_durable(
+                    run_spec, seed, log=log, on_handle=on_handle, attempt=attempt
+                )
             except Exception as exc:
                 # Deploy/submit themselves can fail transiently (observed: RunPod
-                # GraphQL "Something went wrong" x3 during a retry deploy; a vast
-                # offer pool emptying between search and rent). That must consume a
-                # retry, not kill the run — the budget exists precisely for flakes.
+                # GraphQL "Something went wrong" x3 during a retry deploy). That must
+                # consume a retry, not kill the run — the budget exists for flakes.
                 res = durable.PollResult(
                     False, failure="poll_error", detail=f"deploy/submit: {exc}"
                 )
@@ -793,27 +722,13 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     except Exception:
         # Best-effort GC; an undeleted endpoint only holds worker quota, never blocks the run.
         pass
-    # Vast instances bill until destroyed: the runner's per-attempt `finally` already
-    # destroys them, but a crashed supervisor thread can leave one behind. Destroy any
-    # instance still labeled for this run (best-effort; never raises).
-    if os.environ.get("VAST_API_KEY"):
-        try:
-            from autoslm.providers import vast as vast_provider
-
-            vast_provider.destroy_run_instances(spec.run_id)
-        except Exception:
-            # Best-effort orphan sweep; a leftover vast instance is caught by the
-            # periodic sweep_orphans pass, so don't let teardown failure raise here.
-            pass
 
 
 def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     """Write metrics to results/runpod/<phase>/<run_id>/seedN and return the cost.
 
     The run id keeps concurrent/sequential runs of the same phase+seed from
-    overwriting each other's artifacts. Vast runs arrive with ``cost_usd`` already
-    stamped from the offer's real $/hr (plus provider notes) and short-circuit the
-    rate fallback below (the RunPod projection)."""
+    overwriting each other's artifacts."""
     dest = os.path.join(artifacts_dir(spec), f"seed{seed}")
     os.makedirs(dest, exist_ok=True)
     # Rate the actually-allocated class, not the parse-time provisional spec.gpu.type:

@@ -121,11 +121,10 @@ def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
 
 def servable_gpu(gpu_name: str, model: str) -> str:
     """Serving runs on RunPod Flash only: a run trained on a class that is not
-    RunPod-validated (a Vast-only class like L40S/RTX Pro 4000, OR a class that has
-    a RunPod enum member but was validated only on Vast, e.g. RTX 3090) is served
-    from the cheapest RunPod-VALIDATED class with at least the trained class's VRAM
-    — NOT directly on the unvalidated RunPod substrate (which can fail on first chat)
-    and NOT the catalog default (32 GB for open models, too small for the >32 GB
+    RunPod-validated (e.g. RTX 3090, which has a RunPod enum member but no validation)
+    is served from the cheapest RunPod-VALIDATED class with at least the trained class's
+    VRAM — NOT directly on the unvalidated RunPod substrate (which can fail on first
+    chat) and NOT the catalog default (32 GB for open models, too small for the >32 GB
     class the allocator proved was needed)."""
     from autoslm.flash.gpus import GPU_INFO, UnsupportedGpuError, cheapest_gpu
 

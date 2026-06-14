@@ -44,10 +44,10 @@ def test_deploy_rejects_unsupported_gpu():
         )
 
 
-def test_deploy_vast_only_class_falls_back_to_runpod():
-    # Serving is RunPod-only: a run trained on a Vast-only class (L40S, 48 GB) serves
-    # from the cheapest RunPod-VALIDATED class with >= that VRAM — not the 32 GB
-    # catalog default (too small) and not an unvalidated RunPod class.
+def test_deploy_unvalidated_class_falls_back_to_runpod():
+    # Serving is RunPod-only: a run trained on a class that isn't RunPod-validated
+    # (RTX 3090, 24 GB) serves from the cheapest RunPod-VALIDATED class with >= that
+    # VRAM — not directly on the unvalidated class (which can fail on first chat).
     from autoslm.flash.gpus import GPU_INFO, is_validated
     from autoslm.serve.deploy import deploy_adapter
 
@@ -56,12 +56,12 @@ def test_deploy_vast_only_class_falls_back_to_runpod():
         model="Qwen/Qwen3-0.6B",
         hf_repo="org/repo",
         adapter_prefix="sft/r1/seed0",
-        gpu_name="L40S",
+        gpu_name="RTX 3090",
         dry_run=True,
     )
-    assert dep.gpu != "L40S"
+    assert dep.gpu != "RTX 3090"
     assert is_validated(dep.gpu, "runpod"), "must serve on a RunPod-validated class"
-    assert GPU_INFO[dep.gpu].vram_gb >= 48  # >= L40S's VRAM
+    assert GPU_INFO[dep.gpu].vram_gb >= 24  # >= RTX 3090's VRAM
 
 
 def _install_serve_mocks():

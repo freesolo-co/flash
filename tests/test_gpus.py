@@ -27,32 +27,11 @@ def test_unknown_gpu_rejected():
             canonical_gpu(bad)
 
 
-def test_vast_only_classes():
-    from autoslm.flash.gpus import UnsupportedGpuError, canonical_gpu, flash_gpu, providers_for
+def test_providers_for():
+    from autoslm.flash.gpus import providers_for
 
-    # L40S is provisionable on Vast but absent from the Flash SDK's GpuType enum:
-    # canonical as a class, rejected only at the RunPod mapping with a providers hint.
-    assert canonical_gpu("L40S") == "L40S"
-    assert providers_for("L40S") == ("vast",)
-    with pytest.raises(UnsupportedGpuError, match="not available on RunPod"):
-        flash_gpu("L40S")
-    assert providers_for("RTX 4090") == ("runpod", "vast")
+    assert providers_for("RTX 4090") == ("runpod",)
     assert providers_for("RTX Pro 6000") == ("runpod",)
-
-
-def test_vast_gpu_for_offer():
-    from autoslm.flash.gpus import vast_gpu_for_offer
-
-    # plain name matches, with under-reported board RAM tolerated (L4: 23034 MB)
-    assert vast_gpu_for_offer("RTX 3090", 24576) == "RTX 3090"
-    assert vast_gpu_for_offer("L4", 23034) == "L4"
-    assert vast_gpu_for_offer("RTX 6000Ada", 49140) == "RTX 6000 Ada"
-    # A100 SXM4 covers two VRAM variants under one Vast name
-    assert vast_gpu_for_offer("A100 SXM4", 40960) == "A100 SXM 40GB"
-    assert vast_gpu_for_offer("A100 SXM4", 81920) == "A100 SXM"
-    # Ampere+ floor: anything not in the managed table maps to nothing
-    assert vast_gpu_for_offer("Tesla T4", 16384) is None
-    assert vast_gpu_for_offer("RTX 2080 Ti", 11264) is None
 
 
 def test_is_validated_per_provider():
@@ -60,12 +39,9 @@ def test_is_validated_per_provider():
 
     assert is_validated("RTX 4090")  # any-provider
     assert is_validated("RTX 4090", "runpod")
-    assert not is_validated("RTX 4090", "vast")  # no live Vast smoke yet
     assert not is_validated("L4")
-    # live-smoked on Vast 2026-06-12; never smoked on RunPod
-    assert is_validated("RTX 3090", "vast")
+    # RTX 3090 has a RunPod enum member but no live smoke yet
     assert not is_validated("RTX 3090", "runpod")
-    assert is_validated("RTX Pro 4000", "vast")
 
 
 def test_expanded_gpu_table():
@@ -145,13 +121,13 @@ def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
     raw["gpu"] = {"type": "L4", "allow_unvalidated": True}
     spec = spec_from_dict(raw, run_id="x")
     assert spec.gpu.type == "L4"
-    # vast-validated class passes the gate when the provider is consistent
+    # an unvalidated class is blocked without the opt-in
     raw["gpu"] = {"type": "RTX 3090"}
-    assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 3090"
-    # ...but pinning it to a provider it is NOT validated on still blocks
-    raw["gpu"] = {"type": "RTX 3090", "provider": "runpod"}
     with pytest.raises(ConfigError):
         spec_from_dict(raw, run_id="x")
+    # ...and allowed with it
+    raw["gpu"] = {"type": "RTX 3090", "allow_unvalidated": True}
+    assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 3090"
 
 
 def test_flash_gpu_enum_members():
@@ -184,7 +160,7 @@ def test_config_rejects_unsupported_gpu():
         "algorithm": "grpo",
         "environment": {"id": "gsm8k"},
         "train": {"steps": 1, "seeds": [0]},
-        "gpu": {"type": "L40S"},  # not in the Flash SDK's GpuType enum
+        "gpu": {"type": "L40S"},  # not a managed GPU class
     }
     with pytest.raises(ConfigError):
         spec_from_dict(raw, run_id="x")
