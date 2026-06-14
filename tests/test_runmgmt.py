@@ -12,10 +12,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 def test_list_and_cancel(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        os.environ["AUTOSLM_RUNS_DIR"] = tmp
         import autoslm.orchestrator as orchestrator
 
         importlib.reload(orchestrator)
+        # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
+        monkeypatch.setattr(orchestrator, "RUNS_DIR", tmp)
         from autoslm.worker_spec import JobSpec
 
         # two dry-run records

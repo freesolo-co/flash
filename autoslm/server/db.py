@@ -1,6 +1,6 @@
 """SQLite store for the managed control plane: API keys + run ownership.
 
-Run *state* stays in the orchestrator's JSON files (``AUTOSLM_RUNS_DIR``) — the
+Run *state* stays in the orchestrator's JSON files (``orchestrator.RUNS_DIR``) — the
 battle-tested durable/attach/cancel paths all read those. This database is only the
 key registry and the run -> key ownership index that makes the server multi-tenant.
 
@@ -11,7 +11,6 @@ the orchestrator runs jobs in daemon threads inside the same process).
 from __future__ import annotations
 
 import hashlib
-import os
 import secrets
 import sqlite3
 import time
@@ -39,8 +38,13 @@ CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
 """
 
 
+# Fixed location for the keys/run-ownership SQLite DB (not operator-configurable). Tests
+# point it elsewhere with monkeypatch.setattr(db, "DB_PATH", tmp).
+DB_PATH = str(Path.home() / ".autoslm" / "server.db")
+
+
 def db_path() -> str:
-    return os.environ.get("AUTOSLM_DB_PATH", str(Path.home() / ".autoslm" / "server.db"))
+    return DB_PATH
 
 
 def _connect() -> sqlite3.Connection:

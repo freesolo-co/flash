@@ -190,8 +190,6 @@ host — see [self-hosting](self-hosting.md)):
 | `RUNPOD_API_KEY` | RunPod auth (operator credential) |
 | `HF_REPO` | HF **dataset** repo for adapters/checkpoints + code delivery |
 | `HUGGINGFACE_TOKEN` | write access to `HF_REPO` |
-| `AUTOSLM_DB_PATH` | control-plane SQLite (keys + run ownership) |
-| `AUTOSLM_RUNS_DIR` | run status/log files |
 | `AUTOSLM_WORKER_DEPS` | override the pinned worker dependency stack (whitespace-separated, or a JSON list for specs containing commas like `transformers>=5.6,<5.11`) |
 | `AUTOSLM_WORKER_IMAGE` | optional prebuilt worker image (deps and base model baked in); any image exposing the pinned worker stack works |
 | `AUTOSLM_MIN_CUDA` | minimum host driver CUDA version. Auto: 13.0 for Blackwell classes (RTX 5090 / RTX Pro 6000 / B200 — their wheels ship no SASS; older drivers cannot JIT the PTX) on the modern stack, 12.8 otherwise |
@@ -215,6 +213,15 @@ host — see [self-hosting](self-hosting.md)):
 | `RL_VLLM_MAX_LEN` | colocated engine context bound (default prompt+completion; prevents full-context KV sizing). |
 | `VLLM_ATTENTION_BACKEND` | escape hatch (e.g. `TRITON_ATTN`) when a host driver cannot JIT vllm's bundled flash-attn PTX |
 | `PYTORCH_ALLOC_CONF` | allocator tuning (torch >= 2.10 name; both names are set on the worker). Default `expandable_segments:True`; with `RL_VLLM_SLEEP=1` use `garbage_collection_threshold:0.8,max_split_size_mb:256` instead. |
+
+### On-disk state (not configurable)
+
+The control plane keeps all persistent state under a fixed `~/.autoslm/` directory — there
+are no path env vars. It holds the SQLite key/ownership DB (`server.db`), run status + logs
+(`runs/`), and run metrics (`results/`). Mount one volume at `~/.autoslm` (`/root/.autoslm`
+in the Docker image) to persist it; see [self-hosting](self-hosting.md). On first start the
+server best-effort migrates state from pre-consolidation locations (cwd-relative
+`.autoslm/runs` + `results/`, or the old `/state` Docker mount) into this root.
 
 ### Colocated GRPO on one consumer GPU (memory recipes)
 

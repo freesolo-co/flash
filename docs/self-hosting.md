@@ -24,10 +24,6 @@ user ──slm login / slm train──> control plane (this guide) ──> RunPo
 | `RUNPOD_API_KEY` | yes | RunPod key used to provision Flash GPUs |
 | `HUGGINGFACE_TOKEN` | yes | HF token with write access to `HF_REPO` |
 | `HF_REPO` | yes | HF *dataset* repo for adapters/checkpoints/heartbeats, e.g. `your-org/autoslm-runs` |
-| `AUTOSLM_DB_PATH` | no | SQLite path for keys + run ownership (default `~/.autoslm/server.db`) |
-| `AUTOSLM_RUNS_DIR` | no | run status/log files (default `.autoslm/runs`) |
-| `RESULTS_DIR` | no | metrics output (default `results`) |
-| `AUTOSLM_TRUST_PROXY` | no | set truthy when a reverse proxy (nginx/Caddy) fronts the server, so the per-IP `POST /v1/keys` claim throttle keys on the last `X-Forwarded-For` hop instead of the proxy's TCP peer. **Without it, all proxied clients share one peer IP and the throttle becomes per-deployment, not per-IP.** Only enable behind a proxy that strips client-supplied XFF. |
 | `AUTOSLM_VRAM_HEADROOM` | no | open-model VRAM sizing headroom for smart allocation (default `1.15`) |
 
 The server fails fast at startup if a required variable is missing. Provider credentials
@@ -48,7 +44,7 @@ Docker:
 docker build -t autoslm-server .
 docker run -p 8080:8080 \
   -e RUNPOD_API_KEY=... -e HUGGINGFACE_TOKEN=... -e HF_REPO=your-org/autoslm-runs \
-  -v autoslm-state:/state autoslm-server
+  -v autoslm-state:/root/.autoslm autoslm-server
 ```
 
 Point clients at it:
@@ -60,9 +56,18 @@ AUTOSLM_API_URL=https://your-host:8080 slm login
 
 ## Operational model (read this before going public)
 
-- **One instance only.** State is local files (run status/logs) + SQLite. Run exactly
-  one uvicorn worker per state volume; do not scale horizontally or use `--reload`.
-  Backup = the state volume (`AUTOSLM_DB_PATH` + `AUTOSLM_RUNS_DIR` + `RESULTS_DIR`).
+- **One instance only.** All state lives under the fixed `~/.autoslm/` directory: SQLite
+  keys/ownership (`server.db`), run status/logs (`runs/`), and metrics (`results/`). Mount
+  one volume at `~/.autoslm` (`/root/.autoslm` in the container) to persist it; back it up.
+  Run exactly one uvicorn worker per state volume; do not scale horizontally or `--reload`.
+  *Upgrading from an older build?* On first start the server best-effort migrates state from
+  the pre-consolidation locations (cwd-relative `.autoslm/runs` + `results/`, or the old
+  `/state` Docker mount) into `~/.autoslm`. Docker users who mounted the volume at `/state`
+  should just remount that same volume at `/root/.autoslm` (its contents land in place).
+- **Run behind a reverse proxy.** The per-IP `POST /v1/keys` claim throttle keys on the
+  last `X-Forwarded-For` hop (the control plane assumes a trusted proxy / load balancer
+  that strips client-supplied XFF). Don't expose it directly — a direct deployment would
+  let a client spoof `X-Forwarded-For` to bypass the throttle.
 - **Open key claiming = open GPU spend.** There is no billing yet: anyone who can reach
   `POST /v1/keys` can claim a key and start runs **on your RunPod account**. Guards in
   place: a per-IP claim throttle (5/hour) and the per-run `gpu.max_wall_seconds` execution

@@ -13,13 +13,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        os.environ["AUTOSLM_RUNS_DIR"] = os.path.join(tmp, "runs")
-        os.environ["RESULTS_DIR"] = os.path.join(tmp, "results")
         import autoslm.flash.train as flash_train
         import autoslm.orchestrator as orchestrator
 
         importlib.reload(flash_train)
         importlib.reload(orchestrator)
+        # Storage roots are fixed constants now; redirect via monkeypatch (auto-restored).
+        monkeypatch.setattr(orchestrator, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(orchestrator, "RESULTS_DIR", os.path.join(tmp, "results"))
         from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}

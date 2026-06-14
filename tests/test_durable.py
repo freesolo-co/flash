@@ -150,13 +150,15 @@ def _restore_skip_net():
         os.environ["AUTOSLM_SKIP_NET"] = saved
 
 
-def _fresh_orchestrator(tmp):
-    os.environ["AUTOSLM_RUNS_DIR"] = os.path.join(tmp, "runs")
-    os.environ["RESULTS_DIR"] = os.path.join(tmp, "results")
+def _fresh_orchestrator(tmp, monkeypatch):
     os.environ.pop("AUTOSLM_SKIP_NET", None)
     import autoslm.orchestrator as orch
 
     importlib.reload(orch)
+    # Storage roots are fixed constants now; redirect to tmp via monkeypatch so they're
+    # restored after the test (the module object is shared, so a bare assignment would leak).
+    monkeypatch.setattr(orch, "RUNS_DIR", os.path.join(tmp, "runs"))
+    monkeypatch.setattr(orch, "RESULTS_DIR", os.path.join(tmp, "results"))
     return orch
 
 
@@ -174,7 +176,7 @@ def _spec(run_id):
 
 def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        orch = _fresh_orchestrator(tmp)
+        orch = _fresh_orchestrator(tmp, monkeypatch)
         import autoslm.flash.durable as durable
         import autoslm.flash.train as flash_train
 
@@ -200,7 +202,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
 
 def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        orch = _fresh_orchestrator(tmp)
+        orch = _fresh_orchestrator(tmp, monkeypatch)
         import autoslm.flash.durable as durable
         import autoslm.flash.train as flash_train
 
@@ -226,7 +228,7 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_cancel_uses_rest_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        orch = _fresh_orchestrator(tmp)
+        orch = _fresh_orchestrator(tmp, monkeypatch)
         from autoslm.flash import runpod_api
 
         status = orch.RunStatus(
@@ -250,7 +252,7 @@ def test_cancel_uses_rest_handle(monkeypatch):
 
 def test_attach_completes_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        orch = _fresh_orchestrator(tmp)
+        orch = _fresh_orchestrator(tmp, monkeypatch)
         import autoslm.flash.durable as durable
         import autoslm.flash.train as flash_train
 
@@ -277,7 +279,7 @@ def test_attach_clears_stale_handle_before_resuming_seeds(monkeypatch):
     # handle must be cleared before the remaining seeds run: a restart in the
     # provisioning gap must not reattach recovery to the finished job.
     with tempfile.TemporaryDirectory() as tmp:
-        orch = _fresh_orchestrator(tmp)
+        orch = _fresh_orchestrator(tmp, monkeypatch)
         import autoslm.flash.durable as durable
         import autoslm.flash.train as flash_train
         from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
@@ -314,21 +316,21 @@ def test_attach_clears_stale_handle_before_resuming_seeds(monkeypatch):
         assert seen["remote"] is None, "stale completed handle must be cleared before resuming"
 
 
-def test_attach_requires_handle():
+def test_attach_requires_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        orch = _fresh_orchestrator(tmp)
+        orch = _fresh_orchestrator(tmp, monkeypatch)
         orch._save_status(orch.RunStatus(run_id="nh", state="running", spec=_spec("nh").to_dict()))
         with pytest.raises(ValueError, match="no persisted job handle"):
             orch.attach_run("nh")
 
 
-def test_update_will_not_overwrite_terminal_with_lifecycle_state():
+def test_update_will_not_overwrite_terminal_with_lifecycle_state(monkeypatch):
     # Terminal states are STICKY: once cancelled, no other state may overwrite it —
     # neither a non-terminal lifecycle write (provisioning/running) NOR a late terminal
     # done/failed from a worker that finished as the cancel arrived. Same-state writes
     # still pass so terminal field updates (cost_usd, error) are preserved.
     with tempfile.TemporaryDirectory() as tmp:
-        orch = _fresh_orchestrator(tmp)
+        orch = _fresh_orchestrator(tmp, monkeypatch)
         orch._save_status(orch.RunStatus(run_id="c", state="cancelled", spec=_spec("c").to_dict()))
         orch._update("c", "provisioning")
         assert orch.get_status("c").state == "cancelled", "cancelled must not become provisioning"
