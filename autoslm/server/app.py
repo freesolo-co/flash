@@ -86,7 +86,6 @@ def recover_runs(log=None) -> None:
     """Re-attach to in-flight runs after a server restart (per-run daemon threads)."""
     from autoslm.orchestrator import _gc_run_endpoints, _update, attach_run, resume_run
 
-    active: set[str] = set()
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
@@ -95,34 +94,22 @@ def recover_runs(log=None) -> None:
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
-            # Only remote-backed runs are "active" (kept by the orphan sweep). A run
-            # with no handle is being failed below; if it had already rented a Vast
-            # instance (crash between rent and on_handle), it must NOT shield that
-            # instance from the sweep.
-            active.add(status.run_id)
+            # Only remote-backed runs are recoverable; a run with no handle is failed below.
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
         elif status.resume_seed_index is not None:
             # Multi-seed run that restarted in the inter-seed gap: the completed seed's
             # handle was deliberately cleared and the next index recorded. There is no
             # live job to reattach to, so resume the remaining seeds rather than failing
-            # the run and discarding the already-completed work. Keep it in `active` so
-            # the orphan sweep below doesn't reap the label its next seed will reuse.
-            active.add(status.run_id)
+            # the run and discarding the already-completed work.
             threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
             # The first attempt may have registered its uniquely-named RunPod
             # endpoint before on_handle() persisted the handle. GC it (by
             # reconstructed name) before failing, so it doesn't hold worker quota
-            # until manual cleanup. Best-effort; vast orphans are swept below.
+            # until manual cleanup. Best-effort.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(JobSpec.from_dict(status.spec))
             _update(status.run_id, "failed", error="server restarted before job submission")
-    # Vast instances bill until destroyed: anything labeled ours that no recoverable
-    # run owns is an orphan from a crash — destroy it now (best-effort, never raises).
-    if os.environ.get("VAST_API_KEY"):
-        from autoslm.providers.vast import sweep_orphans
-
-        sweep_orphans(active_labels=active)
 
 
 def create_app():
@@ -379,8 +366,8 @@ def create_app():
         with _deploy_lock(run_id):
             status = owned_run(run_id, key)
             spec = JobSpec.from_dict(status.spec)
-            # The deployment record carries the class actually served (a Vast-only
-            # training class falls back to a RunPod class at deploy time).
+            # The deployment record carries the class actually served (an unvalidated
+            # training class falls back to a RunPod-validated class at deploy time).
             deployed_gpu = (status.deployment or {}).get("gpu") or spec.gpu.type
             deleted = undeploy_adapter(run_id, gpu_name=deployed_gpu)
             # dev mode is scale-to-zero: the serve endpoint is created only on the first
@@ -440,8 +427,8 @@ def create_app():
                 model=spec.model,
                 hf_repo=os.environ.get("HF_REPO", ""),
                 adapter_prefix=adapter_prefix(spec),
-                # Use the class actually deployed (a Vast-only / unvalidated training
-                # class falls back to a RunPod class at deploy time). Recomputing from
+                # Use the class actually deployed (an unvalidated training class falls
+                # back to a RunPod-validated class at deploy time). Recomputing from
                 # spec.gpu.type could pick a different serve endpoint that undeploy and
                 # cancel — which target the recorded deployment GPU — would not delete.
                 gpu_name=deployment.get("gpu") or spec.gpu.type,

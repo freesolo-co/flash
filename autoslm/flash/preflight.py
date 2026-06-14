@@ -40,9 +40,7 @@ def check_run_preflight(require_hf: bool = True) -> None:
 
     Raises ``PreflightError`` listing every missing item (``RUNPOD_API_KEY``,
     ``HF_REPO``, ``HUGGINGFACE_TOKEN``) and how to set it. No-op when nothing is
-    missing. ``VAST_API_KEY`` is OPTIONAL — absent just disables the Vast substrate
-    (one log line); present, a cheap auth probe catches a bad key at startup
-    instead of at first allocation. See docs/self-hosting.md.
+    missing. See docs/self-hosting.md.
     """
     problems = _missing_credentials(require_hf=require_hf)
     if problems:
@@ -51,31 +49,3 @@ def check_run_preflight(require_hf: bool = True) -> None:
             + "\n".join(problems)
             + "\n\nSet these on the control-plane host (docs/self-hosting.md)."
         )
-    _check_vast()
-
-
-def _check_vast() -> None:
-    from autoslm._logging import get_logger
-
-    logger = get_logger(__name__)
-    if not os.environ.get("VAST_API_KEY"):
-        logger.info("VAST_API_KEY not set; the vast substrate is disabled (runpod only)")
-        return
-    # An explicit provider pin (AUTOSLM_PROVIDERS=runpod) disables vast without unsetting
-    # its key, so don't fail startup probing a key the allocator will never use.
-    from autoslm.providers import available_providers
-
-    if "vast" not in available_providers():
-        logger.info("AUTOSLM_PROVIDERS pin excludes vast; skipping the Vast auth probe")
-        return
-    if os.environ.get("AUTOSLM_SKIP_NET"):
-        return
-    try:
-        from autoslm.providers import vast_api
-
-        vast_api.list_instances()
-    except Exception as exc:
-        raise PreflightError(
-            f"VAST_API_KEY is set but the Vast API rejected it: {exc}\n"
-            "Fix or unset it (unset = runpod-only) on the control-plane host."
-        ) from exc

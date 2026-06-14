@@ -39,7 +39,7 @@ seeds = [0, 1]                # one dedicated GPU per seed
 
 [gpu]
 # type = "RTX 5090"          # pin a GPU class; OMIT (or "cheapest") for smart allocation
-# provider = "auto"          # "auto" | "runpod" | "vast" (vast = verified datacenters only)
+# provider = "auto"          # "auto" | "runpod"
 disk_gb = 60                 # worker container disk GB (raised automatically to the
                              # model's min_disk_gb; raise-only above the 64 GB default)
 max_wall_seconds = 86400     # execution cap (per seed; enforced on every substrate)
@@ -53,39 +53,31 @@ max_retries = 2              # auto-resubmit budget for infra failures (stall/wo
 ## GPU selection (smart allocation)
 
 When `gpu.type` is omitted (or set to **`"cheapest"`**/`"auto"`), AutoSLM allocates the
-**cheapest GPU across providers** with enough VRAM to comfortably run the full job
-(sized for GRPO — the heavier phase of the usual SFT→GRPO pipeline — with headroom for
-open models; curated catalog entries carry measured minimums). Allocation happens
-live at submit time, per attempt:
+**cheapest RunPod GPU** with enough VRAM to comfortably run the full job (sized for
+GRPO — the heavier phase of the usual SFT→GRPO pipeline — with headroom for open
+models; curated catalog entries carry measured minimums). Allocation happens live at
+submit time, per attempt:
 
 - **RunPod**: every Flash class, ranked by live RunPod pricing (cached 6 h; static
   snapshot offline).
-- **Vast.ai**: live offers from **verified datacenter hosts only** — never consumer
-  machines — additionally filtered by reliability (≥ 0.95), download bandwidth
-  (≥ 200 Mbps), disk, and the class's minimum CUDA driver (Blackwell needs CUDA 13).
-  Enabled when the operator sets `VAST_API_KEY`.
 
 `gpu.type` accepts any managed class (`RTX 4090`, `RTX 5090`, `RTX A4000`, `RTX A4500`,
-`RTX 4000 Ada`, `RTX 2000 Ada`, `RTX A5000`, `RTX 3090`, `L4`, `RTX Pro 4000`, `A40`,
-`RTX A6000`, `RTX 6000 Ada`, `L40S`, `A100 SXM 40GB`, `A100 PCIe`, `A100 SXM`, `H100`,
-`H200`, `RTX Pro 6000`, `B200`); a concrete name pins the class and the allocator only
-picks the cheaper provider for it. `gpu.provider` pins the substrate (`L40S`,
-`RTX Pro 4000`, `A100 SXM 40GB` are vast-only; `RTX Pro 6000`/`B200` runpod-only).
-`slm gpus` shows the live per-provider price book.
+`RTX 4000 Ada`, `RTX 2000 Ada`, `RTX A5000`, `RTX 3090`, `L4`, `A40`, `RTX A6000`,
+`RTX 6000 Ada`, `A100 PCIe`, `A100 SXM`, `H100`, `H200`, `RTX Pro 6000`, `B200`); a
+concrete name pins the class. `slm gpus` shows the live price book.
 
 Two guard rails:
 
-- Validation is **per provider**: only classes that passed AutoSLM's live train
-  smoke on a substrate are selectable there by default; others need
-  `gpu.allow_unvalidated = true` (or `AUTOSLM_GPU_ALLOW_UNVALIDATED=1`).
-  `"cheapest"` honors the same gate.
+- Only classes that passed AutoSLM's live train smoke on RunPod are selectable by
+  default; others need `gpu.allow_unvalidated = true` (or
+  `AUTOSLM_GPU_ALLOW_UNVALIDATED=1`). `"cheapest"` honors the same gate.
 - "Cheapest" means cheapest **per hour**, not per run: older Ampere cards
   (A4000/A5000/3090/A40) are 2–4x cheaper than a 4090/5090 but also slower per step —
   a good trade for queue-pressure escape and small models; measure before committing
   long runs.
 
 Serving (`slm deploy` / `slm chat`) runs on RunPod Flash only: a run trained on a
-vast-only class is served from its model's default RunPod class automatically.
+class that isn't RunPod-validated is served from a RunPod-validated class automatically.
 
 ### Big checkpoints (`disk_gb` / `min_disk_gb`)
 
@@ -196,7 +188,6 @@ host — see [self-hosting](self-hosting.md)):
 | Var | Purpose |
 |---|---|
 | `RUNPOD_API_KEY` | RunPod auth (operator credential) |
-| `VAST_API_KEY` | Vast.ai auth (operator credential, optional) — enables verified-datacenter offers in cross-provider allocation (see [self-hosting](self-hosting.md) for the `AUTOSLM_VAST_*` tuning knobs) |
 | `HF_REPO` | HF **dataset** repo for adapters/checkpoints + code delivery |
 | `HUGGINGFACE_TOKEN` | write access to `HF_REPO` |
 | `AUTOSLM_DB_PATH` | control-plane SQLite (keys + run ownership) |

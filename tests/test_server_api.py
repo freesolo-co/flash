@@ -273,7 +273,6 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
     monkeypatch.setenv("AUTOSLM_DB_PATH", str(tmp_path / "s.db"))
     monkeypatch.setenv("AUTOSLM_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("RESULTS_DIR", str(tmp_path / "results"))
-    monkeypatch.delenv("VAST_API_KEY", raising=False)
     import autoslm.orchestrator as orchestrator
 
     importlib.reload(orchestrator)
