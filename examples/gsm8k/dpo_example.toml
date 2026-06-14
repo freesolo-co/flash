@@ -1,0 +1,19 @@
+# Offline preference optimization on any HF dataset with prompt/chosen/rejected columns.
+model = "Qwen/Qwen3-0.6B"
+algorithm = "dpo"
+
+[environment]
+id = "gsm8k"   # used for evaluation
+[environment.params]
+preference_dataset = "trl-lib/ultrafeedback_binarized"
+preference_split = "train"
+
+[train]
+epochs = 1
+lora_rank = 32
+seeds = [0]
+eval_examples = 200
+
+[gpu]
+type = "RTX 4090"
+max_cost_usd = 3.0

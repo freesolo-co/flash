@@ -1,0 +1,29 @@
+# GRPO post-train on a "real, extended" competition-math task.
+# Train on the official MATH train split (EleutherAI/hendrycks_math, all 7 subjects,
+# ~7.5k problems), eval on MATH-500. The train split is disjoint from MATH-500
+# (2 incidental matches / 500), so there is no eval leakage. Gold answers are
+# derived from each solution's \boxed{}.
+model = "Qwen/Qwen3-4B-Instruct-2507"
+algorithm = "grpo"
+
+[environment]
+id = "math"
+
+[environment.params]
+train_dataset = "EleutherAI/hendrycks_math"
+train_configs = ["algebra", "counting_and_probability", "geometry", "intermediate_algebra", "number_theory", "prealgebra", "precalculus"]
+train_split = "train"
+eval_dataset = "HuggingFaceH4/MATH-500"
+eval_split = "test"
+
+[train]
+steps = 150
+lora_rank = 32
+lora_alpha = 64
+seeds = [0, 1]
+eval_examples = 500
+
+[gpu]
+type = "RTX 5090"
+disk_gb = 80
+max_wall_seconds = 86400

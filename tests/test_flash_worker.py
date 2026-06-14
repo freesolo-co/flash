@@ -1,0 +1,124 @@
+"""Regression tests for the Flash worker plumbing fixed in this PR.
+
+Covers:
+- build_worker_env forwards the documented RL/vLLM tuning knobs to the GPU worker
+  (they were silently dropped) and sets a fragmentation-safe allocator default;
+- the runpod_flash backoff OverflowError that aborted long runs is patched;
+- the serve cold-start execution timeout is generous + env-overridable;
+- per-phase error artifact names don't collide (train error survives a later eval error).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+
+def _spec():
+    from autoslm.worker_spec import JobSpec, TrainSpec
+
+    return JobSpec(
+        model="Qwen/Qwen3-4B-Instruct-2507",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), eval_examples=8),
+    )
+
+
+def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
+    """DEFECT: RL_VLLM_GPU_UTIL / RL_PER_DEVICE_PROMPTS (and the others) were never added to
+    the forward list, so the docs' OOM-fix advice couldn't reach the worker."""
+    from autoslm.flash.train import build_worker_env
+
+    knobs = {
+        "RL_VLLM_GPU_UTIL": "0.40",
+        "RL_VLLM_SLEEP": "1",
+        "RL_PER_DEVICE_PROMPTS": "2",
+        "RL_PROMPTS_PER_STEP": "16",
+        "RL_GROUP_SIZE": "8",
+        "RL_MAX_COMPLETION": "512",
+        "VLLM_USE_V1": "0",
+        "SFT_PER_DEVICE_BS": "4",
+        "EVAL_MAX_NEW_TOKENS": "1024",
+    }
+    for k, v in knobs.items():
+        monkeypatch.setenv(k, v)
+
+    env = build_worker_env(_spec(), 0)
+    for k, v in knobs.items():
+        assert env.get(k) == v, f"{k} not forwarded to worker"
+    # fragmentation-safe allocator default is always set
+    assert "PYTORCH_CUDA_ALLOC_CONF" in env
+
+
+def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
+    from autoslm.flash.train import build_worker_env
+
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
+    env = build_worker_env(_spec(), 0)
+    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
+
+
+def test_runpod_backoff_no_overflow_on_long_runs():
+    """DEFECT: runpod_flash computed base*(2**attempt) then clamped, so a long poll loop
+    overflowed (~80 min in) and killed a healthy job. The patch caps the exponent first."""
+    pytest.importorskip("runpod_flash")
+    from autoslm.flash.train import _patch_runpod_backoff
+
+    _patch_runpod_backoff()
+    from runpod_flash.core.utils import backoff
+
+    # Pre-patch this raised OverflowError; now it must return a clamped, finite delay.
+    delay = backoff.get_backoff_delay(5000, max_seconds=5)
+    assert delay <= 5 * 1.2 + 1e-9
+    # the serverless module's imported reference is patched too (that's the real call site)
+    from runpod_flash.core.resources import serverless
+
+    assert serverless.get_backoff_delay(100000, max_seconds=5) <= 5 * 1.2 + 1e-9
+
+
+def test_serve_execution_timeout_default_and_override(monkeypatch):
+    """DEFECT: serve execution cap (10 min) was shorter than a cold serving worker's
+    startup, so the first slm chat/deploy failed with 'executionTimeout exceeded'."""
+    from autoslm.serve import deploy
+
+    monkeypatch.delenv("AUTOSLM_SERVE_TIMEOUT_MS", raising=False)
+    assert deploy.serve_execution_timeout_ms() >= 20 * 60 * 1000  # generous default
+
+    monkeypatch.setenv("AUTOSLM_SERVE_TIMEOUT_MS", str(30 * 60 * 1000))
+    assert deploy.serve_execution_timeout_ms() == 30 * 60 * 1000
+
+
+def test_error_artifact_name_is_per_phase():
+    """DEFECT: a crashed train phase's error was clobbered when the eval phase also failed.
+    Per-phase error files keep the root-cause train traceback."""
+    from autoslm.engine.worker import error_artifact_name
+
+    names = {error_artifact_name(m) for m in ("sft", "rl", "eval_after", "eval_only")}
+    assert len(names) == 4  # distinct per phase -> no clobber
+    assert error_artifact_name("rl") == "error_rl.txt"
+
+
+def test_train_body_imports_every_name_it_uses():
+    """Flash ships only _train_body's source to the worker, where module-level
+    imports are out of scope, so every stdlib/3p name it references must be
+    imported inside the function body (else NameError before training)."""
+    import ast
+    import inspect
+
+    from autoslm.flash import train
+
+    tree = ast.parse(inspect.getsource(train._train_body))
+    fn = tree.body[0]
+    imported = {
+        alias.asname or alias.name.split(".")[0]
+        for node in ast.walk(fn)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    # Names that must be locally imported (regression: contextlib was missing).
+    for name in ("contextlib", "json", "os", "subprocess", "sys"):
+        assert name in imported, f"_train_body uses {name!r} without a local import"

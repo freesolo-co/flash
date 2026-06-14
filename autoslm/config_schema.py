@@ -1,0 +1,255 @@
+"""Parse AutoSLM TOML configs into worker JobSpecs."""
+
+from __future__ import annotations
+
+import os
+import tomllib
+from typing import Any
+
+from .catalog import normalize_algorithm, resolve_model
+from .flash.gpus import (
+    POLICY_NAMES,
+    SUPPORTED,
+    UnsupportedGpuError,
+    canonical_gpu,
+    is_validated,
+    providers_for,
+    resolve_gpu_policy,
+    unvalidated_allowed,
+)
+from .worker_spec import DistillSpec, EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def load_toml(path: str) -> dict[str, Any]:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def spec_from_file(
+    path: str,
+    run_id: str | None = None,
+    overrides: list[str] | None = None,
+    extra_configs: list[str] | None = None,
+) -> JobSpec:
+    base_dir = os.path.dirname(os.path.abspath(path))
+    raw = load_toml(path)
+    # Composed configs: later files override earlier keys (deep merge).
+    for extra in extra_configs or []:
+        _deep_merge(raw, load_toml(extra))
+    # `--set key=value` dotted overrides (highest precedence).
+    for item in overrides or []:
+        _apply_override(raw, item)
+    return spec_from_dict(raw, base_dir=base_dir, run_id=run_id)
+
+
+def _deep_merge(base: dict, extra: dict) -> dict:
+    for k, v in extra.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def _coerce_scalar(value: str):
+    low = value.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _apply_override(raw: dict, item: str) -> None:
+    if "=" not in item:
+        raise ConfigError(f"--set must be key=value, got {item!r}")
+    key, value = item.split("=", 1)
+    parts = key.strip().split(".")
+    node = raw
+    for p in parts[:-1]:
+        node = node.setdefault(p, {})
+        if not isinstance(node, dict):
+            raise ConfigError(f"--set path {key!r} traverses a non-table value")
+    leaf = parts[-1]
+    # support list values like seeds=[0,1]
+    val = value.strip()
+    if val.startswith("[") and val.endswith("]"):
+        inner = val[1:-1].strip()
+        node[leaf] = [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
+    else:
+        node[leaf] = _coerce_scalar(val)
+
+
+def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None = None) -> JobSpec:
+    try:
+        model = raw["model"]
+    except KeyError as exc:
+        raise ConfigError("config must set `model`") from exc
+
+    try:
+        algorithm = normalize_algorithm(raw.get("algorithm"))
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    model_policy = (raw.get("model_policy") or "catalog").lower()
+    if model_policy not in ("catalog", "allow"):
+        raise ConfigError('model_policy must be "catalog" or "allow"')
+    thinking = raw.get("thinking", False)
+    if not isinstance(thinking, bool):
+        raise ConfigError("thinking must be a boolean")
+
+    env_raw = raw.get("environment") or {}
+    train_raw = raw.get("train") or {}
+    gpu_raw = raw.get("gpu") or {}
+
+    env_path = env_raw.get("path")
+    if env_path and not os.path.isabs(env_path):
+        env_path = os.path.normpath(os.path.join(base_dir, env_path))
+
+    # Smart allocation is the default: an omitted gpu.type means "the cheapest GPU
+    # (across providers) that fits the model", re-resolved live at submit time. The
+    # original request survives in gpu.requested so the orchestrator knows whether
+    # it may re-allocate (policy words) or must honor a concrete pin.
+    requested_gpu = str(gpu_raw.get("requested") or gpu_raw.get("type") or "auto")
+    provider = str(gpu_raw.get("provider") or "auto").strip().lower()
+    if provider not in ("auto", "runpod", "vast"):
+        raise ConfigError('gpu.provider must be "auto", "runpod", or "vast"')
+    allow_unval = gpu_raw.get("allow_unvalidated")
+    if allow_unval is not None and not isinstance(allow_unval, bool):
+        raise ConfigError("gpu.allow_unvalidated must be a boolean")
+    try:
+        # Parse-time provisional: "cheapest"/"auto" resolve to the cheapest validated
+        # RunPod-static class that fits (deterministic offline; open models sized from
+        # HF metadata); concrete names are canonicalized. The submit-time allocator
+        # re-resolves policy words live across providers.
+        gpu_type = resolve_gpu_policy(
+            requested_gpu, model, allow_unvalidated=allow_unval, algorithm=algorithm
+        )
+    except UnsupportedGpuError as exc:
+        raise ConfigError(str(exc)) from exc
+    pinned = requested_gpu.strip().lower() not in POLICY_NAMES
+    if pinned and provider != "auto" and provider not in providers_for(gpu_type):
+        raise ConfigError(
+            f"gpu type {gpu_type!r} is not available on provider {provider!r} "
+            f"(providers: {', '.join(providers_for(gpu_type))})"
+        )
+    if (
+        pinned
+        and not is_validated(gpu_type, provider if provider != "auto" else None)
+        and not unvalidated_allowed(allow_unval)
+    ):
+        raise ConfigError(
+            f"gpu type {gpu_type!r} has not passed AutoSLM's live validation smoke"
+            f"{' on ' + provider if provider != 'auto' else ''} "
+            f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true "
+            f"(or AUTOSLM_GPU_ALLOW_UNVALIDATED=1) to use it anyway."
+        )
+    try:
+        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    if thinking and info.thinking == "none":
+        raise ConfigError(
+            f"{model} does not support thinking mode (its chat template has no "
+            f"<think> support); pick a thinking-capable model — `slm models` lists "
+            f"each model's thinking capability"
+        )
+    if not thinking and info.thinking == "always":
+        raise ConfigError(
+            f"{model} always emits <think> reasoning and cannot run with thinking "
+            f"disabled; set thinking = true"
+        )
+    if thinking and info.thinking == "unknown":
+        print(
+            f"warning: open-model policy: cannot verify that {model}'s chat template "
+            f"supports thinking mode; the run proceeds with enable_thinking=true"
+        )
+
+    spec = JobSpec(
+        model=model,
+        algorithm=algorithm,
+        environment=EnvironmentSpec(
+            id=env_raw.get("id", "gsm8k"),
+            params=dict(env_raw.get("params") or {}),
+            path=env_path,
+            pip=tuple(str(p) for p in env_raw.get("pip") or ()),
+        ),
+        train=TrainSpec(
+            steps=train_raw.get("steps"),
+            epochs=train_raw.get("epochs"),
+            lora_rank=int(train_raw.get("lora_rank", 32)),
+            lora_alpha=int(train_raw.get("lora_alpha", 64)),
+            seeds=tuple(int(s) for s in train_raw.get("seeds", (0,))),
+            eval_examples=int(train_raw.get("eval_examples", 300)),
+            init_from_adapter=str(train_raw.get("init_from_adapter") or ""),
+        ),
+        gpu=GpuSpec(
+            type=gpu_type,
+            provider=provider,
+            requested=requested_gpu,
+            allow_unvalidated=allow_unval,
+            disk_gb=int(gpu_raw.get("disk_gb", 60)),
+            max_wall_seconds=int(gpu_raw.get("max_wall_seconds", 24 * 3600)),
+            max_retries=int(gpu_raw.get("max_retries", 2)),
+            network_volume=gpu_raw.get("network_volume"),
+            network_volume_gb=int(gpu_raw.get("network_volume_gb", 100)),
+            datacenter=gpu_raw.get("datacenter"),
+        ),
+        run_id=run_id or raw.get("run_id", "local"),
+        model_policy=model_policy,
+        thinking=thinking,
+        distill=DistillSpec(
+            teacher=(raw.get("distill") or {}).get("teacher", ""),
+            lmbda=float((raw.get("distill") or {}).get("lmbda", 1.0)),
+            max_completion=int((raw.get("distill") or {}).get("max_completion", 320)),
+            temperature=float((raw.get("distill") or {}).get("temperature", 1.0)),
+        ),
+    )
+    _validate_spec(spec)
+    return spec
+
+
+def _validate_spec(spec: JobSpec) -> None:
+    if not spec.train.seeds:
+        raise ConfigError("train.seeds must contain at least one seed")
+    try:
+        canonical_gpu(spec.gpu.type)
+    except UnsupportedGpuError as exc:
+        raise ConfigError(str(exc)) from exc
+    # GRPO and OPD are step-driven; SFT and DPO are epoch-driven. Reject a
+    # non-positive explicit count for whichever the algorithm consumes, so an
+    # invalid config fails here instead of provisioning a worker that silently
+    # falls back to a default count.
+    if spec.algorithm in ("grpo", "opd") and spec.train.steps is not None and spec.train.steps <= 0:
+        raise ConfigError(f"train.steps must be positive for {spec.algorithm.upper()}")
+    if (
+        spec.algorithm in ("sft", "dpo")
+        and spec.train.epochs is not None
+        and spec.train.epochs <= 0
+    ):
+        raise ConfigError(f"train.epochs must be positive for {spec.algorithm.upper()}")
+    if spec.algorithm == "opd" and not spec.distill.teacher:
+        raise ConfigError('algorithm "opd" requires [distill] teacher = "<hf model id>"')
+    if spec.algorithm == "dpo" and not (spec.environment.params or {}).get("preference_dataset"):
+        raise ConfigError(
+            'algorithm "dpo" requires [environment.params] preference_dataset = "org/name"'
+        )
+    if spec.train.lora_rank <= 0:
+        raise ConfigError("train.lora_rank must be positive")
+    # lora_alpha scales the adapter contribution; 0 (or negative) trains a paid run
+    # that produces a no-op adapter (zero scaling at serve/eval). Reject up front.
+    if spec.train.lora_alpha <= 0:
+        raise ConfigError("train.lora_alpha must be positive")
+    # A non-positive eval count is a deterministic config error: GSM8K crashes in
+    # eval_subset_indices and the math env reads it as "all rows". Fail fast here
+    # instead of on a paid worker reporting metrics for the wrong eval set.
+    if spec.train.eval_examples <= 0:
+        raise ConfigError("train.eval_examples must be positive")

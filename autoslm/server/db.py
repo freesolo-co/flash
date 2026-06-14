@@ -1,0 +1,143 @@
+"""SQLite store for the managed control plane: API keys + run ownership.
+
+Run *state* stays in the orchestrator's JSON files (``AUTOSLM_RUNS_DIR``) — the
+battle-tested durable/attach/cancel paths all read those. This database is only the
+key registry and the run -> key ownership index that makes the server multi-tenant.
+
+Connections are opened per operation (cheap for SQLite, avoids cross-thread state;
+the orchestrator runs jobs in daemon threads inside the same process).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import secrets
+import sqlite3
+import time
+from pathlib import Path
+
+KEY_PREFIX = "sk-autoslm-"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS api_keys (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  key_hash     TEXT NOT NULL UNIQUE,
+  key_prefix   TEXT NOT NULL,
+  email        TEXT,
+  created_at   REAL NOT NULL,
+  last_used_at REAL,
+  disabled     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS runs (
+  run_id     TEXT PRIMARY KEY,
+  key_id     INTEGER NOT NULL REFERENCES api_keys(id),
+  kind       TEXT NOT NULL DEFAULT 'train',
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
+"""
+
+
+def db_path() -> str:
+    return os.environ.get("AUTOSLM_DB_PATH", str(Path.home() / ".autoslm" / "server.db"))
+
+
+def _connect() -> sqlite3.Connection:
+    path = db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(_SCHEMA)
+    return conn
+
+
+def hash_key(api_key: str) -> str:
+    # API keys are 192-bit random tokens (secrets.token_hex(24)), not passwords:
+    # brute-forcing the keyspace is infeasible, so an unsalted fast hash is the
+    # standard at-rest form and keeps O(1) lookup by hash. (CodeQL's
+    # password-hashing rule does not apply to high-entropy machine tokens.)
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def create_key(email: str | None = None) -> dict:
+    """Mint a new API key. The full key is returned exactly once; only its hash is stored."""
+    api_key = KEY_PREFIX + secrets.token_hex(24)
+    prefix = api_key[: len(KEY_PREFIX) + 4]
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO api_keys (key_hash, key_prefix, email, created_at) VALUES (?, ?, ?, ?)",
+            (hash_key(api_key), prefix, email, now),
+        )
+    return {"api_key": api_key, "key_prefix": prefix, "email": email, "created_at": now}
+
+
+def ensure_internal_key(api_key: str, email: str = "freesolo-internal") -> dict:
+    """Provision a row for the shared freesolo internal/service key (idempotent).
+
+    The freesolo platform/SDK authenticate to the control plane with the same
+    ``FREESOLO_INTERNAL_KEY`` they already hold instead of a minted ``sk-autoslm-``
+    key. Backing it with a real row (inserted once, by hash) means run ownership and
+    the runs.key_id foreign key work exactly as for a normal key — all
+    internal-key runs share this single service identity (no per-user isolation;
+    the platform scopes users upstream)."""
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (hash_key(api_key), "internal", email, now),
+        )
+    row = lookup_key(api_key)
+    if row is None:  # pragma: no cover - the row was just inserted
+        raise RuntimeError("failed to provision the internal service key")
+    return row
+
+
+def lookup_key(api_key: str) -> dict | None:
+    """Resolve a presented key to its row (and touch last_used_at); None if unknown/disabled."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ? AND disabled = 0",
+            (hash_key(api_key),),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (time.time(), row["id"]))
+        return dict(row)
+
+
+def record_run(run_id: str, key_id: int, kind: str = "train") -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, ?, ?)",
+            (run_id, key_id, kind, time.time()),
+        )
+
+
+def delete_run(run_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+
+
+def run_owner(run_id: str) -> int | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT key_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        return row["key_id"] if row else None
+
+
+def runs_for_key(key_id: int) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT run_id, kind, created_at FROM runs WHERE key_id = ? ORDER BY created_at",
+            (key_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def all_runs() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT run_id, key_id, kind, created_at FROM runs").fetchall()
+        return [dict(r) for r in rows]

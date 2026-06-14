@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+.cache/
+.autoslm/
+results/
+hf_cache/
+uv-cache/
+dist/
+build/
+*.egg-info/
+.env
+.flash/

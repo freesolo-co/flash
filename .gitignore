@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+.cache/
+artifacts_local/
+hf_cache/
+*.log
+
+# Run artifacts: adapters (large binaries) live on the HF dataset repo, not in git
+results/
+.autoslm/
+uv-cache/
+.flash/
+
+# Operator credentials (use .env.example as the template)
+.env

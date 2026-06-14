@@ -1,0 +1,185 @@
+"""Cross-provider GPU allocation: the cheapest class that comfortably fits the run.
+
+Given a base model (+ algorithm), compute the VRAM the FULL run needs — sized for
+the heavier phase, GRPO, since the typical pipeline is SFT followed by GRPO — then
+rank every provisionable candidate across providers by live $/hr and pick the
+cheapest:
+
+  runpod  every Flash-provisionable class (live pricing, cached; static fallback)
+  vast    live verified-datacenter offers (usable_offers' quality floors applied)
+
+Allocation happens at SUBMIT time in the orchestrator (offers are a volatile
+market); the parse-time resolution in config_schema is a RunPod-static provisional
+for validation/dry-run display. Offline (AUTOSLM_SKIP_NET) the allocator degrades
+to exactly ``cheapest_gpu``'s deterministic static-rate answer.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+from dataclasses import dataclass
+
+from autoslm._logging import get_logger
+from autoslm.flash.gpus import (
+    GPU_INFO,
+    UnsupportedGpuError,
+    canonical_gpu,
+    unvalidated_allowed,
+)
+from autoslm.providers import available_providers
+from autoslm.providers.vast import VastOffer, usable_offers
+
+logger = get_logger(__name__)
+
+# "Comfortably" = the open-model VRAM estimate plus headroom, so a full SFT+GRPO run
+# never lands in check_fit's "tight" band by construction. Curated catalog entries
+# already carry measured minimums and are used as-is.
+VRAM_HEADROOM = float(os.environ.get("AUTOSLM_VRAM_HEADROOM", "1.15"))
+
+
+@dataclass(frozen=True)
+class Candidate:
+    provider: str
+    gpu: str
+    hourly_usd: float
+    vram_gb: int
+    validated: bool
+    offer: VastOffer | None = None  # cheapest matching offer (vast only)
+
+
+@dataclass(frozen=True)
+class Allocation:
+    provider: str
+    gpu: str
+    hourly_usd: float
+    min_vram_gb: int
+    offer: VastOffer | None
+    candidates: tuple[Candidate, ...]  # full ranked list (retry walks this)
+    vast_offers: tuple[VastOffer, ...]  # full offer book (offer-taken walk)
+
+
+def required_vram_gb(model_id: str, algorithm: str, model_policy: str = "catalog") -> int:
+    """VRAM the full run needs. Catalog entries carry measured minimums; open models
+    get the coarse estimate sized for GRPO (the heavier phase of the usual SFT+GRPO
+    pipeline) plus headroom. Unknown sizes fall back to the 24 GB tier (same as
+    ``resolve_gpu_policy``)."""
+    from autoslm.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    if info is not None:
+        return int(info.min_vram_gb)
+    from autoslm.engine.vram import estimate_vram_gb, fetch_hf_params_b
+
+    params_b = fetch_hf_params_b(model_id)
+    if params_b is None:
+        return 24
+    sizing_algo = algorithm if os.environ.get("AUTOSLM_SIZE_FOR_ALGO") == "job" else "grpo"
+    return math.ceil(estimate_vram_gb(params_b, sizing_algo) * VRAM_HEADROOM)
+
+
+def allocate(
+    model_id: str,
+    algorithm: str,
+    *,
+    gpu: str | None = None,
+    provider: str = "auto",
+    disk_gb: int = 60,
+    allow_unvalidated: bool | None = None,
+    model_policy: str = "catalog",
+    exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
+) -> Allocation:
+    """Pick the cheapest (provider, GPU class) able to run the job.
+
+    ``gpu`` pins the class (the allocator then only picks the provider);
+    ``provider`` pins the substrate. Both default to fully automatic.
+    """
+    if provider not in ("auto", "runpod", "vast"):
+        raise UnsupportedGpuError(f"unknown provider {provider!r} (auto, runpod, vast)")
+    pinned_gpu = canonical_gpu(gpu) if gpu else None
+    # The model's requirement is the floor regardless of a pin: an undersized concrete
+    # pin (e.g. Qwen3-8B on a 24 GB card) must drop out of the candidate filter and
+    # raise here, not provision a paid worker that OOMs. The pin only narrows WHICH
+    # fitting class is chosen, never lowers the VRAM bar.
+    need = required_vram_gb(model_id, algorithm, model_policy)
+    allow_unval = unvalidated_allowed(allow_unvalidated)
+    live = available_providers()
+    if provider != "auto" and provider not in live:
+        raise UnsupportedGpuError(
+            f"provider {provider!r} requested but not available on this control plane "
+            f"(available: {', '.join(live)}; vast needs VAST_API_KEY)"
+        )
+
+    candidates: list[Candidate] = []
+    if provider in ("auto", "runpod") and "runpod" in live:
+        from autoslm.flash.pricing import hourly_rate
+
+        for g in GPU_INFO.values():
+            if not g.enum_member or g.vram_gb < need:
+                continue
+            if pinned_gpu and g.name != pinned_gpu:
+                continue
+            if "runpod" not in g.validated_on and not allow_unval:
+                continue
+            candidates.append(
+                Candidate("runpod", g.name, hourly_rate(g.name), g.vram_gb, g.validated)
+            )
+
+    vast_book: list[VastOffer] = []
+    if provider in ("auto", "vast") and "vast" in live:
+        try:
+            vast_book = usable_offers(need, disk_gb, exclude_machine_ids=exclude_machine_ids)
+        except Exception as exc:
+            if provider == "vast":
+                raise UnsupportedGpuError(f"vast offer search failed: {exc}") from exc
+            logger.warning("vast offer search failed (%s); allocating on runpod only", exc)
+        seen: set[str] = set()
+        for o in vast_book:
+            if pinned_gpu and o.gpu != pinned_gpu:
+                continue
+            info = GPU_INFO[o.gpu]
+            if "vast" not in info.validated_on and not allow_unval:
+                continue
+            if o.gpu in seen:  # offers are price-sorted; keep the cheapest per class
+                continue
+            seen.add(o.gpu)
+            candidates.append(
+                Candidate("vast", o.gpu, o.dph_total, info.vram_gb, info.validated, offer=o)
+            )
+
+    if not candidates:
+        constraint = (
+            f"gpu pinned to {pinned_gpu}" if pinned_gpu else f">= {need} GB VRAM for {model_id}"
+        )
+        raise UnsupportedGpuError(
+            f"no allocatable GPU ({constraint}, provider={provider}, "
+            f"validated_only={not allow_unval}); widen with gpu.allow_unvalidated = true "
+            f"or a different gpu.type/provider"
+        )
+    # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small
+    # job), then runpod (the longest-validated substrate).
+    ranked = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, c.provider != "runpod"))
+    best = ranked[0]
+    return Allocation(
+        provider=best.provider,
+        gpu=best.gpu,
+        hourly_usd=best.hourly_usd,
+        min_vram_gb=need,
+        offer=best.offer,
+        candidates=tuple(ranked),
+        vast_offers=tuple(vast_book),
+    )
+
+
+def allocation_summary(a: Allocation) -> str:
+    head = (
+        f"allocated {a.gpu} on {a.provider} at ${a.hourly_usd:.2f}/hr "
+        f"(need >= {a.min_vram_gb} GB VRAM"
+    )
+    if a.offer is not None:
+        head += f", vast offer {a.offer.offer_id} in {a.offer.geolocation}"
+    head += ")"
+    if len(a.candidates) > 1:
+        nxt = a.candidates[1]
+        head += f"; next-best: {nxt.gpu}@{nxt.provider} ${nxt.hourly_usd:.2f}/hr"
+    return head

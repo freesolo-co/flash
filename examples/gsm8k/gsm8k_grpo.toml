@@ -1,0 +1,17 @@
+model = "Qwen/Qwen3-4B-Instruct-2507"
+algorithm = "grpo"
+
+[environment]
+id = "gsm8k"
+
+[train]
+steps = 150
+lora_rank = 32
+seeds = [0]
+eval_examples = 300
+
+[gpu]
+type = "RTX 5090"
+disk_gb = 60
+# Optional spend guard: stop launching further seeds once accrued cost crosses this (USD).
+# max_cost_usd = 10.0

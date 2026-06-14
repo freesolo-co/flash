@@ -1,0 +1,22 @@
+# On-policy distillation: a small student learns from a larger teacher's token-level
+# supervision on the student's own rollouts (often RL-level lift at a fraction of the cost).
+model = "Qwen/Qwen3-0.6B"
+algorithm = "opd"
+
+[environment]
+id = "gsm8k"
+
+[distill]
+teacher = "Qwen/Qwen3-4B-Instruct-2507"
+lmbda = 1.0            # fully on-policy
+max_completion = 320
+
+[train]
+steps = 60
+lora_rank = 32
+seeds = [0]
+eval_examples = 200
+
+[gpu]
+type = "RTX 4090"
+max_cost_usd = 3.0

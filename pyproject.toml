@@ -1,0 +1,101 @@
+[project]
+# INTERNAL monorepo backend — NOT a published distribution. The freesolo platform
+# reaches the control plane over HTTP (autoslm.freesolo.co); nothing installs this
+# from a package index. It stays a buildable project only so the control-plane
+# Docker image (`pip install .[server]`) and `uv` can build/run it from source.
+name = "autoslm-train"
+version = "0.2.0"
+description = "freesolo's managed LoRA post-training backend (internal; not published)"
+readme = "README.md"
+# RunPod Flash supports Python 3.10-3.12 (not 3.13 yet).
+requires-python = ">=3.11,<3.13"
+# SPDX expression only: the standalone-repo LICENSE file was dropped when this
+# was vendored into the monorepo (licensed at the repo root); a license-files
+# glob with no matching file fails the Hatchling build.
+license = "Apache-2.0"
+# The "Private :: Do Not Upload" trove classifier makes PyPI/twine refuse an upload,
+# so this can never be accidentally published.
+classifiers = ["Private :: Do Not Upload"]
+dependencies = [
+    "runpod-flash",
+    "huggingface-hub>=0.25",
+    "datasets>=2.19",
+]
+
+[project.optional-dependencies]
+# Heavy deps for running the fine-tuning worker locally (on the GPU worker these are
+# installed by RunPod Flash via WORKER_DEPS in autoslm/flash/train.py).
+gpu = [
+    "torch==2.10.0",
+    "transformers>=5.6,<5.11",
+    "trl>=1.5,<1.6",
+    "peft>=0.19",
+    "vllm==0.19.1",
+    "bitsandbytes>=0.49",
+    "accelerate>=1.4",
+]
+server = ["fastapi", "uvicorn"]
+# Convenience aggregate of all optional runtime extras.
+all = ["autoslm-train[gpu,server]"]
+
+[project.scripts]
+slm = "autoslm.cli.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["autoslm"]
+# Ship the PEP 561 marker so downstream type checkers pick up AutoSLM's type hints.
+artifacts = ["autoslm/py.typed"]
+# Ship the built-in example environments (gsm8k/math) as a sibling of the package so
+# upload_code() finds them on wheel/pipx installs (not just source checkouts) — the
+# worker resolves default runs from code/examples next to the package.
+force-include = { "examples" = "examples" }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+  "live: hits real provider APIs; opt in with AUTOSLM_LIVE_VAST=1 (plus provider creds)",
+]
+
+[tool.uv]
+# Heavy GPU extras are worker-side; keep the default sync light.
+package = true
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13.0",
+    "pytest>=9.0.3",
+    "ruff>=0.6",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_unused_configs = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "uv-cache"]
+
+[tool.ruff.lint]
+# Matches the backend/agent convention: pycodestyle, pyflakes, import sort,
+# pyupgrade, bugbear, comprehensions, simplify, returns, ruff-specific, perf,
+# pytest-style, fastapi, async, datetime-zone.
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RET", "RUF", "PERF", "PT", "FAST", "ASYNC", "DTZ"]
+# E501 (line length) is reported but not enforced as hard failure here; keep code tidy
+# without churn on long, descriptive comments/strings.
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests do sys.path hacks, importlib.reload, and intentional broad excepts.
+"tests/*" = ["E402", "B011", "F841"]
+# Routes live inside the create_app() closure; with PEP 563 lazy annotations,
+# Annotated[..., Depends(closure_local)] cannot be resolved by get_type_hints,
+# so the definition-time `= Depends(...)` form is required here.
+"autoslm/server/app.py" = ["FAST002"]
