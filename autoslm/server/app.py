@@ -134,10 +134,8 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app):
         from autoslm.flash.preflight import check_run_preflight
-        from autoslm.orchestrator import migrate_legacy_state
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
-        migrate_legacy_state()  # one-time: pull pre-~/.autoslm run state into the fixed root
         recover_runs()
         yield
 
