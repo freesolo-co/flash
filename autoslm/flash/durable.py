@@ -326,6 +326,14 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
     suffix = _run_suffix(spec.run_id)
     if attempt:
         suffix = f"{suffix}r{attempt}"
+    # Resolve the worker env BEFORE provisioning: an unrecorded Hub env raises here, and
+    # doing it after deploy_train_endpoint() would leak the just-created endpoint (its
+    # rN-suffixed name can't be reconstructed from the run id later) against the account
+    # quota — the orchestrator would also treat the raise as a retryable poll_error.
+    extra_pip = list(spec.environment.pip) or worker_pip_for_env(
+        spec.environment.id, spec.environment.params
+    )
+    worker_env = build_worker_env(spec, seed)
     endpoint_id, name = deploy_train_endpoint(
         spec.gpu.type,
         execution_timeout_ms=timeout_s * 1000,
@@ -338,9 +346,8 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
-        "env": build_worker_env(spec, seed),
-        "extra_pip": list(spec.environment.pip)
-        or worker_pip_for_env(spec.environment.id, spec.environment.params),
+        "env": worker_env,
+        "extra_pip": extra_pip,
     }
     try:
         job_id = submit(endpoint_id, payload)

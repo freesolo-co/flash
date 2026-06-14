@@ -18,6 +18,10 @@ from .worker_spec import JobSpec
 RUNS_DIR = os.environ.get("AUTOSLM_RUNS_DIR", ".autoslm/runs")
 RESULTS_DIR = os.environ.get("RESULTS_DIR", "results")
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
+# Terminal states a deploy must NOT overwrite. `done` is terminal but IS deployable
+# (deploying a finished run is the whole point), so it's excluded here; cancelled/failed/
+# dry_run must never be flipped to `deployed`.
+_UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
 # Serializes the read-check-write in _update so a status transition is an atomic
 # compare-and-set (the control plane is single-instance with per-run threads).
 _STATUS_LOCK = threading.Lock()
@@ -373,16 +377,49 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
     return get_status(run_id)
 
 
-def mark_deployed(run_id: str, deployment: dict) -> RunStatus:
+def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None) -> RunStatus:
     # Atomic + terminal-respecting (same guard as _update): a /cancel landing during
     # always-on provisioning/warmup writes `cancelled`; this must NOT overwrite it with
-    # `deployed` and resurrect the run as an active deployment.
+    # `deployed` and resurrect the run as an active deployment. `done` is deployable
+    # though (the common case: deploy a finished run), so only the non-`done` terminal
+    # states block here — otherwise a freshly finished run could never be deployed.
+    #
+    # expect_state is a compare-and-set: the deploy flow passes the state it expects the
+    # run to still be in (the pre-deploy snapshot, or "deployed" after the provisional
+    # mark). If an undeploy raced finalization — deleting the endpoint and writing `done`
+    # with deployment.state="undeployed" mid-warmup — the state no longer matches and we
+    # refuse to re-advertise the just-deleted endpoint.
     with _STATUS_LOCK:
         status = get_status(run_id)
-        if status.state in TERMINAL_STATES:
+        if status.state in _UNDEPLOYABLE_STATES:
+            return status
+        if expect_state is not None and status.state != expect_state:
             return status
         status.deployment = deployment
         status.state = "deployed"
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def mark_undeployed(run_id: str) -> RunStatus:
+    """Record an explicit undeploy (endpoint torn down -> run back to `done`).
+
+    Lock-guarded so it serializes with a racing deploy finalization: the raw read +
+    _save_status the endpoint used to do could interleave with mark_deployed and be
+    clobbered. With this under the same lock, mark_deployed's expect_state CAS then sees
+    the `done`/undeployed write and won't re-advertise the deleted endpoint.
+    """
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.deployment:
+            status.deployment = {**status.deployment, "state": "undeployed"}
+        # Record the teardown but don't resurrect a terminal run: undeploying a
+        # cancelled/failed run keeps its terminal state (only a live `deployed` run goes
+        # back to `done`). `done` is terminal too, so this naturally no-ops the state.
+        if status.state not in TERMINAL_STATES:
+            status.state = "done"
+        status.updated_at = time.time()
         _save_status(status)
         return status
 

@@ -180,6 +180,85 @@ def test_deploy_dry_run(api):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
+    # A finished run (state="done") MUST be deployable: mark_deployed has to record the
+    # deployment and flip to "deployed". But a cancelled/failed run must never be flipped
+    # to "deployed" (a /cancel racing always-on provisioning persisted the terminal state).
+    monkeypatch.setenv("AUTOSLM_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("RESULTS_DIR", str(tmp_path / "results"))
+    import autoslm.orchestrator as orchestrator
+
+    importlib.reload(orchestrator)
+
+    spec = {"model": "Qwen/Qwen3-4B-Instruct-2507", "algorithm": "grpo", "run_id": "dep-1"}
+    orchestrator._save_status(
+        orchestrator.RunStatus(run_id="dep-1", state="done", spec=spec, remote=None)
+    )
+    out = orchestrator.mark_deployed("dep-1", {"endpoint_name": "e", "mode": "dev"})
+    assert out.state == "deployed"
+    assert out.deployment == {"endpoint_name": "e", "mode": "dev"}
+
+    # cancelled is sticky: the deploy must be refused, state preserved.
+    orchestrator._save_status(
+        orchestrator.RunStatus(
+            run_id="dep-2", state="cancelled", spec={**spec, "run_id": "dep-2"}, remote=None
+        )
+    )
+    out2 = orchestrator.mark_deployed("dep-2", {"endpoint_name": "e2", "mode": "dev"})
+    assert out2.state == "cancelled"
+    assert out2.deployment is None
+
+
+def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_path):
+    # Redeploy finalization must NOT clobber an undeploy that raced in mid-warmup: the
+    # undeploy wrote `done`/undeployed and deleted the endpoint, so a final mark_deployed
+    # that still expects "deployed" must refuse to re-advertise the deleted endpoint.
+    monkeypatch.setenv("AUTOSLM_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("RESULTS_DIR", str(tmp_path / "results"))
+    import autoslm.orchestrator as orchestrator
+
+    importlib.reload(orchestrator)
+
+    spec = {"model": "Qwen/Qwen3-4B-Instruct-2507", "algorithm": "grpo", "run_id": "dep-3"}
+    orchestrator._save_status(
+        orchestrator.RunStatus(
+            run_id="dep-3",
+            state="deployed",
+            spec=spec,
+            remote=None,
+            deployment={"endpoint_name": "e", "mode": "always-on"},
+        )
+    )
+    # undeploy races in: endpoint torn down, run back to done/undeployed.
+    undone = orchestrator.mark_undeployed("dep-3")
+    assert undone.state == "done"
+    assert undone.deployment["state"] == "undeployed"
+    # the deploy that was warming finalizes expecting "deployed" -> refused.
+    out = orchestrator.mark_deployed("dep-3", {"endpoint_name": "e2"}, expect_state="deployed")
+    assert out.state == "done"
+    assert out.deployment["state"] == "undeployed"  # not re-advertised
+
+
+def test_deploy_lock_is_usable_and_weakly_cleaned():
+    # threading.Lock() isn't weak-referenceable, so the per-run lock must be a wrapper that
+    # both works as a context manager AND can live in the WeakValueDictionary (the raw lock
+    # would TypeError on the first deploy). It must also re-enter and serialize.
+    import gc
+
+    from autoslm.server import app as app_mod
+
+    lk = app_mod._deploy_lock("run-xyz")
+    assert app_mod._deploy_lock("run-xyz") is lk  # same lock for the same run while alive
+    with lk:
+        pass
+    with app_mod._deploy_lock("run-xyz"):  # re-acquirable after release
+        pass
+    # once nothing references it, the weak entry is dropped (no unbounded growth).
+    del lk
+    gc.collect()
+    assert "run-xyz" not in dict(app_mod._DEPLOY_LOCKS)
+
+
 def test_claim_throttle(api):
     for _ in range(5):
         _claim(api)

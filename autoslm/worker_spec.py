@@ -13,6 +13,29 @@ from .catalog import DEFAULT_MODEL, normalize_algorithm
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 
 
+def _opt_int(value: Any) -> int | None:
+    """int(value) or None — an omitted optional knob stays None (recipe default)."""
+    return None if value is None else int(value)
+
+
+def _opt_float(value: Any) -> float | None:
+    """float(value) or None — an omitted optional knob stays None (recipe default)."""
+    return None if value is None else float(value)
+
+
+def _str_tuple(value: Any) -> tuple[str, ...]:
+    """Normalize a string-or-list knob (e.g. stop_sequences) to a tuple of strings.
+
+    A bare string is ONE element — never iterated into characters ("</s>" must not become
+    ('<','/','s','>')). None and empty strings -> () (no stop configured); empty entries
+    in a list are dropped."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,) if value else ()
+    return tuple(s for s in (str(x) for x in value) if s)
+
+
 def _coerce_bool(value: Any) -> bool:
     """Parse a bool from loosely-typed spec sources (JSON/env/persisted dicts).
 
@@ -45,6 +68,26 @@ class TrainSpec:
     # Artifact-store adapter prefix (``<phase>/<run_id>/seed<N>``) to initialize the
     # LoRA from instead of training fresh — e.g. a GRPO run continuing an SFT adapter.
     init_from_adapter: str = ""
+    # Optimizer/batching knobs (SFT + GRPO). None -> the worker's tuned recipe default.
+    # batch_size is the GLOBAL/effective batch (SFT: grad-accum is sized to hit it; GRPO:
+    # prompts per optimizer step). max_length is the SFT max sequence length. save_every
+    # is the checkpoint interval in optimizer steps.
+    learning_rate: float | None = None
+    batch_size: int | None = None
+    max_length: int | None = None
+    save_every: int | None = None
+    # GRPO recipe knobs (datums parity), shipped by the SDK in [train]. None/() -> recipe
+    # default. group_size = completions per prompt; temperature = rollout sampling temp;
+    # max_tokens = completion budget; kl_penalty_coef = KL beta; advantage_clip = centered-
+    # advantage clamp; thinking_length_penalty_coef = per-<think>-token reward deduction;
+    # stop_sequences = rollout stop strings.
+    group_size: int | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    kl_penalty_coef: float | None = None
+    advantage_clip: float | None = None
+    thinking_length_penalty_coef: float | None = None
+    stop_sequences: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -119,6 +162,17 @@ class JobSpec:
                 lora_alpha=int(train.get("lora_alpha", 64)),
                 seeds=tuple(int(s) for s in train.get("seeds", (0,))),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
+                learning_rate=_opt_float(train.get("learning_rate")),
+                batch_size=_opt_int(train.get("batch_size")),
+                max_length=_opt_int(train.get("max_length")),
+                save_every=_opt_int(train.get("save_every")),
+                group_size=_opt_int(train.get("group_size")),
+                temperature=_opt_float(train.get("temperature")),
+                max_tokens=_opt_int(train.get("max_tokens")),
+                kl_penalty_coef=_opt_float(train.get("kl_penalty_coef")),
+                advantage_clip=_opt_float(train.get("advantage_clip")),
+                thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
+                stop_sequences=_str_tuple(train.get("stop_sequences")),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", "RTX 5090"),

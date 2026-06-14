@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from typing import Any
@@ -18,6 +19,60 @@ from .flash.gpus import (
     unvalidated_allowed,
 )
 from .worker_spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+
+
+def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
+    """Validate an optional integer [train] knob (>= minimum) -> ConfigError (HTTP 400).
+
+    None stays None (recipe default). Rejects bools, non-numbers, non-integers, and
+    out-of-range values at parse time instead of letting them reach a provisioned worker.
+    """
+    v = train_raw.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or float(v) != int(v):
+        raise ConfigError(f"train.{key} must be an integer")
+    v = int(v)
+    if v < minimum:
+        raise ConfigError(f"train.{key} must be >= {minimum}")
+    return v
+
+
+def _train_float(
+    train_raw: dict, key: str, *, minimum: float, exclusive: bool = False
+) -> float | None:
+    """Validate an optional float [train] knob -> ConfigError (HTTP 400). None stays None."""
+    v = train_raw.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ConfigError(f"train.{key} must be a number")
+    v = float(v)
+    # nan/inf slip past the range checks below (nan compares false, inf passes any minimum)
+    # and would reach TRL optimizer/sampling settings; reject them as a 400 here.
+    if not math.isfinite(v):
+        raise ConfigError(f"train.{key} must be a finite number")
+    if exclusive and v <= minimum:
+        raise ConfigError(f"train.{key} must be > {minimum}")
+    if not exclusive and v < minimum:
+        raise ConfigError(f"train.{key} must be >= {minimum}")
+    return v
+
+
+def _train_stops(train_raw: dict) -> tuple[str, ...]:
+    """Validate stop_sequences -> ConfigError. A string is ONE stop (never char-split);
+    a list must hold strings; empties are dropped; anything else is rejected."""
+    v = train_raw.get("stop_sequences")
+    if v is None:
+        return ()
+    if isinstance(v, str):
+        return (v,) if v else ()
+    if not isinstance(v, (list, tuple)):
+        raise ConfigError("train.stop_sequences must be a string or a list of strings")
+    for s in v:
+        if not isinstance(s, str):
+            raise ConfigError("train.stop_sequences entries must be strings")
+    return tuple(s for s in v if s)
 
 
 class ConfigError(ValueError):
@@ -189,6 +244,19 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
             lora_alpha=int(train_raw.get("lora_alpha", 64)),
             seeds=tuple(int(s) for s in train_raw.get("seeds", (0,))),
             init_from_adapter=str(train_raw.get("init_from_adapter") or ""),
+            learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
+            batch_size=_train_int(train_raw, "batch_size", minimum=1),
+            max_length=_train_int(train_raw, "max_length", minimum=1),
+            save_every=_train_int(train_raw, "save_every", minimum=1),
+            group_size=_train_int(train_raw, "group_size", minimum=1),
+            temperature=_train_float(train_raw, "temperature", minimum=0.0),
+            max_tokens=_train_int(train_raw, "max_tokens", minimum=1),
+            kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
+            advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
+            thinking_length_penalty_coef=_train_float(
+                train_raw, "thinking_length_penalty_coef", minimum=0.0
+            ),
+            stop_sequences=_train_stops(train_raw),
         ),
         gpu=GpuSpec(
             type=gpu_type,
