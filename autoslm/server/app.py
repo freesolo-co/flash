@@ -13,7 +13,6 @@ to their persisted RunPod job handles.
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import threading
 
@@ -21,7 +20,6 @@ from autoslm import __version__
 from autoslm.catalog import public_model_rows
 from autoslm.config_schema import ConfigError, spec_from_dict
 from autoslm.orchestrator import (
-    RunStatus,
     _save_status,
     adapter_prefix,
     cancel_run,
@@ -29,7 +27,6 @@ from autoslm.orchestrator import (
     mark_deployed,
     new_run_id,
     runs_file_path,
-    submit_eval_job,
     submit_job,
 )
 from autoslm.serve.deploy import chat as serve_chat
@@ -41,22 +38,6 @@ from . import auth, db
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
-
-
-def _eval_metrics(spec: JobSpec) -> dict | None:
-    path = os.path.join(
-        os.environ.get("RESULTS_DIR", "results"),
-        "runpod",
-        "eval",
-        spec.run_id,
-        f"seed{spec.train.seeds[0]}",
-        "metrics.json",
-    )
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
 
 
 def recover_runs(log=None) -> None:
@@ -185,7 +166,7 @@ def create_app():
     # Built-in env params that name a client-local filesystem path: the worker
     # has no such path, so a managed run would provision a GPU and then fail
     # opening it. Reject before submission.
-    _LOCAL_PATH_PARAMS = ("train_path", "eval_path", "workspace_path", "examples_path")
+    _LOCAL_PATH_PARAMS = ("train_path", "workspace_path", "examples_path")
 
     def _parse_spec(payload: dict, run_id: str) -> JobSpec:
         spec_raw = payload.get("spec") or {}
@@ -235,12 +216,7 @@ def create_app():
     @app.get("/v1/runs/{run_id}")
     def run_status(run_id: str, key: dict = Depends(require_key)):
         status = owned_run(run_id, key)
-        out = status.to_dict()
-        if status.state == "done" and run_id.startswith("eval-"):
-            metrics = _eval_metrics(JobSpec.from_dict(status.spec))
-            if metrics is not None:
-                out["metrics"] = metrics
-        return out
+        return status.to_dict()
 
     @app.get("/v1/runs/{run_id}/logs")
     def run_logs(run_id: str, offset: int = 0, key: dict = Depends(require_key)):
@@ -259,61 +235,12 @@ def create_app():
         owned_run(run_id, key)
         return cancel_run(run_id).to_dict()
 
-    @app.post("/v1/evals")
-    def create_eval(payload: dict, key: dict = Depends(require_key)):
-        spec = _parse_spec(payload, run_id=new_run_id("eval"))
-        dry_run = bool(payload.get("dry_run", False))
-        eval_adapter = None
-        adapter_run_id = payload.get("adapter_run_id")
-        if adapter_run_id:
-            train_status = owned_run(adapter_run_id, key)
-            train_spec = JobSpec.from_dict(train_status.spec)
-            # A non-dry eval provisions a GPU and downloads the adapter, so the
-            # source run must have actually produced one for the same base model.
-            if not dry_run and train_status.state not in _DEPLOYABLE_STATES:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"adapter run {adapter_run_id} is {train_status.state!r}; "
-                    "only a finished run has a downloadable adapter to evaluate",
-                )
-            if train_spec.model != spec.model:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"adapter run {adapter_run_id} trained {train_spec.model!r}, "
-                    f"but this eval requests {spec.model!r}; the adapter cannot load "
-                    "into a different base model",
-                )
-            eval_adapter = adapter_prefix(train_spec)
-        db.record_run(spec.run_id, key["id"], kind="eval")
-        if dry_run:
-            return submit_eval_job(spec, adapter_prefix=eval_adapter, dry_run=True).to_dict()
-
-        # Persist the queued status synchronously (like submit_job does) so a
-        # client that immediately follows the eval cannot 404 on its own run.
-        _save_status(RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()))
-
-        def _run():
-            # state/error are already persisted by submit_eval_job
-            with contextlib.suppress(Exception):
-                submit_eval_job(spec, adapter_prefix=eval_adapter)
-
-        threading.Thread(target=_run, daemon=True).start()
-        return {"run_id": spec.run_id, "state": "queued", "spec": spec.to_dict()}
-
     @app.post("/v1/runs/{run_id}/deploy")
     def deploy(run_id: str, payload: dict | None = None, key: dict = Depends(require_key)):
         payload = payload or {}
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
         dry_run = bool(payload.get("dry_run", False))
-        # Standalone evals (run_id prefix "eval-") never upload a trained adapter under
-        # adapter_prefix(spec); deploying one would mark a deployment ready and then
-        # fail on first chat (or only after always-on warmup) trying to download it.
-        if not dry_run and run_id.startswith("eval-"):
-            raise HTTPException(
-                status_code=409,
-                detail=f"run {run_id} is a standalone eval; it has no trained adapter to deploy",
-            )
         if not dry_run and status.state not in _DEPLOYABLE_STATES:
             raise HTTPException(
                 status_code=409,
@@ -361,11 +288,12 @@ def create_app():
             # /v1/deployments and /chat don't treat a non-existent endpoint as active.
             # deploy_adapter already tears down any endpoint it actually provisioned;
             # this only restores the control-plane record. `status` still holds the
-            # pre-deploy state (mark_deployed wrote a fresh object, not this one).
+            # pre-deploy snapshot; rollback_deploy re-applies it under the status lock and
+            # skips if a concurrent cancel already wrote a terminal state.
             if provisional:
-                from autoslm.orchestrator import _save_status
+                from autoslm.orchestrator import rollback_deploy
 
-                _save_status(status)
+                rollback_deploy(run_id, status)
             if isinstance(exc, ValueError):
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             raise
@@ -375,7 +303,6 @@ def create_app():
 
     @app.delete("/v1/runs/{run_id}/deploy")
     def undeploy(run_id: str, key: dict = Depends(require_key)):
-        from autoslm.orchestrator import _save_status
 
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)

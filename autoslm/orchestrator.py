@@ -18,6 +18,9 @@ from .worker_spec import JobSpec
 RUNS_DIR = os.environ.get("AUTOSLM_RUNS_DIR", ".autoslm/runs")
 RESULTS_DIR = os.environ.get("RESULTS_DIR", "results")
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
+# Serializes the read-check-write in _update so a status transition is an atomic
+# compare-and-set (the control plane is single-instance with per-run threads).
+_STATUS_LOCK = threading.Lock()
 
 
 def artifacts_dir(spec: JobSpec) -> str:
@@ -133,96 +136,6 @@ def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -
     return get_status(spec.run_id)
 
 
-def submit_eval_job(
-    spec: JobSpec, adapter_prefix: str | None = None, dry_run: bool = False
-) -> RunStatus:
-    """Run a standalone eval on a managed Flash GPU; persist metrics + return status."""
-    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
-    spec = JobSpec.from_dict(
-        {**_with_model_disk(spec, info), "run_id": spec.run_id or new_run_id("eval")}
-    )
-    # The /v1/evals route already persisted the queued status before starting this
-    # background thread; if the user cancelled in that window, don't re-create the run
-    # as queued (which would erase the terminal `cancelled` and let the checks below
-    # see `running` and submit a paid eval anyway).
-    with contextlib.suppress(FileNotFoundError):
-        if get_status(spec.run_id).state in TERMINAL_STATES:
-            return get_status(spec.run_id)
-    status = RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
-    _save_status(status)
-    if dry_run:
-        _update(spec.run_id, "dry_run")
-        return get_status(spec.run_id)
-    # Standalone evals run on RunPod Flash only (no allocator/Vast eval path yet): a
-    # vast provider pin, a class with no RunPod enum member, or a class whose RunPod
-    # path AutoSLM has not validated (e.g. RTX 3090, RunPod enum but Vast-only
-    # validated) would otherwise silently rent RunPod on an unsupported substrate or
-    # fail at provisioning. Reject up front instead (unless gpu.allow_unvalidated).
-    from autoslm.flash.gpus import is_validated, providers_for, unvalidated_allowed
-
-    runpod_provisionable = "runpod" in providers_for(spec.gpu.type)
-    runpod_validated = is_validated(spec.gpu.type, "runpod") or unvalidated_allowed(
-        spec.gpu.allow_unvalidated
-    )
-    if spec.gpu.provider == "vast" or not (runpod_provisionable and runpod_validated):
-        _update(
-            spec.run_id,
-            "failed",
-            error=(
-                f"standalone eval runs on RunPod only; {spec.gpu.type!r} "
-                f"(provider={spec.gpu.provider}) is not a RunPod-validated class. "
-                "Train on Vast, then eval the adapter on a RunPod-validated class "
-                "(or set gpu.allow_unvalidated)."
-            ),
-        )
-        return get_status(spec.run_id)
-    from autoslm.flash.train import submit_eval, upload_code
-
-    _update(spec.run_id, "running")
-    log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
-    try:
-        # A cancel during code upload / provisioning (before any remote endpoint
-        # exists) sets `cancelled`; don't launch a paid GPU after that and don't
-        # overwrite the terminal state with done/failed.
-        if get_status(spec.run_id).state == "cancelled":
-            return get_status(spec.run_id)
-        # Ship the slm package to HF so the GPU worker can run it (a standalone `slm eval`
-        # may run before any `slm train` has uploaded the code for this HF_REPO).
-        upload_code()
-        # upload_code() can take a while; a cancel landing during it leaves no endpoint
-        # for cancel_run() to delete. Re-read the state right before paid provisioning so
-        # we don't launch a Flash worker on an already-cancelled eval.
-        if get_status(spec.run_id).state == "cancelled":
-            return get_status(spec.run_id)
-        with open(log_path, "a") as log:
-            metrics = submit_eval(spec, adapter_prefix=adapter_prefix, log=log)
-        if get_status(spec.run_id).state == "cancelled":
-            return get_status(spec.run_id)
-        eval_dir = os.path.join(RESULTS_DIR, "runpod", "eval", spec.run_id)
-        dest = os.path.join(eval_dir, f"seed{spec.train.seeds[0]}")
-        os.makedirs(dest, exist_ok=True)
-        # A standalone eval runs a paid GPU too: fall back to wall-time * rate so
-        # `slm cost` and run lists don't report every eval as free.
-        rate = _gpu_rate(spec.gpu.type)
-        cost = float(metrics.get("cost_usd") or 0.0)
-        if not cost:
-            cost = float(metrics.get("wall_seconds") or 0.0) / 3600.0 * rate
-            metrics = {**metrics, "cost_usd": cost}
-        with open(os.path.join(dest, "metrics.json"), "w") as f:
-            json.dump(metrics, f, indent=2)
-        _update(spec.run_id, "done", cost_usd=cost, artifacts_dir=eval_dir)
-        return get_status(spec.run_id)
-    except Exception as exc:
-        # A user cancel deletes the endpoint, which the poller reports as a failure;
-        # don't overwrite the user's terminal `cancelled` with `failed`.
-        if get_status(spec.run_id).state != "cancelled":
-            _update(spec.run_id, "failed", error=str(exc))
-        raise
-    finally:
-        # Endpoint GC (see _run_job): registered endpoints consume the account quota.
-        _gc_run_endpoints(spec)
-
-
 def get_status(run_id: str) -> RunStatus:
     path = runs_file_path(run_id, ".json")
     if not os.path.exists(path):
@@ -321,7 +234,8 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
 
     Uses the persisted {endpoint_id, job_id} handle to resume polling; on completion,
     persists metrics exactly like the original client would have, flips the state, and
-    GCs the endpoint. Raises if the run has no persisted handle (legacy submission).
+    GCs the endpoint. Raises if the run has no persisted handle (it failed or was
+    cancelled before a worker was provisioned).
     """
     import sys
 
@@ -329,10 +243,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     if status.state in TERMINAL_STATES:
         return status
     if not status.remote:
-        raise ValueError(
-            f"run {run_id} has no persisted job handle (submitted via the legacy path?); "
-            "cannot reattach"
-        )
+        raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
     from autoslm.flash.durable import make_hf_heartbeat_reader
 
     spec = JobSpec.from_dict(status.spec)
@@ -444,22 +355,53 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
     print(f"resuming {run_id}: remaining seeds from index {status.resume_seed_index}", file=log)
     try:
         _run_seed_loop(
-            spec, log, start_index=status.resume_seed_index, prior_cost=float(status.cost_usd or 0.0)
+            spec,
+            log,
+            start_index=status.resume_seed_index,
+            prior_cost=float(status.cost_usd or 0.0),
         )
     except _RunCancelled:
         pass  # cancel_run already set the terminal state
     except Exception as exc:
         if get_status(run_id).state != "cancelled":
             _update(run_id, "failed", error=str(exc))
+    finally:
+        # Mirror _run_job: the resume path also marked this run active in recover_runs, so
+        # the startup orphan sweep skipped its instances — GC any endpoint a transient
+        # destroy left behind rather than leaking a billable Vast instance.
+        _gc_run_endpoints(spec)
     return get_status(run_id)
 
 
 def mark_deployed(run_id: str, deployment: dict) -> RunStatus:
-    status = get_status(run_id)
-    status.deployment = deployment
-    status.state = "deployed"
-    _save_status(status)
-    return status
+    # Atomic + terminal-respecting (same guard as _update): a /cancel landing during
+    # always-on provisioning/warmup writes `cancelled`; this must NOT overwrite it with
+    # `deployed` and resurrect the run as an active deployment.
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES:
+            return status
+        status.deployment = deployment
+        status.state = "deployed"
+        _save_status(status)
+        return status
+
+
+def rollback_deploy(run_id: str, snapshot: RunStatus) -> None:
+    """Restore the pre-deploy state/deployment after always-on provisioning fails.
+
+    Lock-guarded + terminal-respecting (same guard as _update/mark_deployed): a /cancel
+    that landed during provisioning/warmup already persisted `cancelled`; restoring the
+    pre-deploy snapshot must NOT overwrite it and resurrect the run as `done`/`deployed`.
+    """
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.state in TERMINAL_STATES:
+            return
+        status.state = snapshot.state
+        status.deployment = snapshot.deployment
+        status.updated_at = time.time()
+        _save_status(status)
 
 
 def _run_job(spec: JobSpec) -> None:
@@ -496,28 +438,25 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
 def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     """Run one seed with the durable submit/poll path + bounded auto-retry.
 
-    When the spec records a routing intent (``gpu.requested``, always set by config
-    parsing), each attempt first ALLOCATES the GPU: the cheapest class across
-    providers (RunPod live pricing + Vast verified-datacenter offers) that fits the
-    model — re-resolved fresh per attempt because offers are a live market. A
-    concrete ``gpu.requested`` pins the class (the allocator then only picks the
-    provider); ``gpu.provider`` pins the substrate. A spec WITHOUT ``requested``
-    (constructed directly via the API) gets the exact legacy behavior: ``gpu.type``
-    on RunPod, no allocator, no live market calls.
+    Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
+    live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
+    fresh per attempt because offers are a live market. A policy ``gpu.requested``
+    ("cheapest"/"auto") lets the allocator pick the class; a concrete ``gpu.requested``
+    pins the class (the allocator then only picks the provider); ``gpu.provider`` pins
+    the substrate.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF
     checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
     client polling breakdown, or a platform TIMED_OUT/worker-loss. Sick Vast
     machines are blacklisted for the run; failover naturally crosses providers.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
-    immediately. Set AUTOSLM_LEGACY_SUBMIT=1 to fall back to the legacy blocking SDK
-    path (AUTOSLM_SKIP_NET — the offline test/CI marker — implies it, since the
-    durable path is network-only).
+    immediately. The offline test/CI marker AUTOSLM_SKIP_NET takes the blocking
+    in-process submit instead (the durable poll path is network-only).
     """
     import autoslm.flash.durable as durable
     from autoslm.flash.train import submit_train
 
-    if os.environ.get("AUTOSLM_LEGACY_SUBMIT") or os.environ.get("AUTOSLM_SKIP_NET"):
+    if os.environ.get("AUTOSLM_SKIP_NET"):
         return submit_train(spec, seed, log=log)
 
     from autoslm.flash.gpus import POLICY_NAMES
@@ -550,10 +489,9 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
     bad_machines: set[int] = set()
-    # Re-allocate freely for policy requests; honor a concrete user pin; skip the
-    # allocator entirely when no intent was recorded (legacy direct-API specs).
+    # Re-allocate freely for policy requests ("cheapest"/"auto"); honor a concrete
+    # user pin by passing it through as the only candidate class.
     requested = (spec.gpu.requested or "").strip().lower()
-    use_allocator = bool(requested)
     pinned_gpu = None if requested in POLICY_NAMES else spec.gpu.type
     for attempt in range(max_retries + 1):
         if attempt > 0 and last_handle:
@@ -587,6 +525,13 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 except Exception:
                     # Logging the host-escape note is cosmetic; never let it abort the retry.
                     pass
+            # The previous endpoint is now deleted; clear the persisted handle so a cancel
+            # or control-plane restart during the fresh deploy doesn't operate on (or get
+            # shielded by) the dead handle. The next on_handle() records the new one.
+            with contextlib.suppress(FileNotFoundError):
+                st = get_status(spec.run_id)
+                if st.state not in TERMINAL_STATES and st.remote is not None:
+                    _update(spec.run_id, st.state, remote=None)
         res = None
         alloc = None
         # A cancel can land after _run_seed_loop's pre-submit check but while
@@ -597,37 +542,22 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         with contextlib.suppress(FileNotFoundError):
             if get_status(spec.run_id).state == "cancelled":
                 raise _RunCancelled(f"run {spec.run_id} was cancelled")
-        if not use_allocator:
-            # No routing intent recorded: the exact legacy path (gpu.type on RunPod).
-            try:
-                res = durable.submit_train_durable(
-                    spec, seed, log=log, on_handle=on_handle, attempt=attempt
-                )
-            except Exception as exc:
-                res = durable.PollResult(
-                    False, failure="poll_error", detail=f"deploy/submit: {exc}"
-                )
-                if attempt < max_retries:
-                    time.sleep(10 * (attempt + 1))
-        else:
-            try:
-                alloc = allocate(
-                    spec.model,
-                    spec.algorithm,
-                    gpu=pinned_gpu,
-                    provider=spec.gpu.provider,
-                    disk_gb=spec.gpu.disk_gb,
-                    allow_unvalidated=spec.gpu.allow_unvalidated,
-                    model_policy=spec.model_policy,
-                    teacher_id=(spec.distill.teacher or None),
-                    exclude_machine_ids=frozenset(bad_machines),
-                )
-            except Exception as exc:
-                from autoslm.flash.gpus import UnsupportedGpuError
+        try:
+            alloc = allocate(
+                spec.model,
+                spec.algorithm,
+                gpu=pinned_gpu,
+                provider=spec.gpu.provider,
+                disk_gb=spec.gpu.disk_gb,
+                allow_unvalidated=spec.gpu.allow_unvalidated,
+                exclude_machine_ids=frozenset(bad_machines),
+            )
+        except Exception as exc:
+            from autoslm.flash.gpus import UnsupportedGpuError
 
-                if isinstance(exc, UnsupportedGpuError):
-                    raise  # config-shaped: no GPU anywhere can run this job
-                res = durable.PollResult(False, failure="poll_error", detail=f"allocation: {exc}")
+            if isinstance(exc, UnsupportedGpuError):
+                raise  # config-shaped: no GPU anywhere can run this job
+            res = durable.PollResult(False, failure="poll_error", detail=f"allocation: {exc}")
         if alloc is not None:
             # allocate() above ran a live-market price walk; re-check cancellation
             # right before provisioning so a cancel during allocation doesn't still
@@ -676,6 +606,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 if get_status(spec.run_id).state == "cancelled":
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
             except FileNotFoundError:
+                # Status file not yet written (early race): treat as not-cancelled, proceed.
                 pass
             # Worker is done (DONE sentinel seen); GC every endpoint this seed used,
             # including intermediate rN retries _gc_run_endpoints can't name.
@@ -782,8 +713,7 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
             **({"remote": None, "resume_seed_index": i + 1} if more_seeds else {}),
         )
         print(
-            f"seed={seed} done: trained_acc={metrics.get('trained_eval_acc')} "
-            f"base_acc={metrics.get('base_eval_acc')} cost_usd={total_cost:.4f}",
+            f"seed={seed} done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}",
             file=log,
             flush=True,
         )
@@ -835,6 +765,8 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
 
             vast_provider.destroy_run_instances(spec.run_id)
         except Exception:
+            # Best-effort orphan sweep; a leftover vast instance is caught by the
+            # periodic sweep_orphans pass, so don't let teardown failure raise here.
             pass
 
 
@@ -868,20 +800,27 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
 
 
 def _update(run_id: str, state: str, **updates) -> None:
-    status = get_status(run_id)
-    # Terminal states are STICKY: once a run is done/failed/cancelled/dry_run, no other
-    # state may overwrite it. This closes the whole cancel-race class at the source — a
-    # cancel landing between a caller's check and a later write (provisioning/running, or
-    # even a late terminal done/failed from a worker that finished as the cancel arrived)
-    # can no longer resurrect the run. Same-state writes still pass so terminal field
-    # updates (cost_usd, error, artifacts_dir) are preserved.
-    if status.state in TERMINAL_STATES and state != status.state:
-        return
-    status.state = state
-    status.updated_at = time.time()
-    for key, value in updates.items():
-        setattr(status, key, value)
-    _save_status(status)
+    # The read-check-write below must be atomic: a concurrent `slm cancel` (also via
+    # _update) landing between the get_status read and the _save_status write could
+    # otherwise be clobbered by this stale background update, resurrecting a cancelled
+    # run. The control plane is single-instance with per-run threads, so a process-wide
+    # lock serializes all status transitions into a compare-and-set.
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        # Terminal states are STICKY: once a run is done/failed/cancelled/dry_run, no
+        # other state may overwrite it. This closes the whole cancel-race class at the
+        # source — a cancel landing between a caller's check and a later write
+        # (provisioning/running, or even a late terminal done/failed from a worker that
+        # finished as the cancel arrived) can no longer resurrect the run. Same-state
+        # writes still pass so terminal field updates (cost_usd, error, artifacts_dir)
+        # are preserved.
+        if status.state in TERMINAL_STATES and state != status.state:
+            return
+        status.state = state
+        status.updated_at = time.time()
+        for key, value in updates.items():
+            setattr(status, key, value)
+        _save_status(status)
 
 
 def _save_status(status: RunStatus) -> None:

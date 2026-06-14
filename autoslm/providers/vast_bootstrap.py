@@ -2,8 +2,8 @@
 
 Replicates ``flash/train.py:_train_body`` semantics on the Vast substrate: install
 extra pip deps, fetch the autoslm package from the HF dataset repo, then run the
-substrate-neutral worker (``autoslm.engine.worker``) in two fresh processes — train,
-then eval — uploading per-phase console tails on failure. There is NO return channel
+substrate-neutral worker (``autoslm.engine.worker``) to train, uploading the console
+tail on failure. There is NO return channel
 from the instance: the worker's HF artifacts (DONE/metrics.json/heartbeat.json) are
 the success signal, and this bootstrap's attempt-scoped ``vast_attempt<N>.json`` is
 the terminal marker the control plane keys failures on.
@@ -165,39 +165,22 @@ def main() -> int:
         env = build_worker_env(payload)
         deadline = time.time() + float(payload.get("max_wall_s") or 24 * 3600)
         phase = payload["phase"]
-        if phase == "eval":
-            rc = run_mode(payload, env, "eval_only", deadline)
-            if rc != 0:
-                raise RuntimeError(f"worker mode 'eval_only' exited {rc}")
-        else:
-            # A warm/retried Vast instance can carry a previous attempt's handoff/metrics
-            # files; stale ones would let a crashed train phase evaluate the OLD adapter or
-            # report the previous run's metrics. Clear both before training (mirrors the
-            # RunPod Flash handler in autoslm.flash.train).
-            for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
-                with contextlib.suppress(FileNotFoundError):
-                    os.remove(stale)
-            # Phase 1: train. Nonzero rc tolerated — RL's colocated vLLM can segfault
-            # at interpreter exit AFTER the adapter+train_meta are saved.
-            run_mode(payload, env, phase, deadline)
-            if os.path.exists("/tmp/metrics.json"):
-                # Idempotent DONE replay: an earlier attempt already finished this run.
-                # The worker saw DONE on HF, restored /tmp/metrics.json, and exited 0
-                # WITHOUT recreating /tmp/train_meta.json — so don't mistake a successful
-                # replay for a crashed train phase, and don't re-run eval. (Mirrors the
-                # RunPod handler's metrics.json short-circuit.)
-                print("train phase: metrics.json present (DONE replay); skipping eval", flush=True)
-            else:
-                if not os.path.exists("/tmp/train_meta.json"):
-                    raise RuntimeError(
-                        f"train phase '{phase}' produced no /tmp/train_meta.json (it crashed "
-                        f"before saving the adapter); see error_{phase}.txt and "
-                        f"console_{phase}.txt in the HF dataset repo"
-                    )
-                # Phase 2: eval in a FRESH process.
-                rc = run_mode(payload, env, "eval_after", deadline)
-                if rc != 0:
-                    raise RuntimeError(f"worker mode 'eval_after' exited {rc}")
+        # A warm/retried Vast instance can carry a previous attempt's metrics file; a
+        # stale one would let a crashed train phase report the previous run's metrics.
+        # Clear before training (mirrors the RunPod Flash handler in autoslm.flash.train).
+        for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(stale)
+        # Train. Nonzero rc tolerated — RL's colocated vLLM can segfault at interpreter
+        # exit AFTER the adapter + metrics.json + DONE are saved. The train phase writes
+        # metrics.json + DONE itself (or restores them from an earlier attempt's DONE).
+        run_mode(payload, env, phase, deadline)
+        if not os.path.exists("/tmp/metrics.json"):
+            raise RuntimeError(
+                f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
+                f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF "
+                f"dataset repo"
+            )
         ok = True
     except Exception as exc:
         # Record genuine failures in the attempt marker (written in `finally`). Don't catch

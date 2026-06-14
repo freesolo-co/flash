@@ -59,7 +59,7 @@ class Allocation:
     vast_offers: tuple[VastOffer, ...]  # full offer book (offer-taken walk)
 
 
-def required_vram_gb(model_id: str, algorithm: str, model_policy: str = "catalog") -> int:
+def required_vram_gb(model_id: str, algorithm: str) -> int:
     """VRAM the full run needs. Catalog entries carry measured minimums; open models
     get the coarse estimate sized for GRPO (the heavier phase of the usual SFT+GRPO
     pipeline) plus headroom. Unknown sizes fall back to the 24 GB tier (same as
@@ -86,7 +86,6 @@ def allocate(
     provider: str = "auto",
     disk_gb: int = 60,
     allow_unvalidated: bool | None = None,
-    model_policy: str = "catalog",
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
 ) -> Allocation:
     """Pick the cheapest (provider, GPU class) able to run the job.
@@ -101,7 +100,7 @@ def allocate(
     # pin (e.g. Qwen3-8B on a 24 GB card) must drop out of the candidate filter and
     # raise here, not provision a paid worker that OOMs. The pin only narrows WHICH
     # fitting class is chosen, never lowers the VRAM bar.
-    need = required_vram_gb(model_id, algorithm, model_policy)
+    need = required_vram_gb(model_id, algorithm)
     allow_unval = unvalidated_allowed(allow_unvalidated)
     live = available_providers()
     if provider != "auto" and provider not in live:
@@ -122,7 +121,9 @@ def allocate(
             if "runpod" not in g.validated_on and not allow_unval:
                 continue
             candidates.append(
-                Candidate("runpod", g.name, hourly_rate(g.name), g.vram_gb, g.validated)
+                Candidate(
+                    "runpod", g.name, hourly_rate(g.name), g.vram_gb, "runpod" in g.validated_on
+                )
             )
 
     vast_book: list[VastOffer] = []
@@ -144,7 +145,9 @@ def allocate(
                 continue
             seen.add(o.gpu)
             candidates.append(
-                Candidate("vast", o.gpu, o.dph_total, info.vram_gb, info.validated, offer=o)
+                Candidate(
+                    "vast", o.gpu, o.dph_total, info.vram_gb, "vast" in info.validated_on, offer=o
+                )
             )
 
     if not candidates:

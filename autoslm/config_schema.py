@@ -17,7 +17,7 @@ from .flash.gpus import (
     resolve_gpu_policy,
     unvalidated_allowed,
 )
-from .worker_spec import DistillSpec, EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from .worker_spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
 
 class ConfigError(ValueError):
@@ -188,7 +188,6 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
             lora_rank=int(train_raw.get("lora_rank", 32)),
             lora_alpha=int(train_raw.get("lora_alpha", 64)),
             seeds=tuple(int(s) for s in train_raw.get("seeds", (0,))),
-            eval_examples=int(train_raw.get("eval_examples", 300)),
             init_from_adapter=str(train_raw.get("init_from_adapter") or ""),
         ),
         gpu=GpuSpec(
@@ -206,12 +205,6 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
         run_id=run_id or raw.get("run_id", "local"),
         model_policy=model_policy,
         thinking=thinking,
-        distill=DistillSpec(
-            teacher=(raw.get("distill") or {}).get("teacher", ""),
-            lmbda=float((raw.get("distill") or {}).get("lmbda", 1.0)),
-            max_completion=int((raw.get("distill") or {}).get("max_completion", 320)),
-            temperature=float((raw.get("distill") or {}).get("temperature", 1.0)),
-        ),
     )
     _validate_spec(spec)
     return spec
@@ -224,32 +217,16 @@ def _validate_spec(spec: JobSpec) -> None:
         canonical_gpu(spec.gpu.type)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
-    # GRPO and OPD are step-driven; SFT and DPO are epoch-driven. Reject a
-    # non-positive explicit count for whichever the algorithm consumes, so an
-    # invalid config fails here instead of provisioning a worker that silently
-    # falls back to a default count.
-    if spec.algorithm in ("grpo", "opd") and spec.train.steps is not None and spec.train.steps <= 0:
-        raise ConfigError(f"train.steps must be positive for {spec.algorithm.upper()}")
-    if (
-        spec.algorithm in ("sft", "dpo")
-        and spec.train.epochs is not None
-        and spec.train.epochs <= 0
-    ):
-        raise ConfigError(f"train.epochs must be positive for {spec.algorithm.upper()}")
-    if spec.algorithm == "opd" and not spec.distill.teacher:
-        raise ConfigError('algorithm "opd" requires [distill] teacher = "<hf model id>"')
-    if spec.algorithm == "dpo" and not (spec.environment.params or {}).get("preference_dataset"):
-        raise ConfigError(
-            'algorithm "dpo" requires [environment.params] preference_dataset = "org/name"'
-        )
+    # GRPO is step-driven; SFT is epoch-driven. Reject a non-positive explicit count
+    # for whichever the algorithm consumes, so an invalid config fails here instead of
+    # provisioning a worker that silently falls back to a default count.
+    if spec.algorithm == "grpo" and spec.train.steps is not None and spec.train.steps <= 0:
+        raise ConfigError("train.steps must be positive for GRPO")
+    if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
+        raise ConfigError("train.epochs must be positive for SFT")
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")
     # lora_alpha scales the adapter contribution; 0 (or negative) trains a paid run
-    # that produces a no-op adapter (zero scaling at serve/eval). Reject up front.
+    # that produces a no-op adapter (zero scaling at serve). Reject up front.
     if spec.train.lora_alpha <= 0:
         raise ConfigError("train.lora_alpha must be positive")
-    # A non-positive eval count is a deterministic config error: GSM8K crashes in
-    # eval_subset_indices and the math env reads it as "all rows". Fail fast here
-    # instead of on a paid worker reporting metrics for the wrong eval set.
-    if spec.train.eval_examples <= 0:
-        raise ConfigError("train.eval_examples must be positive")

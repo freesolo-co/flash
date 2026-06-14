@@ -63,32 +63,22 @@ def test_reward_shaping():
 def test_math_env_offline_dataset_and_grade():
     from autoslm.envs.registry import load_environment
 
-    env = load_environment(
-        "math",
-        {
-            "train_path": os.path.join(FIXTURES, "math_train.jsonl"),
-            "eval_path": os.path.join(FIXTURES, "math_eval.jsonl"),
-            "eval_examples": 10,
-        },
-    )
+    env = load_environment("math", {"train_path": os.path.join(FIXTURES, "math_eval.jsonl")})
     assert env.id == "math"
 
-    train = env.dataset("train")
-    assert len(train) == 2
-    assert train[0]["question"]
-    assert train[0]["gold"]
-
-    ev = env.dataset("eval")
-    assert len(ev) == 3
+    rows = env.dataset("train")
+    assert len(rows) == 3
+    assert rows[0]["question"]
+    assert rows[0]["gold"]
 
     # polar-coordinates example: graded equivalent despite \left/\right spacing
-    polar = ev[0]
+    polar = rows[0]
     completion = r"... so the answer is \boxed{\left( 3, \frac{\pi}{2} \right)}."
     assert env.grade(completion, polar) is True
     assert env.reward(completion, polar) == 1.0
 
     # 2/3 example: equivalent forms accepted, a different fraction rejected
-    frac = ev[1]
+    frac = rows[1]
     assert env.grade(r"\boxed{\frac{2}{3}}", frac) is True
     assert env.grade(r"\boxed{2/3}", frac) is True
     assert env.grade(r"\boxed{\frac{3}{4}}", frac) is False
@@ -97,7 +87,7 @@ def test_math_env_offline_dataset_and_grade():
 def test_math_env_sft_target_has_boxed():
     from autoslm.envs.registry import load_environment
 
-    env = load_environment("math", {"eval_path": os.path.join(FIXTURES, "math_eval.jsonl")})
+    env = load_environment("math", {"train_path": os.path.join(FIXTURES, "math_eval.jsonl")})
     # solution without boxed -> grader-compatible boxed tail appended
     tgt = env.sft_target({"gold": "9", "solution": "196 has nine divisors"})
     assert r"\boxed{9}" in tgt
@@ -122,7 +112,7 @@ def test_math_env_config_parses():
 
 
 def test_math_env_live_hf_smoke():
-    """Live HF load of MATH-500 (skipped offline / when datasets unavailable)."""
+    """Live HF load of the math train split (skipped offline / when datasets unavailable)."""
     if os.environ.get("AUTOSLM_SKIP_NET"):
         print("SKIP test_math_env_live_hf_smoke (AUTOSLM_SKIP_NET set)")
         return
@@ -134,14 +124,14 @@ def test_math_env_live_hf_smoke():
     try:
         from autoslm.envs.registry import load_environment
 
-        env = load_environment("math", {"eval_examples": 5})
-        ev = env.dataset("eval")
+        env = load_environment("math")
+        rows = env.dataset("train")
     except Exception as exc:  # network/hub hiccup -> don't fail the suite
         print(f"SKIP test_math_env_live_hf_smoke (load failed: {exc})")
         return
-    assert len(ev) == 5
-    assert all(e["question"] and e["gold"] for e in ev)
-    print("live MATH-500 eval rows:", len(ev), "example gold:", ev[0]["gold"])
+    assert rows
+    assert all(e["question"] and e["gold"] for e in rows[:5])
+    print("live math train rows:", len(rows), "example gold:", rows[0]["gold"])
 
 
 if __name__ == "__main__":

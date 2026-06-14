@@ -61,6 +61,13 @@ def _check_vast() -> None:
     if not os.environ.get("VAST_API_KEY"):
         logger.info("VAST_API_KEY not set; the vast substrate is disabled (runpod only)")
         return
+    # An explicit provider pin (AUTOSLM_PROVIDERS=runpod) disables vast without unsetting
+    # its key, so don't fail startup probing a key the allocator will never use.
+    from autoslm.providers import available_providers
+
+    if "vast" not in available_providers():
+        logger.info("AUTOSLM_PROVIDERS pin excludes vast; skipping the Vast auth probe")
+        return
     if os.environ.get("AUTOSLM_SKIP_NET"):
         return
     try:

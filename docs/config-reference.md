@@ -8,7 +8,7 @@ Compose multiple files with `--config` (deep-merged in order) and override any v
 model = "Qwen/Qwen3.5-4B"     # catalog model (`slm models`), or any HF id with model_policy="allow"
 model_policy = "catalog"      # "catalog" (default) | "allow" (any HF model that fits the GPU)
 thinking = false              # opt-in reasoning mode for thinking-capable models (see below)
-algorithm = "grpo"            # "sft" | "grpo" | "opd" | "dpo"
+algorithm = "grpo"            # "sft" | "grpo"
 
 [environment]
 id = "gsm8k"                  # built-in (gsm8k|math|tests_pass) or a verifiers/Prime Hub env id
@@ -18,20 +18,13 @@ id = "gsm8k"                  # built-in (gsm8k|math|tests_pass) or a verifiers/
 # path = "environments/my_env"         # local custom env dir — NOT supported on the managed
 #                                      # service (publish with `slm env push` instead)
 [environment.params]          # optional kwargs forwarded to load_environment(**params)
-# preference_dataset = "trl-lib/ultrafeedback_binarized"   # required for algorithm="dpo"
-
-[distill]                     # required for algorithm="opd"
-teacher = "Qwen/Qwen3-4B-Instruct-2507"  # teacher loads in-process on the same GPU (bf16)
-lmbda = 1.0                   # fraction of on-policy (student-generated) batches
-max_completion = 320
 
 [train]
-steps = 150                   # GRPO/OPD optimizer steps
-epochs = 2                    # SFT/DPO epochs
+steps = 150                   # GRPO optimizer steps
+epochs = 2                    # SFT epochs
 lora_rank = 32
 lora_alpha = 64
 seeds = [0, 1]                # one dedicated GPU per seed
-eval_examples = 300
 
 [gpu]
 # type = "RTX 5090"          # pin a GPU class; OMIT (or "cheapest") for smart allocation
@@ -51,8 +44,8 @@ max_retries = 2              # auto-resubmit budget for infra failures (stall/wo
 When `gpu.type` is omitted (or set to **`"cheapest"`**/`"auto"`), AutoSLM allocates the
 **cheapest GPU across providers** with enough VRAM to comfortably run the full job
 (sized for GRPO — the heavier phase of the usual SFT→GRPO pipeline — with headroom for
-open models; curated catalog entries carry measured minimums). Allocation happens live
-at submit time, per attempt:
+open models; curated catalog entries carry measured minimums). Allocation happens
+live at submit time, per attempt:
 
 - **RunPod**: every Flash class, ranked by live RunPod pricing (cached 6 h; static
   snapshot offline).
@@ -71,7 +64,7 @@ picks the cheaper provider for it. `gpu.provider` pins the substrate (`L40S`,
 
 Two guard rails:
 
-- Validation is **per provider**: only classes that passed AutoSLM's live train+eval
+- Validation is **per provider**: only classes that passed AutoSLM's live train
   smoke on a substrate are selectable there by default; others need
   `gpu.allow_unvalidated = true` (or `AUTOSLM_GPU_ALLOW_UNVALIDATED=1`).
   `"cheapest"` honors the same gate.
@@ -107,34 +100,34 @@ and the volume bills monthly while it exists. Most useful for repeated 35B-class
 |---|---|---|---|
 | `sft` | TRL `SFTTrainer` | env `dataset("train")` + `sft_target` | imitate reference completions |
 | `grpo` | TRL `GRPOTrainer` + colocated vLLM | env prompts + `reward` | verifiable-reward RL |
-| `opd` | TRL `DistillationTrainer` | env prompts + `[distill] teacher` | on-policy distillation: dense token-level teacher supervision on the student's own rollouts — often RL-level lift at a fraction of the cost |
-| `dpo` | TRL `DPOTrainer` | `[environment.params] preference_dataset` (prompt/chosen/rejected) | offline preference tuning |
+
+See [algorithms.md](algorithms.md) for a how-to-choose guide, the data each one
+needs, and per-algorithm tuning knobs. Ready-to-run configs for both live in
+[`examples/gsm8k/`](../examples/gsm8k/).
 
 ## Thinking mode (`thinking = true`)
 
 Off by default: every run renders with `enable_thinking=false` so out-of-the-box
-behavior (token budgets, prompts, eval) is unchanged. Setting `thinking = true` turns
-on the model's reasoning mode **for the whole run** — SFT targets, RL rollouts, eval,
-and serving all render with the same flag (decoding parity is per-run).
+behavior (token budgets, prompts) is unchanged. Setting `thinking = true` turns on
+the model's reasoning mode **for the whole run** — SFT targets, RL rollouts, and
+serving all render with the same flag (decoding parity is per-run).
 
 - **Capability-gated**: `slm models` shows each model's `thinking` capability —
   `hybrid` (template honors the flag) or `none` (e.g. the default
   Qwen3-4B-Instruct-2507, a non-thinking variant; `thinking = true` is rejected).
   Always-thinking models (R1-style distills) work via `model_policy = "allow"` and
   *require* `thinking = true`.
-- **Grading**: `<think>...</think>` blocks are stripped before the environment grades
-  / rewards (in `worker.graded_text`, so every environment benefits). A completion
+- **Reward**: `<think>...</think>` blocks are stripped before the environment rewards
+  a completion (in `worker.graded_text`, so every environment benefits). A completion
   whose reasoning never closes (budget exhausted) scores **0** — deliberate reward
-  pressure to think within budget. Eval generations record per-completion `n_tokens`
-  and `truncated` so cap saturation is visible.
+  pressure to think within budget.
 - **Budgets**: thinking-aware defaults replace the non-thinking ones — RL completion
-  cap 320 -> 1536, eval `max_new_tokens` 512 -> 2048, SFT `max_seq_len` 1024 -> 2048,
-  GRPO per-device completion micro-batch 8 -> 2 (the fp32 logits pass scales with
-  sequence length; grad-accum compensates, so the effective batch is unchanged).
-  `RL_MAX_COMPLETION` / `EVAL_MAX_NEW_TOKENS` / `RL_PER_DEVICE_PROMPTS` still
-  override. Bigger models think longer — raise `EVAL_MAX_NEW_TOKENS` to 3072–4096 for
-  4B-class thinking evals. **Cost warning**: RL rollout cost scales linearly with
-  completion length — expect roughly 5x the generated tokens per step vs non-thinking.
+  cap 320 -> 1536, SFT `max_seq_len` 1024 -> 2048, GRPO per-device completion
+  micro-batch 8 -> 2 (the fp32 logits pass scales with sequence length; grad-accum
+  compensates, so the effective batch is unchanged). `RL_MAX_COMPLETION` /
+  `RL_PER_DEVICE_PROMPTS` still override. **Cost warning**: RL rollout cost scales
+  linearly with completion length — expect roughly 5x the generated tokens per step
+  vs non-thinking.
 - **SFT**: targets should contain `<think>` traces; the worker warns loudly when none
   do (training thinking-rendered prompts on non-reasoning targets teaches the model to
   skip thinking).
@@ -197,8 +190,7 @@ host — see [self-hosting](self-hosting.md)):
 | `HUGGINGFACE_TOKEN` | write access to `HF_REPO` |
 | `AUTOSLM_DB_PATH` | control-plane SQLite (keys + run ownership) |
 | `AUTOSLM_RUNS_DIR` | run status/log files |
-| `AUTOSLM_WORKER_STACK` | `modern` (default; trl 1.x / vllm 0.19 / transformers 5.x) or `legacy` |
-| `AUTOSLM_WORKER_DEPS` | fully custom worker dependency list (whitespace-separated, or a JSON list for specs containing commas like `transformers>=5.6,<5.11`) |
+| `AUTOSLM_WORKER_DEPS` | override the pinned worker dependency stack (whitespace-separated, or a JSON list for specs containing commas like `transformers>=5.6,<5.11`) |
 | `AUTOSLM_WORKER_IMAGE` | optional prebuilt worker image (deps and base model baked in); any image exposing the pinned worker stack works |
 | `AUTOSLM_MIN_CUDA` | minimum host driver CUDA version. Auto: 13.0 for Blackwell classes (RTX 5090 / RTX Pro 6000 / B200 — their wheels ship no SASS; older drivers cannot JIT the PTX) on the modern stack, 12.8 otherwise |
 | `AUTOSLM_GPU_ALLOW_UNVALIDATED` | set `1` to allow GPU classes that haven't passed AutoSLM's live smoke (same as `gpu.allow_unvalidated`) |
@@ -207,22 +199,18 @@ host — see [self-hosting](self-hosting.md)):
 | `AUTOSLM_WORKER_EXTRA_DEPS` | additive worker pip deps (whitespace-separated), e.g. `liger-kernel` for `SFT_LIGER=1` |
 | `SFT_PACKING` | set `1` to pack short SFT examples into full sequences (A/B-gated) |
 | `SFT_LIGER` | set `1` for Liger fused kernels in SFT (needs `AUTOSLM_WORKER_EXTRA_DEPS=liger-kernel`) |
-| `AUTOSLM_LEGACY_SUBMIT` | set `1` to use the legacy blocking submit path (no durable handles) |
 | `AUTOSLM_STALL_AFTER_S` | supervisor stall watchdog (default 1500 s of no worker progress) |
 | `AUTOSLM_EXECUTION_TIMEOUT_MS` | default server-side execution cap |
 | `AUTOSLM_LOG_LEVEL` | CLI log level (`DEBUG`/`INFO`/`WARNING`/...); same effect as `-v`/`-vv` |
 | `AUTOSLM_DEBUG` | set `1` to show full tracebacks on error (same as `--debug`) |
-| `SFT_MAX_STEPS`, `SFT_MAX_EXAMPLES`, `SFT_PER_DEVICE_BS`, `SFT_SAVE_STEPS`, `RL_MAX_COMPLETION`, `RL_SAVE_STEPS`, `EVAL_MAX_NEW_TOKENS` | smoke/tuning passthrough (`RL_MAX_COMPLETION`/`EVAL_MAX_NEW_TOKENS` defaults are thinking-aware: 320/512 normally, 1536/2048 with `thinking = true`) |
-| `EVAL_MAX_MODEL_LEN` | eval engine context bound (default `max(2048, prompt + completion + 128)`) |
+| `SFT_MAX_STEPS`, `SFT_MAX_EXAMPLES`, `SFT_PER_DEVICE_BS`, `SFT_SAVE_STEPS`, `RL_MAX_COMPLETION`, `RL_SAVE_STEPS` | smoke/tuning passthrough (`RL_MAX_COMPLETION` default is thinking-aware: 320 normally, 1536 with `thinking = true`) |
 | `AUTOSLM_THINKING` | worker-side thinking override for the no-JobSpec bench path (runs use the TOML `thinking` flag) |
-| `OPD_PER_DEVICE_BS`, `OPD_BATCH`, `OPD_LR`, `DPO_LR`, `DPO_BETA` | opd/dpo tuning |
 | `RL_PROMPTS_PER_STEP` | unique prompts optimized per GRPO step (default 64). Lower it to reduce per-step memory + wall-time (smaller, noisier batch). |
 | `RL_GROUP_SIZE` | GRPO completions sampled per prompt (default 8). |
 | `RL_PER_DEVICE_PROMPTS` | GRPO per-device *completion* micro-batch (VRAM/throughput knob; 8 measured fastest for 4B on a 5090). Thinking runs default to 2 — the fp32 logits pass scales with sequence length and OOMs a 24 GB card at 8 with 2048-token thinking sequences; grad-accum compensates, so the effective batch is unchanged. |
 | `RL_VLLM_GPU_UTIL` | fraction of GPU memory for the colocated vLLM rollout engine. |
 | `RL_VLLM_SLEEP` | offload vLLM weights between steps. Default on; **disable (`0`) when both fit resident — measured ~2x faster per step** (4B on a 32 GB 5090 fits at `RL_VLLM_GPU_UTIL=0.35` with bf16 loading). |
 | `RL_VLLM_MAX_LEN` | colocated engine context bound (default prompt+completion; prevents full-context KV sizing). |
-| `EVAL_VLLM_GPU_UTIL`, `EVAL_ENFORCE_EAGER` | eval engine knobs (`EVAL_ENFORCE_EAGER=0` required for Qwen3.5-4B+, whose kernels need the compile path) |
 | `VLLM_ATTENTION_BACKEND` | escape hatch (e.g. `TRITON_ATTN`) when a host driver cannot JIT vllm's bundled flash-attn PTX |
 | `PYTORCH_ALLOC_CONF` | allocator tuning (torch >= 2.10 name; both names are set on the worker). Default `expandable_segments:True`; with `RL_VLLM_SLEEP=1` use `garbage_collection_threshold:0.8,max_split_size_mb:256` instead. |
 
@@ -237,6 +225,5 @@ export RL_VLLM_SLEEP=0 RL_VLLM_GPU_UTIL=0.35 RL_PER_DEVICE_PROMPTS=8 \
 
 # Qwen3.5-4B — conservative recipe (sleep mode; use if the fast recipe OOMs on your run)
 export RL_VLLM_SLEEP=1 RL_VLLM_GPU_UTIL=0.48 RL_PER_DEVICE_PROMPTS=2 \
-       EVAL_ENFORCE_EAGER=0 \
        PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:256
 ```

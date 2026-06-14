@@ -1,7 +1,7 @@
 """Frozen, shared AutoSLM fine-tuning recipe.
 
 Single source of truth for the default fine-tuning hyperparameters: base model,
-tokenizer, data, LoRA config, optimization, token budget, eval, and decoding.
+tokenizer, data, LoRA config, optimization, token budget, and decoding.
 Per-run TOML configs (parsed into a ``JobSpec``) override the relevant fields.
 """
 
@@ -78,22 +78,6 @@ class RLConfig:
     sampling_top_p: float = 1.0
 
 
-# ----------------------------------------------------------------------------
-# Evaluation (identical eval set + decoding on both arms; shared grader)
-# ----------------------------------------------------------------------------
-@dataclass(frozen=True)
-class EvalConfig:
-    num_examples: int = 300
-    subset_seed: int = 12345  # fixed seed -> identical indices on both arms
-    # Deterministic greedy decoding for eval
-    temperature: float = 0.0
-    top_p: float = 1.0
-    max_new_tokens: int = 512
-    # Thinking-mode eval budget: the reasoning block must close AND leave room for the
-    # answer (unclosed <think> grades 0). EVAL_MAX_NEW_TOKENS remains the escape hatch.
-    max_new_tokens_thinking: int = 2048
-
-
 @dataclass(frozen=True)
 class Recipe:
     """The complete shared recipe."""
@@ -103,7 +87,6 @@ class Recipe:
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     sft: SFTConfig = field(default_factory=SFTConfig)
     rl: RLConfig = field(default_factory=RLConfig)
-    eval: EvalConfig = field(default_factory=EvalConfig)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, default=str)

@@ -2,8 +2,10 @@
 
 SECURITY: when ``workspace_path`` is set, ``grade`` applies a model-generated diff to a
 *temporary copy* of the repo and runs ``test_command`` in a subprocess. This is **not** a
-security sandbox — the model's diff and the test command run with the worker's privileges.
-Only use this on trusted environments/tasks until container sandboxing lands.
+security sandbox — the model's diff and the test command run with the worker's privileges
+(and can read worker secrets such as the HF token). It is therefore an explicit operator
+opt-in: the code-execution path is refused unless ``AUTOSLM_ALLOW_CODE_EXEC=1`` is set on
+the worker. Only enable it for trusted tasks until container sandboxing lands.
 """
 
 from __future__ import annotations
@@ -19,6 +21,17 @@ from dataclasses import dataclass
 
 from .base import BaseEnvironment
 
+_CODE_EXEC_ENV = "AUTOSLM_ALLOW_CODE_EXEC"
+
+
+def _code_exec_opt_in() -> bool:
+    """Whether the operator opted into the workspace_path code-execution path.
+
+    Truthy allowlist (not a falsey denylist): only an explicit truthy value enables it, so
+    "false"/"False"/"no"/"off"/"0"/"" all correctly keep the code-exec path disabled.
+    """
+    return os.environ.get(_CODE_EXEC_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
 
 @dataclass
 class TestsPassEnvironment(BaseEnvironment):
@@ -32,6 +45,15 @@ class TestsPassEnvironment(BaseEnvironment):
         self.examples_path = kwargs.get("examples_path", self.examples_path)
         self.test_command = kwargs.get("test_command", self.test_command)
         self.workspace_path = kwargs.get("workspace_path")
+        # Fail before any paid run: the workspace_path path executes a model-generated
+        # diff + test_command on the worker (NOT a sandbox), so it requires an explicit
+        # operator opt-in rather than running silently with worker privileges/secrets.
+        if self.workspace_path and not _code_exec_opt_in():
+            raise ValueError(
+                "tests_pass with workspace_path runs a model-generated diff and "
+                f"test_command on the worker (not a sandbox). Set {_CODE_EXEC_ENV}=1 on "
+                "the worker to enable this code-execution path."
+            )
         self.timeout_seconds = int(kwargs.get("timeout_seconds", self.timeout_seconds))
 
     def dataset(self, split: str) -> list[dict]:

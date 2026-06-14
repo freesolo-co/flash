@@ -6,9 +6,8 @@ Flash provisions a dedicated RunPod GPU (RTX 4090 / 5090, no Docker), installs
 Flash's live ("ad-hoc") provisioning does not bundle local project code, so the
 handler fetches the ``autoslm`` package from the HF dataset repo (uploaded by
 ``upload_code`` before submit), adds it to ``PYTHONPATH``, and runs
-``autoslm.engine.worker`` in two fresh processes — train, then eval — so the TRL trainer
-and the vLLM eval engine never share a process/GPU allocation. The worker streams the
-adapter + checkpoints to the same HF repo for serving and preemption-resilient resume.
+``autoslm.engine.worker`` to train. The worker streams the adapter + checkpoints to
+the same HF repo for serving and preemption-resilient resume.
 """
 
 from __future__ import annotations
@@ -26,20 +25,8 @@ from autoslm.worker_spec import JobSpec
 logger = get_logger(__name__)
 
 
-# Legacy pinned worker dependencies (installed by Flash on the GPU). cu128 torch for
-# Blackwell, vllm<0.11, transformers<5; huggingface_hub pulls code + streams artifacts.
-WORKER_DEPS_LEGACY = [
-    "torch==2.8.0",
-    "transformers>=4.55,<5",
-    "trl>=0.23,<0.24",
-    "peft",
-    "vllm<0.11",
-    "datasets>=2.19",
-    "huggingface_hub>=0.25",
-    "accelerate",
-]
-# Modern worker stack: trl 1.x (colocate default, DistillationTrainer for on-policy
-# distillation), vllm 0.22 (Qwen3.5/3.6 archs, native RL APIs, transformers-5
+# Worker stack: trl 1.x (colocate default), vllm 0.19.1 (Qwen3.5/3.6 archs,
+# native RL APIs, transformers-5
 # compatible metadata), transformers 5.x (qwen3_5/qwen3_5_moe model types),
 # bitsandbytes (QLoRA tier for the 35B-A3B MoE).
 # Resolver/driver notes: vllm 0.17/0.18 hard-pin transformers<5 (uv refuses the
@@ -51,7 +38,7 @@ WORKER_DEPS_LEGACY = [
 # trl's *optional* [vllm] extra caps at 0.18, but we install plain trl, so the only
 # constraint that matters is runtime API compat — validated per-model on real
 # RTX 4090/5090 workers before promotion to default (see bench/results/phase1).
-WORKER_DEPS_MODERN = [
+WORKER_DEPS = [
     "torch==2.10.0",
     "transformers>=5.6,<5.11",
     "trl>=1.5,<1.6",
@@ -69,22 +56,15 @@ WORKER_DEPS_MODERN = [
 # NOTE on download speed: Flash's runtime already ships hf_transfer and exports
 # HF_HUB_ENABLE_HF_TRANSFER=1 on workers (measured: Qwen3-4B's ~8 GB pulled in 6.3 s,
 # NIC-saturated — bench/results/phase6). Adding hf_transfer here is redundant; don't.
-# Default stack for workers. Overridable per-run without code changes:
-#   AUTOSLM_WORKER_STACK=legacy|modern   (named stacks)
-#   AUTOSLM_WORKER_DEPS="pkgA==1 pkgB>=2"  (fully custom, whitespace-separated;
-#                                          use a JSON list for specs with commas)
-# The modern stack is the default: it passed the full per-model validation matrix on
-# real RTX 4090/5090 workers (SFT+GRPO+eval; see bench/results/phase1/) and is required
-# for Qwen3.5/3.6 and TRL 1.x features (DistillationTrainer, colocate improvements).
-WORKER_DEPS = WORKER_DEPS_MODERN
+# Override the whole pinned stack per-run with AUTOSLM_WORKER_DEPS="pkgA==1 pkgB>=2"
+# (whitespace-separated, or a JSON list for specs containing commas).
 WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
 
 def resolve_worker_deps() -> list[str]:
     """The dependency list Flash installs on the GPU worker for this run.
 
-    Precedence: AUTOSLM_WORKER_DEPS (explicit list) > AUTOSLM_WORKER_STACK (named) >
-    the package default (``WORKER_DEPS``).
+    Precedence: AUTOSLM_WORKER_DEPS (explicit list) > the pinned ``WORKER_DEPS``.
     """
     explicit = os.environ.get("AUTOSLM_WORKER_DEPS")
     if explicit:
@@ -102,13 +82,7 @@ def resolve_worker_deps() -> list[str]:
             deps = [d for d in shlex.split(explicit) if d.strip()]
         if deps:
             return deps
-    stack = (os.environ.get("AUTOSLM_WORKER_STACK") or "").strip().lower()
-    if stack == "legacy":
-        deps = WORKER_DEPS_LEGACY
-    elif stack == "modern":
-        deps = WORKER_DEPS_MODERN
-    else:
-        deps = WORKER_DEPS
+    deps = WORKER_DEPS
     # Additive per-run extras (e.g. liger-kernel for the SFT_LIGER A/B) without
     # restating the whole pinned stack the way AUTOSLM_WORKER_DEPS requires.
     extra = os.environ.get("AUTOSLM_WORKER_EXTRA_DEPS")
@@ -165,7 +139,7 @@ def upload_code() -> str:
 
 
 def _train_body(input_data: dict) -> dict:
-    """Runs ON the RunPod GPU worker: fetch code, train (phase) then eval, return metrics.
+    """Runs ON the RunPod GPU worker: fetch code, train (phase), return metrics.
 
     NOTE: Flash serializes this handler and runs it standalone, so every name it uses
     must be imported INSIDE the function body (module-level imports are not in scope).
@@ -259,38 +233,26 @@ def _train_body(input_data: dict) -> dict:
                 )
         return proc.returncode
 
-    if input_data["phase"] == "eval":
-        # Standalone eval (no fine-tuning): a single eval_only process.
-        run_mode("eval_only", check=True)
-    else:
-        # A warm worker can carry a previous seed's handoff/metrics files; stale
-        # ones would let a crashed train phase evaluate the OLD adapter or report
-        # the previous run's metrics. Clear both before training.
-        for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(stale)
-        # Phase 1: train. check=False — RL's colocated vLLM can segfault at interpreter exit
-        # AFTER the adapter+train_meta are saved; don't let that abort the eval phase.
-        run_mode(input_data["phase"], check=False)
-        # RunPod can redeliver a completed job: the worker restores the final
-        # metrics.json from the HF DONE sentinel without recreating train_meta.json.
-        # That is success, not a crashed train phase — return the metrics.
-        if os.path.exists("/tmp/metrics.json"):
-            with open("/tmp/metrics.json") as f:
-                return json.load(f)
-        # Fail fast with the REAL cause if the train phase never produced its handoff
-        # metadata, instead of running a doomed eval whose "train_meta not found" masks the
-        # underlying error. The full traceback is in error_<phase>.txt in the HF repo.
-        if not os.path.exists("/tmp/train_meta.json"):
-            phase = input_data["phase"]
-            raise RuntimeError(
-                f"train phase '{phase}' produced no /tmp/train_meta.json (it crashed before "
-                f"saving the adapter); see error_{phase}.txt and console_{phase}.txt in the "
-                f"HF dataset repo for the full traceback"
-            )
-        # Phase 2: eval in a FRESH process (loads train_meta + adapter from HF / local).
-        run_mode("eval_after", check=True)
-
+    # A warm worker can carry a previous seed's metrics files; a stale metrics.json
+    # would let a crashed train phase report the previous run's numbers. Clear before
+    # training.
+    for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(stale)
+    # Train. check=False — RL's colocated vLLM can segfault at interpreter exit AFTER
+    # the adapter + metrics.json + DONE are saved; don't treat that as a failure.
+    run_mode(input_data["phase"], check=False)
+    # The train phase writes metrics.json + the DONE sentinel itself (RunPod can also
+    # redeliver a completed job, whose worker restores metrics.json from DONE). If it
+    # is missing, the train phase crashed before finishing — fail fast with the real
+    # cause (full traceback in error_<phase>.txt / console_<phase>.txt in the HF repo).
+    if not os.path.exists("/tmp/metrics.json"):
+        phase = input_data["phase"]
+        raise RuntimeError(
+            f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
+            f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF "
+            f"dataset repo for the full traceback"
+        )
     with open("/tmp/metrics.json") as f:
         return json.load(f)
 
@@ -365,6 +327,8 @@ def _patch_runpod_backoff() -> None:
 
             _sl.get_backoff_delay = _safe_get_backoff_delay
         except Exception:
+            # serverless.py may not import the symbol in this SDK version; the primary
+            # patch above still applies, so a missing alias is fine to ignore.
             pass
     except Exception as exc:  # never let the patch break submission
         logger.warning("runpod backoff patch skipped: %s", exc)
@@ -385,13 +349,9 @@ def min_cuda_for(friendly_gpu: str) -> str:
     explicit = os.environ.get("AUTOSLM_MIN_CUDA")
     if explicit:
         return explicit
-    stack = (os.environ.get("AUTOSLM_WORKER_STACK") or "").strip().lower()
-    modern = stack == "modern" or (not stack and WORKER_DEPS is WORKER_DEPS_MODERN)
-    if modern:
-        from autoslm.flash.gpus import min_cuda_modern
+    from autoslm.flash.gpus import min_cuda_modern
 
-        return min_cuda_modern(friendly_gpu)
-    return "12.8"
+    return min_cuda_modern(friendly_gpu)
 
 
 def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
@@ -524,8 +484,6 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list:
     With ``run_id`` it targets exactly that run's uniquely-named endpoint; without it, the
     bare ``autoslm-train-<gpu>`` prefix matches every endpoint of that GPU class.
     """
-    import asyncio
-
     friendly = canonical_gpu(friendly_gpu)
     target = endpoint_name(friendly, _run_suffix(run_id))
     try:
@@ -560,6 +518,21 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list:
     except Exception as exc:
         results = [{"success": False, "name": target, "message": str(exc)}]
 
+    # Registry-less fallback: isolate_flash_state() keeps the Flash SDK's resource
+    # registry per-process under ~/.autoslm, so a recreated container (or a crash before
+    # on_handle() persisted the endpoint id) leaves the live endpoint invisible to the
+    # lookup above. Delete it via the RunPod REST API by its reconstructed name so it
+    # can't keep a paid worker alive.
+    if not uids:
+        with contextlib.suppress(Exception):
+            from autoslm.flash import runpod_api
+
+            for ep in runpod_api.find_endpoints_by_name(target):
+                if ep.get("name") == target and runpod_api.delete_endpoint(ep["id"]):
+                    results.append(
+                        {"success": True, "name": target, "message": "deleted via REST API"}
+                    )
+
     # also drop the in-process cached handler for THIS run only (a class-wide
     # drop would evict a concurrent run's endpoint on the same GPU class).
     with contextlib.suppress(Exception):
@@ -572,7 +545,6 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
         "BENCH_HF_MODEL": spec.model,
-        "EVAL_NUM": str(spec.train.eval_examples),
         # Colocate (TRL trainer + vLLM on one GPU) is memory-tight and fragments over a long
         # run, OOMing late (e.g. in vLLM's sampler) with memory "reserved but unallocated".
         # expandable_segments lets the allocator reclaim that fragmentation. Overridable.
@@ -628,12 +600,6 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "RL_PROMPTS_PER_STEP",
         "RL_GROUP_SIZE",
         "RL_SAVE_STEPS",
-        "OPD_PER_DEVICE_BS",
-        "OPD_BATCH",
-        "OPD_LR",
-        "OPD_VLLM_GPU_UTIL",
-        "DPO_LR",
-        "DPO_BETA",
         "VLLM_USE_V1",
         # Attention-backend escape hatch: vllm's bundled flash-attn PTX can be newer
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
@@ -642,10 +608,6 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "AUTOSLM_QUANT",
         "AUTOSLM_QUANT_REPO",
         "AUTOSLM_THINKING",
-        "EVAL_MAX_NEW_TOKENS",
-        "EVAL_MAX_MODEL_LEN",
-        "EVAL_VLLM_GPU_UTIL",
-        "EVAL_ENFORCE_EAGER",
         "LORA_TARGETS",
     ):
         if os.environ.get(k):
@@ -654,7 +616,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
 
 
 def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
-    """Provision a dedicated GPU via Flash, run train+eval, return the metrics dict."""
+    """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
     from autoslm.envs.registry import worker_pip_for_env
 
@@ -691,49 +653,4 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
     out = asyncio.run(_call())
     if not isinstance(out, dict):
         raise RuntimeError(f"flash job returned no metrics: {out!r}")
-    return out
-
-
-def submit_eval(spec: JobSpec, adapter_prefix: str | None = None, log=None) -> dict:
-    """Run a standalone eval (base + optional adapter) on a managed Flash GPU."""
-    from autoslm.envs.registry import worker_pip_for_env
-
-    timeout_s = max(60, int(spec.gpu.max_wall_seconds))
-    handler = get_train_endpoint(
-        spec.gpu.type,
-        execution_timeout_ms=timeout_s * 1000,
-        name_suffix=_run_suffix(spec.run_id),
-        disk_gb=spec.gpu.disk_gb,
-        spec=spec,
-    )
-    env = build_worker_env(spec, spec.train.seeds[0])
-    env["PHASE"] = "eval"
-    if adapter_prefix:
-        env["ADAPTER_PREFIX"] = adapter_prefix
-    payload = {
-        "hf_repo": os.environ.get("HF_REPO", ""),
-        "job_spec_json": spec.to_json(),
-        "phase": "eval",
-        "seed": int(spec.train.seeds[0]),
-        "env": env,
-        "extra_pip": list(spec.environment.pip)
-        or worker_pip_for_env(spec.environment.id, spec.environment.params),
-    }
-    if log is not None:
-        print(
-            f"submitting Flash eval: gpu={spec.gpu.type} model={spec.model} "
-            f"adapter={adapter_prefix}",
-            file=log,
-            flush=True,
-        )
-
-    async def _call():
-        res = handler(payload)
-        if inspect.isawaitable(res):
-            res = await res
-        return res
-
-    out = asyncio.run(_call())
-    if not isinstance(out, dict):
-        raise RuntimeError(f"flash eval returned no metrics: {out!r}")
     return out

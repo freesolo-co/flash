@@ -1,21 +1,21 @@
-"""On-GPU fine-tuning/eval worker (default RTX 5090). Modes: sft | rl | eval_after.
+"""On-GPU fine-tuning worker (default RTX 5090). Modes: sft | rl.
 
 This module runs **on the RunPod GPU** provisioned by ``autoslm.flash``. It uses the
-shared recipe (``autoslm.engine.recipe``) and grader so SFT targets, RL rewards, and
-eval are scored identically.
+shared recipe (``autoslm.engine.recipe``) so SFT targets and RL rewards are rendered
+and scored consistently.
 
-Artifacts (adapter, metrics.json, generations.jsonl, heartbeat.json, checkpoints)
-are streamed to a Hugging Face dataset repo. HF checkpoints give preemption
-resilience: if a worker is recycled mid-run we resume from the latest uploaded
-checkpoint. Metrics are also returned directly to the caller by the Flash endpoint.
+Artifacts (adapter, metrics.json, heartbeat.json, checkpoints) are streamed to a
+Hugging Face dataset repo. HF checkpoints give preemption resilience: if a worker is
+recycled mid-run we resume from the latest uploaded checkpoint. Metrics are also
+returned directly to the caller by the Flash endpoint.
 
 Environment variables (set by the Flash endpoint / orchestrator):
-  RUN_MODE      sft|rl|eval_after
+  RUN_MODE      sft|rl
   SEED          int
   HF_REPO       Hugging Face dataset repo for artifacts (e.g. your-org/autoslm-runs)
   HUGGINGFACE_TOKEN
   RUN_ID        unique id for this run (namespacing in the repo)
-  RL_STEPS, SFT_EPOCHS, EVAL_NUM   optional overrides
+  RL_STEPS, SFT_EPOCHS   optional overrides
 """
 
 from __future__ import annotations
@@ -39,18 +39,10 @@ RUN_ID = os.environ.get("RUN_ID", "local")
 SEED = int(os.environ.get("SEED", "0"))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
 JOB_SPEC = load_job_spec_from_env()
-# PHASE is the stable artifact namespace (sft|rl). RUN_MODE may be "eval_after" for the
-# separate eval process, but artifacts must stay under the train PHASE (sft|rl) prefix.
+# PHASE is the stable artifact namespace (sft|rl) and matches RUN_MODE for a train run.
 PHASE = os.environ.get(
     "PHASE",
-    JOB_SPEC.phase
-    if JOB_SPEC
-    else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd", "dpo") else "sft"),
-)
-EVAL_NUM = int(
-    os.environ.get(
-        "EVAL_NUM", str(JOB_SPEC.train.eval_examples if JOB_SPEC else RECIPE.eval.num_examples)
-    )
+    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl") else "sft"),
 )
 ACTIVE_ENV = (
     load_environment(
@@ -62,7 +54,7 @@ ACTIVE_ENV = (
     else load_environment("gsm8k")
 )
 # Thinking/reasoning mode: one flag per run, consumed identically by SFT rendering,
-# RL rollouts, eval, and serving. The env fallback serves the bench/no-JobSpec path.
+# RL rollouts, and serving. The env fallback serves the bench/no-JobSpec path.
 THINKING = (
     JOB_SPEC.thinking
     if JOB_SPEC
@@ -74,12 +66,8 @@ THINKING = (
 # HF helpers (code-delivery + artifact channel; works without inbound network)
 # ---------------------------------------------------------------------------
 def error_artifact_name(mode: str) -> str:
-    """Per-phase error filename so a later phase's failure can't clobber the train error.
-
-    Each run mode (sft|rl|eval_after|eval_only) uploads its traceback under a distinct
-    name, so when the train phase crashes its root-cause traceback survives even though a
-    subsequent eval phase also errors (and overwrites the single heartbeat.json).
-    """
+    """Per-mode error filename (e.g. error_sft.txt) so a run's traceback is uploaded
+    under a stable name even though heartbeat.json is single-file/overwritten."""
     return f"error_{mode}.txt"
 
 
@@ -287,7 +275,7 @@ def heartbeat(stage: str, **kw):
 
 # ---------------------------------------------------------------------------
 # Decoding parity: render with the model's own chat template and one run-wide thinking
-# flag (off by default), so SFT targets, RL rollouts, and eval all use identical prompt
+# flag (off by default), so SFT targets and RL rollouts use identical prompt
 # formatting within a run.
 # ---------------------------------------------------------------------------
 def render_prompt(tokenizer, item) -> str:
@@ -327,109 +315,6 @@ def graded_text(completion: str | None) -> str | None:
     return strip_think(completion) if THINKING else completion
 
 
-def eval_max_new_tokens() -> int:
-    ec = RECIPE.eval
-    default = ec.max_new_tokens_thinking if THINKING else ec.max_new_tokens
-    return int(os.environ.get("EVAL_MAX_NEW_TOKENS", default))
-
-
-def eval_max_model_len(max_new: int) -> int:
-    """Eval engine context bound: prompt + completion + template overhead. The old
-    hardcoded 2048 can't even hold a thinking completion (2048 new tokens)."""
-    return int(
-        os.environ.get(
-            "EVAL_MAX_MODEL_LEN", str(max(2048, RECIPE.rl.max_prompt_len + max_new + 128))
-        )
-    )
-
-
-# ---------------------------------------------------------------------------
-# Eval with vLLM (greedy, identical settings + shared grader)
-# ---------------------------------------------------------------------------
-def vllm_eval(llm, tokenizer, eval_examples, lora_request=None):
-    from vllm import SamplingParams
-
-    ec = RECIPE.eval
-    max_new = eval_max_new_tokens()
-    sp = SamplingParams(temperature=ec.temperature, top_p=ec.top_p, max_tokens=max_new)
-    prompts = [render_prompt(tokenizer, ex) for ex in eval_examples]
-    if lora_request is not None:
-        outs = llm.generate(prompts, sp, lora_request=lora_request)
-    else:
-        outs = llm.generate(prompts, sp)
-    completions = [o.outputs[0].text for o in outs]
-    gen_tokens = sum(len(o.outputs[0].token_ids) for o in outs)
-    gens = []
-    for ex, c, o in zip(eval_examples, completions, outs, strict=False):
-        graded = graded_text(c)
-        correct = ACTIVE_ENV.grade(graded, ex)
-        gold = ex.get("gold") or ex.get("answer") or ex.get("target")
-        pred = getattr(ACTIVE_ENV, "extract_pred", lambda _c: None)(graded)
-        n_tokens = len(o.outputs[0].token_ids)
-        gens.append(
-            {
-                "question": ex.get("question") or ex.get("prompt"),
-                "gold": gold,
-                "completion": c,  # raw (incl. <think> in thinking runs)
-                "pred": pred,
-                "correct": correct,
-                "n_tokens": n_tokens,
-                # Cap saturation is the thinking failure signature; surface it
-                # per-completion so smokes can assert on it.
-                "truncated": n_tokens >= max_new,
-            }
-        )
-    # Reuse the grades already computed above: re-grading runs every custom
-    # environment's grade() twice (tests_pass re-applies a diff and re-runs the
-    # test command, doubling side effects/timeouts on every eval).
-    acc = sum(1 for g in gens if g["correct"]) / max(1, len(gens))
-    return acc, gen_tokens, gens
-
-
-def transformers_eval(model, tokenizer, eval_examples, batch_size: int = 4):
-    """Greedy eval via transformers.generate — fallback for models vLLM cannot serve on
-    this GPU (the 4-bit QLoRA MoE tier). Same prompts/decoding/grader as vllm_eval."""
-    import torch
-
-    max_new = eval_max_new_tokens()
-    prompts = [render_prompt(tokenizer, ex) for ex in eval_examples]
-    completions: list[str] = []
-    gen_tokens = 0
-    model.eval()
-    for i in range(0, len(prompts), batch_size):
-        batch = prompts[i : i + batch_size]
-        inputs = tokenizer(batch, return_tensors="pt", padding=True, padding_side="left").to(
-            model.device
-        )
-        with torch.no_grad():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=max_new,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        new_tokens = out[:, inputs["input_ids"].shape[1] :]
-        gen_tokens += int(new_tokens.numel())
-        completions.extend(tokenizer.batch_decode(new_tokens, skip_special_tokens=True))
-    gens = []
-    for ex, c in zip(eval_examples, completions, strict=False):
-        graded = graded_text(c)
-        correct = ACTIVE_ENV.grade(graded, ex)
-        gold = ex.get("gold") or ex.get("answer") or ex.get("target")
-        gens.append(
-            {
-                "question": ex.get("question") or ex.get("prompt"),
-                "gold": gold,
-                "completion": c,
-                "pred": getattr(ACTIVE_ENV, "extract_pred", lambda _c: None)(graded),
-                "correct": correct,
-                "n_tokens": None,
-            }
-        )
-    acc = sum(1 for gg in gens if gg["correct"]) / max(1, len(gens))
-    return acc, gen_tokens, gens
-
-
 def _patch_peft_weight_converter_compat() -> None:
     """peft 0.19.1 x transformers 5.6-5.10: make MoE adapter loading work.
 
@@ -466,39 +351,6 @@ def _patch_peft_weight_converter_compat() -> None:
     converter.__init__ = _compat_init
     converter._autoslm_compat = True
     print("[compat] WeightConverter patched (peft<->transformers signature drift)")
-
-
-def run_eval_after_quantized(meta: dict, t0: float):
-    """Eval path for the QLoRA tier: 4-bit base via transformers (+ adapter), no vLLM."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    _patch_peft_weight_converter_compat()
-
-    phase = meta["phase"]
-    model_id = meta["model_id"]
-    adapter_dir = _ensure_adapter_local(meta["adapter_dir"])
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    heartbeat(f"{phase}_eval_start", adapter=adapter_dir, eval_engine="transformers-4bit")
-
-    eval_examples = ACTIVE_ENV.dataset("eval")[:EVAL_NUM]
-    weights_id = quant_weights_repo(model_id) or model_id
-    model = AutoModelForCausalLM.from_pretrained(
-        weights_id,
-        trust_remote_code=True,
-        device_map="auto",
-        **qlora_model_init_kwargs(prequantized=weights_id != model_id),
-    )
-    base_acc, _, _ = transformers_eval(model, tok, eval_examples)
-    heartbeat(f"{phase}_base_eval", base_acc=base_acc)
-
-    from peft import PeftModel
-
-    model = PeftModel.from_pretrained(model, adapter_dir)
-    acc, eval_gen, gens = transformers_eval(model, tok, eval_examples)
-    heartbeat(f"{phase}_trained_eval", trained_acc=acc)
-    return base_acc, acc, eval_gen, gens, adapter_dir
 
 
 # ---------------------------------------------------------------------------
@@ -604,25 +456,9 @@ def make_lora(model_id: str | None = None):
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
         if exclude:
-            # peft>=0.14 supports exclude_modules; drop silently on older peft.
-            import inspect
-
-            if "exclude_modules" in inspect.signature(LoraConfig.__init__).parameters:
-                kwargs["exclude_modules"] = exclude
-                print(f"[lora] excluding modules for {model_id}: {exclude}")
+            kwargs["exclude_modules"] = exclude
+            print(f"[lora] excluding modules for {model_id}: {exclude}")
     return LoraConfig(**kwargs)
-
-
-def eval_max_lora_rank() -> int:
-    """vLLM rejects adapters whose rank exceeds max_lora_rank; cover the
-    configured train rank, not just the recipe default."""
-    spec_rank = 0
-    if JOB_SPEC is not None:
-        try:
-            spec_rank = int(JOB_SPEC.train.lora_rank)
-        except Exception:
-            spec_rank = 0
-    return max(int(RECIPE.lora.rank), spec_rank)
 
 
 def model_quant(model_id: str) -> str:
@@ -791,7 +627,7 @@ def run_sft():
         # accelerate-offload large models to meta ("expected device meta but got
         # cuda:0" in backward on the 9B).
         cfg_kwargs["model_init_kwargs"] = {"dtype": "bfloat16", "device_map": None}
-    cfg = TRLSFTConfig(**supported_config_kwargs(TRLSFTConfig, cfg_kwargs))
+    cfg = TRLSFTConfig(**cfg_kwargs)
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
     trainer = SFTTrainer(
@@ -816,8 +652,7 @@ def run_sft():
     # count train tokens
     train_tokens = int(sum(len(tok(t["text"])["input_ids"]) for t in texts) * epochs)
 
-    # Hand off to a SEPARATE eval process (see run_eval_after): the trainer (transformers/TRL)
-    # and eval (vLLM) must not share a process/GPU allocation or vLLM init OOMs.
+    # Write train metadata + the completion sentinel (metrics.json/DONE) for this phase.
     write_train_meta(
         phase="sft",
         adapter_dir=adapter_dir,
@@ -883,36 +718,6 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
         # TRL requires the global completion batch be divisible by num_generations.
         "divisible_by_group": (generations_per_step % group_size == 0),
     }
-
-
-def supported_config_kwargs(config_cls, kwargs: dict) -> dict:
-    """Filter ``kwargs`` to fields accepted by the installed TRL config dataclass.
-
-    TRL configs (SFTConfig/GRPOConfig/...) extend the HF trainer config and gain/rename/
-    remove knobs across versions (TRL 0.23 -> 1.x removed ``max_prompt_length``, renamed
-    packing strategies, added ``vllm_*`` knobs ...). Passing an unknown one raises and
-    kills the worker, so we drop unsupported keys (with a log line) rather than crash.
-    Recipe-critical keys are still passed when present.
-    """
-    try:
-        import dataclasses
-
-        valid = {f.name for f in dataclasses.fields(config_cls)}
-    except Exception as e:
-        print(f"supported_config_kwargs: could not introspect {config_cls.__name__} fields:", e)
-        return kwargs
-    kept, dropped = {}, []
-    for k, v in kwargs.items():
-        if k in valid:
-            kept[k] = v
-        else:
-            dropped.append(k)
-    if dropped:
-        print(
-            f"{config_cls.__name__}: dropping kwargs unsupported by this TRL version:",
-            ", ".join(dropped),
-        )
-    return kept
 
 
 def rl_per_device_comps() -> int:
@@ -993,7 +798,7 @@ def _init_adapter_model(model_id: str, tokenizer):
     prefix = JOB_SPEC.train.init_from_adapter if JOB_SPEC else ""
     if not prefix:
         return model_id, make_lora(model_id)
-    adir = _download_eval_adapter(prefix)
+    adir = _download_adapter(prefix)
     if not adir:
         # The user explicitly asked GRPO to continue from this adapter; silently
         # falling back to a fresh base-model LoRA would spend a full paid run
@@ -1098,10 +903,9 @@ def run_rl():
         "top_p": rl.sampling_top_p,
         "use_vllm": True,
         "vllm_mode": "colocate",
-        # TRL 1.x: bound the colocated engine's KV allocation to what GRPO actually
-        # needs. Without this, vLLM sizes its KV cache for the model's FULL context
-        # (262k for Qwen3-4B-Instruct-2507) and refuses to start on a consumer GPU.
-        # (Dropped harmlessly on legacy TRL, which sizes from max_prompt/completion.)
+        # Bound the colocated engine's KV allocation to what GRPO actually needs.
+        # Without this, vLLM sizes its KV cache for the model's FULL context (262k for
+        # Qwen3-4B-Instruct-2507) and refuses to start on a consumer GPU.
         "vllm_max_model_length": int(
             os.environ.get("RL_VLLM_MAX_LEN", str(max(1024, rl.max_prompt_len + _max_completion)))
         ),
@@ -1123,7 +927,7 @@ def run_rl():
         # to 0 over the run), advantages centered by group mean only (no std scaling, which
         # biases by difficulty/length — matches datums.centered_advantages), and no
         # length-normalized loss. beta is the KL-to-reference coef (datums kl_masks ->
-        # kl_penalty_coef). Unsupported keys are dropped per TRL version.
+        # kl_penalty_coef).
         "lr_scheduler_type": "constant",
         "warmup_ratio": 0.0,
         "beta": _kl_beta,
@@ -1142,7 +946,7 @@ def run_rl():
     # centered) and surface a note when a config asks for an explicit clamp.
     if _adv_clip > 0:
         print(f"[rl] advantage_clip={_adv_clip} recorded; TRL centers advantages (no value clip)")
-    cfg = GRPOConfig(**supported_config_kwargs(GRPOConfig, grpo_kwargs))
+    cfg = GRPOConfig(**grpo_kwargs)
     setup_seconds = time.time() - t_start
     heartbeat("rl_train_start", setup_seconds=setup_seconds)
 
@@ -1212,215 +1016,7 @@ def run_rl():
 
 
 # ---------------------------------------------------------------------------
-# On-policy distillation (TRL DistillationTrainer, experimental module)
-# ---------------------------------------------------------------------------
-def run_opd():
-    """On-policy distillation: the student generates rollouts; the teacher provides
-    dense token-level supervision (reverse-KL on student-visited states). The teacher
-    loads in-process on the same GPU (bf16) — pick a pair that fits the card."""
-    os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
-    from datasets import Dataset
-    from transformers import AutoTokenizer
-    from trl.experimental.distillation import DistillationConfig, DistillationTrainer
-
-    t_start = time.time()
-    heartbeat("opd_start")
-    wait_for_gpu()
-    model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
-    teacher_id = JOB_SPEC.distill.teacher if JOB_SPEC else ""
-    if not teacher_id:
-        raise SystemExit("opd requires distill.teacher")
-    prefetch_model(model_id)
-    prefetch_model(teacher_id)
-    steps = int(os.environ.get("RL_STEPS", str(JOB_SPEC.train.steps or 100)))
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
-    train = ACTIVE_ENV.dataset("train")
-    rng = random.Random(SEED)
-    rng.shuffle(train)
-    # Prompt-only dataset. The DistillationTrainer's collator reads a "messages"
-    # column (conversational form) and the student generates the completion on-policy.
-    prompts = [{"messages": (ACTIVE_ENV.prompt_messages(ex))} for ex in train]
-    ds = Dataset.from_list(prompts)
-
-    per_device = int(os.environ.get("OPD_PER_DEVICE_BS", "4"))
-    grad_accum = max(1, int(os.environ.get("OPD_BATCH", "16")) // per_device)
-    cfg_kwargs = {
-        "output_dir": f"/tmp/opd_seed{SEED}",
-        "max_steps": steps,
-        "per_device_train_batch_size": per_device,
-        "gradient_accumulation_steps": grad_accum,
-        "learning_rate": float(os.environ.get("OPD_LR", "1e-4")),
-        "lr_scheduler_type": "constant",
-        "teacher_model_name_or_path": teacher_id,
-        "teacher_model_init_kwargs": {"dtype": "bfloat16", "trust_remote_code": True},
-        "model_init_kwargs": {"dtype": "bfloat16"},
-        "lmbda": JOB_SPEC.distill.lmbda if JOB_SPEC else 1.0,
-        "temperature": JOB_SPEC.distill.temperature if JOB_SPEC else 1.0,
-        "max_completion_length": JOB_SPEC.distill.max_completion if JOB_SPEC else 320,
-        "logging_steps": 1,
-        "save_steps": int(os.environ.get("RL_SAVE_STEPS", "20")),
-        "save_total_limit": 1,
-        "bf16": True,
-        "report_to": [],
-        "seed": SEED,
-        "gradient_checkpointing": True,
-        # Student rollouts via colocated vLLM: transformers.generate is far too slow for
-        # on-policy generation (minutes per step at batch 16 x 320 new tokens).
-        "use_vllm": True,
-        "vllm_mode": "colocate",
-        "vllm_gpu_memory_utilization": float(os.environ.get("OPD_VLLM_GPU_UTIL", "0.25")),
-        "vllm_enable_sleep_mode": False,
-        "vllm_max_model_length": int(
-            os.environ.get(
-                "RL_VLLM_MAX_LEN",
-                str(max(1024, 512 + (JOB_SPEC.distill.max_completion if JOB_SPEC else 320))),
-            )
-        ),
-        # TRL renders the "messages" column itself — pin the run's thinking flag so OPD
-        # rollouts match SFT/RL/eval rendering instead of the template's own default
-        # (thinking ON for hybrid Qwen3). Dropped-with-log on TRL versions without it.
-        "chat_template_kwargs": {"enable_thinking": THINKING},
-    }
-    cfg = DistillationConfig(**supported_config_kwargs(DistillationConfig, cfg_kwargs))
-    # Force language_model_only on the colocated vLLM engine TRL builds for student
-    # rollouts (same as run_rl): a Qwen3.5/3.6 VL checkpoint would otherwise load the
-    # vision tower and hit the VRAM/PTX failures the RL path avoids.
-    patch_vllm_language_model_only(model_id)
-    setup_seconds = time.time() - t_start
-    heartbeat("opd_train_start", setup_seconds=setup_seconds, teacher=teacher_id)
-    # The teacher is a TRAINER argument (the config's teacher_model_name_or_path alone
-    # is not honored by this TRL version — "No teacher model or teacher server").
-    trainer = DistillationTrainer(
-        model=model_id,
-        teacher_model=teacher_id,
-        args=cfg,
-        train_dataset=ds,
-        processing_class=tok,
-        peft_config=make_lora(model_id),
-        callbacks=[make_checkpoint_upload_callback()],
-    )
-    t_train = time.time()
-    trainer.train(resume_from_checkpoint=hf_resume_checkpoint())
-    train_wall = time.time() - t_train
-
-    adapter_dir = f"/tmp/opd_seed{SEED}/adapter"
-    trainer.model.save_pretrained(adapter_dir)
-    tok.save_pretrained(adapter_dir)
-    hf_upload_folder(adapter_dir, "adapter", required=True)
-    heartbeat("opd_trained", train_wall=train_wall)
-    gen_tokens = (
-        steps * per_device * grad_accum * (JOB_SPEC.distill.max_completion if JOB_SPEC else 320)
-    )
-    write_train_meta(
-        phase="opd",
-        adapter_dir=adapter_dir,
-        model_id=model_id,
-        train_wall=train_wall,
-        setup_seconds=setup_seconds,
-        train_tokens=0,
-        generated_tokens=gen_tokens,
-        notes={
-            "steps": steps,
-            "teacher": teacher_id,
-            "lmbda": JOB_SPEC.distill.lmbda if JOB_SPEC else 1.0,
-            "gen_tokens_is_upper_bound": True,
-        },
-    )
-    free_gpu(trainer)
-
-
-# ---------------------------------------------------------------------------
-# DPO (offline preference optimization)
-# ---------------------------------------------------------------------------
-def run_dpo():
-    """Direct preference optimization on a preference dataset with chosen/rejected
-    columns. Point the environment at one via [environment.params]
-    preference_dataset = "org/name" (any HF dataset with prompt/chosen/rejected)."""
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
-    from trl import DPOConfig, DPOTrainer
-
-    t_start = time.time()
-    heartbeat("dpo_start")
-    wait_for_gpu()
-    model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
-    pref = (JOB_SPEC.environment.params or {}).get("preference_dataset") if JOB_SPEC else None
-    if not pref:
-        raise SystemExit(
-            'dpo requires [environment.params] preference_dataset = "org/name" '
-            "(prompt/chosen/rejected columns)"
-        )
-    prefetch_model(model_id)
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    split = (JOB_SPEC.environment.params or {}).get("preference_split", "train")
-    ds = load_dataset(pref, split=split)
-    max_examples = int(os.environ.get("SFT_MAX_EXAMPLES", "0"))
-    if max_examples > 0:
-        ds = ds.shuffle(seed=SEED).select(range(min(max_examples, len(ds))))
-
-    epochs = int(os.environ.get("SFT_EPOCHS", str(JOB_SPEC.train.epochs or 1)))
-    per_device = int(os.environ.get("SFT_PER_DEVICE_BS", "2"))
-    cfg_kwargs = {
-        "output_dir": f"/tmp/dpo_seed{SEED}",
-        "num_train_epochs": epochs,
-        "per_device_train_batch_size": per_device,
-        "gradient_accumulation_steps": max(1, RECIPE.sft.effective_batch // per_device),
-        "learning_rate": float(os.environ.get("DPO_LR", "5e-6")),
-        "beta": float(os.environ.get("DPO_BETA", "0.1")),
-        "logging_steps": 10,
-        "save_steps": int(os.environ.get("SFT_SAVE_STEPS", "50")),
-        "save_total_limit": 1,
-        "bf16": True,
-        "report_to": [],
-        "seed": SEED,
-        "gradient_checkpointing": True,
-        "model_init_kwargs": {"dtype": "bfloat16"},
-    }
-    max_steps = int(os.environ.get("SFT_MAX_STEPS", "0"))
-    if max_steps > 0:
-        cfg_kwargs["max_steps"] = max_steps
-    cfg = DPOConfig(**supported_config_kwargs(DPOConfig, cfg_kwargs))
-    setup_seconds = time.time() - t_start
-    heartbeat("dpo_train_start", setup_seconds=setup_seconds, dataset=pref)
-    trainer = DPOTrainer(
-        model=model_id,
-        args=cfg,
-        train_dataset=ds,
-        processing_class=tok,
-        peft_config=make_lora(model_id),
-        callbacks=[make_checkpoint_upload_callback()],
-    )
-    t_train = time.time()
-    trainer.train(resume_from_checkpoint=hf_resume_checkpoint())
-    train_wall = time.time() - t_train
-
-    adapter_dir = f"/tmp/dpo_seed{SEED}/adapter"
-    trainer.model.save_pretrained(adapter_dir)
-    tok.save_pretrained(adapter_dir)
-    hf_upload_folder(adapter_dir, "adapter", required=True)
-    heartbeat("dpo_trained", train_wall=train_wall)
-    write_train_meta(
-        phase="dpo",
-        adapter_dir=adapter_dir,
-        model_id=model_id,
-        train_wall=train_wall,
-        setup_seconds=setup_seconds,
-        train_tokens=0,
-        generated_tokens=0,
-        notes={"epochs": epochs, "preference_dataset": pref},
-    )
-    free_gpu(trainer)
-
-
-# ---------------------------------------------------------------------------
-# Train -> eval handoff (separate processes so transformers/TRL trainer and the
-# vLLM eval engine never share a process/GPU allocation; the RL colocate engine
-# in particular would OOM if a second vLLM engine were created in-process).
+# Completion: train phase writes metrics.json + the DONE sentinel (see _finalize).
 # ---------------------------------------------------------------------------
 def gpu_diagnostics() -> dict:
     """Collect CUDA/driver diagnostics to pin down GPU init failures on rented nodes."""
@@ -1487,6 +1083,7 @@ def free_gpu(trainer=None):
             if trainer is not None and hasattr(trainer, "model"):
                 trainer.model = None
         except Exception:
+            # Best-effort VRAM release before gc; any failure here is non-fatal cleanup.
             pass
         gc.collect()
         if torch.cuda.is_available():
@@ -1515,161 +1112,35 @@ def write_train_meta(
         f"{phase}_train_done",
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
     )
-    print(f"TRAIN DONE ({phase}); meta written. Eval runs in a separate process.")
-
-
-def _load_train_meta():
-    """Load /tmp/train_meta.json, downloading from HF if a restart wiped local /tmp."""
-    p = "/tmp/train_meta.json"
-    if not os.path.exists(p) and HF_REPO:
-        try:
-            from huggingface_hub import hf_hub_download
-
-            got = hf_hub_download(
-                repo_id=HF_REPO,
-                repo_type="dataset",
-                filename=f"{hf_prefix()}/train_meta.json",
-                token=os.environ.get("HUGGINGFACE_TOKEN"),
-            )
-            import shutil
-
-            shutil.copy(got, p)
-        except Exception as e:
-            print("could not fetch train_meta from HF:", e)
-    with open(p) as f:
-        return json.load(f)
-
-
-def _ensure_adapter_local(adapter_dir: str):
-    """Make sure the adapter is on local disk (download from HF if a restart wiped it)."""
-    if os.path.isdir(adapter_dir) and os.listdir(adapter_dir):
-        return adapter_dir
-    if HF_REPO:
-        from huggingface_hub import snapshot_download
-
-        snapshot_download(
-            repo_id=HF_REPO,
-            repo_type="dataset",
-            allow_patterns=[f"{hf_prefix()}/adapter/*"],
-            local_dir="/tmp/dl",
-            token=os.environ.get("HUGGINGFACE_TOKEN"),
-        )
-        cand = os.path.join("/tmp/dl", hf_prefix(), "adapter")
-        if os.path.isdir(cand):
-            return cand
-    return adapter_dir
-
-
-def run_eval_after():
-    """Fresh-process eval of base + trained adapter (reads train_meta from the
-    trainer process). Builds RunMetrics and writes the DONE sentinel."""
-    from transformers import AutoTokenizer
-    from vllm import LLM
-    from vllm.lora.request import LoRARequest
-
-    t0 = time.time()
-    wait_for_gpu()
-    meta = _load_train_meta()
-    phase = meta["phase"]
-    model_id = meta["model_id"]
-    if model_quant(model_id) == "4bit-qlora":
-        # vLLM cannot host this model in bf16 on a consumer GPU; eval via transformers.
-        base_acc, acc, eval_gen, gens, adapter_dir = run_eval_after_quantized(meta, t0)
-    else:
-        adapter_dir = _ensure_adapter_local(meta["adapter_dir"])
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        heartbeat(f"{phase}_eval_start", adapter=adapter_dir)
-
-        eval_examples = ACTIVE_ENV.dataset("eval")[:EVAL_NUM]
-        llm = LLM(
-            model=model_id,
-            enable_lora=True,
-            max_lora_rank=eval_max_lora_rank(),
-            dtype="bfloat16",
-            gpu_memory_utilization=float(os.environ.get("EVAL_VLLM_GPU_UTIL", "0.85")),
-            max_model_len=eval_max_model_len(eval_max_new_tokens()),
-            enforce_eager=os.environ.get("EVAL_ENFORCE_EAGER", "1") not in ("0", "false"),
-            trust_remote_code=True,
-            **vllm_language_model_only_kwargs(model_id),
-        )
-        base_acc, _, _ = vllm_eval(llm, tok, eval_examples, lora_request=None)
-        heartbeat(f"{phase}_base_eval", base_acc=base_acc)
-        lora_req = LoRARequest("adapter", 1, adapter_dir)
-        acc, eval_gen, gens = vllm_eval(llm, tok, eval_examples, lora_request=lora_req)
-        heartbeat(f"{phase}_trained_eval", trained_acc=acc)
-
-    tw = meta.get("train_wall") or 0.0
-    gen_toks = meta.get("generated_tokens") or 0
-    train_toks = meta.get("train_tokens") or 0
+    # Finalize directly from the training phase: build the run-metrics record (training
+    # metrics only — loss/reward are streamed by the trainer; reward_history is in notes)
+    # and write the completion sentinel. There is no separate eval phase.
     m = RunMetrics(
         arm="runpod",
         phase=phase,
         seed=SEED,
         model_id=model_id,
-        wall_seconds=tw + (time.time() - t0),
-        setup_seconds=meta.get("setup_seconds") or 0.0,
-        train_throughput_toks_per_s=((gen_toks or train_toks) / tw if tw else 0.0),
-        prefill_tokens=0,
-        sample_tokens=eval_gen,
-        train_tokens=train_toks,
-        generated_tokens=gen_toks,
-        cost_usd=0.0,
-        gpu_seconds=0.0,
-        base_eval_acc=base_acc,
-        trained_eval_acc=acc,
+        wall_seconds=train_wall,
+        setup_seconds=setup_seconds,
+        train_throughput_toks_per_s=(
+            (generated_tokens or train_tokens) / train_wall if train_wall else 0.0
+        ),
+        train_tokens=train_tokens,
+        generated_tokens=generated_tokens,
         notes={
-            **(meta.get("notes") or {}),
+            **(notes or {}),
             "renderer": "autoslm_env",
             "thinking": THINKING,
-            "train_wall": tw,
+            "train_wall": train_wall,
             "model_id": model_id,
             "environment": ACTIVE_ENV.id,
             "job_spec": JOB_SPEC.to_dict() if JOB_SPEC else None,
         },
     )
-    with open("/tmp/generations.jsonl", "w") as f:
-        for gg in gens:
-            f.write(json.dumps(gg) + "\n")
-    hf_upload_file("/tmp/generations.jsonl", "generations.jsonl")
     _finalize(m, adapter_dir)
 
 
-def _run_eval_only_quantized(model_id: str, t0: float):
-    """Standalone-eval branch for the QLoRA tier (4-bit transformers, no vLLM)."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    _patch_peft_weight_converter_compat()
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    heartbeat("eval_only_start", model=model_id, eval_engine="transformers-4bit")
-
-    eval_examples = ACTIVE_ENV.dataset("eval")[:EVAL_NUM]
-    weights_id = quant_weights_repo(model_id) or model_id
-    model = AutoModelForCausalLM.from_pretrained(
-        weights_id,
-        trust_remote_code=True,
-        device_map="auto",
-        **qlora_model_init_kwargs(prequantized=weights_id != model_id),
-    )
-    base_acc, _, gens = transformers_eval(model, tok, eval_examples)
-    heartbeat("eval_only_base", base_acc=base_acc)
-
-    trained_acc, eval_gen = None, 0
-    adapter_prefix = os.environ.get("ADAPTER_PREFIX")
-    adir = _download_eval_adapter(adapter_prefix)
-    if adir:
-        from peft import PeftModel
-
-        model = PeftModel.from_pretrained(model, adir)
-        trained_acc, eval_gen, gens = transformers_eval(model, tok, eval_examples)
-        heartbeat("eval_only_trained", trained_acc=trained_acc)
-    _finalize_eval_only(
-        model_id, t0, eval_examples, base_acc, trained_acc, eval_gen, gens, adapter_prefix
-    )
-
-
-def _download_eval_adapter(adapter_prefix: str | None) -> str | None:
+def _download_adapter(adapter_prefix: str | None) -> str | None:
     if not (adapter_prefix and HF_REPO):
         return None
     from huggingface_hub import snapshot_download
@@ -1685,85 +1156,6 @@ def _download_eval_adapter(adapter_prefix: str | None) -> str | None:
     return adir if os.path.isdir(adir) else None
 
 
-def run_eval_only():
-    """Standalone eval (no fine-tuning) of the base model and, optionally, a trained adapter
-    referenced by ADAPTER_PREFIX on HF. Used by `slm eval`."""
-    from transformers import AutoTokenizer
-    from vllm import LLM
-    from vllm.lora.request import LoRARequest
-
-    t0 = time.time()
-    wait_for_gpu()
-    model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
-    if model_quant(model_id) == "4bit-qlora":
-        # Prefetch the PRE-QUANTIZED weights the quantized eval actually loads, not
-        # the bf16 base — for the large MoE tiers, downloading the full base wastes
-        # tens of GB of disk and paid GPU time (mirrors the SFT QLoRA path, which
-        # prefetches quant_weights_repo(model_id) or model_id).
-        prefetch_model(quant_weights_repo(model_id) or model_id)
-        # _run_eval_only_quantized finalizes/uploads in place (returns nothing); just stop here.
-        _run_eval_only_quantized(model_id, t0)
-        return
-    prefetch_model(model_id)
-    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    heartbeat("eval_only_start", model=model_id)
-
-    eval_examples = ACTIVE_ENV.dataset("eval")[:EVAL_NUM]
-    llm = LLM(
-        model=model_id,
-        enable_lora=True,
-        max_lora_rank=eval_max_lora_rank(),
-        dtype="bfloat16",
-        gpu_memory_utilization=float(os.environ.get("EVAL_VLLM_GPU_UTIL", "0.85")),
-        max_model_len=eval_max_model_len(eval_max_new_tokens()),
-        enforce_eager=os.environ.get("EVAL_ENFORCE_EAGER", "1") not in ("0", "false"),
-        trust_remote_code=True,
-        **vllm_language_model_only_kwargs(model_id),
-    )
-    base_acc, _, base_gens = vllm_eval(llm, tok, eval_examples, lora_request=None)
-    heartbeat("eval_only_base", base_acc=base_acc)
-
-    trained_acc = None
-    eval_gen = 0
-    gens = base_gens
-    adapter_prefix = os.environ.get("ADAPTER_PREFIX")
-    adir = _download_eval_adapter(adapter_prefix)
-    if adir:
-        trained_acc, eval_gen, gens = vllm_eval(
-            llm, tok, eval_examples, lora_request=LoRARequest("adapter", 1, adir)
-        )
-        heartbeat("eval_only_trained", trained_acc=trained_acc)
-    _finalize_eval_only(
-        model_id, t0, eval_examples, base_acc, trained_acc, eval_gen, gens, adapter_prefix
-    )
-
-
-def _finalize_eval_only(
-    model_id, t0, eval_examples, base_acc, trained_acc, eval_gen, gens, adapter_prefix
-):
-    m = RunMetrics(
-        arm="runpod",
-        phase="eval",
-        seed=SEED,
-        model_id=model_id,
-        wall_seconds=time.time() - t0,
-        sample_tokens=eval_gen,
-        base_eval_acc=base_acc,
-        trained_eval_acc=trained_acc,
-        notes={
-            "environment": ACTIVE_ENV.id,
-            "eval_examples": len(eval_examples),
-            "adapter_prefix": adapter_prefix,
-            "thinking": THINKING,
-        },
-    )
-    with open("/tmp/generations.jsonl", "w") as f:
-        for gg in gens:
-            f.write(json.dumps(gg) + "\n")
-    hf_upload_file("/tmp/generations.jsonl", "generations.jsonl")
-    _finalize(m, "")
-
-
 def _finalize(metrics: RunMetrics, adapter_dir: str):
     metrics.save("/tmp/metrics.json")
     # Required: on Vast these two artifacts ARE the success signal (no queue return),
@@ -1773,7 +1165,7 @@ def _finalize(metrics: RunMetrics, adapter_dir: str):
     with open("/tmp/DONE", "w") as f:
         f.write(str(time.time()))
     hf_upload_file("/tmp/DONE", "DONE", required=True)
-    heartbeat("done", trained_acc=metrics.trained_eval_acc, base_acc=metrics.base_eval_acc)
+    heartbeat("done")
     print("NODE DONE:", metrics.to_json())
 
 
@@ -1813,26 +1205,21 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         heartbeat("boot")
-        # Dispatch table — register new algorithms (e.g. dpo/ppo) here as they land.
+        # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
             "sft": run_sft,  # SFT (TRL SFTTrainer)
             "rl": run_rl,  # GRPO (TRL GRPOTrainer + colocated vLLM)
-            "opd": run_opd,  # on-policy distillation (TRL DistillationTrainer)
-            "dpo": run_dpo,  # offline preference optimization (TRL DPOTrainer)
-            "eval_after": run_eval_after,  # eval base + trained adapter after a train run
-            "eval_only": run_eval_only,  # standalone eval (`slm eval`)
         }
         handler = modes.get(RUN_MODE)
         if handler is None:
             raise SystemExit(f"unknown RUN_MODE {RUN_MODE}; known: {sorted(modes)}")
         handler()
         # All artifacts (adapter, train_meta, metrics, DONE) are uploaded to HF *inside* the
-        # handler. The RL trainer's colocated vLLM (and the eval vLLM engine) can DEADLOCK at
-        # interpreter shutdown during NCCL/IPC/CUDA teardown — not segfault-and-exit (which
-        # `check=False` on the train subprocess already tolerates), but hang forever. That
-        # would block the Flash handler's *blocking* `subprocess.run`, so the train phase
-        # never hands off to eval (heartbeat frozen at "rl_train_done") and the whole run
-        # stalls until the wall-clock cap. Hard-exit to bypass the hanging teardown now that
+        # handler. The RL trainer's colocated vLLM can DEADLOCK at interpreter shutdown
+        # during NCCL/IPC/CUDA teardown — not segfault-and-exit (which `check=False` on the
+        # train subprocess already tolerates), but hang forever. That would block the Flash
+        # handler's *blocking* `subprocess.run` (heartbeat frozen at "rl_train_done") and the
+        # whole run stalls until the wall-clock cap. Hard-exit to bypass the hanging teardown now that
         # every output is safely persisted.
         sys.stdout.flush()
         sys.stderr.flush()
@@ -1840,10 +1227,9 @@ def main():
     except Exception as e:
         tb = traceback.format_exc()
         traceback.print_exc()
-        # Upload the FULL traceback under a phase-specific name so a later phase's error
-        # (e.g. eval_after) can't clobber it — the train (sft/rl) error is the root cause
-        # and must survive for debugging. heartbeat.json is single-file/overwritten, so the
-        # per-phase error file is the durable signal.
+        # Upload the FULL traceback under a phase-specific name (error_<phase>.txt) so the
+        # train (sft/rl) root-cause error survives for debugging. heartbeat.json is
+        # single-file/overwritten, so the per-phase error file is the durable signal.
         try:
             err_name = error_artifact_name(RUN_MODE)
             err_path = f"/tmp/{err_name}"

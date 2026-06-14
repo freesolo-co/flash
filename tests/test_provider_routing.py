@@ -75,7 +75,6 @@ def orch(monkeypatch, tmp_path):
     from autoslm import orchestrator
 
     monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
-    monkeypatch.delenv("AUTOSLM_LEGACY_SUBMIT", raising=False)
     monkeypatch.setattr(orchestrator, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(tmp_path / "results"))
     return orchestrator
@@ -104,7 +103,7 @@ def test_vast_allocation_routes_to_vast_runner(orch, monkeypatch):
         on_handle(_vast_handle_dict())
         return PollResult(
             True,
-            metrics={"trained_eval_acc": 1.0, "cost_usd": 0.123, "notes": {"provider": "vast"}},
+            metrics={"train_tokens": 4096, "cost_usd": 0.123, "notes": {"provider": "vast"}},
         )
 
     monkeypatch.setattr(vast_provider, "submit_train_durable_vast", fake_vast_submit)
@@ -123,7 +122,7 @@ def test_vast_cost_flows_into_run_status(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
     cost = orch._persist_metrics(
-        spec, 0, {"trained_eval_acc": 1.0, "cost_usd": 0.2, "notes": {"provider": "vast"}}
+        spec, 0, {"train_tokens": 4096, "cost_usd": 0.2, "notes": {"provider": "vast"}}
     )
     assert cost == 0.2  # the stamped vast cost short-circuits the runpod projection
 
@@ -156,14 +155,14 @@ def test_failover_crosses_providers_and_blacklists_machine(orch, monkeypatch):
         durable,
         "submit_train_durable",
         lambda spec, seed, log=None, on_handle=None, attempt=0: PollResult(
-            True, metrics={"trained_eval_acc": 0.9}
+            True, metrics={"train_tokens": 4096}
         ),
     )
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
     metrics = orch._submit_seed_supervised(spec, 0, log)
-    assert metrics["trained_eval_acc"] == 0.9
+    assert metrics["train_tokens"] == 4096
     # the stalled attempt's instance was torn down and its machine blacklisted
     assert destroyed == [77]
     assert allocate_calls[0] == frozenset()
@@ -223,34 +222,32 @@ def test_concrete_requested_pins_class(orch, monkeypatch):
     assert pins == [None]  # policy request -> allocator free to re-pick
 
 
-def test_no_requested_means_legacy_runpod_path(orch, monkeypatch):
-    """A spec without routing intent (direct API construction) must NEVER touch the
-    allocator or the live market — exact legacy behavior (live incident: durable
-    supervisor tests with real keys rented actual vast instances)."""
-    import autoslm.flash.durable as durable
+def test_empty_requested_pins_concrete_type(orch, monkeypatch):
+    """An empty gpu.requested (a direct-API spec that skipped config parsing) is treated
+    as a concrete pin of gpu.type: the allocator runs (so failover/pricing still apply)
+    but only to pick the provider for that one class — it never re-picks the class."""
     from autoslm.flash.durable import PollResult
     from autoslm.providers import allocator
     from autoslm.providers import vast as vast_provider
 
-    def boom(*a, **k):
-        raise AssertionError("allocator/vast must not be touched without gpu.requested")
+    pins = []
 
-    monkeypatch.setattr(allocator, "allocate", boom)
-    monkeypatch.setattr(vast_provider, "submit_train_durable_vast", boom)
-    submitted = []
+    def fake_allocate(model, algorithm, **kw):
+        pins.append(kw["gpu"])
+        offer = _offer_obj()
+        return _alloc(offer=offer, vast_offers=[offer])
+
+    monkeypatch.setattr(allocator, "allocate", fake_allocate)
     monkeypatch.setattr(
-        durable,
-        "submit_train_durable",
-        lambda spec, seed, log=None, on_handle=None, attempt=0: (
-            submitted.append(spec.gpu.type),
-            PollResult(True, metrics={"a": 1}),
-        )[1],
+        vast_provider,
+        "submit_train_durable_vast",
+        lambda *a, **k: PollResult(True, metrics={"a": 1}),
     )
-    spec = _spec(requested="")  # no intent recorded
+    spec = _spec(type="RTX A5000", requested="")  # no routing intent recorded
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert metrics == {"a": 1}
-    assert submitted == ["RTX A5000"]  # the spec's own type, untouched
+    assert metrics["a"] == 1
+    assert pins == ["RTX A5000"]  # empty requested -> concrete gpu.type pinned through
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +306,7 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
         vast_provider,
         "poll_vast_job",
         lambda handle, spec, seed, log=None, heartbeat_reader=None: PollResult(
-            True, metrics={"trained_eval_acc": 1.0, "cost_usd": 0.3}
+            True, metrics={"train_tokens": 4096, "cost_usd": 0.3}
         ),
     )
     destroyed = []

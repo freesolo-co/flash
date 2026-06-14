@@ -1,14 +1,11 @@
-"""GSM8K data loading + prompt formatting + fixed seeded eval subset.
+"""GSM8K data loading + prompt formatting.
 
 Moved out of ``autoslm.engine`` into this example so the core package carries no
-task-specific data wiring. Shared by both training arms here so the data,
-ordering, and eval set are identical. The only dependency back into the package
-is the generic, task-agnostic ``eval_subset_indices`` helper.
+task-specific data wiring. Shared by both training arms here so the data and
+ordering are identical.
 """
 
 from __future__ import annotations
-
-from autoslm.engine.data import eval_subset_indices
 
 from .grading import extract_gold_answer
 
@@ -33,7 +30,7 @@ def build_target_text(solution: str) -> str:
     """Build the SFT target completion from a GSM8K gold solution.
 
     Converts the trailing '#### N' into reasoning + '\\boxed{N}' so the SFT
-    target matches the format the eval/reward expects.
+    target matches the format the grader/reward expects.
     """
     ans = extract_gold_answer(solution)
     # Strip the '#### N' tail from the reasoning, keep the chain-of-thought.
@@ -54,15 +51,3 @@ def load_gsm8k(split: str, dataset: str = "openai/gsm8k", dataset_config: str = 
         }
         for ex in ds
     ]
-
-
-def fixed_eval_subset(
-    num_examples: int,
-    subset_seed: int,
-    dataset: str = "openai/gsm8k",
-    dataset_config: str = "main",
-    split: str = "test",
-) -> list[dict]:
-    """Deterministic eval subset: same indices on both arms for a given seed."""
-    full = load_gsm8k(split, dataset, dataset_config)
-    return [full[i] for i in eval_subset_indices(num_examples, subset_seed, len(full))]

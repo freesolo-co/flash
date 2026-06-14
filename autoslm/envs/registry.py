@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -92,7 +93,16 @@ def record_installed_env(env_id: str, package: str, extras: dict | None = None) 
     manifest = load_installed_manifest()
     manifest[env_id] = {"package": package, **(extras or {})}
     INSTALLED_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    INSTALLED_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    # The manifest can hold a credentialed --extra-index-url. Create/truncate with 0600
+    # from the start (not write_text + chmod, which leaves it umask-readable in between);
+    # O_NOFOLLOW refuses a symlink planted at the path. chmod after covers a pre-existing
+    # file created before this code path.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(INSTALLED_MANIFEST, flags, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    with contextlib.suppress(OSError):
+        os.chmod(INSTALLED_MANIFEST, 0o600)
 
 
 def _bare_wheel_name(env_ref: str) -> str:
@@ -103,32 +113,32 @@ def _bare_wheel_name(env_ref: str) -> str:
 def worker_pip_for_env(env_id: str, params: dict | None = None) -> list[str]:
     """Pip requirements the GPU worker needs to run ``env_id`` (verifiers Hub envs).
 
-    Installs ``verifiers`` + the env wheel(s). Also installs a separate **eval** Hub env
-    (``[environment.params] eval_env_id``) when configured, and carries any
-    ``extra_index_url`` recorded at ``slm env install`` time (e.g. the Prime Intellect Hub
-    index) through to the worker's ``pip install``.
+    Installs ``verifiers`` + the recorded env wheel, and carries any ``extra_index_url``
+    recorded at ``slm env install`` time (e.g. the Prime Intellect Hub index) through to
+    the worker's ``pip install``.
+
+    A non-built-in env MUST be recorded (``slm env install <env>``) so the wheel name and
+    index are known. We deliberately do NOT guess a wheel name from an ``owner/name`` slug
+    — that could install an unrelated PyPI package on a name collision and hides the real
+    requirement; callers that want to bypass the manifest set ``[environment] pip`` instead
+    (the caller prefers ``spec.environment.pip`` over this function).
     """
     params = params or {}
     if env_id in _BUILTINS:
         extra = _BUILTIN_WORKER_PIP.get(env_id)
         return list(extra(params)) if callable(extra) else list(extra or [])
     manifest = load_installed_manifest()
-    refs = [env_id]
-    ref = params.get("eval_env_id")
-    if ref:
-        refs.append(str(ref))
-    deps = ["verifiers"]
-    indexes: list[str] = []
-    for ref in refs:
-        entry = manifest.get(ref) or {}
-        pkg = entry.get("package") or (_bare_wheel_name(ref) if ref not in manifest else None)
-        if pkg:
-            deps.append(pkg)
-        idx = entry.get("extra_index_url")
-        if idx and idx not in indexes:
-            indexes.append(idx)
+    entry = manifest.get(env_id)
+    if entry is None:
+        raise ValueError(
+            f"environment {env_id!r} is not a built-in and is not recorded as installed. "
+            f"Run `slm env install {env_id}` first, or set [environment] pip = [...] in "
+            "the config to declare the worker requirements explicitly."
+        )
+    deps = ["verifiers", entry.get("package") or _bare_wheel_name(env_id)]
     out = list(dict.fromkeys(deps))  # dedupe, preserve order
-    for idx in indexes:
+    idx = entry.get("extra_index_url")
+    if idx:
         out += ["--extra-index-url", idx]
     return out
 

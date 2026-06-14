@@ -32,10 +32,7 @@ maintained options: vLLM releases ~weekly, TRL monthly minors). That upgrade del
 measured on real workers (`bench/results/phase1..3/`):
 
 - Qwen3.5 / MiniCPM5 model support (transformers-5 architectures);
-- GRPO per-step wall 46.6 s → ~15.5 s steady-state on the identical recipe;
-- `DistillationTrainer` → the new `opd` algorithm (validated: GRPO-level lift at ~1/3
-  the wall-clock on a 0.6B student);
-- DPO support.
+- GRPO per-step wall 46.6 s → ~15.5 s steady-state on the identical recipe.
 
 ## Engine bake-off (TRL vs Unsloth)
 

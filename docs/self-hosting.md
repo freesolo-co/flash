@@ -29,6 +29,7 @@ user ──slm login / slm train──> control plane (this guide) ──> RunPo
 | `AUTOSLM_RUNS_DIR` | no | run status/log files (default `.autoslm/runs`) |
 | `RESULTS_DIR` | no | metrics output (default `results`) |
 | `AUTOSLM_PROVIDERS` | no | pin the substrate set, e.g. `runpod` to disable vast without unsetting its key |
+| `AUTOSLM_TRUST_PROXY` | no | set truthy when a reverse proxy (nginx/Caddy) fronts the server, so the per-IP `POST /v1/keys` claim throttle keys on the last `X-Forwarded-For` hop instead of the proxy's TCP peer. **Without it, all proxied clients share one peer IP and the throttle becomes per-deployment, not per-IP.** Only enable behind a proxy that strips client-supplied XFF. |
 | `AUTOSLM_VAST_MIN_RELIABILITY` | no | Vast offer reliability floor (default `0.95`) |
 | `AUTOSLM_VAST_MIN_INET_MBPS` | no | Vast offer download-bandwidth floor (default `200`) |
 | `AUTOSLM_VAST_MAX_DPH` | no | hard $/hr ceiling on Vast offers |
@@ -46,7 +47,7 @@ file holds the client-side AutoSLM key) and never sent to clients.
 ## Run it
 
 ```bash
-pip install 'autoslm-train[server]'
+pip install './autoslm[server]'   # internal package — install from the monorepo source, not an index
 export RUNPOD_API_KEY=... HUGGINGFACE_TOKEN=hf_... HF_REPO=your-org/autoslm-runs
 slm server --host 0.0.0.0 --port 8080        # or: python -m autoslm.server
 ```
@@ -81,8 +82,7 @@ AUTOSLM_API_URL=https://your-host:8080 slm login
   (Caddy/nginx/Traefik).
 - **Restart recovery.** On startup the server re-attaches to every non-terminal training
   run via its persisted RunPod job handle; GPU runs are unaffected by control-plane
-  restarts. Known gap: standalone *evals* in flight during a restart are not recovered
-  (they have no durable handle yet) — they fail with a clear error and can be re-run.
+  restarts.
 - **Tenant isolation.** Keys are stored hashed (sha256); every run is owned by the key
   that created it, and other keys get 404s. Note that all tenants' artifacts live in the
   operator's single `HF_REPO`, namespaced by run id — per-tenant repos are on the
@@ -101,10 +101,9 @@ sk-autoslm-...`.
 | `GET /v1/models` | key | curated model catalog |
 | `POST /v1/runs` | key | `{"spec": {...}, "dry_run": false}` → run status |
 | `GET /v1/runs` | key | your runs |
-| `GET /v1/runs/{id}` | owner | status (+ eval metrics when done) |
+| `GET /v1/runs/{id}` | owner | status (+ metrics when done) |
 | `GET /v1/runs/{id}/logs?offset=N` | owner | incremental logs `{logs, offset, state}` |
 | `POST /v1/runs/{id}/cancel` | owner | best-effort cancel |
-| `POST /v1/evals` | key | `{"spec": ..., "adapter_run_id": ...}` |
 | `POST /v1/runs/{id}/deploy` | owner | `{"mode": "dev"\|"always-on", "idle_timeout_s": 300}` |
 | `DELETE /v1/runs/{id}/deploy` | owner | tear down serving |
 | `GET /v1/deployments` | key | your active deployments |

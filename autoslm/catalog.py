@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-ALGORITHMS = ("sft", "grpo", "opd", "dpo")
+ALGORITHMS = ("sft", "grpo")
 
 
 def normalize_algorithm(value: str) -> str:
@@ -243,20 +243,12 @@ def resolve_model(
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
     info = get_model(model_id)
     algo = normalize_algorithm(algorithm)
-    # Catalog entries advertise the capability classes "sft" and "grpo". Algorithms map
-    # onto them by GPU footprint: opd/dpo are trainer-only (like sft, opd additionally
-    # needs the teacher to fit — checked at run time), grpo needs the colocated engine.
+    # Catalog entries advertise the capability classes "sft" and "grpo": grpo needs the
+    # colocated rollout engine, sft is trainer-only.
     required = "grpo" if algo == "grpo" else "sft"
     if required not in info.algos:
         allowed = ", ".join(info.algos)
         raise ValueError(f"{model_id} supports {allowed}, not {algo}")
-    # Only run_sft uses the QLoRA loading path; run_dpo/run_opd build the base in
-    # bf16, which would OOM the 4-bit-only tiers. Reject them up front.
-    if algo in ("dpo", "opd") and info.quant == "4bit-qlora":
-        raise ValueError(
-            f"{model_id} is a 4-bit-QLoRA-only tier; {algo} loads the base in bf16 "
-            "and would not fit. Use sft (or a smaller bf16 model)."
-        )
     return info
 
 

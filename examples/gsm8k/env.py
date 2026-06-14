@@ -1,8 +1,20 @@
-"""Built-in GSM8K verifiable math environment."""
+"""Built-in GSM8K verifiable-math environment (the simplest worked example).
+
+Task wiring lives in three sibling modules so each concern is independently
+readable and reusable:
+
+  * ``data.py``    -> dataset loading, prompt formatting, and SFT target.
+  * ``grading.py`` -> the dependency-free grader (answer extraction + numeric
+                      equivalence) backing the GRPO reward.
+  * ``env.py``     -> this file: the ``Environment`` that the registry path-loads
+                      as the ``gsm8k`` built-in, delegating to the two above.
+
+Both algorithms (SFT / GRPO) run against this one environment; see the
+``gsm8k_*.toml`` configs in this folder and ``docs/algorithms.md``.
+"""
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 from autoslm.envs.base import BaseEnvironment
@@ -17,8 +29,6 @@ class GSM8KEnvironment(BaseEnvironment):
     dataset_config: str = "main"
     correct_reward: float = 1.0
     format_reward: float = 0.1
-    eval_examples: int = 300
-    eval_seed: int = 12345
 
     def __init__(self, **kwargs):
         super().__init__(id="gsm8k")
@@ -26,26 +36,12 @@ class GSM8KEnvironment(BaseEnvironment):
         self.dataset_config = kwargs.get("dataset_config", self.dataset_config)
         self.correct_reward = float(kwargs.get("correct_reward", self.correct_reward))
         self.format_reward = float(kwargs.get("format_reward", self.format_reward))
-        # Default to the run's [train] eval_examples (the worker exports it as EVAL_NUM)
-        # so a config setting only train.eval_examples builds the seeded N-row subset
-        # directly, instead of slicing the worker's [:N] off a fixed 300-row sample
-        # (values > 300 were silently capped; smaller values used the wrong rows). An
-        # explicit environment.params.eval_examples still wins.
-        default_eval = int(os.environ.get("EVAL_NUM") or self.eval_examples)
-        self.eval_examples = int(kwargs.get("eval_examples", default_eval))
-        self.eval_seed = int(kwargs.get("eval_seed", self.eval_seed))
 
+    # -- data -------------------------------------------------------------
     def dataset(self, split: str) -> list[dict]:
-        if split in {"eval", "validation", "test"}:
-            return d.fixed_eval_subset(
-                self.eval_examples,
-                self.eval_seed,
-                self.dataset_name,
-                self.dataset_config,
-                "test",
-            )
         return d.load_gsm8k("train", self.dataset_name, self.dataset_config)
 
+    # -- task interface ---------------------------------------------------
     def prompt_messages(self, example: dict) -> list[dict]:
         return d.build_prompt_messages(example["question"])
 

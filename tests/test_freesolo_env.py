@@ -94,18 +94,16 @@ def test_environment_bundle_param_is_stored_for_worker_materialization():
     assert set(env.environment_bundle) == {"environment.py", "config.py"}
 
 
-def test_eval_split_does_not_leak_training_records():
+def test_dataset_returns_training_records():
     from autoslm.envs.freesolo import FreesoloEnvironment
 
     train = [{"task": "a"}, {"task": "b"}]
-    # No held-out set: eval is empty, NOT the training records (no label leak).
     env = FreesoloEnvironment(contract_text="# c", records=train, mode="grpo")
     assert env.dataset("train") == train
-    assert env.dataset("eval") == []
-    # With a held-out set, eval reads it.
-    held = [{"task": "z"}]
-    env2 = FreesoloEnvironment(contract_text="# c", records=train, eval_records=held, mode="grpo")
-    assert env2.dataset("eval") == held
+    # A stale eval_records kwarg is absorbed (**_) and ignored, not an error.
+    env2 = FreesoloEnvironment(
+        contract_text="# c", records=train, eval_records=[{"task": "z"}], mode="grpo"
+    )
     assert env2.dataset("train") == train
 
 

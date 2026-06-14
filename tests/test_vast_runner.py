@@ -63,8 +63,7 @@ def test_onstart_ships_payload_and_bootstrap(monkeypatch):
     assert json.loads(base64.b64decode(b64)) == payload
     # the self-contained bootstrap is embedded and keeps _train_body's semantics
     assert "AUTOSLM_BOOTSTRAP_EOF" in script
-    assert "train_meta.json" in script
-    assert "eval_after" in script
+    assert "metrics.json" in script
     # worker deps install (skippable with a baked image)
     assert "pip install" in script
     assert "torch==2.10.0" in script
@@ -89,7 +88,7 @@ def test_onstart_ships_payload_and_bootstrap(monkeypatch):
     assert "rp-supersecret" not in script
 
 
-def _bootstrap_env(monkeypatch, phase="sft", train_meta=True, rcs=(0, 0), metrics=False):
+def _bootstrap_env(monkeypatch, phase="sft", rcs=(0,), metrics=True):
     from autoslm.providers import vast_bootstrap as vb
 
     calls: list[str] = []
@@ -115,57 +114,26 @@ def _bootstrap_env(monkeypatch, phase="sft", train_meta=True, rcs=(0, 0), metric
     monkeypatch.setattr(
         vb, "write_attempt_marker", lambda p, ok, error="": markers.append((ok, error))
     )
-
-    # Path-aware: /tmp/metrics.json present only signals an idempotent DONE replay;
-    # /tmp/train_meta.json presence is the normal train-success signal.
-    def _exists(p):
-        if "metrics.json" in p:
-            return metrics
-        return train_meta
-
-    monkeypatch.setattr(vb.os.path, "exists", _exists)
+    # The train phase writes /tmp/metrics.json itself (or restores it from an earlier
+    # attempt's DONE sentinel); its presence is the success signal.
+    monkeypatch.setattr(vb.os.path, "exists", lambda p: metrics if "metrics.json" in p else False)
     return vb, calls, markers
 
 
-def test_bootstrap_train_then_eval(monkeypatch):
+def test_bootstrap_train(monkeypatch):
     vb, calls, markers = _bootstrap_env(monkeypatch)
     assert vb.main() == 0
-    assert calls == ["sft", "eval_after"]  # two fresh processes, train then eval
+    assert calls == ["sft"]  # one fresh process; no separate eval phase
     assert markers == [(True, "")]
 
 
-def test_bootstrap_standalone_eval(monkeypatch):
-    vb, calls, markers = _bootstrap_env(monkeypatch, phase="eval")
-    assert vb.main() == 0
-    assert calls == ["eval_only"]
-    assert markers == [(True, "")]
-
-
-def test_bootstrap_fails_without_train_meta(monkeypatch):
-    vb, calls, markers = _bootstrap_env(monkeypatch, train_meta=False)
+def test_bootstrap_fails_without_metrics(monkeypatch):
+    vb, calls, markers = _bootstrap_env(monkeypatch, metrics=False)
     assert vb.main() == 1
-    assert calls == ["sft"]  # eval never runs on a doomed train
+    assert calls == ["sft"]
     ok, error = markers[0]
     assert not ok
-    assert "train_meta.json" in error
-
-
-def test_bootstrap_eval_failure_marks_not_ok(monkeypatch):
-    vb, _calls, markers = _bootstrap_env(monkeypatch, rcs=(0, 3))
-    assert vb.main() == 1
-    ok, error = markers[0]
-    assert not ok
-    assert "eval_after" in error
-
-
-def test_bootstrap_done_replay_skips_eval(monkeypatch):
-    # A restarted attempt where an earlier worker already uploaded DONE: the worker
-    # restores /tmp/metrics.json and exits 0 WITHOUT recreating train_meta.json. That
-    # is a successful idempotent replay, not a crashed train phase — no eval re-run.
-    vb, calls, markers = _bootstrap_env(monkeypatch, train_meta=False, metrics=True)
-    assert vb.main() == 0
-    assert calls == ["sft"]  # eval is not re-run on a replay
-    assert markers == [(True, "")]
+    assert "metrics.json" in error
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +255,11 @@ def test_poll_success_stamps_real_cost(monkeypatch):
         monkeypatch,
         instances=[{"actual_status": "running"}],
         done="10500.0",  # fresh: after started_ts
-        metrics=json.dumps({"trained_eval_acc": 0.8, "wall_seconds": 100, "cost_usd": 0.0}),
+        metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
     )
     res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0)
     assert res.ok
-    assert res.metrics["trained_eval_acc"] == 0.8
+    assert res.metrics["train_tokens"] == 4096
     # cost comes from the OFFER's real rate x wall time, not a runpod table rate
     assert res.metrics["cost_usd"] > 0
     assert res.metrics["notes"]["provider"] == "vast"
@@ -307,7 +275,7 @@ def test_poll_caps_recovered_cost_at_done_timestamp(monkeypatch):
         monkeypatch,
         instances=[{"actual_status": "running"}],
         done="9100.0",  # 100s after the handle's started_ts, but BEFORE the poll clock
-        metrics=json.dumps({"trained_eval_acc": 1.0, "wall_seconds": 100, "cost_usd": 0.0}),
+        metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
     )
     res = vast.poll_vast_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
     assert res.ok
@@ -441,7 +409,6 @@ def test_instance_label_always_sweepable():
     # orphan sweep can never miss an instance we rented (live incident: a unit
     # test's "fail-fast" run id produced unsweepable labels)
     assert instance_label("autoslm-1700-abcd", 0, 1) == "autoslm-1700-abcd-s0-a1"
-    assert instance_label("eval-1700-abcd", 0, 0) == "eval-1700-abcd-s0-a0"
     assert instance_label("fail-fast", 0, 0) == "autoslm-fail-fast-s0-a0"
 
 
@@ -476,11 +443,10 @@ def test_sweep_orphans_label_safety(monkeypatch):
         {"id": 2, "label": "autoslm-1700-bbbb-s0-a1"},  # active run -> keep
         {"id": 3, "label": "someone-elses-workload"},  # not ours -> NEVER touch
         {"id": 4, "label": ""},  # unlabeled -> NEVER touch
-        {"id": 5, "label": "eval-1700-cccc-s0-a0"},  # eval orphan -> destroy
     ]
     destroyed = []
     monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels={"autoslm-1700-bbbb"})
-    assert out == [1, 5]
-    assert destroyed == [1, 5]
+    assert out == [1]
+    assert destroyed == [1]

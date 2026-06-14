@@ -43,10 +43,10 @@ def test_required_vram_catalog_and_open(monkeypatch):
     est = vram.estimate_vram_gb(4.0, "grpo")
     import math
 
-    assert required_vram_gb("org/some-4b", "sft", model_policy="allow") == math.ceil(est * 1.15)
+    assert required_vram_gb("org/some-4b", "sft") == math.ceil(est * 1.15)
     # unknown size -> the 24 GB tier, like resolve_gpu_policy
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m: None)
-    assert required_vram_gb("org/mystery", "grpo", model_policy="allow") == 24
+    assert required_vram_gb("org/mystery", "grpo") == 24
 
 
 def test_cheapest_across_providers(monkeypatch):

@@ -39,7 +39,7 @@ LOAD_TIMEOUT_S = float(os.environ.get("AUTOSLM_VAST_LOAD_TIMEOUT_S", "900"))
 # slack, the class gate stays exact (vast_gpu_for_offer).
 _SEARCH_VRAM_SLACK = 0.92
 
-# Worker image: torch 2.10 cu128 matches WORKER_DEPS_MODERN's pin and, critically,
+# Worker image: torch 2.10 cu128 matches WORKER_DEPS's pin and, critically,
 # ships the CUDA 12.8 runtime libs the PyPI wheels link against (verified live: the
 # cuda13.0 image broke vllm with "libcudart.so.12: cannot open shared object file").
 # Blackwell's CUDA-13 requirement is about the host DRIVER (PTX JIT), enforced by
@@ -170,11 +170,11 @@ class VastJobHandle:
 
 def instance_label(run_id: str, seed: int, attempt: int) -> str:
     """Instance label: run-derived so ``sweep_orphans`` can tell ours from anything
-    else on the account. Platform run ids already start with ``autoslm-``/``eval-``;
-    anything else (direct-API callers, tests) gets the prefix forced — an instance
-    we rented must NEVER be invisible to the orphan sweep."""
+    else on the account. Platform run ids already start with ``autoslm-``; anything else
+    (direct-API callers, tests) gets the prefix forced — an instance we rented must NEVER
+    be invisible to the orphan sweep."""
     label = f"{run_id}-s{seed}-a{attempt}"
-    if not (label.startswith("autoslm-") or label.startswith("eval-")):
+    if not label.startswith("autoslm-"):
         label = f"autoslm-{label}"
     return label
 
@@ -373,7 +373,7 @@ def _failure_detail(
     parts = []
     if marker and marker.get("error"):
         parts.append(str(marker["error"]))
-    for mode in (phase, "eval_after", "eval_only"):
+    for mode in (phase,):
         content = _make_hf_file_reader(hf_repo, f"{prefix}/error_{mode}.txt")(force=True)
         if content:
             parts.append(f"--- error_{mode}.txt ---\n{content[-2000:]}")
@@ -657,7 +657,7 @@ def sweep_orphans(active_labels: set[str] | None = None) -> list[int]:
     active = active_labels or set()
     for inst in instances:
         label = str(inst.get("label") or "")
-        if not (label.startswith("autoslm-") or label.startswith("eval-")):
+        if not label.startswith("autoslm-"):
             continue
         if any(label.startswith(a) for a in active):
             continue

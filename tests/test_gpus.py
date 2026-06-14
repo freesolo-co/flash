@@ -211,10 +211,9 @@ def test_build_worker_env():
         run_id="r1",
         model="Qwen/Qwen3-4B-Instruct-2507",
         algorithm="grpo",
-        train=TrainSpec(steps=20, seeds=(0,), eval_examples=50),
+        train=TrainSpec(steps=20, seeds=(0,)),
     )
     env = build_worker_env(spec, 0)
     assert env["RUN_ID"] == "r1"
     assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3-4B-Instruct-2507"
-    assert env["EVAL_NUM"] == "50"
     assert env["RL_STEPS"] == "20"
