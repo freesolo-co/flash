@@ -1,0 +1,142 @@
+"""CPU tests for the AutoSLM MVP package."""
+
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+import pytest
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+
+def test_catalog_validation():
+    from autoslm.catalog import get_model, validate_model_for_algorithm
+
+    info = get_model("Qwen/Qwen3-4B-Instruct-2507")
+    assert "grpo" in info.algos
+    with pytest.raises(ValueError, match="not grpo"):
+        validate_model_for_algorithm("Qwen/Qwen3.6-35B-A3B", "grpo")
+
+
+def test_config_to_job_spec():
+    from autoslm.config_schema import spec_from_file
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "run.toml")
+        with open(path, "w") as f:
+            f.write(
+                'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
+                'algorithm = "grpo"\n'
+                "[environment]\n"
+                'id = "gsm8k"\n'
+                "[train]\n"
+                "steps = 10\n"
+                "seeds = [0, 1]\n"
+                "[gpu]\n"
+                'type = "RTX 5090"\n'
+            )
+        spec = spec_from_file(path, run_id="test-run")
+        assert spec.run_id == "test-run"
+        assert spec.phase == "rl"
+        assert spec.train.seeds == (0, 1)
+
+
+def test_environment_registry():
+    from autoslm.envs.registry import load_environment
+
+    env = load_environment("tests_pass", {"expected": "unused"})
+    assert env.id == "tests_pass"
+    assert env.grade("the expected-token is here", {"expected": "expected-token"})
+
+
+def test_orchestrator_dry_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["AUTOSLM_RUNS_DIR"] = tmp
+        import autoslm.orchestrator as orchestrator
+
+        importlib.reload(orchestrator)
+        from autoslm.worker_spec import JobSpec
+
+        spec = JobSpec(run_id="dry", model="Qwen/Qwen3-4B-Instruct-2507", algorithm="grpo")
+        status = orchestrator.submit_job(spec, dry_run=True)
+        assert status.state == "dry_run"
+        assert orchestrator.get_status("dry").spec["model"] == "Qwen/Qwen3-4B-Instruct-2507"
+
+
+def test_mcp_handler_dry_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["AUTOSLM_RUNS_DIR"] = tmp
+        import autoslm.mcp.server as mcp
+        import autoslm.orchestrator as orchestrator
+
+        importlib.reload(orchestrator)
+        importlib.reload(mcp)
+        result = mcp.handle(
+            {
+                "tool": "create_" + "train" + "ing_run",
+                "args": {
+                    "run_id": "mcp-dry",
+                    "model": "Qwen/Qwen3-4B-Instruct-2507",
+                    "algorithm": "grpo",
+                    "environment": {"id": "gsm8k"},
+                    "train": {"steps": 1, "seeds": [0]},
+                    "gpu": {"type": "RTX 5090"},
+                    "dry_run": True,
+                },
+            }
+        )
+        assert result["state"] == "dry_run"
+
+
+def test_cli_train_dry_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        config = os.path.join(tmp, "run.toml")
+        runs = os.path.join(tmp, "runs")
+        with open(config, "w") as f:
+            f.write(
+                'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
+                'algorithm = "grpo"\n'
+                "[environment]\n"
+                'id = "gsm8k"\n'
+                "[train]\n"
+                "steps = 1\n"
+                "seeds = [0]\n"
+                "[gpu]\n"
+                'type = "RTX 5090"\n'
+            )
+        env = os.environ.copy()
+        env["AUTOSLM_RUNS_DIR"] = runs
+        proc = subprocess.run(
+            [sys.executable, "-m", "autoslm.cli.main", "train", config, "--dry-run"],
+            cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stdout
+        payload = json.loads(proc.stdout)
+        assert payload["state"] == "dry_run"
+
+
+if __name__ == "__main__":
+    import traceback
+
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    passed = 0
+    for fn in fns:
+        try:
+            fn()
+            print("PASS", fn.__name__)
+            passed += 1
+        except Exception:
+            print("FAIL", fn.__name__)
+            traceback.print_exc()
+    print(f"\n{passed}/{len(fns)} passed")
+    sys.exit(0 if passed == len(fns) else 1)

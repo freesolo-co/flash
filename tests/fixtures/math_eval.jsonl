@@ -1,0 +1,3 @@
+{"problem": "Convert the point $(0,3)$ in rectangular coordinates to polar coordinates.", "answer": "\\left( 3, \\frac{\\pi}{2} \\right)", "solution": "We have $r=3$ and $\\theta=\\frac{\\pi}{2}$, so the answer is $\\boxed{\\left( 3, \\frac{\\pi}{2} \\right)}$."}
+{"problem": "What is 2/3 as a number?", "answer": "\\frac{2}{3}", "solution": "It is two thirds."}
+{"problem": "How many positive whole number divisors does 196 have?", "answer": "9", "solution": "$196=2^2\\cdot7^2$ has $(2+1)(2+1)=9$ divisors."}

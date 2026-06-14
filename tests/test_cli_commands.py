@@ -1,0 +1,214 @@
+"""In-process CLI coverage: every read/manage command against a fake ApiClient.
+
+`slm login`/`slm train` subprocess flows live in test_cli_managed.py; these tests
+drive main() directly so the table rendering, exit codes, and client wiring of
+the remaining commands are covered without a server.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from autoslm.cli import main as cli
+
+
+class _FakeClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def me(self) -> dict:
+        return {"key_prefix": "sk-autoslm-fake", "email": "t@example.com"}
+
+    def models(self, include_experimental: bool = False) -> list[dict]:
+        rows = [
+            {
+                "id": "Qwen/Qwen3-0.6B",
+                "display_name": "Qwen3 0.6B",
+                "params": "0.6B dense",
+                "algos": ["sft", "grpo"],
+                "min_vram_gb": 12,
+                "quant": "bf16",
+                "recommended_gpu": "RTX 4090",
+                "experimental": False,
+                "notes": "",
+            }
+        ]
+        if include_experimental:
+            rows.append({**rows[0], "id": "Qwen/Qwen3.6-35B-A3B", "experimental": True})
+        return rows
+
+    def list_runs(self) -> list[dict]:
+        return [
+            {
+                "run_id": "autoslm-1",
+                "state": "done",
+                "cost_usd": 0.25,
+                "updated_at": 1700000000.0,
+                "spec": {"model": "Qwen/Qwen3-0.6B", "algorithm": "sft"},
+            }
+        ]
+
+    def get_run(self, run_id: str) -> dict:
+        return {
+            "run_id": run_id,
+            "state": "done",
+            "cost_usd": 0.25,
+            "error": None,
+            "spec": {"model": "Qwen/Qwen3-0.6B"},
+        }
+
+    def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        return {
+            "run_id": run_id,
+            "logs": "hello from the worker\n",
+            "offset": 22,
+            "state": "done",
+        }
+
+    def cancel_run(self, run_id: str) -> dict:
+        self.calls.append(("cancel", run_id))
+        return {"run_id": run_id, "state": "cancelled"}
+
+    def deploy(self, run_id: str, mode: str = "dev", idle_timeout_s: int = 300, **_) -> dict:
+        self.calls.append(("deploy", run_id, mode, idle_timeout_s))
+        return {"run_id": run_id, "mode": mode, "openai_model": f"autoslm-{run_id}"}
+
+    def undeploy(self, run_id: str) -> dict:
+        self.calls.append(("undeploy", run_id))
+        return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
+
+    def deployments(self) -> list[dict]:
+        return [{"run_id": "autoslm-1", "mode": "dev", "gpu": "RTX 4090"}]
+
+    def chat(self, run_id: str, messages: list[dict], **_) -> dict:
+        self.calls.append(("chat", run_id, messages))
+        return {"choices": [{"message": {"content": "42"}}]}
+
+
+@pytest.fixture
+def fake_client(monkeypatch) -> _FakeClient:
+    client = _FakeClient()
+    monkeypatch.setattr(cli, "client_from_config", lambda *a, **k: client)
+    return client
+
+
+def _run(argv: list[str]) -> int:
+    return cli.main(argv)
+
+
+def test_whoami_prints_identity(fake_client, capsys) -> None:
+    assert _run(["whoami"]) == 0
+    out = capsys.readouterr().out
+    assert "sk-autoslm-fake" in out
+    assert "t@example.com" in out
+
+
+def test_models_table_and_experimental_flag(fake_client, capsys) -> None:
+    assert _run(["models"]) == 0
+    base = capsys.readouterr().out
+    assert "Qwen/Qwen3-0.6B" in base
+    assert "Qwen3.6-35B" not in base
+
+    assert _run(["models", "--experimental"]) == 0
+    assert "Qwen3.6-35B" in capsys.readouterr().out
+
+
+def test_status_ps_cost_and_logs(fake_client, capsys) -> None:
+    assert _run(["status", "autoslm-1"]) == 0
+    assert "done" in capsys.readouterr().out
+
+    assert _run(["ps"]) == 0
+    out = capsys.readouterr().out
+    assert "autoslm-1" in out
+    assert "done" in out
+
+    assert _run(["cost", "autoslm-1"]) == 0
+    assert "0.25" in capsys.readouterr().out
+
+    assert _run(["logs", "autoslm-1"]) == 0
+    assert "hello from the worker" in capsys.readouterr().out
+
+
+def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
+    assert _run(["cancel", "autoslm-1"]) == 0
+    assert ("cancel", "autoslm-1") in fake_client.calls
+
+    assert _run(["deploy", "autoslm-1", "--mode", "dev", "--idle-timeout", "120"]) == 0
+    assert ("deploy", "autoslm-1", "dev", 120) in fake_client.calls
+
+    assert _run(["deployments"]) == 0
+    assert "autoslm-1" in capsys.readouterr().out
+
+    assert _run(["undeploy", "autoslm-1"]) == 0
+    assert ("undeploy", "autoslm-1") in fake_client.calls
+
+
+def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
+    assert _run(["chat", "autoslm-1", "-m", "What is 6*7?"]) == 0
+    assert "42" in capsys.readouterr().out
+    assert fake_client.calls[-1][0] == "chat"
+
+
+def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None:
+    from autoslm.client import ApiError
+
+    class _Erroring(_FakeClient):
+        def get_run(self, run_id: str) -> dict:
+            raise ApiError(404, "unknown run")
+
+    monkeypatch.setattr(cli, "client_from_config", lambda *a, **k: _Erroring())
+    assert _run(["status", "nope"]) != 0
+    assert "unknown run" in capsys.readouterr().err
+
+
+def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
+    from autoslm.client.specs import spec_payload
+    from autoslm.worker_spec import EnvironmentSpec, JobSpec
+
+    # Built-in envs ship no extra pip...
+    spec = JobSpec(model="Qwen/Qwen3-0.6B", environment=EnvironmentSpec(id="gsm8k"))
+    assert "pip" not in spec_payload(spec)["environment"] or not (
+        spec_payload(spec)["environment"].get("pip")
+    )
+
+    # ...the freesolo bridge resolves its GRPO worker deps client-side...
+    spec = JobSpec(
+        model="Qwen/Qwen3-0.6B",
+        environment=EnvironmentSpec(id="freesolo", params={"mode": "grpo"}),
+    )
+    assert spec_payload(spec)["environment"]["pip"] == ["freesolo[full]"]
+
+    # ...and an explicit pip list (the documented escape hatch) wins untouched.
+    spec = JobSpec(
+        model="Qwen/Qwen3-0.6B",
+        environment=EnvironmentSpec(id="freesolo", params={"mode": "grpo"}, pip=("custom==1",)),
+    )
+    assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
+
+
+# ---------------------------------------------------------------------------
+# MCP bridge: tool dispatch over the same client surface
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_handle_dispatches_tools(monkeypatch, fake_client, capsys) -> None:
+    from autoslm.mcp import server as mcp
+
+    monkeypatch.setattr(mcp, "client_from_config", lambda *a, **k: fake_client, raising=False)
+
+    models = mcp.handle({"tool": "list_models", "args": {}})
+    assert any("Qwen" in str(m) for m in str(models).split(","))
+
+    status = mcp.handle({"tool": "get_run_status", "args": {"run_id": "autoslm-1"}})
+    assert status["state"] == "done"
+
+    logs = mcp.handle({"tool": "get_run_logs", "args": {"run_id": "autoslm-1"}})
+    assert "hello from the worker" in str(logs)
+
+    with pytest.raises(ValueError, match="unknown tool"):
+        mcp.handle({"tool": "nope"})
