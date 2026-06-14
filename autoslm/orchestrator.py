@@ -6,7 +6,6 @@ import contextlib
 import json
 import os
 import re
-import shutil
 import tempfile
 import threading
 import time
@@ -31,42 +30,6 @@ _UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
 # Serializes the read-check-write in _update so a status transition is an atomic
 # compare-and-set (the control plane is single-instance with per-run threads).
 _STATUS_LOCK = threading.Lock()
-
-# Pre-consolidation state locations, kept only for a one-time best-effort migration into the
-# fixed ~/.autoslm root: older releases defaulted to cwd-relative dirs, and the old Docker
-# image mounted its volume at /state with AUTOSLM_RUNS_DIR=/state/runs etc. The SQLite
-# ownership rows survive an upgrade, so the run files/metrics they reference must move too —
-# otherwise runs 404 and recover_runs skips them while their remote jobs may still be live.
-_LEGACY_RUNS_DIRS = ("/state/runs", os.path.join(".autoslm", "runs"))
-_LEGACY_RESULTS_DIRS = ("/state/results", "results")
-
-
-def migrate_legacy_state(log=None) -> None:
-    """Move any pre-``~/.autoslm`` run/result dirs into the fixed state root, once.
-
-    Best-effort and idempotent: each legacy dir is moved only if it exists, differs from the
-    destination, and the destination is absent or empty (never clobber newer state). No-ops
-    when the state root has been redirected (tests monkeypatch ``RUNS_DIR`` to a tmpdir) so it
-    only ever touches the real ``~/.autoslm`` layout.
-    """
-    if os.path.abspath(RUNS_DIR) != os.path.join(_STATE_DIR, "runs"):
-        return
-    with contextlib.suppress(Exception):
-        os.makedirs(_STATE_DIR, exist_ok=True)
-    pairs = [(d, RUNS_DIR) for d in _LEGACY_RUNS_DIRS]
-    pairs += [(d, RESULTS_DIR) for d in _LEGACY_RESULTS_DIRS]
-    for legacy, dest in pairs:
-        with contextlib.suppress(Exception):
-            src = os.path.abspath(legacy)
-            if not os.path.isdir(src) or src == os.path.abspath(dest):
-                continue
-            if os.path.isdir(dest) and os.listdir(dest):
-                continue  # destination already populated — leave the newer state in place
-            if os.path.isdir(dest):
-                os.rmdir(dest)  # empty placeholder created by an earlier startup
-            shutil.move(src, dest)
-            if log:
-                log(f"migrated legacy AutoSLM state {src} -> {dest}")
 
 
 def artifacts_dir(spec: JobSpec) -> str:
