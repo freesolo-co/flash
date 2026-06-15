@@ -14,7 +14,6 @@ can tear down exactly one deployment (via the REST API, from any process).
 
 The handler boots vLLM with the base model + the LoRA adapter (pulled from the HF
 dataset repo the trainer streamed it to) and returns an OpenAI-shaped chat-completion.
-A local OpenAI-compatible HTTP shim is available via ``slm serve-proxy``.
 """
 
 from __future__ import annotations
@@ -428,7 +427,7 @@ def deploy_adapter(
     # is scale-to-zero by design, so it warms lazily on first chat.
     if mode == "always-on":
         warmup = {
-            "hf_repo": hf_repo or os.environ.get("HF_REPO", ""),
+            "hf_repo": hf_repo,
             "model": model,
             "adapter_prefix": adapter_prefix,
             "token": os.environ.get("HUGGINGFACE_TOKEN", ""),
@@ -493,7 +492,7 @@ def chat(
     # client-side; the family-name check mirrors the worker's config-based one).
     language_model_only = any(s in model for s in ("Qwen3.5", "Qwen3.6"))
     payload = {
-        "hf_repo": hf_repo or os.environ.get("HF_REPO", ""),
+        "hf_repo": hf_repo,
         "model": model,
         "adapter_prefix": adapter_prefix,
         "token": os.environ.get("HUGGINGFACE_TOKEN", ""),

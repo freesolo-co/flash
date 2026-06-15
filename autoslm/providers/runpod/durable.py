@@ -8,7 +8,7 @@ the run. This module owns the lifecycle instead:
   deploy_train_endpoint()  -> endpoint_id (Flash SDK deploy, same worker template)
   build_function_input()   -> the exact FunctionRequest payload Flash workers expect
   submit + poll_job()      -> REST queue API with hardened retries; the job handle
-                              {endpoint_id, job_id} is persisted by the orchestrator so
+                              {endpoint_id, job_id} is persisted by the runner so
                               any process can re-attach (`slm attach`).
 """
 
@@ -119,7 +119,7 @@ class JobHandle:
 
     @classmethod
     def from_dict(cls, d: dict) -> JobHandle:
-        # `provider` is routing metadata consumed upstream (orchestrator); handles
+        # `provider` is routing metadata consumed upstream (runner); handles
         # persisted before it existed default to runpod there.
         return cls(d["endpoint_id"], d.get("endpoint_name", ""), d["job_id"])
 
@@ -272,7 +272,7 @@ def poll_job(
                 detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])[-2000:]
             elif not detail:
                 detail = str(out)[:1500]
-            # Prefix the terminal status so the orchestrator's infra-retry markers
+            # Prefix the terminal status so the runner's infra-retry markers
             # (e.g. TIMED_OUT) match even when RunPod sets no error/output text.
             return PollResult(False, failure="job_failed", detail=f"[{status}] {detail}")
         # While queued, surface worker availability (throttled hosts are the common
@@ -322,9 +322,9 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
     """Durable equivalent of ``submit_train``: deploy, submit, persist handle, poll.
 
     ``on_handle(handle_dict)`` is invoked as soon as the job is queued so the
-    orchestrator can persist {endpoint_id, job_id} for cross-process reattach.
+    runner can persist {endpoint_id, job_id} for cross-process reattach.
     """
-    from autoslm.envs.registry import worker_pip_for_env
+    from autoslm.envs.registry import worker_hub_env_ids, worker_pip_for_env
     from autoslm.providers.runpod.train import _run_suffix, build_worker_env
 
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
@@ -337,7 +337,7 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
     # Resolve the worker env BEFORE provisioning: an unrecorded Hub env raises here, and
     # doing it after deploy_train_endpoint() would leak the just-created endpoint (its
     # rN-suffixed name can't be reconstructed from the run id later) against the account
-    # quota — the orchestrator would also treat the raise as a retryable poll_error.
+    # quota — the runner would also treat the raise as a retryable poll_error.
     extra_pip = list(spec.environment.pip) or worker_pip_for_env(
         spec.environment.id, spec.environment.params
     )
@@ -350,12 +350,13 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
         spec=spec,
     )
     payload = {
-        "hf_repo": os.environ.get("HF_REPO", ""),
+        "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
         "env": worker_env,
         "extra_pip": extra_pip,
+        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     try:
         job_id = submit(endpoint_id, payload)
@@ -377,7 +378,7 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
         )
     if on_handle is not None:
         on_handle(handle.to_dict())
-    hf_repo = os.environ.get("HF_REPO", "")
+    hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
     stall = float(os.environ.get("AUTOSLM_STALL_AFTER_S", "1500"))

@@ -35,6 +35,10 @@ from autoslm.providers.runpod import train as _train
 # Setting only one of the two leaves the other spelling broken, so we set both.
 _ALIASES = {
     "runpod_api": _api,
+    # Historical short name for the RunPod REST client; kept so existing
+    # ``from autoslm.flash import runpod`` (and monkeypatches against it) land on the
+    # SAME module object the provider layer uses (``providers.runpod.api``).
+    "runpod": _api,
     "auth": _auth,
     "train": _train,
     "durable": _durable,

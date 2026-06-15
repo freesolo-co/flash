@@ -18,4 +18,4 @@ RUN pip install --no-cache-dir ".[server]"
 VOLUME /root/.autoslm
 EXPOSE 8080
 
-CMD ["slm", "server", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["autoslm-server", "--host", "0.0.0.0", "--port", "8080"]

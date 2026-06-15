@@ -168,10 +168,11 @@ def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None
 
 def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     from autoslm.client.specs import spec_payload
-    from autoslm.worker_spec import EnvironmentSpec, JobSpec
+    from autoslm.spec import EnvironmentSpec, JobSpec
 
-    # An unrecorded env resolves to just verifiers (the worker installs verifiers; the env
-    # module travels with a local path, or is a recorded Hub wheel).
+    # An unrecorded env resolves to just verifiers (the worker pip-installs verifiers; the
+    # Hub env itself is installed on the worker via `prime env install` — no local path / pip
+    # wheel delivery).
     spec = JobSpec(model="Qwen/Qwen3-0.6B", environment=EnvironmentSpec(id="owner/env"))
     assert spec_payload(spec)["environment"]["pip"] == ["verifiers"]
 

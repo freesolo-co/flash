@@ -46,6 +46,9 @@ Repository = "https://github.com/freesolo-co/freesolo"
 
 [project.scripts]
 slm = "autoslm.cli.main:main"
+# Operator-only: the control plane is a separate service, run once on the host, not a `slm`
+# subcommand. Requires the `server` extra (`pip install 'autoslm-train[server]'`).
+autoslm-server = "autoslm.server.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

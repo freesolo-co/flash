@@ -18,8 +18,8 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from autoslm.config_schema import spec_from_dict
-from autoslm.worker_spec import JobSpec
+from autoslm.schema import spec_from_dict
+from autoslm.spec import JobSpec
 
 
 class _Tok:
@@ -100,7 +100,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
 
 
 def test_train_grpo_knobs_parse_and_roundtrip() -> None:
-    from autoslm.config_schema import spec_from_dict
+    from autoslm.schema import spec_from_dict
 
     raw = {
         "model": "Qwen/Qwen3-0.6B",
@@ -111,6 +111,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
         "train": {
             "seeds": [0],
             "steps": 10,
+            "hf_repo": "owner/runs",
             "group_size": 4,
             "temperature": 0.7,
             "max_tokens": 256,
@@ -137,10 +138,10 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
 def test_opt_int_float_reject_bools() -> None:
     """A JSON boolean must NOT silently coerce to a numeric train knob: bool is an int
     subclass in Python, so ``int(True)`` would become 1. JobSpec.from_dict (via
-    _opt_int/_opt_float) rejects it, matching config_schema._opt_num."""
+    _opt_int/_opt_float) rejects it, matching schema._opt_num."""
     import pytest
 
-    from autoslm.worker_spec import _opt_float, _opt_int
+    from autoslm.spec import _opt_float, _opt_int
 
     for bad in (True, False):
         with pytest.raises(TypeError):
@@ -213,7 +214,12 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
         "gpu": {"type": "cheapest", "allow_unvalidated": True},
-        "train": {"seeds": [0], "steps": 10, "init_from_adapter": "sft/run-x/seed0"},
+        "train": {
+            "seeds": [0],
+            "steps": 10,
+            "hf_repo": "owner/runs",
+            "init_from_adapter": "sft/run-x/seed0",
+        },
     }
     spec = spec_from_dict(raw, run_id="grpo-x")
     assert spec.train.init_from_adapter == "sft/run-x/seed0"
@@ -224,8 +230,38 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
     assert spec_from_dict(raw, run_id="grpo-y").train.init_from_adapter == ""
 
 
+def test_hf_repo_per_run_parses_and_validates() -> None:
+    # [train] hf_repo is the REQUIRED per-run HF artifact repo (no operator HF_REPO default);
+    # it must parse through schema (server) AND JobSpec.from_dict (worker), an absent value
+    # must be rejected as required, and a malformed value must 400 at parse time.
+    from autoslm.schema import ConfigError
+
+    raw = {
+        "model": "Qwen/Qwen3-0.6B",
+        "algorithm": "grpo",
+        "model_policy": "allow",
+        "environment": {"id": "owner/env"},
+        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "train": {"seeds": [0], "steps": 10, "hf_repo": "myorg/runs"},
+    }
+    spec = spec_from_dict(raw, run_id="hf-x")
+    assert spec.train.hf_repo == "myorg/runs"
+    # survives the JSON round-trip the worker reconstructs from
+    assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == "myorg/runs"
+    # absent -> rejected (it is required; there is no operator HF_REPO fallback)
+    with pytest.raises(ConfigError, match=r"train\.hf_repo is required"):
+        spec_from_dict({**raw, "train": {"seeds": [0], "steps": 10}}, run_id="hf-y")
+    # malformed values are rejected at parse time (server 400), not passed to the worker
+    for bad in ("noslash", "/name", "owner/", "a/b/c", "owner//name"):
+        with pytest.raises(ConfigError):
+            spec_from_dict(
+                {**raw, "train": {"seeds": [0], "steps": 10, "hf_repo": bad}},
+                run_id="hf-bad",
+            )
+
+
 def test_optimizer_and_batching_knobs_roundtrip() -> None:
-    # The SDK's SftConfig/GrpoConfig optimizer/batching knobs must survive config_schema
+    # The SDK's SftConfig/GrpoConfig optimizer/batching knobs must survive schema
     # (server validation) AND the worker's JobSpec.from_dict, or the worker would silently
     # train with recipe defaults while W&B reports the user's values.
     raw = {
@@ -236,6 +272,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "gpu": {"type": "cheapest", "allow_unvalidated": True},
         "train": {
             "seeds": [0],
+            "hf_repo": "owner/runs",
             "learning_rate": 3e-5,
             "batch_size": 16,
             "max_length": 2048,
@@ -253,29 +290,36 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         assert s.train.max_tokens == 512
         assert s.train.stop_sequences == ("</answer>", "\n\n")
     # omitted optimizer knobs stay None so the worker applies its recipe defaults
-    bare = spec_from_dict({**raw, "train": {"seeds": [0]}}, run_id="grpo-w")
+    bare = spec_from_dict(
+        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs"}}, run_id="grpo-w"
+    )
     assert bare.train.learning_rate is None
     assert bare.train.batch_size is None
     assert bare.train.stop_sequences == ()
     # a bare-string stop_sequences is ONE stop, never split into characters
     one = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "stop_sequences": "</answer>"}}, run_id="grpo-s"
+        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs", "stop_sequences": "</answer>"}},
+        run_id="grpo-s",
     )
     assert one.train.stop_sequences == ("</answer>",)
     assert JobSpec.from_dict(one.to_dict()).train.stop_sequences == ("</answer>",)
     # an empty string means "no stop configured" -> (), not ("",); empty list entries drop
-    empty = spec_from_dict({**raw, "train": {"seeds": [0], "stop_sequences": ""}}, run_id="grpo-e")
+    empty = spec_from_dict(
+        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs", "stop_sequences": ""}},
+        run_id="grpo-e",
+    )
     assert empty.train.stop_sequences == ()
     dropped = spec_from_dict(
-        {**raw, "train": {"seeds": [0], "stop_sequences": ["x", ""]}}, run_id="grpo-d"
+        {**raw, "train": {"seeds": [0], "hf_repo": "owner/runs", "stop_sequences": ["x", ""]}},
+        run_id="grpo-d",
     )
     assert dropped.train.stop_sequences == ("x",)
 
 
 def test_optimizer_knob_validation_rejects_bad_values() -> None:
-    # config_schema is the server's 400 layer: nonsensical/malformed knobs must raise
+    # schema is the server's 400 layer: nonsensical/malformed knobs must raise
     # ConfigError at parse time, not TypeError (500) or a silently-misbehaving worker.
-    from autoslm.config_schema import ConfigError
+    from autoslm.schema import ConfigError
 
     base = {
         "model": "Qwen/Qwen3-0.6B",

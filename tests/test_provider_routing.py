@@ -12,7 +12,7 @@ import io
 
 import pytest
 
-from autoslm.worker_spec import JobSpec
+from autoslm.spec import JobSpec
 
 
 def _spec(run_id="autoslm-1700000001-rt01", **gpu_kw) -> JobSpec:
@@ -23,7 +23,7 @@ def _spec(run_id="autoslm-1700000001-rt01", **gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3-0.6B",
             "algorithm": "sft",
             "run_id": run_id,
-            "train": {"epochs": 1, "seeds": [0]},
+            "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
             "gpu": gpu,
         }
     )
@@ -77,12 +77,12 @@ def _vast_handle_dict(instance_id=1, machine_id=2):
 
 @pytest.fixture
 def orch(monkeypatch, tmp_path):
-    from autoslm import orchestrator
+    from autoslm import runner
 
     monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
-    monkeypatch.setattr(orchestrator, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(tmp_path / "results"))
-    return orchestrator
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    return runner
 
 
 def _seed_status(orch, spec):
@@ -372,14 +372,14 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
 # config: provider fields
 # ---------------------------------------------------------------------------
 def test_config_provider_fields(monkeypatch):
-    from autoslm.config_schema import ConfigError, spec_from_dict
+    from autoslm.schema import ConfigError, spec_from_dict
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
     base = {
         "model": "Qwen/Qwen3-4B-Instruct-2507",
         "algorithm": "sft",
-        "train": {"epochs": 1, "seeds": [0]},
+        "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "environment": {"id": "owner/env"},
     }
     # omitted gpu.type -> smart-allocation default, original request preserved

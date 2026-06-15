@@ -41,15 +41,15 @@ def test_decode_output_error_includes_stdout_tail():
 
 
 # ---------------------------------------------------------------------------
-# poll_job state machine (mocked runpod_api)
+# poll_job state machine (mocked runpod)
 # ---------------------------------------------------------------------------
 def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
     import cloudpickle
 
-    from autoslm.flash import durable, runpod_api
+    from autoslm.flash import durable, runpod
 
     seq = iter(statuses)
-    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(seq))
+    monkeypatch.setattr(runpod, "job_status", lambda eid, jid: next(seq))
     monkeypatch.setattr(durable.time, "sleep", lambda s: None)
     hb_iter = iter(heartbeats) if heartbeats is not None else None
 
@@ -100,9 +100,9 @@ def test_poll_job_stall_detection(monkeypatch):
     # job stays IN_PROGRESS forever, heartbeat never advances -> stall
     import itertools
 
-    from autoslm.flash import durable, runpod_api
+    from autoslm.flash import durable, runpod
 
-    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(runpod, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(durable.time, "sleep", lambda s: None)
     clock = itertools.count(start=0, step=100.0)
     monkeypatch.setattr(durable.time, "time", lambda: next(clock))
@@ -115,7 +115,7 @@ def test_poll_job_stall_detection(monkeypatch):
 def test_poll_job_tolerates_transient_api_errors(monkeypatch):
     import cloudpickle
 
-    from autoslm.flash import durable, runpod_api
+    from autoslm.flash import durable, runpod
 
     ok = {
         "success": True,
@@ -126,10 +126,10 @@ def test_poll_job_tolerates_transient_api_errors(monkeypatch):
     def flaky(eid, jid):
         calls["n"] += 1
         if calls["n"] < 4:
-            raise runpod_api.RunpodApiError("blip")
+            raise runpod.RunpodApiError("blip")
         return {"status": "COMPLETED", "output": ok}
 
-    monkeypatch.setattr(runpod_api, "job_status", flaky)
+    monkeypatch.setattr(runpod, "job_status", flaky)
     monkeypatch.setattr(durable.time, "sleep", lambda s: None)
     res = durable.poll_job(durable.JobHandle("ep", "n", "j"), interval_s=0, stall_after_s=1e9)
     assert res.ok
@@ -137,7 +137,7 @@ def test_poll_job_tolerates_transient_api_errors(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Supervisor retry logic (orchestrator) with mocked durable submit
+# Supervisor retry logic (runner) with mocked durable submit
 # ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def _restore_skip_net():
@@ -151,7 +151,7 @@ def _restore_skip_net():
 
 def _fresh_orchestrator(tmp, monkeypatch):
     os.environ.pop("AUTOSLM_SKIP_NET", None)
-    import autoslm.orchestrator as orch
+    import autoslm.runner as orch
 
     importlib.reload(orch)
     # Storage roots are fixed constants now; redirect to tmp via monkeypatch so they're
@@ -162,7 +162,7 @@ def _fresh_orchestrator(tmp, monkeypatch):
 
 
 def _spec(run_id):
-    from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
+    from autoslm.spec import GpuSpec, JobSpec, TrainSpec
 
     return JobSpec(
         run_id=run_id,
@@ -190,7 +190,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
             return durable.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         orch.submit_job(_spec("retry-ok"), dry_run=False, background=False)
         st = orch.get_status("retry-ok")
@@ -214,7 +214,7 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
             )
 
         monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         with pytest.raises(RuntimeError):
             orch.submit_job(_spec("fail-fast"), dry_run=False, background=False)
@@ -233,7 +233,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         import autoslm.flash.pricing as pricing
         import autoslm.flash.train as flash_train
 
-        from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
+        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
 
         # Force the deterministic static ranking (no live pricing fetch) and the
         # validated-only pool, so a stray AUTOSLM_GPU_ALLOW_UNVALIDATED in the dev's
@@ -252,7 +252,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             return durable.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -284,7 +284,7 @@ def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
         import autoslm.flash.pricing as pricing
         import autoslm.flash.train as flash_train
 
-        from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
+        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
 
         monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
@@ -299,7 +299,7 @@ def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
             return durable.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -326,7 +326,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         import autoslm.flash.train as flash_train
 
         import autoslm.providers.allocator as allocator
-        from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
+        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
 
         monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
@@ -351,7 +351,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             return durable.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
         monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda: "repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -414,7 +414,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
 def test_cancel_uses_rest_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        from autoslm.flash import runpod_api
+        from autoslm.flash import runpod
 
         status = orch.RunStatus(
             run_id="c1",
@@ -424,8 +424,8 @@ def test_cancel_uses_rest_handle(monkeypatch):
         )
         orch._save_status(status)
         cancelled, deleted = [], []
-        monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled.append((e, j)))
-        monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e))
+        monkeypatch.setattr(runpod, "cancel_job", lambda e, j: cancelled.append((e, j)))
+        monkeypatch.setattr(runpod, "delete_endpoint", lambda e: deleted.append(e))
         import autoslm.flash.train as flash_train
 
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
@@ -472,7 +472,7 @@ def test_attach_clears_stale_handle_before_resuming_seeds(monkeypatch):
         import autoslm.flash.durable as durable
         import autoslm.flash.train as flash_train
 
-        from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
+        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
 
         spec = JobSpec(
             run_id="m1",

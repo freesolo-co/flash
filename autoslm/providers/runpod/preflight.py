@@ -22,17 +22,11 @@ def missing_credentials(require_hf: bool = True) -> list[str]:
     problems: list[str] = []
     if not load_api_key():
         problems.append("  - RUNPOD_API_KEY: the operator's RunPod API key")
-    if require_hf:
-        if not os.environ.get("HF_REPO"):
-            problems.append(
-                "  - HF_REPO: a Hugging Face *dataset* repo for adapters/checkpoints, e.g. "
-                "`export HF_REPO=your-org/autoslm-runs`"
-            )
-        if not os.environ.get("HUGGINGFACE_TOKEN"):
-            problems.append(
-                "  - HUGGINGFACE_TOKEN: a token with write access to HF_REPO, e.g. "
-                "`export HUGGINGFACE_TOKEN=hf_...`"
-            )
+    if require_hf and not os.environ.get("HUGGINGFACE_TOKEN"):
+        problems.append(
+            "  - HUGGINGFACE_TOKEN: a token with write access to each run's "
+            "`[train] hf_repo`, e.g. `export HUGGINGFACE_TOKEN=hf_...`"
+        )
     return problems
 
 
@@ -41,16 +35,19 @@ _missing_credentials = missing_credentials
 
 
 def check_run_preflight(require_hf: bool = True) -> None:
-    """Validate that everything needed to provision managed GPU runs is present.
+    """Validate the RunPod-specific operator credentials for managed GPU runs.
 
-    Raises ``PreflightError`` listing every missing item (``RUNPOD_API_KEY``,
-    ``HF_REPO``, ``HUGGINGFACE_TOKEN``) and how to set it. No-op when nothing is
-    missing. See docs/self-hosting.md.
+    This provider-level check covers only the RunPod-specific creds (``RUNPOD_API_KEY``)
+    plus the shared HF write token (``HUGGINGFACE_TOKEN``); it raises ``PreflightError``
+    listing every missing item and how to set it. ``PRIME_API_KEY`` (the worker uses it to
+    ``prime env install`` Hub envs) and the per-run ``[train] hf_repo`` are NOT validated
+    here — they are checked by the aggregated entrypoint
+    ``autoslm.flash.preflight.check_run_preflight``. No-op when nothing is missing.
     """
     problems = missing_credentials(require_hf=require_hf)
     if problems:
         raise PreflightError(
             "the AutoSLM control plane is missing required operator configuration:\n"
             + "\n".join(problems)
-            + "\n\nSet these on the control-plane host (docs/self-hosting.md)."
+            + "\n\nSet these on the control-plane host."
         )

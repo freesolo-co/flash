@@ -25,6 +25,9 @@ epochs = 2                    # SFT epochs
 lora_rank = 32
 lora_alpha = 64
 seeds = [0, 1]                # one dedicated GPU per seed
+hf_repo = "myorg/runs"        # REQUIRED: per-run HF dataset repo for THIS run's adapter/
+                             # checkpoints/code + serving. Must be writable by the operator's
+                             # HUGGINGFACE_TOKEN. Shape "owner/name".
 # GRPO recipe knobs (all optional; omit one to use the worker's recipe default). These
 # belong in [train], NOT [environment.params] (which is forwarded verbatim to the
 # verifiers env's load_environment(**params)):
@@ -81,7 +84,7 @@ class that isn't RunPod-validated is served from a RunPod-validated class automa
 
 The platform's default worker disk is 64 GB. Catalog models that need more declare
 `min_disk_gb` (e.g. Qwen3.6-35B-A3B's ~72 GB bf16 checkpoint -> 160 GB) and the
-orchestrator raises `gpu.disk_gb` automatically; for unlisted big models set
+runner raises `gpu.disk_gb` automatically; for unlisted big models set
 `gpu.disk_gb` yourself. Verified live: RunPod honors the larger container disk on
 serverless GPU workers.
 
@@ -152,7 +155,6 @@ slm deploy <run_id> --mode dev          # scale-to-zero: cold start after idle, 
 slm deploy <run_id> --mode always-on    # one warm worker 24/7: no cold starts, continuous billing
 slm deploy <run_id> --idle-timeout 300  # dev mode: seconds before scale-to-zero
 slm chat <run_id> -m "..."              # OpenAI-shaped chat through the managed GPU
-slm serve-proxy <run_id> --port 8000    # local OpenAI-compatible /v1 shim (any OpenAI SDK client)
 slm deployments                          # list active deployments + projected $/day
 slm undeploy <run_id>                    # tear the serving endpoint down
 ```
@@ -177,7 +179,8 @@ Client-side:
 
 | Var | Purpose |
 |---|---|
-| `AUTOSLM_API_KEY` | your AutoSLM key (normally stored by `slm login`) |
+| `FREESOLO_API_KEY` | your freesolo API key, read by `slm login`; also a runtime override of the stored key (created in the freesolo dashboard) |
+| `FREESOLO_BASE_URL` | freesolo backend that verifies the key on login (default `https://api.freesolo.co`) |
 | `AUTOSLM_API_URL` | control-plane URL |
 
 Server-side (operator; the remaining variables below also apply on the control-plane
@@ -186,8 +189,8 @@ host):
 | Var | Purpose |
 |---|---|
 | `RUNPOD_API_KEY` | RunPod auth (operator credential) |
-| `HF_REPO` | HF **dataset** repo for adapters/checkpoints + code delivery |
-| `HUGGINGFACE_TOKEN` | write access to `HF_REPO` |
+| `PRIME_API_KEY` | Prime Intellect auth; the GPU worker uses it to `prime env install` the run's Hub environment (public + private) |
+| `HUGGINGFACE_TOKEN` | write access to every run's `[train] hf_repo` (the per-run HF **dataset** repo for adapters/checkpoints + code delivery; the worker also exports the token as `HF_TOKEN`, which the HF libraries read) |
 | `AUTOSLM_WORKER_DEPS` | override the pinned worker dependency stack (whitespace-separated, or a JSON list for specs containing commas like `transformers>=5.6,<5.11`) |
 | `AUTOSLM_WORKER_IMAGE` | optional prebuilt worker image (deps and base model baked in); any image exposing the pinned worker stack works |
 | `AUTOSLM_MIN_CUDA` | minimum host driver CUDA version. Auto: 13.0 for Blackwell classes (RTX 5090 / RTX Pro 6000 / B200 — their wheels ship no SASS; older drivers cannot JIT the PTX) on the modern stack, 12.8 otherwise |

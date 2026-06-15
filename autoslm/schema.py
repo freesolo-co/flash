@@ -19,7 +19,7 @@ from .providers.base import (
     resolve_gpu_policy,
     unvalidated_allowed,
 )
-from .worker_spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from .spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
 
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
@@ -167,12 +167,22 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
         raise ConfigError("thinking must be a boolean")
 
     env_raw = raw.get("environment") or {}
+    if not isinstance(env_raw, dict):
+        raise ConfigError("[environment] must be a table")
+    # Local environment paths are gone: a run names a published Hub env by [environment] id.
+    # A stray `path` (alone or alongside `id`) is a stale config — reject it loudly instead of
+    # silently ignoring the key and training against the wrong/missing env.
+    if env_raw.get("path"):
+        raise ConfigError(
+            "local environment paths are no longer supported — remove `path` and reference a "
+            'published Hub `id` ("owner/name")'
+        )
     train_raw = raw.get("train") or {}
     gpu_raw = raw.get("gpu") or {}
 
     # Smart allocation is the default: an omitted gpu.type means "the cheapest GPU
     # (across providers) that fits the model", re-resolved live at submit time. The
-    # original request survives in gpu.requested so the orchestrator knows whether
+    # original request survives in gpu.requested so the runner knows whether
     # it may re-allocate (policy words) or must honor a concrete pin.
     requested_gpu = str(gpu_raw.get("requested") or gpu_raw.get("type") or "auto")
     provider = str(gpu_raw.get("provider") or "auto").strip().lower()
@@ -245,6 +255,7 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
             lora_alpha=int(train_raw.get("lora_alpha", 64)),
             seeds=tuple(int(s) for s in train_raw.get("seeds", (0,))),
             init_from_adapter=str(train_raw.get("init_from_adapter") or ""),
+            hf_repo=str(train_raw.get("hf_repo") or ""),
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
             max_length=_train_int(train_raw, "max_length", minimum=1),
@@ -300,8 +311,35 @@ def _validate_spec(spec: JobSpec) -> None:
             "config must set [environment] id (a verifiers/Prime Hub env slug, e.g. "
             '"owner/name"); there is no local path mode'
         )
+    # The id must be a full Prime Hub slug "owner/name": exactly one slash, both parts
+    # non-empty. A bare id like "gsm8k" passes the presence check but then the worker runs
+    # `prime env install gsm8k` (invalid — Prime needs owner/name) and fails after provisioning.
+    id_parts = spec.environment.id.split("/")
+    if len(id_parts) != 2 or not all(id_parts):
+        raise ConfigError('[environment] id must be a published Prime Hub slug "owner/name"')
+    # A separate eval env ([environment.params] eval_env_id / eval_env) is also prime-installed
+    # on the worker (worker_hub_env_ids), so it must be a full "owner/name" slug too — else a
+    # bare eval id passes --dry-run but fails `prime env install` after a GPU is provisioned.
+    eval_ref = spec.environment.params.get("eval_env_id") or spec.environment.params.get("eval_env")
+    if eval_ref:
+        eval_parts = str(eval_ref).split("/")
+        if len(eval_parts) != 2 or not all(eval_parts):
+            raise ConfigError(
+                '[environment.params] eval_env_id must be a published Prime Hub slug "owner/name"'
+            )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")
+    # The per-run HF artifact repo (adapters/checkpoints/code + serving) is required: there
+    # is no operator-wide default anymore. It must look like "owner/name" (exactly one slash,
+    # both parts non-empty) — a malformed value would reach the worker/serve as an unusable id.
+    if not spec.train.hf_repo:
+        raise ConfigError(
+            "train.hf_repo is required: the HF dataset repo for this run's adapters/checkpoints, "
+            'e.g. "owner/name"'
+        )
+    parts = spec.train.hf_repo.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ConfigError('train.hf_repo must be a HuggingFace repo of the form "owner/name"')
     # GRPO recipe knobs (optional): validate the ones that are set. A None means
     # "the worker applies its recipe default", so only constrain explicit values.
     if spec.train.group_size is not None and spec.train.group_size <= 0:

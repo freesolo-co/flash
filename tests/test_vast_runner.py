@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from autoslm.worker_spec import JobSpec
+from autoslm.spec import JobSpec
 
 
 def _spec(**gpu_kw) -> JobSpec:
@@ -19,7 +19,7 @@ def _spec(**gpu_kw) -> JobSpec:
             "model": "Qwen/Qwen3-0.6B",
             "algorithm": "sft",
             "run_id": "autoslm-1700000000-abcd1234",
-            "train": {"epochs": 1, "seeds": [0]},
+            "train": {"epochs": 1, "seeds": [0], "hf_repo": "org/repo"},
             "gpu": gpu,
         }
     )
@@ -88,6 +88,28 @@ def test_onstart_ships_payload_and_bootstrap(monkeypatch):
     assert "rp-supersecret" not in script
 
 
+def test_build_payload_carries_per_run_hf_repo(monkeypatch):
+    """The submit payload's hf_repo is the run's [train] hf_repo (there is no operator HF_REPO
+    fallback). The worker fetches code + writes artifacts to this repo, its env's HF_REPO must
+    match the payload's, and an operator HF_REPO in the env must NOT leak in."""
+    from autoslm.providers.vast import durable as vast
+
+    # an operator HF_REPO in the control-plane env must be ignored
+    monkeypatch.setenv("HF_REPO", "operator/default")
+    per_run = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3-0.6B",
+            "algorithm": "sft",
+            "run_id": "autoslm-1700000000-abcd1234",
+            "train": {"epochs": 1, "seeds": [0], "hf_repo": "myorg/runs"},
+            "gpu": {"type": "RTX 3090", "provider": "vast", "max_wall_seconds": 3600},
+        }
+    )
+    payload = vast.build_payload(per_run, seed=0, attempt=0)
+    assert payload["hf_repo"] == "myorg/runs"
+    assert payload["env"]["HF_REPO"] == "myorg/runs"
+
+
 def _bootstrap_env(monkeypatch, phase="sft", rcs=(0,), metrics=True):
     from autoslm.providers.vast import _bootstrap as vb
 
@@ -134,6 +156,62 @@ def test_bootstrap_fails_without_metrics(monkeypatch):
     ok, error = markers[0]
     assert not ok
     assert "metrics.json" in error
+
+
+def _bootstrap_with_hub_env(monkeypatch, prime_present):
+    """Drive _bootstrap.main() with one Prime Hub env to install, recording subprocess cmds."""
+    from autoslm.providers.vast import _bootstrap as vb
+
+    cmds: list[list[str]] = []
+    monkeypatch.setattr(
+        vb,
+        "load_payload",
+        lambda path=vb.PAYLOAD_PATH: {
+            "hf_repo": "org/repo",
+            "job_spec_json": "{}",
+            "phase": "sft",
+            "seed": 0,
+            "env": {"PRIME_API_KEY": "pit-test"},
+            "extra_pip": [],
+            "hub_env_ids": ["owner/env"],
+            "hf_prefix": "sft/x/seed0",
+            "max_wall_s": 60,
+            "attempt": 0,
+        },
+    )
+    monkeypatch.setattr(vb, "fetch_code", lambda p: None)
+    monkeypatch.setattr(vb, "run_mode", lambda p, e, m, d: 0)
+    monkeypatch.setattr(vb, "write_attempt_marker", lambda p, ok, error="": None)
+    monkeypatch.setattr(vb.os.path, "exists", lambda p: "metrics.json" in p)
+
+    class _Proc:
+        returncode = 0
+
+    monkeypatch.setattr(
+        vb.subprocess, "run", lambda cmd, *a, **k: (cmds.append(list(cmd)), _Proc())[1]
+    )
+    monkeypatch.setattr(
+        vb.shutil,
+        "which",
+        lambda name: "/usr/bin/prime" if (prime_present and name == "prime") else None,
+    )
+    return vb, cmds
+
+
+def test_bootstrap_skips_prime_install_when_present(monkeypatch):
+    # `prime` baked into the image -> no per-run `pip install prime`; still runs `prime env install`.
+    vb, cmds = _bootstrap_with_hub_env(monkeypatch, prime_present=True)
+    assert vb.main() == 0
+    assert not any(c[-1] == "prime" and "install" in c for c in cmds)
+    assert ["prime", "env", "install", "owner/env"] in cmds
+
+
+def test_bootstrap_installs_prime_when_absent(monkeypatch):
+    # `prime` not on the image -> install it once, then `prime env install`.
+    vb, cmds = _bootstrap_with_hub_env(monkeypatch, prime_present=False)
+    assert vb.main() == 0
+    assert any(c[-1] == "prime" and "install" in c for c in cmds)
+    assert ["prime", "env", "install", "owner/env"] in cmds
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ AutoSLM is **verifiers-only**: every environment is a Prime Intellect
 [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) environment. The env defines
 the task — its dataset, the prompts, and the weighted reward `Rubric`. There are no built-in
 task environments and no training contract/oracle: the `verifiers` env *is* the task
-definition. AutoSLM wraps it via `autoslm.envs.verifiers_adapter` so it runs unchanged on
+definition. AutoSLM wraps it via `autoslm.envs.adapter` so it runs unchanged on
 the trainer (single-turn SFT/GRPO/eval is fully supported).
 
 ## The interface

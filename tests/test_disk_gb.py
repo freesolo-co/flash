@@ -57,29 +57,29 @@ def test_catalog_min_disk_for_big_moe():
 
 def test_submit_raises_disk_to_model_min(monkeypatch):
     """submit_job (dry-run) bumps gpu.disk_gb to the catalog's min_disk_gb."""
-    from autoslm import orchestrator
-    from autoslm.worker_spec import JobSpec
+    from autoslm import runner
+    from autoslm.spec import JobSpec
 
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(orchestrator, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(
             {
                 "model": "Qwen/Qwen3.6-35B-A3B",
                 "algorithm": "sft",
-                "environment": {"id": "gsm8k"},
+                "environment": {"id": "primeintellect/gsm8k"},
                 "gpu": {"type": "RTX 5090", "disk_gb": 60},
             }
         )
-        status = orchestrator.submit_job(spec, dry_run=True)
+        status = runner.submit_job(spec, dry_run=True)
         assert status.spec["gpu"]["disk_gb"] == 160
         # explicit larger user value wins
         spec_big = JobSpec.from_dict(
             {
                 "model": "Qwen/Qwen3.6-35B-A3B",
                 "algorithm": "sft",
-                "environment": {"id": "gsm8k"},
+                "environment": {"id": "primeintellect/gsm8k"},
                 "gpu": {"type": "RTX 5090", "disk_gb": 200},
             }
         )
-        status = orchestrator.submit_job(spec_big, dry_run=True)
+        status = runner.submit_job(spec_big, dry_run=True)
         assert status.spec["gpu"]["disk_gb"] == 200

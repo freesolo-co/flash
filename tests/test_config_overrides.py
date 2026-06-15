@@ -13,8 +13,8 @@ import pytest
 BASE = (
     'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
     'algorithm = "grpo"\n'
-    '[environment]\nid = "gsm8k"\n'
-    "[train]\nsteps = 100\nseeds = [0]\n"
+    '[environment]\nid = "primeintellect/gsm8k"\n'
+    '[train]\nsteps = 100\nseeds = [0]\nhf_repo = "owner/runs"\n'
     '[gpu]\ntype = "RTX 5090"\n'
 )
 
@@ -27,7 +27,7 @@ def _write(tmp, name, text):
 
 
 def test_set_overrides_scalar_and_list():
-    from autoslm.config_schema import spec_from_file
+    from autoslm.schema import spec_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         cfg = _write(tmp, "c.toml", BASE)
@@ -40,7 +40,7 @@ def test_set_overrides_scalar_and_list():
 
 
 def test_composed_config_deep_merge():
-    from autoslm.config_schema import spec_from_file
+    from autoslm.schema import spec_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         base = _write(tmp, "base.toml", BASE)
@@ -48,11 +48,11 @@ def test_composed_config_deep_merge():
         spec = spec_from_file(base, run_id="x", extra_configs=[override])
         assert spec.train.steps == 250
         assert spec.gpu.type == "RTX 4090"
-        assert spec.environment.id == "gsm8k"  # untouched key preserved
+        assert spec.environment.id == "primeintellect/gsm8k"  # untouched key preserved
 
 
 def test_set_requires_key_value():
-    from autoslm.config_schema import ConfigError, spec_from_file
+    from autoslm.schema import ConfigError, spec_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         cfg = _write(tmp, "c.toml", BASE)

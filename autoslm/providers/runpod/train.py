@@ -21,7 +21,7 @@ from typing import Any
 from autoslm._logging import get_logger
 from autoslm.providers.base import canonical_gpu, gpu_short
 from autoslm.providers.runpod.gpus import flash_gpu
-from autoslm.worker_spec import JobSpec
+from autoslm.spec import JobSpec
 
 logger = get_logger(__name__)
 
@@ -103,8 +103,12 @@ DEFAULT_EXECUTION_TIMEOUT_MS = int(
 _ENDPOINT_CACHE: dict[str, Any] = {}
 
 
-def upload_code() -> str:
-    """Upload the ``autoslm`` package to ``HF_REPO``.
+def upload_code(repo: str | None = None) -> str:
+    """Upload the ``autoslm`` package to the run's HF artifact repo.
+
+    ``repo`` is the per-run artifact repo (``spec.train.hf_repo``); the worker fetches
+    ``code/**`` from the same repo it is given in the submit payload, so the code must land in
+    that per-run repo.
 
     The worker downloads ``code/**`` to ``/runcode``. Verifiers-only: there are no built-in
     example environments to ship — Hub/installed envs are pip-installed on the worker (see
@@ -118,9 +122,10 @@ def upload_code() -> str:
 
     import autoslm
 
-    repo = os.environ.get("HF_REPO")
     if not repo:
-        raise RuntimeError("HF_REPO must be set (HF dataset repo for code + artifacts)")
+        raise RuntimeError(
+            "hf_repo must be set (the run's [train] hf_repo: HF dataset repo for code + artifacts)"
+        )
     token = os.environ.get("HUGGINGFACE_TOKEN")
     pkg_dir = os.path.dirname(os.path.abspath(autoslm.__file__))
     api = HfApi(token=token)
@@ -144,6 +149,7 @@ def _train_body(input_data: dict) -> dict:
     import contextlib
     import json
     import os
+    import shutil
     import subprocess
     import sys
 
@@ -155,6 +161,27 @@ def _train_body(input_data: dict) -> dict:
         # check=True: a deterministic dependency failure should fail fast here,
         # not after model download + worker startup with a less actionable error.
         subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
+
+    # Install the run's verifiers environment(s) from the Prime Hub via the authenticated
+    # `prime` CLI. The public pip index does not serve PRIVATE env wheels, so a plain pip
+    # install can't fetch them; `prime env install` pulls/builds/installs public + private
+    # alike, authenticated by PRIME_API_KEY forwarded from the control plane.
+    hub_env_ids = input_data.get("hub_env_ids") or []
+    if hub_env_ids:
+        worker_env = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
+        prime_key = worker_env.get("PRIME_API_KEY") or os.environ.get("PRIME_API_KEY")
+        if not prime_key:
+            raise RuntimeError(
+                "PRIME_API_KEY is required to install the Prime Hub environment on the worker"
+            )
+        # Only install `prime` when it isn't already on the worker (it's often baked into
+        # the worker image) — an unconditional install adds latency and a per-run PyPI
+        # failure point every run.
+        if shutil.which("prime") is None:
+            subprocess.run([sys.executable, "-m", "pip", "install", "prime"], check=True)
+        install_env = {**os.environ, "PRIME_API_KEY": prime_key, "PRIME_DISABLE_VERSION_CHECK": "1"}
+        for env_id in hub_env_ids:
+            subprocess.run(["prime", "env", "install", env_id], check=True, env=install_env)
 
     overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
     snapshot_download(
@@ -569,12 +596,23 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
             else {}
         ),
     }
-    # HF artifact creds + optional reward-judge creds: a verifiers env whose rubric calls an
-    # LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER, where the
-    # reward runs. Forward any that the operator has set; absent ones are simply not passed.
-    for key in ("HF_REPO", "HUGGINGFACE_TOKEN", "OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+    # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub
+    # env(s), public + private) + optional reward-judge creds: a verifiers env whose rubric
+    # calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
+    # where the reward runs. Forward any that the operator has set; absent ones are simply
+    # not passed.
+    for key in (
+        "HUGGINGFACE_TOKEN",
+        "PRIME_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+    ):
         if os.environ.get(key):
             env[key] = os.environ[key]
+    # Seed the worker's own HF_REPO env from the run's [train] hf_repo (adapter/checkpoint/
+    # code storage + heartbeats). The worker reads HF_REPO from its own process env; that env
+    # is now sourced from the spec, not the operator's HF_REPO.
+    env["HF_REPO"] = spec.train.hf_repo
     # snapshot_download / from_pretrained / load_dataset / vLLM read HF_TOKEN, not
     # HUGGINGFACE_TOKEN, so private/gated model+data pulls need it under that name.
     if os.environ.get("HUGGINGFACE_TOKEN") and not env.get("HF_TOKEN"):
@@ -627,7 +665,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
 def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
     """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
-    from autoslm.envs.registry import worker_pip_for_env
+    from autoslm.envs.registry import worker_hub_env_ids, worker_pip_for_env
 
     handler = get_train_endpoint(
         spec.gpu.type,
@@ -637,13 +675,14 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         spec=spec,
     )
     payload = {
-        "hf_repo": os.environ.get("HF_REPO", ""),
+        "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
         "env": build_worker_env(spec, seed),
         "extra_pip": list(spec.environment.pip)
         or worker_pip_for_env(spec.environment.id, spec.environment.params),
+        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     if log is not None:
         print(

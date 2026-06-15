@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from autoslm.config_schema import ConfigError, spec_from_dict
-from autoslm.worker_spec import ALGORITHMS
+from autoslm.schema import ConfigError, spec_from_dict
+from autoslm.spec import ALGORITHMS
 
 
 def test_algorithms_registry():
@@ -23,7 +23,7 @@ def test_grpo_capability_still_enforced():
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "owner/env"},
-        "train": {"steps": 1},
+        "train": {"steps": 1, "hf_repo": "owner/runs"},
     }
     with pytest.raises(ConfigError):
         spec_from_dict(raw, run_id="x")
@@ -32,6 +32,6 @@ def test_grpo_capability_still_enforced():
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "owner/env"},
-        "train": {"epochs": 1},
+        "train": {"epochs": 1, "hf_repo": "owner/runs"},
     }
     assert spec_from_dict(raw_sft, run_id="x").algorithm == "sft"

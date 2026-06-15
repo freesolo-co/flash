@@ -13,7 +13,7 @@ sys.path.insert(0, ROOT)
 
 def _run(args, env=None):
     full_env = os.environ.copy()
-    full_env.pop("AUTOSLM_API_KEY", None)  # never let the host's login leak into tests
+    full_env.pop("FREESOLO_API_KEY", None)  # never let the host's login leak into tests
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -46,7 +46,10 @@ def test_bad_model_is_friendly():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
-            f.write('model = "Not/AReal-Model"\nalgorithm = "grpo"\n[environment]\nid = "gsm8k"\n')
+            f.write(
+                'model = "Not/AReal-Model"\nalgorithm = "grpo"\n'
+                '[environment]\nid = "primeintellect/gsm8k"\n'
+            )
         proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
     assert proc.returncode == 1
     assert proc.stderr.startswith("error:")
@@ -67,7 +70,7 @@ def test_train_without_login_fails_fast():
         with open(cfg, "w") as f:
             f.write(
                 'model = "Qwen/Qwen3-4B-Instruct-2507"\nalgorithm = "grpo"\n'
-                '[environment]\nid = "gsm8k"\n[train]\nsteps = 1\nseeds = [0]\n'
+                '[environment]\nid = "primeintellect/gsm8k"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
             )
         proc = _run(["train", cfg], env=_logged_out_env(tmp))
     assert proc.returncode == 1, proc.stdout + proc.stderr
@@ -96,7 +99,7 @@ def test_dry_run_needs_no_credentials_or_server():
         with open(cfg, "w") as f:
             f.write(
                 'model = "Qwen/Qwen3-4B-Instruct-2507"\nalgorithm = "grpo"\n'
-                '[environment]\nid = "gsm8k"\n[train]\nsteps = 1\nseeds = [0]\n'
+                '[environment]\nid = "primeintellect/gsm8k"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
             )
         proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
     assert proc.returncode == 0, proc.stdout + proc.stderr

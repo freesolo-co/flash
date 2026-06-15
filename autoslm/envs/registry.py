@@ -58,41 +58,26 @@ def _bare_wheel_name(env_ref: str) -> str:
 
 
 def worker_pip_for_env(env_id: str, params: dict | None = None) -> list[str]:
-    """Pip requirements the GPU worker needs to run ``env_id`` (a verifiers/Hub env).
+    """Pip deps the GPU worker needs to run ``env_id`` (a verifiers/Hub env): just ``verifiers``.
 
-    Always installs ``verifiers``; the env wheel is added only for an env RECORDED in the
-    local install manifest (``slm env install`` captures its package name and the Prime
-    Intellect ``extra_index_url``). An unrecorded Hub id ships ``verifiers`` only — to run a
-    published Hub env on the managed worker, ``slm env install`` it first (so the wheel +
-    index are known) or set ``[environment] pip`` explicitly. Also installs a separate
-    **eval** Hub env (``[environment.params] eval_env_id``, alias ``eval_env``) when
-    configured, and carries any recorded ``extra_index_url`` through to the worker's
-    ``pip install``.
+    The environment itself (and any separate eval env) is installed on the worker via the
+    authenticated ``prime env install`` (see :func:`worker_hub_env_ids`), not pip — the public
+    pip index does not serve private env wheels. Override with ``[environment] pip`` if a run
+    needs extra packages.
+    """
+    return ["verifiers"]
 
-    Managed runs must reference a published Hub ``id`` (the worker pip-installs the env wheel),
-    so ``slm env install`` the env first (so the wheel + index are known) or set
-    ``[environment] pip`` explicitly.
+
+def worker_hub_env_ids(env_id: str, params: dict | None = None) -> list[str]:
+    """The Prime Hub env ids the worker must ``prime env install`` for this run.
+
+    The training env plus a separate **eval** Hub env (``[environment.params] eval_env_id``,
+    alias ``eval_env``) when configured. ``prime env install`` is authenticated by
+    ``PRIME_API_KEY`` and installs public and private envs alike.
     """
     params = params or {}
-    manifest = load_installed_manifest()
-    refs = [env_id]
-    eval_ref = params.get("eval_env_id") or params.get("eval_env")
-    if eval_ref:
-        refs.append(str(eval_ref))
-    deps = ["verifiers"]
-    indexes: list[str] = []
-    for ref in refs:
-        entry = manifest.get(ref) or {}
-        pkg = entry.get("package") or (_bare_wheel_name(ref) if ref in manifest else None)
-        if pkg:
-            deps.append(pkg)
-        idx = entry.get("extra_index_url")
-        if idx and idx not in indexes:
-            indexes.append(idx)
-    out = list(dict.fromkeys(deps))  # dedupe, preserve order
-    for idx in indexes:
-        out += ["--extra-index-url", idx]
-    return out
+    ids = [env_id, params.get("eval_env_id") or params.get("eval_env")]
+    return list(dict.fromkeys(str(i) for i in ids if i))
 
 
 def load_environment(env_id: str, params: dict | None = None) -> Environment:
@@ -101,7 +86,7 @@ def load_environment(env_id: str, params: dict | None = None) -> Environment:
     ``env_id`` is resolved as an installed / Prime Hub verifiers env slug.
     """
     params = params or {}
-    from .verifiers_adapter import load_verifiers_environment
+    from .adapter import load_verifiers_environment
 
     if not env_id:
         raise ValueError(

@@ -45,10 +45,10 @@ def test_terminate_endpoint_never_raises_when_sdk_missing(monkeypatch):
 
 
 def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
-    import autoslm.orchestrator as orch
+    import autoslm.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.worker_spec import JobSpec
+    from autoslm.spec import JobSpec
 
     spec = JobSpec.from_dict(
         {
@@ -81,11 +81,11 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     # Cancelling a deployed run tears down its serve endpoint; the deployment record
     # must flip to "undeployed" so /v1/deployments and /chat stop treating the
     # cancelled run as active (and can't recreate the endpoint).
-    import autoslm.orchestrator as orch
+    import autoslm.runner as orch
     import autoslm.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.worker_spec import JobSpec
+    from autoslm.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-dep-1"})
     st = orch.RunStatus(
@@ -105,10 +105,10 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
 
 
 def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
-    import autoslm.orchestrator as orch
+    import autoslm.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.worker_spec import JobSpec
+    from autoslm.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-done-1"})
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="done", spec=spec.to_dict()))

@@ -2,7 +2,7 @@
 
 Stored in ``~/.autoslm/config.json`` (dir 0700, file 0600 — it holds a secret).
 Environment variables take precedence so CI/agents can inject credentials without
-touching the file: ``AUTOSLM_API_KEY`` for the key, ``AUTOSLM_API_URL`` for the URL.
+touching the file: ``FREESOLO_API_KEY`` for the key, ``AUTOSLM_API_URL`` for the URL.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def load_credentials() -> tuple[str, str | None]:
     """Resolve (api_url, api_key); the key is None when the user hasn't logged in."""
     cfg = _read_config()
     api_url = os.environ.get("AUTOSLM_API_URL") or cfg.get("api_url") or DEFAULT_API_URL
-    api_key = os.environ.get("AUTOSLM_API_KEY") or cfg.get("api_key")
+    api_key = os.environ.get("FREESOLO_API_KEY") or cfg.get("api_key")
     return api_url.rstrip("/"), api_key
 
 

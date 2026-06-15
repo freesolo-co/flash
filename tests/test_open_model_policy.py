@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from autoslm.catalog import resolve_model
-from autoslm.config_schema import ConfigError, spec_from_dict
 from autoslm.engine.vram import VramEstimate, check_fit, estimate_vram_gb
+from autoslm.schema import ConfigError, spec_from_dict
 
 
 def test_catalog_policy_rejects_unlisted_with_hint():
@@ -81,7 +81,7 @@ def _raw(model="Qwen/Qwen3-0.6B", **kw):
     d = {
         "model": model,
         "algorithm": "sft",
-        "train": {"epochs": 1},
+        "train": {"epochs": 1, "hf_repo": "owner/runs"},
         "environment": {"id": "owner/env"},  # any verifiers/Hub slug (not loaded here)
     }
     d.update(kw)

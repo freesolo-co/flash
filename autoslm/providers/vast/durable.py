@@ -208,17 +208,18 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
 def build_payload(spec, seed: int, attempt: int) -> dict:
     """The bootstrap's input — field-compatible with _train_body's, plus the bits the
     instance can't infer (HF prefix for markers, wall cap, attempt)."""
-    from autoslm.envs.registry import worker_pip_for_env
+    from autoslm.envs.registry import worker_hub_env_ids, worker_pip_for_env
     from autoslm.providers.runpod.train import build_worker_env
 
     return {
-        "hf_repo": os.environ.get("HF_REPO", ""),
+        "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
         "env": build_worker_env(spec, seed),
         "extra_pip": list(spec.environment.pip)
         or worker_pip_for_env(spec.environment.id, spec.environment.params),
+        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
         "hf_prefix": f"{spec.phase}/{spec.run_id}/seed{seed}",
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
         "attempt": int(attempt),
@@ -458,7 +459,7 @@ def poll_vast_job(
         if log is not None:
             print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=log, flush=True)
 
-    hf_repo = os.environ.get("HF_REPO", "")
+    hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     done_reader = _make_hf_file_reader(hf_repo, f"{prefix}/DONE")
     marker_reader = _make_hf_file_reader(
@@ -647,7 +648,7 @@ def submit_train_durable_vast(
     try:
         if on_handle is not None:
             on_handle(handle.to_dict())
-        hf_repo = os.environ.get("HF_REPO", "")
+        hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         stall = float(os.environ.get("AUTOSLM_STALL_AFTER_S", "1500"))

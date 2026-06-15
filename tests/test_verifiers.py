@@ -38,7 +38,7 @@ class _FakeVfEnv:
 
 
 def test_verifiers_adapter_mapping():
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
     assert env.id == "fake/env"
@@ -61,7 +61,7 @@ def test_verifiers_adapter_mapping():
 
 def test_eval_split_uses_eval_dataset_not_train():
     """A populated eval_dataset is returned for the eval split (not the train split)."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
     eval_rows = env.dataset("eval")
@@ -72,7 +72,7 @@ def test_empty_eval_dataset_does_not_fall_back_to_train():
     """An empty-but-configured eval split ([]) is honored as an empty eval set; it must NOT
     fall back to the TRAIN split (the `or` -> `is None` fix). Falling back would evaluate on
     training data."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     class _Env(_FakeVfEnv):
         def __init__(self):
@@ -87,7 +87,7 @@ def test_empty_eval_dataset_does_not_fall_back_to_train():
 def test_eval_get_eval_dataset_empty_does_not_fall_back():
     """An empty list from get_eval_dataset() (not the attr) is likewise honored as empty and
     must not fall through to get_dataset/train."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     class _Env:
         rubric = None
@@ -106,7 +106,7 @@ def test_eval_get_eval_dataset_empty_does_not_fall_back():
 def test_missing_eval_dataset_falls_back_to_train():
     """When NO eval split is configured at all (genuinely absent / None), the eval split falls
     back to the env's train split — the only legitimate fallback case."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     class _Env:
         rubric = None
@@ -126,17 +126,17 @@ def test_install_manifest_and_worker_deps():
         import autoslm.envs.registry as registry
 
         importlib.reload(registry)
-        # An unrecorded env (no manifest entry) ships verifiers only — install it with
-        # `slm env install` (or set [environment] pip) so the worker gets the env wheel.
+        # The worker only pip-installs `verifiers`; the env itself is installed via the
+        # authenticated `prime env install` (see worker_hub_env_ids), not pip.
         assert registry.worker_pip_for_env("owner/env") == ["verifiers"]
-        assert registry.list_installed_verifiers_envs() == []
-
-        registry.record_installed_env("owner/math", package="vf-math")
-        assert "owner/math" in registry.list_installed_verifiers_envs()
-        assert registry.worker_pip_for_env("owner/math") == ["verifiers", "vf-math"]
-
-        # An unrecorded Hub slug: no wheel is guessed from the slug; just verifiers.
-        assert registry.worker_pip_for_env("owner/never-installed") == ["verifiers"]
+        assert registry.worker_hub_env_ids("owner/env") == ["owner/env"]
+        # A separate eval Hub env is also prime-installed.
+        assert registry.worker_hub_env_ids("owner/train", {"eval_env_id": "owner/eval"}) == [
+            "owner/train",
+            "owner/eval",
+        ]
+        # The train env doubling as the eval env is installed once.
+        assert registry.worker_hub_env_ids("owner/x", {"eval_env": "owner/x"}) == ["owner/x"]
 
         os.environ.pop("AUTOSLM_ENVS_MANIFEST", None)
         importlib.reload(registry)
@@ -148,7 +148,7 @@ def test_install_manifest_and_worker_deps():
 def test_vf_load_id_strips_owner_slug():
     """DEFECT: the adapter passed the full ``owner/name`` slug to verifiers, which only
     resolves the bare env id."""
-    from autoslm.envs.verifiers_adapter import vf_load_id
+    from autoslm.envs.adapter import vf_load_id
 
     assert vf_load_id("primeintellect/hendrycks-math") == "hendrycks-math"
     assert vf_load_id("math500") == "math500"  # already bare -> unchanged
@@ -159,7 +159,7 @@ def test_load_verifiers_environment_uses_bare_ids(monkeypatch):
     import sys
     import types as _types
 
-    from autoslm.envs import verifiers_adapter as va
+    from autoslm.envs import adapter as va
 
     seen = []
 
@@ -178,7 +178,7 @@ def test_load_verifiers_environment_uses_bare_ids(monkeypatch):
 def test_rubric_group_is_flattened_and_zero_weight_skipped():
     """DEFECT: a RubricGroup's top-level funcs is empty, so reward was always 0; and a
     zero-weight monitor func (e.g. num_turns) crashed on missing state."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment, _flatten_rubric
+    from autoslm.envs.adapter import VerifiersEnvironment, _flatten_rubric
 
     def correct(completion, answer):
         return 1.0 if str(answer) in completion[-1]["content"] else 0.0
@@ -211,7 +211,7 @@ def test_reward_from_weighted_func_propagates_exception():
     0.0 — a raise in a weighted func is a real reward failure (e.g. judge API error) that would
     otherwise train/score on an all-zero signal. (Zero-weight funcs run with guarded exceptions
     instead — see test_reward_zero_weight_crashing_func_runs_with_guarded_exception.)"""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     def boom(**kwargs):
         raise RuntimeError("kaboom")
@@ -233,7 +233,7 @@ def test_reward_zero_weight_crashing_func_runs_with_guarded_exception():
     """Per verifiers semantics a zero-weight monitor func RUNS (it may mutate shared state /
     be logged), but its exceptions are GUARDED (swallowed) — a thrown monitor must not fail the
     run — and it contributes 0 to the reward."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     calls = []
 
@@ -261,7 +261,7 @@ def test_reward_zero_weight_crashing_func_runs_with_guarded_exception():
 def test_zero_weight_func_runs_and_can_mutate_shared_state():
     """A zero-weight func runs BEFORE a later weighted func and may set shared ``state`` the
     weighted func then reads. It still contributes 0 itself and is absent from the breakdown."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     def monitor(state, **kwargs):  # zero-weight: seeds shared state, returns nothing useful
         state["seen"] = True
@@ -290,7 +290,7 @@ def test_reward_available_uses_state_transcript_in_multi_turn():
     """In multi-turn mode, `completion`/`prompt` passed to reward funcs come from the
     accumulated `state` transcript (full message list), not the scalar completion wrapped as a
     lone assistant message. Single-turn keeps the scalar-wrapping behavior."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     class _Env:
         rubric = None
@@ -327,7 +327,7 @@ def test_reward_available_uses_state_transcript_in_multi_turn():
 def test_group_reward_func_is_rejected_at_construction():
     """A weighted group/batch reward func (plural required arg the single-turn worker
     can't supply) must fail fast, not silently score 0.0 on a paid run."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     def group_reward(completions, answers):  # plural batch args — unsupported
         return [1.0 for _ in completions]
@@ -358,7 +358,7 @@ def test_group_reward_func_is_rejected_at_construction():
 def test_reward_parses_json_string_info():
     """A Hub row may store `info` as a JSON string; reward funcs that index it must
     receive a dict, not raise TypeError (swallowed as 0.0)."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     def uses_info(completion, info):
         return 1.0 if info.get("want") == "yes" else 0.0
@@ -383,7 +383,7 @@ def test_reward_parses_json_string_info():
 def test_dataset_getter_requiring_args_is_called_correctly():
     """A Hub env exposing get_dataset(n, seed) without defaults must be called with
     those args, not no-arg (which raised TypeError -> swallowed -> empty train set)."""
-    from autoslm.envs.verifiers_adapter import VerifiersEnvironment
+    from autoslm.envs.adapter import VerifiersEnvironment
 
     rows = [{"prompt": [{"role": "user", "content": "q"}], "answer": "a"}]
 
@@ -402,25 +402,12 @@ def test_dataset_getter_requiring_args_is_called_correctly():
     assert train[0]["answer"] == "a"
 
 
-def test_worker_pip_installs_env_wheel_with_index():
-    """The Flash worker must install verifiers + the Hub env wheel + the recorded index."""
-    with tempfile.TemporaryDirectory() as tmp:
-        os.environ["AUTOSLM_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
-        import autoslm.envs.registry as registry
+def test_worker_installs_env_via_prime():
+    """The Flash worker pip-installs only verifiers; the Hub env installs via `prime`."""
+    import autoslm.envs.registry as registry
 
-        importlib.reload(registry)
-        idx = "https://hub.primeintellect.ai/primeintellect/simple/"
-        registry.record_installed_env(
-            "primeintellect/hendrycks-math",
-            package="hendrycks-math",
-            extras={"extra_index_url": idx},
-        )
-
-        deps = registry.worker_pip_for_env("primeintellect/hendrycks-math")
-        assert "verifiers" in deps
-        assert "hendrycks-math" in deps
-        assert "--extra-index-url" in deps
-        assert idx in deps
-
-        os.environ.pop("AUTOSLM_ENVS_MANIFEST", None)
-        importlib.reload(registry)
+    assert registry.worker_pip_for_env("primeintellect/hendrycks-math") == ["verifiers"]
+    # The env id is handed to the worker to `prime env install` (authenticated, public+private).
+    assert registry.worker_hub_env_ids("primeintellect/hendrycks-math") == [
+        "primeintellect/hendrycks-math"
+    ]

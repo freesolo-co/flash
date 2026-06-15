@@ -19,12 +19,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 
 def _spec():
-    from autoslm.worker_spec import JobSpec, TrainSpec
+    from autoslm.spec import JobSpec, TrainSpec
 
     return JobSpec(
         model="Qwen/Qwen3-4B-Instruct-2507",
         algorithm="grpo",
-        train=TrainSpec(steps=10, seeds=(0,)),
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
     )
 
 
@@ -61,6 +61,37 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
 
 
+def test_build_worker_env_forwards_prime_api_key(monkeypatch):
+    """The worker needs PRIME_API_KEY to `prime env install` the run's Hub env(s)."""
+    from autoslm.flash.train import build_worker_env
+
+    monkeypatch.setenv("PRIME_API_KEY", "pit-secret")
+    assert build_worker_env(_spec(), 0).get("PRIME_API_KEY") == "pit-secret"
+    monkeypatch.delenv("PRIME_API_KEY", raising=False)
+    assert "PRIME_API_KEY" not in build_worker_env(_spec(), 0)
+
+
+def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
+    """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
+    HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
+    ignored — the worker reads its own seeded value, sourced from the spec."""
+    from autoslm.flash.train import build_worker_env
+
+    from autoslm.spec import JobSpec, TrainSpec
+
+    # an operator HF_REPO in the env must NOT leak into the worker env
+    monkeypatch.setenv("HF_REPO", "operator/default")
+    per_run = JobSpec(
+        model="Qwen/Qwen3-4B-Instruct-2507",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="myorg/runs"),
+    )
+    assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
+    # still the per-run value even with no operator HF_REPO at all
+    monkeypatch.delenv("HF_REPO", raising=False)
+    assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
+
+
 def test_alloc_conf_default_avoids_expandable_under_grpo_sleep(monkeypatch):
     # vLLM sleep-mode CuMemAllocator is incompatible with expandable_segments; GRPO with sleep
     # ON (the default) must NOT default to expandable_segments or the run crashes at engine init.
@@ -87,7 +118,7 @@ def test_alloc_conf_default_expandable_when_sleep_off(monkeypatch):
 def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     from autoslm.flash.train import build_worker_env
 
-    from autoslm.worker_spec import JobSpec, TrainSpec
+    from autoslm.spec import JobSpec, TrainSpec
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -152,9 +183,26 @@ def test_train_body_imports_every_name_it_uses():
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in node.names
     }
-    # Names that must be locally imported (regression: contextlib was missing).
-    for name in ("contextlib", "json", "os", "subprocess", "sys"):
+    # Names that must be locally imported (regression: contextlib was missing). shutil is used
+    # to gate the conditional `prime` install, so it must also be imported locally.
+    for name in ("contextlib", "json", "os", "shutil", "subprocess", "sys"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
+
+
+def test_train_body_installs_prime_only_when_absent():
+    """`prime` is often baked into the worker image; an unconditional `pip install prime`
+    every run adds latency + a per-run PyPI failure point. The handler must guard the install
+    behind `shutil.which("prime") is None`."""
+    import inspect
+
+    from autoslm.flash import train
+
+    src = inspect.getsource(train._train_body)
+    assert 'shutil.which("prime")' in src
+    # The pip install of `prime` must be conditional, not at module/handler top level.
+    install_idx = src.index('"install", "prime"')
+    guard_idx = src.index('shutil.which("prime") is None')
+    assert guard_idx < install_idx, "the prime install must be gated by the which() check"
 
 
 def test_flash_dotted_and_from_imports_both_work():
