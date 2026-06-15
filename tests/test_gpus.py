@@ -137,14 +137,6 @@ def test_flash_gpu_enum_members():
     assert flash_gpu("4090").name == "NVIDIA_GEFORCE_RTX_4090"
 
 
-def test_gpu_for_model_thresholds():
-    from autoslm.flash.gpus import gpu_for_model
-
-    # >=32GB catalog models -> 5090; smaller -> 4090
-    assert gpu_for_model("Qwen/Qwen3.5-9B") == "RTX 5090"
-    assert gpu_for_model("Qwen/Qwen3.5-2B") == "RTX 4090"
-
-
 def test_gpu_short():
     from autoslm.flash.gpus import gpu_short
 

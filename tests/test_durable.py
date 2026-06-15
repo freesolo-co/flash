@@ -223,6 +223,189 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
         assert orch.get_status("fail-fast").state == "failed"
 
 
+def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
+    # A policy ("cheapest") request that keeps hitting infra-shaped failures must walk
+    # down the ranked candidate list, not burn every retry on the same (capacity-starved)
+    # class. With static rates the validated pool for a 0.6B GRPO run ranks
+    # A5000 < RTX 4090 < RTX 5090 by $/hr, so successive attempts step through them.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import autoslm.flash.durable as durable
+        import autoslm.flash.pricing as pricing
+        import autoslm.flash.train as flash_train
+        from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
+
+        # Force the deterministic static ranking (no live pricing fetch) and the
+        # validated-only pool, so a stray AUTOSLM_GPU_ALLOW_UNVALIDATED in the dev's
+        # environment can't add cheaper unvalidated cards and reorder the walk.
+        monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            if attempt < 2:
+                return durable.PollResult(False, failure="stalled", detail="frozen")
+            return durable.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="walk",
+            model="Qwen/Qwen3-0.6B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", requested="cheapest", max_retries=2),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("walk").state == "done"
+        # Three attempts, three distinct classes, each at least as expensive as the last.
+        assert len(gpus_seen) == 3
+        assert len(set(gpus_seen)) == 3
+        from autoslm.flash.pricing import hourly_rate
+
+        rates = [hourly_rate(g) for g in gpus_seen]
+        assert rates == sorted(rates)
+        assert gpus_seen[0] == "RTX A5000"  # cheapest validated class with >= 12 GB
+
+
+def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
+    # A concrete pin yields a single candidate, so infra retries stay on that class
+    # (offset clamps) — the walk must not silently move a pinned run to another card.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import autoslm.flash.durable as durable
+        import autoslm.flash.pricing as pricing
+        import autoslm.flash.train as flash_train
+        from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            if attempt < 2:
+                return durable.PollResult(False, failure="stalled", detail="frozen")
+            return durable.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="pinned",
+            model="Qwen/Qwen3-0.6B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="RTX 4090", requested="RTX 4090", max_retries=2),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("pinned").state == "done"
+        assert gpus_seen == ["RTX 4090", "RTX 4090", "RTX 4090"]
+
+
+def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
+    # An allocation/pricing failure must NOT advance the candidate walk: that attempt never
+    # provisioned a class, so the retry has to start over from the cheapest, not a pricier
+    # one. (Regression guard for the walk-offset-vs-attempt-counter bug.)
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import autoslm.flash.durable as durable
+        import autoslm.flash.pricing as pricing
+        import autoslm.flash.train as flash_train
+        import autoslm.providers.allocator as allocator
+        from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+
+        real_allocate = allocator.allocate
+        alloc_calls = {"n": 0}
+
+        def flaky_allocate(*a, **k):
+            alloc_calls["n"] += 1
+            if alloc_calls["n"] == 1:
+                raise RuntimeError("pricing API blip")  # not Unsupported -> infra-shaped retry
+            return real_allocate(*a, **k)
+
+        monkeypatch.setattr(allocator, "allocate", flaky_allocate)
+
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            return durable.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="alloc-blip",
+            model="Qwen/Qwen3-0.6B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", requested="cheapest", max_retries=2),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("alloc-blip").state == "done"
+        # First allocation failed (no provision); the retry provisioned the cheapest class.
+        assert gpus_seen == ["RTX A5000"]
+
+
+def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
+    # A policy run that walked to a pricier class persists that class in the handle, so a
+    # recovery via attach_run costs the card it actually ran on, not the provisional one.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import autoslm.flash.durable as durable
+        import autoslm.flash.pricing as pricing
+        import autoslm.flash.train as flash_train
+
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+        status = orch.RunStatus(
+            run_id="walked",
+            state="running",
+            spec=_spec("walked").to_dict(),  # provisional spec.gpu.type == "RTX 4090"
+            remote={
+                "endpoint_id": "epW",
+                "endpoint_name": "n",
+                "job_id": "jW",
+                "allocated_gpu": "RTX 5090",
+            },
+        )
+        orch._save_status(status)
+        # Worker output carries wall time but neither cost nor allocated_gpu (the in-process
+        # success path that stamps allocated_gpu is bypassed on recovery).
+        monkeypatch.setattr(
+            durable,
+            "poll_job",
+            lambda *a, **k: durable.PollResult(True, metrics={"wall_seconds": 3600.0}),
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        st = orch.attach_run("walked", log_stream=sys.stderr)
+
+        assert st.state == "done"
+        from autoslm.flash.pricing import hourly_rate
+
+        # ~1 GPU-hour on the walked 5090, not the cheaper provisional 4090.
+        assert abs(st.cost_usd - hourly_rate("RTX 5090")) < 1e-6
+        assert st.cost_usd > hourly_rate("RTX 4090")
+
+
 # ---------------------------------------------------------------------------
 # Cross-process cancel via REST handle + attach
 # ---------------------------------------------------------------------------
