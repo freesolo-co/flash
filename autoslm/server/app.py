@@ -96,6 +96,7 @@ def recover_runs(log=None) -> None:
     """Re-attach to in-flight runs after a server restart (per-run daemon threads)."""
     from autoslm.orchestrator import _gc_run_endpoints, _update, attach_run, resume_run
 
+    active: set[str] = set()
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
@@ -104,22 +105,39 @@ def recover_runs(log=None) -> None:
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
-            # Only remote-backed runs are recoverable; a run with no handle is failed below.
+            # Only remote-backed runs are "active" (kept by the orphan sweep). A run
+            # with no handle is being failed below; if it had already rented a Vast
+            # instance (crash between rent and on_handle), it must NOT shield that
+            # instance from the sweep.
+            active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
         elif status.resume_seed_index is not None:
             # Multi-seed run that restarted in the inter-seed gap: the completed seed's
             # handle was deliberately cleared and the next index recorded. There is no
             # live job to reattach to, so resume the remaining seeds rather than failing
-            # the run and discarding the already-completed work.
+            # the run and discarding the already-completed work. Keep it in `active` so
+            # the orphan sweep below doesn't reap the label its next seed will reuse.
+            active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
             # The first attempt may have registered its uniquely-named RunPod
             # endpoint before on_handle() persisted the handle. GC it (by
             # reconstructed name) before failing, so it doesn't hold worker quota
-            # until manual cleanup. Best-effort.
+            # until manual cleanup. Best-effort; vast orphans are swept below.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(JobSpec.from_dict(status.spec))
             _update(status.run_id, "failed", error="server restarted before job submission")
+    # Standing per-run billing (Vast instances) survives a crash until destroyed:
+    # anything labeled ours that no recoverable run owns is an orphan. Each available
+    # provider's ``sweep_orphans`` hook reaps its own (RunPod's is a no-op). Dispatched
+    # generically through the registry — ``sweep_orphans`` is part of base.Provider, so
+    # no provider is special-cased. ``active`` carries raw run ids; each provider applies
+    # its own label-prefix transform. Best-effort: never raises.
+    from autoslm.providers import configured_providers
+
+    for prov in configured_providers():
+        with contextlib.suppress(Exception):
+            prov.sweep_orphans(active_labels=active)
 
 
 def create_app():

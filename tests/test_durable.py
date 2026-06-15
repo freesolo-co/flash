@@ -25,7 +25,6 @@ def test_job_handle_roundtrip():
 
 def test_decode_output_success():
     import cloudpickle
-
     from autoslm.flash.durable import decode_output
 
     metrics = {"trained_eval_acc": 0.9, "cost_usd": 0.5}
@@ -233,6 +232,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         import autoslm.flash.durable as durable
         import autoslm.flash.pricing as pricing
         import autoslm.flash.train as flash_train
+
         from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
 
         # Force the deterministic static ranking (no live pricing fetch) and the
@@ -283,6 +283,7 @@ def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
         import autoslm.flash.durable as durable
         import autoslm.flash.pricing as pricing
         import autoslm.flash.train as flash_train
+
         from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
 
         monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
@@ -323,6 +324,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         import autoslm.flash.durable as durable
         import autoslm.flash.pricing as pricing
         import autoslm.flash.train as flash_train
+
         import autoslm.providers.allocator as allocator
         from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
 
@@ -430,7 +432,11 @@ def test_cancel_uses_rest_handle(monkeypatch):
         st = orch.cancel_run("c1")
         assert st.state == "cancelled"
         assert cancelled == [("epX", "jX")]
-        assert deleted == ["epX"]
+        # cancel_run now also destroys the handle's endpoint for cost-safety symmetry
+        # with vast (idempotent); the GC backstop may delete it again — endpoint id
+        # was torn down, which is what matters.
+        assert deleted
+        assert all(e == "epX" for e in deleted)
 
 
 def test_attach_completes_run(monkeypatch):
@@ -465,6 +471,7 @@ def test_attach_clears_stale_handle_before_resuming_seeds(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import autoslm.flash.durable as durable
         import autoslm.flash.train as flash_train
+
         from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
 
         spec = JobSpec(

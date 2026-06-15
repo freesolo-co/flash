@@ -1,0 +1,114 @@
+"""RunPod Flash provider: managed, serverless GPUs (no Docker) for AutoSLM.
+
+Fine-tuning runs on a dedicated RunPod GPU provisioned by Flash. A decorated Python
+handler (``train._train_body``) executes ``autoslm.engine.worker`` on the GPU; Flash
+handles provisioning, dependency install, execution, and scale-to-zero teardown.
+Serving exposes an OpenAI-compatible endpoint for a trained LoRA adapter.
+
+``PROVIDER`` is the ``base.Provider`` implementation the registry hands out; the
+orchestrator/allocator only talk to its interface, never these modules directly.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from autoslm.providers.base import GpuClass, JobHandle, PollResult, Provider
+
+
+class RunpodProvider:
+    """``base.Provider`` for the RunPod Flash substrate."""
+
+    name = "runpod"
+
+    def is_configured(self) -> bool:
+        # RunPod is the ALWAYS-ON default substrate, so it is always "available" for
+        # allocation (offline pricing degrades to the static snapshot, and a missing
+        # RUNPOD_API_KEY surfaces at provision time via ensure_auth / the preflight —
+        # never as a silent empty candidate list). This matches the historical
+        # ``available_providers()`` which listed runpod unconditionally.
+        return True
+
+    def preflight(self, require_hf: bool = True) -> list[str]:
+        from autoslm.providers.runpod.preflight import missing_credentials
+
+        return missing_credentials(require_hf=require_hf)
+
+    def gpu_classes(self) -> list[GpuClass]:
+        from autoslm.providers.runpod.gpus import gpu_classes
+
+        return gpu_classes()
+
+    def hourly_rate(self, gpu: str) -> float:
+        from autoslm.providers.runpod.pricing import hourly_rate
+
+        return hourly_rate(gpu)
+
+    def submit_train_durable(
+        self,
+        spec,
+        seed: int,
+        *,
+        log: Any = None,
+        on_handle: Any = None,
+        attempt: int = 0,
+        offers: Any = None,
+        exclude_machine_ids: Any = frozenset(),
+    ) -> PollResult:
+        # ``offers``/``exclude_machine_ids`` are Vast live-market concerns; RunPod
+        # provisions a fresh serverless endpoint and never re-searches a market, so it
+        # ignores both (kept in the signature for cross-provider symmetry).
+        from autoslm.providers.runpod.durable import submit_train_durable
+
+        return submit_train_durable(spec, seed, log=log, on_handle=on_handle, attempt=attempt)
+
+    def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
+        from autoslm.providers.runpod.durable import JobHandle as RunpodJobHandle
+        from autoslm.providers.runpod.durable import make_hf_heartbeat_reader, poll_job
+
+        hf_repo = os.environ.get("HF_REPO", "")
+        prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+        reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
+        rh = RunpodJobHandle.from_dict(handle.to_dict())
+        if log is not None:
+            print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
+        return poll_job(rh, log=log, heartbeat_reader=reader)
+
+    def cancel(self, handle: JobHandle) -> None:
+        from autoslm.providers.runpod import api as runpod_api
+
+        d = handle.to_dict()
+        if d.get("endpoint_id") and d.get("job_id"):
+            runpod_api.cancel_job(d["endpoint_id"], d["job_id"])
+
+    def destroy(self, handle: JobHandle) -> None:
+        from autoslm.providers.runpod import api as runpod_api
+
+        d = handle.to_dict()
+        if d.get("endpoint_id"):
+            runpod_api.delete_endpoint(d["endpoint_id"])
+
+    def gc(self, spec) -> None:
+        from autoslm.providers.runpod.train import terminate_endpoint
+
+        terminate_endpoint(spec.gpu.type, spec.run_id)
+
+    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
+        # No-op: RunPod serverless endpoints have no standing per-run billing to reap on
+        # crash recovery (a failed-before-submit endpoint is GC'd by reconstructed name in
+        # recover_runs). Present for ``base.Provider`` symmetry with Vast's instance sweep.
+        return []
+
+    def deploy_serve(self, *args: Any, **kwargs: Any) -> Any:
+        from autoslm.serve.deploy import deploy_adapter
+
+        return deploy_adapter(*args, **kwargs)
+
+    def undeploy_serve(self, *args: Any, **kwargs: Any) -> Any:
+        from autoslm.serve.deploy import undeploy_adapter
+
+        return undeploy_adapter(*args, **kwargs)
+
+
+PROVIDER: Provider = RunpodProvider()

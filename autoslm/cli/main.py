@@ -323,25 +323,40 @@ def cmd_models(args) -> int:
 def cmd_gpus(args) -> int:
     """List GPU classes, VRAM, per-provider $/hr and validation (live unless --offline)."""
     import os as _os
+    import sys
 
-    from autoslm.flash.gpus import GPU_INFO
-    from autoslm.flash.pricing import live_rates
+    from autoslm.providers import available_providers
+    from autoslm.providers.base import GPU_INFO
+    from autoslm.providers.runpod.pricing import live_rates
 
     if args.offline:
         _os.environ["AUTOSLM_SKIP_NET"] = "1"
     rates = live_rates()
+    # Cheapest live verified-datacenter offer per class (vast key + network only).
+    vast_rates: dict[str, float] = {}
+    if "vast" in available_providers():
+        try:
+            from autoslm.providers.vast.durable import usable_offers
+
+            for offer in usable_offers(0, 0):
+                vast_rates.setdefault(offer.gpu, offer.dph_total)  # offers are price-sorted
+        except Exception as exc:
+            print(f"warning: vast offers unavailable ({exc})", file=sys.stderr)
 
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
-    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}  validated_on")
+    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}  validated_on")
     for info in sorted(GPU_INFO.values(), key=lambda g: rates.get(g.name, g.hourly_usd)):
         runpod_rate = rates.get(info.name, info.hourly_usd) if info.enum_member else None
         validated = ",".join(info.validated_on) or "- (needs gpu.allow_unvalidated)"
-        print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}  {validated}")
+        print(
+            f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}"
+            f"{fmt_rate(vast_rates.get(info.name))}  {validated}"
+        )
     print(
         '\nTip: omit gpu.type (or set "cheapest") to allocate the cheapest validated class\n'
-        "that fits the model."
+        "across providers that fits the model; gpu.provider pins runpod/vast."
     )
     return 0
 

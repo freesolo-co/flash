@@ -1,5 +1,10 @@
-"""Orchestrator routing: RunPod submit/cancel/attach, retry/failover, handle
-persistence, cost flow, and config provider fields (all mocked)."""
+"""Orchestrator provider routing: vast vs runpod submit/cancel/attach, cross-provider
+failover, handle persistence, cost flow, and config provider fields (all mocked).
+
+Everything dispatches through the ``base.Provider`` interface (the registry), so these
+tests patch the provider's durable functions / api modules — the same objects the
+provider methods import lazily — rather than any hardcoded orchestrator branch.
+"""
 
 from __future__ import annotations
 
@@ -24,24 +29,49 @@ def _spec(run_id="autoslm-1700000001-rt01", **gpu_kw) -> JobSpec:
     )
 
 
-def _alloc(provider="runpod", gpu="RTX A5000", rate=0.27):
-    from autoslm.providers.allocator import Allocation, Candidate
+def _offer_obj(offer_id=5, machine_id=2, gpu="RTX 3090", dph=0.25):
+    from autoslm.providers.vast.durable import VastOffer
 
-    cand = Candidate(provider, gpu, rate, 24, True)
+    return VastOffer(
+        offer_id=offer_id,
+        machine_id=machine_id,
+        gpu=gpu,
+        vram_gb=24,
+        dph_total=dph,
+        cuda_max_good=12.8,
+        disk_space=200.0,
+        reliability=0.99,
+        inet_down=5000.0,
+        geolocation="CZ",
+    )
+
+
+def _alloc(provider="vast", gpu="RTX 3090", rate=0.25, offer=None, provider_offers=()):
+    from autoslm.providers.base import Allocation, Candidate
+
+    cand = Candidate(provider, gpu, rate, 24, True, offer=offer)
     return Allocation(
         provider=provider,
         gpu=gpu,
         hourly_usd=rate,
         min_vram_gb=12,
+        offer=offer,
         candidates=(cand,),
+        provider_offers=tuple(provider_offers),
     )
 
 
-def _handle_dict(endpoint_id="ep1", job_id="j1"):
+def _vast_handle_dict(instance_id=1, machine_id=2):
     return {
-        "endpoint_id": endpoint_id,
-        "endpoint_name": "autoslm-a5000-x",
-        "job_id": job_id,
+        "provider": "vast",
+        "instance_id": instance_id,
+        "offer_id": 5,
+        "machine_id": machine_id,
+        "label": "autoslm-x-s0-a0",
+        "gpu": "RTX 3090",
+        "hourly_usd": 0.25,
+        "attempt": 0,
+        "started_ts": 0.0,
     }
 
 
@@ -61,79 +91,137 @@ def _seed_status(orch, spec):
     return st
 
 
-def test_allocation_routes_to_runpod_runner(orch, monkeypatch):
-    import autoslm.flash.durable as durable
-    from autoslm.flash.durable import PollResult
+def test_vast_allocation_routes_to_vast_runner(orch, monkeypatch):
     from autoslm.providers import allocator
+    from autoslm.providers.base import PollResult
+    from autoslm.providers.vast import durable as vast_durable
 
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(gpu="RTX 3090", rate=0.46))
+    offer = _offer_obj()
+    monkeypatch.setattr(
+        allocator, "allocate", lambda *a, **k: _alloc(offer=offer, provider_offers=[offer])
+    )
     captured = {}
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0):
+    def fake_vast_submit(
+        run_spec,
+        seed,
+        log=None,
+        on_handle=None,
+        attempt=0,
+        offers=None,
+        exclude_machine_ids=frozenset(),
+    ):
         captured["gpu_type"] = run_spec.gpu.type
-        on_handle(_handle_dict())
-        return PollResult(True, metrics={"train_tokens": 4096})
+        captured["offers"] = offers
+        on_handle(_vast_handle_dict())
+        return PollResult(
+            True,
+            metrics={"train_tokens": 4096, "cost_usd": 0.123, "notes": {"provider": "vast"}},
+        )
 
-    monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
+    monkeypatch.setattr(vast_durable, "submit_train_durable_vast", fake_vast_submit)
     spec = _spec()
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert metrics["train_tokens"] == 4096
+    assert metrics["cost_usd"] == 0.123
     # the attempt ran with the ALLOCATED class, not the parse-time provisional
     assert captured["gpu_type"] == "RTX 3090"
+    assert [o.offer_id for o in captured["offers"]] == [5]
     # handle persisted for cross-process cancel/attach
-    assert orch.get_status(spec.run_id).remote["endpoint_id"] == "ep1"
+    assert orch.get_status(spec.run_id).remote["provider"] == "vast"
 
 
-def test_runpod_cost_projection(orch, monkeypatch):
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+def test_vast_cost_flows_into_run_status(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
-    cost = orch._persist_metrics(spec, 0, {"train_tokens": 4096, "cost_usd": 0.2})
-    assert cost == 0.2  # an explicit cost short-circuits the projection
+    cost = orch._persist_metrics(
+        spec, 0, {"train_tokens": 4096, "cost_usd": 0.2, "notes": {"provider": "vast"}}
+    )
+    assert cost == 0.2  # the stamped vast cost short-circuits the runpod projection
 
 
-def test_failover_retries_on_fresh_endpoint(orch, monkeypatch):
-    import autoslm.flash.durable as durable
-    from autoslm.flash import runpod_api
-    from autoslm.flash.durable import PollResult
+def test_failover_crosses_providers_and_blacklists_machine(orch, monkeypatch):
     from autoslm.providers import allocator
+    from autoslm.providers.base import PollResult
+    from autoslm.providers.runpod import durable as rp_durable
+    from autoslm.providers.vast import api as vast_api
+    from autoslm.providers.vast import durable as vast_durable
 
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
-    deleted = []
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a: None)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e))
-    calls = []
+    offer = _offer_obj(machine_id=42)
+    allocate_calls = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0):
-        calls.append(attempt)
-        on_handle(_handle_dict(endpoint_id=f"ep{attempt}"))
-        if attempt == 0:
-            return PollResult(False, failure="stalled", detail="no worker progress")
-        return PollResult(True, metrics={"train_tokens": 4096})
+    def fake_allocate(model, algorithm, **kw):
+        allocate_calls.append(kw["exclude_machine_ids"])
+        if not kw["exclude_machine_ids"]:
+            return _alloc(offer=offer, provider_offers=[offer])
+        return _alloc(provider="runpod", gpu="RTX A5000", rate=0.27)
 
-    monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
+    monkeypatch.setattr(allocator, "allocate", fake_allocate)
+
+    submit_excludes = []
+
+    def fake_vast_submit(
+        run_spec,
+        seed,
+        log=None,
+        on_handle=None,
+        attempt=0,
+        offers=None,
+        exclude_machine_ids=frozenset(),
+    ):
+        submit_excludes.append(exclude_machine_ids)
+        on_handle(_vast_handle_dict(instance_id=77, machine_id=42))
+        return PollResult(False, failure="stalled", detail="no worker progress")
+
+    monkeypatch.setattr(vast_durable, "submit_train_durable_vast", fake_vast_submit)
+    destroyed = []
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
+    monkeypatch.setattr(
+        rp_durable,
+        "submit_train_durable",
+        lambda spec, seed, log=None, on_handle=None, attempt=0: PollResult(
+            True, metrics={"train_tokens": 4096}
+        ),
+    )
     spec = _spec()
     _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, 0, log)
     assert metrics["train_tokens"] == 4096
-    assert calls == [0, 1]  # the stalled attempt was retried on a fresh endpoint
-    assert "ep0" in deleted  # the stalled endpoint was torn down before retry
+    # the stalled attempt's instance was torn down and its machine blacklisted
+    assert destroyed == [77]
+    assert allocate_calls[0] == frozenset()
+    assert allocate_calls[1] == frozenset({42})
+    assert "blacklisted" in log.getvalue()
+    # the blacklist is threaded into the provider submit too, so an in-provider offer
+    # refresh keeps the sick machine excluded (Fix #3)
+    assert submit_excludes[0] == frozenset()
 
 
 def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
-    import autoslm.flash.durable as durable
-    from autoslm.flash.durable import PollResult
     from autoslm.providers import allocator
+    from autoslm.providers.base import PollResult
+    from autoslm.providers.vast import durable as vast_durable
 
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
+    offer = _offer_obj()
+    monkeypatch.setattr(
+        allocator, "allocate", lambda *a, **k: _alloc(offer=offer, provider_offers=[offer])
+    )
     calls = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0):
+    def fake_vast_submit(
+        run_spec,
+        seed,
+        log=None,
+        on_handle=None,
+        attempt=0,
+        offers=None,
+        exclude_machine_ids=frozenset(),
+    ):
         calls.append(attempt)
         return PollResult(False, failure="job_failed", detail="ValueError: bad reward fn")
 
-    monkeypatch.setattr(durable, "submit_train_durable", fake_submit)
+    monkeypatch.setattr(vast_durable, "submit_train_durable_vast", fake_vast_submit)
     spec = _spec()
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError, match="bad reward fn"):
@@ -142,21 +230,24 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
 
 
 def test_concrete_requested_pins_class(orch, monkeypatch):
-    import autoslm.flash.durable as durable
-    from autoslm.flash.durable import PollResult
     from autoslm.providers import allocator
+    from autoslm.providers.base import PollResult
+    from autoslm.providers.vast import durable as vast_durable
 
     pins = []
 
     def fake_allocate(model, algorithm, **kw):
         pins.append(kw["gpu"])
-        return _alloc()
+        offer = _offer_obj()
+        return _alloc(offer=offer, provider_offers=[offer])
 
     monkeypatch.setattr(allocator, "allocate", fake_allocate)
     monkeypatch.setattr(
-        durable, "submit_train_durable", lambda *a, **k: PollResult(True, metrics={"a": 1})
+        vast_durable,
+        "submit_train_durable_vast",
+        lambda *a, **k: PollResult(True, metrics={"a": 1}),
     )
-    spec = _spec(type="RTX 3090", requested="RTX 3090", allow_unvalidated=True)
+    spec = _spec(type="RTX 3090", requested="RTX 3090")
     _seed_status(orch, spec)
     orch._submit_seed_supervised(spec, 0, io.StringIO())
     assert pins == ["RTX 3090"]  # concrete request -> class pinned through allocation
@@ -170,20 +261,23 @@ def test_concrete_requested_pins_class(orch, monkeypatch):
 def test_empty_requested_pins_concrete_type(orch, monkeypatch):
     """An empty gpu.requested (a direct-API spec that skipped config parsing) is treated
     as a concrete pin of gpu.type: the allocator runs (so failover/pricing still apply)
-    but only for that one class — it never re-picks the class."""
-    import autoslm.flash.durable as durable
-    from autoslm.flash.durable import PollResult
+    but only to pick the provider for that one class — it never re-picks the class."""
     from autoslm.providers import allocator
+    from autoslm.providers.base import PollResult
+    from autoslm.providers.vast import durable as vast_durable
 
     pins = []
 
     def fake_allocate(model, algorithm, **kw):
         pins.append(kw["gpu"])
-        return _alloc()
+        offer = _offer_obj()
+        return _alloc(offer=offer, provider_offers=[offer])
 
     monkeypatch.setattr(allocator, "allocate", fake_allocate)
     monkeypatch.setattr(
-        durable, "submit_train_durable", lambda *a, **k: PollResult(True, metrics={"a": 1})
+        vast_durable,
+        "submit_train_durable_vast",
+        lambda *a, **k: PollResult(True, metrics={"a": 1}),
     )
     spec = _spec(type="RTX A5000", requested="")  # no routing intent recorded
     _seed_status(orch, spec)
@@ -195,50 +289,83 @@ def test_empty_requested_pins_concrete_type(orch, monkeypatch):
 # ---------------------------------------------------------------------------
 # cancel / attach routing
 # ---------------------------------------------------------------------------
-def test_cancel_routes_runpod(orch, monkeypatch):
-    import autoslm.flash.train as flash_train
-    from autoslm.flash import runpod_api
+def test_cancel_routes_vast(orch, monkeypatch):
+    from autoslm.providers.runpod import api as runpod_api
+    from autoslm.providers.runpod import train as rp_train
+    from autoslm.providers.vast import api as vast_api
+    from autoslm.providers.vast import durable as vast_durable
 
-    cancelled_jobs, deleted_eps, terminated = [], [], []
-    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled_jobs.append((e, j)))
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted_eps.append(e))
-    monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: terminated.append(a))
+    cancelled, destroyed, swept, runpod_calls, terminated = [], [], [], [], []
+    monkeypatch.setattr(vast_durable, "cancel", lambda remote: cancelled.append(remote))
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
+    monkeypatch.setattr(vast_durable, "destroy_run_instances", lambda rid: swept.append(rid) or [])
+    monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: terminated.append(a))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda *a: runpod_calls.append(a))
+    # make the vast provider "available" so _gc_run_endpoints invokes its gc sweep
+    monkeypatch.setenv("VAST_API_KEY", "x")
+    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+
     spec = _spec()
     st = _seed_status(orch, spec)
     st.state = "running"
-    st.remote = _handle_dict()
+    st.remote = _vast_handle_dict(instance_id=7)
     orch._save_status(st)
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled"
-    assert cancelled_jobs == [("ep1", "j1")]
-    assert deleted_eps == ["ep1"]
-    assert terminated  # name-reconstructed endpoint GC also runs
+    # cancel + belt-and-suspenders destroy both routed to vast via the handle's provider
+    # (cancel_run destroys the handle; _gc_run_endpoints destroys it again — idempotent).
+    assert cancelled
+    assert cancelled[0]["instance_id"] == 7
+    assert destroyed
+    assert all(i == 7 for i in destroyed)
+    assert swept == [spec.run_id]  # _gc_run_endpoints -> vast provider gc
+    assert not runpod_calls  # never touched the runpod cancel path
 
 
-def test_attach_routes_runpod(orch, monkeypatch):
-    import autoslm.flash.durable as durable
-    import autoslm.flash.train as flash_train
-    from autoslm.flash.durable import PollResult
+def test_cancel_legacy_handle_defaults_to_runpod(orch, monkeypatch):
+    from autoslm.providers.runpod import api as runpod_api
+    from autoslm.providers.runpod import train as rp_train
 
-    monkeypatch.setattr(
-        durable,
-        "poll_job",
-        lambda handle, log=None, heartbeat_reader=None: PollResult(
-            True, metrics={"train_tokens": 4096, "cost_usd": 0.3}
-        ),
-    )
-    monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-    from autoslm.flash import runpod_api
-
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: None)
+    cancelled_jobs, deleted_eps = [], []
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled_jobs.append((e, j)))
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted_eps.append(e) or True)
+    monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
     spec = _spec()
     st = _seed_status(orch, spec)
     st.state = "running"
-    st.remote = _handle_dict()
+    st.remote = {"endpoint_id": "ep1", "endpoint_name": "n", "job_id": "j1"}  # pre-provider era
+    orch._save_status(st)
+    out = orch.cancel_run(spec.run_id)
+    assert out.state == "cancelled"
+    assert cancelled_jobs == [("ep1", "j1")]  # no `provider` -> defaults to runpod
+    assert "ep1" in deleted_eps
+
+
+def test_attach_routes_vast_and_destroys(orch, monkeypatch):
+    from autoslm.providers.base import PollResult
+    from autoslm.providers.runpod import train as rp_train
+    from autoslm.providers.vast import api as vast_api
+    from autoslm.providers.vast import durable as vast_durable
+
+    monkeypatch.setattr(
+        vast_durable,
+        "poll_vast_job",
+        lambda handle, spec, seed, log=None, heartbeat_reader=None: PollResult(
+            True, metrics={"train_tokens": 4096, "cost_usd": 0.3}
+        ),
+    )
+    destroyed = []
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
+    monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
+    spec = _spec()
+    st = _seed_status(orch, spec)
+    st.state = "running"
+    st.remote = _vast_handle_dict(instance_id=8)
     orch._save_status(st)
     out = orch.attach_run(spec.run_id, log_stream=io.StringIO())
     assert out.state == "done"
     assert out.cost_usd == 0.3
+    assert 8 in destroyed  # _gc_run_endpoints destroyed the instance via the handle
 
 
 # ---------------------------------------------------------------------------
@@ -265,8 +392,19 @@ def test_config_provider_fields(monkeypatch):
     assert (again.gpu.provider, again.gpu.requested) == ("auto", "auto")
 
     with pytest.raises(ConfigError, match="provider"):
-        spec_from_dict({**base, "gpu": {"provider": "vast"}}, run_id="x")
-    # a runpod pin parses cleanly
-    spec = spec_from_dict({**base, "gpu": {"type": "RTX A5000", "provider": "runpod"}}, run_id="x")
-    assert spec.gpu.provider == "runpod"
-    assert spec.gpu.type == "RTX A5000"
+        spec_from_dict({**base, "gpu": {"provider": "lambda"}}, run_id="x")
+    # class/provider mismatch fails at parse time
+    with pytest.raises(ConfigError, match="not available on provider"):
+        spec_from_dict(
+            {**base, "gpu": {"type": "L40S", "provider": "runpod", "allow_unvalidated": True}},
+            run_id="x",
+        )
+    # vast-only class pinned to vast parses (with the unvalidated opt-in)
+    spec = spec_from_dict(
+        {**base, "gpu": {"type": "L40S", "provider": "vast", "allow_unvalidated": True}},
+        run_id="x",
+    )
+    assert spec.gpu.type == "L40S"
+    assert spec.gpu.provider == "vast"
+    assert spec.gpu.requested == "L40S"
+    assert spec.gpu.allow_unvalidated is True

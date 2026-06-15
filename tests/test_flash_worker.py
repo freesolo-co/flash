@@ -120,3 +120,28 @@ def test_train_body_imports_every_name_it_uses():
     # Names that must be locally imported (regression: contextlib was missing).
     for name in ("contextlib", "json", "os", "subprocess", "sys"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
+
+
+def test_flash_dotted_and_from_imports_both_work():
+    """Fix #10: the autoslm.flash compatibility shim must support BOTH import spellings
+    for every aliased submodule:
+      * ``from autoslm.flash import train``  (attribute lookup on the package)
+      * ``import autoslm.flash.train``       (sys.modules resolution)
+    and both must yield the SAME provider module object the new code uses (so a
+    monkeypatch against the alias is effective)."""
+    import importlib
+
+    import autoslm.flash as flash
+    from autoslm.providers.runpod import durable as rp_durable
+    from autoslm.providers.runpod import pricing as rp_pricing
+    from autoslm.providers.runpod import train as rp_train
+
+    expected = {"train": rp_train, "durable": rp_durable, "pricing": rp_pricing}
+    for name, real in expected.items():
+        # `import autoslm.flash.<name>` (dotted form)
+        dotted = importlib.import_module(f"autoslm.flash.{name}")
+        assert dotted is real, f"import autoslm.flash.{name} resolved to the wrong object"
+        # `from autoslm.flash import <name>` (attribute form)
+        assert getattr(flash, name) is real, f"autoslm.flash.{name} attribute missing/wrong"
+        # the dotted attribute is bound on the package after the dotted import
+        assert getattr(flash, name) is dotted
