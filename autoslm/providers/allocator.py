@@ -48,7 +48,7 @@ class Allocation:
     gpu: str
     hourly_usd: float
     min_vram_gb: int
-    candidates: tuple[Candidate, ...]  # full ranked list (retry walks this)
+    candidates: tuple[Candidate, ...]  # full ranked list; the submit retry loop walks it
 
 
 def required_vram_gb(model_id: str, algorithm: str) -> int:

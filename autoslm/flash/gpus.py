@@ -269,21 +269,6 @@ def gpu_api_id(name: str) -> str:
     return flash_gpu(name).value
 
 
-def gpu_for_model(model_id: str) -> str:
-    """Default GPU for a model when a config omits ``gpu.type``.
-
-    Models needing >= 32 GB VRAM go to the RTX 5090; everything else to the 4090.
-    (Unchanged default: cheaper classes are opt-in via an explicit type or "cheapest".)
-    """
-    from autoslm.catalog import get_model
-
-    try:
-        info = get_model(model_id)
-    except Exception:
-        return "RTX 5090"
-    return "RTX 5090" if info.min_vram_gb >= 32 else "RTX 4090"
-
-
 def cheapest_gpu(min_vram_gb: int, include_unvalidated: bool = False) -> str:
     """Cheapest RunPod GPU class with at least ``min_vram_gb`` VRAM (live rates, cached).
 

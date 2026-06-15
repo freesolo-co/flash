@@ -244,6 +244,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     spec = JobSpec.from_dict(status.spec)
     remote = dict(status.remote)
     seed = int(remote.pop("seed", spec.train.seeds[0]))
+    # The class the run actually provisioned (a policy retry may have walked past the
+    # provisional spec.gpu.type). The in-process success path stamps this into metrics;
+    # on recovery the worker output carries no such field, so recover it from the handle
+    # to cost the right card.
+    allocated_gpu = remote.pop("allocated_gpu", None)
     log = log_stream or sys.stderr
     hf_repo = os.environ.get("HF_REPO", "")
     reader = make_hf_heartbeat_reader(hf_repo, adapter_prefix(spec, seed)) if hf_repo else None
@@ -261,6 +266,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if not res.ok:
             _update(run_id, "failed", error=f"{res.failure}: {res.detail}")
             return get_status(run_id)
+        # Carry the provisioned class into metrics so _persist_metrics costs the card the
+        # run actually used (the in-process path stamps this; recovery must restore it).
+        if allocated_gpu and isinstance(res.metrics, dict):
+            res.metrics.setdefault("allocated_gpu", allocated_gpu)
         # Earlier seeds of a multi-seed run already persisted their cost into
         # status.cost_usd; add this seed's so recovery doesn't underreport spend.
         total = float(status.cost_usd or 0.0) + _persist_metrics(spec, seed, res.metrics)
@@ -468,6 +477,10 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     from autoslm.providers.allocator import allocate, allocation_summary
 
     last_handle: dict = {}
+    # The friendly GPU class the CURRENT attempt provisioned (set right before each submit),
+    # so on_handle persists it into the run handle and a recovery via attach_run costs the
+    # class actually used rather than the parse-time provisional spec.gpu.type.
+    current_gpu: dict = {}
     # Every RunPod endpoint id this run registered across attempts. Retries run on
     # rN-suffixed endpoints whose names _gc_run_endpoints cannot reconstruct, and a
     # failed delete during the next attempt's teardown would otherwise lose the id;
@@ -479,7 +492,11 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         last_handle.update(handle)
         if handle.get("endpoint_id"):
             seen_endpoints.add(handle["endpoint_id"])
-        _update(spec.run_id, "running", remote={**handle, "seed": int(seed)})
+        _update(
+            spec.run_id,
+            "running",
+            remote={**handle, "seed": int(seed), "allocated_gpu": current_gpu.get("name")},
+        )
 
     def _gc_seen_endpoints() -> None:
         if not seen_endpoints:
@@ -496,6 +513,10 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     # user pin by passing it through as the only candidate class.
     requested = (spec.gpu.requested or "").strip().lower()
     pinned_gpu = None if requested in POLICY_NAMES else spec.gpu.type
+    # Index into the ranked candidate list. It advances only after an attempt that
+    # actually provisioned a class lost it to an infra failure (see the retry tail), so a
+    # failed allocation — which never tried a card — can't skip past the cheapest class.
+    gpu_walk_offset = 0
     for attempt in range(max_retries + 1):
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
@@ -524,6 +545,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                     _update(spec.run_id, st.state, remote=None)
         res = None
         alloc = None
+        chosen = None
         # A cancel can land after _run_seed_loop's pre-submit check but while
         # allocation/pricing runs, when no handle exists yet for cancel_run() to
         # delete. Re-read state right before paid provisioning so a cancelled run
@@ -554,8 +576,22 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             with contextlib.suppress(FileNotFoundError):
                 if get_status(spec.run_id).state == "cancelled":
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
+            # Walk down the ranked candidates by the walk offset (clamped to the last): the
+            # first attempt takes the cheapest; each retry that provisioned a class and lost
+            # it to an infra failure steps to the next-cheapest, so a capacity-starved class
+            # can't burn the whole budget. A concrete pin yields a single candidate, so the
+            # clamp keeps a pinned run on its class.
+            chosen = alloc.candidates[min(gpu_walk_offset, len(alloc.candidates) - 1)]
             print(allocation_summary(alloc), file=log, flush=True)
-            run_spec = _spec_with_gpu(spec, alloc.gpu)
+            if chosen.gpu != alloc.gpu:
+                print(
+                    f"retry {attempt}: walking past the cheapest class to {chosen.gpu} "
+                    f"@ ${chosen.hourly_usd:.2f}/hr",
+                    file=log,
+                    flush=True,
+                )
+            run_spec = _spec_with_gpu(spec, chosen.gpu)
+            current_gpu["name"] = chosen.gpu
             try:
                 res = durable.submit_train_durable(
                     run_spec, seed, log=log, on_handle=on_handle, attempt=attempt
@@ -584,8 +620,8 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             _gc_seen_endpoints()
             # Record the class actually allocated so _persist_metrics rates the right
             # RunPod card when a policy GPU was re-allocated away from the provisional.
-            if alloc is not None and isinstance(res.metrics, dict):
-                res.metrics.setdefault("allocated_gpu", alloc.gpu)
+            if chosen is not None and isinstance(res.metrics, dict):
+                res.metrics.setdefault("allocated_gpu", chosen.gpu)
             return res.metrics
         last_detail = f"{res.failure}: {res.detail}"
         # Infra-shaped failures are retried on a FRESH endpoint/host; genuine worker
@@ -621,6 +657,11 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         )
         if not infra_shaped or attempt >= max_retries:
             break
+        # Step to the next-cheapest class only when THIS attempt actually provisioned one
+        # and it failed infra-shaped. An allocation/pricing failure (chosen is None) never
+        # tried a card, so the next attempt must retry from the cheapest, not walk past it.
+        if chosen is not None:
+            gpu_walk_offset += 1
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones
     # are only known here).
