@@ -1,6 +1,6 @@
 """On-GPU fine-tuning worker (default RTX 5090). Modes: sft | rl.
 
-This module runs **on the RunPod GPU** provisioned by ``autoslm.flash``. It uses the
+This module runs **on the RunPod GPU** provisioned by ``autoslm.providers.runpod``. It uses the
 shared recipe (``autoslm.engine.recipe``) so SFT targets and RL rewards are rendered
 and scored consistently.
 
@@ -98,7 +98,7 @@ def require_active_env():
 THINKING = (
     JOB_SPEC.thinking
     if JOB_SPEC
-    else os.environ.get("AUTOSLM_THINKING", "0") not in ("0", "false", "False")
+    else os.environ.get("AUTOSLM_THINKING", "1") not in ("0", "false", "False")
 )
 
 
@@ -575,6 +575,23 @@ def qlora_model_init_kwargs(prequantized: bool = False) -> dict:
     return kwargs
 
 
+def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_id: str) -> None:
+    """Fail fast when a multi-turn GRPO run needs colocated vLLM but it's disabled.
+
+    The multi-turn rollout closure (``multiturn_rollout.build_rollout_func``) drives generation
+    through ``trainer.vllm_generation.llm``. TRL only creates that engine when ``use_vllm`` is
+    True, so with vLLM disabled (catalog ``grpo_use_vllm=False`` — e.g. the MoE 35B tier — or
+    ``RL_USE_VLLM=0``) the rollout would AttributeError at the first turn. Reject the combination
+    up front with an actionable message instead of crashing deep in training.
+    """
+    if use_rollout_func and not use_vllm:
+        raise RuntimeError(
+            f"multi-turn GRPO needs colocated vLLM, which is disabled for {model_id} "
+            "(grpo_use_vllm=False / RL_USE_VLLM=0). Use a single-turn environment for this "
+            "model, or a model tier that keeps vLLM enabled for rollouts."
+        )
+
+
 def run_sft():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -905,7 +922,18 @@ def _init_adapter_model(model_id: str, tokenizer):
     from transformers import AutoModelForCausalLM
 
     print(f"[init-adapter] initializing LoRA from {prefix}")
-    base = AutoModelForCausalLM.from_pretrained(model_id, dtype="bfloat16", trust_remote_code=True)
+    # 4-bit-QLoRA tier: load the frozen base in NF4 so a continued-adapter GRPO run fits
+    # the same memory budget as a fresh-LoRA one (and TRL still sees Linear4bit modules ->
+    # bitsandbytes vLLM rollout).
+    if model_quant(model_id) == "4bit-qlora":
+        _patch_peft_weight_converter_compat()
+        base = AutoModelForCausalLM.from_pretrained(
+            model_id, trust_remote_code=True, **qlora_model_init_kwargs()
+        )
+    else:
+        base = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype="bfloat16", trust_remote_code=True
+        )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
     return model, None
 
@@ -932,7 +960,11 @@ def run_rl():
     conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
     wait_for_gpu()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
-    download_seconds = prefetch_model(model_id)
+    # QLoRA tier: prefetch a pre-quantized export when one exists (~3.5x smaller), else the
+    # base bf16 checkpoint (vLLM/transformers quantize it to 4-bit NF4 at load).
+    quant = model_quant(model_id)
+    weights_id = (quant_weights_repo(model_id) or model_id) if quant == "4bit-qlora" else model_id
+    download_seconds = prefetch_model(weights_id)
     rl = RECIPE.rl
     steps = int(os.environ.get("RL_STEPS", str(rl.num_steps)))
     # Throughput/quality knobs (env-overridable): the number of prompts optimized per step,
@@ -954,6 +986,19 @@ def run_rl():
     _adv_clip = float(gcfg.get("advantage_clip") or 0.0)
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     sleep_mode = os.environ.get("RL_VLLM_SLEEP", "1") not in ("0", "false", "False")
+    # Rollout backend: colocated vLLM (fast) unless the catalog disables it for this model
+    # (e.g. fused-MoE tiers whose experts bnb can't 4-bit, so a 2nd vLLM copy won't fit one
+    # GPU) — then TRL generates with the trainer model via transformers. Env RL_USE_VLLM wins.
+    from autoslm.catalog import MODELS as _CATALOG
+
+    _info = _CATALOG.get(model_id)
+    _catalog_use_vllm = _info.grpo_use_vllm if _info is not None else True
+    use_vllm = os.environ.get("RL_USE_VLLM", "1" if _catalog_use_vllm else "0") not in (
+        "0",
+        "false",
+        "False",
+    )
+    print(f"[rl] rollout backend: {'colocated vLLM' if use_vllm else 'transformers generation'}")
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -1101,18 +1146,7 @@ def run_rl():
         "max_steps": steps,
         "temperature": _temperature,
         "top_p": rl.sampling_top_p,
-        "use_vllm": True,
-        "vllm_mode": "colocate",
-        # Bound the colocated engine's KV allocation to what GRPO actually needs (computed
-        # above as vllm_max_len). Without this, vLLM sizes its KV cache for the model's FULL
-        # context (262k for Qwen3-4B-Instruct-2507) and refuses to start on a consumer GPU.
-        "vllm_max_model_length": vllm_max_len,
-        # Colocate shares one GPU between the policy model and the vLLM rollout engine; on a
-        # 32 GB RTX 5090 a 4B policy (~8 GB) + vLLM weights/KV easily OOMs. RL_VLLM_GPU_UTIL
-        # sizes vLLM's pool; RL_VLLM_SLEEP offloads its weights between steps (saves memory
-        # but costs a reload each step). Default util 0.45 fits colocate on a 5090.
-        "vllm_gpu_memory_utilization": float(os.environ.get("RL_VLLM_GPU_UTIL", "0.45")),
-        "vllm_enable_sleep_mode": sleep_mode,
+        "use_vllm": use_vllm,
         "logging_steps": 1,
         "save_steps": int(
             os.environ.get(
@@ -1136,13 +1170,38 @@ def run_rl():
         "scale_rewards": "none",
         "loss_type": "dr_grpo",
     }
+    if use_vllm:
+        # Colocate shares one GPU between the policy model and the vLLM rollout engine.
+        # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
+        # the model's FULL context and won't start on a consumer GPU). RL_VLLM_GPU_UTIL
+        # sizes vLLM's pool; RL_VLLM_SLEEP offloads its weights between steps.
+        grpo_kwargs.update(
+            vllm_mode="colocate",
+            vllm_max_model_length=vllm_max_len,
+            vllm_gpu_memory_utilization=float(os.environ.get("RL_VLLM_GPU_UTIL", "0.45")),
+            vllm_enable_sleep_mode=sleep_mode,
+        )
     # Adapter init: continue training the SFT adapter (peft_config=None, model is the
     # loaded PeftModel) when train.init_from_adapter is set, else a fresh LoRA on the
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
     # to fp32 and double VRAM).
     init_model, init_peft = _init_adapter_model(model_id, tok)
     if init_peft is not None:
-        grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
+        # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
+        # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
+        # bnb.Linear4bit modules and brings up its colocated vLLM rollout engine with
+        # quantization="bitsandbytes" (so a 36B MoE fits an 80 GB GPU in 4-bit on both the
+        # trainer and rollout sides). Otherwise force bf16 (TRL string-loading can fall
+        # back to fp32 and double VRAM).
+        if quant == "4bit-qlora":
+            _patch_peft_weight_converter_compat()  # MoE adapter (re)load compatibility
+            grpo_kwargs["model_init_kwargs"] = qlora_model_init_kwargs(
+                prequantized=weights_id != model_id
+            )
+            _vllm_note = "; vLLM rollout -> bitsandbytes" if use_vllm else ""
+            print(f"[rl] loading {model_id} in 4-bit (QLoRA tier){_vllm_note}")
+        else:
+            grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
     # stop_sequences: TRL forwards generation_kwargs to the (vLLM) sampler, whose
     # SamplingParams.stop truncates each rollout at the requested delimiter — so the reward
     # sees the same completion the config intends, instead of generating to max_completion.
@@ -1159,7 +1218,10 @@ def run_rl():
 
     # VL checkpoints (Qwen3.5/3.6) train text-only: make TRL's colocated rollout
     # engine skip the vision tower (VRAM + 5090 PTX-compat; see the patch docstring).
-    patch_vllm_language_model_only(model_id)
+    # Only relevant when vLLM drives rollouts; transformers generation uses the trainer
+    # model (already text-only via the LoRA target/exclude config).
+    if use_vllm:
+        patch_vllm_language_model_only(model_id)
     hb_cb = make_reward_heartbeat_callback()
     # Multi-turn / tool wiring (trl 1.6): tool envs hand TRL the tool callables so it runs the
     # tool-call loop natively; pure multi-turn envs hand TRL a rollout_func that drives the
@@ -1171,6 +1233,7 @@ def run_rl():
     if is_tool_env and not tools:
         print("[rl][warn] tool env exposes no tools — using the multi-turn rollout_func path")
     use_rollout_func = is_multi_turn and not (is_tool_env and tools)
+    require_vllm_for_rollout_func(use_rollout_func, use_vllm, model_id)
     if is_tool_env and tools:
         extra_trainer_kwargs["tools"] = tools
         print(f"[rl] tool env: handing {len(tools)} tool(s) to TRL's native tool loop")
@@ -1476,7 +1539,7 @@ def main():
         traceback.print_exc()
         # Upload the FULL traceback under a phase-specific name (error_<phase>.txt) so the
         # train (sft/rl) root-cause error survives for debugging. heartbeat.json is
-        # single-file/overwritten, so the per-phase error file is the durable signal.
+        # single-file/overwritten, so the per-phase error file is the persistent signal.
         try:
             err_name = error_artifact_name(RUN_MODE)
             err_path = f"/tmp/{err_name}"

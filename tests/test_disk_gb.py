@@ -21,7 +21,7 @@ class _FakeConfig:
 
 
 def test_apply_disk_gb_raises_disk():
-    from autoslm.flash.durable import apply_disk_gb
+    from autoslm.providers.runpod.jobs import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, 160)
@@ -30,7 +30,7 @@ def test_apply_disk_gb_raises_disk():
 
 def test_apply_disk_gb_never_shrinks():
     """Configs carry a historical disk_gb=60 default; it must not shrink the 64 default."""
-    from autoslm.flash.durable import apply_disk_gb
+    from autoslm.providers.runpod.jobs import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, 60)
@@ -38,7 +38,7 @@ def test_apply_disk_gb_never_shrinks():
 
 
 def test_apply_disk_gb_noops():
-    from autoslm.flash.durable import apply_disk_gb
+    from autoslm.providers.runpod.jobs import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, None)
@@ -51,8 +51,7 @@ def test_catalog_min_disk_for_big_moe():
     from autoslm.catalog import get_model
 
     assert get_model("Qwen/Qwen3.6-35B-A3B").min_disk_gb >= 100  # ~72 GB checkpoint
-    assert get_model("Qwen/Qwen3-30B-A3B").min_disk_gb >= 100  # ~61 GB checkpoint
-    assert get_model("Qwen/Qwen3-4B-Instruct-2507").min_disk_gb == 0
+    assert get_model("Qwen/Qwen3.5-4B").min_disk_gb == 0
 
 
 def test_submit_raises_disk_to_model_min(monkeypatch):

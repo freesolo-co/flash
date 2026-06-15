@@ -17,7 +17,7 @@ def test_import_is_quiet_and_has_nullhandler():
     root = logging.getLogger("autoslm")
     assert any(isinstance(h, logging.NullHandler) for h in root.handlers)
     # get_logger namespaces under "autoslm".
-    assert ctlog.get_logger("flash.train").name == "autoslm.flash.train"
+    assert ctlog.get_logger("providers.runpod.train").name == "autoslm.providers.runpod.train"
     assert ctlog.get_logger(__name__).name.startswith("autoslm.")
 
 
@@ -41,7 +41,7 @@ def test_configure_logging_sets_level():
 def test_importing_autoslm_emits_no_stderr():
     # A fresh interpreter importing slm must produce no output.
     proc = subprocess.run(
-        [sys.executable, "-c", "import autoslm, autoslm.runner, autoslm.flash.train"],
+        [sys.executable, "-c", "import autoslm, autoslm.runner, autoslm.providers.runpod.train"],
         cwd=ROOT,
         text=True,
         capture_output=True,

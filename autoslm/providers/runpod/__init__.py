@@ -44,7 +44,7 @@ class RunpodProvider:
 
         return hourly_rate(gpu)
 
-    def submit_train_durable(
+    def submit_run(
         self,
         spec,
         seed: int,
@@ -58,13 +58,17 @@ class RunpodProvider:
         # ``offers``/``exclude_machine_ids`` are Vast live-market concerns; RunPod
         # provisions a fresh serverless endpoint and never re-searches a market, so it
         # ignores both (kept in the signature for cross-provider symmetry).
-        from autoslm.providers.runpod.durable import submit_train_durable
+        from autoslm.providers.runpod.jobs import submit_run
 
-        return submit_train_durable(spec, seed, log=log, on_handle=on_handle, attempt=attempt)
+        return submit_run(spec, seed, log=log, on_handle=on_handle, attempt=attempt)
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
-        from autoslm.providers.runpod.durable import JobHandle as RunpodJobHandle
-        from autoslm.providers.runpod.durable import make_hf_heartbeat_reader, poll_job
+        from autoslm.providers.runpod.jobs import JobHandle as RunpodJobHandle
+        from autoslm.providers.runpod.jobs import (
+            make_hf_heartbeat_reader,
+            poll_job,
+            stall_kwargs_from_env,
+        )
 
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
@@ -72,7 +76,8 @@ class RunpodProvider:
         rh = RunpodJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
-        return poll_job(rh, log=log, heartbeat_reader=reader)
+        # Same stall tuning as the submit path so a reattached run isn't judged differently.
+        return poll_job(rh, log=log, heartbeat_reader=reader, **stall_kwargs_from_env())
 
     def cancel(self, handle: JobHandle) -> None:
         from autoslm.providers.runpod import api as runpod_api

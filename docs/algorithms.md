@@ -42,13 +42,14 @@ generation during training — a plain LoRA fit, so it is the cheapest arm and f
 smallest GPUs.
 
 ```toml
-model     = "Qwen/Qwen3-0.6B"
+model     = "Qwen/Qwen3.5-0.8B"
 algorithm = "sft"
 
 [environment]
 id = "owner/my-env"   # a verifiers / Prime Hub env slug
 
 [train]
+hf_repo    = "your-org/your-runs"   # HF dataset repo for this run's adapters/checkpoints
 epochs     = 3
 lora_rank  = 32
 lora_alpha = 64
@@ -75,13 +76,14 @@ environment's `Rubric` reward funcs score each, and GRPO shifts probability mass
 toward the higher-reward completions in each group. Needs a reward `Rubric`.
 
 ```toml
-model     = "Qwen/Qwen3-4B-Instruct-2507"
+model     = "Qwen/Qwen3.5-4B"
 algorithm = "grpo"
 
 [environment]
 id = "owner/my-env"   # a verifiers / Prime Hub env slug
 
 [train]
+hf_repo   = "your-org/your-runs"   # HF dataset repo for this run's adapters/checkpoints
 steps     = 150
 lora_rank = 32
 ```

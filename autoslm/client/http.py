@@ -124,9 +124,8 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     # -- catalog -----------------------------------------------------------------------
-    def models(self, include_experimental: bool = False) -> list[dict]:
-        path = "/v1/models" + ("?include_experimental=true" if include_experimental else "")
-        return self._request("GET", path)["models"]
+    def models(self) -> list[dict]:
+        return self._request("GET", "/v1/models")["models"]
 
     # -- runs --------------------------------------------------------------------------
     def create_run(self, spec: dict, dry_run: bool = False) -> dict:

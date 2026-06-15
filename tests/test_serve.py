@@ -16,7 +16,7 @@ def test_deploy_dry_run():
 
     dep = deploy_adapter(
         run_id="r1",
-        model="Qwen/Qwen3-0.6B",
+        model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
         adapter_prefix="sft/r1/seed0",
         gpu_name="RTX 4090",
@@ -30,13 +30,13 @@ def test_deploy_dry_run():
 
 
 def test_deploy_rejects_unsupported_gpu():
-    from autoslm.flash.gpus import UnsupportedGpuError
+    from autoslm.providers.base import UnsupportedGpuError
     from autoslm.serve.deploy import deploy_adapter
 
     with pytest.raises(UnsupportedGpuError):
         deploy_adapter(
             run_id="r1",
-            model="Qwen/Qwen3-0.6B",
+            model="Qwen/Qwen3.5-0.8B",
             hf_repo="org/repo",
             adapter_prefix="sft/r1/seed0",
             gpu_name="TPU v5",  # junk still rejects
@@ -48,12 +48,12 @@ def test_deploy_unvalidated_class_falls_back_to_runpod():
     # Serving is RunPod-only: a run trained on a class that isn't RunPod-validated
     # (RTX 3090, 24 GB) serves from the cheapest RunPod-VALIDATED class with >= that
     # VRAM — not directly on the unvalidated class (which can fail on first chat).
-    from autoslm.flash.gpus import GPU_INFO, is_validated
+    from autoslm.providers.base import GPU_INFO, is_validated
     from autoslm.serve.deploy import deploy_adapter
 
     dep = deploy_adapter(
         run_id="r1",
-        model="Qwen/Qwen3-0.6B",
+        model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
         adapter_prefix="sft/r1/seed0",
         gpu_name="RTX 3090",
@@ -194,7 +194,7 @@ def test_serve_body_openai_shape():
     _sub.Popen = _fake_popen
     payload = {
         "hf_repo": "org/repo",
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "Qwen/Qwen3.5-0.8B",
         "adapter_prefix": "sft/r1/seed0",
         "token": "x",
         "served_model": "autoslm-r1",
@@ -284,7 +284,7 @@ def test_serve_body_drops_template_kwargs_on_old_vllm():
         resp = d._serve_body(
             {
                 "hf_repo": "org/repo",
-                "model": "Qwen/Qwen3-0.6B",
+                "model": "Qwen/Qwen3.5-0.8B",
                 "adapter_prefix": "sft/r1/seed0",
                 "token": "x",
                 "served_model": "autoslm-r1",

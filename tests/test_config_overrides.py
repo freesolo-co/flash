@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import pytest
 
 BASE = (
-    'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
+    'model = "Qwen/Qwen3.5-4B"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "primeintellect/gsm8k"\n'
     '[train]\nsteps = 100\nseeds = [0]\nhf_repo = "owner/runs"\n'

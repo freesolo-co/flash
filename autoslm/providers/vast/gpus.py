@@ -3,7 +3,7 @@
 The class table is provider-agnostic and lives in ``providers/base.py``. This module
 carves out Vast's rows (``gpu_classes()`` == every class with a ``vast_name``,
 including the Vast-only classes L40S / RTX Pro 4000 / A100 SXM 40GB) and re-exports the
-offer disambiguation (``vast_gpu_for_offer``) so the durable path can map a live offer
+offer disambiguation (``vast_gpu_for_offer``) so the job path can map a live offer
 back to a canonical class.
 """
 

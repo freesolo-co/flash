@@ -152,7 +152,7 @@ def create_app():
 
     @asynccontextmanager
     async def lifespan(app):
-        from autoslm.flash.preflight import check_run_preflight
+        from autoslm.providers.preflight import check_run_preflight
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
@@ -221,8 +221,8 @@ def create_app():
         }
 
     @app.get("/v1/models")
-    def models(include_experimental: bool = False, _: dict = Depends(require_key)):
-        return {"models": public_model_rows(include_experimental)}
+    def models(_: dict = Depends(require_key)):
+        return {"models": public_model_rows()}
 
     # Built-in env params that name a client-local filesystem path: the worker
     # has no such path, so a managed run would provision a GPU and then fail

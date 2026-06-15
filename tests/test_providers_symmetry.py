@@ -13,14 +13,14 @@ import importlib
 import pytest
 
 # The fixed module set every provider subpackage must expose (symmetry contract).
-PROVIDER_MODULES = ("api", "auth", "pricing", "gpus", "durable", "train", "preflight")
+PROVIDER_MODULES = ("api", "auth", "pricing", "gpus", "jobs", "train", "preflight")
 # The fixed method set base.Provider defines.
 PROVIDER_METHODS = (
     "is_configured",
     "preflight",
     "gpu_classes",
     "hourly_rate",
-    "submit_train_durable",
+    "submit_run",
     "poll",
     "cancel",
     "destroy",
@@ -70,7 +70,7 @@ def test_method_signatures_match_across_providers():
     for meth in (
         "gpu_classes",
         "hourly_rate",
-        "submit_train_durable",
+        "submit_run",
         "poll",
         "cancel",
         "destroy",
@@ -146,20 +146,20 @@ def test_runpod_live_pricing_mock(monkeypatch):
 
 def test_vast_live_pricing_from_offers_mock(monkeypatch):
     """Vast's hourly_rate is the cheapest live offer for the class (mocked offers)."""
-    from autoslm.providers.vast import durable, pricing
+    from autoslm.providers.vast import jobs, pricing
 
     monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
     monkeypatch.setenv("VAST_API_KEY", "vk")
 
     def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):
-        from autoslm.providers.vast.durable import VastOffer
+        from autoslm.providers.vast.jobs import VastOffer
 
         return [
             VastOffer(1, 1, "RTX 3090", 24, 0.19, 12.8, 200.0, 0.99, 5000.0, "CZ"),
             VastOffer(2, 2, "RTX 3090", 24, 0.40, 12.8, 200.0, 0.99, 5000.0, "DE"),
         ]
 
-    monkeypatch.setattr(durable, "usable_offers", fake_offers)
+    monkeypatch.setattr(jobs, "usable_offers", fake_offers)
     assert pricing.hourly_rate("RTX 3090") == 0.19  # cheapest live offer wins
 
 
@@ -178,13 +178,13 @@ def _mock_both_available(monkeypatch):
 
 
 def _mock_vast_offers(monkeypatch, offers):
-    from autoslm.providers.vast import durable
+    from autoslm.providers.vast import jobs
 
-    monkeypatch.setattr(durable, "usable_offers", lambda *a, **k: list(offers))
+    monkeypatch.setattr(jobs, "usable_offers", lambda *a, **k: list(offers))
 
 
 def _offer(gpu="RTX 3090", dph=0.10, oid=1, mid=1):
-    from autoslm.providers.vast.durable import VastOffer
+    from autoslm.providers.vast.jobs import VastOffer
 
     return VastOffer(oid, mid, gpu, 24, dph, 12.8, 200.0, 0.99, 5000.0, "CZ")
 
@@ -195,7 +195,7 @@ def test_allocator_picks_cheaper_vast_over_runpod(monkeypatch):
     _mock_both_available(monkeypatch)
     # a cheap vast RTX 3090 offer undercuts the cheapest runpod validated 24 GB class
     _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 3090", dph=0.10)])
-    a = allocate("Qwen/Qwen3-0.6B", "sft")
+    a = allocate("Qwen/Qwen3.5-0.8B", "sft")
     assert a.provider == "vast"
     assert a.gpu == "RTX 3090"
     assert a.offer is not None  # the chosen offer is carried for provisioning
@@ -209,7 +209,7 @@ def test_allocator_prefers_runpod_on_price_tie(monkeypatch):
     # vast RTX A5000 at the same price as runpod's RTX A5000 ($0.27 static): runpod wins
     # the tie (longest-validated substrate / registry order).
     _mock_vast_offers(monkeypatch, [_offer(gpu="RTX A5000", dph=0.27)])
-    a = allocate("Qwen/Qwen3-0.6B", "sft")
+    a = allocate("Qwen/Qwen3.5-0.8B", "sft")
     assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
 
 
@@ -218,26 +218,26 @@ def test_allocator_provider_pin_vast(monkeypatch):
 
     _mock_both_available(monkeypatch)
     _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 3090", dph=0.50)])
-    a = allocate("Qwen/Qwen3-0.6B", "sft", provider="vast")
+    a = allocate("Qwen/Qwen3.5-0.8B", "sft", provider="vast")
     assert a.provider == "vast"  # pinned even though a cheaper runpod class exists
 
 
 def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):
     from autoslm.providers.allocator import allocate
-    from autoslm.providers.vast import durable
+    from autoslm.providers.vast import jobs
 
     _mock_both_available(monkeypatch)
 
     def boom(*a, **k):
         raise RuntimeError("vast offer search 500")
 
-    monkeypatch.setattr(durable, "usable_offers", boom)
+    monkeypatch.setattr(jobs, "usable_offers", boom)
     # provider="auto": a vast failure degrades to runpod-only, never raises
-    a = allocate("Qwen/Qwen3-0.6B", "sft")
+    a = allocate("Qwen/Qwen3.5-0.8B", "sft")
     assert a.provider == "runpod"
     # provider="vast": the same failure is a hard error
     with pytest.raises(Exception, match="vast offer search failed"):
-        allocate("Qwen/Qwen3-0.6B", "sft", provider="vast")
+        allocate("Qwen/Qwen3.5-0.8B", "sft", provider="vast")
 
 
 def test_allocator_gpu_pin_chooses_provider(monkeypatch):
@@ -246,7 +246,7 @@ def test_allocator_gpu_pin_chooses_provider(monkeypatch):
 
     _mock_both_available(monkeypatch)
     _mock_vast_offers(monkeypatch, [_offer(gpu="L40S", dph=0.80)])
-    a = allocate("Qwen/Qwen3-0.6B", "sft", gpu="L40S", allow_unvalidated=True)
+    a = allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="L40S", allow_unvalidated=True)
     assert (a.provider, a.gpu) == ("vast", "L40S")
 
 
@@ -264,11 +264,11 @@ def test_allocator_pinned_larger_gpu_searches_at_pin_size(monkeypatch):
         captured["min_vram_gb"] = min_vram_gb
         return [_offer(gpu="A40", dph=0.40)]  # A40 = 48 GB, the pinned class
 
-    from autoslm.providers.vast import durable
+    from autoslm.providers.vast import jobs
 
-    monkeypatch.setattr(durable, "usable_offers", fake_offers)
+    monkeypatch.setattr(jobs, "usable_offers", fake_offers)
     # Qwen3-0.6B needs ~24 GB, but the user pinned the 48 GB A40 -> search at 48
-    a = allocator.allocate("Qwen/Qwen3-0.6B", "sft", gpu="A40", allow_unvalidated=True)
+    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="A40", allow_unvalidated=True)
     assert (a.provider, a.gpu) == ("vast", "A40")
     assert captured["min_vram_gb"] == GPU_INFO["A40"].vram_gb  # searched at the pin size
 

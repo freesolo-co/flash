@@ -25,7 +25,7 @@ def _spec_from_args(args: dict, run_id: str | None = None):
 
 
 def list_models(args: dict) -> dict:
-    return {"models": public_model_rows(args.get("include_experimental", False))}
+    return {"models": public_model_rows()}
 
 
 def create_train_run(args: dict) -> dict:

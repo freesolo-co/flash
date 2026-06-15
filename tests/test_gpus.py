@@ -11,7 +11,7 @@ import pytest
 
 
 def test_canonical_gpu_aliases():
-    from autoslm.flash.gpus import canonical_gpu
+    from autoslm.providers.base import canonical_gpu
 
     for alias in ("RTX 5090", "rtx5090", "5090", "RTX_5090", "NVIDIA GeForce RTX 5090"):
         assert canonical_gpu(alias) == "RTX 5090"
@@ -20,7 +20,7 @@ def test_canonical_gpu_aliases():
 
 
 def test_unknown_gpu_rejected():
-    from autoslm.flash.gpus import UnsupportedGpuError, canonical_gpu
+    from autoslm.providers.base import UnsupportedGpuError, canonical_gpu
 
     for bad in ("", "TPU v5", "RTX 9090", "Tesla T4"):  # junk + sub-Ampere reject
         with pytest.raises(UnsupportedGpuError):
@@ -28,7 +28,7 @@ def test_unknown_gpu_rejected():
 
 
 def test_providers_for():
-    from autoslm.flash.gpus import providers_for
+    from autoslm.providers.base import providers_for
 
     # RTX 4090 is provisionable on BOTH substrates; RTX Pro 6000 is RunPod-only
     # (no vast_name); L40S / RTX Pro 4000 are vast-only (no Flash enum member).
@@ -39,7 +39,7 @@ def test_providers_for():
 
 
 def test_is_validated_per_provider():
-    from autoslm.flash.gpus import is_validated
+    from autoslm.providers.base import is_validated
 
     assert is_validated("RTX 4090")  # any-provider
     assert is_validated("RTX 4090", "runpod")
@@ -49,7 +49,7 @@ def test_is_validated_per_provider():
 
 
 def test_expanded_gpu_table():
-    from autoslm.flash.gpus import GPU_INFO, canonical_gpu, get_gpu_info, gpu_short
+    from autoslm.providers.base import GPU_INFO, canonical_gpu, get_gpu_info, gpu_short
 
     # Cheap-capacity classes the cheapest policy exists for are all mapped.
     assert canonical_gpu("A100") == "A100 PCIe"
@@ -65,7 +65,7 @@ def test_expanded_gpu_table():
 
 
 def test_blackwell_min_cuda_pin():
-    from autoslm.flash.gpus import min_cuda_modern
+    from autoslm.providers.base import min_cuda_modern
 
     assert min_cuda_modern("RTX 5090") == "13.0"
     assert min_cuda_modern("B200") == "13.0"
@@ -75,7 +75,8 @@ def test_blackwell_min_cuda_pin():
 
 
 def test_cheapest_gpu_policy(monkeypatch):
-    from autoslm.flash import gpus, pricing
+    from autoslm.providers import base as gpus
+    from autoslm.providers.runpod import pricing
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")  # static rates only
     # RTX A5000 (validated 2026-06-11) is the cheapest 24GB-capable class.
@@ -92,15 +93,15 @@ def test_cheapest_gpu_policy(monkeypatch):
 
 
 def test_resolve_gpu_policy(monkeypatch):
-    from autoslm.flash.gpus import resolve_gpu_policy
+    from autoslm.providers.base import resolve_gpu_policy
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
-    # catalog model needing 24GB -> cheapest validated 24GB class
-    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3-4B-Instruct-2507") == "RTX A5000"
-    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3-8B") == "RTX 5090"
+    # small (12GB) model -> cheapest validated class (A5000); 32GB model -> 5090
+    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-0.8B") == "RTX A5000"
+    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-9B") == "RTX 5090"
     # concrete names pass through canonicalization
-    assert resolve_gpu_policy("rtx5090", "Qwen/Qwen3-8B") == "RTX 5090"
+    assert resolve_gpu_policy("rtx5090", "Qwen/Qwen3.5-9B") == "RTX 5090"
 
 
 def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
@@ -109,14 +110,14 @@ def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
     raw = {
-        "model": "Qwen/Qwen3-4B-Instruct-2507",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "environment": {"id": "primeintellect/gsm8k"},
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "gpu": {"type": "cheapest"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    assert spec.gpu.type == "RTX A5000"  # cheapest validated 24GB class
+    assert spec.gpu.type == "RTX A5000"  # cheapest validated class for a small model
     # class validated on NO provider blocked without opt-in...
     raw["gpu"] = {"type": "L4"}
     with pytest.raises(ConfigError):
@@ -139,14 +140,14 @@ def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
 
 
 def test_flash_gpu_enum_members():
-    from autoslm.flash.gpus import flash_gpu
+    from autoslm.providers.runpod.gpus import flash_gpu
 
     assert flash_gpu("RTX 5090").name == "NVIDIA_GEFORCE_RTX_5090"
     assert flash_gpu("4090").name == "NVIDIA_GEFORCE_RTX_4090"
 
 
 def test_gpu_short():
-    from autoslm.flash.gpus import gpu_short
+    from autoslm.providers.base import gpu_short
 
     assert gpu_short("RTX 5090") == "5090"
     assert gpu_short("rtx_4090") == "4090"
@@ -156,7 +157,7 @@ def test_config_rejects_unsupported_gpu():
     from autoslm.schema import ConfigError, spec_from_dict
 
     raw = {
-        "model": "Qwen/Qwen3-4B-Instruct-2507",
+        "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "environment": {"id": "primeintellect/gsm8k"},
         "train": {"steps": 1, "seeds": [0], "hf_repo": "owner/runs"},
@@ -180,17 +181,16 @@ def test_config_defaults_gpu_from_model():
 
 
 def test_build_worker_env():
-    from autoslm.flash.train import build_worker_env
-
+    from autoslm.providers.runpod.train import build_worker_env
     from autoslm.spec import JobSpec, TrainSpec
 
     spec = JobSpec(
         run_id="r1",
-        model="Qwen/Qwen3-4B-Instruct-2507",
+        model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         train=TrainSpec(steps=20, seeds=(0,)),
     )
     env = build_worker_env(spec, 0)
     assert env["RUN_ID"] == "r1"
-    assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3.5-4B"
     assert env["RL_STEPS"] == "20"

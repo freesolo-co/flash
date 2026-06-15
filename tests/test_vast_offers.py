@@ -44,7 +44,7 @@ FIXTURE = [
 
 def test_usable_offers_filters_and_order(monkeypatch):
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     captured = {}
 
@@ -70,7 +70,7 @@ def test_usable_offers_filters_and_order(monkeypatch):
 
 def test_usable_offers_vram_gate(monkeypatch):
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
     out = vast.usable_offers(32, disk_gb=60)
@@ -80,7 +80,7 @@ def test_usable_offers_vram_gate(monkeypatch):
 
 def test_usable_offers_exclude_machines_and_price_cap(monkeypatch):
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     rows = [_offer(id=1, machine_id=7, dph_total=0.25), _offer(id=2, machine_id=8, dph_total=0.30)]
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: rows)

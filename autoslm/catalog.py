@@ -24,7 +24,17 @@ class ModelInfo:
     min_vram_gb: int
     quant: str = "bf16"
     recommended_gpu: str = "RTX 5090"
-    experimental: bool = False
+    # GRPO needs more VRAM than SFT (a colocated vLLM rollout engine holds a second copy of
+    # the weights + KV cache). 0 => GRPO uses ``min_vram_gb`` like SFT; set it when the GRPO
+    # tier needs a bigger card than SFT (e.g. the 4-bit 36B MoE: SFT fits 32 GB, GRPO needs
+    # 80 GB for trainer-4bit + vLLM-4bit + KV). Used by providers.allocator.required_vram_gb.
+    grpo_min_vram_gb: int = 0
+    # GRPO rollout backend. True (default) = colocated vLLM (fast). False = generate with the
+    # trainer model via transformers (slower, but no 2nd weight copy). Needed for fused-MoE
+    # tiers whose experts bitsandbytes can't 4-bit quantize: the base stays ~bf16, so a 2nd
+    # vLLM copy won't fit one GPU — use_vllm=False keeps it to a single copy. Env override:
+    # RL_USE_VLLM. Used by engine.worker.run_rl.
+    grpo_use_vllm: bool = True
     notes: str = ""
     # Worker container disk this model needs (GB). 0 = the platform default (64 GB)
     # suffices. The runner raises gpu.disk_gb to at least this, so big-checkpoint
@@ -48,42 +58,12 @@ class ModelInfo:
         return asdict(self)
 
 
-# The default model AutoSLM trains when a config omits one. A proven, dense, text-only
-# instruction model that loads cleanly on the pinned worker stack (transformers<5,
-# trl<0.24, vllm<0.11) — the safe out-of-the-box choice for the average developer.
-DEFAULT_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+# The default model AutoSLM trains when a config omits one. A current-gen dense 4B
+# (text-only fine-tune) on the modern worker stack — the safe out-of-the-box choice for
+# the average developer. It is thinking-"hybrid"; the thinking flag now defaults ON.
+DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 MODELS: dict[str, ModelInfo] = {
-    # ---- Supported tier: proven dense text models on the pinned worker stack ----
-    "Qwen/Qwen3-0.6B": ModelInfo(
-        id="Qwen/Qwen3-0.6B",
-        display_name="Qwen3 0.6B",
-        params="0.6B dense",
-        algos=("sft", "grpo"),
-        min_vram_gb=12,
-        recommended_gpu="RTX 4090",
-        thinking="hybrid",
-        notes="Smallest real model; ideal for cheap smoke/dev runs.",
-    ),
-    "Qwen/Qwen3-4B-Instruct-2507": ModelInfo(
-        id="Qwen/Qwen3-4B-Instruct-2507",
-        display_name="Qwen3 4B Instruct 2507",
-        params="4B dense",
-        algos=("sft", "grpo"),
-        min_vram_gb=24,
-        recommended_gpu="RTX 4090",
-        thinking="none",  # the non-thinking Instruct variant (no <think> in its template)
-        notes="Default model: benchmark-proven, dense, loads on the pinned worker stack.",
-    ),
-    "Qwen/Qwen3-8B": ModelInfo(
-        id="Qwen/Qwen3-8B",
-        display_name="Qwen3 8B",
-        params="8B dense",
-        algos=("sft", "grpo"),
-        min_vram_gb=32,
-        recommended_gpu="RTX 5090",
-        thinking="hybrid",
-    ),
     "openbmb/MiniCPM5-1B": ModelInfo(
         id="openbmb/MiniCPM5-1B",
         display_name="MiniCPM5 1B",
@@ -93,19 +73,6 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="RTX 4090",
         thinking="hybrid",
         notes="On-device class SLM (131k ctx); standard Llama architecture.",
-    ),
-    "Qwen/Qwen3-30B-A3B": ModelInfo(
-        id="Qwen/Qwen3-30B-A3B",
-        display_name="Qwen3 30B-A3B",
-        params="30B total / 3B active MoE",
-        algos=("sft",),
-        min_vram_gb=32,
-        recommended_gpu="RTX 5090",
-        quant="4bit-qlora",
-        experimental=True,
-        thinking="hybrid",
-        min_disk_gb=120,  # ~61 GB bf16 checkpoint + worker stack > the 64 GB default
-        notes="Experimental SFT-only tier; all experts still occupy VRAM.",
     ),
     # ---- Qwen3.5 dense family: validated on the modern worker stack ----
     # (trl 1.x / vllm 0.19 / transformers 5.x). Trained + served TEXT-ONLY: the
@@ -146,36 +113,41 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.5-9B",
         display_name="Qwen3.5 9B",
         params="9.7B (text-only fine-tune)",
-        algos=("sft",),
+        algos=("sft", "grpo"),
         min_vram_gb=32,
+        grpo_min_vram_gb=80,  # bf16 colocate (trainer ~19GB + vLLM ~19GB + KV) won't fit 32GB
         recommended_gpu="RTX 5090",
         thinking="hybrid",
-        notes="SFT at micro-batch 1 on a 5090; colocated GRPO does not fit in 32 GB bf16.",
+        notes="SFT at micro-batch 1 on a 5090 (32 GB). GRPO keeps the normal bf16 base + LoRA "
+        "but the colocated vLLM rollout holds a 2nd copy, so it needs an 80 GB A100 "
+        "(auto-routed via grpo_min_vram_gb); colocated GRPO does not fit 32 GB bf16.",
     ),
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",
         display_name="Qwen3.6 35B-A3B",
         params="36B total / 3B active MoE",
-        algos=("sft",),
+        algos=("sft", "grpo"),
         min_vram_gb=32,
-        recommended_gpu="RTX 5090",
+        grpo_min_vram_gb=80,  # 64 GB ~bf16 base (fused experts can't 4-bit) -> needs 80 GB
+        grpo_use_vllm=False,  # fused MoE experts aren't bnb-4bit-quantizable, so a 2nd vLLM
+        # copy won't fit one GPU; GRPO generates with the trainer model (transformers) on a
+        # single A100. Slower rollouts, but the only single-GPU path for this MoE.
+        recommended_gpu="A100 PCIe",
         quant="4bit-qlora",
-        experimental=True,
         thinking="hybrid",
         min_disk_gb=160,  # ~72 GB bf16 checkpoint + worker stack + headroom
-        notes="QLoRA SFT tier. AutoSLM provisions the bigger worker disk automatically "
-        "(min_disk_gb; the 64 GB platform default can't hold the ~72 GB checkpoint). "
-        "Validated end-to-end (train+eval) on A100 PCIe; 5090 works when its host "
-        "pool bootstraps the stack (or with AUTOSLM_WORKER_IMAGE).",
+        notes="QLoRA SFT + GRPO tier. SFT fits a 32 GB 5090. GRPO runs on one 80 GB A100: the "
+        "MoE experts are fused 3-D tensors bitsandbytes can't 4-bit quantize, so the base "
+        "stays ~bf16 (~64 GB) — too big for a 2nd colocated vLLM copy. GRPO therefore uses "
+        "transformers generation (grpo_use_vllm=False), keeping a single weight copy. "
+        "AutoSLM auto-provisions the bigger worker disk and auto-routes GRPO to the 80 GB "
+        "tier (grpo_min_vram_gb). For faster rollouts use 2 GPUs + a vLLM server (roadmap).",
     ),
 }
 
 
-def list_models(include_experimental: bool = False) -> list[ModelInfo]:
-    models = MODELS.values()
-    if not include_experimental:
-        models = [m for m in models if not m.experimental]
-    return sorted(models, key=lambda m: (m.experimental, m.min_vram_gb, m.id))
+def list_models() -> list[ModelInfo]:
+    return sorted(MODELS.values(), key=lambda m: (m.min_vram_gb, m.id))
 
 
 def get_model(model_id: str) -> ModelInfo:
@@ -234,7 +206,6 @@ def resolve_model(
         min_vram_gb=int(est.est_gb) if est.est_gb else 24,
         min_disk_gb=min_disk,
         recommended_gpu=gpu or "RTX 5090",
-        experimental=True,
         thinking="unknown",
         notes="unlisted model accepted via the open-model policy (not curated/validated)",
     )
@@ -252,5 +223,5 @@ def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
     return info
 
 
-def public_model_rows(include_experimental: bool = False) -> list[dict]:
-    return [m.to_dict() for m in list_models(include_experimental=include_experimental)]
+def public_model_rows() -> list[dict]:
+    return [m.to_dict() for m in list_models()]

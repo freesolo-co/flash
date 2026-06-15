@@ -1,7 +1,7 @@
 """SQLite store for the managed control plane: API keys + run ownership.
 
 Run *state* stays in the runner's JSON files (``runner.RUNS_DIR``) — the
-battle-tested durable/attach/cancel paths all read those. This database is only the
+battle-tested submit/attach/cancel paths all read those. This database is only the
 key registry and the run -> key ownership index that makes the server multi-tenant.
 
 Connections are opened per operation (cheap for SQLite, avoids cross-thread state;

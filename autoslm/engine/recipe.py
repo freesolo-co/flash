@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field
 # A proven, dense, text-only instruction model that loads on the current worker stack
 # (transformers 5.x / TRL 1.x / vLLM 0.19.x). The natively-multimodal Qwen3.5/3.6
 # checkpoints are also in the catalog, trained/served text-only.
-HF_MODEL_ID = os.environ.get("BENCH_HF_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+HF_MODEL_ID = os.environ.get("BENCH_HF_MODEL", "Qwen/Qwen3.5-4B")  # catalog DEFAULT_MODEL
 
 
 # ----------------------------------------------------------------------------

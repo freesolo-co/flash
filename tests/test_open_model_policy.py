@@ -15,8 +15,8 @@ def test_catalog_policy_rejects_unlisted_with_hint():
 
 
 def test_catalog_model_resolves_normally():
-    info = resolve_model("Qwen/Qwen3-4B-Instruct-2507", "grpo", policy="catalog")
-    assert info.id == "Qwen/Qwen3-4B-Instruct-2507"
+    info = resolve_model("Qwen/Qwen3.5-4B", "grpo", policy="catalog")
+    assert info.id == "Qwen/Qwen3.5-4B"
 
 
 def test_minicpm5_in_catalog():
@@ -29,7 +29,7 @@ def test_minicpm5_in_catalog():
 def test_allow_policy_accepts_fitting_model(monkeypatch):
     monkeypatch.setattr("autoslm.engine.vram.fetch_hf_params_b", lambda model_id: 1.2, raising=True)
     info = resolve_model("acme/tiny-1b", "grpo", policy="allow", gpu="RTX 4090")
-    assert info.experimental
+    assert info.thinking == "unknown"
     assert "open-model policy" in info.notes
 
 
@@ -77,7 +77,7 @@ def test_grpo_needs_more_than_sft():
 # ---------------------------------------------------------------------------
 # Config schema plumbing
 # ---------------------------------------------------------------------------
-def _raw(model="Qwen/Qwen3-0.6B", **kw):
+def _raw(model="Qwen/Qwen3.5-0.8B", **kw):
     d = {
         "model": model,
         "algorithm": "sft",

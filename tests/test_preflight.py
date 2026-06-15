@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import autoslm.flash.preflight as pf
+import autoslm.providers.preflight as pf
 
 
 @pytest.fixture
@@ -56,7 +56,7 @@ def test_preflight_require_hf_false_still_needs_provider_keys(clean_env, monkeyp
 
 def test_runpod_key_is_env_only(clean_env):
     # ~/.autoslm/config.json holds the AutoSLM key; it must never be read as a RunPod key.
-    from autoslm.flash.auth import load_api_key
+    from autoslm.providers.runpod.auth import load_api_key
 
     assert load_api_key() is None
 

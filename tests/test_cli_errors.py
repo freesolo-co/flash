@@ -69,7 +69,7 @@ def test_train_without_login_fails_fast():
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
             f.write(
-                'model = "Qwen/Qwen3-4B-Instruct-2507"\nalgorithm = "grpo"\n'
+                'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
                 '[environment]\nid = "primeintellect/gsm8k"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
             )
         proc = _run(["train", cfg], env=_logged_out_env(tmp))
@@ -84,7 +84,7 @@ def test_missing_env_id_rejected_client_side():
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
             f.write(
-                'model = "Qwen/Qwen3-4B-Instruct-2507"\nalgorithm = "grpo"\n'
+                'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
                 "[environment]\n[train]\nseeds = [0]\n"
             )
         # A config without [environment] id is rejected before any network call.
@@ -98,7 +98,7 @@ def test_dry_run_needs_no_credentials_or_server():
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
             f.write(
-                'model = "Qwen/Qwen3-4B-Instruct-2507"\nalgorithm = "grpo"\n'
+                'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
                 '[environment]\nid = "primeintellect/gsm8k"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
             )
         proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))

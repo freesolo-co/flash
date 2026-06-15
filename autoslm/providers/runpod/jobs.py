@@ -28,6 +28,7 @@ from autoslm.providers.runpod import api as runpod_api
 from autoslm.providers.runpod.gpus import flash_gpu
 from autoslm.providers.runpod.train import (
     DEFAULT_EXECUTION_TIMEOUT_MS,
+    FLASH_SDK_LOCK,
     WORKER_SYSTEM_DEPS,
     _patch_runpod_backoff,
     _train_body,
@@ -39,7 +40,7 @@ from autoslm.providers.runpod.train import (
 
 logger = get_logger(__name__)
 
-# Re-export so callers/tests that did ``from ...durable import PollResult`` keep working.
+# Re-export so callers/tests that did ``from ...jobs import PollResult`` keep working.
 __all__ = [
     "JobHandle",
     "PollResult",
@@ -50,12 +51,32 @@ __all__ = [
     "make_hf_heartbeat_reader",
     "poll_job",
     "submit",
-    "submit_train_durable",
+    "submit_run",
     "volume_endpoint_kwargs",
 ]
 
 TERMINAL_OK = {"COMPLETED"}
 TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
+
+# Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
+# training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
+# Receiving one proves the worker is alive but NOT that the slow setup (model download +
+# vLLM init) finished, so they must not flip stall detection to the tight training window.
+_SETUP_HEARTBEAT_STAGES = frozenset(
+    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
+)
+
+
+def stall_kwargs_from_env() -> dict:
+    """``poll_job`` stall-window kwargs from the operator env, shared by the submit and
+    reattach paths so a recovered run uses the same tuning as the original submit.
+    ``AUTOSLM_STALL_AFTER_S`` = post-training-heartbeat window; ``AUTOSLM_SETUP_GRACE_S`` =
+    the larger cold-start window before the first training heartbeat.
+    """
+    return {
+        "stall_after_s": float(os.environ.get("AUTOSLM_STALL_AFTER_S", "1500")),
+        "setup_grace_s": float(os.environ.get("AUTOSLM_SETUP_GRACE_S", "3000")),
+    }
 
 
 def volume_endpoint_kwargs(spec) -> dict:
@@ -139,32 +160,37 @@ def deploy_train_endpoint(
 
     ensure_auth()
     _patch_runpod_backoff()
-    isolate_flash_state(name_suffix)
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
-    kwargs = dict(
-        name=name,
-        gpu=flash_gpu(friendly),
-        gpu_count=1,
-        min_cuda_version=min_cuda_for(friendly),
-        execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-        workers=(0, 1),
-        **volume_endpoint_kwargs(spec),
-    )
     image = os.environ.get("AUTOSLM_WORKER_IMAGE")
-    if image:
-        kwargs["image"] = image
-    else:
-        kwargs["dependencies"] = resolve_worker_deps()
-        kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-    ep = Endpoint(**kwargs)
-    ep._qb_target = _train_body
-    config = ep._build_resource_config()
-    apply_disk_gb(config, disk_gb)
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
-    rm = ResourceManager()
-    resource = asyncio.run(rm.get_or_deploy_resource(config))
+    # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
+    # suffix, and ResourceManager + the deploy share the SDK's asyncio singleton. Hold the
+    # lock across the whole critical section so a concurrent run can't swap the registry
+    # scope or race the event loop mid-deploy.
+    with FLASH_SDK_LOCK:
+        isolate_flash_state(name_suffix)
+        kwargs = dict(
+            name=name,
+            gpu=flash_gpu(friendly),
+            gpu_count=1,
+            min_cuda_version=min_cuda_for(friendly),
+            execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+            workers=(0, 1),
+            **volume_endpoint_kwargs(spec),
+        )
+        if image:
+            kwargs["image"] = image
+        else:
+            kwargs["dependencies"] = resolve_worker_deps()
+            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+        ep = Endpoint(**kwargs)
+        ep._qb_target = _train_body
+        config = ep._build_resource_config()
+        apply_disk_gb(config, disk_gb)
+        rm = ResourceManager()
+        resource = asyncio.run(rm.get_or_deploy_resource(config))
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
         raise RuntimeError(f"deploy_train_endpoint: no endpoint id on resource {resource!r}")
@@ -220,14 +246,17 @@ def poll_job(
     interval_s: float = 10.0,
     heartbeat_reader=None,
     stall_after_s: float = 1200.0,
+    setup_grace_s: float = 3000.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
 
-    ``heartbeat_reader`` (optional callable -> dict|None) surfaces worker progress into
-    the run log and powers stall detection: if the job claims IN_PROGRESS but the
-    worker heartbeat hasn't advanced for ``stall_after_s``, we declare a stall so the
-    supervisor can resubmit instead of waiting for the wall-clock cap.
+    Two stall windows: the cold-start phase (dep install, per-run env pip, model download,
+    vLLM init) is slow and only emits *setup* heartbeats (``_SETUP_HEARTBEAT_STAGES``).
+    Until a *training* heartbeat arrives we apply the larger ``setup_grace_s`` budget so a
+    slow cold start isn't misread as a stall; after it we use the tight ``stall_after_s``.
+    Needs a ``heartbeat_reader`` to tell the phases apart — without one we keep
+    ``stall_after_s`` throughout (no regression).
     """
 
     def say(msg: str):
@@ -238,6 +267,7 @@ def poll_job(
     last_status = None
     last_hb_key = None
     last_progress = time.time()
+    seen_heartbeat = False
     last_health_probe = 0.0
     consecutive_poll_errors = 0
     while True:
@@ -301,24 +331,34 @@ def poll_job(
                     last_hb_key = key
                     last_progress = time.time()
                     stage = hb.get("stage")
+                    # Only a training-phase heartbeat means cold-start setup is done and we
+                    # can switch to the tight window; setup heartbeats keep the grace budget.
+                    if stage not in _SETUP_HEARTBEAT_STAGES:
+                        seen_heartbeat = True
                     step = hb.get("step")
                     reward = hb.get("reward")
                     say(
                         f"worker: stage={stage}"
                         + (f" step={step}" if step is not None else "")
-                        + (f" reward={reward:.3f}" if isinstance(reward, int | float) else "")
+                        + (f" reward={reward:.3f}" if isinstance(reward, (int, float)) else "")
                     )
-        if time.time() - last_progress > stall_after_s:
+        # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s,
+        # but only when a heartbeat_reader lets us tell setup from training; without one we
+        # can't, so stay on stall_after_s (no regression).
+        in_setup = heartbeat_reader is not None and not seen_heartbeat
+        stall_limit = setup_grace_s if in_setup else stall_after_s
+        if time.time() - last_progress > stall_limit:
+            phase = "setup (pre-training)" if in_setup else "training"
             return PollResult(
                 False,
                 failure="stalled",
                 detail=f"no worker progress for {int(time.time() - last_progress)}s "
-                f"(job status {status})",
+                f"during {phase} (job status {status}, limit {int(stall_limit)}s)",
             )
         time.sleep(interval_s)
 
 
-def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> PollResult:
+def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> PollResult:
     """Durable equivalent of ``submit_train``: deploy, submit, persist handle, poll.
 
     ``on_handle(handle_dict)`` is invoked as soon as the job is queued so the
@@ -361,7 +401,7 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
     try:
         job_id = submit(endpoint_id, payload)
     except Exception:
-        # The endpoint is registered but no durable handle exists yet, and a
+        # The endpoint is registered but no run handle exists yet, and a
         # retry endpoint's rN-suffixed name can't be reconstructed from the run
         # id later — delete it now so a transient submit failure doesn't leak a
         # serverless endpoint against the account quota.
@@ -371,7 +411,7 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
     handle = JobHandle(endpoint_id, name, job_id)
     if log is not None:
         print(
-            f"submitted durable job: endpoint={name} ({endpoint_id}) job={job_id} "
+            f"submitted job: endpoint={name} ({endpoint_id}) job={job_id} "
             f"attempt={attempt} gpu={spec.gpu.type} phase={spec.phase} seed={seed}",
             file=log,
             flush=True,
@@ -381,8 +421,7 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
-    stall = float(os.environ.get("AUTOSLM_STALL_AFTER_S", "1500"))
-    return poll_job(handle, log=log, heartbeat_reader=reader, stall_after_s=stall)
+    return poll_job(handle, log=log, heartbeat_reader=reader, **stall_kwargs_from_env())
 
 
 def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 30.0):

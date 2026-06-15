@@ -387,7 +387,13 @@ def resolve_gpu_policy(
 
     info = MODELS.get(model_id)
     if info is not None:
-        min_vram = info.min_vram_gb
+        # GRPO can need a bigger card than SFT (colocated vLLM rollout / 2nd weight copy);
+        # honor grpo_min_vram_gb so "auto" routes GRPO to the right tier. MUST stay in sync
+        # with providers.allocator.required_vram_gb (the submit-time path).
+        if (algorithm or "").lower() == "grpo" and info.grpo_min_vram_gb:
+            min_vram = info.grpo_min_vram_gb
+        else:
+            min_vram = info.min_vram_gb
     else:
         from autoslm.engine.vram import estimate_vram_gb, fetch_hf_params_b
 
@@ -465,7 +471,7 @@ class Provider(Protocol):
     """The pluggable GPU-substrate interface.
 
     Both ``providers/runpod`` and ``providers/vast`` expose ``PROVIDER`` implementing
-    this protocol with an identical module layout (api/auth/pricing/gpus/durable/
+    this protocol with an identical module layout (api/auth/pricing/gpus/jobs/
     train/preflight). The orchestrator/allocator only ever talk to these methods, so a
     provider is swappable without touching the control plane.
     """
@@ -489,7 +495,7 @@ class Provider(Protocol):
         """$/hr for one friendly GPU name (live if available, else static)."""
         ...
 
-    def submit_train_durable(
+    def submit_run(
         self,
         spec: JobSpec,
         seed: int,

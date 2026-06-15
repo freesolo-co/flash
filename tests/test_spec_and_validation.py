@@ -18,7 +18,7 @@ from autoslm.schema import ConfigError, spec_from_dict
 from autoslm.spec import JobSpec, load_job_spec_from_env
 
 BASE_RAW = {
-    "model": "Qwen/Qwen3-0.6B",
+    "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
     "environment": {"id": "primeintellect/gsm8k"},
     "train": {"steps": 10, "lora_rank": 8, "seeds": [0], "hf_repo": "owner/runs"},
@@ -241,7 +241,7 @@ def test_get_logger_namespacing() -> None:
 
     assert get_logger().name == "autoslm"
     assert get_logger("autoslm").name == "autoslm"
-    assert get_logger("autoslm.flash").name == "autoslm.flash"
+    assert get_logger("autoslm.providers").name == "autoslm.providers"
     assert get_logger("mymodule").name == "autoslm.mymodule"
 
 

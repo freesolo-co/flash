@@ -162,7 +162,7 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
     model_policy = (raw.get("model_policy") or "catalog").lower()
     if model_policy not in ("catalog", "allow"):
         raise ConfigError('model_policy must be "catalog" or "allow"')
-    thinking = raw.get("thinking", False)
+    thinking = raw.get("thinking", True)  # reasoning mode ON by default
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
 

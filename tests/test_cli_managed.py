@@ -67,7 +67,7 @@ def stub_server():
                                 "state": "done",
                                 "cost_usd": 0.25,
                                 "updated_at": 1.0,
-                                "spec": {"model": "Qwen/Qwen3-4B-Instruct-2507"},
+                                "spec": {"model": "Qwen/Qwen3.5-4B"},
                             }
                         ]
                     },
@@ -122,14 +122,14 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     # `slm train --background` posts the locally-validated spec and prints the handle.
     toml = tmp_path / "run.toml"
     toml.write_text(
-        'model = "Qwen/Qwen3-4B-Instruct-2507"\nalgorithm = "grpo"\n'
+        'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
         '[environment]\nid = "primeintellect/gsm8k"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
     )
     proc = _run(["train", str(toml), "--background"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = json.loads(proc.stdout)
     assert out["run_id"] == "autoslm-1-stub"
-    assert out["spec"]["model"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert out["spec"]["model"] == "Qwen/Qwen3.5-4B"
 
     # `slm ps` renders the server's run list.
     proc = _run(["ps"], home=home, api_url=stub_server)

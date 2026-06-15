@@ -461,7 +461,7 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
 
 
 def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
-    """Run one seed with the durable submit/poll path + bounded auto-retry.
+    """Run one seed with the job submit/poll path + bounded auto-retry.
 
     Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
     live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
@@ -476,7 +476,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     are blacklisted for the run; failover naturally crosses providers.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
     immediately. The offline test/CI marker AUTOSLM_SKIP_NET takes the blocking
-    in-process submit instead (the durable poll path is network-only).
+    in-process submit instead (the job poll path is network-only).
     """
     from autoslm.providers.base import PollResult
     from autoslm.providers.runpod.train import submit_train
@@ -633,7 +633,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                     key=lambda o: (o.gpu != chosen.gpu, o.dph_total),
                 )
             try:
-                res = provider.submit_train_durable(
+                res = provider.submit_run(
                     run_spec,
                     seed,
                     log=log,

@@ -17,10 +17,23 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 def test_catalog_validation():
     from autoslm.catalog import get_model, validate_model_for_algorithm
 
-    info = get_model("Qwen/Qwen3-4B-Instruct-2507")
+    info = get_model("Qwen/Qwen3.5-4B")
     assert "grpo" in info.algos
-    with pytest.raises(ValueError, match="not grpo"):
-        validate_model_for_algorithm("Qwen/Qwen3.6-35B-A3B", "grpo")
+    # Qwen3.6-35B-A3B is GRPO-capable (QLoRA on an 80 GB A100, transformers generation).
+    assert (
+        validate_model_for_algorithm("Qwen/Qwen3.6-35B-A3B", "grpo").id == "Qwen/Qwen3.6-35B-A3B"
+    )
+    # An sft-only model still rejects grpo (inject one — no catalog entry is sft-only now).
+    from autoslm.catalog import MODELS, ModelInfo
+
+    MODELS["test/sft-only"] = ModelInfo(
+        id="test/sft-only", display_name="x", params="1B", algos=("sft",), min_vram_gb=12
+    )
+    try:
+        with pytest.raises(ValueError, match="not grpo"):
+            validate_model_for_algorithm("test/sft-only", "grpo")
+    finally:
+        MODELS.pop("test/sft-only", None)
 
 
 def test_config_to_job_spec():
@@ -30,7 +43,7 @@ def test_config_to_job_spec():
         path = os.path.join(tmp, "run.toml")
         with open(path, "w") as f:
             f.write(
-                'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
+                'model = "Qwen/Qwen3.5-4B"\n'
                 'algorithm = "grpo"\n'
                 "[environment]\n"
                 'id = "primeintellect/gsm8k"\n'
@@ -65,10 +78,10 @@ def test_orchestrator_dry_run(monkeypatch):
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
         from autoslm.spec import JobSpec
 
-        spec = JobSpec(run_id="dry", model="Qwen/Qwen3-4B-Instruct-2507", algorithm="grpo")
+        spec = JobSpec(run_id="dry", model="Qwen/Qwen3.5-4B", algorithm="grpo")
         status = runner.submit_job(spec, dry_run=True)
         assert status.state == "dry_run"
-        assert runner.get_status("dry").spec["model"] == "Qwen/Qwen3-4B-Instruct-2507"
+        assert runner.get_status("dry").spec["model"] == "Qwen/Qwen3.5-4B"
 
 
 def test_mcp_handler_dry_run(monkeypatch):
@@ -85,7 +98,7 @@ def test_mcp_handler_dry_run(monkeypatch):
                 "tool": "create_" + "train" + "ing_run",
                 "args": {
                     "run_id": "mcp-dry",
-                    "model": "Qwen/Qwen3-4B-Instruct-2507",
+                    "model": "Qwen/Qwen3.5-4B",
                     "algorithm": "grpo",
                     "environment": {"id": "primeintellect/gsm8k"},
                     "train": {"steps": 1, "seeds": [0], "hf_repo": "owner/runs"},
@@ -103,7 +116,7 @@ def test_cli_train_dry_run():
         runs = os.path.join(tmp, "runs")
         with open(config, "w") as f:
             f.write(
-                'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
+                'model = "Qwen/Qwen3.5-4B"\n'
                 'algorithm = "grpo"\n'
                 "[environment]\n"
                 'id = "primeintellect/gsm8k"\n'

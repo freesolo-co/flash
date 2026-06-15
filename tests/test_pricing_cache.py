@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 def _fresh_pricing(monkeypatch, tmp_path):
     monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
-    import autoslm.flash.pricing as pricing
+    import autoslm.providers.runpod.pricing as pricing
 
     pricing = importlib.reload(pricing)
     monkeypatch.setattr(pricing, "_CACHE_PATH", tmp_path / "rates.json")

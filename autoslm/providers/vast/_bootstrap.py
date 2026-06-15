@@ -9,7 +9,7 @@ the success signal, and this bootstrap's attempt-scoped ``vast_attempt<N>.json``
 the terminal marker the control plane keys failures on.
 
 This file is shipped verbatim inside the instance's onstart script (see
-``providers/vast/durable.py:build_onstart``), so it must stay self-contained: stdlib +
+``providers/vast/jobs.py:build_onstart``), so it must stay self-contained: stdlib +
 huggingface_hub (installed with the worker deps) only — never import autoslm here.
 It reads its payload from ``/root/autoslm/payload.json``.
 """

@@ -151,8 +151,8 @@ class JobSpec:
     # "catalog" (curated models only) or "allow" (any HF model that fits the GPU).
     model_policy: str = "catalog"
     # Thinking/reasoning mode (thinking-capable models only). One flag per run, consumed
-    # identically by SFT rendering, RL rollouts, and serving (decoding parity).
-    thinking: bool = False
+    # identically by SFT rendering, RL rollouts, and serving (decoding parity). ON by default.
+    thinking: bool = True
 
     @property
     def phase(self) -> str:
@@ -218,7 +218,7 @@ class JobSpec:
             ),
             run_id=data.get("run_id", "local"),
             model_policy=data.get("model_policy", "catalog"),
-            thinking=_coerce_bool(data.get("thinking", False)),
+            thinking=_coerce_bool(data.get("thinking", True)),
         )
 
     @classmethod

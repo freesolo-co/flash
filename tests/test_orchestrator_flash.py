@@ -13,8 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import autoslm.flash.train as flash_train
-
+        import autoslm.providers.runpod.train as flash_train
         import autoslm.runner as runner
 
         importlib.reload(flash_train)
@@ -40,13 +39,13 @@ def test_run_job_persists_flash_metrics(monkeypatch):
                 "notes": {},
             }
 
-        # _run_job does `from autoslm.flash.train import submit_train, upload_code` at call time.
+        # _run_job does `from autoslm.providers.runpod.train import submit_train, upload_code` at call time.
         monkeypatch.setattr(flash_train, "submit_train", fake_submit)
         monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "mock/repo")
 
         spec = JobSpec(
             run_id="flash-run",
-            model="Qwen/Qwen3-4B-Instruct-2507",
+            model="Qwen/Qwen3.5-4B",
             algorithm="grpo",
             train=TrainSpec(steps=2, seeds=(0,)),
             gpu=GpuSpec(type="RTX 4090"),
@@ -55,7 +54,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         assert status.state == "done", status.error
         # 1h on a 4090 at the projected rate (static fallback under AUTOSLM_SKIP_NET)
-        from autoslm.flash.pricing import hourly_rate
+        from autoslm.providers.runpod.pricing import hourly_rate
 
         assert abs(status.cost_usd - hourly_rate("RTX 4090")) < 1e-6, status.cost_usd
         assert captured["gpu"] == "RTX 4090"

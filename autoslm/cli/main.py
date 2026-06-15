@@ -90,7 +90,6 @@ def main(argv: list[str] | None = None) -> int:
     setup.set_defaults(func=cmd_lab_setup)
 
     models = sub.add_parser("models")
-    models.add_argument("--experimental", action="store_true")
     models.set_defaults(func=cmd_models)
 
     gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
@@ -290,7 +289,7 @@ def cmd_lab_setup(args) -> int:
     sample = Path("configs/verifiers_grpo.toml")
     if not sample.exists():
         sample.write_text(
-            'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
+            'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
             "# Environment: a verifiers / Prime Hub env slug. Publish the scaffolded\n"
             "# environments/starter_env.py with `slm env push environments/starter_env.py`\n"
@@ -298,6 +297,7 @@ def cmd_lab_setup(args) -> int:
             "[environment]\n"
             'id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
             "[train]\n"
+            'hf_repo = "your-org/your-runs"   # HF dataset repo for adapters/checkpoints\n'
             "steps = 150\n"
             "lora_rank = 32\n"
             "seeds = [0]\n\n"
@@ -313,11 +313,10 @@ def cmd_lab_setup(args) -> int:
 
 
 def cmd_models(args) -> int:
-    for row in public_model_rows(include_experimental=args.experimental):
-        suffix = " experimental" if row["experimental"] else ""
+    for row in public_model_rows():
         print(
             f"{row['id']}\t{row['params']}\talgos={','.join(row['algos'])}\t{row['quant']}"
-            f"\tthinking={row.get('thinking', 'none')}{suffix}"
+            f"\tthinking={row.get('thinking', 'none')}"
         )
     return 0
 
@@ -335,7 +334,7 @@ def cmd_gpus(args) -> int:
     vast_rates: dict[str, float] = {}
     if "vast" in available_providers():
         try:
-            from autoslm.providers.vast.durable import usable_offers
+            from autoslm.providers.vast.jobs import usable_offers
 
             for offer in usable_offers(0, 0):
                 vast_rates.setdefault(offer.gpu, offer.dph_total)  # offers are price-sorted

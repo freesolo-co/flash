@@ -16,7 +16,7 @@ def _spec(**gpu_kw) -> JobSpec:
     gpu = {"type": "RTX 3090", "provider": "vast", "max_wall_seconds": 3600, **gpu_kw}
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3-0.6B",
+            "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": "autoslm-1700000000-abcd1234",
             "train": {"epochs": 1, "seeds": [0], "hf_repo": "org/repo"},
@@ -26,7 +26,7 @@ def _spec(**gpu_kw) -> JobSpec:
 
 
 def _offer_obj(offer_id=1, machine_id=10, gpu="RTX 3090", dph=0.25):
-    from autoslm.providers.vast.durable import VastOffer
+    from autoslm.providers.vast.jobs import VastOffer
 
     return VastOffer(
         offer_id=offer_id,
@@ -46,7 +46,7 @@ def _offer_obj(offer_id=1, machine_id=10, gpu="RTX 3090", dph=0.25):
 # onstart + bootstrap
 # ---------------------------------------------------------------------------
 def test_onstart_ships_payload_and_bootstrap(monkeypatch):
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     monkeypatch.setenv("VAST_API_KEY", "vk-supersecret")
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-supersecret")
@@ -92,7 +92,7 @@ def test_build_payload_carries_per_run_hf_repo(monkeypatch):
     """The submit payload's hf_repo is the run's [train] hf_repo (there is no operator HF_REPO
     fallback). The worker fetches code + writes artifacts to this repo, its env's HF_REPO must
     match the payload's, and an operator HF_REPO in the env must NOT leak in."""
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     # an operator HF_REPO in the control-plane env must be ignored
     monkeypatch.setenv("HF_REPO", "operator/default")
@@ -219,7 +219,7 @@ def test_bootstrap_installs_prime_when_absent(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_deploy_walks_taken_offers(monkeypatch):
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     attempts = []
@@ -242,7 +242,7 @@ def test_deploy_walks_taken_offers(monkeypatch):
 
 def test_deploy_refreshes_once_when_all_taken(monkeypatch):
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     created = []
@@ -267,7 +267,7 @@ def test_deploy_refresh_excludes_blacklisted_machines(monkeypatch):
     excluded — otherwise a sick machine the orchestrator just blacklisted can be
     re-selected from the fresh market."""
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     captured = {}
@@ -299,7 +299,7 @@ def test_deploy_refresh_uses_disk_floor(monkeypatch):
     floor create_instance enforces (max(disk_gb, 60)); a spec asking <60 GB must NOT
     surface offers that then fail to rent."""
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     captured = {}
@@ -322,7 +322,7 @@ def test_deploy_refresh_uses_disk_floor(monkeypatch):
 
 def test_deploy_raises_when_pool_exhausted(monkeypatch):
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     monkeypatch.setattr(
@@ -343,7 +343,7 @@ def test_deploy_raises_when_pool_exhausted(monkeypatch):
 def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, step=10.0):
     """Mock the instance status sequence + the HF artifact readers + the clock."""
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     seq = iter(instances)
     last = {"inst": None}
@@ -375,7 +375,7 @@ def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, ste
 
 
 def _handle(started_ts=10_000.0, rate=0.25):
-    from autoslm.providers.vast.durable import VastJobHandle
+    from autoslm.providers.vast.jobs import VastJobHandle
 
     return VastJobHandle(
         instance_id=9999,
@@ -499,7 +499,7 @@ def test_poll_client_deadline(monkeypatch):
 def _wire_runner(monkeypatch, poll_outcome):
     from autoslm.providers.base import PollResult
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
@@ -519,9 +519,7 @@ def test_runner_destroys_on_success(monkeypatch):
 
     vast, destroyed, _ = _wire_runner(monkeypatch, PollResult(True, metrics={"a": 1}))
     handles = []
-    res = vast.submit_train_durable_vast(
-        _spec(), seed=0, on_handle=handles.append, offers=[_offer_obj()]
-    )
+    res = vast.submit_run_vast(_spec(), seed=0, on_handle=handles.append, offers=[_offer_obj()])
     assert res.ok
     assert destroyed == [9999]
     assert handles
@@ -533,13 +531,13 @@ def test_runner_destroys_on_failure_and_exception(monkeypatch):
     from autoslm.providers.base import PollResult
 
     vast, destroyed, _ = _wire_runner(monkeypatch, PollResult(False, failure="stalled"))
-    res = vast.submit_train_durable_vast(_spec(), seed=0, offers=[_offer_obj()])
+    res = vast.submit_run_vast(_spec(), seed=0, offers=[_offer_obj()])
     assert not res.ok
     assert destroyed == [9999]
 
     vast, destroyed, _ = _wire_runner(monkeypatch, KeyboardInterrupt())
     with pytest.raises(KeyboardInterrupt):
-        vast.submit_train_durable_vast(_spec(), seed=0, offers=[_offer_obj()])
+        vast.submit_run_vast(_spec(), seed=0, offers=[_offer_obj()])
     assert destroyed == [9999]
 
 
@@ -553,12 +551,12 @@ def test_runner_destroys_when_handle_persist_fails(monkeypatch):
         raise RuntimeError("status store unreachable")
 
     with pytest.raises(RuntimeError, match="status store unreachable"):
-        vast.submit_train_durable_vast(_spec(), seed=0, on_handle=boom, offers=[_offer_obj()])
+        vast.submit_run_vast(_spec(), seed=0, on_handle=boom, offers=[_offer_obj()])
     assert destroyed == [9999]  # the paid instance was torn down despite the persist crash
 
 
 def test_instance_label_always_sweepable():
-    from autoslm.providers.vast.durable import instance_label
+    from autoslm.providers.vast.jobs import instance_label
 
     # platform run ids pass through; anything else gets the prefix FORCED so the
     # orphan sweep can never miss an instance we rented (live incident: a unit
@@ -569,7 +567,7 @@ def test_instance_label_always_sweepable():
 
 def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     instances = [
         {"id": 1, "label": "autoslm-fail-fast-s0-a0"},  # forced-prefix label
@@ -583,7 +581,7 @@ def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
 
 
 def test_handle_roundtrip():
-    from autoslm.providers.vast.durable import VastJobHandle
+    from autoslm.providers.vast.jobs import VastJobHandle
 
     h = _handle()
     d = h.to_dict()
@@ -594,7 +592,7 @@ def test_handle_roundtrip():
 def test_run_label_prefix_matches_instance_label():
     """Fix #8: run_label_prefix applies the SAME forced-`autoslm-` transform the labels
     carry, so the orphan-sweep allowlist (built from raw run ids) actually matches."""
-    from autoslm.providers.vast.durable import instance_label, run_label_prefix
+    from autoslm.providers.vast.jobs import instance_label, run_label_prefix
 
     # a raw run id (no prefix) -> the prefix its labels start with IS prefixed
     assert run_label_prefix("fail-fast") == "autoslm-fail-fast"
@@ -611,7 +609,7 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
     sweep_orphans transforms active ids through run_label_prefix before matching, so its
     forced-prefix instance label is not swept."""
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     instances = [
         {"id": 1, "label": vast.instance_label("fail-fast", 0, 0)},  # live run -> KEEP
@@ -628,7 +626,7 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
 
 def test_sweep_orphans_label_safety(monkeypatch):
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast
+    from autoslm.providers.vast import jobs as vast
 
     instances = [
         {"id": 1, "label": "autoslm-1700-aaaa-s0-a0"},  # orphan -> destroy
