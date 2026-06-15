@@ -36,11 +36,6 @@ def list_installed_verifiers_envs() -> list[str]:
     return sorted(load_installed_manifest())
 
 
-def list_environments() -> list[str]:
-    """All known environments — just the installed verifiers/Hub envs (no builtins)."""
-    return list_installed_verifiers_envs()
-
-
 def record_installed_env(env_id: str, package: str, extras: dict | None = None) -> None:
     manifest = load_installed_manifest()
     manifest[env_id] = {"package": package, **(extras or {})}
