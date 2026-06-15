@@ -11,12 +11,9 @@ the runner runs jobs in daemon threads inside the same process).
 from __future__ import annotations
 
 import hashlib
-import secrets
 import sqlite3
 import time
 from pathlib import Path
-
-KEY_PREFIX = "sk-autoslm-"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -65,25 +62,12 @@ def hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
-def create_key(email: str | None = None) -> dict:
-    """Mint a new API key. The full key is returned exactly once; only its hash is stored."""
-    api_key = KEY_PREFIX + secrets.token_hex(24)
-    prefix = api_key[: len(KEY_PREFIX) + 4]
-    now = time.time()
-    with _connect() as conn:
-        conn.execute(
-            "INSERT INTO api_keys (key_hash, key_prefix, email, created_at) VALUES (?, ?, ?, ?)",
-            (hash_key(api_key), prefix, email, now),
-        )
-    return {"api_key": api_key, "key_prefix": prefix, "email": email, "created_at": now}
-
-
 def ensure_internal_key(api_key: str, email: str = "freesolo-internal") -> dict:
     """Provision a row for the shared freesolo internal/service key (idempotent).
 
     The freesolo platform/SDK authenticate to the control plane with the same
-    ``FREESOLO_INTERNAL_KEY`` they already hold instead of a minted ``sk-autoslm-``
-    key. Backing it with a real row (inserted once, by hash) means run ownership and
+    ``FREESOLO_INTERNAL_KEY`` they already hold. Backing it with a real row
+    (inserted once, by hash) means run ownership and
     the runs.key_id foreign key work exactly as for a normal key — all
     internal-key runs share this single service identity (no per-user isolation;
     the platform scopes users upstream)."""
@@ -106,7 +90,7 @@ def ensure_external_key(api_key: str, email: str = "freesolo-user") -> dict | No
     Unlike :func:`ensure_internal_key` (one shared service identity), this keys a distinct
     row by the presented token's hash, so each freesolo user key gets its OWN run-ownership
     identity (the runs.key_id foreign key then scopes runs per user). The full token is never
-    stored — only its sha256, like any minted key.
+    stored — only its sha256.
 
     Returns ``None`` (not a row) when the token's row already exists but is DISABLED:
     ``INSERT OR IGNORE`` won't revive it and ``lookup_key`` filters disabled rows, so a

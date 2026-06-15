@@ -7,12 +7,7 @@ the remaining commands are covered without a server.
 
 from __future__ import annotations
 
-import os
-import sys
-
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from autoslm.cli import main as cli
 
@@ -22,7 +17,7 @@ class _FakeClient:
         self.calls: list[tuple] = []
 
     def me(self) -> dict:
-        return {"key_prefix": "sk-autoslm-fake", "email": "t@example.com"}
+        return {"key_prefix": "freesolo", "email": "t@example.com"}
 
     def models(self, include_experimental: bool = False) -> list[dict]:
         rows = [
@@ -104,7 +99,7 @@ def _run(argv: list[str]) -> int:
 def test_whoami_prints_identity(fake_client, capsys) -> None:
     assert _run(["whoami"]) == 0
     out = capsys.readouterr().out
-    assert "sk-autoslm-fake" in out
+    assert "freesolo" in out
     assert "t@example.com" in out
 
 

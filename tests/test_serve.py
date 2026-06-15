@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import os
+import json as _json
 import sys
+import threading
 import types
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -119,8 +119,6 @@ def _install_serve_mocks():
 
 
 def _openai_completion_bytes():
-    import json as _json
-
     return _json.dumps(
         {
             "id": "chatcmpl-1",
@@ -143,12 +141,6 @@ def test_serve_body_openai_shape():
 
     Also covers thinking parity: the run's flag rides the chat_template_kwargs and is
     part of the engine key (a thinking deploy boots vLLM with a bigger --max-model-len)."""
-    import json as _json
-    import sys
-    import threading
-    import types
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
     seen_bodies = []
     boot_cmds = []
 
@@ -228,12 +220,6 @@ def test_serve_body_openai_shape():
 
 def test_serve_body_drops_template_kwargs_on_old_vllm():
     """Older vLLM 400s on chat_template_kwargs; the handler retries without it."""
-    import json as _json
-    import sys
-    import threading
-    import types
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
     seen_bodies = []
 
     class _OldVllmStub(BaseHTTPRequestHandler):

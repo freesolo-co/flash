@@ -11,8 +11,6 @@ import tempfile
 
 import pytest
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 
 def test_catalog_validation():
     from autoslm.catalog import get_model, validate_model_for_algorithm
@@ -20,9 +18,7 @@ def test_catalog_validation():
     info = get_model("Qwen/Qwen3.5-4B")
     assert "grpo" in info.algos
     # Qwen3.6-35B-A3B is GRPO-capable (QLoRA on an 80 GB A100, transformers generation).
-    assert (
-        validate_model_for_algorithm("Qwen/Qwen3.6-35B-A3B", "grpo").id == "Qwen/Qwen3.6-35B-A3B"
-    )
+    assert validate_model_for_algorithm("Qwen/Qwen3.6-35B-A3B", "grpo").id == "Qwen/Qwen3.6-35B-A3B"
     # An sft-only model still rejects grpo (inject one — no catalog entry is sft-only now).
     from autoslm.catalog import MODELS, ModelInfo
 
@@ -95,7 +91,7 @@ def test_mcp_handler_dry_run(monkeypatch):
         importlib.reload(mcp)
         result = mcp.handle(
             {
-                "tool": "create_" + "train" + "ing_run",
+                "tool": "create_training_run",
                 "args": {
                     "run_id": "mcp-dry",
                     "model": "Qwen/Qwen3.5-4B",
@@ -113,7 +109,6 @@ def test_mcp_handler_dry_run(monkeypatch):
 def test_cli_train_dry_run():
     with tempfile.TemporaryDirectory() as tmp:
         config = os.path.join(tmp, "run.toml")
-        runs = os.path.join(tmp, "runs")
         with open(config, "w") as f:
             f.write(
                 'model = "Qwen/Qwen3.5-4B"\n'
@@ -128,7 +123,6 @@ def test_cli_train_dry_run():
                 'type = "RTX 5090"\n'
             )
         env = os.environ.copy()
-        env["AUTOSLM_RUNS_DIR"] = runs
         proc = subprocess.run(
             [sys.executable, "-m", "autoslm.cli.main", "train", config, "--dry-run"],
             cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
@@ -141,20 +135,3 @@ def test_cli_train_dry_run():
         assert proc.returncode == 0, proc.stdout
         payload = json.loads(proc.stdout)
         assert payload["state"] == "dry_run"
-
-
-if __name__ == "__main__":
-    import traceback
-
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-    passed = 0
-    for fn in fns:
-        try:
-            fn()
-            print("PASS", fn.__name__)
-            passed += 1
-        except Exception:
-            print("FAIL", fn.__name__)
-            traceback.print_exc()
-    print(f"\n{passed}/{len(fns)} passed")
-    sys.exit(0 if passed == len(fns) else 1)

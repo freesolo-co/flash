@@ -11,6 +11,8 @@ Fix: ``worker.main`` calls ``os._exit(0)`` after the handler completes (all arti
 already persisted to HF inside the handler), bypassing the hanging teardown.
 """
 
+from __future__ import annotations
+
 import autoslm.engine.worker as worker
 
 

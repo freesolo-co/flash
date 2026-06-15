@@ -8,11 +8,8 @@ import importlib
 import json
 import logging
 import os
-import sys
 
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from autoslm.schema import ConfigError, spec_from_dict
 from autoslm.spec import JobSpec, load_job_spec_from_env
@@ -46,10 +43,16 @@ def _raw(**overrides) -> dict:
     ("overrides", "match"),
     [
         ({"train.seeds": []}, "at least one seed"),
-        ({"train.steps": 0}, "steps must be positive"),
-        ({"train.lora_rank": 0}, "lora_rank must be positive"),
-        ({"train.lora_alpha": 0}, "lora_alpha must be positive"),
-        ({"train.lora_alpha": -8}, "lora_alpha must be positive"),
+        ({"train.steps": 0}, "steps must be >= 1"),
+        # lora_rank/alpha now parse via _train_int(minimum=1), so out-of-range values
+        # are rejected at parse time with the shared ">= 1" message (a non-positive int
+        # never reaches the later "must be positive" guard).
+        ({"train.lora_rank": 0}, "lora_rank must be >= 1"),
+        ({"train.lora_alpha": 0}, "lora_alpha must be >= 1"),
+        ({"train.lora_alpha": -8}, "lora_alpha must be >= 1"),
+        # bools must be rejected (bool is an int subclass: True would coerce to 1).
+        ({"train.lora_rank": True}, "lora_rank must be an integer"),
+        ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         ({"model_policy": "yolo"}, "model_policy"),
         ({"gpu.allow_unvalidated": "yes"}, "must be a boolean"),
@@ -63,7 +66,7 @@ def test_spec_validation_rejections(overrides, match) -> None:
 def test_sft_epochs_must_be_positive() -> None:
     raw = _raw(algorithm="sft")
     raw["train"] = {"epochs": 0, "lora_rank": 8, "seeds": [0]}
-    with pytest.raises(ConfigError, match="epochs must be positive"):
+    with pytest.raises(ConfigError, match="epochs must be >= 1"):
         spec_from_dict(raw)
 
 

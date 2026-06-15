@@ -7,8 +7,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .catalog import ALGORITHMS as ALGORITHMS  # re-exported for spec consumers
-from .catalog import DEFAULT_MODEL, normalize_algorithm
+from .catalog import DEFAULT_GPU, DEFAULT_MODEL, normalize_algorithm
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 
@@ -41,8 +40,8 @@ def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
     Rejects JSON booleans: ``bool`` is an ``int`` subclass in Python, so ``int(True)`` would
-    silently coerce a stray boolean train knob to 1 (and ``False`` to 0). Mirrors
-    schema._opt_num — a bool is a type error, not a number.
+    silently coerce a stray boolean train knob to 1 (and ``False`` to 0). Mirrors the
+    bool rejection in schema._train_int — a bool is a type error, not a number.
     """
     if value is None:
         return None
@@ -55,7 +54,7 @@ def _opt_float(value: Any) -> float | None:
     """Parse an optional float from a loosely-typed spec source; None stays None.
 
     Rejects JSON booleans (``bool`` is an ``int`` subclass) so a stray boolean train knob is
-    not silently coerced to 0.0/1.0; mirrors schema._opt_num.
+    not silently coerced to 0.0/1.0; mirrors the bool rejection in schema._train_float.
     """
     if value is None:
         return None
@@ -115,7 +114,7 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
-    type: str = "RTX 5090"
+    type: str = DEFAULT_GPU
     # GPU substrate: "auto" (cheapest across providers at submit time), "runpod", or
     # "vast" (verified datacenters only).
     provider: str = "auto"
@@ -135,6 +134,8 @@ class GpuSpec:
     # cross-run HF model cache (repeat runs skip the model download). Trade-offs: it
     # pins the run to the volume's datacenter (smaller GPU pool — usually the bigger
     # cost) and the volume bills monthly while it exists. Off (None) by default.
+    # RunPod-specific: network_volume/datacenter are read only by the RunPod provider
+    # and ignored by Vast (which rents single-GPU instances with no network volume).
     network_volume: str | None = None
     network_volume_gb: int = 100
     datacenter: str | None = None  # e.g. "EU-RO-1"; required pool pin for the volume
@@ -205,7 +206,7 @@ class JobSpec:
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
             ),
             gpu=GpuSpec(
-                type=gpu.get("type", "RTX 5090"),
+                type=gpu.get("type", DEFAULT_GPU),
                 provider=gpu.get("provider", "auto"),
                 requested=gpu.get("requested", ""),
                 allow_unvalidated=gpu.get("allow_unvalidated"),

@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 
 from autoslm._logging import get_logger
+from autoslm.providers._poll import PollErrorTracker, make_say, surface_heartbeat
 from autoslm.providers.base import PollResult, canonical_gpu
 from autoslm.providers.runpod import api as runpod_api
 from autoslm.providers.runpod.gpus import flash_gpu
@@ -49,8 +50,8 @@ __all__ = [
     "decode_output",
     "deploy_train_endpoint",
     "make_hf_heartbeat_reader",
+    "make_hf_text_reader",
     "poll_job",
-    "submit",
     "submit_run",
     "volume_endpoint_kwargs",
 ]
@@ -215,10 +216,6 @@ def build_function_input(payload: dict) -> dict:
     return req
 
 
-def submit(endpoint_id: str, payload: dict) -> str:
-    return runpod_api.submit_job(endpoint_id, build_function_input(payload))
-
-
 def decode_output(output) -> dict:
     """Decode a Flash FunctionResponse job output into the worker's metrics dict."""
     if isinstance(output, str):
@@ -259,9 +256,8 @@ def poll_job(
     ``stall_after_s`` throughout (no regression).
     """
 
-    def say(msg: str):
-        if log is not None:
-            print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=log, flush=True)
+    say = make_say(log)
+    poll_errors = PollErrorTracker(say, interval_s)
 
     start = time.time()
     last_status = None
@@ -269,19 +265,15 @@ def poll_job(
     last_progress = time.time()
     seen_heartbeat = False
     last_health_probe = 0.0
-    consecutive_poll_errors = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
         try:
             st = runpod_api.job_status(handle.endpoint_id, handle.job_id)
-            consecutive_poll_errors = 0
+            poll_errors.reset()
         except runpod_api.RunpodApiError as e:
-            consecutive_poll_errors += 1
-            say(f"poll error ({consecutive_poll_errors}): {e}")
-            if consecutive_poll_errors >= 8:
+            if poll_errors.record(e):
                 return PollResult(False, failure="poll_error", detail=str(e))
-            time.sleep(min(60, interval_s * consecutive_poll_errors))
             continue
         status = st.get("status")
         if status != last_status:
@@ -320,28 +312,14 @@ def poll_job(
                 # Health surfacing is diagnostic only; a probe failure must not stop polling.
                 pass
         # heartbeat progress surfacing + stall detection
-        if heartbeat_reader is not None:
-            try:
-                hb = heartbeat_reader()
-            except Exception:
-                hb = None
-            if hb:
-                key = (hb.get("stage"), hb.get("step"), hb.get("ts"))
-                if key != last_hb_key:
-                    last_hb_key = key
-                    last_progress = time.time()
-                    stage = hb.get("stage")
-                    # Only a training-phase heartbeat means cold-start setup is done and we
-                    # can switch to the tight window; setup heartbeats keep the grace budget.
-                    if stage not in _SETUP_HEARTBEAT_STAGES:
-                        seen_heartbeat = True
-                    step = hb.get("step")
-                    reward = hb.get("reward")
-                    say(
-                        f"worker: stage={stage}"
-                        + (f" step={step}" if step is not None else "")
-                        + (f" reward={reward:.3f}" if isinstance(reward, (int, float)) else "")
-                    )
+        new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
+        if new_key != last_hb_key:
+            last_hb_key = new_key
+            last_progress = time.time()
+            # Only a training-phase heartbeat means cold-start setup is done and we
+            # can switch to the tight window; setup heartbeats keep the grace budget.
+            if stage not in _SETUP_HEARTBEAT_STAGES:
+                seen_heartbeat = True
         # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s,
         # but only when a heartbeat_reader lets us tell setup from training; without one we
         # can't, so stay on stall_after_s (no regression).
@@ -378,9 +356,7 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     # doing it after deploy_train_endpoint() would leak the just-created endpoint (its
     # rN-suffixed name can't be reconstructed from the run id later) against the account
     # quota — the runner would also treat the raise as a retryable poll_error.
-    extra_pip = list(spec.environment.pip) or worker_pip_for_env(
-        spec.environment.id, spec.environment.params
-    )
+    extra_pip = list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
     worker_env = build_worker_env(spec, seed)
     endpoint_id, name = deploy_train_endpoint(
         spec.gpu.type,
@@ -399,7 +375,7 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
         "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     try:
-        job_id = submit(endpoint_id, payload)
+        job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
     except Exception:
         # The endpoint is registered but no run handle exists yet, and a
         # retry endpoint's rN-suffixed name can't be reconstructed from the run
@@ -424,12 +400,20 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     return poll_job(handle, log=log, heartbeat_reader=reader, **stall_kwargs_from_env())
 
 
-def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 30.0):
-    """Reader for the worker's heartbeat.json on HF (rate-limited, never raises)."""
+def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float = 45.0):
+    """Rate-limited reader for one HF artifact's text content (None until it exists).
+
+    Generic helper shared by both providers' pollers (runpod heartbeats + vast's
+    DONE/metrics/error artifacts). ``read(force=False)`` re-downloads at most once per
+    ``min_interval_s`` (``force=True`` bypasses the gate); it never raises — any HF error
+    (artifact absent, network) returns None.
+    """
     state = {"last": 0.0}
 
-    def read() -> dict | None:
-        if time.time() - state["last"] < min_interval_s:
+    def read(force: bool = False) -> str | None:
+        if not hf_repo:
+            return None
+        if not force and time.time() - state["last"] < min_interval_s:
             return None
         state["last"] = time.time()
         try:
@@ -437,14 +421,33 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
 
             p = hf_hub_download(
                 hf_repo,
-                f"{prefix}/heartbeat.json",
+                path_in_repo,
                 repo_type="dataset",
                 token=os.environ.get("HUGGINGFACE_TOKEN"),
                 force_download=True,
             )
             with open(p) as f:
-                return json.load(f)
+                return f.read()
         except Exception:
+            return None
+
+    return read
+
+
+def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 30.0):
+    """Reader for the worker's heartbeat.json on HF (rate-limited, never raises).
+
+    Thin JSON-parsing wrapper over :func:`make_hf_text_reader` bound to ``{prefix}/heartbeat.json``.
+    """
+    text_reader = make_hf_text_reader(hf_repo, f"{prefix}/heartbeat.json", min_interval_s)
+
+    def read() -> dict | None:
+        raw = text_reader()
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
             return None
 
     return read

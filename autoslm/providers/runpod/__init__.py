@@ -104,15 +104,5 @@ class RunpodProvider:
         # recover_runs). Present for ``base.Provider`` symmetry with Vast's instance sweep.
         return []
 
-    def deploy_serve(self, *args: Any, **kwargs: Any) -> Any:
-        from autoslm.serve.deploy import deploy_adapter
-
-        return deploy_adapter(*args, **kwargs)
-
-    def undeploy_serve(self, *args: Any, **kwargs: Any) -> Any:
-        from autoslm.serve.deploy import undeploy_adapter
-
-        return undeploy_adapter(*args, **kwargs)
-
 
 PROVIDER: Provider = RunpodProvider()

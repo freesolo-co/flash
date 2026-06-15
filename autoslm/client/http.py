@@ -39,6 +39,16 @@ def freesolo_base_url(override: str | None = None) -> str:
     )
 
 
+def _detail_from_http_error(exc: urllib.error.HTTPError) -> str:
+    """Extract the server's error message from an HTTPError body (FastAPI ``detail``)."""
+    body = exc.read()
+    try:
+        detail = json.loads(body).get("detail") or body.decode()
+    except (ValueError, AttributeError):
+        detail = body.decode(errors="replace") if body else str(exc)
+    return str(detail)
+
+
 def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
     """Verify a freesolo API key against the freesolo backend's ``/api/auth/verify``.
 
@@ -61,12 +71,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
                 "freesolo rejected this API key — create or copy a valid key from your "
                 "freesolo dashboard and pass it with `slm login --api-key` (or FREESOLO_API_KEY)"
             ) from exc
-        body = exc.read()
-        try:
-            detail = json.loads(body).get("detail") or body.decode()
-        except (ValueError, AttributeError):
-            detail = body.decode(errors="replace") if body else str(exc)
-        raise ApiError(exc.code, str(detail)) from exc
+        raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
     except urllib.error.URLError as exc:
         raise ClientError(
             f"cannot reach the freesolo backend at {base} ({exc.reason}); "
@@ -101,35 +106,23 @@ class ApiClient:
                 raw = resp.read()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:
-            raw = exc.read()
-            try:
-                detail = json.loads(raw).get("detail") or raw.decode()
-            except (ValueError, AttributeError):
-                detail = raw.decode(errors="replace") if raw else str(exc)
-            raise ApiError(exc.code, str(detail)) from exc
+            raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
         except urllib.error.URLError as exc:
             raise ClientError(
                 f"cannot reach the AutoSLM service at {self.api_url} ({exc.reason}); "
                 "check your network connection and AUTOSLM_API_URL"
             ) from exc
 
-    # -- keys / identity ---------------------------------------------------------------
-    def claim_key(self, email: str | None = None) -> dict:
-        return self._request("POST", "/v1/keys", body={"email": email} if email else {})
-
+    # -- identity ----------------------------------------------------------------------
     def me(self) -> dict:
         return self._request("GET", "/v1/me")
 
     def health(self) -> dict:
         return self._request("GET", "/v1/health", timeout=10.0)
 
-    # -- catalog -----------------------------------------------------------------------
-    def models(self) -> list[dict]:
-        return self._request("GET", "/v1/models")["models"]
-
     # -- runs --------------------------------------------------------------------------
-    def create_run(self, spec: dict, dry_run: bool = False) -> dict:
-        return self._request("POST", "/v1/runs", body={"spec": spec, "dry_run": dry_run})
+    def create_run(self, spec: dict) -> dict:
+        return self._request("POST", "/v1/runs", body={"spec": spec})
 
     def list_runs(self) -> list[dict]:
         return self._request("GET", "/v1/runs")["runs"]

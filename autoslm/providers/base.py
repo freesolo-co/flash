@@ -16,8 +16,11 @@ specific:
   * The canonicalization / alias / policy helpers every call site already used.
 
 The ``Provider`` protocol is the FIXED method set both providers implement; the
-orchestrator dispatches cancel/poll/destroy/gc generically through it (never a
-hardcoded per-provider branch).
+orchestrator dispatches cancel/poll/destroy generically through the persisted
+handle's ``provider`` key. The post-run GC backstop is the deliberate exception:
+RunPod's ``gc`` runs unconditionally (a name-reconstruction backstop for rN-suffixed
+endpoints the persisted handle can't name) and Vast's ``gc`` is called by name only
+when Vast is available (its billing-leak reap), so that path branches per provider.
 """
 
 from __future__ import annotations
@@ -64,11 +67,6 @@ class GpuClass:
     @property
     def validated(self) -> bool:  # validated on ANY provider
         return bool(self.validated_on)
-
-
-# GpuInfo is the historical name; keep it as an alias so the wide call-site surface
-# (catalog, vram, serving, tests) that imports ``GpuInfo`` keeps working.
-GpuInfo = GpuClass
 
 
 # Fallback hourly rates are RunPod secure-cloud on-demand (snapshot 2026-06-11); live
@@ -383,18 +381,13 @@ def resolve_gpu_policy(
     key = (requested or "").strip().lower()
     if key not in POLICY_NAMES:
         return canonical_gpu(requested)
-    from autoslm.catalog import MODELS
+    from autoslm.catalog import catalog_min_vram_gb
 
-    info = MODELS.get(model_id)
-    if info is not None:
-        # GRPO can need a bigger card than SFT (colocated vLLM rollout / 2nd weight copy);
-        # honor grpo_min_vram_gb so "auto" routes GRPO to the right tier. MUST stay in sync
-        # with providers.allocator.required_vram_gb (the submit-time path).
-        if (algorithm or "").lower() == "grpo" and info.grpo_min_vram_gb:
-            min_vram = info.grpo_min_vram_gb
-        else:
-            min_vram = info.min_vram_gb
-    else:
+    # Catalog models carry a measured floor (shared with the submit-time
+    # allocator via catalog.catalog_min_vram_gb); open models get the coarse
+    # parse-time estimate (no headroom — the allocator re-resolves live).
+    min_vram = catalog_min_vram_gb(model_id, algorithm)
+    if min_vram is None:
         from autoslm.engine.vram import estimate_vram_gb, fetch_hf_params_b
 
         params_b = fetch_hf_params_b(model_id)
@@ -538,14 +531,4 @@ class Provider(Protocol):
         provider rented that matches none of them is an orphan. Returns the destroyed
         resource ids. Providers without a standing-billing substrate (RunPod's
         serverless endpoints self-reap) implement this as a no-op."""
-        ...
-
-    # Serving hooks the current control plane needs (RunPod serves everything; Vast is
-    # a no-op for serving — see each provider's deploy/undeploy).
-    def deploy_serve(self, *args: Any, **kwargs: Any) -> Any:
-        """Provision an OpenAI-compatible serving endpoint for a trained adapter."""
-        ...
-
-    def undeploy_serve(self, *args: Any, **kwargs: Any) -> Any:
-        """Tear down a serving endpoint."""
         ...

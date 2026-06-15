@@ -9,8 +9,6 @@ import tempfile
 
 import pytest
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 
 class _FakeRubric:
     def __init__(self, funcs, weights):
@@ -156,7 +154,6 @@ def test_vf_load_id_strips_owner_slug():
 
 def test_load_verifiers_environment_uses_bare_ids(monkeypatch):
     """DEFECT: load must hand verifiers the BARE id (owner stripped)."""
-    import sys
     import types as _types
 
     from autoslm.envs import adapter as va
@@ -286,6 +283,46 @@ def test_zero_weight_func_runs_and_can_mutate_shared_state():
     assert state["seen"] is True
 
 
+def test_scores_breakdown_collision_does_not_clobber_existing_distinct_key():
+    """Colliding reward-func names get a probed exact-key suffix, never one a
+    prefix/length heuristic could recompute onto an already-recorded scorer.
+
+    The failing case for the old ``len([k for k in breakdown if k.startswith(name)])``
+    rule: a func named ``score`` followed by one named ``score_detail``, then a second
+    ``score``. After the first two keys (``score``, ``score_detail``) the heuristic counts
+    BOTH (both start with ``score``) and forms ``score_2`` for the third — fine here, but
+    a distinct-but-prefixed name in the wrong order makes it recompute an occupied key and
+    silently drop a scorer. Exact-key probing keeps every scorer."""
+    from autoslm.envs.adapter import VerifiersEnvironment
+
+    def make(name):
+        def f(**kwargs):
+            return 1.0
+
+        f.__name__ = name
+        return f
+
+    funcs = (make("score"), make("score_1"), make("score"), make("score"))
+
+    class _Rubric:
+        funcs = ()
+        weights = ()
+
+    _Rubric.funcs = funcs
+    _Rubric.weights = (1.0, 1.0, 1.0, 1.0)
+
+    class _Env:
+        rubric = _Rubric()
+        parser = None
+
+    env = VerifiersEnvironment(_Env(), "owner/x")
+    breakdown = env.scores_breakdown("anything", {"answer": "x"}, {})
+    # Every one of the 4 weighted scorers survives as a distinct key (+ total); none is
+    # overwritten. Probing yields: score, score_1, then score_2, score_3 for the dupes.
+    assert breakdown["total"] == 4.0
+    assert set(breakdown) == {"score", "score_1", "score_2", "score_3", "total"}
+
+
 def test_reward_available_uses_state_transcript_in_multi_turn():
     """In multi-turn mode, `completion`/`prompt` passed to reward funcs come from the
     accumulated `state` transcript (full message list), not the scalar completion wrapped as a
@@ -411,3 +448,70 @@ def test_worker_installs_env_via_prime():
     assert registry.worker_hub_env_ids("primeintellect/hendrycks-math") == [
         "primeintellect/hendrycks-math"
     ]
+
+
+def _multi_turn_env(vf_env):
+    """A VerifiersEnvironment forced into multi-turn mode (so env_reply/rollout_done run)."""
+    from autoslm.envs.adapter import VerifiersEnvironment
+
+    env = VerifiersEnvironment(vf_env, "owner/x")
+    env.multi_turn = True
+    return env
+
+
+def test_env_reply_propagates_real_env_response_error(capsys):
+    """A genuine bug in a MultiTurnEnv's `env_response` must NOT be silently swallowed as
+    [] (which would collapse every multi-turn rollout to a single turn and train a paid GRPO
+    run on degenerate transcripts). Mirroring `_invoke_reward`, env_reply logs context and
+    re-raises so the run fails fast. A NotImplementedError stays the benign "no env turn"."""
+
+    class _Env:
+        rubric = None
+        parser = None
+
+        async def env_response(self, messages, state):
+            raise RuntimeError("env boom")
+
+    env = _multi_turn_env(_Env())
+    with pytest.raises(RuntimeError, match="env boom"):
+        env.env_reply([{"role": "assistant", "content": "hi"}], {"turn": 1})
+    # the failure is surfaced, not vanished
+    assert "env_response failed" in capsys.readouterr().out
+
+    class _NotImpl:
+        rubric = None
+        parser = None
+
+        async def env_response(self, messages, state):
+            raise NotImplementedError
+
+    # NotImplementedError is the legitimate "no env turn" signal -> [] (does not raise).
+    assert _multi_turn_env(_NotImpl()).env_reply([], {"turn": 0}) == []
+
+
+def test_rollout_done_propagates_real_is_completed_error(capsys):
+    """A genuine bug in `is_completed` must NOT be silently treated as done=True (which would
+    truncate every rollout). It logs context and re-raises; a NotImplementedError remains the
+    benign "no completion check -> rely on the turn cap" signal."""
+
+    class _Env:
+        rubric = None
+        parser = None
+
+        async def is_completed(self, state):
+            raise RuntimeError("done boom")
+
+    env = _multi_turn_env(_Env())
+    with pytest.raises(RuntimeError, match="done boom"):
+        env.rollout_done({"turn": 1})
+    assert "is_completed failed" in capsys.readouterr().out
+
+    class _NotImpl:
+        rubric = None
+        parser = None
+
+        async def is_completed(self, state):
+            raise NotImplementedError
+
+    # NotImplementedError -> treat as done (turn-cap-only), does not raise.
+    assert _multi_turn_env(_NotImpl()).rollout_done({"turn": 0}) is True

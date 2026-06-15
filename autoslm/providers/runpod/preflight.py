@@ -28,26 +28,3 @@ def missing_credentials(require_hf: bool = True) -> list[str]:
             "`[train] hf_repo`, e.g. `export HUGGINGFACE_TOKEN=hf_...`"
         )
     return problems
-
-
-# Historical private name kept for callers/tests that import it.
-_missing_credentials = missing_credentials
-
-
-def check_run_preflight(require_hf: bool = True) -> None:
-    """Validate the RunPod-specific operator credentials for managed GPU runs.
-
-    This provider-level check covers only the RunPod-specific creds (``RUNPOD_API_KEY``)
-    plus the shared HF write token (``HUGGINGFACE_TOKEN``); it raises ``PreflightError``
-    listing every missing item and how to set it. ``PRIME_API_KEY`` (the worker uses it to
-    ``prime env install`` Hub envs) and the per-run ``[train] hf_repo`` are NOT validated
-    here — they are checked by the aggregated entrypoint
-    ``autoslm.flash.preflight.check_run_preflight``. No-op when nothing is missing.
-    """
-    problems = missing_credentials(require_hf=require_hf)
-    if problems:
-        raise PreflightError(
-            "the AutoSLM control plane is missing required operator configuration:\n"
-            + "\n".join(problems)
-            + "\n\nSet these on the control-plane host."
-        )

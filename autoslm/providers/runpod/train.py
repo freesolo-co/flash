@@ -204,10 +204,10 @@ def _train_body(input_data: dict) -> dict:
 
     env = dict(os.environ)
     env.update(overrides)
-    # A Freesolo bridge spec embeds the whole dataset in records, which can blow
-    # past the ~128 KiB per-env-string exec limit ("Argument list too long").
-    # Pass a large spec via a file (AUTOSLM_JOB_SPEC_PATH); keep the inline env
-    # var for small specs. load_job_spec_from_env reads either.
+    # A large job_spec_json (e.g. many inline params/dataset refs) can blow past the
+    # ~128 KiB per-env-string exec limit ("Argument list too long"). Pass a large spec
+    # via a file (AUTOSLM_JOB_SPEC_PATH); keep the inline env var for small specs.
+    # load_job_spec_from_env reads either.
     spec_json = input_data["job_spec_json"]
     if len(spec_json) > 96_000:
         spec_path = "/tmp/job_spec.json"
@@ -476,7 +476,7 @@ def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
     if name:
         match = [k for k in _ENDPOINT_CACHE if k == name]
     else:
-        match = [k for k in _ENDPOINT_CACHE if k == friendly or k.startswith(prefix)]
+        match = [k for k in _ENDPOINT_CACHE if k.startswith(prefix)]
     for key in match:
         handler = _ENDPOINT_CACHE.pop(key, None)
         ep = getattr(handler, "__self__", None) or getattr(handler, "endpoint", None)
@@ -490,7 +490,7 @@ def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
                     continue
 
 
-def _select_endpoint_resources(resources: dict, target: str) -> list:
+def _select_endpoint_resources(resources: dict, target: str) -> list[str]:
     """Resource ids whose resource ``.name`` contains ``target``.
 
     The live-provisioned resource is named ``live-<endpoint_name>``, so we match by substring
@@ -506,7 +506,7 @@ def _select_endpoint_resources(resources: dict, target: str) -> list:
     return out
 
 
-def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list:
+def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dict]:
     """Reliably tear down the remote Flash endpoint(s) for a run — cross-process.
 
     Unlike ``stop_endpoint`` (which only touches this process's in-memory cache), this looks
@@ -602,6 +602,9 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     )
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
+        # Compute substrate, read back by engine.worker for the RunMetrics record. Vast's
+        # on-instance bootstrap overrides this to "vast" (it reuses this same env builder).
+        "AUTOSLM_ARM": "runpod",
         "BENCH_HF_MODEL": spec.model,
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
@@ -698,8 +701,7 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         "phase": spec.phase,
         "seed": int(seed),
         "env": build_worker_env(spec, seed),
-        "extra_pip": list(spec.environment.pip)
-        or worker_pip_for_env(spec.environment.id, spec.environment.params),
+        "extra_pip": list(spec.environment.pip) or worker_pip_for_env(spec.environment.id),
         "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     if log is not None:

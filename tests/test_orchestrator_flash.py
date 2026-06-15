@@ -5,10 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
-import sys
 import tempfile
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
 def test_run_job_persists_flash_metrics(monkeypatch):
@@ -68,6 +65,3 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             m = json.load(f)
         assert m["trained_eval_acc"] == 0.7
         assert m["notes"]["runpod_gpu"] == "RTX 4090"
-
-        os.environ.pop("AUTOSLM_RUNS_DIR", None)
-        os.environ.pop("RESULTS_DIR", None)

@@ -19,7 +19,7 @@ dataset repo the trainer streamed it to) and returns an OpenAI-shaped chat-compl
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 
 from autoslm._logging import get_logger
 from autoslm.providers.base import canonical_gpu, gpu_short
@@ -64,24 +64,21 @@ _DEFAULT_SERVE_TIMEOUT_MS = 25 * 60 * 1000
 MODES = ("dev", "always-on")
 DEFAULT_IDLE_TIMEOUT_S = 300
 
-# Projected always-on cost uses live RunPod rates (static fallback): flash/pricing.py.
+# Projected always-on cost uses live RunPod rates (static fallback):
+# providers/runpod/pricing.py (hourly_rate).
 
 
 def serve_execution_timeout_ms() -> int:
-    import os
-
     return int(os.environ.get("AUTOSLM_SERVE_TIMEOUT_MS", str(_DEFAULT_SERVE_TIMEOUT_MS)))
 
 
 def resolve_serve_deps() -> list[str]:
-    import os
-
     explicit = os.environ.get("AUTOSLM_SERVE_DEPS")
     if explicit:
         # JSON list (use this for specs containing commas, e.g.
         # "transformers>=5.6,<5.11") or a whitespace-separated string. NOT comma-split:
         # a comma is part of a PEP 440 range and must not become two pip arguments
-        # (mirrors flash.train.resolve_worker_deps).
+        # (mirrors providers/runpod/train.resolve_worker_deps).
         if explicit.strip().startswith("["):
             import json as _json
 
@@ -107,10 +104,15 @@ class Deployment:
     idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S
     est_idle_cost_usd_per_day: float = 0.0
     state: str = "ready"
-    extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _language_model_only(model: str) -> bool:
+    """Natively-multimodal checkpoints are served text-only (the family-name check
+    mirrors the worker's config-based one; the client can't load the HF config)."""
+    return any(s in model for s in ("Qwen3.5", "Qwen3.6"))
 
 
 def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
@@ -327,8 +329,6 @@ def _get_serve_endpoint(
     mode: str = "dev",
     idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S,
 ):
-    import os
-
     os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
 
@@ -406,12 +406,9 @@ def deploy_adapter(
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
     _reject_qlora_serving(model)
     friendly = servable_gpu(gpu_name, model)
-    try:
-        from autoslm.providers.runpod.pricing import hourly_rate
+    from autoslm.runner import _gpu_rate
 
-        rate = hourly_rate(friendly)
-    except Exception:
-        rate = 0.80
+    rate = _gpu_rate(friendly)
     dep = Deployment(
         run_id=run_id,
         model=model,
@@ -437,7 +434,7 @@ def deploy_adapter(
             "adapter_prefix": adapter_prefix,
             "token": os.environ.get("HUGGINGFACE_TOKEN", ""),
             "max_lora_rank": max(64, int(lora_rank)),
-            "language_model_only": any(s in model for s in ("Qwen3.5", "Qwen3.6")),
+            "language_model_only": _language_model_only(model),
             # warm the engine with the run's thinking flag so the first real chat (same
             # flag) reuses the warmed subprocess instead of rebooting for --max-model-len.
             "thinking": thinking,
@@ -462,10 +459,14 @@ def undeploy_adapter(run_id: str, gpu_name: str = "RTX 5090") -> list[str]:
     from autoslm.providers.runpod import api as runpod_api
 
     name = serve_endpoint_name(gpu_name, run_id)
+    # find_endpoints_by_name is a substring filter, so guard with an exact-name
+    # check (mirrors providers/runpod/train.py terminate_endpoint) — otherwise a
+    # name that is a substring of another run's endpoint would over-delete and
+    # mis-report the returned `deleted` list.
     deleted = [
         ep["name"]
         for ep in runpod_api.find_endpoints_by_name(name)
-        if runpod_api.delete_endpoint(ep["id"])
+        if ep.get("name") == name and runpod_api.delete_endpoint(ep["id"])
     ]
     # Drop in-process handler cache entries for this endpoint (keyed name:mode:idle)
     # so a later redeploy constructs a fresh endpoint instead of reusing a handler
@@ -495,7 +496,7 @@ def chat(
     )
     # Natively-multimodal checkpoints are served text-only (no transformers needed
     # client-side; the family-name check mirrors the worker's config-based one).
-    language_model_only = any(s in model for s in ("Qwen3.5", "Qwen3.6"))
+    language_model_only = _language_model_only(model)
     payload = {
         "hf_repo": hf_repo,
         "model": model,

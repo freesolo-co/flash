@@ -3,8 +3,8 @@
 This is the operator-side component. It holds the
 provider credentials (``RUNPOD_API_KEY``, ``HUGGINGFACE_TOKEN``, ``PRIME_API_KEY`` —
 the worker needs the last to ``prime env install`` the run's Prime Hub env) and
-exposes the full run lifecycle to clients that authenticate with a claimed
-``sk-autoslm-...`` key — clients never see provider credentials.
+exposes the full run lifecycle to clients that authenticate with their freesolo API
+key (verified against the freesolo backend) — clients never see provider credentials.
 
 Run state truth stays in the runner's JSON files; SQLite (server/db.py) holds
 keys and run ownership. Runs the server owns are recovered on startup by re-attaching
@@ -14,7 +14,6 @@ to their persisted RunPod job handles.
 from __future__ import annotations
 
 import contextlib
-import ipaddress
 import os
 import threading
 import weakref
@@ -41,15 +40,6 @@ from . import auth, db
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
-
-
-def _is_ip_literal(value: str) -> bool:
-    """True if ``value`` parses as an IPv4/IPv6 address (used to validate an XFF hop)."""
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except ValueError:
-        return False
 
 
 class _RunLock:
@@ -143,7 +133,7 @@ def recover_runs(log=None) -> None:
 
 def create_app():
     try:
-        from fastapi import Depends, FastAPI, Header, HTTPException, Request
+        from fastapi import Depends, FastAPI, Header, HTTPException
     except ImportError as exc:
         raise RuntimeError(
             "the control plane needs the server extras: pip install 'autoslm-train[server]'"
@@ -165,7 +155,8 @@ def create_app():
         if key is None:
             raise HTTPException(
                 status_code=401,
-                detail="invalid or missing API key; claim one with `slm login`",
+                detail="invalid or missing API key; log in with `slm login` using your "
+                "freesolo API key",
             )
         return key
 
@@ -181,36 +172,6 @@ def create_app():
     @app.get("/v1/health")
     def health():
         return {"ok": True, "service": "autoslm", "version": __version__}
-
-    @app.post("/v1/keys")
-    def claim_key(payload: dict | None = None, request: Request = None):
-        email = ((payload or {}).get("email") or None) if payload else None
-        if email is not None and (not isinstance(email, str) or len(email) > 254):
-            raise HTTPException(status_code=400, detail="invalid email")
-        # Throttle key. NB on XFF semantics: the LEFTMOST entry is the (client-settable,
-        # spoofable) original client; entries are appended left->right, so the RIGHTMOST is
-        # the hop closest to us. The control plane is deployed behind a trusted edge proxy /
-        # load balancer that OVERWRITES (or appends a verified) X-Forwarded-For — so we take
-        # the last hop (the value that trusted proxy set) and never the client-controlled
-        # first hop. Operators with multiple proxies must ensure the edge strips/overwrites
-        # client-supplied XFF, else the last hop is still attacker-influenced. Fall back to
-        # the socket peer when no XFF header is present.
-        peer = request.client.host if request and request.client else ""
-        fwd = request.headers.get("x-forwarded-for") if request else None
-        # An empty/whitespace last hop (e.g. a trailing comma or "X-Forwarded-For: ") must
-        # NOT collapse everyone into one throttle bucket — fall back to the socket peer.
-        hop = fwd.split(",")[-1].strip() if fwd else ""
-        # Accept the hop as the throttle key only if it's a well-formed IP literal (bounded
-        # length first, so a pathological header is cheap to reject). Otherwise fall back to
-        # the socket peer — a direct/misconfigured deployment can't then grow the in-memory
-        # `_claims` map without bound by sending unique/oversized spoofed XFF values.
-        if not (hop and len(hop) <= 45 and _is_ip_literal(hop)):
-            hop = ""
-        client_ip = hop or peer
-        try:
-            return auth.claim_key(email=email, client_ip=client_ip)
-        except auth.ThrottledError as exc:
-            raise HTTPException(status_code=429, detail=str(exc)) from exc
 
     @app.get("/v1/me")
     def me(key: dict = Depends(require_key)):
@@ -509,9 +470,3 @@ def run_server(host: str = "127.0.0.1", port: int = 8080) -> None:
             "the control plane needs the server extras: pip install 'autoslm-train[server]'"
         ) from exc
     uvicorn.run(create_app(), host=host, port=port)
-
-
-try:
-    app = create_app()
-except RuntimeError:
-    app = None

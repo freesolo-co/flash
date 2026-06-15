@@ -6,12 +6,7 @@ against the catalog's per-model capability, carried by JobSpec end to end.
 
 from __future__ import annotations
 
-import os
-import sys
-
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from autoslm.catalog import ModelInfo
 from autoslm.schema import ConfigError, spec_from_dict, spec_from_file

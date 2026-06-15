@@ -8,13 +8,12 @@ persisted ids + VAST_API_KEY. Only verified DATACENTER offers are ever searched
 
 from __future__ import annotations
 
-import contextlib
-import json
-import os
 import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+from autoslm.providers._http import RestClient
 
 VAST_BASE = "https://console.vast.ai/api"
 
@@ -23,30 +22,23 @@ class VastApiError(RuntimeError):
     pass
 
 
+# Shared urllib client (path form: callers pass paths joined onto VAST_BASE).
+# Env-only by design, like RUNPOD_API_KEY: the operator sets VAST_API_KEY on the
+# control-plane host; it is never written to config files or shipped to workers.
+_CLIENT = RestClient(
+    env_var="VAST_API_KEY",
+    error_cls=VastApiError,
+    base_url=VAST_BASE,
+    missing_key_message=("VAST_API_KEY not configured on the control-plane host"),
+)
+
+
 def _api_key() -> str:
-    # Env-only by design, like RUNPOD_API_KEY: the operator sets VAST_API_KEY on the
-    # control-plane host; it is never written to config files or shipped to workers.
-    key = os.environ.get("VAST_API_KEY")
-    if not key:
-        raise VastApiError(
-            "VAST_API_KEY not configured on the control-plane host (see docs/self-hosting.md)"
-        )
-    return key
+    return _CLIENT.api_key()
 
 
 def _request(path: str, method: str = "GET", body: dict | None = None, timeout: float = 30.0):
-    req = urllib.request.Request(
-        f"{VAST_BASE}{path}",
-        method=method,
-        data=json.dumps(body).encode() if body is not None else None,
-        headers={
-            "Authorization": f"Bearer {_api_key()}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        return json.loads(raw) if raw else {}
+    return _CLIENT.request(path, method=method, body=body, timeout=timeout)
 
 
 def request_with_retries(
@@ -57,25 +49,9 @@ def request_with_retries(
     base_delay: float = 2.0,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
-    import random
-
-    last: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            return _request(path, method=method, body=body)
-        except urllib.error.HTTPError as e:
-            if e.code < 500 and e.code != 429:
-                detail = ""
-                with contextlib.suppress(Exception):
-                    detail = e.read().decode()[:500]
-                raise VastApiError(f"{method} {path} -> HTTP {e.code}: {e.reason} {detail}") from e
-            last = e
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            last = e
-        if attempt < retries:
-            delay = min(base_delay * (2 ** min(attempt, 6)), 30.0)
-            time.sleep(delay * random.uniform(0.7, 1.3))
-    raise VastApiError(f"{method} {path} failed after {retries + 1} attempts: {last}")
+    return _CLIENT.request_with_retries(
+        path, method=method, body=body, retries=retries, base_delay=base_delay
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +175,6 @@ def instance_logs(instance_id: int, tail: int = 400, wait_s: float = 20.0) -> st
     reach HF) are visible. Best-effort: returns None when logs are unavailable
     (e.g. the instance is already destroyed); never raises.
     """
-    import urllib.request
-
     try:
         out = request_with_retries(
             f"/v0/instances/request_logs/{int(instance_id)}/",

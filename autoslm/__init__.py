@@ -1,9 +1,9 @@
-"""AutoSLM — managed LoRA post-training: claim a key, train.
+"""AutoSLM — managed LoRA post-training: log in with your freesolo key, train.
 
 A focused developer experience (TOML run specs, pluggable environments,
-CLI/API/MCP entry points, adapter deployment). Users authenticate with a single
-AutoSLM key (`slm login`); the control plane runs each job on a dedicated managed
-consumer GPU (RTX 4090 / RTX 5090) behind the scenes.
+CLI/API/MCP entry points, adapter deployment). Users authenticate with their
+freesolo API key (`slm login`); the control plane runs each job on a managed
+GPU (RunPod or Vast.ai) behind the scenes.
 """
 
 __all__ = ["__version__"]

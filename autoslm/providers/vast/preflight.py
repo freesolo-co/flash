@@ -14,7 +14,12 @@ from autoslm.providers.vast.auth import load_api_key
 
 
 def missing_credentials(require_hf: bool = True) -> list[str]:
-    """Vast-related operator config that is missing (empty list == ready)."""
+    """Vast-related operator config that is missing (empty list == ready).
+
+    ``require_hf`` is accepted only for signature parity with the RunPod check and is
+    intentionally ignored: Vast has no provider-owned HF requirement (the shared
+    HUGGINGFACE_TOKEN is checked once centrally in ``providers.preflight``).
+    """
     problems: list[str] = []
     if not load_api_key():
         problems.append("  - VAST_API_KEY: the operator's Vast.ai API key (for the vast provider)")

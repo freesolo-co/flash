@@ -12,15 +12,12 @@ import os
 
 from autoslm.providers.runpod.preflight import (
     PreflightError,
-    _missing_credentials,
     missing_credentials,
 )
 
 __all__ = [
     "PreflightError",
-    "_missing_credentials",
     "check_run_preflight",
-    "missing_credentials",
 ]
 
 
@@ -50,12 +47,11 @@ def _preflight_provider_names() -> set[str]:
     (``AUTOSLM_PROVIDERS=vast``) must NOT demand RUNPOD_API_KEY, and conversely.
     Without a pin, RunPod is always required (the default substrate) and Vast is opt-in
     (preflighted only when VAST_API_KEY signals intent)."""
-    from autoslm.providers import PROVIDER_NAMES
+    from autoslm.providers import PROVIDER_NAMES, pinned_provider_names
 
-    pinned = os.environ.get("AUTOSLM_PROVIDERS")
-    if pinned:
-        names = {p.strip().lower() for p in pinned.split(",") if p.strip()}
-        return {n for n in PROVIDER_NAMES if n in names}
+    pinned = pinned_provider_names()
+    if pinned is not None:
+        return {n for n in PROVIDER_NAMES if n in pinned}
     names = {"runpod"}  # always-on default substrate
     if os.environ.get("VAST_API_KEY"):
         names.add("vast")  # opt-in: a partial vast config signals intent

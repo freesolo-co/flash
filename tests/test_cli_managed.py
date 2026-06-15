@@ -13,7 +13,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, ROOT)
 
 
 @pytest.fixture
@@ -30,17 +29,7 @@ def stub_server():
         def do_POST(self):
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
-            if self.path == "/v1/keys":
-                self._send(
-                    200,
-                    {
-                        "api_key": "sk-autoslm-stub0000",
-                        "key_prefix": "sk-autoslm-stub",
-                        "email": body.get("email"),
-                        "created_at": 0,
-                    },
-                )
-            elif self.path == "/v1/runs":
+            if self.path == "/v1/runs":
                 if self.headers.get("Authorization") != "Bearer fs-stub-key":
                     self._send(401, {"detail": "invalid or missing API key"})
                     return

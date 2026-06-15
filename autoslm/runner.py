@@ -1,4 +1,4 @@
-"""Platform runner: drives managed RunPod Flash GPUs (one per run)."""
+"""Platform runner: drives managed GPUs across providers (RunPod Flash + Vast), one allocation per seed."""
 
 from __future__ import annotations
 
@@ -127,7 +127,8 @@ def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
 
 
 def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -> RunStatus:
-    """Submit a job. In real mode this provisions a RunPod Flash GPU; dry-run only records state."""
+    """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
+    across the configured providers (RunPod Flash or Vast); dry-run only records state."""
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
     spec = JobSpec.from_dict(
         {**_with_model_disk(spec, info), "run_id": spec.run_id or new_run_id()}
@@ -183,6 +184,13 @@ def cancel_run(run_id: str) -> RunStatus:
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
         return status
+    # Whether the run was a live `deployed` serving run at cancel entry. This scopes the
+    # final `cancelled` transition's terminal override below: only a `deployed` run can have
+    # a concurrent undeploy (`mark_undeployed`) race this teardown and write a non-completion
+    # terminal `done`. A non-deployed run (running/provisioning/queued) has an in-flight
+    # TRAINING thread whose only terminal `done` is a GENUINE completion — which cancel must
+    # never clobber. See the final _update call for how this gates the override.
+    entered_deployed = status.state == "deployed"
     spec = JobSpec.from_dict(status.spec)
     remote = status.remote or {}
     # A deployed run also owns a serving endpoint (autoslm-serve-*) that the
@@ -204,8 +212,18 @@ def cancel_run(run_id: str) -> RunStatus:
             # once a deletion is confirmed (an empty deletion there is suspicious).
             dev_mode = (status.deployment or {}).get("mode", "dev") == "dev"
             if status.deployment and (deleted or dev_mode):
-                status.deployment = {**status.deployment, "state": "undeployed"}
-                _save_status(status)
+                # Mark the deployment inactive through the lock-guarded path so this write
+                # participates in the same _STATUS_LOCK as the rest of the runner. A bare
+                # _save_status here would persist a stale pre-teardown snapshot OUTSIDE the
+                # lock, bypassing serialization and potentially clobbering a concurrent field
+                # update. We mark ONLY the deployment field and leave the run's state alone
+                # (no state re-assert): a concurrent mark_undeployed can move the run to
+                # terminal `done` between our get_status read and this write, and _update's
+                # compare-and-set rejects ANY transition off a terminal state (even a
+                # same-field re-assert of the stale `deployed`), which would silently leave
+                # the deployment advertised as `ready`. mark_deployment_undeployed flips the
+                # deployment regardless of (and without disturbing) the current state.
+                mark_deployment_undeployed(run_id)
         except Exception:
             # Best-effort serving teardown: a failure here must not block the cancel
             # below (the run still flips to cancelled and the training endpoint is GC'd).
@@ -228,7 +246,24 @@ def cancel_run(run_id: str) -> RunStatus:
             # Best-effort remote stop; _gc_run_endpoints below still tears the endpoint down.
             pass
     _gc_run_endpoints(spec)
-    _update(run_id, "cancelled")
+    # Final transition to `cancelled`. The run was NON-terminal at entry, but teardown takes
+    # time and a terminal state can race in mid-teardown. We must distinguish two cases:
+    #
+    #   - A concurrent mark_undeployed() (an external `DELETE /v1/runs/{id}/deploy`) flipped a
+    #     `deployed` run to terminal `done`. That `done` is NOT a fresh result — it just
+    #     restored the run's pre-deploy completion marker while retiring serving. The user
+    #     explicitly asked to cancel, so this must be OVERRIDDEN to `cancelled`.
+    #   - A genuine training-COMPLETION `done` from the run's own training thread
+    #     (_run_job_inner / attach_run), which persisted real metrics+cost+artifacts. Cancel
+    #     must NEVER clobber that — the run finished, so the real result is preserved.
+    #
+    # These two races are mutually exclusive on the entry state: only a `deployed` run owns a
+    # deployment that mark_undeployed can race, and only a non-deployed (running/provisioning/
+    # queued) run has an in-flight training thread that can complete mid-teardown. So scope the
+    # terminal override to runs that were `deployed` at entry — there a racing `done` is always
+    # an undeploy artifact (cancel wins); elsewhere a racing `done` is a genuine completion that
+    # _update's CAS correctly protects (cancel loses to a real finish).
+    _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
     return get_status(run_id)
 
 
@@ -412,6 +447,28 @@ def mark_undeployed(run_id: str) -> RunStatus:
         return status
 
 
+def mark_deployment_undeployed(run_id: str) -> RunStatus:
+    """Flip ONLY the deployment field to ``undeployed``, leaving the run's state untouched.
+
+    Used by ``cancel_run`` to retire a deployed run's serving record. Unlike
+    ``mark_undeployed`` (which is a state transition: a live `deployed` run goes back to
+    `done`), this never asserts or changes the run state. That matters under the cancel
+    race: a concurrent ``mark_undeployed`` may have already moved the run to terminal
+    `done`, and ``_update``'s compare-and-set rejects any transition off a terminal state —
+    even re-asserting `deployed` to carry the deployment field — which would leave the
+    deployment advertised as `ready`. Marking the field directly (lock-guarded for
+    serialization) sidesteps the CAS so the deployment reliably ends `undeployed`, while the
+    trailing ``cancelled`` transition is left to ``_update``.
+    """
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        if status.deployment:
+            status.deployment = {**status.deployment, "state": "undeployed"}
+            status.updated_at = time.time()
+            _save_status(status)
+        return status
+
+
 def rollback_deploy(run_id: str, snapshot: RunStatus) -> None:
     """Restore the pre-deploy state/deployment after always-on provisioning fails.
 
@@ -431,7 +488,7 @@ def rollback_deploy(run_id: str, snapshot: RunStatus) -> None:
 
 def _run_job(spec: JobSpec) -> None:
     # Lazy import so dry-run / unit tests never construct a Flash endpoint.
-    from autoslm.providers.runpod.train import submit_train, upload_code
+    from autoslm.providers.runpod.train import upload_code
 
     # A cancel can land between the queued status being returned to the client and
     # this background thread starting; don't overwrite a terminal state (cancelled)
@@ -441,7 +498,7 @@ def _run_job(spec: JobSpec) -> None:
     _update(spec.run_id, "provisioning")
     log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
     try:
-        _run_job_inner(spec, log_path, submit_train, upload_code)
+        _run_job_inner(spec, log_path, upload_code)
     finally:
         # Endpoint GC: every run leaves its uniquely-named endpoint registered, and the
         # account-wide *max workers quota* (5 by default) counts registered endpoints —
@@ -716,7 +773,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
 
 
-def _run_job_inner(spec: JobSpec, log_path: str, submit_train, upload_code) -> None:
+def _run_job_inner(spec: JobSpec, log_path: str, upload_code) -> None:
     try:
         # Ship the slm package to the run's HF repo (the per-run [train] hf_repo) so the GPU
         # worker — which fetches code/** from that same repo — can run it.
@@ -844,8 +901,21 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     # the worker stamps "allocated_gpu" into metrics for the cost fallback below.
     gpu_type = metrics.get("allocated_gpu") or spec.gpu.type
     rate = _gpu_rate(gpu_type)
-    cost = metrics.get("cost_usd") or 0.0
-    if not cost:
+    # A non-runpod provider (e.g. Vast) stamps the real cost_usd from its offer's $/hr
+    # AND tags notes["provider"] with its own name — and a near-zero-duration run can
+    # legitimately stamp cost_usd == 0.0. The RunPod arm, by contrast, never stamps a real
+    # cost: it arrives with cost_usd absent (or a 0.0 placeholder) and no provider note, so
+    # the wall-based projection below must run. A bare `cost or 0.0` would treat the Vast
+    # 0.0 as "absent" and re-rate it against RunPod pricing while overwriting the provider
+    # notes, mis-attributing the run to 'runpod'. So fall back only when the cost is
+    # missing/zero AND it has NOT already been attributed to a non-runpod provider.
+    _notes = metrics.get("notes")
+    _stamped_provider = _notes.get("provider") if isinstance(_notes, dict) else None
+    _non_runpod = bool(_stamped_provider) and _stamped_provider != "runpod"
+    cost = metrics.get("cost_usd")
+    if cost or _non_runpod:
+        cost = float(cost or 0.0)
+    else:
         wall = float(metrics.get("wall_seconds") or 0.0)
         cost = wall / 3600.0 * rate
         metrics = {**metrics, "cost_usd": cost}
@@ -859,7 +929,7 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     return float(cost)
 
 
-def _update(run_id: str, state: str, **updates) -> None:
+def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> None:
     # The read-check-write below must be atomic: a concurrent `slm cancel` (also via
     # _update) landing between the get_status read and the _save_status write could
     # otherwise be clobbered by this stale background update, resurrecting a cancelled
@@ -874,7 +944,18 @@ def _update(run_id: str, state: str, **updates) -> None:
         # finished as the cancel arrived) can no longer resurrect the run. Same-state
         # writes still pass so terminal field updates (cost_usd, error, artifacts_dir)
         # are preserved.
-        if status.state in TERMINAL_STATES and state != status.state:
+        #
+        # allow_from_terminal is the NARROW escape hatch used ONLY by cancel_run's final
+        # `cancelled` transition, and ONLY when the run was `deployed` at cancel entry (see
+        # cancel_run). In that case an explicit user cancel must WIN over a racing
+        # mark_undeployed() that flipped the `deployed` run to terminal `done` mid-teardown —
+        # that `done` is an undeploy artifact (restoring the pre-deploy completion marker while
+        # retiring serving), not a fresh result. Without the override the `cancelled` write
+        # no-ops against the freshly-written `done` and the run wrongly ends `done` despite the
+        # user asking to cancel. cancel_run passes allow_from_terminal=False for a non-deployed
+        # run, so a GENUINE training-completion `done` racing in from the run's own training
+        # thread is protected by the CAS below — cancel correctly loses to a real finish.
+        if status.state in TERMINAL_STATES and state != status.state and not allow_from_terminal:
             return
         status.state = state
         status.updated_at = time.time()

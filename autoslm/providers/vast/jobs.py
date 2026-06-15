@@ -26,8 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from autoslm._logging import get_logger
+from autoslm.providers._poll import PollErrorTracker, make_say, surface_heartbeat
 from autoslm.providers.base import GPU_INFO, PollResult, min_cuda_modern, vast_gpu_for_offer
-from autoslm.providers.runpod.jobs import make_hf_heartbeat_reader
+from autoslm.providers.runpod.jobs import make_hf_heartbeat_reader, make_hf_text_reader
 from autoslm.providers.vast import api as vast_api
 
 logger = get_logger(__name__)
@@ -110,6 +111,9 @@ def usable_offers(
         if (
             r.get("hosting_type") != 1  # datacenter (the result field `datacenter` is null)
             or r.get("verification") != "verified"
+            # Exact class gate: guard against a board whose canonical class nominal VRAM
+            # is below the request (e.g. asking for 48 GB but the mapping landed on a
+            # 24 GB class) — the server-side gpu_ram filter only carries slack.
             or info.vram_gb < min_vram_gb
             or float(r.get("reliability2") or 0) < RELIABILITY_FLOOR
             or float(r.get("disk_space") or 0) < float(disk_gb)
@@ -137,7 +141,7 @@ def usable_offers(
     return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
 
 
-def vast_image(gpu: str) -> str:
+def vast_image() -> str:
     """Docker image for the worker. AUTOSLM_WORKER_IMAGE (fully baked) wins, then
     AUTOSLM_VAST_IMAGE, then the default cu128 stack image (every class — the
     Blackwell driver floor lives in the offer filter, not the image)."""
@@ -217,8 +221,7 @@ def build_payload(spec, seed: int, attempt: int) -> dict:
         "phase": spec.phase,
         "seed": int(seed),
         "env": build_worker_env(spec, seed),
-        "extra_pip": list(spec.environment.pip)
-        or worker_pip_for_env(spec.environment.id, spec.environment.params),
+        "extra_pip": list(spec.environment.pip) or worker_pip_for_env(spec.environment.id),
         "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
         "hf_prefix": f"{spec.phase}/{spec.run_id}/seed{seed}",
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
@@ -333,7 +336,7 @@ def deploy_and_submit(
         try:
             instance_id = vast_api.create_instance(
                 offer.offer_id,
-                image=vast_image(offer.gpu),
+                image=vast_image(),
                 disk_gb=_effective_disk_gb(spec),
                 env={},
                 onstart=onstart,
@@ -383,32 +386,11 @@ def deploy_and_submit(
     raise vast_api.VastApiError(f"all {len(tried)} vast offers rejected the job: {last_err}")
 
 
-def _make_hf_file_reader(hf_repo: str, path_in_repo: str, min_interval_s: float = 45.0):
-    """Rate-limited reader for one HF artifact's text content (None until it exists)."""
-    state = {"last": 0.0}
-
-    def read(force: bool = False) -> str | None:
-        if not hf_repo:
-            return None
-        if not force and time.time() - state["last"] < min_interval_s:
-            return None
-        state["last"] = time.time()
-        try:
-            from huggingface_hub import hf_hub_download
-
-            p = hf_hub_download(
-                hf_repo,
-                path_in_repo,
-                repo_type="dataset",
-                token=os.environ.get("HUGGINGFACE_TOKEN"),
-                force_download=True,
-            )
-            with open(p) as f:
-                return f.read()
-        except Exception:
-            return None
-
-    return read
+# Rate-limited reader for one HF artifact's text content (None until it exists). Shared
+# with runpod's poller via make_hf_text_reader; kept under this module-local name because
+# tests monkeypatch ``vast.jobs._make_hf_file_reader`` and the poll/failure paths below
+# resolve it as a module global (so a monkeypatch still takes effect).
+_make_hf_file_reader = make_hf_text_reader
 
 
 def _failure_detail(
@@ -418,11 +400,9 @@ def _failure_detail(
     parts = []
     if marker and marker.get("error"):
         parts.append(str(marker["error"]))
-    for mode in (phase,):
-        content = _make_hf_file_reader(hf_repo, f"{prefix}/error_{mode}.txt")(force=True)
-        if content:
-            parts.append(f"--- error_{mode}.txt ---\n{content[-2000:]}")
-            break
+    content = _make_hf_file_reader(hf_repo, f"{prefix}/error_{phase}.txt")(force=True)
+    if content:
+        parts.append(f"--- error_{phase}.txt ---\n{content[-2000:]}")
     if instance_id:
         # Early-bootstrap failures (pip/env errors before the worker can reach HF)
         # only ever appear on the container console.
@@ -455,9 +435,7 @@ def poll_vast_job(
                stall_after_s, or the client-side deadline passed.
     """
 
-    def say(msg: str):
-        if log is not None:
-            print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=log, flush=True)
+    say = make_say(log)
 
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
@@ -472,9 +450,11 @@ def poll_vast_job(
         if raw is None:
             return PollResult(False, failure="job_failed", detail="DONE without metrics.json")
         metrics = json.loads(raw)
-        # Bill to the worker's completion time, not now: on recovery the control plane
-        # may call this hours after the instance wrote DONE and self-destroyed, so
-        # time.time() would add the downtime. DONE carries the worker's time.time().
+        # Prefer the worker's DONE timestamp when present and sane; fall back to now.
+        # On delayed recovery the control plane may call this hours after the instance
+        # wrote DONE and self-destroyed, so billing to now would over-bill by the
+        # downtime — accepted because a missing/garbled DONE timestamp is rare. DONE
+        # carries the worker's time.time().
         end_ts = time.time()
         if done_content:
             try:
@@ -506,25 +486,23 @@ def poll_vast_job(
         except ValueError:
             return False
 
+    poll_errors = PollErrorTracker(say, interval_s)
+
     start = time.time()
     last_status = None
     last_hb_key = None
     last_progress = time.time()
     became_running = False
-    consecutive_poll_errors = 0
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
         try:
             inst = vast_api.get_instance(handle.instance_id)
-            consecutive_poll_errors = 0
+            poll_errors.reset()
         except vast_api.VastApiError as e:
-            consecutive_poll_errors += 1
-            say(f"poll error ({consecutive_poll_errors}): {e}")
-            if consecutive_poll_errors >= 8:
+            if poll_errors.record(e):
                 return PollResult(False, failure="poll_error", detail=str(e))
-            time.sleep(min(60, interval_s * consecutive_poll_errors))
             continue
         # Verified live: the instance-detail route TRANSIENTLY answers
         # {"instances": null} for perfectly healthy instances (and for brand-new ones
@@ -586,22 +564,10 @@ def poll_vast_job(
                 f"(image pull / host issue)",
             )
 
-        if heartbeat_reader is not None:
-            try:
-                hb = heartbeat_reader()
-            except Exception:
-                hb = None
-            if hb:
-                key = (hb.get("stage"), hb.get("step"), hb.get("ts"))
-                if key != last_hb_key:
-                    last_hb_key = key
-                    last_progress = time.time()
-                    stage, step, reward = hb.get("stage"), hb.get("step"), hb.get("reward")
-                    say(
-                        f"worker: stage={stage}"
-                        + (f" step={step}" if step is not None else "")
-                        + (f" reward={reward:.3f}" if isinstance(reward, int | float) else "")
-                    )
+        new_key, _stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
+        if new_key != last_hb_key:
+            last_hb_key = new_key
+            last_progress = time.time()
         if became_running and time.time() - last_progress > stall_after_s:
             return PollResult(
                 False,
@@ -627,6 +593,13 @@ def submit_run_vast(
     failure, stall, exception, KeyboardInterrupt — tears the paid instance down.
     """
     if offers is None:
+        # GPU_INFO is keyed by concrete GPU class; a policy word ("cheapest"/"auto") would
+        # KeyError opaquely here. The allocator resolves policy words to a concrete class
+        # upstream, so reaching this fallback with one is a caller bug — name it clearly.
+        if spec.gpu.type not in GPU_INFO:
+            raise vast_api.VastApiError(
+                f"submit_run_vast needs a concrete gpu class, got {spec.gpu.type!r}"
+            )
         info = GPU_INFO[spec.gpu.type]
         offers = [
             o
@@ -691,9 +664,14 @@ def destroy_run_instances(run_id: str) -> list[int]:
     prefixes = (run_id, f"autoslm-{run_id}")  # instance_label may force the prefix
     for inst in instances:
         iid = inst.get("id")
+        label = str(inst.get("label") or "")
+        # Match on the label boundary, not a raw string prefix (see ``sweep_orphans``):
+        # an instance label is ``f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"``, so a
+        # run's prefix must equal the label or be followed by the ``-s`` seed boundary.
+        # A bare ``startswith`` would let run ``100`` also destroy run ``1000``'s instances.
         if (
             iid
-            and str(inst.get("label") or "").startswith(prefixes)
+            and any(label == p or label.startswith(p + "-s") for p in prefixes)
             and vast_api.destroy_instance(int(iid))
         ):
             destroyed.append(int(iid))
@@ -723,7 +701,12 @@ def sweep_orphans(active_labels: set[str] | None = None) -> list[int]:
         label = str(inst.get("label") or "")
         if not label.startswith("autoslm-"):
             continue
-        if any(label.startswith(a) for a in active):
+        # Match on the label boundary, not a raw string prefix: an instance label is
+        # ``f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"`` (see ``instance_label``),
+        # so a live run's prefix must equal the label or be followed by the ``-s`` seed
+        # boundary. A bare ``startswith`` would let one run's prefix (e.g. ``autoslm-100``)
+        # shield another run's orphan (``autoslm-1000-...``) from the sweep.
+        if any(label == a or label.startswith(a + "-s") for a in active):
             continue
         iid = inst.get("id")
         if iid and vast_api.destroy_instance(int(iid)):

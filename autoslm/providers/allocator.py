@@ -47,16 +47,13 @@ def required_vram_gb(model_id: str, algorithm: str) -> int:
     get the coarse estimate sized for GRPO (the heavier phase of the usual SFT+GRPO
     pipeline) plus headroom. Unknown sizes fall back to the 24 GB tier (same as
     ``resolve_gpu_policy``)."""
-    from autoslm.catalog import MODELS
+    from autoslm.catalog import catalog_min_vram_gb
 
-    info = MODELS.get(model_id)
-    if info is not None:
-        # GRPO can need a bigger card than SFT (colocated vLLM rollout holds a 2nd copy of
-        # the weights + KV); grpo_min_vram_gb carries that floor when set (e.g. the 4-bit
-        # 36B MoE: SFT 32 GB, GRPO 80 GB). Otherwise GRPO sizes like SFT.
-        if (algorithm or "").lower() == "grpo" and info.grpo_min_vram_gb:
-            return int(info.grpo_min_vram_gb)
-        return int(info.min_vram_gb)
+    # Catalog entries carry measured minimums (shared with the parse-time
+    # resolve_gpu_policy via catalog.catalog_min_vram_gb, incl. the grpo floor).
+    catalog_vram = catalog_min_vram_gb(model_id, algorithm)
+    if catalog_vram is not None:
+        return catalog_vram
     from autoslm.engine.vram import estimate_vram_gb, fetch_hf_params_b
 
     params_b = fetch_hf_params_b(model_id)

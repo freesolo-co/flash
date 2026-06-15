@@ -29,8 +29,16 @@ from autoslm.client.config import load_credentials
 from autoslm.client.specs import spec_payload
 from autoslm.runner import TERMINAL_STATES, new_run_id
 from autoslm.schema import ConfigError, spec_from_file
+from autoslm.spec import _coerce_bool
 
 logger = get_logger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    """Truthiness of an env var, honoring the project's falsey convention
+    (``""``/``0``/``false``/``no``/``off`` are all False)."""
+    return _coerce_bool(os.environ.get(name, ""))
+
 
 # Exceptions that represent expected user/config errors: report them as a clean one-line
 # message instead of a Python traceback (use --debug / AUTOSLM_DEBUG=1 to see the full trace).
@@ -84,20 +92,20 @@ def main(argv: list[str] | None = None) -> int:
     whoami = sub.add_parser("whoami", help="show the identity behind your stored key")
     whoami.set_defaults(func=cmd_whoami)
 
-    lab = sub.add_parser("lab")
+    lab = sub.add_parser("lab", help="local authoring scaffolds")
     lab_sub = lab.add_subparsers(dest="lab_cmd", required=True)
-    setup = lab_sub.add_parser("setup")
+    setup = lab_sub.add_parser("setup", help="scaffold environments/ + configs/ in the cwd")
     setup.set_defaults(func=cmd_lab_setup)
 
-    models = sub.add_parser("models")
+    models = sub.add_parser("models", help="list supported base models")
     models.set_defaults(func=cmd_models)
 
     gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
     gpus.set_defaults(func=cmd_gpus)
 
-    env = sub.add_parser("env")
+    env = sub.add_parser("env", help="manage verifiers environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
-    init = env_sub.add_parser("init")
+    init = env_sub.add_parser("init", help="scaffold a new local verifiers environment")
     init.add_argument("name")
     init.set_defaults(func=cmd_env_init)
 
@@ -114,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
 
-    train = sub.add_parser("train")
+    train = sub.add_parser("train", help="submit a managed training run from a TOML config")
     train.add_argument("config")
     train.add_argument(
         "--config",
@@ -139,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     train.set_defaults(func=cmd_train)
 
-    status = sub.add_parser("status")
+    status = sub.add_parser("status", help="show a run's full status JSON")
     status.add_argument("run_id")
     status.set_defaults(func=cmd_status)
 
@@ -198,11 +206,11 @@ def main(argv: list[str] | None = None) -> int:
     chat.set_defaults(func=cmd_chat)
 
     # The control plane is operator-only and run as a separate one-off service via the
-    # `autoslm-server` console script (autoslm.server.app:main), not a `slm` subcommand.
+    # `autoslm-server` console script (autoslm.server.__main__:main), not a `slm` subcommand.
 
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
-    debug = getattr(args, "debug", False) or os.environ.get("AUTOSLM_DEBUG") not in (None, "", "0")
+    debug = getattr(args, "debug", False) or _env_flag("AUTOSLM_DEBUG")
     try:
         return args.func(args)
     except _USER_ERRORS as exc:
@@ -323,8 +331,6 @@ def cmd_models(args) -> int:
 
 def cmd_gpus(args) -> int:
     """List GPU classes, VRAM, per-provider $/hr and live validation."""
-    import sys
-
     from autoslm.providers import available_providers
     from autoslm.providers.base import GPU_INFO
     from autoslm.providers.runpod.pricing import live_rates
@@ -461,22 +467,22 @@ def cmd_env_install(args) -> int:
     # managed worker does NOT reinstall from this record — it installs Hub envs itself via an
     # authenticated `prime env install` on the GPU box. A Hub slug `owner/name` maps to the pip
     # wheel `name` on the Prime Intellect Hub index; we record that index alongside the env.
-    extras = {"extra_index_url": PRIME_HUB_INDEX} if "/" in env_id else None
-    is_hub_slug = "/" in env_id
+    # env_id is a validated "owner/name" slug (checked above), so it always maps to the Prime
+    # Hub index wheel; record that index alongside the env.
+    extras = {"extra_index_url": PRIME_HUB_INDEX}
     if shutil.which("prime"):
         # The `prime` CLI resolves the Hub + index itself (and is the only path that can fetch a
         # PRIVATE Hub env — autoslm publishes envs PRIVATE).
         cmd = ["prime", "env", "install", env_id]
     else:
-        if is_hub_slug:
-            # The pip fallback hits the PUBLIC Hub index only; it cannot fetch PRIVATE Hub envs
-            # (the public index never serves private wheels). Be explicit instead of letting a
-            # private install fail confusingly, but still attempt pip for the public case.
-            print(
-                f"note: `prime` CLI not found; attempting a pip install of {env_id} from the "
-                "PUBLIC Hub index. PRIVATE Hub envs require the `prime` CLI — install it "
-                "(https://docs.primeintellect.ai) to install a private env."
-            )
+        # The pip fallback hits the PUBLIC Hub index only; it cannot fetch PRIVATE Hub envs
+        # (the public index never serves private wheels). Be explicit instead of letting a
+        # private install fail confusingly, but still attempt pip for the public case.
+        print(
+            f"note: `prime` CLI not found; attempting a pip install of {env_id} from the "
+            "PUBLIC Hub index. PRIVATE Hub envs require the `prime` CLI — install it "
+            "(https://docs.primeintellect.ai) to install a private env."
+        )
         installer = (
             # `uv pip install` outside an active venv errors with "No virtual environment
             # found"; --python targets the CLI's own interpreter so a global/pipx `slm`
@@ -485,9 +491,7 @@ def cmd_env_install(args) -> int:
             if shutil.which("uv")
             else [sys.executable, "-m", "pip", "install"]
         )
-        cmd = [*installer, _bare_wheel_name(env_id)]
-        if extras:
-            cmd += ["--extra-index-url", PRIME_HUB_INDEX]
+        cmd = [*installer, _bare_wheel_name(env_id), "--extra-index-url", PRIME_HUB_INDEX]
     print("running:", " ".join(cmd))
     rc = subprocess.run(cmd).returncode
     if rc != 0:
@@ -537,9 +541,7 @@ def _push_is_version_conflict(text: str) -> bool:
 
 
 def _push_slug_from(env_dir, output: str) -> str | None:
-    import json
     import re
-    from pathlib import Path
 
     meta = Path(env_dir) / ".prime" / ".env-metadata.json"
     try:
@@ -560,7 +562,6 @@ def _config_env_name(config_path) -> str | None:
     version) instead of deriving a fresh name from the file stem. Owner still comes from the
     authenticated Prime account/team, so only the name part is consumed here."""
     import tomllib
-    from pathlib import Path
 
     path = Path(config_path)
     if not path.is_file():
@@ -623,7 +624,6 @@ def _run_prime_push(env_dir, *, is_new: bool, name: str | None = None) -> int:
 def cmd_env_push(args) -> int:
     import shutil
     import tempfile
-    from pathlib import Path
 
     if not shutil.which("prime"):
         print("the `prime` CLI is required to publish to the Environments Hub.")
@@ -687,8 +687,6 @@ def cmd_env_push(args) -> int:
         # `os.path.dirname(__file__)/datasets/...` read resolves on the worker); the whole package
         # dir ships via `[tool.hatch.build.targets.wheel] packages = ["<module>"]`.
         if data_dir.is_dir() and any(data_dir.iterdir()):
-            import shutil
-
             shutil.copytree(data_dir, pkg / module / "datasets")
         (pkg / "pyproject.toml").write_text(
             _ENV_PUSH_PYPROJECT.format(name=env_name, module=module, version=_PUSH_INITIAL_VERSION)
@@ -733,8 +731,8 @@ def cmd_train(args) -> int:
     return _follow_run(client, run_id)
 
 
-def _follow_run(client: ApiClient, run_id: str, final_status: bool = True) -> int:
-    """Poll logs (offset-paged) until the run reaches a terminal state."""
+def _poll_logs(client: ApiClient, run_id: str, interval: float) -> str:
+    """Stream offset-paged logs until the run reaches a terminal state; return that state."""
     offset = 0
     while True:
         page = client.get_logs(run_id, offset=offset)
@@ -742,11 +740,14 @@ def _follow_run(client: ApiClient, run_id: str, final_status: bool = True) -> in
             print(page["logs"], end="", flush=True)
         offset = page["offset"]
         if page["state"] in _CLI_DONE_STATES:
-            state = page["state"]
-            break
-        time.sleep(2.0)
-    if final_status:
-        print(json.dumps(client.get_run(run_id), indent=2))
+            return page["state"]
+        time.sleep(interval)
+
+
+def _follow_run(client: ApiClient, run_id: str) -> int:
+    """Poll logs until the run reaches a terminal state, then print the final status."""
+    state = _poll_logs(client, run_id, interval=2.0)
+    print(json.dumps(client.get_run(run_id), indent=2))
     return 0 if state in _OK_STATES else 1
 
 
@@ -809,15 +810,8 @@ def cmd_logs(args) -> int:
     if not args.follow:
         print(client.get_logs(args.run_id)["logs"], end="")
         return 0
-    offset = 0
-    while True:
-        page = client.get_logs(args.run_id, offset=offset)
-        if page["logs"]:
-            print(page["logs"], end="", flush=True)
-        offset = page["offset"]
-        if page["state"] in _CLI_DONE_STATES:
-            return 0
-        time.sleep(1.0)
+    _poll_logs(client, args.run_id, interval=1.0)
+    return 0
 
 
 def cmd_deploy(args) -> int:

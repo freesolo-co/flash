@@ -5,6 +5,8 @@ end-of-turn token, so the prefix-preserving token alignment + env_mask construct
 verified the same way a real template (Qwen-style <|im_start|>/<|im_end|>) would behave.
 """
 
+from __future__ import annotations
+
 import pytest
 
 from autoslm.engine.multiturn_rollout import (
