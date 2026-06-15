@@ -24,17 +24,20 @@ __all__ = [
 
 
 def _missing_hf_credentials() -> list[str]:
-    """The shared HF dataset-repo requirements (every substrate streams through HF)."""
+    """Shared run infra every substrate needs: the HF write token, plus PRIME_API_KEY (the
+    worker ``prime env install``s the run's Hub env regardless of the GPU provider). The HF
+    dataset repo is per-run (``[train] hf_repo``), not an operator var."""
     problems: list[str] = []
-    if not os.environ.get("HF_REPO"):
+    if not os.environ.get("PRIME_API_KEY"):
         problems.append(
-            "  - HF_REPO: a Hugging Face *dataset* repo for adapters/checkpoints, e.g. "
-            "`export HF_REPO=your-org/autoslm-runs`"
+            "  - PRIME_API_KEY: a Prime Intellect API key; the GPU worker uses it to "
+            "`prime env install` the run's Hub environment (public + private), e.g. "
+            "`export PRIME_API_KEY=pit_...`"
         )
     if not os.environ.get("HUGGINGFACE_TOKEN"):
         problems.append(
-            "  - HUGGINGFACE_TOKEN: a token with write access to HF_REPO, e.g. "
-            "`export HUGGINGFACE_TOKEN=hf_...`"
+            "  - HUGGINGFACE_TOKEN: a token with write access to each run's "
+            "`[train] hf_repo`, e.g. `export HUGGINGFACE_TOKEN=hf_...`"
         )
     return problems
 
@@ -64,15 +67,16 @@ def check_run_preflight(require_hf: bool = True) -> None:
     Only the providers this control plane actually uses are checked: the
     ``AUTOSLM_PROVIDERS`` pin selects the substrate set, so a Vast-only deployment never
     fails on a missing RUNPOD_API_KEY (and vice versa). Unpinned, RunPod's requirements
-    (RUNPOD_API_KEY + the shared HF_REPO/HUGGINGFACE_TOKEN) are always checked and a
-    configured Vast key adds its own check.
+    (RUNPOD_API_KEY + the shared PRIME_API_KEY/HUGGINGFACE_TOKEN) are always checked
+    and a configured Vast key adds its own check. The HF dataset repo is per-run
+    (``[train] hf_repo``), not an operator var.
     """
     selected = _preflight_provider_names()
     problems: list[str] = []
-    # The HF dataset repo + token are SHARED run infra (every substrate streams artifacts
-    # through HF), so they are checked once regardless of which providers are selected —
-    # a Vast-only plane still needs them. Each provider check is asked for its keys only
-    # (require_hf=False) so HF isn't double-reported.
+    # The HF write token is SHARED run infra (every substrate streams artifacts through HF),
+    # so it is checked once regardless of which providers are selected — a Vast-only plane
+    # still needs it. Each provider check is asked for its keys only (require_hf=False) so HF
+    # isn't double-reported. The HF dataset repo itself is per-run (``[train] hf_repo``).
     if "runpod" in selected:
         problems += missing_credentials(require_hf=False)
     if "vast" in selected:
@@ -85,5 +89,5 @@ def check_run_preflight(require_hf: bool = True) -> None:
         raise PreflightError(
             "the AutoSLM control plane is missing required operator configuration:\n"
             + "\n".join(problems)
-            + "\n\nSet these on the control-plane host (docs/self-hosting.md)."
+            + "\n\nSet these on the control-plane host."
         )

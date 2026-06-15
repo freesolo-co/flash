@@ -9,7 +9,7 @@ the config (the documented escape hatch) wins.
 
 from __future__ import annotations
 
-from autoslm.worker_spec import JobSpec
+from autoslm.spec import JobSpec
 
 
 def spec_payload(spec: JobSpec) -> dict:

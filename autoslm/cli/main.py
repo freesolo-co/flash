@@ -1,8 +1,9 @@
 """CLI for the managed AutoSLM service.
 
 Every run-lifecycle command is a thin HTTP call to the AutoSLM control plane —
-users authenticate with a single claimed key (`slm login`), never with provider
-credentials. Config parsing/validation and `--dry-run` stay fully local.
+users authenticate with their freesolo API key (`slm login` verifies it against
+the freesolo backend), never with provider credentials. Config parsing/validation
+and `--dry-run` stay fully local.
 """
 
 from __future__ import annotations
@@ -17,11 +18,17 @@ from pathlib import Path
 from autoslm import __version__
 from autoslm._logging import configure_logging, get_logger
 from autoslm.catalog import public_model_rows
-from autoslm.client import ApiClient, ClientError, client_from_config, save_credentials
+from autoslm.client import (
+    ApiClient,
+    ClientError,
+    client_from_config,
+    save_credentials,
+    verify_freesolo_key,
+)
 from autoslm.client.config import load_credentials
 from autoslm.client.specs import spec_payload
-from autoslm.config_schema import ConfigError, spec_from_file
-from autoslm.orchestrator import TERMINAL_STATES, new_run_id
+from autoslm.runner import TERMINAL_STATES, new_run_id
+from autoslm.schema import ConfigError, spec_from_file
 
 logger = get_logger(__name__)
 
@@ -59,10 +66,19 @@ def main(argv: list[str] | None = None) -> int:
     version = sub.add_parser("version", help="print the AutoSLM version")
     version.set_defaults(func=cmd_version)
 
-    login = sub.add_parser("login", help="claim (or store) your AutoSLM API key")
-    login.add_argument("--email", help="optionally tag the claimed key with your email")
-    login.add_argument("--api-key", help="store an existing AutoSLM key instead of claiming one")
-    login.add_argument("--api-url", help="control-plane URL (default: AUTOSLM_API_URL or hosted)")
+    login = sub.add_parser("login", help="log in with your freesolo API key (verified by freesolo)")
+    login.add_argument(
+        "--api-key",
+        help="your freesolo API key (default: FREESOLO_API_KEY); created in the dashboard",
+    )
+    login.add_argument(
+        "--freesolo-url",
+        dest="freesolo_url",
+        help="freesolo backend base URL (default: FREESOLO_BASE_URL or https://api.freesolo.co)",
+    )
+    login.add_argument(
+        "--api-url", help="autoslm control-plane URL for training calls (default: AUTOSLM_API_URL)"
+    )
     login.set_defaults(func=cmd_login)
 
     whoami = sub.add_parser("whoami", help="show the identity behind your stored key")
@@ -78,7 +94,6 @@ def main(argv: list[str] | None = None) -> int:
     models.set_defaults(func=cmd_models)
 
     gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
-    gpus.add_argument("--offline", action="store_true", help="static rates only (no API call)")
     gpus.set_defaults(func=cmd_gpus)
 
     env = sub.add_parser("env")
@@ -90,26 +105,14 @@ def main(argv: list[str] | None = None) -> int:
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
-    env_install = env_sub.add_parser("install", help="install a verifiers / Prime Hub environment")
-    env_install.add_argument("env_id", help="e.g. owner/name or a verifiers env id")
-    env_install.add_argument("--package", help="pip wheel name to install (default: the env name)")
-    env_install.add_argument(
-        "--extra-index-url",
-        dest="extra_index_url",
-        help="extra pip index (Prime Hub slugs default to the Prime index)",
-    )
+    env_install = env_sub.add_parser("install", help="install a published Prime Hub environment")
+    env_install.add_argument("env_id", help='the env id to install (a Hub slug, "owner/name")')
     env_install.set_defaults(func=cmd_env_install)
 
-    env_push = env_sub.add_parser("push", help="publish a local environment to the Prime Hub")
+    env_push = env_sub.add_parser(
+        "push", help="publish a local verifiers env to the Prime Hub (private); prints its env id"
+    )
     env_push.add_argument("path", nargs="?", default=".")
-    env_push.add_argument(
-        "--name",
-        default=None,
-        help="override the published env name (defaults to the file/dir name)",
-    )
-    env_push.add_argument(
-        "--visibility", default=None, help="environment visibility (PUBLIC/PRIVATE)"
-    )
     env_push.set_defaults(func=cmd_env_push)
 
     train = sub.add_parser("train")
@@ -188,15 +191,6 @@ def main(argv: list[str] | None = None) -> int:
     deployments = sub.add_parser("deployments", help="list active serving deployments")
     deployments.set_defaults(func=cmd_deployments)
 
-    proxy = sub.add_parser(
-        "serve-proxy",
-        help="local OpenAI-compatible HTTP shim (/v1/chat/completions) for a deployment",
-    )
-    proxy.add_argument("run_id")
-    proxy.add_argument("--port", type=int, default=8000)
-    proxy.add_argument("--host", default="127.0.0.1")
-    proxy.set_defaults(func=cmd_serve_proxy)
-
     chat = sub.add_parser("chat", help="chat with a deployed adapter")
     chat.add_argument("run_id")
     chat.add_argument("-m", "--message", required=True)
@@ -204,10 +198,8 @@ def main(argv: list[str] | None = None) -> int:
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
 
-    server = sub.add_parser("server", help="run the AutoSLM control plane (operator-side)")
-    server.add_argument("--host", default="127.0.0.1")
-    server.add_argument("--port", type=int, default=8080)
-    server.set_defaults(func=cmd_server)
+    # The control plane is operator-only and run as a separate one-off service via the
+    # `autoslm-server` console script (autoslm.server.app:main), not a `slm` subcommand.
 
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
@@ -230,18 +222,22 @@ def cmd_version(args) -> int:
 
 
 def cmd_login(args) -> int:
+    # Login is handled by the freesolo backend (not the autoslm control plane): the user
+    # supplies the freesolo API key they created in the dashboard, and we verify it against
+    # freesolo before storing it. The same key authenticates autoslm's control plane.
+    api_key = args.api_key or os.environ.get("FREESOLO_API_KEY")
+    if not api_key:
+        raise ClientError(
+            "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
+            "Create a key in your freesolo dashboard."
+        )
+    verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
     api_url = args.api_url or load_credentials()[0]
-    if args.api_key:
-        api_key = args.api_key
-    else:
-        claimed = ApiClient(api_url).claim_key(email=args.email)
-        api_key = claimed["api_key"]
-    # Persist the plane we actually authenticated against (it may have come from
-    # AUTOSLM_API_URL). save_credentials clears the stored url when it's the default, so
-    # logging into default also drops a stale custom url from a previous custom-URL login.
+    # save_credentials clears the stored url when it's the default, so logging into the
+    # default plane also drops a stale custom url from a previous custom-URL login.
     path = save_credentials(api_key, api_url=api_url)
     # Never echo the key itself; the stored file is the single source of truth.
-    print(f"logged in: key saved to {path}")
+    print(f"logged in: freesolo verified your key (saved to {path})")
     print("you're ready to train — try `slm train <config.toml>`")
     return 0
 
@@ -327,16 +323,13 @@ def cmd_models(args) -> int:
 
 
 def cmd_gpus(args) -> int:
-    """List GPU classes, VRAM, per-provider $/hr and validation (live unless --offline)."""
-    import os as _os
+    """List GPU classes, VRAM, per-provider $/hr and live validation."""
     import sys
 
     from autoslm.providers import available_providers
     from autoslm.providers.base import GPU_INFO
     from autoslm.providers.runpod.pricing import live_rates
 
-    if args.offline:
-        _os.environ["AUTOSLM_SKIP_NET"] = "1"
     rates = live_rates()
     # Cheapest live verified-datacenter offer per class (vast key + network only).
     vast_rates: dict[str, float] = {}
@@ -454,46 +447,54 @@ def cmd_env_install(args) -> int:
     from autoslm.envs.registry import _bare_wheel_name, record_installed_env
 
     env_id = args.env_id
-    package = args.package
-    extra_index = getattr(args, "extra_index_url", None)
-
-    # Prefer the `prime` CLI when present (it resolves the Hub + index), unless the user
-    # explicitly passed a pip --package/--extra-index-url (then use pip so the flag works).
-    if not package and not extra_index and shutil.which("prime"):
+    # Managed envs are Prime Hub slugs: exactly one `/` with non-empty owner and name. A bare
+    # id (`gsm8k`) or a malformed slug can't be resolved on the Hub, so reject it up front
+    # rather than letting `prime`/pip fail with an opaque error.
+    parts = env_id.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        print(
+            f'env id must be a Prime Hub slug "owner/name" (got {env_id!r})',
+            file=sys.stderr,
+        )
+        return 1
+    # `slm env install` is a LOCAL-client convenience: it installs the env into the client's
+    # interpreter and records it in ~/.autoslm/envs.json for local authoring/dry-run. The
+    # managed worker does NOT reinstall from this record — it installs Hub envs itself via an
+    # authenticated `prime env install` on the GPU box. A Hub slug `owner/name` maps to the pip
+    # wheel `name` on the Prime Intellect Hub index; we record that index alongside the env.
+    extras = {"extra_index_url": PRIME_HUB_INDEX} if "/" in env_id else None
+    is_hub_slug = "/" in env_id
+    if shutil.which("prime"):
+        # The `prime` CLI resolves the Hub + index itself (and is the only path that can fetch a
+        # PRIVATE Hub env — autoslm publishes envs PRIVATE).
         cmd = ["prime", "env", "install", env_id]
-        print("running:", " ".join(cmd))
-        rc = subprocess.run(cmd).returncode
-        if rc != 0:
-            print("install failed")
-            return rc
-        # owner/name slugs live on the Prime Hub index; record it so the managed
-        # worker can reinstall the wheel (worker_pip_for_env forwards it).
-        extras = {"extra_index_url": PRIME_HUB_INDEX} if "/" in env_id else None
-        record_installed_env(env_id, package=_bare_wheel_name(env_id), extras=extras)
     else:
-        # A Hub slug `owner/name` maps to the pip wheel `name`; such slugs live on the Prime
-        # Intellect Hub index by default (override with --extra-index-url).
-        pkg = package or _bare_wheel_name(env_id)
-        if extra_index is None and "/" in env_id:
-            extra_index = PRIME_HUB_INDEX
+        if is_hub_slug:
+            # The pip fallback hits the PUBLIC Hub index only; it cannot fetch PRIVATE Hub envs
+            # (the public index never serves private wheels). Be explicit instead of letting a
+            # private install fail confusingly, but still attempt pip for the public case.
+            print(
+                f"note: `prime` CLI not found; attempting a pip install of {env_id} from the "
+                "PUBLIC Hub index. PRIVATE Hub envs require the `prime` CLI — install it "
+                "(https://docs.primeintellect.ai) to install a private env."
+            )
         installer = (
-            # `uv pip install` outside an active venv errors with "No virtual
-            # environment found"; --python targets the CLI's own interpreter so a
-            # global/pipx `slm` install still records the env.
+            # `uv pip install` outside an active venv errors with "No virtual environment
+            # found"; --python targets the CLI's own interpreter so a global/pipx `slm`
+            # install still records the env.
             ["uv", "pip", "install", "--python", sys.executable]
             if shutil.which("uv")
             else [sys.executable, "-m", "pip", "install"]
         )
-        cmd = [*installer, pkg]
-        if extra_index:
-            cmd += ["--extra-index-url", extra_index]
-        print("running:", " ".join(cmd))
-        rc = subprocess.run(cmd).returncode
-        if rc != 0:
-            print("install failed")
-            return rc
-        extras = {"extra_index_url": extra_index} if extra_index else None
-        record_installed_env(env_id, package=pkg, extras=extras)
+        cmd = [*installer, _bare_wheel_name(env_id)]
+        if extras:
+            cmd += ["--extra-index-url", PRIME_HUB_INDEX]
+    print("running:", " ".join(cmd))
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print("install failed")
+        return rc
+    record_installed_env(env_id, package=_bare_wheel_name(env_id), extras=extras)
     print(f"installed {env_id}; recorded in ~/.autoslm/envs.json")
     print(f'use it via:  [environment]\\nid = "{env_id}"')
     return 0
@@ -553,18 +554,42 @@ def _push_slug_from(env_dir, output: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _run_prime_push(env_dir, name: str | None, visibility: str | None, *, is_new: bool) -> int:
-    """Run `prime env push` on a packaged env dir, climbing past version conflicts."""
+def _config_env_name(config_path) -> str | None:
+    """The `name` part of a sibling autoslm.toml's `[environment] id = "owner/name"`, or None.
+
+    Used so a bare `environment.py` re-publishes under its EXISTING Hub env (minting a new
+    version) instead of deriving a fresh name from the file stem. Owner still comes from the
+    authenticated Prime account/team, so only the name part is consumed here."""
+    import tomllib
+    from pathlib import Path
+
+    path = Path(config_path)
+    if not path.is_file():
+        return None
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    env = data.get("environment")
+    env_id = str(env.get("id") or "").strip() if isinstance(env, dict) else ""
+    if "/" in env_id:
+        name = env_id.split("/", 1)[1].strip()
+        return name or None
+    return None
+
+
+def _run_prime_push(env_dir, *, is_new: bool, name: str | None = None) -> int:
+    """Run `prime env push` on a packaged env dir (always PRIVATE), climbing past conflicts.
+
+    When `name` is given it is passed as `--name` so the push targets that exact Hub env."""
     import subprocess
 
-    # Match the agent publish path's invocation exactly (prime env push --plain --path <dir>).
-    base = ["prime", "env", "push", "--plain", "--path", str(env_dir)]
+    # Published environments are always PRIVATE — they can hold proprietary task data.
+    base = ["prime", "env", "push", "--plain", "--path", str(env_dir), "--visibility", "PRIVATE"]
     if name:
         base += ["--name", name]
-    if visibility:
-        base += ["--visibility", visibility]
-    # Mirror the agent publish path: disable prime's interactive version check so a push isn't
-    # blocked in non-interactive use (PRIME_API_KEY is inherited from the user's environment).
+    # Disable prime's interactive version check so a push isn't blocked in non-interactive
+    # use (PRIME_API_KEY is inherited from the user's environment).
     env = {**os.environ, "PRIME_DISABLE_VERSION_CHECK": "1"}
     auto_bump = not is_new  # a re-publish must land on a fresh version
     for _ in range(_PUSH_MAX_ATTEMPTS):
@@ -607,21 +632,32 @@ def cmd_env_push(args) -> int:
         return 1
 
     src = Path(args.path)
-    name = getattr(args, "name", None)
-    visibility = getattr(args, "visibility", None)
     if not src.exists():
         print(f"no such path: {src}", file=sys.stderr)
         return 1
 
-    # A proper env directory (has a pyproject.toml) is pushed as-is.
+    # A proper env directory (has a pyproject.toml) is pushed as-is; its name comes from the
+    # pyproject. Otherwise the published env name is derived from the env's path.
     if src.is_dir() and (src / "pyproject.toml").is_file():
-        return _run_prime_push(src, name, visibility, is_new=False)
+        # First attempt never forces --auto-bump; the version-conflict retry enables it only
+        # when the version actually collides, so a genuine first publish keeps its version.
+        return _run_prime_push(src, is_new=True)
 
-    # Otherwise wrap a bare verifiers module (a single .py, or a one-module dir) into a
-    # Prime-compatible env package and push that. `--auto-bump` retries handle re-publishes.
+    # Wrap a bare verifiers module (a single .py, or a one-module dir) into a Prime-compatible
+    # env package and push that. `--auto-bump` retries handle re-publishes. `data_dir` is a
+    # committed `datasets/` sibling of the module (if any); we ship it inside the package so an
+    # env that reads a `__file__`-relative data file still resolves once installed.
     if src.is_file() and src.suffix == ".py":
         module_source = src.read_text()
-        env_name = _push_env_name(name or src.stem)
+        # Re-publish to the SAME Hub env when a sibling autoslm.toml names one: use its
+        # `[environment] id` name part so an edited environment.py mints a new version of the
+        # existing env instead of creating a fresh env from the file stem.
+        sibling_name = _config_env_name(src.parent / "autoslm.toml")
+        env_name = sibling_name or _push_env_name(src.stem)
+        data_dir = src.parent / "datasets"
+        # A sibling config id means we're re-publishing an EXISTING Hub env: auto-bump from the
+        # first attempt so it doesn't restart at 0.1.0 and climb through version conflicts.
+        is_new = sibling_name is None
     elif src.is_dir():
         modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
         if len(modules) != 1:
@@ -633,7 +669,9 @@ def cmd_env_push(args) -> int:
             )
             return 1
         module_source = modules[0].read_text()
-        env_name = _push_env_name(name or src.name)
+        env_name = _push_env_name(src.name)
+        data_dir = src / "datasets"
+        is_new = True
     else:
         print(f"cannot publish {src}: expected a verifiers .py module or an env directory.")
         return 1
@@ -646,11 +684,18 @@ def cmd_env_push(args) -> int:
         pkg = Path(tmp)
         (pkg / module).mkdir()
         (pkg / module / "__init__.py").write_text(module_source)
+        # Ship committed sibling data inside the package dir (it lands at <module>/datasets/, so a
+        # `os.path.dirname(__file__)/datasets/...` read resolves on the worker); the whole package
+        # dir ships via `[tool.hatch.build.targets.wheel] packages = ["<module>"]`.
+        if data_dir.is_dir() and any(data_dir.iterdir()):
+            import shutil
+
+            shutil.copytree(data_dir, pkg / module / "datasets")
         (pkg / "pyproject.toml").write_text(
             _ENV_PUSH_PYPROJECT.format(name=env_name, module=module, version=_PUSH_INITIAL_VERSION)
         )
         (pkg / "README.md").write_text(f"# {env_name}\n\nAutoSLM verifiers environment.\n")
-        return _run_prime_push(pkg, env_name, visibility, is_new=True)
+        return _run_prime_push(pkg, is_new=is_new, name=env_name)
 
 
 def cmd_train(args) -> int:
@@ -814,15 +859,6 @@ def cmd_deployments(args) -> int:
     return 0
 
 
-def cmd_serve_proxy(args) -> int:
-    from autoslm.serve.proxy import run_proxy
-
-    client = client_from_config()
-    print(f"OpenAI-compatible proxy for {args.run_id} -> http://{args.host}:{args.port}/v1")
-    run_proxy(client=client, run_id=args.run_id, host=args.host, port=args.port)
-    return 0
-
-
 def cmd_chat(args) -> int:
     resp = client_from_config().chat(
         args.run_id,
@@ -831,13 +867,6 @@ def cmd_chat(args) -> int:
         max_tokens=args.max_tokens,
     )
     print(resp["choices"][0]["message"]["content"])
-    return 0
-
-
-def cmd_server(args) -> int:
-    from autoslm.server.app import run_server
-
-    run_server(host=args.host, port=args.port)
     return 0
 
 

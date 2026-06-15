@@ -74,7 +74,7 @@ class VastProvider:
         from autoslm.providers.runpod.durable import make_hf_heartbeat_reader
         from autoslm.providers.vast.durable import VastJobHandle, poll_vast_job
 
-        hf_repo = os.environ.get("HF_REPO", "")
+        hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         vh = VastJobHandle.from_dict(handle.to_dict())

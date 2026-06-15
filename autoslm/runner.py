@@ -1,4 +1,4 @@
-"""Platform orchestrator: drives managed RunPod Flash GPUs (one per run)."""
+"""Platform runner: drives managed RunPod Flash GPUs (one per run)."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ import uuid
 from dataclasses import asdict, dataclass, field
 
 from .catalog import ModelInfo, resolve_model
-from .worker_spec import JobSpec
+from .spec import JobSpec
 
 # Fixed local storage roots (not operator-configurable): run-state JSON + result artifacts,
 # both under the ~/.autoslm state dir (same root as server/db.py's DB_PATH) so a single
 # directory holds all control-plane state — mount one volume at ~/.autoslm to persist it.
-# Tests redirect them via monkeypatch.setattr(orchestrator, "RUNS_DIR"/"RESULTS_DIR").
+# Tests redirect them via monkeypatch.setattr(runner, "RUNS_DIR"/"RESULTS_DIR").
 _STATE_DIR = os.path.join(os.path.expanduser("~"), ".autoslm")
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
 RESULTS_DIR = os.path.join(_STATE_DIR, "results")
@@ -718,7 +718,9 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
 
 def _run_job_inner(spec: JobSpec, log_path: str, submit_train, upload_code) -> None:
     try:
-        upload_code()  # ship the slm package to HF so the GPU worker can run it
+        # Ship the slm package to the run's HF repo (the per-run [train] hf_repo) so the GPU
+        # worker — which fetches code/** from that same repo — can run it.
+        upload_code(spec.train.hf_repo)
         with open(log_path, "a") as log:
             _run_seed_loop(spec, log, start_index=0, prior_cost=0.0)
     except _RunCancelled:

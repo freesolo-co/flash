@@ -41,7 +41,7 @@ def stub_server():
                     },
                 )
             elif self.path == "/v1/runs":
-                if self.headers.get("Authorization") != "Bearer sk-autoslm-stub0000":
+                if self.headers.get("Authorization") != "Bearer fs-stub-key":
                     self._send(401, {"detail": "invalid or missing API key"})
                     return
                 self._send(
@@ -52,6 +52,11 @@ def stub_server():
                 self._send(404, {"detail": f"unknown path {self.path}"})
 
         def do_GET(self):
+            if self.path == "/api/auth/verify":
+                # Login is handled by the freesolo backend: it verifies the bearer key.
+                ok = self.headers.get("Authorization") == "Bearer fs-stub-key"
+                self._send(200 if ok else 401, {"ok": ok})
+                return
             if self.path == "/v1/runs":
                 self._send(
                     200,
@@ -84,8 +89,10 @@ def stub_server():
 
 def _run(args, home: str, api_url: str):
     env = os.environ.copy()
+    env.pop("FREESOLO_API_KEY", None)
     env.pop("AUTOSLM_API_KEY", None)
-    env.update({"HOME": home, "AUTOSLM_API_URL": api_url})
+    # The stub serves both the freesolo verify endpoint and the autoslm control plane.
+    env.update({"HOME": home, "AUTOSLM_API_URL": api_url, "FREESOLO_BASE_URL": api_url})
     return subprocess.run(
         [sys.executable, "-m", "autoslm.cli.main", *args],
         cwd=ROOT,
@@ -96,27 +103,27 @@ def _run(args, home: str, api_url: str):
     )
 
 
-def test_login_claims_key_and_train_submits(stub_server, tmp_path):
+def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     home = str(tmp_path)
 
-    # `slm login` (no args) claims a key from the control plane.
-    proc = _run(["login"], home=home, api_url=stub_server)
+    # `slm login` verifies the freesolo key against the freesolo backend, then stores it.
+    proc = _run(["login", "--api-key", "fs-stub-key"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     # The key must never be echoed; only the storage location is printed.
-    assert "sk-autoslm-stub" not in proc.stdout
-    assert "key saved to" in proc.stdout
+    assert "fs-stub-key" not in proc.stdout
+    assert "saved to" in proc.stdout
 
     cfg = os.path.join(home, ".autoslm", "config.json")
     with open(cfg) as f:
         cfg_data = json.load(f)
-    assert cfg_data["api_key"] == "sk-autoslm-stub0000"
+    assert cfg_data["api_key"] == "fs-stub-key"
     assert stat.S_IMODE(os.stat(cfg).st_mode) == 0o600
 
     # `slm train --background` posts the locally-validated spec and prints the handle.
     toml = tmp_path / "run.toml"
     toml.write_text(
         'model = "Qwen/Qwen3-4B-Instruct-2507"\nalgorithm = "grpo"\n'
-        '[environment]\nid = "gsm8k"\n[train]\nsteps = 1\nseeds = [0]\n'
+        '[environment]\nid = "primeintellect/gsm8k"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
     )
     proc = _run(["train", str(toml), "--background"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr

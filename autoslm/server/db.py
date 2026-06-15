@@ -1,11 +1,11 @@
 """SQLite store for the managed control plane: API keys + run ownership.
 
-Run *state* stays in the orchestrator's JSON files (``orchestrator.RUNS_DIR``) — the
+Run *state* stays in the runner's JSON files (``runner.RUNS_DIR``) — the
 battle-tested durable/attach/cancel paths all read those. This database is only the
 key registry and the run -> key ownership index that makes the server multi-tenant.
 
 Connections are opened per operation (cheap for SQLite, avoids cross-thread state;
-the orchestrator runs jobs in daemon threads inside the same process).
+the runner runs jobs in daemon threads inside the same process).
 """
 
 from __future__ import annotations
@@ -98,6 +98,27 @@ def ensure_internal_key(api_key: str, email: str = "freesolo-internal") -> dict:
     if row is None:  # pragma: no cover - the row was just inserted
         raise RuntimeError("failed to provision the internal service key")
     return row
+
+
+def ensure_external_key(api_key: str, email: str = "freesolo-user") -> dict | None:
+    """Provision a per-token row for a verified external (freesolo USER) key (idempotent).
+
+    Unlike :func:`ensure_internal_key` (one shared service identity), this keys a distinct
+    row by the presented token's hash, so each freesolo user key gets its OWN run-ownership
+    identity (the runs.key_id foreign key then scopes runs per user). The full token is never
+    stored — only its sha256, like any minted key.
+
+    Returns ``None`` (not a row) when the token's row already exists but is DISABLED:
+    ``INSERT OR IGNORE`` won't revive it and ``lookup_key`` filters disabled rows, so a
+    revoked key is rejected (401) by the caller instead of surfacing as a 500."""
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (hash_key(api_key), "freesolo", email, now),
+        )
+    return lookup_key(api_key)
 
 
 def lookup_key(api_key: str) -> dict | None:

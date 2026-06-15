@@ -27,7 +27,7 @@ class ModelInfo:
     experimental: bool = False
     notes: str = ""
     # Worker container disk this model needs (GB). 0 = the platform default (64 GB)
-    # suffices. The orchestrator raises gpu.disk_gb to at least this, so big-checkpoint
+    # suffices. The runner raises gpu.disk_gb to at least this, so big-checkpoint
     # models (MoE tiers whose bf16 weights alone exceed 64 GB) work out of the box.
     min_disk_gb: int = 0
     # Optional pre-quantized weights repo for the 4bit-qlora tier: the worker loads

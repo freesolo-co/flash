@@ -24,7 +24,7 @@ def test_catalog_validation():
 
 
 def test_config_to_job_spec():
-    from autoslm.config_schema import spec_from_file
+    from autoslm.schema import spec_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "run.toml")
@@ -33,10 +33,11 @@ def test_config_to_job_spec():
                 'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
                 'algorithm = "grpo"\n'
                 "[environment]\n"
-                'id = "gsm8k"\n'
+                'id = "primeintellect/gsm8k"\n'
                 "[train]\n"
                 "steps = 10\n"
                 "seeds = [0, 1]\n"
+                'hf_repo = "owner/runs"\n'
                 "[gpu]\n"
                 'type = "RTX 5090"\n'
             )
@@ -57,27 +58,27 @@ def test_environment_registry():
 
 def test_orchestrator_dry_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import autoslm.orchestrator as orchestrator
+        import autoslm.runner as runner
 
-        importlib.reload(orchestrator)
+        importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
-        monkeypatch.setattr(orchestrator, "RUNS_DIR", tmp)
-        from autoslm.worker_spec import JobSpec
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        from autoslm.spec import JobSpec
 
         spec = JobSpec(run_id="dry", model="Qwen/Qwen3-4B-Instruct-2507", algorithm="grpo")
-        status = orchestrator.submit_job(spec, dry_run=True)
+        status = runner.submit_job(spec, dry_run=True)
         assert status.state == "dry_run"
-        assert orchestrator.get_status("dry").spec["model"] == "Qwen/Qwen3-4B-Instruct-2507"
+        assert runner.get_status("dry").spec["model"] == "Qwen/Qwen3-4B-Instruct-2507"
 
 
 def test_mcp_handler_dry_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         import autoslm.mcp.server as mcp
-        import autoslm.orchestrator as orchestrator
+        import autoslm.runner as runner
 
-        importlib.reload(orchestrator)
+        importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
-        monkeypatch.setattr(orchestrator, "RUNS_DIR", tmp)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
         importlib.reload(mcp)
         result = mcp.handle(
             {
@@ -86,8 +87,8 @@ def test_mcp_handler_dry_run(monkeypatch):
                     "run_id": "mcp-dry",
                     "model": "Qwen/Qwen3-4B-Instruct-2507",
                     "algorithm": "grpo",
-                    "environment": {"id": "gsm8k"},
-                    "train": {"steps": 1, "seeds": [0]},
+                    "environment": {"id": "primeintellect/gsm8k"},
+                    "train": {"steps": 1, "seeds": [0], "hf_repo": "owner/runs"},
                     "gpu": {"type": "RTX 5090"},
                     "dry_run": True,
                 },
@@ -105,10 +106,11 @@ def test_cli_train_dry_run():
                 'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
                 'algorithm = "grpo"\n'
                 "[environment]\n"
-                'id = "gsm8k"\n'
+                'id = "primeintellect/gsm8k"\n'
                 "[train]\n"
                 "steps = 1\n"
                 "seeds = [0]\n"
+                'hf_repo = "owner/runs"\n'
                 "[gpu]\n"
                 'type = "RTX 5090"\n'
             )

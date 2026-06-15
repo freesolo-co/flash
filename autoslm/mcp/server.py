@@ -17,7 +17,7 @@ from collections.abc import Callable
 from autoslm.catalog import public_model_rows
 from autoslm.client import client_from_config
 from autoslm.client.specs import spec_payload
-from autoslm.config_schema import spec_from_dict
+from autoslm.schema import spec_from_dict
 
 
 def _spec_from_args(args: dict, run_id: str | None = None):

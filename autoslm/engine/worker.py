@@ -9,7 +9,7 @@ Hugging Face dataset repo. HF checkpoints give preemption resilience: if a worke
 recycled mid-run we resume from the latest uploaded checkpoint. Metrics are also
 returned directly to the caller by the Flash endpoint.
 
-Environment variables (set by the Flash endpoint / orchestrator):
+Environment variables (set by the Flash endpoint / runner):
   RUN_MODE      sft|rl
   SEED          int
   HF_REPO       Hugging Face dataset repo for artifacts (e.g. your-org/autoslm-runs)
@@ -32,7 +32,7 @@ from autoslm.engine.accounting import RunMetrics
 # Shared, substrate-neutral fine-tuning internals (live in this same package).
 from autoslm.engine.recipe import RECIPE
 from autoslm.envs.registry import load_environment
-from autoslm.worker_spec import load_job_spec_from_env
+from autoslm.spec import load_job_spec_from_env
 
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")

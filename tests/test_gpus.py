@@ -104,15 +104,15 @@ def test_resolve_gpu_policy(monkeypatch):
 
 
 def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
-    from autoslm.config_schema import ConfigError, spec_from_dict
+    from autoslm.schema import ConfigError, spec_from_dict
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
     raw = {
         "model": "Qwen/Qwen3-4B-Instruct-2507",
         "algorithm": "sft",
-        "environment": {"id": "gsm8k"},
-        "train": {"epochs": 1, "seeds": [0]},
+        "environment": {"id": "primeintellect/gsm8k"},
+        "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "gpu": {"type": "cheapest"},
     }
     spec = spec_from_dict(raw, run_id="x")
@@ -153,13 +153,13 @@ def test_gpu_short():
 
 
 def test_config_rejects_unsupported_gpu():
-    from autoslm.config_schema import ConfigError, spec_from_dict
+    from autoslm.schema import ConfigError, spec_from_dict
 
     raw = {
         "model": "Qwen/Qwen3-4B-Instruct-2507",
         "algorithm": "grpo",
-        "environment": {"id": "gsm8k"},
-        "train": {"steps": 1, "seeds": [0]},
+        "environment": {"id": "primeintellect/gsm8k"},
+        "train": {"steps": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "gpu": {"type": "L40S"},  # not a managed GPU class
     }
     with pytest.raises(ConfigError):
@@ -167,13 +167,13 @@ def test_config_rejects_unsupported_gpu():
 
 
 def test_config_defaults_gpu_from_model():
-    from autoslm.config_schema import spec_from_dict
+    from autoslm.schema import spec_from_dict
 
     raw = {
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",  # 9B is SFT-only (colocated GRPO does not fit 32 GB bf16)
-        "environment": {"id": "gsm8k"},
-        "train": {"epochs": 1, "seeds": [0]},
+        "environment": {"id": "primeintellect/gsm8k"},
+        "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
     assert spec.gpu.type == "RTX 5090"  # 9B needs >=32GB
@@ -182,7 +182,7 @@ def test_config_defaults_gpu_from_model():
 def test_build_worker_env():
     from autoslm.flash.train import build_worker_env
 
-    from autoslm.worker_spec import JobSpec, TrainSpec
+    from autoslm.spec import JobSpec, TrainSpec
 
     spec = JobSpec(
         run_id="r1",

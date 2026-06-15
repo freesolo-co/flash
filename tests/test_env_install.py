@@ -38,9 +38,7 @@ def test_env_install_prime_hub_slug(monkeypatch):
         # No `prime` CLI; `uv` present -> pip path via uv.
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
-        args = argparse.Namespace(
-            env_id="primeintellect/hendrycks-math", package=None, extra_index_url=None
-        )
+        args = argparse.Namespace(env_id="primeintellect/hendrycks-math")
         rc = cli.cmd_env_install(args)
         assert rc == 0
 
@@ -63,36 +61,21 @@ def test_env_install_prime_hub_slug(monkeypatch):
         importlib.reload(registry)
 
 
-def test_env_install_respects_explicit_package_and_index(monkeypatch):
-    """A user-supplied --package/--extra-index-url must be honored (not overridden)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setenv("AUTOSLM_ENVS_MANIFEST", os.path.join(tmp, "envs.json"))
-        import autoslm.envs.registry as registry
-        from autoslm.cli import main as cli
+def test_env_install_rejects_bare_id(monkeypatch, capsys):
+    # The managed service is Prime Hub slug-only (`owner/name`). A bare id can't be resolved,
+    # so `cmd_env_install` must reject it (return 1) WITHOUT shelling out to prime/pip.
+    from autoslm.cli import main as cli
 
-        importlib.reload(registry)
+    called = {"n": 0}
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: called.__setitem__("n", called["n"] + 1))
 
-        recorded = {}
-        monkeypatch.setattr(
-            "subprocess.run", lambda cmd, *a, **k: recorded.update(cmd=cmd) or _FakeProc()
-        )
-        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    rc = cli.cmd_env_install(argparse.Namespace(env_id="gsm8k"))
+    assert rc == 1
+    assert called["n"] == 0  # no install attempted
+    err = capsys.readouterr().err
+    assert "owner/name" in err
 
-        args = argparse.Namespace(
-            env_id="owner/custom",
-            package="my-wheel==1.2",
-            extra_index_url="https://example.com/simple/",
-        )
-        rc = cli.cmd_env_install(args)
-        assert rc == 0
-        cmd = recorded["cmd"]
-        assert "my-wheel==1.2" in cmd
-        assert "https://example.com/simple/" in cmd
-
-        with open(os.path.join(tmp, "envs.json")) as f:
-            manifest = json.load(f)
-        assert manifest["owner/custom"]["package"] == "my-wheel==1.2"
-        assert manifest["owner/custom"]["extra_index_url"] == "https://example.com/simple/"
-
-        monkeypatch.delenv("AUTOSLM_ENVS_MANIFEST", raising=False)
-        importlib.reload(registry)
+    # Malformed slugs (trailing slash, extra segment) are rejected too.
+    assert cli.cmd_env_install(argparse.Namespace(env_id="owner/")) == 1
+    assert cli.cmd_env_install(argparse.Namespace(env_id="a/b/c")) == 1
+    assert called["n"] == 0

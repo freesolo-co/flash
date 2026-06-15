@@ -32,20 +32,20 @@ PROVIDER_METHODS = (
 
 
 def test_registry_lists_both_providers():
-    from autoslm.providers import PROVIDER_NAMES, all_providers, get_provider
+    from autoslm.providers import PROVIDER_NAMES, get_provider
 
     assert PROVIDER_NAMES == ("runpod", "vast")
-    assert {p.name for p in all_providers()} == {"runpod", "vast"}
+    assert {get_provider(n).name for n in PROVIDER_NAMES} == {"runpod", "vast"}
     assert get_provider("RunPod ").name == "runpod"  # case/space-insensitive
     with pytest.raises(KeyError):
         get_provider("lambda")
 
 
 def test_both_providers_implement_the_interface():
-    from autoslm.providers import all_providers
+    from autoslm.providers import PROVIDER_NAMES, get_provider
     from autoslm.providers.base import Provider
 
-    for prov in all_providers():
+    for prov in [get_provider(n) for n in PROVIDER_NAMES]:
         assert isinstance(prov, Provider)  # runtime_checkable Protocol
         for meth in PROVIDER_METHODS:
             assert callable(getattr(prov, meth)), f"{prov.name} missing {meth}"
@@ -104,10 +104,10 @@ def test_sweep_orphans_is_part_of_the_protocol():
     """sweep_orphans is a base.Provider method on BOTH providers (Fix #9): RunPod is a
     no-op (serverless endpoints self-reap), Vast reaps instances. The server iterates
     providers generically through this hook — never a hardcoded `get_provider('vast')`."""
-    from autoslm.providers import all_providers, get_provider
+    from autoslm.providers import PROVIDER_NAMES, get_provider
     from autoslm.providers.base import Provider
 
-    for prov in all_providers():
+    for prov in [get_provider(n) for n in PROVIDER_NAMES]:
         assert hasattr(prov, "sweep_orphans")
     # RunPod's is a no-op and never raises (no live API call).
     assert get_provider("runpod").sweep_orphans(active_labels={"autoslm-x"}) == []

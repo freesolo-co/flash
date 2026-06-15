@@ -10,9 +10,9 @@ durable,train,preflight}.py``), so they are interchangeable:
   runpod  serverless Flash endpoints (the original substrate)
   vast    verified-datacenter instances (REST only)
 
-This module is the registry: ``get_provider(name)`` / ``all_providers()`` /
-``PROVIDER_NAMES``. ``allocator.allocate`` is the cross-provider "cheapest GPU that
-fits" policy that iterates every registered provider.
+This module is the registry: ``get_provider(name)`` / ``PROVIDER_NAMES``.
+``allocator.allocate`` is the cross-provider "cheapest GPU that fits" policy that
+iterates every registered provider.
 """
 
 from __future__ import annotations
@@ -47,11 +47,6 @@ def _get_provider(key: str) -> Provider:
 
         return PROVIDER
     raise KeyError(f"unknown provider {key!r} (known: {', '.join(PROVIDER_NAMES)})")
-
-
-def all_providers() -> list[Provider]:
-    """Every registered provider, in registry order (configured or not)."""
-    return [get_provider(n) for n in PROVIDER_NAMES]
 
 
 def available_providers() -> tuple[str, ...]:

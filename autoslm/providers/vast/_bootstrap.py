@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -161,6 +162,30 @@ def main() -> int:
             # / verifiers extras) must stop NOW with an actionable error, not proceed to
             # a later import crash while the paid instance runs (matches the RunPod path).
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
+        # Install the run's verifiers environment(s) from the Prime Hub via the
+        # authenticated `prime` CLI (mirrors runpod/train.py:_train_body). The public pip
+        # index does not serve PRIVATE env wheels; `prime env install` pulls/builds/installs
+        # public + private alike, authenticated by PRIME_API_KEY forwarded in the payload env.
+        hub_env_ids = payload.get("hub_env_ids") or []
+        if hub_env_ids:
+            worker_env = {k: str(v) for k, v in (payload.get("env") or {}).items()}
+            prime_key = worker_env.get("PRIME_API_KEY") or os.environ.get("PRIME_API_KEY")
+            if not prime_key:
+                raise RuntimeError(
+                    "PRIME_API_KEY is required to install the Prime Hub environment on the worker"
+                )
+            # Only install `prime` when it isn't already present (it's often baked into the
+            # instance image) — an unconditional install adds latency and a per-run PyPI
+            # failure point every run.
+            if shutil.which("prime") is None:
+                subprocess.run([sys.executable, "-m", "pip", "install", "prime"], check=True)
+            install_env = {
+                **os.environ,
+                "PRIME_API_KEY": prime_key,
+                "PRIME_DISABLE_VERSION_CHECK": "1",
+            }
+            for env_id in hub_env_ids:
+                subprocess.run(["prime", "env", "install", env_id], check=True, env=install_env)
         fetch_code(payload)
         env = build_worker_env(payload)
         deadline = time.time() + float(payload.get("max_wall_s") or 24 * 3600)

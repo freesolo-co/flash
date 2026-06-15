@@ -14,14 +14,14 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from autoslm.config_schema import ConfigError, spec_from_dict
-from autoslm.worker_spec import JobSpec, load_job_spec_from_env
+from autoslm.schema import ConfigError, spec_from_dict
+from autoslm.spec import JobSpec, load_job_spec_from_env
 
 BASE_RAW = {
     "model": "Qwen/Qwen3-0.6B",
     "algorithm": "grpo",
-    "environment": {"id": "gsm8k"},
-    "train": {"steps": 10, "lora_rank": 8, "seeds": [0]},
+    "environment": {"id": "primeintellect/gsm8k"},
+    "train": {"steps": 10, "lora_rank": 8, "seeds": [0], "hf_repo": "owner/runs"},
     "gpu": {"type": "RTX 4090"},
 }
 
@@ -38,7 +38,7 @@ def _raw(**overrides) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# config_schema validation error paths
+# schema validation error paths
 # ---------------------------------------------------------------------------
 
 
@@ -72,6 +72,66 @@ def test_missing_model_is_rejected() -> None:
         spec_from_dict({"algorithm": "sft"})
 
 
+def test_missing_hf_repo_is_rejected() -> None:
+    # [train] hf_repo is now REQUIRED (no operator HF_REPO default); a config without it fails.
+    raw = _raw()
+    raw["train"] = {"steps": 10, "lora_rank": 8, "seeds": [0]}
+    with pytest.raises(ConfigError, match=r"train\.hf_repo is required"):
+        spec_from_dict(raw)
+
+
+def test_environment_path_is_rejected() -> None:
+    # Local environment paths are gone; a `path` (alone or alongside `id`) must fail loudly.
+    raw = _raw()
+    raw["environment"] = {"path": "./environment.py"}
+    with pytest.raises(ConfigError, match="local environment paths are no longer supported"):
+        spec_from_dict(raw)
+    raw["environment"] = {"id": "gsm8k", "path": "./environment.py"}
+    with pytest.raises(ConfigError, match="local environment paths are no longer supported"):
+        spec_from_dict(raw)
+
+
+def test_bare_environment_id_is_rejected() -> None:
+    # A bare id like "gsm8k" passes the presence check but the worker would run
+    # `prime env install gsm8k` (invalid — Prime needs owner/name); reject it up front.
+    for bad in ("gsm8k", "owner/", "/name", "a/b/c"):
+        raw = _raw()
+        raw["environment"] = {"id": bad}
+        with pytest.raises(ConfigError, match=r"owner/name"):
+            spec_from_dict(raw)
+
+
+def test_bare_eval_env_id_is_rejected() -> None:
+    # The eval env ([environment.params] eval_env_id / eval_env) is also prime-installed on the
+    # worker, so a bare eval id must be rejected up front (not fail after a GPU is provisioned).
+    for key in ("eval_env_id", "eval_env"):
+        raw = _raw()
+        raw["environment"] = {"id": "owner/train", "params": {key: "gsm8k"}}
+        with pytest.raises(ConfigError, match=r"eval_env_id must be a published Prime Hub slug"):
+            spec_from_dict(raw)
+    # A full owner/name eval slug is accepted.
+    raw = _raw()
+    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "owner/eval"}}
+    spec_from_dict(raw)  # no raise
+
+
+def test_environment_must_be_a_table() -> None:
+    raw = _raw()
+    raw["environment"] = "gsm8k"
+    with pytest.raises(ConfigError, match=r"\[environment\] must be a table"):
+        spec_from_dict(raw)
+
+
+def test_jobspec_from_dict_rejects_path() -> None:
+    # Defense-in-depth: a stale worker payload carrying a local path must be rejected.
+    data = {
+        "model": "Qwen/Qwen3-0.6B",
+        "environment": {"id": "gsm8k", "path": "./environment.py"},
+    }
+    with pytest.raises(ValueError, match="local environment paths are no longer supported"):
+        JobSpec.from_dict(data)
+
+
 # ---------------------------------------------------------------------------
 # JobSpec serialization round-trips (what travels client -> server -> worker)
 # ---------------------------------------------------------------------------
@@ -102,18 +162,18 @@ def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# orchestrator: run-id containment + dry-run/list/cancel surface
+# runner: run-id containment + dry-run/list/cancel surface
 # ---------------------------------------------------------------------------
 
 
 def _fresh_orchestrator(tmp_path, monkeypatch):
-    import autoslm.orchestrator as orchestrator
+    import autoslm.runner as runner
 
-    importlib.reload(orchestrator)
+    importlib.reload(runner)
     # Storage roots are fixed constants now; redirect to tmp for isolation.
-    monkeypatch.setattr(orchestrator, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(orchestrator, "RESULTS_DIR", str(tmp_path / "results"))
-    return orchestrator
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    return runner
 
 
 def test_runs_file_path_rejects_traversal(tmp_path, monkeypatch) -> None:

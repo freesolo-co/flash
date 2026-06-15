@@ -11,7 +11,6 @@ orchestrator/allocator only talk to its interface, never these modules directly.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from autoslm.providers.base import GpuClass, JobHandle, PollResult, Provider
@@ -67,7 +66,7 @@ class RunpodProvider:
         from autoslm.providers.runpod.durable import JobHandle as RunpodJobHandle
         from autoslm.providers.runpod.durable import make_hf_heartbeat_reader, poll_job
 
-        hf_repo = os.environ.get("HF_REPO", "")
+        hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         rh = RunpodJobHandle.from_dict(handle.to_dict())

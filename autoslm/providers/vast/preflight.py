@@ -3,8 +3,9 @@
 Mirrors ``providers/runpod/preflight.py``: surfaces missing operator config as a clear
 problem list the control plane aggregates into one startup error. Vast is opt-in (it is
 only required when a run pins ``gpu.provider = "vast"`` or the operator enables it), so
-the only Vast-specific requirement is ``VAST_API_KEY``; HF_REPO/HUGGINGFACE_TOKEN are
-shared run requirements checked once by the RunPod preflight.
+the only Vast-specific requirement is ``VAST_API_KEY``; HUGGINGFACE_TOKEN is a shared run
+requirement checked once by the RunPod preflight (the HF dataset repo is per-run via
+``[train] hf_repo``).
 """
 
 from __future__ import annotations

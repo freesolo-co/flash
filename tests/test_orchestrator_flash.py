@@ -15,14 +15,14 @@ def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         import autoslm.flash.train as flash_train
 
-        import autoslm.orchestrator as orchestrator
+        import autoslm.runner as runner
 
         importlib.reload(flash_train)
-        importlib.reload(orchestrator)
+        importlib.reload(runner)
         # Storage roots are fixed constants now; redirect via monkeypatch (auto-restored).
-        monkeypatch.setattr(orchestrator, "RUNS_DIR", os.path.join(tmp, "runs"))
-        monkeypatch.setattr(orchestrator, "RESULTS_DIR", os.path.join(tmp, "results"))
-        from autoslm.worker_spec import GpuSpec, JobSpec, TrainSpec
+        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
+        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}
 
@@ -42,7 +42,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         # _run_job does `from autoslm.flash.train import submit_train, upload_code` at call time.
         monkeypatch.setattr(flash_train, "submit_train", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda: "mock/repo")
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "mock/repo")
 
         spec = JobSpec(
             run_id="flash-run",
@@ -51,7 +51,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             train=TrainSpec(steps=2, seeds=(0,)),
             gpu=GpuSpec(type="RTX 4090"),
         )
-        status = orchestrator.submit_job(spec, dry_run=False, background=False)
+        status = runner.submit_job(spec, dry_run=False, background=False)
 
         assert status.state == "done", status.error
         # 1h on a 4090 at the projected rate (static fallback under AUTOSLM_SKIP_NET)

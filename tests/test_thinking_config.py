@@ -14,15 +14,15 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from autoslm.catalog import ModelInfo
-from autoslm.config_schema import ConfigError, spec_from_dict, spec_from_file
-from autoslm.worker_spec import JobSpec
+from autoslm.schema import ConfigError, spec_from_dict, spec_from_file
+from autoslm.spec import JobSpec
 
 
 def _raw(model="Qwen/Qwen3-0.6B", **kw):
     d = {
         "model": model,
         "algorithm": "sft",
-        "train": {"epochs": 1},
+        "train": {"epochs": 1, "hf_repo": "owner/runs"},
         "environment": {"id": "owner/env"},  # any verifiers/Hub slug (not loaded here)
     }
     d.update(kw)
@@ -56,8 +56,8 @@ def test_always_thinking_model_requires_flag(monkeypatch):
         min_vram_gb=12,
         thinking="always",
     )
-    monkeypatch.setattr("autoslm.config_schema.resolve_model", lambda *a, **k: info)
-    monkeypatch.setattr("autoslm.config_schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
+    monkeypatch.setattr("autoslm.schema.resolve_model", lambda *a, **k: info)
+    monkeypatch.setattr("autoslm.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
     with pytest.raises(ConfigError) as ei:
         spec_from_dict(_raw(model="acme/r1-distill", model_policy="allow"))
     assert "thinking = true" in str(ei.value)
@@ -77,8 +77,8 @@ def test_thinking_unknown_capability_warns_but_allows(monkeypatch, capsys):
         experimental=True,
         thinking="unknown",
     )
-    monkeypatch.setattr("autoslm.config_schema.resolve_model", lambda *a, **k: info)
-    monkeypatch.setattr("autoslm.config_schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
+    monkeypatch.setattr("autoslm.schema.resolve_model", lambda *a, **k: info)
+    monkeypatch.setattr("autoslm.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
     spec = spec_from_dict(_raw(model="acme/tiny-1b", model_policy="allow", thinking=True))
     assert spec.thinking is True
     assert "warning" in capsys.readouterr().out
@@ -102,7 +102,7 @@ def test_thinking_set_override(tmp_path):
     cfg = tmp_path / "cfg.toml"
     cfg.write_text(
         'model = "Qwen/Qwen3-0.6B"\nalgorithm = "sft"\n\n'
-        '[environment]\nid = "owner/env"\n\n[train]\nepochs = 1\n'
+        '[environment]\nid = "owner/env"\n\n[train]\nepochs = 1\nhf_repo = "owner/runs"\n'
     )
     spec = spec_from_file(str(cfg), overrides=["thinking=true"])
     assert spec.thinking is True

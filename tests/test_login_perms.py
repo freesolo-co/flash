@@ -1,4 +1,4 @@
-"""`slm login` stores the AutoSLM API key with private (0600) permissions."""
+"""`slm login` verifies the freesolo key, then stores it with private (0600) permissions."""
 
 from __future__ import annotations
 
@@ -33,12 +33,16 @@ def _check_login():
         importlib.reload(client_config)
         import autoslm.cli.main as cli
 
-        # `--api-key` stores an existing key without contacting the control plane.
-        args = types.SimpleNamespace(
-            api_key="sk-autoslm-secret-123", email=None, api_url=None, debug=False
+        # Login verifies the freesolo key against the freesolo backend, then stores it. Stub
+        # the network verify so the test stays offline; an invalid key would raise instead.
+        verified: dict = {}
+        cli.verify_freesolo_key = lambda api_key, base_url=None: verified.update(
+            api_key=api_key, base_url=base_url
         )
+        args = types.SimpleNamespace(api_key="fs-secret-123", api_url=None, freesolo_url=None)
         rc = cli.cmd_login(args)
         assert rc == 0
+        assert verified["api_key"] == "fs-secret-123"  # the key was actually verified
 
         cfg = client_config.CONFIG_PATH
         assert cfg.exists()
@@ -47,8 +51,8 @@ def _check_login():
         # Directory should be private too.
         dir_mode = stat.S_IMODE(os.stat(client_config.CONFIG_DIR).st_mode)
         assert dir_mode == 0o700, f"expected 0700, got {oct(dir_mode)}"
-        assert json.loads(cfg.read_text())["api_key"] == "sk-autoslm-secret-123"
+        assert json.loads(cfg.read_text())["api_key"] == "fs-secret-123"
         # And the stored key resolves through the normal credential lookup.
-        os.environ.pop("AUTOSLM_API_KEY", None)
+        os.environ.pop("FREESOLO_API_KEY", None)
         _, key = client_config.load_credentials()
-        assert key == "sk-autoslm-secret-123"
+        assert key == "fs-secret-123"

@@ -33,7 +33,7 @@ def test_default_model_is_supported_and_non_experimental():
 
 def test_recipe_and_jobspec_defaults_match_catalog_default():
     from autoslm.engine.recipe import RECIPE
-    from autoslm.worker_spec import JobSpec
+    from autoslm.spec import JobSpec
 
     # When BENCH_HF_MODEL isn't overriding it, the recipe + JobSpec default to the catalog default.
     if not os.environ.get("BENCH_HF_MODEL"):

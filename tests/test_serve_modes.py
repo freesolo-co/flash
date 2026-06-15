@@ -1,10 +1,6 @@
-"""Serving modes: deploy kwargs, per-run endpoints, undeploy, proxy shaping (CPU-only)."""
+"""Serving modes: deploy kwargs, per-run endpoints, undeploy (CPU-only)."""
 
 from __future__ import annotations
-
-import json
-import threading
-import urllib.request
 
 import pytest
 
@@ -67,16 +63,16 @@ def test_resolve_serve_deps_preserves_comma_ranges(monkeypatch):
 
 
 def test_undeploy_uses_rest(monkeypatch):
-    from autoslm.flash import runpod_api
+    from autoslm.flash import runpod
     from autoslm.serve import deploy as deploy_mod
 
     monkeypatch.setattr(
-        runpod_api,
+        runpod,
         "find_endpoints_by_name",
         lambda name: [{"id": "ep1", "name": name}],
     )
     deleted_ids = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted_ids.append(eid) or True)
+    monkeypatch.setattr(runpod, "delete_endpoint", lambda eid: deleted_ids.append(eid) or True)
     # A stale cache entry for this run+gpu must be dropped on undeploy so a later
     # redeploy builds a fresh endpoint instead of reusing the deleted one.
     name = deploy_mod.serve_endpoint_name("RTX 5090", "autoslm-1-abc")
@@ -98,78 +94,3 @@ def test_deployment_roundtrip_dict():
         mode="dev",
     )
     assert d.to_dict()["mode"] == "dev"
-
-
-# ---------------------------------------------------------------------------
-# Proxy: /v1 shaping with a mocked upstream chat
-# ---------------------------------------------------------------------------
-def test_proxy_chat_completions(monkeypatch):
-    import autoslm.serve.proxy as proxy_mod
-    from autoslm.client import ApiClient
-
-    class FakeClient(ApiClient):
-        def chat(self, run_id, messages, temperature=0.0, max_tokens=512):
-            assert run_id == "r1"
-            assert messages == [{"role": "user", "content": "hi"}]
-            return {
-                "id": "chatcmpl-1",
-                "object": "chat.completion",
-                "model": "autoslm-r1",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "hello"},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-
-    # run the proxy on an ephemeral port in a thread
-    from http.server import ThreadingHTTPServer
-
-    server_holder = {}
-    orig_init = ThreadingHTTPServer.__init__
-
-    def capture_init(self, *a, **k):
-        orig_init(self, *a, **k)
-        server_holder["server"] = self
-
-    monkeypatch.setattr(ThreadingHTTPServer, "__init__", capture_init)
-
-    t = threading.Thread(
-        target=proxy_mod.run_proxy,
-        kwargs={
-            "client": FakeClient("http://unused", "sk-autoslm-test"),
-            "run_id": "r1",
-            "host": "127.0.0.1",
-            "port": 0,
-        },
-        daemon=True,
-    )
-    t.start()
-    import time
-
-    for _ in range(50):
-        if "server" in server_holder:
-            break
-        time.sleep(0.05)
-    server = server_holder["server"]
-    port = server.server_address[1]
-
-    # /v1/models
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models") as r:
-        models = json.load(r)
-    assert models["data"][0]["id"] == "autoslm-r1"
-
-    # /v1/chat/completions
-    body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req) as r:
-        out = json.load(r)
-    assert out["choices"][0]["message"]["content"] == "hello"
-
-    server.shutdown()

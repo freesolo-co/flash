@@ -8,8 +8,8 @@ cheapest:
   runpod  every Flash-provisionable class (live pricing, cached; static fallback)
   vast    live verified-datacenter offers (usable_offers' quality floors applied)
 
-Allocation happens at SUBMIT time in the orchestrator (offers are a volatile market);
-the parse-time resolution in config_schema is a RunPod-static provisional for
+Allocation happens at SUBMIT time in the runner (offers are a volatile market);
+the parse-time resolution in schema is a RunPod-static provisional for
 validation/dry-run display. Offline (AUTOSLM_SKIP_NET) the allocator degrades to exactly
 ``cheapest_gpu``'s deterministic static-rate answer (RunPod only — Vast is offline-off).
 

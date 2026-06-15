@@ -1,4 +1,4 @@
-"""Structured job specification shared by CLI/API/orchestrator and GPU workers."""
+"""Structured job specification shared by CLI/API/runner and GPU workers."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def _opt_int(value: Any) -> int | None:
 
     Rejects JSON booleans: ``bool`` is an ``int`` subclass in Python, so ``int(True)`` would
     silently coerce a stray boolean train knob to 1 (and ``False`` to 0). Mirrors
-    config_schema._opt_num — a bool is a type error, not a number.
+    schema._opt_num — a bool is a type error, not a number.
     """
     if value is None:
         return None
@@ -55,7 +55,7 @@ def _opt_float(value: Any) -> float | None:
     """Parse an optional float from a loosely-typed spec source; None stays None.
 
     Rejects JSON booleans (``bool`` is an ``int`` subclass) so a stray boolean train knob is
-    not silently coerced to 0.0/1.0; mirrors config_schema._opt_num.
+    not silently coerced to 0.0/1.0; mirrors schema._opt_num.
     """
     if value is None:
         return None
@@ -67,7 +67,7 @@ def _opt_float(value: Any) -> float | None:
 @dataclass(frozen=True)
 class EnvironmentSpec:
     # Verifiers/Prime Hub env slug ("owner/name") or installed/local env id. No default:
-    # a run must name an environment explicitly (validated in config_schema / the worker).
+    # a run must name an environment explicitly (validated in schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     # Pip requirements the GPU worker needs for this environment (verifiers/Hub envs).
@@ -86,6 +86,10 @@ class TrainSpec:
     # Artifact-store adapter prefix (``<phase>/<run_id>/seed<N>``) to initialize the
     # LoRA from instead of training fresh — e.g. a GRPO run continuing an SFT adapter.
     init_from_adapter: str = ""
+    # Per-run HuggingFace artifact repo ("owner/name") for this run's adapter/checkpoint/
+    # code storage AND serving. REQUIRED (validated in schema._validate_spec); there is no
+    # operator-wide default. The operator's HUGGINGFACE_TOKEN must have write access to it.
+    hf_repo: str = ""
     # Optimizer/batching knobs (SFT + GRPO). None -> the worker's tuned recipe default.
     # batch_size is the GLOBAL/effective batch (SFT: grad-accum is sized to hit it; GRPO:
     # prompts per optimizer step). max_length is the SFT max sequence length. save_every
@@ -116,7 +120,7 @@ class GpuSpec:
     # "vast" (verified datacenters only).
     provider: str = "auto"
     # The raw user gpu.type input ("cheapest"/"auto" or a concrete class), always set
-    # by config parsing. The orchestrator re-allocates the class at submit time iff
+    # by config parsing. The runner re-allocates the class at submit time iff
     # this is a policy word — ``type`` is then just the parse-time provisional; a
     # concrete ``requested`` pins the class and the allocator only picks the provider.
     requested: str = ""
@@ -163,6 +167,13 @@ class JobSpec:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
         env = data.get("environment") or {}
+        # Defense-in-depth: a stale/older payload may still carry a local `path`. The worker only
+        # runs published Hub env ids, so reject it here rather than silently dropping it.
+        if isinstance(env, dict) and env.get("path"):
+            raise ValueError(
+                "local environment paths are no longer supported; the worker only runs "
+                "published Hub env ids"
+            )
         train = data.get("train") or {}
         gpu = data.get("gpu") or {}
         return cls(
@@ -180,6 +191,7 @@ class JobSpec:
                 lora_alpha=int(train.get("lora_alpha", 64)),
                 seeds=tuple(int(s) for s in train.get("seeds", (0,))),
                 init_from_adapter=str(train.get("init_from_adapter") or ""),
+                hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=_opt_float(train.get("learning_rate")),
                 batch_size=_opt_int(train.get("batch_size")),
                 max_length=_opt_int(train.get("max_length")),

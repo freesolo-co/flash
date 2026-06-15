@@ -41,7 +41,7 @@ def test_configure_logging_sets_level():
 def test_importing_autoslm_emits_no_stderr():
     # A fresh interpreter importing slm must produce no output.
     proc = subprocess.run(
-        [sys.executable, "-c", "import autoslm, autoslm.orchestrator, autoslm.flash.train"],
+        [sys.executable, "-c", "import autoslm, autoslm.runner, autoslm.flash.train"],
         cwd=ROOT,
         text=True,
         capture_output=True,

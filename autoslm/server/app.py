@@ -1,11 +1,12 @@
 """FastAPI control plane for the managed AutoSLM service.
 
 This is the operator-side component. It holds the
-provider credentials (``RUNPOD_API_KEY``, ``HUGGINGFACE_TOKEN``, ``HF_REPO``) and
+provider credentials (``RUNPOD_API_KEY``, ``HUGGINGFACE_TOKEN``, ``PRIME_API_KEY`` —
+the worker needs the last to ``prime env install`` the run's Prime Hub env) and
 exposes the full run lifecycle to clients that authenticate with a claimed
 ``sk-autoslm-...`` key — clients never see provider credentials.
 
-Run state truth stays in the orchestrator's JSON files; SQLite (server/db.py) holds
+Run state truth stays in the runner's JSON files; SQLite (server/db.py) holds
 keys and run ownership. Runs the server owns are recovered on startup by re-attaching
 to their persisted RunPod job handles.
 """
@@ -20,8 +21,7 @@ import weakref
 
 from autoslm import __version__
 from autoslm.catalog import public_model_rows
-from autoslm.config_schema import ConfigError, spec_from_dict
-from autoslm.orchestrator import (
+from autoslm.runner import (
     adapter_prefix,
     cancel_run,
     get_status,
@@ -31,9 +31,10 @@ from autoslm.orchestrator import (
     runs_file_path,
     submit_job,
 )
+from autoslm.schema import ConfigError, spec_from_dict
 from autoslm.serve.deploy import chat as serve_chat
 from autoslm.serve.deploy import deploy_adapter, servable_gpu, undeploy_adapter
-from autoslm.worker_spec import JobSpec
+from autoslm.spec import JobSpec
 
 from . import auth, db
 
@@ -94,7 +95,7 @@ def _deploy_lock(run_id: str) -> _RunLock:
 
 def recover_runs(log=None) -> None:
     """Re-attach to in-flight runs after a server restart (per-run daemon threads)."""
-    from autoslm.orchestrator import _gc_run_endpoints, _update, attach_run, resume_run
+    from autoslm.runner import _gc_run_endpoints, _update, attach_run, resume_run
 
     active: set[str] = set()
     for row in db.all_runs():
@@ -313,6 +314,18 @@ def create_app():
                         "trained adapter artifacts can be deployed"
                     ),
                 )
+            # A run persisted BEFORE `[train] hf_repo` became required can have an empty
+            # hf_repo; serving downloads the adapter from it, so without a clear guard
+            # snapshot_download would fail downstream with an opaque error. Reject early.
+            # (Dry-run deploys never download, so they don't need it.)
+            if not dry_run and not spec.train.hf_repo:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"run {run_id} predates per-run `[train] hf_repo` and can't be served; "
+                        "re-run it so its adapter is published to a per-run HF repo"
+                    ),
+                )
             mode = payload.get("mode", "dev")
             # always-on provisions AND warms a billable 1-worker endpoint inside
             # deploy_adapter before returning. Persist a provisional deployment record
@@ -347,7 +360,7 @@ def create_app():
                 dep = deploy_adapter(
                     run_id=run_id,
                     model=spec.model,
-                    hf_repo=os.environ.get("HF_REPO", ""),
+                    hf_repo=spec.train.hf_repo,
                     adapter_prefix=adapter_prefix(spec),
                     gpu_name=spec.gpu.type,
                     mode=mode,
@@ -367,7 +380,7 @@ def create_app():
                 # pre-deploy snapshot; rollback_deploy re-applies it under the status lock
                 # and skips if a concurrent cancel already wrote a terminal state.
                 if provisional:
-                    from autoslm.orchestrator import rollback_deploy
+                    from autoslm.runner import rollback_deploy
 
                     rollback_deploy(run_id, status)
                 if isinstance(exc, ValueError):
@@ -451,12 +464,23 @@ def create_app():
                 status_code=409,
                 detail=f"run {run_id} has no active deployment; `slm deploy {run_id}` first",
             )
+        # A run persisted BEFORE `[train] hf_repo` became required can have an empty
+        # hf_repo; serving pulls the adapter from it, so a missing repo would fail
+        # downstream in snapshot_download with an opaque error. Reject early with a clear 409.
+        if not spec.train.hf_repo:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {run_id} predates per-run `[train] hf_repo` and can't be served; "
+                    "re-run it so its adapter is published to a per-run HF repo"
+                ),
+            )
         try:
             return serve_chat(
                 run_id=run_id,
                 messages=payload.get("messages") or [],
                 model=spec.model,
-                hf_repo=os.environ.get("HF_REPO", ""),
+                hf_repo=spec.train.hf_repo,
                 adapter_prefix=adapter_prefix(spec),
                 # Use the class actually deployed (an unvalidated training class falls
                 # back to a RunPod-validated class at deploy time). Recomputing from
