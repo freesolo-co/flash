@@ -61,8 +61,7 @@ class ApiClient:
         except urllib.error.URLError as exc:
             raise ClientError(
                 f"cannot reach the AutoSLM service at {self.api_url} ({exc.reason}); "
-                "check your network, or point AUTOSLM_API_URL at your control plane "
-                "(see docs/self-hosting.md)"
+                "check your network connection and AUTOSLM_API_URL"
             ) from exc
 
     # -- keys / identity ---------------------------------------------------------------

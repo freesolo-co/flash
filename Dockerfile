@@ -1,4 +1,4 @@
-# AutoSLM control plane (operator-side). See docs/self-hosting.md.
+# AutoSLM control plane (operator-side).
 #
 #   docker build -t autoslm-server .
 #   docker run -p 8080:8080 \

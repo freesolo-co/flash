@@ -1,19 +1,25 @@
 """Adapter that runs Prime Intellect ``verifiers`` / Environments Hub envs on AutoSLM.
 
-Wraps a ``verifiers`` ``Environment`` (``SingleTurnEnv``, ``MultiTurnEnv``, ``ToolEnv``)
-in AutoSLM's small ``Environment`` protocol so Hub environments run unchanged on AutoSLM's
-trainer. Single-turn is fully supported (SFT/GRPO/eval).
+Wraps a ``verifiers`` ``Environment`` (``SingleTurnEnv``, ``MultiTurnEnv``, ``ToolEnv`` and
+its subclasses) in AutoSLM's small ``Environment`` protocol so Hub environments run unchanged
+on AutoSLM's trainer.
 
-Multi-turn / tool envs are NOT yet wired end-to-end:
-  * multi-turn GRPO raises ``NotImplementedError`` in ``autoslm.engine.worker.run_rl`` (TRL's
-    GRPO rollout is single-shot; the turn loop has no clean hook there) — it fails loudly
-    rather than silently training on a degenerate single-shot rollout;
-  * no multi-turn eval path is wired either: nothing in the worker drives the adapter's
-    rollout helpers (``new_rollout_state`` / ``record_model_turn`` / ``env_reply`` /
-    ``rollout_done``). Those helpers are implemented and tested here so the eval driver can be
-    added later, but until then they have no caller;
-  * SFT on a multi-turn/ToolEnv env only fits the single assistant ``sft_target`` per row and
-    ignores tool/env turns, so it should be avoided (see ``run_sft`` / ``sft_target``).
+GRPO supports all three shapes (the worker routes on ``multi_turn`` / ``is_tool_env``):
+  * single-turn — TRL's single-shot generation + per-completion reward;
+  * tool (``ToolEnv`` / ``StatefulToolEnv`` / ``SandboxEnv`` / ``PythonEnv``) — TRL drives the
+    tool-call loop natively via ``GRPOTrainer(tools=...)`` (:meth:`tools`), masking tool tokens
+    itself; the reward scores the full transcript (:meth:`reward_from_messages`);
+  * pure multi-turn — ``autoslm.engine.multiturn_rollout`` supplies a ``rollout_func`` that
+    drives this env's turn loop on the colocate engine via the adapter rollout helpers
+    (:meth:`new_rollout_state` / :meth:`record_model_turn` / :meth:`env_reply` /
+    :meth:`rollout_done`) and returns an ``env_mask`` so only model tokens are trained.
+
+Caveats:
+  * SFT on a multi-turn/tool env only fits the single assistant ``sft_target`` per row and
+    ignores tool/env turns, so it should be avoided (see ``run_sft`` / ``sft_target``);
+  * a ``StatefulToolEnv`` whose tools need verifiers' state-injection (``update_tool_args``)
+    is only fully honored on the rollout path — under TRL's native tool loop the tools are
+    called as plain functions.
 
 verifiers contract (docs):
   * ``vf.load_environment(env_id, **kwargs) -> Environment``
@@ -279,14 +285,33 @@ def _is_multi_turn(vf_env) -> bool:
     return False
 
 
+def _is_tool_env(vf_env) -> bool:
+    """True for a verifiers ``ToolEnv`` or any subclass (Stateful/Sandbox/Python).
+
+    Tool envs expose Python tool callables; the worker hands those to TRL's
+    ``GRPOTrainer(tools=...)`` so TRL drives the tool-call loop natively (it owns generation,
+    tool execution, and assistant-only token masking). A *pure* ``MultiTurnEnv`` (env turns are
+    arbitrary content, e.g. a simulated user) is multi-turn but NOT a tool env, and takes the
+    ``rollout_func`` path instead."""
+    try:
+        import verifiers as vf
+    except ImportError:
+        return False
+    tool = getattr(vf, "ToolEnv", None)
+    return tool is not None and isinstance(vf_env, tool)
+
+
 class VerifiersEnvironment(BaseEnvironment):
     """AutoSLM environment backed by a verifiers ``Environment`` instance.
 
-    Single-turn is fully supported. Multi-turn/tool envs are accepted (``multi_turn`` is set),
-    but no caller drives a turn loop yet: multi-turn GRPO raises ``NotImplementedError`` in the
-    worker and no multi-turn eval path is wired. The rollout helpers
-    (:meth:`new_rollout_state` / :meth:`record_model_turn` / :meth:`env_reply` /
-    :meth:`rollout_done`) are implemented for a future driver but currently have no caller.
+    GRPO training supports three env shapes (the worker routes on these flags):
+      * **single-turn** (``multi_turn`` False) — TRL's single-shot rollout (original path);
+      * **tool** (``is_tool_env`` True) — TRL drives the tool-call loop natively via
+        ``GRPOTrainer(tools=...)`` (:meth:`tools`); the reward scores the full transcript
+        (:meth:`reward_from_messages`);
+      * **pure multi-turn** (``multi_turn`` True, ``is_tool_env`` False) — TRL's
+        ``rollout_func`` drives this env's turn loop (:meth:`new_rollout_state` /
+        :meth:`record_model_turn` / :meth:`env_reply` / :meth:`rollout_done`).
     """
 
     def __init__(
@@ -305,6 +330,9 @@ class VerifiersEnvironment(BaseEnvironment):
         self._eval_examples = int(eval_examples) if eval_examples else 0
         self._eval_seed = int(eval_seed)
         self.multi_turn = _is_multi_turn(vf_env)
+        self.is_tool_env = _is_tool_env(vf_env)
+        # Turn cap for the tool / multi-turn rollout loop (verifiers ToolEnv defaults to 10).
+        self.max_turns = int(getattr(vf_env, "max_turns", 10) or 10)
         # The shared scorer is the TRAIN env's (flattened) rubric + parser, so the reward used
         # for RL and the grader used at eval are byte-for-byte identical.
         rubric = getattr(vf_env, "rubric", None)
@@ -468,6 +496,27 @@ class VerifiersEnvironment(BaseEnvironment):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(self.scores_breakdown(completion, example, state)["total"])
 
+    def tools(self) -> list:
+        """The underlying ToolEnv's Python tool callables (``[]`` for non-tool envs).
+
+        Handed to ``GRPOTrainer(tools=...)`` so TRL runs the tool-call loop and does the
+        assistant-only token masking itself. Each is a plain function with type hints + a
+        Google-style docstring (verifiers and TRL share that requirement)."""
+        return list(getattr(self._env, "tools", None) or [])
+
+    def reward_from_messages(
+        self, completion_msgs: list[dict], example: dict, prompt_msgs: list[dict] | None = None
+    ) -> float:
+        """Reward for a full transcript (assistant + tool/env messages) via the rubric.
+
+        The tool / multi-turn training path produces a *message list* rollout rather than a
+        single completion string; this routes it through the same weighted-rubric scoring as
+        :meth:`reward` by handing the transcript to the env's reward funcs as ``state``."""
+        state: dict = {"completion": [dict(m) for m in completion_msgs]}
+        if prompt_msgs:
+            state["prompt"] = [dict(m) for m in prompt_msgs]
+        return self.reward("", example, state)
+
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         threshold = getattr(self._env, "pass_threshold", 0.5)
         return self.reward(completion, example, state) >= threshold
@@ -584,39 +633,6 @@ def load_verifiers_environment(
     return VerifiersEnvironment(
         vf_env,
         env_id,
-        eval_vf_env=eval_vf_env,
-        eval_env_id=eval_ref,
-        eval_examples=eval_examples,
-        eval_seed=eval_seed,
-    )
-
-
-def load_local_verifiers_environment(
-    path: str,
-    env_id: str | None = None,
-    eval_env_id: str | None = None,
-    eval_env: str | None = None,
-    eval_examples: int | None = None,
-    eval_seed: int = 12345,
-    **kwargs,
-) -> VerifiersEnvironment:
-    """Load a LOCAL verifiers env module (dir or ``*.py`` exposing ``load_environment``).
-
-    The module's ``load_environment(**kwargs)`` must return a ``verifiers.Environment``; it is
-    wrapped for AutoSLM exactly like a Hub env. ``eval_env_id`` (a Hub slug) still selects a
-    separate eval env if given.
-    """
-    from .base import load_environment_from_path
-
-    vf_env = load_environment_from_path(path, **_drop_reserved_kwargs(kwargs))
-    eval_ref = eval_env_id or eval_env
-    eval_vf_env = None
-    if eval_ref:
-        vf = _import_vf()
-        eval_vf_env = vf.load_environment(vf_load_id(eval_ref))
-    return VerifiersEnvironment(
-        vf_env,
-        env_id or path,
         eval_vf_env=eval_vf_env,
         eval_env_id=eval_ref,
         eval_examples=eval_examples,

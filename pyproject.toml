@@ -1,21 +1,22 @@
 [project]
-# INTERNAL monorepo backend — NOT a published distribution. The freesolo platform
-# reaches the control plane over HTTP (autoslm.freesolo.co); nothing installs this
-# from a package index. It stays a buildable project only so the control-plane
-# Docker image (`pip install .[server]`) and `uv` can build/run it from source.
 name = "autoslm-train"
 version = "0.2.0"
-description = "freesolo's managed LoRA post-training backend (internal; not published)"
+description = "AutoSLM — managed LoRA post-training (SFT/GRPO) for verifiers environments, driven by the `slm` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.10-3.12 (not 3.13 yet).
 requires-python = ">=3.11,<3.13"
-# SPDX expression only: the standalone-repo LICENSE file was dropped when this
-# was vendored into the monorepo (licensed at the repo root); a license-files
-# glob with no matching file fails the Hatchling build.
 license = "Apache-2.0"
-# The "Private :: Do Not Upload" trove classifier makes PyPI/twine refuse an upload,
-# so this can never be accidentally published.
-classifiers = ["Private :: Do Not Upload"]
+license-files = ["LICENSE"]
+authors = [{ name = "Freesolo" }]
+keywords = ["llm", "rl", "grpo", "sft", "lora", "fine-tuning", "verifiers"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "runpod-flash",
     "huggingface-hub>=0.25",
@@ -29,7 +30,7 @@ dependencies = [
 gpu = [
     "torch==2.10.0",
     "transformers>=5.6,<5.11",
-    "trl>=1.5,<1.6",
+    "trl>=1.6,<1.7",
     "peft>=0.19",
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
@@ -38,6 +39,10 @@ gpu = [
 server = ["fastapi", "uvicorn"]
 # Convenience aggregate of all optional runtime extras.
 all = ["autoslm-train[gpu,server]"]
+
+[project.urls]
+Homepage = "https://github.com/freesolo-co/freesolo"
+Repository = "https://github.com/freesolo-co/freesolo"
 
 [project.scripts]
 slm = "autoslm.cli.main:main"

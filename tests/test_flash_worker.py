@@ -61,6 +61,41 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
 
 
+def test_alloc_conf_default_avoids_expandable_under_grpo_sleep(monkeypatch):
+    # vLLM sleep-mode CuMemAllocator is incompatible with expandable_segments; GRPO with sleep
+    # ON (the default) must NOT default to expandable_segments or the run crashes at engine init.
+    from autoslm.flash.train import build_worker_env
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("RL_VLLM_SLEEP", raising=False)  # default = sleep on
+    env = build_worker_env(_spec(), 0)
+    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
+    assert env["PYTORCH_ALLOC_CONF"] == env["PYTORCH_CUDA_ALLOC_CONF"]
+
+
+def test_alloc_conf_default_expandable_when_sleep_off(monkeypatch):
+    from autoslm.flash.train import build_worker_env
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("RL_VLLM_SLEEP", "0")  # sleep off -> expandable is safe + preferred
+    env = build_worker_env(_spec(), 0)
+    assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
+
+
+def test_alloc_conf_default_expandable_for_sft(monkeypatch):
+    from autoslm.flash.train import build_worker_env
+
+    from autoslm.worker_spec import JobSpec, TrainSpec
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    spec = JobSpec(model="Qwen/Qwen3-0.6B", algorithm="sft", train=TrainSpec(steps=2, seeds=(0,)))
+    env = build_worker_env(spec, 0)
+    assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
+
+
 def test_runpod_backoff_no_overflow_on_long_runs():
     """DEFECT: runpod_flash computed base*(2**attempt) then clamped, so a long poll loop
     overflowed (~80 min in) and killed a healthy job. The patch caps the exponent first."""

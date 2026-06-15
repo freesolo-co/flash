@@ -70,7 +70,6 @@ class EnvironmentSpec:
     # a run must name an environment explicitly (validated in config_schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
-    path: str | None = None
     # Pip requirements the GPU worker needs for this environment (verifiers/Hub envs).
     # Filled in client-side from the local install manifest so the managed control
     # plane never depends on client-local state; empty means "derive on the server".
@@ -172,7 +171,6 @@ class JobSpec:
             environment=EnvironmentSpec(
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
-                path=env.get("path"),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
             ),
             train=TrainSpec(

@@ -69,10 +69,9 @@ def worker_pip_for_env(env_id: str, params: dict | None = None) -> list[str]:
     configured, and carries any recorded ``extra_index_url`` through to the worker's
     ``pip install``.
 
-    A local-path env is for LOCAL runs only — it is NOT uploaded to a managed worker (Flash
-    ships only the ``autoslm`` package, not the client project tree), so the managed CLI
-    rejects ``[environment] path`` before submit and managed runs must reference a published
-    Hub ``id``. For local execution it just needs ``verifiers`` installed.
+    Managed runs must reference a published Hub ``id`` (the worker pip-installs the env wheel),
+    so ``slm env install`` the env first (so the wheel + index are known) or set
+    ``[environment] pip`` explicitly.
     """
     params = params or {}
     manifest = load_installed_manifest()
@@ -96,25 +95,17 @@ def worker_pip_for_env(env_id: str, params: dict | None = None) -> list[str]:
     return out
 
 
-def load_environment(
-    env_id: str, params: dict | None = None, path: str | None = None
-) -> Environment:
+def load_environment(env_id: str, params: dict | None = None) -> Environment:
     """Load a verifiers environment and wrap it in AutoSLM's protocol.
 
-    ``path`` -> a LOCAL verifiers env module (dir or ``*.py``); otherwise ``env_id`` is
-    resolved as an installed / Prime Hub verifiers env.
+    ``env_id`` is resolved as an installed / Prime Hub verifiers env slug.
     """
     params = params or {}
-    from .verifiers_adapter import (
-        load_local_verifiers_environment,
-        load_verifiers_environment,
-    )
+    from .verifiers_adapter import load_verifiers_environment
 
-    if path:
-        return load_local_verifiers_environment(path, env_id=env_id or path, **params)
     if not env_id:
         raise ValueError(
             "no environment specified: set [environment] id to a verifiers/Prime Hub env "
-            "slug (e.g. 'owner/name'), or [environment] path to a local verifiers env module"
+            "slug (e.g. 'owner/name')"
         )
     return load_verifiers_environment(env_id, **params)

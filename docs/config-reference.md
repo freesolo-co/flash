@@ -15,10 +15,8 @@ id = "owner/name"            # a verifiers / Prime Hub env slug (install first: 
 # pip = ["verifiers", "my-env-wheel"]  # optional: explicit worker pip requirements for the
 #                                      # environment (default: derived from `slm env install`'s
 #                                      # local manifest and shipped with the run)
-# path = "environments/my_env"         # local custom verifiers env (dir or *.py) — LOCAL runs
-#                                      # only; NOT supported on the managed service (Flash ships
-#                                      # only the autoslm package, not your project tree —
-#                                      # publish with `slm env push` and use `id` instead)
+# To run your own env, scaffold it (`slm env init`), publish it with `slm env push`, then set
+# `id` to the resulting Hub slug — only published Hub envs run on the managed service.
 [environment.params]          # optional kwargs forwarded to load_environment(**params)
 
 [train]
@@ -180,10 +178,10 @@ Client-side:
 | Var | Purpose |
 |---|---|
 | `AUTOSLM_API_KEY` | your AutoSLM key (normally stored by `slm login`) |
-| `AUTOSLM_API_URL` | control-plane URL (e.g. a self-hosted server; see [self-hosting](self-hosting.md)) |
+| `AUTOSLM_API_URL` | control-plane URL |
 
 Server-side (operator; the remaining variables below also apply on the control-plane
-host — see [self-hosting](self-hosting.md)):
+host):
 
 | Var | Purpose |
 |---|---|
@@ -219,7 +217,7 @@ host — see [self-hosting](self-hosting.md)):
 The control plane keeps all persistent state under a fixed `~/.autoslm/` directory — there
 are no path env vars. It holds the SQLite key/ownership DB (`server.db`), run status + logs
 (`runs/`), and run metrics (`results/`). Mount one volume at `~/.autoslm` (`/root/.autoslm`
-in the Docker image) to persist it; see [self-hosting](self-hosting.md). On first start the
+in the Docker image) to persist it. On first start the
 server best-effort migrates state from pre-consolidation locations (cwd-relative
 `.autoslm/runs` + `results/`, or the old `/state` Docker mount) into this root.
 

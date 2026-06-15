@@ -29,9 +29,7 @@ def _api_key() -> str:
     # never the RunPod key — the operator sets RUNPOD_API_KEY on the control-plane host.
     key = os.environ.get("RUNPOD_API_KEY")
     if not key:
-        raise RunpodApiError(
-            "RUNPOD_API_KEY not configured on the control-plane host (see docs/self-hosting.md)"
-        )
+        raise RunpodApiError("RUNPOD_API_KEY not configured on the control-plane host")
     return key
 
 
