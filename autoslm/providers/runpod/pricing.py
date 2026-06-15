@@ -4,7 +4,7 @@ Cost projection (orchestrator, serve) and the ``gpu.type = "cheapest"`` policy b
 need $/hr per GPU class. Rates move with the market, so we read them live from the
 RunPod pricing API (the ``runpod`` SDK's GraphQL wrapper — the plain REST surface has
 no GPU-types route and direct GraphQL is 403 for scoped keys) and cache them on disk;
-any failure falls back to the static snapshot in ``flash.gpus.GPU_INFO``.
+any failure falls back to the static snapshot in ``providers.base.GPU_INFO``.
 
 Rates are RunPod secure-cloud on-demand — representative for ranking and projection,
 not an exact serverless invoice (the worker also records wall time; real cost comes
@@ -28,7 +28,7 @@ _MEM: dict = {"ts": 0.0, "rates": {}}
 
 
 def _static_rates() -> dict[str, float]:
-    from autoslm.flash.gpus import GPU_INFO
+    from autoslm.providers.base import GPU_INFO
 
     return {name: info.hourly_usd for name, info in GPU_INFO.items()}
 
@@ -47,12 +47,15 @@ def _fetch_live_rates() -> dict[str, float]:
     """One pricing call per managed GPU class (the list query carries no prices)."""
     import runpod
 
-    from autoslm.flash.gpus import GPU_INFO, gpu_api_id
+    from autoslm.providers.base import GPU_INFO
+    from autoslm.providers.runpod.gpus import gpu_api_id
 
     if not runpod.api_key:
         runpod.api_key = os.environ.get("RUNPOD_API_KEY")
     rates: dict[str, float] = {}
-    for name in GPU_INFO:
+    for name, info in GPU_INFO.items():
+        if not info.enum_member:  # Vast-only class -> no RunPod pricing route
+            continue
         try:
             rate = _pick_rate(runpod.get_gpu(gpu_api_id(name)) or {})
         except Exception as exc:
@@ -101,7 +104,7 @@ def live_rates(refresh: bool = False) -> dict[str, float]:
 
 def hourly_rate(gpu_name: str) -> float:
     """$/hr for one friendly GPU name (live if available, else static)."""
-    from autoslm.flash.gpus import canonical_gpu
+    from autoslm.providers.base import canonical_gpu
 
     name = canonical_gpu(gpu_name)
     return live_rates().get(name) or _static_rates()[name]

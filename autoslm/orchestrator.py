@@ -47,7 +47,7 @@ def _gpu_rate(gpu_type: str) -> float:
     """Representative $/hr for cost projection (live RunPod pricing, static fallback);
     the worker also records wall time so cost = wall_hours * rate."""
     try:
-        from autoslm.flash.pricing import hourly_rate
+        from autoslm.providers.runpod.pricing import hourly_rate
 
         return hourly_rate(gpu_type)
     except Exception:
@@ -184,11 +184,12 @@ def cancel_run(run_id: str) -> RunStatus:
     if status.state in TERMINAL_STATES:
         return status
     spec = JobSpec.from_dict(status.spec)
+    remote = status.remote or {}
     # A deployed run also owns a serving endpoint (autoslm-serve-*) that the
     # training-endpoint GC below does not touch; tear it down too so a
-    # cancelled run can't leave a billable deployment registered. Use the class
-    # actually deployed (an unvalidated training class falls back to a RunPod-validated
-    # class at deploy time).
+    # cancelled run can't leave a billable deployment registered. Serving is
+    # RunPod-only, so use the class actually deployed (a Vast-only training class
+    # falls back to a RunPod class at deploy time).
     if status.state == "deployed":
         try:
             from autoslm.serve.deploy import undeploy_adapter
@@ -209,13 +210,20 @@ def cancel_run(run_id: str) -> RunStatus:
             # Best-effort serving teardown: a failure here must not block the cancel
             # below (the run still flips to cancelled and the training endpoint is GC'd).
             pass
-    # Durable path first: stop the exact remote worker via the RunPod REST API
-    # (works from any process); endpoint teardown is shared with the GC.
-    if status.remote:
+    # Durable path first: stop the exact remote worker via the handle's provider
+    # (works from any process); endpoint/instance teardown is shared with the GC.
+    # Dispatched generically through the registry — never a hardcoded per-provider branch.
+    if remote:
         try:
-            from autoslm.flash import runpod_api
+            from autoslm.providers import get_provider
+            from autoslm.providers.base import JobHandle
 
-            runpod_api.cancel_job(status.remote["endpoint_id"], status.remote["job_id"])
+            handle = JobHandle.from_dict(remote)
+            provider = get_provider(handle.provider)
+            provider.cancel(handle)
+            # Vast bills until destroyed, so also belt-and-suspenders destroy the
+            # instance (a no-op cost-wise for runpod, whose endpoint GC follows).
+            provider.destroy(handle)
         except Exception:
             # Best-effort remote stop; _gc_run_endpoints below still tears the endpoint down.
             pass
@@ -239,7 +247,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         return status
     if not status.remote:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
-    from autoslm.flash.durable import make_hf_heartbeat_reader
 
     spec = JobSpec.from_dict(status.spec)
     remote = dict(status.remote)
@@ -250,13 +257,14 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     # to cost the right card.
     allocated_gpu = remote.pop("allocated_gpu", None)
     log = log_stream or sys.stderr
-    hf_repo = os.environ.get("HF_REPO", "")
-    reader = make_hf_heartbeat_reader(hf_repo, adapter_prefix(spec, seed)) if hf_repo else None
-    from autoslm.flash.durable import JobHandle, poll_job
+    # Dispatch the poll generically via the handle's provider (the provider owns its
+    # heartbeat reader + poll loop); the orchestrator stays provider-agnostic.
+    from autoslm.providers import get_provider
+    from autoslm.providers.base import JobHandle
 
     handle = JobHandle.from_dict(remote)
-    print(f"attaching to {run_id}: job={handle.job_id} endpoint={handle.endpoint_name}", file=log)
-    res = poll_job(handle, log=log, heartbeat_reader=reader)
+    print(f"attaching to {run_id}: provider={handle.provider} {handle.data}", file=log)
+    res = get_provider(handle.provider).poll(handle, spec, seed, log=log)
     try:
         # A best-effort cancel deletes the job/instance, which the poller reports as a
         # failure (or a late worker may still succeed) — either way, re-read the state
@@ -423,7 +431,7 @@ def rollback_deploy(run_id: str, snapshot: RunStatus) -> None:
 
 def _run_job(spec: JobSpec) -> None:
     # Lazy import so dry-run / unit tests never construct a Flash endpoint.
-    from autoslm.flash.train import submit_train, upload_code
+    from autoslm.providers.runpod.train import submit_train, upload_code
 
     # A cancel can land between the queued status being returned to the client and
     # this background thread starting; don't overwrite a terminal state (cancelled)
@@ -455,26 +463,30 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
 def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     """Run one seed with the durable submit/poll path + bounded auto-retry.
 
-    Each attempt first ALLOCATES the GPU: the cheapest RunPod class (live pricing) that
-    fits the model — re-resolved fresh per attempt. A policy ``gpu.requested``
+    Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
+    live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
+    fresh per attempt because offers are a live market. A policy ``gpu.requested``
     ("cheapest"/"auto") lets the allocator pick the class; a concrete ``gpu.requested``
-    pins the class.
+    pins the class (the allocator then only picks the provider); ``gpu.provider`` pins
+    the substrate.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF
     checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
-    client polling breakdown, or a platform TIMED_OUT/worker-loss.
+    client polling breakdown, or a platform TIMED_OUT/worker-loss. Sick Vast machines
+    are blacklisted for the run; failover naturally crosses providers.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
     immediately. The offline test/CI marker AUTOSLM_SKIP_NET takes the blocking
     in-process submit instead (the durable poll path is network-only).
     """
-    import autoslm.flash.durable as durable
-    from autoslm.flash.train import submit_train
+    from autoslm.providers.base import PollResult
+    from autoslm.providers.runpod.train import submit_train
 
     if os.environ.get("AUTOSLM_SKIP_NET"):
         return submit_train(spec, seed, log=log)
 
-    from autoslm.flash.gpus import POLICY_NAMES
+    from autoslm.providers import get_provider
     from autoslm.providers.allocator import allocate, allocation_summary
+    from autoslm.providers.base import POLICY_NAMES
 
     last_handle: dict = {}
     # The friendly GPU class the CURRENT attempt provisioned (set right before each submit),
@@ -501,7 +513,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     def _gc_seen_endpoints() -> None:
         if not seen_endpoints:
             return
-        from autoslm.flash import runpod_api
+        from autoslm.providers.runpod import api as runpod_api
 
         for eid in seen_endpoints:
             with contextlib.suppress(Exception):
@@ -509,6 +521,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
 
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
+    bad_machines: set[int] = set()
     # Re-allocate freely for policy requests ("cheapest"/"auto"); honor a concrete
     # user pin by passing it through as the only candidate class.
     requested = (spec.gpu.requested or "").strip().lower()
@@ -521,9 +534,25 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
-            if last_handle.get("endpoint_id"):
+            # Dispatched generically via the handle's provider.
+            if last_handle.get("provider") == "vast":
+                with contextlib.suppress(Exception):
+                    from autoslm.providers import get_provider
+                    from autoslm.providers.base import JobHandle
+
+                    get_provider("vast").destroy(JobHandle.from_dict(last_handle))
+                if last_handle.get("machine_id"):
+                    bad_machines.add(int(last_handle["machine_id"]))
+                print(
+                    f"retry {attempt}: destroyed vast instance "
+                    f"{last_handle.get('instance_id')} (machine "
+                    f"{last_handle.get('machine_id')} blacklisted for this run)",
+                    file=log,
+                    flush=True,
+                )
+            elif last_handle.get("endpoint_id"):
                 try:
-                    from autoslm.flash import runpod_api
+                    from autoslm.providers.runpod import api as runpod_api
 
                     runpod_api.cancel_job(last_handle["endpoint_id"], last_handle["job_id"])
                     runpod_api.delete_endpoint(last_handle["endpoint_id"])
@@ -562,13 +591,14 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 provider=spec.gpu.provider,
                 disk_gb=spec.gpu.disk_gb,
                 allow_unvalidated=spec.gpu.allow_unvalidated,
+                exclude_machine_ids=frozenset(bad_machines),
             )
         except Exception as exc:
-            from autoslm.flash.gpus import UnsupportedGpuError
+            from autoslm.providers.base import UnsupportedGpuError
 
             if isinstance(exc, UnsupportedGpuError):
                 raise  # config-shaped: no GPU anywhere can run this job
-            res = durable.PollResult(False, failure="poll_error", detail=f"allocation: {exc}")
+            res = PollResult(False, failure="poll_error", detail=f"allocation: {exc}")
         if alloc is not None:
             # allocate() above ran a live-market price walk; re-check cancellation
             # right before provisioning so a cancel during allocation doesn't still
@@ -592,17 +622,34 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 )
             run_spec = _spec_with_gpu(spec, chosen.gpu)
             current_gpu["name"] = chosen.gpu
+            provider = get_provider(chosen.provider)
+            # Vast needs the live-market offer book for the chosen class first, then the
+            # other allocator-approved classes by price; RunPod ignores ``offers``.
+            offers = None
+            if chosen.provider == "vast":
+                ok_classes = {c.gpu for c in alloc.candidates if c.provider == "vast"}
+                offers = sorted(
+                    (o for o in alloc.provider_offers if o.gpu in ok_classes),
+                    key=lambda o: (o.gpu != chosen.gpu, o.dph_total),
+                )
             try:
-                res = durable.submit_train_durable(
-                    run_spec, seed, log=log, on_handle=on_handle, attempt=attempt
+                res = provider.submit_train_durable(
+                    run_spec,
+                    seed,
+                    log=log,
+                    on_handle=on_handle,
+                    attempt=attempt,
+                    offers=offers,
+                    # The run's machine blacklist must reach the provider so an in-provider
+                    # offer REFRESH (Vast) keeps stalled/sick machines excluded.
+                    exclude_machine_ids=frozenset(bad_machines),
                 )
             except Exception as exc:
                 # Deploy/submit themselves can fail transiently (observed: RunPod
-                # GraphQL "Something went wrong" x3 during a retry deploy). That must
-                # consume a retry, not kill the run — the budget exists for flakes.
-                res = durable.PollResult(
-                    False, failure="poll_error", detail=f"deploy/submit: {exc}"
-                )
+                # GraphQL "Something went wrong" x3 during a retry deploy; a vast offer
+                # pool emptying between search and rent). That must consume a retry, not
+                # kill the run — the budget exists precisely for flakes.
+                res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
                 if attempt < max_retries:
                     time.sleep(10 * (attempt + 1))  # let the transient clear
         if res.ok:
@@ -755,26 +802,39 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
         status = get_status(spec.run_id)
     if status is not None and status.remote:
         try:
-            from autoslm.flash import runpod_api
+            from autoslm.providers import get_provider
+            from autoslm.providers.base import JobHandle
 
-            runpod_api.delete_endpoint(status.remote["endpoint_id"])
+            handle = JobHandle.from_dict(status.remote)
+            get_provider(handle.provider).destroy(handle)
         except Exception:
-            # Best-effort GC; the name-reconstructed terminate_endpoint below is the backstop.
+            # Best-effort GC; the name-reconstructed RunPod gc below is the backstop.
             pass
     try:
-        from autoslm.flash.train import terminate_endpoint
+        # RunPod's gc reaps rN-suffixed endpoints the persisted handle can't name.
+        from autoslm.providers import get_provider
 
-        terminate_endpoint(spec.gpu.type, spec.run_id)
+        get_provider("runpod").gc(spec)
     except Exception:
         # Best-effort GC; an undeleted endpoint only holds worker quota, never blocks the run.
         pass
+    # Vast instances bill until destroyed: the runner's per-attempt `finally` already
+    # destroys them, but a crashed supervisor thread can leave one behind. Reap any
+    # instance still labeled for this run via the provider's gc (best-effort).
+    from autoslm.providers import available_providers, get_provider
+
+    if "vast" in available_providers():
+        with contextlib.suppress(Exception):
+            get_provider("vast").gc(spec)
 
 
 def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     """Write metrics to results/runpod/<phase>/<run_id>/seedN and return the cost.
 
     The run id keeps concurrent/sequential runs of the same phase+seed from
-    overwriting each other's artifacts."""
+    overwriting each other's artifacts. Vast runs arrive with ``cost_usd`` already
+    stamped from the offer's real $/hr (plus provider notes) and short-circuit the
+    rate fallback below (the RunPod projection)."""
     dest = os.path.join(artifacts_dir(spec), f"seed{seed}")
     os.makedirs(dest, exist_ok=True)
     # Rate the actually-allocated class, not the parse-time provisional spec.gpu.type:

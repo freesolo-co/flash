@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         import autoslm.flash.train as flash_train
+
         import autoslm.orchestrator as orchestrator
 
         importlib.reload(flash_train)

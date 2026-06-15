@@ -30,8 +30,12 @@ def test_unknown_gpu_rejected():
 def test_providers_for():
     from autoslm.flash.gpus import providers_for
 
-    assert providers_for("RTX 4090") == ("runpod",)
+    # RTX 4090 is provisionable on BOTH substrates; RTX Pro 6000 is RunPod-only
+    # (no vast_name); L40S / RTX Pro 4000 are vast-only (no Flash enum member).
+    assert providers_for("RTX 4090") == ("runpod", "vast")
     assert providers_for("RTX Pro 6000") == ("runpod",)
+    assert providers_for("L40S") == ("vast",)
+    assert providers_for("RTX Pro 4000") == ("vast",)
 
 
 def test_is_validated_per_provider():
@@ -121,12 +125,16 @@ def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
     raw["gpu"] = {"type": "L4", "allow_unvalidated": True}
     spec = spec_from_dict(raw, run_id="x")
     assert spec.gpu.type == "L4"
-    # an unvalidated class is blocked without the opt-in
+    # RTX 3090 is validated on vast (validated on ANY provider) so it parses with no
+    # opt-in when the provider is left "auto".
     raw["gpu"] = {"type": "RTX 3090"}
+    assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 3090"
+    # ...but pinning it to runpod (where it is NOT validated) is blocked without opt-in
+    raw["gpu"] = {"type": "RTX 3090", "provider": "runpod"}
     with pytest.raises(ConfigError):
         spec_from_dict(raw, run_id="x")
-    # ...and allowed with it
-    raw["gpu"] = {"type": "RTX 3090", "allow_unvalidated": True}
+    # ...and allowed with the opt-in
+    raw["gpu"] = {"type": "RTX 3090", "provider": "runpod", "allow_unvalidated": True}
     assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 3090"
 
 
@@ -173,6 +181,7 @@ def test_config_defaults_gpu_from_model():
 
 def test_build_worker_env():
     from autoslm.flash.train import build_worker_env
+
     from autoslm.worker_spec import JobSpec, TrainSpec
 
     spec = JobSpec(

@@ -81,11 +81,22 @@ def test_provider_pin_runpod(monkeypatch):
 
 
 def test_unknown_provider_rejected(monkeypatch):
-    from autoslm.flash.gpus import UnsupportedGpuError
     from autoslm.providers import allocator
+    from autoslm.providers.base import UnsupportedGpuError
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    # A name not in PROVIDER_NAMES is an "unknown provider".
     with pytest.raises(UnsupportedGpuError, match="unknown provider"):
+        allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo", provider="lambda")
+
+
+def test_known_provider_unavailable_offline(monkeypatch):
+    from autoslm.providers import allocator
+    from autoslm.providers.base import UnsupportedGpuError
+
+    # vast is a known provider but offline (AUTOSLM_SKIP_NET) it is not available.
+    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    with pytest.raises(UnsupportedGpuError, match="not available"):
         allocator.allocate("Qwen/Qwen3-4B-Instruct-2507", "grpo", provider="vast")
 
 

@@ -19,7 +19,8 @@ import os
 from typing import Any
 
 from autoslm._logging import get_logger
-from autoslm.flash.gpus import canonical_gpu, flash_gpu, gpu_short
+from autoslm.providers.base import canonical_gpu, gpu_short
+from autoslm.providers.runpod.gpus import flash_gpu
 from autoslm.worker_spec import JobSpec
 
 logger = get_logger(__name__)
@@ -261,7 +262,7 @@ def isolate_flash_state(scope: str | None = None) -> None:
     entries resurrecting long-dead endpoints on later syncs, and concurrent processes
     clobbering each other's bookkeeping. Each AutoSLM process gets its own registry
     under ``~/.autoslm/flash-state/<scope>``; remote cleanup never relies on the
-    registry anyway (REST by id/name — see runpod_api).
+    registry anyway (REST by id/name — see api.py).
     """
     try:
         from pathlib import Path
@@ -339,13 +340,13 @@ def min_cuda_for(friendly_gpu: str) -> str:
     CUDA-12.8-era drivers can JIT (observed: "the provided PTX was compiled with an
     unsupported toolchain" on driver 570.x). CUDA-13 drivers JIT it fine, so those
     classes are pinned to >=13.0 on the modern stack (per-GPU ``min_cuda_modern`` in
-    flash.gpus.GPU_INFO). Ampere/Ada/Hopper have SASS in the wheels and run on 12.8.
+    providers.base.GPU_INFO). Ampere/Ada/Hopper have SASS in the wheels and run on 12.8.
     Override with AUTOSLM_MIN_CUDA.
     """
     explicit = os.environ.get("AUTOSLM_MIN_CUDA")
     if explicit:
         return explicit
-    from autoslm.flash.gpus import min_cuda_modern
+    from autoslm.providers.base import min_cuda_modern
 
     return min_cuda_modern(friendly_gpu)
 
@@ -378,8 +379,8 @@ def get_train_endpoint(
     os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
 
-    from autoslm.flash.auth import ensure_auth
-    from autoslm.flash.durable import volume_endpoint_kwargs
+    from autoslm.providers.runpod.auth import ensure_auth
+    from autoslm.providers.runpod.durable import volume_endpoint_kwargs
 
     ensure_auth()
     _patch_runpod_backoff()
@@ -410,7 +411,7 @@ def get_train_endpoint(
     handler = ep(_train_body)  # register the queue-based handler; returns the callable
     # The resource config is cached on the Endpoint, so raising the disk on it here
     # carries through to the deploy that the first handler call triggers.
-    from autoslm.flash.durable import apply_disk_gb
+    from autoslm.providers.runpod.durable import apply_disk_gb
 
     apply_disk_gb(ep._build_resource_config(), disk_gb)
     _ENDPOINT_CACHE[name] = handler
@@ -483,7 +484,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list:
     friendly = canonical_gpu(friendly_gpu)
     target = endpoint_name(friendly, _run_suffix(run_id))
     try:
-        from autoslm.flash.auth import ensure_auth
+        from autoslm.providers.runpod.auth import ensure_auth
 
         ensure_auth()
         isolate_flash_state(_run_suffix(run_id))
@@ -521,7 +522,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list:
     # can't keep a paid worker alive.
     if not uids:
         with contextlib.suppress(Exception):
-            from autoslm.flash import runpod_api
+            from autoslm.providers.runpod import api as runpod_api
 
             for ep in runpod_api.find_endpoints_by_name(target):
                 if ep.get("name") == target and runpod_api.delete_endpoint(ep["id"]):

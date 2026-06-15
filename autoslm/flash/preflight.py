@@ -1,48 +1,86 @@
-"""Fail-fast credential checks for the control plane (operator-side).
+"""Compatibility shim -> ``autoslm.providers.runpod.preflight``.
 
-These run when the AutoSLM server starts (and before any RunPod Flash provisioning) so
-missing operator configuration produces one clear, actionable error instead of a
-partial run that dies mid-provisioning. End users never see these — their preflight is
-client-side ("do I have an AutoSLM key?", see autoslm/client).
+``check_run_preflight`` now aggregates EVERY registered provider's missing-config
+problems (RunPod is always required; Vast only when configured), so a single startup
+error lists everything missing.
 """
 
 from __future__ import annotations
 
 import os
 
-from autoslm.flash.auth import load_api_key
+from autoslm.providers.runpod.preflight import (
+    PreflightError,
+    _missing_credentials,
+    missing_credentials,
+)
+
+__all__ = [
+    "PreflightError",
+    "_missing_credentials",
+    "check_run_preflight",
+    "missing_credentials",
+]
 
 
-class PreflightError(RuntimeError):
-    """Raised when required operator credentials/configuration are missing."""
-
-
-def _missing_credentials(require_hf: bool = True) -> list[str]:
+def _missing_hf_credentials() -> list[str]:
+    """The shared HF dataset-repo requirements (every substrate streams through HF)."""
     problems: list[str] = []
-    if not load_api_key():
-        problems.append("  - RUNPOD_API_KEY: the operator's RunPod API key")
-    if require_hf:
-        if not os.environ.get("HF_REPO"):
-            problems.append(
-                "  - HF_REPO: a Hugging Face *dataset* repo for adapters/checkpoints, e.g. "
-                "`export HF_REPO=your-org/autoslm-runs`"
-            )
-        if not os.environ.get("HUGGINGFACE_TOKEN"):
-            problems.append(
-                "  - HUGGINGFACE_TOKEN: a token with write access to HF_REPO, e.g. "
-                "`export HUGGINGFACE_TOKEN=hf_...`"
-            )
+    if not os.environ.get("HF_REPO"):
+        problems.append(
+            "  - HF_REPO: a Hugging Face *dataset* repo for adapters/checkpoints, e.g. "
+            "`export HF_REPO=your-org/autoslm-runs`"
+        )
+    if not os.environ.get("HUGGINGFACE_TOKEN"):
+        problems.append(
+            "  - HUGGINGFACE_TOKEN: a token with write access to HF_REPO, e.g. "
+            "`export HUGGINGFACE_TOKEN=hf_...`"
+        )
     return problems
 
 
-def check_run_preflight(require_hf: bool = True) -> None:
-    """Validate that everything needed to provision managed GPU runs is present.
+def _preflight_provider_names() -> set[str]:
+    """The providers whose operator config this control plane must satisfy.
 
-    Raises ``PreflightError`` listing every missing item (``RUNPOD_API_KEY``,
-    ``HF_REPO``, ``HUGGINGFACE_TOKEN``) and how to set it. No-op when nothing is
-    missing. See docs/self-hosting.md.
+    Honors the ``AUTOSLM_PROVIDERS`` pin: a Vast-only control plane
+    (``AUTOSLM_PROVIDERS=vast``) must NOT demand RUNPOD_API_KEY, and conversely.
+    Without a pin, RunPod is always required (the default substrate) and Vast is opt-in
+    (preflighted only when VAST_API_KEY signals intent)."""
+    from autoslm.providers import PROVIDER_NAMES
+
+    pinned = os.environ.get("AUTOSLM_PROVIDERS")
+    if pinned:
+        names = {p.strip().lower() for p in pinned.split(",") if p.strip()}
+        return {n for n in PROVIDER_NAMES if n in names}
+    names = {"runpod"}  # always-on default substrate
+    if os.environ.get("VAST_API_KEY"):
+        names.add("vast")  # opt-in: a partial vast config signals intent
+    return names
+
+
+def check_run_preflight(require_hf: bool = True) -> None:
+    """Validate operator config across the configured providers; raise on missing.
+
+    Only the providers this control plane actually uses are checked: the
+    ``AUTOSLM_PROVIDERS`` pin selects the substrate set, so a Vast-only deployment never
+    fails on a missing RUNPOD_API_KEY (and vice versa). Unpinned, RunPod's requirements
+    (RUNPOD_API_KEY + the shared HF_REPO/HUGGINGFACE_TOKEN) are always checked and a
+    configured Vast key adds its own check.
     """
-    problems = _missing_credentials(require_hf=require_hf)
+    selected = _preflight_provider_names()
+    problems: list[str] = []
+    # The HF dataset repo + token are SHARED run infra (every substrate streams artifacts
+    # through HF), so they are checked once regardless of which providers are selected —
+    # a Vast-only plane still needs them. Each provider check is asked for its keys only
+    # (require_hf=False) so HF isn't double-reported.
+    if "runpod" in selected:
+        problems += missing_credentials(require_hf=False)
+    if "vast" in selected:
+        from autoslm.providers.vast.preflight import missing_credentials as vast_missing
+
+        problems += vast_missing(require_hf=False)
+    if require_hf:
+        problems += _missing_hf_credentials()
     if problems:
         raise PreflightError(
             "the AutoSLM control plane is missing required operator configuration:\n"

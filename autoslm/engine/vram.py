@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 def _gpu_vram_table() -> dict[str, int]:
     try:
-        from autoslm.flash.gpus import GPU_INFO
+        from autoslm.providers.base import GPU_INFO
 
         return {name: info.vram_gb for name, info in GPU_INFO.items()}
     except Exception:

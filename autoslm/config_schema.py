@@ -8,7 +8,8 @@ import tomllib
 from typing import Any
 
 from .catalog import normalize_algorithm, resolve_model
-from .flash.gpus import (
+from .providers import PROVIDER_NAMES
+from .providers.base import (
     POLICY_NAMES,
     SUPPORTED,
     UnsupportedGpuError,
@@ -179,8 +180,9 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
     # it may re-allocate (policy words) or must honor a concrete pin.
     requested_gpu = str(gpu_raw.get("requested") or gpu_raw.get("type") or "auto")
     provider = str(gpu_raw.get("provider") or "auto").strip().lower()
-    if provider not in ("auto", "runpod"):
-        raise ConfigError('gpu.provider must be "auto" or "runpod"')
+    if provider not in ("auto", *PROVIDER_NAMES):
+        allowed = '", "'.join(("auto", *PROVIDER_NAMES))
+        raise ConfigError(f'gpu.provider must be "{allowed}"')
     allow_unval = gpu_raw.get("allow_unvalidated")
     if allow_unval is not None and not isinstance(allow_unval, bool):
         raise ConfigError("gpu.allow_unvalidated must be a boolean")

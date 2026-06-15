@@ -23,9 +23,10 @@ import time
 from dataclasses import dataclass
 
 from autoslm._logging import get_logger
-from autoslm.flash import runpod_api
-from autoslm.flash.gpus import canonical_gpu, flash_gpu
-from autoslm.flash.train import (
+from autoslm.providers.base import PollResult, canonical_gpu
+from autoslm.providers.runpod import api as runpod_api
+from autoslm.providers.runpod.gpus import flash_gpu
+from autoslm.providers.runpod.train import (
     DEFAULT_EXECUTION_TIMEOUT_MS,
     WORKER_SYSTEM_DEPS,
     _patch_runpod_backoff,
@@ -37,6 +38,21 @@ from autoslm.flash.train import (
 )
 
 logger = get_logger(__name__)
+
+# Re-export so callers/tests that did ``from ...durable import PollResult`` keep working.
+__all__ = [
+    "JobHandle",
+    "PollResult",
+    "apply_disk_gb",
+    "build_function_input",
+    "decode_output",
+    "deploy_train_endpoint",
+    "make_hf_heartbeat_reader",
+    "poll_job",
+    "submit",
+    "submit_train_durable",
+    "volume_endpoint_kwargs",
+]
 
 TERMINAL_OK = {"COMPLETED"}
 TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
@@ -119,7 +135,7 @@ def deploy_train_endpoint(
     os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
 
-    from autoslm.flash.auth import ensure_auth
+    from autoslm.providers.runpod.auth import ensure_auth
 
     ensure_auth()
     _patch_runpod_backoff()
@@ -196,14 +212,6 @@ def decode_output(output) -> dict:
     err = output.get("error") or "unknown worker error"
     stdout_tail = (output.get("stdout") or "")[-1500:]
     raise RuntimeError(f"Remote execution failed: {err}\n--- worker stdout tail ---\n{stdout_tail}")
-
-
-@dataclass
-class PollResult:
-    ok: bool
-    metrics: dict | None = None
-    failure: str | None = None  # "job_failed" | "stalled" | "poll_error"
-    detail: str | None = None
 
 
 def poll_job(
@@ -317,7 +325,7 @@ def submit_train_durable(spec, seed: int, log=None, on_handle=None, attempt: int
     orchestrator can persist {endpoint_id, job_id} for cross-process reattach.
     """
     from autoslm.envs.registry import worker_pip_for_env
-    from autoslm.flash.train import _run_suffix, build_worker_env
+    from autoslm.providers.runpod.train import _run_suffix, build_worker_env
 
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
     # Per-attempt endpoint name: a retry must land on a genuinely fresh endpoint —

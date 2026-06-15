@@ -23,7 +23,8 @@ import os
 from dataclasses import asdict, dataclass, field
 
 from autoslm._logging import get_logger
-from autoslm.flash.gpus import canonical_gpu, flash_gpu, gpu_short
+from autoslm.providers.base import canonical_gpu, gpu_short
+from autoslm.providers.runpod.gpus import flash_gpu
 
 logger = get_logger(__name__)
 
@@ -121,12 +122,13 @@ def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
 
 def servable_gpu(gpu_name: str, model: str) -> str:
     """Serving runs on RunPod Flash only: a run trained on a class that is not
-    RunPod-validated (e.g. RTX 3090, which has a RunPod enum member but no validation)
-    is served from the cheapest RunPod-VALIDATED class with at least the trained class's
-    VRAM — NOT directly on the unvalidated RunPod substrate (which can fail on first
-    chat) and NOT the catalog default (32 GB for open models, too small for the >32 GB
-    class the allocator proved was needed)."""
-    from autoslm.flash.gpus import GPU_INFO, UnsupportedGpuError, cheapest_gpu
+    RunPod-validated (a Vast-only class like L40S/RTX Pro 4000, OR a class that has a
+    RunPod enum member but was validated only on Vast, e.g. RTX 3090) is served from the
+    cheapest RunPod-VALIDATED class with at least the trained class's VRAM — NOT directly
+    on the unvalidated RunPod substrate (which can fail on first chat) and NOT the
+    catalog default (32 GB for open models, too small for the >32 GB class the allocator
+    proved was needed)."""
+    from autoslm.providers.base import GPU_INFO, UnsupportedGpuError, cheapest_gpu
 
     friendly = canonical_gpu(gpu_name)
     info = GPU_INFO[friendly]
@@ -331,8 +333,8 @@ def _get_serve_endpoint(
     os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
 
-    from autoslm.flash.auth import ensure_auth
-    from autoslm.flash.train import isolate_flash_state, min_cuda_for
+    from autoslm.providers.runpod.auth import ensure_auth
+    from autoslm.providers.runpod.train import isolate_flash_state, min_cuda_for
 
     ensure_auth()
     isolate_flash_state(f"serve-{run_id.split('-')[-1]}")
@@ -401,7 +403,7 @@ def deploy_adapter(
     _reject_qlora_serving(model)
     friendly = servable_gpu(gpu_name, model)
     try:
-        from autoslm.flash.pricing import hourly_rate
+        from autoslm.providers.runpod.pricing import hourly_rate
 
         rate = hourly_rate(friendly)
     except Exception:
@@ -453,7 +455,7 @@ def deploy_adapter(
 
 def undeploy_adapter(run_id: str, gpu_name: str = "RTX 5090") -> list[str]:
     """Tear down the run's serve endpoint via the REST API (works from any process)."""
-    from autoslm.flash import runpod_api
+    from autoslm.providers.runpod import api as runpod_api
 
     name = serve_endpoint_name(gpu_name, run_id)
     deleted = [

@@ -14,7 +14,13 @@ import autoslm.flash.preflight as pf
 
 @pytest.fixture
 def clean_env(monkeypatch):
-    for var in ("RUNPOD_API_KEY", "HF_REPO", "HUGGINGFACE_TOKEN"):
+    for var in (
+        "RUNPOD_API_KEY",
+        "HF_REPO",
+        "HUGGINGFACE_TOKEN",
+        "VAST_API_KEY",
+        "AUTOSLM_PROVIDERS",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -50,6 +56,47 @@ def test_runpod_key_is_env_only(clean_env):
     from autoslm.flash.auth import load_api_key
 
     assert load_api_key() is None
+
+
+def test_preflight_vast_only_pin_ignores_runpod(clean_env, monkeypatch):
+    """Fix #7: AUTOSLM_PROVIDERS=vast is a Vast-only control plane — preflight must NOT
+    demand RUNPOD_API_KEY, only the pinned provider's key (+ the shared HF requirement)."""
+    monkeypatch.setenv("AUTOSLM_PROVIDERS", "vast")
+    monkeypatch.setenv("HF_REPO", "org/runs")
+    monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf_token")
+    # No RUNPOD_API_KEY set, but vast is the only pinned provider -> runpod not required.
+    with pytest.raises(pf.PreflightError) as excinfo:
+        pf.check_run_preflight()
+    msg = str(excinfo.value)
+    assert "VAST_API_KEY" in msg  # the pinned provider's key is demanded
+    assert "RUNPOD_API_KEY" not in msg  # ...but RunPod's is not, since it's deselected
+    # supplying the vast key clears preflight (HF already present)
+    monkeypatch.setenv("VAST_API_KEY", "vk")
+    pf.check_run_preflight()
+
+
+def test_preflight_vast_only_still_requires_hf(clean_env, monkeypatch):
+    """Fix #7: even a Vast-only plane needs the SHARED HF dataset repo (every substrate
+    streams artifacts through HF), so HF is checked regardless of the provider pin."""
+    monkeypatch.setenv("AUTOSLM_PROVIDERS", "vast")
+    monkeypatch.setenv("VAST_API_KEY", "vk")
+    with pytest.raises(pf.PreflightError) as excinfo:
+        pf.check_run_preflight()
+    msg = str(excinfo.value)
+    assert "HF_REPO" in msg
+    assert "HUGGINGFACE_TOKEN" in msg
+    assert "RUNPOD_API_KEY" not in msg
+
+
+def test_preflight_runpod_pin_ignores_vast_key(clean_env, monkeypatch):
+    """Fix #7: pinning runpod-only means a stray VAST_API_KEY does not pull vast into
+    preflight (the pin is authoritative)."""
+    monkeypatch.setenv("AUTOSLM_PROVIDERS", "runpod")
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp")
+    monkeypatch.setenv("HF_REPO", "org/runs")
+    monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf")
+    monkeypatch.setenv("VAST_API_KEY", "")  # set-but-empty: vast not really configured
+    pf.check_run_preflight()  # runpod-only pin, fully configured -> passes
 
 
 # -- client preflight (`slm <cmd>` without a key fails with a login hint) --------------
