@@ -76,10 +76,15 @@ def test_thinking_budget_selection():
         assert ne.rl_per_device_comps() == 4
     finally:
         _restore_env(saved)
+    # thinking off (explicit, since the env fallback now defaults ON): original micro-batch
+    os.environ["AUTOSLM_THINKING"] = "0"
+    try:
         importlib.reload(ne)
-    # thinking off: original default micro-batch
-    assert ne.THINKING is False
-    assert ne.rl_per_device_comps() == 8
+        assert ne.THINKING is False
+        assert ne.rl_per_device_comps() == 8
+    finally:
+        os.environ.pop("AUTOSLM_THINKING", None)
+        importlib.reload(ne)
 
 
 def test_grpo_batching_rounds_up_to_divisible():

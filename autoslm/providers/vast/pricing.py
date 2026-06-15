@@ -32,7 +32,7 @@ def live_rates(refresh: bool = False) -> dict[str, float]:
     if os.environ.get("AUTOSLM_SKIP_NET") or not os.environ.get("VAST_API_KEY"):
         return static
     try:
-        from autoslm.providers.vast.durable import usable_offers
+        from autoslm.providers.vast.jobs import usable_offers
 
         rates: dict[str, float] = {}
         for offer in usable_offers(0, 0):  # offers are price-sorted, cheapest first

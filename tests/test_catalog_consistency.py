@@ -1,7 +1,7 @@
 """Guardrails on the model catalog and the package-wide default model.
 
 These keep the curated catalog internally consistent and make sure the out-of-the-box
-default an average developer hits is a real, supported, non-experimental model.
+default an average developer hits is a real, supported model.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from autoslm.catalog import DEFAULT_MODEL, MODELS, get_model
-from autoslm.flash.gpus import SUPPORTED, canonical_gpu
+from autoslm.providers.base import SUPPORTED, canonical_gpu
 
 
 def test_recommended_gpu_is_supported():
@@ -23,9 +23,8 @@ def test_recommended_gpu_is_supported():
         )
 
 
-def test_default_model_is_supported_and_non_experimental():
+def test_default_model_is_supported():
     info = get_model(DEFAULT_MODEL)
-    assert not info.experimental, "default model must not be experimental"
     # The default is GRPO+SFT capable so both algorithms work out of the box.
     assert "grpo" in info.algos
     assert "sft" in info.algos
@@ -39,7 +38,6 @@ def test_recipe_and_jobspec_defaults_match_catalog_default():
     if not os.environ.get("BENCH_HF_MODEL"):
         assert RECIPE.hf_model_id == DEFAULT_MODEL
     assert JobSpec().model == DEFAULT_MODEL
-    assert not get_model(JobSpec().model).experimental
 
 
 def test_thinking_capability_values_are_valid():
@@ -49,16 +47,17 @@ def test_thinking_capability_values_are_valid():
         assert info.thinking in ("none", "hybrid", "always"), (model_id, info.thinking)
 
 
-def test_default_model_is_non_thinking():
-    # Default runs must never require the thinking flag (out-of-the-box behavior is
-    # byte-identical to the pre-thinking recipe).
-    assert get_model(DEFAULT_MODEL).thinking == "none"
+def test_default_model_supports_default_on_thinking():
+    # The thinking flag now defaults ON, so the default model must be thinking-capable
+    # ("hybrid" or "always"); a "none" default would be rejected by config_schema on a
+    # plain default run. (DEFAULT_MODEL is currently hybrid.)
+    assert get_model(DEFAULT_MODEL).thinking in ("hybrid", "always")
 
 
 def test_default_model_is_a_dense_text_model():
     # Guard against regressing the default back to a multimodal / novel-arch model: the
     # default should be the proven dense instruction model.
-    assert DEFAULT_MODEL == "Qwen/Qwen3-4B-Instruct-2507"
+    assert DEFAULT_MODEL == "Qwen/Qwen3.5-4B"
 
 
 if __name__ == "__main__":

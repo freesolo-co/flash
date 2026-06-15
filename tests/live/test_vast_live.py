@@ -45,7 +45,7 @@ def test_vast_usable_offers_and_pricing():
     """usable_offers maps live offers to managed classes; pricing reads the cheapest."""
     _require_key()
     from autoslm.providers import get_provider
-    from autoslm.providers.vast.durable import usable_offers
+    from autoslm.providers.vast.jobs import usable_offers
 
     offers = usable_offers(16, disk_gb=40)
     assert isinstance(offers, list)

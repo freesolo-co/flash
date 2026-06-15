@@ -2,7 +2,7 @@
 failover, handle persistence, cost flow, and config provider fields (all mocked).
 
 Everything dispatches through the ``base.Provider`` interface (the registry), so these
-tests patch the provider's durable functions / api modules — the same objects the
+tests patch the provider's job functions / api modules — the same objects the
 provider methods import lazily — rather than any hardcoded orchestrator branch.
 """
 
@@ -20,7 +20,7 @@ def _spec(run_id="autoslm-1700000001-rt01", **gpu_kw) -> JobSpec:
     gpu.update(gpu_kw)
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3-0.6B",
+            "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": run_id,
             "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
@@ -30,7 +30,7 @@ def _spec(run_id="autoslm-1700000001-rt01", **gpu_kw) -> JobSpec:
 
 
 def _offer_obj(offer_id=5, machine_id=2, gpu="RTX 3090", dph=0.25):
-    from autoslm.providers.vast.durable import VastOffer
+    from autoslm.providers.vast.jobs import VastOffer
 
     return VastOffer(
         offer_id=offer_id,
@@ -94,7 +94,7 @@ def _seed_status(orch, spec):
 def test_vast_allocation_routes_to_vast_runner(orch, monkeypatch):
     from autoslm.providers import allocator
     from autoslm.providers.base import PollResult
-    from autoslm.providers.vast import durable as vast_durable
+    from autoslm.providers.vast import jobs as vast_jobs
 
     offer = _offer_obj()
     monkeypatch.setattr(
@@ -119,7 +119,7 @@ def test_vast_allocation_routes_to_vast_runner(orch, monkeypatch):
             metrics={"train_tokens": 4096, "cost_usd": 0.123, "notes": {"provider": "vast"}},
         )
 
-    monkeypatch.setattr(vast_durable, "submit_train_durable_vast", fake_vast_submit)
+    monkeypatch.setattr(vast_jobs, "submit_run_vast", fake_vast_submit)
     spec = _spec()
     _seed_status(orch, spec)
     metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
@@ -143,9 +143,9 @@ def test_vast_cost_flows_into_run_status(orch, monkeypatch):
 def test_failover_crosses_providers_and_blacklists_machine(orch, monkeypatch):
     from autoslm.providers import allocator
     from autoslm.providers.base import PollResult
-    from autoslm.providers.runpod import durable as rp_durable
+    from autoslm.providers.runpod import jobs as rp_jobs
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast_durable
+    from autoslm.providers.vast import jobs as vast_jobs
 
     offer = _offer_obj(machine_id=42)
     allocate_calls = []
@@ -173,12 +173,12 @@ def test_failover_crosses_providers_and_blacklists_machine(orch, monkeypatch):
         on_handle(_vast_handle_dict(instance_id=77, machine_id=42))
         return PollResult(False, failure="stalled", detail="no worker progress")
 
-    monkeypatch.setattr(vast_durable, "submit_train_durable_vast", fake_vast_submit)
+    monkeypatch.setattr(vast_jobs, "submit_run_vast", fake_vast_submit)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     monkeypatch.setattr(
-        rp_durable,
-        "submit_train_durable",
+        rp_jobs,
+        "submit_run",
         lambda spec, seed, log=None, on_handle=None, attempt=0: PollResult(
             True, metrics={"train_tokens": 4096}
         ),
@@ -201,7 +201,7 @@ def test_failover_crosses_providers_and_blacklists_machine(orch, monkeypatch):
 def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
     from autoslm.providers import allocator
     from autoslm.providers.base import PollResult
-    from autoslm.providers.vast import durable as vast_durable
+    from autoslm.providers.vast import jobs as vast_jobs
 
     offer = _offer_obj()
     monkeypatch.setattr(
@@ -221,7 +221,7 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
         calls.append(attempt)
         return PollResult(False, failure="job_failed", detail="ValueError: bad reward fn")
 
-    monkeypatch.setattr(vast_durable, "submit_train_durable_vast", fake_vast_submit)
+    monkeypatch.setattr(vast_jobs, "submit_run_vast", fake_vast_submit)
     spec = _spec()
     _seed_status(orch, spec)
     with pytest.raises(RuntimeError, match="bad reward fn"):
@@ -232,7 +232,7 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
 def test_concrete_requested_pins_class(orch, monkeypatch):
     from autoslm.providers import allocator
     from autoslm.providers.base import PollResult
-    from autoslm.providers.vast import durable as vast_durable
+    from autoslm.providers.vast import jobs as vast_jobs
 
     pins = []
 
@@ -243,8 +243,8 @@ def test_concrete_requested_pins_class(orch, monkeypatch):
 
     monkeypatch.setattr(allocator, "allocate", fake_allocate)
     monkeypatch.setattr(
-        vast_durable,
-        "submit_train_durable_vast",
+        vast_jobs,
+        "submit_run_vast",
         lambda *a, **k: PollResult(True, metrics={"a": 1}),
     )
     spec = _spec(type="RTX 3090", requested="RTX 3090")
@@ -264,7 +264,7 @@ def test_empty_requested_pins_concrete_type(orch, monkeypatch):
     but only to pick the provider for that one class — it never re-picks the class."""
     from autoslm.providers import allocator
     from autoslm.providers.base import PollResult
-    from autoslm.providers.vast import durable as vast_durable
+    from autoslm.providers.vast import jobs as vast_jobs
 
     pins = []
 
@@ -275,8 +275,8 @@ def test_empty_requested_pins_concrete_type(orch, monkeypatch):
 
     monkeypatch.setattr(allocator, "allocate", fake_allocate)
     monkeypatch.setattr(
-        vast_durable,
-        "submit_train_durable_vast",
+        vast_jobs,
+        "submit_run_vast",
         lambda *a, **k: PollResult(True, metrics={"a": 1}),
     )
     spec = _spec(type="RTX A5000", requested="")  # no routing intent recorded
@@ -293,12 +293,12 @@ def test_cancel_routes_vast(orch, monkeypatch):
     from autoslm.providers.runpod import api as runpod_api
     from autoslm.providers.runpod import train as rp_train
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast_durable
+    from autoslm.providers.vast import jobs as vast_jobs
 
     cancelled, destroyed, swept, runpod_calls, terminated = [], [], [], [], []
-    monkeypatch.setattr(vast_durable, "cancel", lambda remote: cancelled.append(remote))
+    monkeypatch.setattr(vast_jobs, "cancel", lambda remote: cancelled.append(remote))
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
-    monkeypatch.setattr(vast_durable, "destroy_run_instances", lambda rid: swept.append(rid) or [])
+    monkeypatch.setattr(vast_jobs, "destroy_run_instances", lambda rid: swept.append(rid) or [])
     monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: terminated.append(a))
     monkeypatch.setattr(runpod_api, "cancel_job", lambda *a: runpod_calls.append(a))
     # make the vast provider "available" so _gc_run_endpoints invokes its gc sweep
@@ -345,10 +345,10 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
     from autoslm.providers.base import PollResult
     from autoslm.providers.runpod import train as rp_train
     from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import durable as vast_durable
+    from autoslm.providers.vast import jobs as vast_jobs
 
     monkeypatch.setattr(
-        vast_durable,
+        vast_jobs,
         "poll_vast_job",
         lambda handle, spec, seed, log=None, heartbeat_reader=None: PollResult(
             True, metrics={"train_tokens": 4096, "cost_usd": 0.3}
@@ -377,7 +377,7 @@ def test_config_provider_fields(monkeypatch):
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
     base = {
-        "model": "Qwen/Qwen3-4B-Instruct-2507",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "environment": {"id": "owner/env"},

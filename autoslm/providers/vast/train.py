@@ -1,9 +1,9 @@
-"""Vast.ai train submission: build the instance payload + submit a durable run.
+"""Vast.ai train submission: build the instance payload + submit a run.
 
 The worker stack/env is substrate-neutral, so the per-run worker env and dependency
 resolution are shared with RunPod (``providers/runpod/train.py``); this module owns the
 Vast-specific submission entrypoint and the instance payload shape. Provisioning,
-polling, and teardown live in ``providers/vast/durable.py``.
+polling, and teardown live in ``providers/vast/jobs.py``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from autoslm.providers.runpod.train import (
     build_worker_env,
     resolve_worker_deps,
 )
-from autoslm.providers.vast.durable import build_payload, submit_train_durable_vast
+from autoslm.providers.vast.jobs import build_payload, submit_run_vast
 
 __all__ = [
     "WORKER_DEPS",
@@ -23,5 +23,5 @@ __all__ = [
     "build_payload",
     "build_worker_env",
     "resolve_worker_deps",
-    "submit_train_durable_vast",
+    "submit_run_vast",
 ]

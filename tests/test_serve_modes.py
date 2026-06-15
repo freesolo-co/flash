@@ -22,12 +22,12 @@ def test_serve_endpoint_name_is_per_run():
 
 
 def test_deploy_dry_run_modes():
-    dev = deploy_adapter("r1", "Qwen/Qwen3-0.6B", "repo", "rl/r1/seed0", "RTX 4090", dry_run=True)
+    dev = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090", dry_run=True)
     assert dev.mode == "dev"
     assert dev.est_idle_cost_usd_per_day == 0.0
     warm = deploy_adapter(
         "r1",
-        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3.5-0.8B",
         "repo",
         "rl/r1/seed0",
         "RTX 4090",
@@ -35,7 +35,7 @@ def test_deploy_dry_run_modes():
         dry_run=True,
     )
     assert warm.mode == "always-on"
-    from autoslm.flash.pricing import hourly_rate
+    from autoslm.providers.runpod.pricing import hourly_rate
 
     assert warm.est_idle_cost_usd_per_day == pytest.approx(hourly_rate("RTX 4090") * 24, rel=0.01)
 
@@ -63,7 +63,7 @@ def test_resolve_serve_deps_preserves_comma_ranges(monkeypatch):
 
 
 def test_undeploy_uses_rest(monkeypatch):
-    from autoslm.flash import runpod
+    from autoslm.providers.runpod import api as runpod
     from autoslm.serve import deploy as deploy_mod
 
     monkeypatch.setattr(

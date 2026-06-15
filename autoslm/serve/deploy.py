@@ -333,38 +333,43 @@ def _get_serve_endpoint(
     from runpod_flash import Endpoint
 
     from autoslm.providers.runpod.auth import ensure_auth
-    from autoslm.providers.runpod.train import isolate_flash_state, min_cuda_for
+    from autoslm.providers.runpod.train import FLASH_SDK_LOCK, isolate_flash_state, min_cuda_for
 
     ensure_auth()
-    isolate_flash_state(f"serve-{run_id.split('-')[-1]}")
-
     friendly = canonical_gpu(friendly_gpu)
     name = serve_endpoint_name(friendly, run_id)
     cache_key = f"{name}:{mode}:{idle_timeout_s}"
-    if cache_key in _ENDPOINT_CACHE:
-        return _ENDPOINT_CACHE[cache_key]
-    kwargs = {
-        "name": name,
-        "gpu": flash_gpu(friendly),
-        "gpu_count": 1,
-        "min_cuda_version": min_cuda_for(friendly),
-        # dev: scale to zero after idle_timeout (cold start accepted, $0 idle).
-        # always-on: one permanently warm worker (no cold start, 24/7 billing).
-        "workers": (0, 1) if mode == "dev" else (1, 1),
-        "idle_timeout": int(idle_timeout_s),
-        "flashboot": True,
-        "execution_timeout_ms": serve_execution_timeout_ms(),
-    }
-    image = os.environ.get("AUTOSLM_WORKER_IMAGE")
-    if image:
-        kwargs["image"] = image
-    else:
-        kwargs["dependencies"] = resolve_serve_deps()
-        kwargs["system_dependencies"] = SERVE_SYSTEM_DEPS
-    ep = Endpoint(**kwargs)
-    handler = ep(_serve_body)
-    _ENDPOINT_CACHE[cache_key] = handler
-    return handler
+
+    # Serialize against training deploy/teardown on the same process: isolate_flash_state()
+    # swaps runpod_flash's process-wide registry globals and Endpoint() touches the SDK's
+    # asyncio singleton, so a concurrent terminate_endpoint()/always-on warmup on another
+    # thread could race the registry scope. Hold the same lock across isolation + construction.
+    with FLASH_SDK_LOCK:
+        isolate_flash_state(f"serve-{run_id.split('-')[-1]}")
+        if cache_key in _ENDPOINT_CACHE:
+            return _ENDPOINT_CACHE[cache_key]
+        kwargs = {
+            "name": name,
+            "gpu": flash_gpu(friendly),
+            "gpu_count": 1,
+            "min_cuda_version": min_cuda_for(friendly),
+            # dev: scale to zero after idle_timeout (cold start accepted, $0 idle).
+            # always-on: one permanently warm worker (no cold start, 24/7 billing).
+            "workers": (0, 1) if mode == "dev" else (1, 1),
+            "idle_timeout": int(idle_timeout_s),
+            "flashboot": True,
+            "execution_timeout_ms": serve_execution_timeout_ms(),
+        }
+        image = os.environ.get("AUTOSLM_WORKER_IMAGE")
+        if image:
+            kwargs["image"] = image
+        else:
+            kwargs["dependencies"] = resolve_serve_deps()
+            kwargs["system_dependencies"] = SERVE_SYSTEM_DEPS
+        ep = Endpoint(**kwargs)
+        handler = ep(_serve_body)
+        _ENDPOINT_CACHE[cache_key] = handler
+        return handler
 
 
 def _reject_qlora_serving(model: str) -> None:

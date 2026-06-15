@@ -47,7 +47,7 @@ class VastProvider:
 
         return hourly_rate(gpu)
 
-    def submit_train_durable(
+    def submit_run(
         self,
         spec,
         seed: int,
@@ -58,9 +58,9 @@ class VastProvider:
         offers: Any = None,
         exclude_machine_ids: Any = frozenset(),
     ) -> PollResult:
-        from autoslm.providers.vast.durable import submit_train_durable_vast
+        from autoslm.providers.vast.jobs import submit_run_vast
 
-        return submit_train_durable_vast(
+        return submit_run_vast(
             spec,
             seed,
             log=log,
@@ -71,8 +71,8 @@ class VastProvider:
         )
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
-        from autoslm.providers.runpod.durable import make_hf_heartbeat_reader
-        from autoslm.providers.vast.durable import VastJobHandle, poll_vast_job
+        from autoslm.providers.runpod.jobs import make_hf_heartbeat_reader
+        from autoslm.providers.vast.jobs import VastJobHandle, poll_vast_job
 
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
@@ -83,7 +83,7 @@ class VastProvider:
         return poll_vast_job(vh, spec, seed, log=log, heartbeat_reader=reader)
 
     def cancel(self, handle: JobHandle) -> None:
-        from autoslm.providers.vast.durable import cancel
+        from autoslm.providers.vast.jobs import cancel
 
         cancel(handle.to_dict())
 
@@ -95,13 +95,13 @@ class VastProvider:
             vast_api.destroy_instance(int(d["instance_id"]))
 
     def gc(self, spec) -> None:
-        from autoslm.providers.vast.durable import destroy_run_instances
+        from autoslm.providers.vast.jobs import destroy_run_instances
 
         destroy_run_instances(spec.run_id)
 
     def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
         """Vast-only crash-recovery sweep (called via the provider object at startup)."""
-        from autoslm.providers.vast.durable import sweep_orphans
+        from autoslm.providers.vast.jobs import sweep_orphans
 
         return sweep_orphans(active_labels=active_labels)
 

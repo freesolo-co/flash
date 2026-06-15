@@ -1,6 +1,6 @@
 """Thin RunPod REST client (no SDK state): endpoints, queue jobs, health.
 
-Used by the durable-run supervisor and endpoint GC so that a *fresh process* can
+Used by the run supervisor and endpoint GC so that a *fresh process* can
 reattach to / clean up after any run using only the persisted ids + RUNPOD_API_KEY —
 independent of the Flash SDK's local resource registry (which is per-directory,
 whole-dict, last-writer-wins and therefore unreliable across processes).

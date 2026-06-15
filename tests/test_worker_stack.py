@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import types
 
-from autoslm.flash.train import (
+from autoslm.providers.runpod.train import (
     WORKER_DEPS,
     resolve_worker_deps,
 )

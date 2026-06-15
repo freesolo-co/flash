@@ -22,7 +22,7 @@ def _spec():
     from autoslm.spec import JobSpec, TrainSpec
 
     return JobSpec(
-        model="Qwen/Qwen3-4B-Instruct-2507",
+        model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
     )
@@ -31,7 +31,7 @@ def _spec():
 def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
     """DEFECT: RL_VLLM_GPU_UTIL / RL_PER_DEVICE_PROMPTS (and the others) were never added to
     the forward list, so the docs' OOM-fix advice couldn't reach the worker."""
-    from autoslm.flash.train import build_worker_env
+    from autoslm.providers.runpod.train import build_worker_env
 
     knobs = {
         "RL_VLLM_GPU_UTIL": "0.40",
@@ -54,7 +54,7 @@ def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
 
 
 def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
-    from autoslm.flash.train import build_worker_env
+    from autoslm.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
     env = build_worker_env(_spec(), 0)
@@ -63,7 +63,7 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
 
 def test_build_worker_env_forwards_prime_api_key(monkeypatch):
     """The worker needs PRIME_API_KEY to `prime env install` the run's Hub env(s)."""
-    from autoslm.flash.train import build_worker_env
+    from autoslm.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("PRIME_API_KEY", "pit-secret")
     assert build_worker_env(_spec(), 0).get("PRIME_API_KEY") == "pit-secret"
@@ -75,14 +75,13 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
     ignored — the worker reads its own seeded value, sourced from the spec."""
-    from autoslm.flash.train import build_worker_env
-
+    from autoslm.providers.runpod.train import build_worker_env
     from autoslm.spec import JobSpec, TrainSpec
 
     # an operator HF_REPO in the env must NOT leak into the worker env
     monkeypatch.setenv("HF_REPO", "operator/default")
     per_run = JobSpec(
-        model="Qwen/Qwen3-4B-Instruct-2507",
+        model="Qwen/Qwen3.5-4B",
         algorithm="grpo",
         train=TrainSpec(steps=10, seeds=(0,), hf_repo="myorg/runs"),
     )
@@ -95,7 +94,7 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
 def test_alloc_conf_default_avoids_expandable_under_grpo_sleep(monkeypatch):
     # vLLM sleep-mode CuMemAllocator is incompatible with expandable_segments; GRPO with sleep
     # ON (the default) must NOT default to expandable_segments or the run crashes at engine init.
-    from autoslm.flash.train import build_worker_env
+    from autoslm.providers.runpod.train import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -106,7 +105,7 @@ def test_alloc_conf_default_avoids_expandable_under_grpo_sleep(monkeypatch):
 
 
 def test_alloc_conf_default_expandable_when_sleep_off(monkeypatch):
-    from autoslm.flash.train import build_worker_env
+    from autoslm.providers.runpod.train import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -116,13 +115,12 @@ def test_alloc_conf_default_expandable_when_sleep_off(monkeypatch):
 
 
 def test_alloc_conf_default_expandable_for_sft(monkeypatch):
-    from autoslm.flash.train import build_worker_env
-
+    from autoslm.providers.runpod.train import build_worker_env
     from autoslm.spec import JobSpec, TrainSpec
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    spec = JobSpec(model="Qwen/Qwen3-0.6B", algorithm="sft", train=TrainSpec(steps=2, seeds=(0,)))
+    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", algorithm="sft", train=TrainSpec(steps=2, seeds=(0,)))
     env = build_worker_env(spec, 0)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
@@ -131,7 +129,7 @@ def test_runpod_backoff_no_overflow_on_long_runs():
     """DEFECT: runpod_flash computed base*(2**attempt) then clamped, so a long poll loop
     overflowed (~80 min in) and killed a healthy job. The patch caps the exponent first."""
     pytest.importorskip("runpod_flash")
-    from autoslm.flash.train import _patch_runpod_backoff
+    from autoslm.providers.runpod.train import _patch_runpod_backoff
 
     _patch_runpod_backoff()
     from runpod_flash.core.utils import backoff
@@ -157,6 +155,20 @@ def test_serve_execution_timeout_default_and_override(monkeypatch):
     assert deploy.serve_execution_timeout_ms() == 30 * 60 * 1000
 
 
+def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():
+    """Multi-turn GRPO with vLLM disabled (the 35B tier's grpo_use_vllm=False, or RL_USE_VLLM=0)
+    must fail fast — the rollout closure reads trainer.vllm_generation.llm, which only exists
+    when use_vllm=True, so otherwise it would AttributeError deep in the first rollout turn."""
+    from autoslm.engine.worker import require_vllm_for_rollout_func
+
+    with pytest.raises(RuntimeError, match="needs colocated vLLM"):
+        require_vllm_for_rollout_func(True, False, "Qwen/Qwen3.6-35B-A3B")
+    # every supported combination is a no-op (single-turn, or vLLM enabled)
+    require_vllm_for_rollout_func(True, True, "m")
+    require_vllm_for_rollout_func(False, False, "m")
+    require_vllm_for_rollout_func(False, True, "m")
+
+
 def test_error_artifact_name_is_per_phase():
     """Per-phase error files keep the root-cause train traceback under a stable name."""
     from autoslm.engine.worker import error_artifact_name
@@ -173,7 +185,7 @@ def test_train_body_imports_every_name_it_uses():
     import ast
     import inspect
 
-    from autoslm.flash import train
+    from autoslm.providers.runpod import train
 
     tree = ast.parse(inspect.getsource(train._train_body))
     fn = tree.body[0]
@@ -195,7 +207,7 @@ def test_train_body_installs_prime_only_when_absent():
     behind `shutil.which("prime") is None`."""
     import inspect
 
-    from autoslm.flash import train
+    from autoslm.providers.runpod import train
 
     src = inspect.getsource(train._train_body)
     assert 'shutil.which("prime")' in src
@@ -203,28 +215,3 @@ def test_train_body_installs_prime_only_when_absent():
     install_idx = src.index('"install", "prime"')
     guard_idx = src.index('shutil.which("prime") is None')
     assert guard_idx < install_idx, "the prime install must be gated by the which() check"
-
-
-def test_flash_dotted_and_from_imports_both_work():
-    """Fix #10: the autoslm.flash compatibility shim must support BOTH import spellings
-    for every aliased submodule:
-      * ``from autoslm.flash import train``  (attribute lookup on the package)
-      * ``import autoslm.flash.train``       (sys.modules resolution)
-    and both must yield the SAME provider module object the new code uses (so a
-    monkeypatch against the alias is effective)."""
-    import importlib
-
-    import autoslm.flash as flash
-    from autoslm.providers.runpod import durable as rp_durable
-    from autoslm.providers.runpod import pricing as rp_pricing
-    from autoslm.providers.runpod import train as rp_train
-
-    expected = {"train": rp_train, "durable": rp_durable, "pricing": rp_pricing}
-    for name, real in expected.items():
-        # `import autoslm.flash.<name>` (dotted form)
-        dotted = importlib.import_module(f"autoslm.flash.{name}")
-        assert dotted is real, f"import autoslm.flash.{name} resolved to the wrong object"
-        # `from autoslm.flash import <name>` (attribute form)
-        assert getattr(flash, name) is real, f"autoslm.flash.{name} attribute missing/wrong"
-        # the dotted attribute is bound on the package after the dotted import
-        assert getattr(flash, name) is dotted

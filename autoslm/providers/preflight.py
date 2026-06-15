@@ -1,8 +1,9 @@
-"""Compatibility shim -> ``autoslm.providers.runpod.preflight``.
+"""Cross-provider startup preflight.
 
-``check_run_preflight`` now aggregates EVERY registered provider's missing-config
-problems (RunPod is always required; Vast only when configured), so a single startup
-error lists everything missing.
+``check_run_preflight`` aggregates EVERY selected provider's missing-config problems
+(RunPod is the default substrate; Vast only when configured/pinned) plus the shared
+Hugging Face dataset-repo requirements, so a single startup error lists everything
+missing. The per-provider key checks live in ``autoslm.providers.<name>.preflight``.
 """
 
 from __future__ import annotations

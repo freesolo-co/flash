@@ -9,8 +9,8 @@ runpod_flash's persisted registry and delete it via the RunPod API (cross-proces
 
 import types
 
-import autoslm.flash.train as ftrain
-from autoslm.flash.train import _run_suffix, _select_endpoint_resources, endpoint_name
+import autoslm.providers.runpod.train as ftrain
+from autoslm.providers.runpod.train import _run_suffix, _select_endpoint_resources, endpoint_name
 
 
 def _res(name):
@@ -35,7 +35,7 @@ def test_select_empty_target_matches_nothing():
 
 def test_terminate_endpoint_never_raises_when_sdk_missing(monkeypatch):
     # ensure_auth raises (no key) -> terminate_endpoint must swallow and return a result list
-    import autoslm.flash.auth as auth
+    import autoslm.providers.runpod.auth as auth
 
     monkeypatch.setattr(auth, "ensure_auth", lambda: (_ for _ in ()).throw(RuntimeError("no key")))
     out = ftrain.terminate_endpoint("RTX 5090", "autoslm-1-abcd1234")
@@ -52,7 +52,7 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3-4B-Instruct-2507",
+            "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
             "gpu": {"type": "RTX 5090"},
             "run_id": "autoslm-9-feedface",
@@ -102,6 +102,29 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
+
+
+def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
+    """Regression (6 bot threads): isolate_flash_state() + the ResourceManager lookup must run
+    UNDER FLASH_SDK_LOCK, not just the undeploy. isolate_flash_state swaps runpod_flash's
+    process-wide registry globals, so a concurrent deploy could swap the scope mid-teardown.
+    Asserts the lock is held when isolate_flash_state runs (and released afterward)."""
+    import autoslm.providers.runpod.auth as auth
+
+    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    held = {}
+
+    def rec_isolate(scope=None):
+        held["locked"] = ftrain.FLASH_SDK_LOCK.locked()
+        raise RuntimeError("short-circuit before the real SDK lookup")
+
+    monkeypatch.setattr(ftrain, "isolate_flash_state", rec_isolate)
+    out = ftrain.terminate_endpoint("RTX 5090", "autoslm-1-abcd1234")
+    assert held.get("locked") is True, "isolate_flash_state must run while holding FLASH_SDK_LOCK"
+    assert ftrain.FLASH_SDK_LOCK.locked() is False, "lock must be released after terminate"
+    assert isinstance(out, list)  # still never raises
+    assert out
+    assert out[0]["success"] is False
 
 
 def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):

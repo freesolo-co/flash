@@ -55,7 +55,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     # GRPO knobs live in [train]/TrainSpec, NOT [environment.params].
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3-0.6B",
+            "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "owner/env"},
             "train": {"seeds": [0], **knobs},
@@ -66,7 +66,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     # A leftover grpo_config in environment.params must NOT be read by the worker.
     poisoned = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3-0.6B",
+            "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
             "environment": {"id": "owner/env", "params": {"grpo_config": knobs}},
             "train": {"seeds": [0]},
@@ -80,7 +80,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         "JOB_SPEC",
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3-0.6B",
+                "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
                 "environment": {"id": "owner/env"},
                 "train": {"seeds": [0], "group_size": 2},
@@ -92,7 +92,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     monkeypatch.setattr(
         w,
         "JOB_SPEC",
-        JobSpec.from_dict({"model": "Qwen/Qwen3-0.6B", "algorithm": "grpo"}),
+        JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"}),
     )
     assert w.grpo_overrides() == {}
     monkeypatch.setattr(w, "JOB_SPEC", None)
@@ -103,7 +103,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     from autoslm.schema import spec_from_dict
 
     raw = {
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
@@ -159,7 +159,7 @@ def test_opt_int_float_reject_bools() -> None:
     with pytest.raises(TypeError):
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3-0.6B",
+                "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
                 "environment": {"id": "owner/env"},
                 "train": {"steps": 10, "group_size": True},
@@ -209,7 +209,7 @@ def test_verifiers_adapter_forwards_only_env_kwargs(monkeypatch) -> None:
 
 def test_init_from_adapter_parses_and_roundtrips() -> None:
     raw = {
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
@@ -265,7 +265,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     # (server validation) AND the worker's JobSpec.from_dict, or the worker would silently
     # train with recipe defaults while W&B reports the user's values.
     raw = {
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
@@ -322,7 +322,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
     from autoslm.schema import ConfigError
 
     base = {
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},

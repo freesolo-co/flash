@@ -22,7 +22,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 SPEC = {
-    "model": "Qwen/Qwen3-4B-Instruct-2507",
+    "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
     "environment": {"id": "primeintellect/gsm8k"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
@@ -414,7 +414,7 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
-    spec = {"model": "Qwen/Qwen3-4B-Instruct-2507", "algorithm": "grpo", "run_id": "dep-1"}
+    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-1"}
     runner._save_status(runner.RunStatus(run_id="dep-1", state="done", spec=spec, remote=None))
     out = runner.mark_deployed("dep-1", {"endpoint_name": "e", "mode": "dev"})
     assert out.state == "deployed"
@@ -441,7 +441,7 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
-    spec = {"model": "Qwen/Qwen3-4B-Instruct-2507", "algorithm": "grpo", "run_id": "dep-3"}
+    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-3"}
     runner._save_status(
         runner.RunStatus(
             run_id="dep-3",
@@ -504,7 +504,7 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
     importlib.reload(app_mod)
 
     spec = {
-        "model": "Qwen/Qwen3-4B-Instruct-2507",
+        "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
         "train": {"steps": 1, "seeds": [0]},
         "gpu": {"type": "RTX 5090"},

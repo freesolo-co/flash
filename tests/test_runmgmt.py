@@ -22,7 +22,7 @@ def test_list_and_cancel(monkeypatch):
         # two dry-run records
         for rid in ("a", "b"):
             runner.submit_job(
-                JobSpec(run_id=rid, model="Qwen/Qwen3-4B-Instruct-2507", algorithm="grpo"),
+                JobSpec(run_id=rid, model="Qwen/Qwen3.5-4B", algorithm="grpo"),
                 dry_run=True,
             )
         runs = {r.run_id for r in runner.list_runs()}

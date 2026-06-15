@@ -5,7 +5,7 @@ JobSpec from the environment, pulls code from the HF dataset repo, and streams
 artifacts/heartbeats/metrics back to it. Providers differ only in HOW a GPU is priced,
 provisioned, and torn down, and every provider implements the SAME ``base.Provider``
 interface behind the SAME module layout (``providers/<name>/{api,auth,pricing,gpus,
-durable,train,preflight}.py``), so they are interchangeable:
+jobs,train,preflight}.py``), so they are interchangeable:
 
   runpod  serverless Flash endpoints (the original substrate)
   vast    verified-datacenter instances (REST only)

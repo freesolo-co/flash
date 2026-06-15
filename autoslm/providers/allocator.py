@@ -51,6 +51,11 @@ def required_vram_gb(model_id: str, algorithm: str) -> int:
 
     info = MODELS.get(model_id)
     if info is not None:
+        # GRPO can need a bigger card than SFT (colocated vLLM rollout holds a 2nd copy of
+        # the weights + KV); grpo_min_vram_gb carries that floor when set (e.g. the 4-bit
+        # 36B MoE: SFT 32 GB, GRPO 80 GB). Otherwise GRPO sizes like SFT.
+        if (algorithm or "").lower() == "grpo" and info.grpo_min_vram_gb:
+            return int(info.grpo_min_vram_gb)
         return int(info.min_vram_gb)
     from autoslm.engine.vram import estimate_vram_gb, fetch_hf_params_b
 
@@ -99,7 +104,7 @@ def _vast_candidates(
     pin) re-raises a search failure; otherwise it degrades to RunPod-only.
     """
     from autoslm.providers.base import GPU_INFO
-    from autoslm.providers.vast.durable import MIN_DISK_GB, usable_offers
+    from autoslm.providers.vast.jobs import MIN_DISK_GB, usable_offers
 
     # When a larger class is pinned for a small model, search at the PINNED class's VRAM,
     # not the (smaller) model requirement: the offer search returns the cheapest ``limit``

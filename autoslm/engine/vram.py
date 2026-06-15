@@ -6,7 +6,7 @@ unlisted HF model can plausibly run on the requested GPU before provisioning it.
 These are deliberately coarse heuristics (documented ±20%): they exist to catch
 *provably impossible* configurations (70B bf16 on a 24 GB card) and to warn on tight
 fits — not to guarantee success. Calibrated against the measured catalog entries
-(Qwen3-0.6B/4B/8B, Qwen3.5 dense, Qwen3-30B-A3B QLoRA).
+(Qwen3-0.6B/4B/8B, Qwen3.5 dense, Qwen3.6-35B-A3B QLoRA).
 """
 
 from __future__ import annotations

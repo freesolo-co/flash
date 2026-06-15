@@ -27,7 +27,7 @@ class _FakeClient:
     def models(self, include_experimental: bool = False) -> list[dict]:
         rows = [
             {
-                "id": "Qwen/Qwen3-0.6B",
+                "id": "Qwen/Qwen3.5-0.8B",
                 "display_name": "Qwen3 0.6B",
                 "params": "0.6B dense",
                 "algos": ["sft", "grpo"],
@@ -49,7 +49,7 @@ class _FakeClient:
                 "state": "done",
                 "cost_usd": 0.25,
                 "updated_at": 1700000000.0,
-                "spec": {"model": "Qwen/Qwen3-0.6B", "algorithm": "sft"},
+                "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
             }
         ]
 
@@ -59,7 +59,7 @@ class _FakeClient:
             "state": "done",
             "cost_usd": 0.25,
             "error": None,
-            "spec": {"model": "Qwen/Qwen3-0.6B"},
+            "spec": {"model": "Qwen/Qwen3.5-0.8B"},
         }
 
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
@@ -108,14 +108,12 @@ def test_whoami_prints_identity(fake_client, capsys) -> None:
     assert "t@example.com" in out
 
 
-def test_models_table_and_experimental_flag(fake_client, capsys) -> None:
+def test_models_table(fake_client, capsys) -> None:
     assert _run(["models"]) == 0
-    base = capsys.readouterr().out
-    assert "Qwen/Qwen3-0.6B" in base
-    assert "Qwen3.6-35B" not in base
-
-    assert _run(["models", "--experimental"]) == 0
-    assert "Qwen3.6-35B" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # every catalog model is listed (no experimental/hidden tier)
+    assert "Qwen/Qwen3.5-0.8B" in out
+    assert "Qwen/Qwen3.6-35B-A3B" in out
 
 
 def test_status_ps_cost_and_logs(fake_client, capsys) -> None:
@@ -173,12 +171,12 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     # An unrecorded env resolves to just verifiers (the worker pip-installs verifiers; the
     # Hub env itself is installed on the worker via `prime env install` — no local path / pip
     # wheel delivery).
-    spec = JobSpec(model="Qwen/Qwen3-0.6B", environment=EnvironmentSpec(id="owner/env"))
+    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", environment=EnvironmentSpec(id="owner/env"))
     assert spec_payload(spec)["environment"]["pip"] == ["verifiers"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
-        model="Qwen/Qwen3-0.6B",
+        model="Qwen/Qwen3.5-0.8B",
         environment=EnvironmentSpec(id="owner/env", pip=("custom==1",)),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]

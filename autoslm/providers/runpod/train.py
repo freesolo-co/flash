@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import inspect
 import os
+import threading
 from typing import Any
 
 from autoslm._logging import get_logger
@@ -24,6 +25,14 @@ from autoslm.providers.runpod.gpus import flash_gpu
 from autoslm.spec import JobSpec
 
 logger = get_logger(__name__)
+
+# The control plane runs each training run in its own thread. All runpod_flash deploy/
+# undeploy work goes through a shared asyncio singleton whose Lock binds to the first event
+# loop that touches it; two threads each calling asyncio.run() get distinct loops and the
+# second fails with "Lock ... is bound to a different event loop". Serialize every Flash SDK
+# async section (deploy AND undeploy) behind this one process-wide lock. Deploys/teardowns
+# are infrequent vs training, so the serialization cost is negligible.
+FLASH_SDK_LOCK = threading.Lock()
 
 
 # Worker stack: trl 1.6 (colocate default; adds the GRPO `tools=` / `rollout_func`
@@ -407,7 +416,7 @@ def get_train_endpoint(
     from runpod_flash import Endpoint
 
     from autoslm.providers.runpod.auth import ensure_auth
-    from autoslm.providers.runpod.durable import volume_endpoint_kwargs
+    from autoslm.providers.runpod.jobs import volume_endpoint_kwargs
 
     ensure_auth()
     _patch_runpod_backoff()
@@ -438,7 +447,7 @@ def get_train_endpoint(
     handler = ep(_train_body)  # register the queue-based handler; returns the callable
     # The resource config is cached on the Endpoint, so raising the disk on it here
     # carries through to the deploy that the first handler call triggers.
-    from autoslm.providers.runpod.durable import apply_disk_gb
+    from autoslm.providers.runpod.jobs import apply_disk_gb
 
     apply_disk_gb(ep._build_resource_config(), disk_gb)
     _ENDPOINT_CACHE[name] = handler
@@ -510,37 +519,45 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list:
     """
     friendly = canonical_gpu(friendly_gpu)
     target = endpoint_name(friendly, _run_suffix(run_id))
-    try:
-        from autoslm.providers.runpod.auth import ensure_auth
+    # Hold FLASH_SDK_LOCK across the ENTIRE Flash critical section, not just the undeploy.
+    # isolate_flash_state() swaps runpod_flash's process-wide registry globals and
+    # ResourceManager shares the SDK's asyncio singleton, so a concurrent deploy/undeploy on
+    # another thread could swap the registry scope between our lookup and our undeploy and tear
+    # down the wrong run's resources. Serialize isolation + lookup + undeploy together.
+    with FLASH_SDK_LOCK:
+        try:
+            from autoslm.providers.runpod.auth import ensure_auth
 
-        ensure_auth()
-        isolate_flash_state(_run_suffix(run_id))
-        from runpod_flash.core.resources.resource_manager import ResourceManager
-    except Exception as exc:  # SDK/auth unavailable
-        return [{"success": False, "name": target, "message": f"flash unavailable: {exc}"}]
+            ensure_auth()
+            isolate_flash_state(_run_suffix(run_id))
+            from runpod_flash.core.resources.resource_manager import ResourceManager
+        except Exception as exc:  # SDK/auth unavailable
+            return [{"success": False, "name": target, "message": f"flash unavailable: {exc}"}]
 
-    try:
-        rm = ResourceManager()
-        resources = rm.list_all_resources()
-        uids = _select_endpoint_resources(resources, target)
-    except Exception as exc:
-        return [{"success": False, "name": target, "message": f"resource lookup failed: {exc}"}]
+        try:
+            rm = ResourceManager()
+            resources = rm.list_all_resources()
+            uids = _select_endpoint_resources(resources, target)
+        except Exception as exc:
+            return [{"success": False, "name": target, "message": f"resource lookup failed: {exc}"}]
 
-    async def _undeploy_all() -> list:
-        out = []
-        for uid in uids:
-            res = resources.get(uid)
-            name = getattr(res, "name", None)
-            try:
-                out.append(await rm.undeploy_resource(uid, resource_name=name, force_remove=True))
-            except Exception as exc:
-                out.append({"success": False, "name": name, "message": str(exc)})
-        return out
+        async def _undeploy_all() -> list:
+            out = []
+            for uid in uids:
+                res = resources.get(uid)
+                name = getattr(res, "name", None)
+                try:
+                    out.append(
+                        await rm.undeploy_resource(uid, resource_name=name, force_remove=True)
+                    )
+                except Exception as exc:
+                    out.append({"success": False, "name": name, "message": str(exc)})
+            return out
 
-    try:
-        results = asyncio.run(_undeploy_all())
-    except Exception as exc:
-        results = [{"success": False, "name": target, "message": str(exc)}]
+        try:
+            results = asyncio.run(_undeploy_all())
+        except Exception as exc:
+            results = [{"success": False, "name": target, "message": str(exc)}]
 
     # Registry-less fallback: isolate_flash_state() keeps the Flash SDK's resource
     # registry per-process under ~/.autoslm, so a recreated container (or a crash before
@@ -639,6 +656,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "RL_MAX_COMPLETION",
         "RL_VLLM_GPU_UTIL",
         "RL_VLLM_SLEEP",
+        "RL_USE_VLLM",
         "RL_VLLM_MAX_LEN",
         "RL_PER_DEVICE_PROMPTS",
         "RL_PROMPTS_PER_STEP",
