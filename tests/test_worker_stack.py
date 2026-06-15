@@ -34,7 +34,7 @@ def test_worker_stack_pins_qwen35_capable_versions():
     joined = " ".join(WORKER_DEPS)
     assert "vllm==0.19" in joined  # first transformers-5-compatible vllm line
     assert "transformers>=5" in joined  # qwen3_5 model types need transformers 5.x
-    assert "trl>=1.5" in joined  # colocate default
+    assert "trl>=1.6" in joined  # 1.6 adds the GRPO tools=/rollout_func multi-turn hooks
     assert "bitsandbytes" in joined  # QLoRA tier for the 35B-A3B MoE
 
 
@@ -80,3 +80,31 @@ def test_lora_exclude_modules_text_model(monkeypatch):
     worker = _import_worker(monkeypatch)
     _fake_transformers(monkeypatch, "llama")
     assert worker.lora_exclude_modules("openbmb/MiniCPM5-1B") is None
+
+
+def test_heartbeat_commit_is_throttled(monkeypatch):
+    """heartbeat() must rate-limit HF commits (per-step commits blow HF's 128/hour repo cap),
+    while always committing milestone stages."""
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("autoslm.engine.worker", None)
+    import autoslm.engine.worker as w
+
+    calls = []
+    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: calls.append(a[1]))
+
+    # Large interval -> only milestone + the first commit; per-step heartbeats throttled.
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 9999.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    w.heartbeat("rl_start")  # milestone -> commits
+    w.heartbeat("rl_step", step=1)  # throttled
+    w.heartbeat("rl_step", step=2)  # throttled
+    assert calls.count("heartbeat.json") == 1
+
+    # Zero interval -> every call commits.
+    calls.clear()
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    w.heartbeat("rl_step", step=1)
+    w.heartbeat("rl_step", step=2)
+    assert len(calls) == 2

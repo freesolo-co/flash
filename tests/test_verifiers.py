@@ -126,8 +126,8 @@ def test_install_manifest_and_worker_deps():
         import autoslm.envs.registry as registry
 
         importlib.reload(registry)
-        # An unrecorded env (no manifest entry) needs only verifiers — its module either
-        # travels with a local [environment] path or fails loudly at load time.
+        # An unrecorded env (no manifest entry) ships verifiers only — install it with
+        # `slm env install` (or set [environment] pip) so the worker gets the env wheel.
         assert registry.worker_pip_for_env("owner/env") == ["verifiers"]
         assert registry.list_installed_verifiers_envs() == []
 

@@ -22,7 +22,6 @@ from autoslm.client.config import load_credentials
 from autoslm.client.specs import spec_payload
 from autoslm.config_schema import ConfigError, spec_from_file
 from autoslm.orchestrator import TERMINAL_STATES, new_run_id
-from autoslm.worker_spec import JobSpec
 
 logger = get_logger(__name__)
 
@@ -103,6 +102,14 @@ def main(argv: list[str] | None = None) -> int:
 
     env_push = env_sub.add_parser("push", help="publish a local environment to the Prime Hub")
     env_push.add_argument("path", nargs="?", default=".")
+    env_push.add_argument(
+        "--name",
+        default=None,
+        help="override the published env name (defaults to the file/dir name)",
+    )
+    env_push.add_argument(
+        "--visibility", default=None, help="environment visibility (PUBLIC/PRIVATE)"
+    )
     env_push.set_defaults(func=cmd_env_push)
 
     train = sub.add_parser("train")
@@ -231,7 +238,7 @@ def cmd_login(args) -> int:
         api_key = claimed["api_key"]
     # Persist the plane we actually authenticated against (it may have come from
     # AUTOSLM_API_URL). save_credentials clears the stored url when it's the default, so
-    # logging into default also drops a stale custom url from a previous self-hosted login.
+    # logging into default also drops a stale custom url from a previous custom-URL login.
     path = save_credentials(api_key, api_url=api_url)
     # Never echo the key itself; the stored file is the single source of truth.
     print(f"logged in: key saved to {path}")
@@ -245,12 +252,12 @@ def cmd_whoami(args) -> int:
 
 
 _STARTER_ENV_PY = '''\
-"""Starter LOCAL verifiers environment.
+"""Starter local verifiers environment.
 
-`slm train` loads this via [environment] path (no install needed). Replace the dataset and
-rubric with your task. See https://github.com/PrimeIntellect-ai/verifiers for the full API.
-To use a published Prime Hub env instead, run `slm env install owner/name` and set
-[environment] id = "owner/name" in the config (drop the `path`).
+Replace the dataset and rubric with your task, then publish it to the Prime Hub with
+`slm env push environments/starter_env.py`. A managed run references the published env by
+its Hub slug: set [environment] id = "owner/name" in the config.
+See https://github.com/PrimeIntellect-ai/verifiers for the full API.
 """
 
 import verifiers as vf
@@ -289,12 +296,11 @@ def cmd_lab_setup(args) -> int:
         sample.write_text(
             'model = "Qwen/Qwen3-4B-Instruct-2507"\n'
             'algorithm = "grpo"\n\n'
-            "# Environment: either a Prime Hub slug (install it first with\n"
-            '#   `slm env install owner/name`  then set  id = "owner/name")\n'
-            "# or a LOCAL verifiers env module via `path` (scaffolded below).\n"
+            "# Environment: a verifiers / Prime Hub env slug. Publish the scaffolded\n"
+            "# environments/starter_env.py with `slm env push environments/starter_env.py`\n"
+            "# (then `slm env install owner/name`) to get the slug, and set it below.\n"
             "[environment]\n"
-            'path = "environments/starter_env.py"\n'
-            '# id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
+            'id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
@@ -367,14 +373,12 @@ def cmd_env_init(args) -> int:
     root.mkdir(parents=True, exist_ok=True)
     # Verifiers-only: scaffold a real verifiers env whose load_environment returns a
     # vf.Environment (here a SingleTurnEnv + Rubric over a datasets.Dataset). This is what
-    # the local-`path` loader (registry.load_environment -> VerifiersEnvironment) and a Hub
-    # push both expect, so a freshly scaffolded env actually loads.
+    # a Hub push expects, so a freshly scaffolded env actually loads.
     (root / f"{mod}.py").write_text(
-        f'"""Custom LOCAL verifiers environment ({args.name}).\n\n'
-        'Run it locally via [environment] path = "environments/'
-        f'{mod}/{mod}.py" in your config.\n'
-        "Replace the dataset and rubric with your task, then publish to the Prime Hub with\n"
-        "`slm env push` to reference it by id on the managed service.\n"
+        f'"""Custom verifiers environment ({args.name}).\n\n'
+        "Replace the dataset and rubric with your task, then publish it to the Prime Hub\n"
+        f"with `slm env push environments/{mod}/{mod}.py` and reference it by id\n"
+        '([environment] id = "owner/name") in your config.\n'
         "See https://github.com/PrimeIntellect-ai/verifiers for the full API.\n"
         '"""\n\n'
         "import verifiers as vf\n"
@@ -398,9 +402,8 @@ def cmd_env_init(args) -> int:
     (root / "README.md").write_text(f"# {args.name}\n\nCustom verifiers environment for AutoSLM.\n")
     print(f"created {root}")
     print(
-        f'run it locally:  [environment]\\npath = "environments/{mod}/{mod}.py"\n'
-        "or publish it to the Prime Hub with `slm env push` and reference it by id "
-        "(required on the managed service)."
+        f"publish it to the Prime Hub with `slm env push environments/{mod}/{mod}.py`, "
+        'then reference it by id ([environment] id = "owner/name") in your config.'
     )
     return 0
 
@@ -416,16 +419,17 @@ def cmd_env_list(args) -> int:
     local = Path("environments")
     if local.is_dir():
         # Both directory envs (environments/<name>/<name>.py) and top-level single-file
-        # modules (environments/<name>.py, e.g. the `slm lab` starter env). Print the
-        # actual path so it can be pasted straight into [environment] path.
+        # modules (environments/<name>.py, e.g. the `slm lab` starter env). These are local
+        # env SOURCES — publish one with `slm env push <path>` to run it on the managed
+        # service by its Hub id.
         paths: list[str] = []
         for p in local.iterdir():
             if p.name.startswith("__"):
                 continue
             if p.is_dir():
-                # The loader (and `slm env init`) maps a hyphenated dir to an underscored
-                # inner module file (my-env/ -> my-env/my_env.py). List that exact path, and
-                # only when it actually exists (an empty/incomplete folder isn't loadable).
+                # `slm env init` maps a hyphenated dir to an underscored inner module file
+                # (my-env/ -> my-env/my_env.py). List that exact path, and only when it
+                # actually exists (an empty/incomplete folder isn't a publishable source).
                 stem = p.name.replace("-", "_")
                 module = p / f"{stem}.py"
                 if module.is_file():
@@ -433,7 +437,7 @@ def cmd_env_list(args) -> int:
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
         if paths:
-            print("local (set [environment] path to one of):")
+            print("local env sources (publish with `slm env push <path>`):")
             for path in sorted(paths):
                 print(f"  {path}")
     return 0
@@ -495,24 +499,158 @@ def cmd_env_install(args) -> int:
     return 0
 
 
-def cmd_env_push(args) -> int:
-    import shutil
+# A verifiers env packaged for the Prime Hub is a pyproject + an importable module exposing
+# load_environment(). When `slm env push` is pointed at a bare module (a single `.py`, as the
+# freesolo training agent emits, or a dir without a pyproject), we wrap it in this layout so the
+# push Just Works instead of erroring on "pyproject.toml not found".
+_ENV_PUSH_PYPROJECT = """\
+[project]
+name = "{name}"
+version = "{version}"
+description = "AutoSLM verifiers environment ({name})."
+requires-python = ">=3.10"
+dependencies = ["verifiers"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["{module}"]
+"""
+
+_PUSH_INITIAL_VERSION = "0.1.0"
+_PUSH_MAX_ATTEMPTS = 8
+_PUSH_CONFLICT_MARKERS = ("already exists", "version already", "duplicate", "conflict", "409")
+
+
+def _push_env_name(raw: str) -> str:
+    import re
+
+    name = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    return name or "autoslm-env"
+
+
+def _push_is_version_conflict(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _PUSH_CONFLICT_MARKERS)
+
+
+def _push_slug_from(env_dir, output: str) -> str | None:
+    import json
+    import re
+    from pathlib import Path
+
+    meta = Path(env_dir) / ".prime" / ".env-metadata.json"
+    try:
+        data = json.loads(meta.read_text())
+        owner, name = data.get("owner"), data.get("name")
+        if owner and name:
+            return f"{owner}/{name}"
+    except (OSError, json.JSONDecodeError):
+        pass
+    match = re.search(r"[Ss]uccessfully pushed\s+([A-Za-z0-9][\w.-]*/[\w.-]+)", output)
+    return match.group(1) if match else None
+
+
+def _run_prime_push(env_dir, name: str | None, visibility: str | None, *, is_new: bool) -> int:
+    """Run `prime env push` on a packaged env dir, climbing past version conflicts."""
     import subprocess
 
-    if shutil.which("prime"):
-        return subprocess.run(["prime", "env", "push", args.path]).returncode
-    print("the `prime` CLI is required to publish to the Environments Hub.")
-    print("install it (https://docs.primeintellect.ai) then re-run `slm env push`.")
+    # Match the agent publish path's invocation exactly (prime env push --plain --path <dir>).
+    base = ["prime", "env", "push", "--plain", "--path", str(env_dir)]
+    if name:
+        base += ["--name", name]
+    if visibility:
+        base += ["--visibility", visibility]
+    # Mirror the agent publish path: disable prime's interactive version check so a push isn't
+    # blocked in non-interactive use (PRIME_API_KEY is inherited from the user's environment).
+    env = {**os.environ, "PRIME_DISABLE_VERSION_CHECK": "1"}
+    auto_bump = not is_new  # a re-publish must land on a fresh version
+    for _ in range(_PUSH_MAX_ATTEMPTS):
+        cmd = [*base, "--auto-bump"] if auto_bump else list(base)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        output = f"{proc.stdout or ''}{proc.stderr or ''}"
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.stderr:
+            print(proc.stderr, end="")
+        if proc.returncode == 0:
+            slug = _push_slug_from(env_dir, output)
+            if slug:
+                print(f"published {slug}")
+            else:
+                # Don't report a clean success we can't confirm: the push exited 0 but we
+                # couldn't parse the owner/name id, so the env reference may be unrecorded.
+                print(
+                    "warning: `prime env push` exited 0 but no owner/name id could be parsed; "
+                    "verify the environment on the Prime Hub before training against it",
+                    file=sys.stderr,
+                )
+            return 0
+        if _push_is_version_conflict(output):
+            auto_bump = True
+            continue
+        return proc.returncode
+    print(f"push failed after {_PUSH_MAX_ATTEMPTS} version-conflict retries", file=sys.stderr)
     return 1
 
 
-def _check_managed_spec(spec: JobSpec) -> None:
-    if spec.environment.path:
-        raise ClientError(
-            "local environment paths ([environment] path = ...) are not supported on the "
-            "managed service; publish the environment with `slm env push` and reference it "
-            'by id ([environment] id = "owner/name")'
+def cmd_env_push(args) -> int:
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    if not shutil.which("prime"):
+        print("the `prime` CLI is required to publish to the Environments Hub.")
+        print("install it (https://docs.primeintellect.ai) then re-run `slm env push`.")
+        return 1
+
+    src = Path(args.path)
+    name = getattr(args, "name", None)
+    visibility = getattr(args, "visibility", None)
+    if not src.exists():
+        print(f"no such path: {src}", file=sys.stderr)
+        return 1
+
+    # A proper env directory (has a pyproject.toml) is pushed as-is.
+    if src.is_dir() and (src / "pyproject.toml").is_file():
+        return _run_prime_push(src, name, visibility, is_new=False)
+
+    # Otherwise wrap a bare verifiers module (a single .py, or a one-module dir) into a
+    # Prime-compatible env package and push that. `--auto-bump` retries handle re-publishes.
+    if src.is_file() and src.suffix == ".py":
+        module_source = src.read_text()
+        env_name = _push_env_name(name or src.stem)
+    elif src.is_dir():
+        modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
+        if len(modules) != 1:
+            print(
+                f"{src} has no pyproject.toml and {'no' if not modules else 'multiple'} "
+                "top-level .py module(s); point `slm env push` at the env's .py file or add a "
+                "pyproject.toml.",
+                file=sys.stderr,
+            )
+            return 1
+        module_source = modules[0].read_text()
+        env_name = _push_env_name(name or src.name)
+    else:
+        print(f"cannot publish {src}: expected a verifiers .py module or an env directory.")
+        return 1
+
+    module = env_name.replace("-", "_")
+    # A Python package name can't start with a digit, so prefix one (e.g. "2026-task").
+    if module[:1].isdigit():
+        module = f"env_{module}"
+    with tempfile.TemporaryDirectory(prefix="slm-env-push-") as tmp:
+        pkg = Path(tmp)
+        (pkg / module).mkdir()
+        (pkg / module / "__init__.py").write_text(module_source)
+        (pkg / "pyproject.toml").write_text(
+            _ENV_PUSH_PYPROJECT.format(name=env_name, module=module, version=_PUSH_INITIAL_VERSION)
         )
+        (pkg / "README.md").write_text(f"# {env_name}\n\nAutoSLM verifiers environment.\n")
+        return _run_prime_push(pkg, env_name, visibility, is_new=True)
 
 
 def cmd_train(args) -> int:
@@ -523,16 +661,13 @@ def cmd_train(args) -> int:
         extra_configs=getattr(args, "extra_configs", None),
     )
     if args.dry_run:
-        # Fully local: validate the config without credentials, a server, or a GPU. A local
-        # [environment] path is legitimate here (the env runs client-side) — only a real
-        # managed submit rejects it, so the managed check stays out of this branch.
+        # Fully local: validate the id-based config without credentials, a server, or a GPU.
         print(
             json.dumps(
                 {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}, indent=2
             )
         )
         return 0
-    _check_managed_spec(spec)
     client = client_from_config()
     status = client.create_run(spec_payload(spec))
     run_id = status["run_id"]

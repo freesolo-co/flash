@@ -41,17 +41,17 @@ is supplied to reward funcs that declare it.
 uv run slm env init my-env          # creates environments/my_env/my_env.py (a verifiers env)
 ```
 
-The scaffold emits a real `verifiers` env you can run locally right away:
+The scaffold emits a real `verifiers` env. Publish it to the Prime Hub and reference it by
+its slug in your config:
 
 ```toml
 [environment]
-path = "environments/my_env/my_env.py"   # LOCAL runs only
+id = "owner/my-env"   # the Hub slug you get after `slm env push`
 ```
 
-> `[environment] path = ...` loads a local module and is only usable on the machine where the
-> training code runs. The **managed service rejects it** — Flash ships only the `autoslm`
-> package, not your project tree, so the worker never sees your env file. Publish to the Prime
-> Hub and reference it by `id` for managed runs (see below).
+> The managed service runs published Hub envs only — Flash ships only the `autoslm` package,
+> not your project tree, so the worker never sees a local env file. Publish your scaffolded env
+> to the Prime Hub with `slm env push` and reference it by `id` (see below).
 
 ## Prime Hub / `verifiers` interop (managed runs)
 

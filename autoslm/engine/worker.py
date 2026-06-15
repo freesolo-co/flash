@@ -50,8 +50,8 @@ def _load_active_env():
     """Load the run's verifiers environment from the JobSpec; require an explicit env.
 
     There is no default/builtin environment (verifiers-only): a run MUST name a verifiers/
-    Prime Hub env id or a local env path. Failing here (instead of falling back to some
-    default) prevents a paid worker from training/evaluating the wrong task.
+    Prime Hub env id. Failing here (instead of falling back to some default) prevents a paid
+    worker from training/evaluating the wrong task.
     """
     if JOB_SPEC is None:
         # No JobSpec at all (e.g. the module imported for a non-run path / a unit test). There
@@ -59,16 +59,15 @@ def _load_active_env():
         # module stays importable. A real run always carries a JobSpec.
         return None
     env_id = JOB_SPEC.environment.id
-    env_path = JOB_SPEC.environment.path
-    if not env_id and not env_path:
+    if not env_id:
         # Every supported algorithm (sft/grpo) trains/evaluates against a verifiers env, so a
         # missing env is always a misconfigured spec. Fail loudly rather than fall back to a
         # default and burn a paid worker on the wrong task.
         raise RuntimeError(
             "JobSpec sets no environment: provide [environment] id (a verifiers/Prime Hub "
-            "slug, e.g. 'owner/name') or [environment] path (a local verifiers env module)."
+            "slug, e.g. 'owner/name')."
         )
-    return load_environment(env_id, JOB_SPEC.environment.params, env_path)
+    return load_environment(env_id, JOB_SPEC.environment.params)
 
 
 ACTIVE_ENV = _load_active_env()
@@ -89,7 +88,7 @@ def require_active_env():
             "no environment is loaded: this worker was started without a JobSpec "
             "(AUTOSLM_JOB_SPEC_JSON / AUTOSLM_JOB_SPEC_PATH is unset). A train/eval run must "
             "carry a JobSpec naming [environment] id (a verifiers/Prime Hub slug, e.g. "
-            "'owner/name') or [environment] path (a local verifiers env module)."
+            "'owner/name')."
         )
     return ACTIVE_ENV
 
@@ -296,7 +295,20 @@ def make_checkpoint_upload_callback():
     return _CheckpointUpload()
 
 
+# Heartbeat HF-commit throttle. Each heartbeat() commits heartbeat.json to the HF artifact
+# repo; committing every training step (the reward callback fires per step) blows HuggingFace's
+# per-repo commit rate limit (128/hour), especially when several runs share one HF_REPO. Only
+# the per-step "rl_step" stage is high-frequency, so throttle JUST that one to once per
+# AUTOSLM_HEARTBEAT_MIN_S (default 60s); every other stage — including milestones and the
+# terminal done/already_done — always commits so the control plane never misses a transition.
+# The local file + stdout line are always written regardless.
+_HB_LAST_UPLOAD = 0.0
+_HB_MIN_INTERVAL_S = float(os.environ.get("AUTOSLM_HEARTBEAT_MIN_S", "60"))
+_HB_THROTTLED_STAGES = frozenset({"rl_step"})
+
+
 def heartbeat(stage: str, **kw):
+    global _HB_LAST_UPLOAD
     payload = {
         "stage": stage,
         "ts": time.time(),
@@ -309,7 +321,11 @@ def heartbeat(stage: str, **kw):
     p = "/tmp/hb/heartbeat.json"
     with open(p, "w") as f:
         json.dump(payload, f)
-    hf_upload_file(p, "heartbeat.json")
+    now = time.time()
+    throttled = stage in _HB_THROTTLED_STAGES
+    if not throttled or (now - _HB_LAST_UPLOAD) >= _HB_MIN_INTERVAL_S:
+        hf_upload_file(p, "heartbeat.json")
+        _HB_LAST_UPLOAD = now
     print("HEARTBEAT", json.dumps(payload))
 
 
@@ -902,21 +918,18 @@ def run_rl():
     require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
     heartbeat("rl_start")
-    # TODO(multi-turn-grpo): wiring a verifiers multi-turn/tool rollout into TRL's
-    # GRPOTrainer is invasive (TRL drives single-shot generation; a turn loop with
-    # env_response/is_completed between model turns has no clean hook in the colocated
-    # vLLM path). Until that lands, refuse multi-turn GRPO LOUDLY rather than silently
-    # train on a degenerate single-shot rollout (which would mis-score every reward func
-    # that reads multi-turn `state`). Single-turn GRPO is fully supported. A multi-turn EVAL
-    # path is NOT wired either: the adapter exposes rollout helpers
-    # (new_rollout_state/record_model_turn/env_reply/rollout_done) for a future driver, but
-    # nothing here calls them yet.
-    if getattr(ACTIVE_ENV, "multi_turn", False):
-        raise NotImplementedError(
-            "multi-turn / tool verifiers environments are not yet supported for GRPO "
-            "training on AutoSLM (the TRL GRPO rollout loop is single-shot). Use a "
-            "single-turn environment for GRPO, or run eval-only for multi-turn envs."
-        )
+    # GRPO rollout strategy by env shape (trl 1.6 adds the hooks these need):
+    #   * single-turn          -> TRL single-shot generation + per-completion reward (below);
+    #   * tool (ToolEnv & subs:
+    #     Stateful/Sandbox/Python) -> TRL drives the tool-call loop natively via
+    #     GRPOTrainer(tools=...) (it parses tool calls, executes the tools, and masks the
+    #     tool-result tokens itself); the reward scores the full transcript;
+    #   * pure multi-turn      -> a custom rollout_func (autoslm.engine.multiturn_rollout)
+    #     drives THIS env's turn loop on the colocate engine and returns the interleaved
+    #     token sequence with an env_mask so only the model's tokens are trained.
+    is_tool_env = getattr(ACTIVE_ENV, "is_tool_env", False)
+    is_multi_turn = getattr(ACTIVE_ENV, "multi_turn", False)
+    conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
     wait_for_gpu()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
     download_seconds = prefetch_model(model_id)
@@ -948,7 +961,12 @@ def run_rl():
     train = ACTIVE_ENV.dataset("train")
     rng = random.Random(SEED)
     rng.shuffle(train)
-    prompts = [{"prompt": render_prompt(tok, ex), "example": ex} for ex in train]
+    if conversational:
+        # Message-list prompts so the chat template applies roles + (for tool envs) the tool
+        # schemas; per-turn length is managed by the tool loop / rollout_func, not a flat budget.
+        prompts = [{"prompt": ACTIVE_ENV.prompt_messages(ex), "example": ex} for ex in train]
+    else:
+        prompts = [{"prompt": render_prompt(tok, ex), "example": ex} for ex in train]
     # The colocated vLLM engine's model length is the hard cap on prompt+completion at
     # rollout. Size it (honoring RL_VLLM_MAX_LEN) and derive the prompt budget from it so a
     # bigger engine or a smaller completion automatically admits longer prompts (rather than
@@ -972,17 +990,49 @@ def run_rl():
             "completion; raise RL_VLLM_MAX_LEN or lower RL_MAX_COMPLETION"
         )
     prompt_budget = vllm_max_len - _max_completion
+
     # TRL 1.5's GRPOConfig has no max_prompt_length and does NOT truncate prompts, so a prompt
     # that leaves no room for the completion within the engine length would fail mid-rollout
     # AFTER the paid worker is provisioned. Drop prompts that don't fit the budget up front.
     # render_prompt returns an apply_chat_template(tokenize=False) string that already carries
     # the special tokens, so tokenize with add_special_tokens=False (the default re-adds
     # BOS/EOS and over-counts).
-    kept = [
-        p
-        for p in prompts
-        if len(tok(p["prompt"], add_special_tokens=False).input_ids) <= prompt_budget
-    ]
+    # Drop prompts that leave no room for the completion within the engine length — applies to
+    # BOTH single-turn (string prompts) and conversational (message-list) prompts, so a tool /
+    # multi-turn rollout can't overflow the colocate engine mid-generation. Conversational
+    # prompts are length-checked via the chat template (with the generation prompt).
+    # Tool schemas TRL injects into the prompt for native tools= GRPO — include them in the
+    # budget for a tool env so a prompt isn't undercounted at filter time vs. rollout time.
+    _oai_tools = (
+        getattr(getattr(ACTIVE_ENV, "_env", None), "oai_tools", None) if is_tool_env else None
+    )
+
+    def _prompt_tokens(p) -> int:
+        if conversational:
+            # Render to text then tokenize — the SAME path the rollout uses — so the filter
+            # count matches the rollout's count (avoids a tokenize=True vs text mismatch).
+            kw = {"tools": _oai_tools} if _oai_tools else {}
+            try:
+                text = tok.apply_chat_template(
+                    p["prompt"],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    enable_thinking=THINKING,
+                    **kw,
+                )
+            except Exception as exc:
+                # Fail fast WITH context: a tokenizer/template incompatibility would render every
+                # prompt uncountable and otherwise surface as a misleading "all prompts exceed
+                # budget" — raise so the model/template can be fixed before a paid run trains on
+                # a degenerate dataset.
+                raise RuntimeError(
+                    "failed to render a conversational prompt with this model's chat template "
+                    f"(fix the model/template or the env's prompts): {exc}"
+                ) from exc
+            return len(tok(text, add_special_tokens=False).input_ids)
+        return len(tok(p["prompt"], add_special_tokens=False).input_ids)
+
+    kept = [p for p in prompts if 0 < _prompt_tokens(p) <= prompt_budget]
     if len(kept) < len(prompts):
         print(
             f"[rl] dropped {len(prompts) - len(kept)} prompts over the {prompt_budget}-token "
@@ -998,14 +1048,23 @@ def run_rl():
     ds = Dataset.from_list(prompts)
 
     def reward_fn(completions, **kwargs):
+        # rollout_func (pure multi-turn) path: the per-rollout reward is computed by the env
+        # during the rollout and forwarded as the "reward" extra field — pass it through.
+        if kwargs.get("reward") is not None:
+            return [float(r) for r in kwargs["reward"]]
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
         examples = kwargs.get("example")
         rewards = []
-        for raw, ex in zip(completions, examples, strict=False):
-            r = ACTIVE_ENV.reward(graded_text(raw), ex)
+        for comp, ex in zip(completions, examples, strict=False):
+            if isinstance(comp, list):
+                # Tool / conversational transcript (TRL passes a list of messages): score the
+                # whole transcript via the rubric (no <think> stripping — multi-turn content).
+                rewards.append(ACTIVE_ENV.reward_from_messages(comp, ex))
+                continue
+            r = ACTIVE_ENV.reward(graded_text(comp), ex)
             if _think_penalty > 0 and THINKING:
-                r -= _think_penalty * think_token_count(raw, tok)
+                r -= _think_penalty * think_token_count(comp, tok)
             rewards.append(r)
         return rewards
 
@@ -1102,6 +1161,46 @@ def run_rl():
     # engine skip the vision tower (VRAM + 5090 PTX-compat; see the patch docstring).
     patch_vllm_language_model_only(model_id)
     hb_cb = make_reward_heartbeat_callback()
+    # Multi-turn / tool wiring (trl 1.6): tool envs hand TRL the tool callables so it runs the
+    # tool-call loop natively; pure multi-turn envs hand TRL a rollout_func that drives the
+    # env's own turn loop on the colocate engine (env_mask masks the non-model tokens).
+    extra_trainer_kwargs: dict = {}
+    tools = ACTIVE_ENV.tools() if is_tool_env else []
+    # A tool env exposing NO tools would silently degrade to single-shot under tools=[]; drive
+    # it through the rollout_func turn loop instead so it isn't mis-trained as single-turn.
+    if is_tool_env and not tools:
+        print("[rl][warn] tool env exposes no tools — using the multi-turn rollout_func path")
+    use_rollout_func = is_multi_turn and not (is_tool_env and tools)
+    if is_tool_env and tools:
+        extra_trainer_kwargs["tools"] = tools
+        print(f"[rl] tool env: handing {len(tools)} tool(s) to TRL's native tool loop")
+    if use_rollout_func:
+        from autoslm.engine.multiturn_rollout import (
+            build_examples_index,
+            build_rollout_func,
+            index_collisions,
+        )
+
+        examples_by_key = build_examples_index(train, ACTIVE_ENV.prompt_messages)
+        ncol = index_collisions(train, ACTIVE_ENV.prompt_messages)
+        if ncol:
+            print(
+                f"[rl][warn] {ncol} duplicate prompt(s) collide in the reward index; the shared "
+                "prompt scores against the last example's answer/info"
+            )
+        extra_trainer_kwargs["rollout_func"] = build_rollout_func(
+            active_env=ACTIVE_ENV,
+            tok=tok,
+            examples_by_key=examples_by_key,
+            max_completion=_max_completion,
+            max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
+            temperature=_temperature,
+            top_p=rl.sampling_top_p,
+            stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
+            thinking=THINKING,
+            engine_max_len=vllm_max_len,
+        )
+        print("[rl] multi-turn env: driving the turn loop via rollout_func")
     trainer = GRPOTrainer(
         model=init_model,
         args=cfg,
@@ -1110,6 +1209,7 @@ def run_rl():
         peft_config=init_peft,
         processing_class=tok,
         callbacks=[hb_cb, make_checkpoint_upload_callback()],
+        **extra_trainer_kwargs,
     )
     t_train = time.time()
     trainer.train(resume_from_checkpoint=resume_ckpt)

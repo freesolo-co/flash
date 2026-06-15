@@ -325,7 +325,7 @@ requires-dist = [
     { name = "runpod-flash" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.10.0" },
     { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.11" },
-    { name = "trl", marker = "extra == 'gpu'", specifier = ">=1.5,<1.6" },
+    { name = "trl", marker = "extra == 'gpu'", specifier = ">=1.6,<1.7" },
     { name = "uvicorn", marker = "extra == 'server'" },
     { name = "verifiers", specifier = ">=0.1.10" },
     { name = "vllm", marker = "extra == 'gpu'", specifier = "==0.19.1" },
@@ -4011,7 +4011,7 @@ wheels = [
 
 [[package]]
 name = "trl"
-version = "1.5.1"
+version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -4020,9 +4020,9 @@ dependencies = [
     { name = "packaging" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a4/72/115c84b05d0e9b3458bb485ff3aa170cdd923fd2136e7832e41850475a8c/trl-1.5.1.tar.gz", hash = "sha256:8d73ffd9329ac21ffc47919656da2b7faaa6406fbe3574896a1923f390a9197b", size = 622292, upload-time = "2026-05-27T15:26:20.223Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/15/71/053cfddac9ec13a444b48167180e8c6c7dbd9d7b02dcfc6ad400b11e8274/trl-1.6.0.tar.gz", hash = "sha256:c24692f6436eb0ee8666965f37513b198b828eb76690cd330446bce67182a029", size = 673487, upload-time = "2026-06-11T21:45:34.256Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/9a/646429e405d49d0db2e612c418f8278d193158781a9daf3b86356244097f/trl-1.5.1-py3-none-any.whl", hash = "sha256:502a4c71f807fcb2de9768802faf5d1e9c16e52c483f51e80630b10da3451928", size = 761076, upload-time = "2026-05-27T15:26:18.22Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/55/9779cb8a5fd066afa719531f740018078a4ca4c83406f2d68bda2b4b26e6/trl-1.6.0-py3-none-any.whl", hash = "sha256:78023ee1e8ba11e9b7eaa9077c8d37b3581ff7c7ddf32fbe1f19a22fe2c76360", size = 825130, upload-time = "2026-06-11T21:45:32.526Z" },
 ]
 
 [[package]]

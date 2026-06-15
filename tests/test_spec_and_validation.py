@@ -72,13 +72,6 @@ def test_missing_model_is_rejected() -> None:
         spec_from_dict({"algorithm": "sft"})
 
 
-def test_relative_environment_path_is_anchored_to_config_dir(tmp_path) -> None:
-    raw = _raw()
-    raw["environment"] = {"id": "x", "path": "envs/custom"}
-    spec = spec_from_dict(raw, base_dir=str(tmp_path))
-    assert spec.environment.path == os.path.normpath(str(tmp_path / "envs" / "custom"))
-
-
 # ---------------------------------------------------------------------------
 # JobSpec serialization round-trips (what travels client -> server -> worker)
 # ---------------------------------------------------------------------------

@@ -26,10 +26,12 @@ from autoslm.worker_spec import JobSpec
 logger = get_logger(__name__)
 
 
-# Worker stack: trl 1.x (colocate default), vllm 0.19.1 (Qwen3.5/3.6 archs,
-# native RL APIs, transformers-5
+# Worker stack: trl 1.6 (colocate default; adds the GRPO `tools=` / `rollout_func`
+# multi-turn hooks used for verifiers ToolEnv / MultiTurnEnv training), vllm 0.19.1
+# (Qwen3.5/3.6 archs, native RL APIs, transformers-5
 # compatible metadata), transformers 5.x (qwen3_5/qwen3_5_moe model types),
-# bitsandbytes (QLoRA tier for the 35B-A3B MoE).
+# bitsandbytes (QLoRA tier for the 35B-A3B MoE). trl 1.6 requires transformers>=4.56,
+# satisfied by the 5.6+ pin; GRPOConfig is field-compatible with the 1.5 usage here.
 # Resolver/driver notes: vllm 0.17/0.18 hard-pin transformers<5 (uv refuses the
 # combo), so the first transformers-5-compatible vllm line is 0.19.1. vllm >=0.20
 # pins torch 2.11 whose default pypi wheels are CUDA-13 builds — RunPod 4090/5090
@@ -42,7 +44,7 @@ logger = get_logger(__name__)
 WORKER_DEPS = [
     "torch==2.10.0",
     "transformers>=5.6,<5.11",
-    "trl>=1.5,<1.6",
+    "trl>=1.6,<1.7",
     "peft>=0.19",
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
@@ -108,11 +110,9 @@ def upload_code() -> str:
     example environments to ship — Hub/installed envs are pip-installed on the worker (see
     ``registry.worker_pip_for_env``).
 
-    Only the ``autoslm`` package is uploaded, NOT the client's project tree, so a LOCAL
-    verifiers env (``[environment] path``) does NOT reach the worker. Managed runs must
-    reference a published Hub env by ``id`` (``slm env push`` to publish first); local
-    ``path`` envs are for LOCAL runs only. ``cli.main._check_managed_spec`` rejects a managed
-    ``path`` before submit.
+    Only the ``autoslm`` package is uploaded, NOT the client's project tree. Managed runs must
+    reference a published Hub env by ``id`` (``slm env push`` to publish a local env first); the
+    worker pip-installs the env wheel.
     """
     from huggingface_hub import HfApi
 
@@ -539,22 +539,28 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list:
 
 def build_worker_env(spec: JobSpec, seed: int) -> dict:
     """Per-run env passed to the worker (secrets + recipe overrides)."""
+    # CUDA allocator conf. Colocate (TRL trainer + vLLM on one GPU) fragments over a long run,
+    # so expandable_segments (which reclaims fragmentation) is the right default — EXCEPT under
+    # GRPO vLLM sleep mode, whose CuMemAllocator memory pool is incompatible with
+    # expandable_segments (vLLM asserts and the run crashes at engine init). So for RL with
+    # sleep mode ON (the default), default to a non-expandable conf instead; SFT and
+    # sleep-off RL keep expandable_segments. An explicit operator override always wins.
+    _is_rl = str(getattr(spec, "algorithm", "")).lower() not in ("sft",)
+    _sleep_on = os.environ.get("RL_VLLM_SLEEP", "1") not in ("0", "false", "False")
+    _alloc_default = (
+        "garbage_collection_threshold:0.8,max_split_size_mb:256"
+        if (_is_rl and _sleep_on)
+        else "expandable_segments:True"
+    )
+    # torch >= 2.10 renamed the env to PYTORCH_ALLOC_CONF — set BOTH names for either stack.
+    _alloc_conf = os.environ.get(
+        "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", _alloc_default)
+    )
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
         "BENCH_HF_MODEL": spec.model,
-        # Colocate (TRL trainer + vLLM on one GPU) is memory-tight and fragments over a long
-        # run, OOMing late (e.g. in vLLM's sampler) with memory "reserved but unallocated".
-        # expandable_segments lets the allocator reclaim that fragmentation. Overridable.
-        # torch >= 2.10 renamed the env to PYTORCH_ALLOC_CONF — set BOTH names so the
-        # setting applies on either stack.
-        "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
-            "PYTORCH_ALLOC_CONF",
-            os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
-        ),
-        "PYTORCH_ALLOC_CONF": os.environ.get(
-            "PYTORCH_ALLOC_CONF",
-            os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
-        ),
+        "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
+        "PYTORCH_ALLOC_CONF": _alloc_conf,
         # Escape hatch for torch.compile/inductor spikes (Qwen3.5 DeltaNet kernels
         # compile at first forward and can OOM a tight colocate budget).
         **(
@@ -563,7 +569,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
             else {}
         ),
     }
-    for key in ("HF_REPO", "HUGGINGFACE_TOKEN"):
+    # HF artifact creds + optional reward-judge creds: a verifiers env whose rubric calls an
+    # LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER, where the
+    # reward runs. Forward any that the operator has set; absent ones are simply not passed.
+    for key in ("HF_REPO", "HUGGINGFACE_TOKEN", "OPENROUTER_API_KEY", "OPENAI_API_KEY"):
         if os.environ.get(key):
             env[key] = os.environ[key]
     # snapshot_download / from_pretrained / load_dataset / vLLM read HF_TOKEN, not
@@ -597,6 +606,9 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "RL_PROMPTS_PER_STEP",
         "RL_GROUP_SIZE",
         "RL_SAVE_STEPS",
+        # Min seconds between heartbeat.json HF commits — raise it when several runs share one
+        # HF_REPO to stay under HuggingFace's 128-commits/hour-per-repo limit.
+        "AUTOSLM_HEARTBEAT_MIN_S",
         "VLLM_USE_V1",
         # Attention-backend escape hatch: vllm's bundled flash-attn PTX can be newer
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER

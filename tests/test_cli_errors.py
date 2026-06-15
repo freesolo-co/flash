@@ -76,24 +76,18 @@ def test_train_without_login_fails_fast():
     assert "slm login" in proc.stderr
 
 
-def test_local_env_path_rejected_client_side():
+def test_missing_env_id_rejected_client_side():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
             f.write(
                 'model = "Qwen/Qwen3-4B-Instruct-2507"\nalgorithm = "grpo"\n'
-                '[environment]\nid = "custom"\npath = "envs/custom.py"\n'
-                "[train]\nseeds = [0]\n"
+                "[environment]\n[train]\nseeds = [0]\n"
             )
-        # A real managed submit rejects a local [environment] path before any network call.
+        # A config without [environment] id is rejected before any network call.
         submit = _run(["train", cfg], env=_logged_out_env(tmp))
         assert submit.returncode == 1
-        assert "not supported on the managed service" in submit.stderr
-        # ...but --dry-run validates a local-path config fully offline (the env runs
-        # client-side there), so the drafter's `slm train <cfg> --dry-run` check can pass.
-        dry = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
-        assert dry.returncode == 0, dry.stdout + dry.stderr
-        assert '"state": "dry_run"' in dry.stdout
+        assert "[environment] id" in submit.stderr
 
 
 def test_dry_run_needs_no_credentials_or_server():

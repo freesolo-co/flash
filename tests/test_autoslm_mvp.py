@@ -49,8 +49,8 @@ def test_config_to_job_spec():
 def test_environment_registry():
     from autoslm.envs.registry import load_environment
 
-    # Verifiers-only: there are no builtin envs and no default — an empty id with no
-    # path is a hard error (env loading itself is covered in test_envs_coverage).
+    # Verifiers-only: there are no builtin envs and no default — an empty id is a hard
+    # error (env loading itself is covered in test_envs_coverage).
     with pytest.raises(ValueError, match="no environment specified"):
         load_environment("")
 

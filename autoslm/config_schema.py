@@ -170,10 +170,6 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
     train_raw = raw.get("train") or {}
     gpu_raw = raw.get("gpu") or {}
 
-    env_path = env_raw.get("path")
-    if env_path and not os.path.isabs(env_path):
-        env_path = os.path.normpath(os.path.join(base_dir, env_path))
-
     # Smart allocation is the default: an omitted gpu.type means "the cheapest GPU
     # (across providers) that fits the model", re-resolved live at submit time. The
     # original request survives in gpu.requested so the orchestrator knows whether
@@ -240,7 +236,6 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
         environment=EnvironmentSpec(
             id=str(env_raw.get("id") or ""),
             params=dict(env_raw.get("params") or {}),
-            path=env_path,
             pip=tuple(str(p) for p in env_raw.get("pip") or ()),
         ),
         train=TrainSpec(
@@ -298,13 +293,12 @@ def _validate_spec(spec: JobSpec) -> None:
         raise ConfigError("train.steps must be positive for GRPO")
     if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
         raise ConfigError("train.epochs must be positive for SFT")
-    # Verifiers-only: every run must name an environment (a verifiers/Prime Hub slug via
-    # [environment] id, or a local verifiers env module via [environment] path). There is
-    # no default environment.
-    if not (spec.environment.id or spec.environment.path):
+    # Verifiers-only: every run must name an environment by its verifiers/Prime Hub slug
+    # via [environment] id. There is no default environment and no local path mode.
+    if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (a verifiers/Prime Hub env slug, e.g. "
-            '"owner/name") or [environment] path (a local verifiers env module)'
+            '"owner/name"); there is no local path mode'
         )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")

@@ -157,6 +157,7 @@ def test_logs_offset_paging(api):
 
 
 def test_local_env_path_rejected(api):
+    # Prime Hub-only: a local [environment] path is rejected on the managed service.
     key = _claim(api)
     bad = {**SPEC, "environment": {"id": "custom", "path": "/home/user/env.py"}}
     r = api.post("/v1/runs", json={"spec": bad, "dry_run": True}, headers=_bearer(key))

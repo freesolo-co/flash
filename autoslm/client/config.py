@@ -40,7 +40,7 @@ def save_credentials(api_key: str, api_url: str | None = None) -> Path:
     if api_url:
         # Record the plane actually authenticated against. When it's the default, drop any
         # stored url instead of pinning it — this also clears a stale custom url from a
-        # previous self-hosted login so later commands don't keep hitting the old host.
+        # previous custom AUTOSLM_API_URL login so later commands don't keep hitting the old host.
         if api_url.rstrip("/") == DEFAULT_API_URL.rstrip("/"):
             cfg.pop("api_url", None)
         else:

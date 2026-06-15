@@ -1,6 +1,6 @@
 """FastAPI control plane for the managed AutoSLM service.
 
-This is the component an operator hosts (see docs/self-hosting.md). It holds the
+This is the operator-side component. It holds the
 provider credentials (``RUNPOD_API_KEY``, ``HUGGINGFACE_TOKEN``, ``HF_REPO``) and
 exposes the full run lifecycle to clients that authenticate with a claimed
 ``sk-autoslm-...`` key — clients never see provider credentials.

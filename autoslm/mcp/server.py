@@ -21,14 +21,7 @@ from autoslm.config_schema import spec_from_dict
 
 
 def _spec_from_args(args: dict, run_id: str | None = None):
-    spec = spec_from_dict(args, run_id=run_id)
-    if spec.environment.path:
-        raise ValueError(
-            "local environment paths are not supported on the managed service; "
-            "publish the environment with `slm env push`, then reference it by its Hub id "
-            '(`[environment] id = "owner/name"`)'
-        )
-    return spec
+    return spec_from_dict(args, run_id=run_id)
 
 
 def list_models(args: dict) -> dict:
