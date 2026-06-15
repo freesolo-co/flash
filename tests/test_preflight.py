@@ -2,12 +2,7 @@
 
 from __future__ import annotations
 
-import os
-import sys
-
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import autoslm.providers.preflight as pf
 
@@ -106,6 +101,65 @@ def test_preflight_runpod_pin_ignores_vast_key(clean_env, monkeypatch):
     monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf")
     monkeypatch.setenv("VAST_API_KEY", "")  # set-but-empty: vast not really configured
     pf.check_run_preflight()  # runpod-only pin, fully configured -> passes
+
+
+# -- AUTOSLM_PROVIDERS pin parsing (parses-to-nothing => unset, not disable-all) -------
+
+
+def test_pinned_provider_names_unset_is_none(clean_env):
+    from autoslm.providers import pinned_provider_names
+
+    assert pinned_provider_names() is None
+
+
+def test_pinned_provider_names_blank_is_none(clean_env, monkeypatch):
+    # A blank/whitespace/comma-only pin parses to NO known names. It must be treated as
+    # UNSET (None) — the documented "no pin / default" contract — NOT an empty set (which
+    # downstream would treat as an authoritative pin disabling EVERY provider) and NOT the
+    # full set (which would force every provider's credentials in preflight).
+    from autoslm.providers import pinned_provider_names
+
+    for blank in (",", "  ", " , ,"):
+        monkeypatch.setenv("AUTOSLM_PROVIDERS", blank)
+        assert pinned_provider_names() is None, f"blank {blank!r} must be treated as unset"
+
+
+def test_pinned_provider_names_all_unknown_is_none(clean_env, monkeypatch):
+    # Only-unknown names (a typo) drop to nothing after filtering -> treated as unset (None)
+    # rather than silently pinning to the full set or to nothing.
+    from autoslm.providers import pinned_provider_names
+
+    monkeypatch.setenv("AUTOSLM_PROVIDERS", "rnupod, vastt")
+    assert pinned_provider_names() is None
+
+
+def test_pinned_provider_names_drops_unknown_keeps_known(clean_env, monkeypatch):
+    from autoslm.providers import pinned_provider_names
+
+    monkeypatch.setenv("AUTOSLM_PROVIDERS", "runpod, bogus")
+    assert pinned_provider_names() == {"runpod"}
+
+
+def test_blank_pin_does_not_skip_preflight(clean_env, monkeypatch):
+    # The bug downstream: a blank pin -> empty set -> _preflight_provider_names() selects no
+    # providers -> check_run_preflight silently passes with NO credentials. Treating it as
+    # unset (None) restores the default checks (runpod's key demanded), without forcing
+    # Vast's key (which a full-set fallback would).
+    monkeypatch.setenv("AUTOSLM_PROVIDERS", " , ")
+    with pytest.raises(pf.PreflightError) as excinfo:
+        pf.check_run_preflight()
+    assert "RUNPOD_API_KEY" in str(excinfo.value)
+
+
+def test_blank_pin_does_not_force_vast_key(clean_env, monkeypatch):
+    # A parses-to-nothing pin must behave like UNSET, not like the full provider set: a
+    # RunPod-only operator (RunPod creds present, Vast opt-out) must clear preflight WITHOUT
+    # a VAST_API_KEY. A full-set fallback would wrongly demand it.
+    monkeypatch.setenv("AUTOSLM_PROVIDERS", "rnupod, vastt")  # all-typo -> parses to nothing
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp")
+    monkeypatch.setenv("PRIME_API_KEY", "pit")
+    monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf")
+    pf.check_run_preflight()  # no VAST_API_KEY, but vast is not demanded -> passes
 
 
 # -- client preflight (`slm <cmd>` without a key fails with a login hint) --------------

@@ -7,6 +7,8 @@ so back-to-back runs (e.g. a sequential benchmark) failed to launch. There is no
 GC/reuse, so the fix is a per-run unique endpoint name.
 """
 
+from __future__ import annotations
+
 from autoslm.providers.runpod.train import _run_suffix, endpoint_name
 
 

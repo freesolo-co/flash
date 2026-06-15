@@ -30,20 +30,9 @@ def _spec(run_id="autoslm-1700000001-rt01", **gpu_kw) -> JobSpec:
 
 
 def _offer_obj(offer_id=5, machine_id=2, gpu="RTX 3090", dph=0.25):
-    from autoslm.providers.vast.jobs import VastOffer
+    from tests._helpers.vast import make_vast_offer
 
-    return VastOffer(
-        offer_id=offer_id,
-        machine_id=machine_id,
-        gpu=gpu,
-        vram_gb=24,
-        dph_total=dph,
-        cuda_max_good=12.8,
-        disk_space=200.0,
-        reliability=0.99,
-        inet_down=5000.0,
-        geolocation="CZ",
-    )
+    return make_vast_offer(offer_id=offer_id, machine_id=machine_id, gpu=gpu, dph_total=dph)
 
 
 def _alloc(provider="vast", gpu="RTX 3090", rate=0.25, offer=None, provider_offers=()):
@@ -347,13 +336,15 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
     from autoslm.providers.vast import api as vast_api
     from autoslm.providers.vast import jobs as vast_jobs
 
-    monkeypatch.setattr(
-        vast_jobs,
-        "poll_vast_job",
-        lambda handle, spec, seed, log=None, heartbeat_reader=None: PollResult(
-            True, metrics={"train_tokens": 4096, "cost_usd": 0.3}
-        ),
-    )
+    seen_kwargs: dict = {}
+
+    def _fake_poll(handle, spec, seed, log=None, heartbeat_reader=None, **kwargs):
+        # The reattach path must forward the stall tuning + wall-cap deadline (matching
+        # submit_run_vast / RunPod's reattach), not silently drop them.
+        seen_kwargs.update(kwargs)
+        return PollResult(True, metrics={"train_tokens": 4096, "cost_usd": 0.3})
+
+    monkeypatch.setattr(vast_jobs, "poll_vast_job", _fake_poll)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
@@ -366,6 +357,9 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
     assert out.state == "done"
     assert out.cost_usd == 0.3
     assert 8 in destroyed  # _gc_run_endpoints destroyed the instance via the handle
+    # Reattach forwarded the stall window + wall-cap deadline (not dropped on recovery).
+    assert "stall_after_s" in seen_kwargs
+    assert seen_kwargs.get("deadline_s") == max(60, int(spec.gpu.max_wall_seconds)) + 1800
 
 
 # ---------------------------------------------------------------------------

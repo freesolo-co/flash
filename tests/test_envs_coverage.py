@@ -3,12 +3,7 @@ id-based loader (verifiers-only — there are no built-in envs and no local-path
 
 from __future__ import annotations
 
-import os
-import sys
-
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from autoslm.envs.base import BaseEnvironment
 

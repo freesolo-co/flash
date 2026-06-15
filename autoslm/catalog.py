@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
+from typing import Any
 
 ALGORITHMS = ("sft", "grpo")
 
@@ -15,6 +17,14 @@ def normalize_algorithm(value: str) -> str:
     return value
 
 
+# The default GPU class a run lands on when none is pinned (also the open-model-policy
+# sizing reference and the spec/from_dict fallback). The validated GPU class set
+# (SUPPORTED/is_validated) lives in providers.base; per-provider classes and pricing live
+# under providers/{runpod,vast}. Defined above ModelInfo so it can back the
+# recommended_gpu field default.
+DEFAULT_GPU = "RTX 5090"
+
+
 @dataclass(frozen=True)
 class ModelInfo:
     id: str
@@ -23,7 +33,7 @@ class ModelInfo:
     algos: tuple[str, ...]
     min_vram_gb: int
     quant: str = "bf16"
-    recommended_gpu: str = "RTX 5090"
+    recommended_gpu: str = DEFAULT_GPU
     # GRPO needs more VRAM than SFT (a colocated vLLM rollout engine holds a second copy of
     # the weights + KV cache). 0 => GRPO uses ``min_vram_gb`` like SFT; set it when the GRPO
     # tier needs a bigger card than SFT (e.g. the 4-bit 36B MoE: SFT fits 32 GB, GRPO needs
@@ -54,7 +64,7 @@ class ModelInfo:
     #   "unknown" open-model-policy entries (capability not verified)
     thinking: str = "none"
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -180,10 +190,17 @@ def resolve_model(
     if policy != "allow":
         # Reuse get_model's error (includes the open-model hint).
         return get_model(model_id)
+    return _resolve_open_model(model_id, algo, gpu)
 
+
+def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
+    """Synthesize a ModelInfo for the open-model "allow" policy from a coarse VRAM-fit
+    estimate (HF safetensors metadata, no download). Blocks provably-impossible fits and
+    warns on tight ones. Isolates the engine.vram dependency + disk-floor heuristic from
+    the curated-catalog path in resolve_model."""
     from autoslm.engine.vram import check_fit
 
-    est = check_fit(model_id, algo, gpu or "RTX 5090")
+    est = check_fit(model_id, algo, gpu or DEFAULT_GPU)
     if est.verdict == "too_big":
         raise ValueError(
             f"{model_id} does not fit the requested GPU: {est.describe()}. "
@@ -202,13 +219,31 @@ def resolve_model(
         id=model_id,
         display_name=model_id,
         params=params,
-        algos=("sft", "grpo"),
-        min_vram_gb=int(est.est_gb) if est.est_gb else 24,
+        algos=ALGORITHMS,
+        min_vram_gb=math.ceil(est.est_gb) if est.est_gb else 24,
         min_disk_gb=min_disk,
-        recommended_gpu=gpu or "RTX 5090",
+        recommended_gpu=gpu or DEFAULT_GPU,
         thinking="unknown",
         notes="unlisted model accepted via the open-model policy (not curated/validated)",
     )
+
+
+def catalog_min_vram_gb(model_id: str, algorithm: str) -> int | None:
+    """Curated VRAM floor for a catalog model under ``algorithm``, else ``None``.
+
+    GRPO can need a bigger card than SFT (the colocated vLLM rollout holds a 2nd copy
+    of the weights + KV), so honor ``grpo_min_vram_gb`` when set; otherwise GRPO sizes
+    like SFT. Returns ``None`` for non-catalog (open-model) ids so callers can apply
+    their own coarse estimate. Single source of truth for both the parse-time
+    ``providers.base.resolve_gpu_policy`` and the submit-time
+    ``providers.allocator.required_vram_gb``.
+    """
+    info = MODELS.get(model_id)
+    if info is None:
+        return None
+    if (algorithm or "").lower() == "grpo" and info.grpo_min_vram_gb:
+        return int(info.grpo_min_vram_gb)
+    return int(info.min_vram_gb)
 
 
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
@@ -223,5 +258,5 @@ def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
     return info
 
 
-def public_model_rows() -> list[dict]:
+def public_model_rows() -> list[dict[str, Any]]:
     return [m.to_dict() for m in list_models()]

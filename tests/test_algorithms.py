@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from autoslm.catalog import ALGORITHMS
 from autoslm.schema import ConfigError, spec_from_dict
-from autoslm.spec import ALGORITHMS
 
 
 def test_algorithms_registry():

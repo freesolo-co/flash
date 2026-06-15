@@ -6,11 +6,8 @@ import importlib
 import json
 import os
 import stat
-import sys
 import tempfile
 import types
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
 def test_login_writes_private_config():

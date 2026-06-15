@@ -17,7 +17,7 @@ def spec_payload(spec: JobSpec) -> dict:
     if not spec.environment.pip:
         from autoslm.envs.registry import worker_pip_for_env
 
-        pip = worker_pip_for_env(spec.environment.id, spec.environment.params)
+        pip = worker_pip_for_env(spec.environment.id)
         if pip:
             out["environment"]["pip"] = pip
     return out

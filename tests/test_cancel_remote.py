@@ -7,6 +7,8 @@ so the remote RunPod worker kept running (and billing) until the wall-clock cap.
 runpod_flash's persisted registry and delete it via the RunPod API (cross-process).
 """
 
+from __future__ import annotations
+
 import types
 
 import autoslm.providers.runpod.train as ftrain
@@ -102,6 +104,165 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
+
+
+def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, monkeypatch):
+    # Regression: the deployed branch used a bare _save_status OUTSIDE _STATUS_LOCK, which
+    # persisted a stale pre-teardown snapshot and bypassed serialization. It must instead
+    # mark the deployment inactive through the lock-guarded mark_deployment_undeployed
+    # helper, and that write must happen while _STATUS_LOCK is held.
+    import inspect
+
+    import autoslm.runner as orch
+    import autoslm.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from autoslm.spec import JobSpec
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-dep-lock"})
+    st = orch.RunStatus(
+        run_id=spec.run_id,
+        state="deployed",
+        spec=spec.to_dict(),
+        deployment={"state": "ready", "gpu": "RTX 5090", "mode": "dev"},
+    )
+    orch._save_status(st)
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["autoslm-serve-5090-x"])
+    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+
+    # The undeploy write must route through the lock-guarded helper (not a bare _save_status
+    # outside _STATUS_LOCK, the old racy path); that helper holds _STATUS_LOCK.
+    assert "with _STATUS_LOCK" in inspect.getsource(orch.mark_deployment_undeployed)
+
+    called = []
+    real_helper = orch.mark_deployment_undeployed
+
+    def spy(run_id):
+        called.append(run_id)
+        return real_helper(run_id)
+
+    monkeypatch.setattr(orch, "mark_deployment_undeployed", spy)
+
+    out = orch.cancel_run(spec.run_id)
+    assert called == [spec.run_id], "undeploy must go through mark_deployment_undeployed"
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+
+
+def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, monkeypatch):
+    # Race: while cancel_run tears down a `deployed` run, a concurrent mark_undeployed moves
+    # the run to terminal `done` on disk. The deployment-field write must NOT re-assert a
+    # non-terminal state (the old _update(run_id, "deployed", deployment=...) path no-ops
+    # against the terminal `done` CAS, leaving the deployment advertised as `ready`). It must
+    # mark the deployment undeployed regardless of the terminal race.
+    import autoslm.runner as orch
+    import autoslm.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from autoslm.spec import JobSpec
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-dep-race"})
+    st = orch.RunStatus(
+        run_id=spec.run_id,
+        state="deployed",
+        spec=spec.to_dict(),
+        deployment={"state": "ready", "gpu": "RTX 5090", "mode": "dev"},
+    )
+    orch._save_status(st)
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["autoslm-serve-5090-x"])
+    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+
+    # Inject the race: a concurrent mark_undeployed flips the run to terminal `done` AFTER
+    # cancel_run's initial get_status (state="deployed") but BEFORE the deployment is retired.
+    def racing_undeploy(*a, **k):
+        # mark_undeployed moves a live `deployed` run to terminal `done`.
+        orch.mark_undeployed(spec.run_id)
+        return ["autoslm-serve-5090-x"]
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", racing_undeploy)
+
+    out = orch.cancel_run(spec.run_id)
+    # Explicit cancel WINS over the racing undeploy: even though mark_undeployed flipped the
+    # run to terminal `done`, cancel_run's final transition (allow_from_terminal) overrides it
+    # so the run ends `cancelled`, and the deployment is reliably retired regardless of the race.
+    assert out.state == "cancelled"
+    assert out.deployment["state"] == "undeployed", (
+        "deployment must end undeployed even when the run raced to terminal `done`"
+    )
+
+
+def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
+    # Cancel-race regression: while cancel_run tears down a `deployed` run, a concurrent
+    # mark_undeployed() moves the run to terminal `done`. The user explicitly asked to cancel,
+    # so the final transition must OVERRIDE the racing `done` — the run must end `cancelled`,
+    # not `done`. (Mirrors test_cancel_deployed_run_undeployed_even_when_raced_to_terminal but
+    # asserts the state verdict specifically.)
+    import autoslm.runner as orch
+    import autoslm.serve.deploy as deploy
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from autoslm.spec import JobSpec
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-cancel-wins"})
+    st = orch.RunStatus(
+        run_id=spec.run_id,
+        state="deployed",
+        spec=spec.to_dict(),
+        deployment={"state": "ready", "gpu": "RTX 5090", "mode": "dev"},
+    )
+    orch._save_status(st)
+
+    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+
+    # The racing undeploy flips the run to terminal `done` mid-cancel (after cancel_run's
+    # initial non-terminal read, before its final `cancelled` write).
+    def racing_undeploy(*a, **k):
+        orch.mark_undeployed(spec.run_id)
+        assert orch.get_status(spec.run_id).state == "done"  # the race landed
+        return ["autoslm-serve-5090-x"]
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", racing_undeploy)
+
+    out = orch.cancel_run(spec.run_id)
+    assert out.state == "cancelled", "explicit cancel must win over a racing undeploy `done`"
+    assert orch.get_status(spec.run_id).state == "cancelled"
+    assert out.deployment["state"] == "undeployed"
+
+
+def test_cancel_loses_to_racing_genuine_completion_done(tmp_path, monkeypatch):
+    # Cancel-race regression (the mirror of test_cancel_wins_over_racing_undeploy_done): while
+    # cancel_run tears down a NON-deployed `running` run, the run's OWN training thread finishes
+    # and writes a GENUINE training-completion `done` (real metrics: cost_usd + artifacts_dir).
+    # The run actually finished, so its result MUST be preserved — cancel must NOT clobber it to
+    # `cancelled`. (A blunt allow_from_terminal=True would discard the real result here; the
+    # override is scoped to runs that were `deployed` at entry, which a `running` run is not.)
+    import autoslm.runner as orch
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from autoslm.spec import JobSpec
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-finish-race"})
+    # A `running` run (NOT deployed): no deployment, an in-flight training thread.
+    st = orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
+    orch._save_status(st)
+
+    # Inject the race: the training thread completes mid-teardown and writes the terminal
+    # `done` with a real result (mirrors _run_job_inner's finish path) AFTER cancel_run's
+    # initial non-terminal read but BEFORE its final `cancelled` write.
+    def racing_completion(*a, **k):
+        orch._update(spec.run_id, "done", cost_usd=1.23, artifacts_dir="/runs/finished")
+        assert orch.get_status(spec.run_id).state == "done"  # the genuine finish landed
+        return [{"success": True}]
+
+    monkeypatch.setattr(ftrain, "terminate_endpoint", racing_completion)
+
+    out = orch.cancel_run(spec.run_id)
+    assert out.state == "done", "a genuine training-completion `done` must NOT be clobbered by cancel"
+    assert orch.get_status(spec.run_id).state == "done"
+    assert out.cost_usd == 1.23, "the finished run's real result (cost) must be preserved"
+    assert out.artifacts_dir == "/runs/finished"
 
 
 def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):

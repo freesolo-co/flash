@@ -54,23 +54,25 @@ import random
 
 from .base import BaseEnvironment
 
-# The kwargs this adapter can supply to a reward func (kept in sync with the ``available``
-# dict built in VerifiersEnvironment._reward_available).
-_AVAILABLE_REWARD_KWARGS = frozenset(
-    {
-        "completion",
-        "prompt",
-        "answer",
-        "info",
-        "state",
-        "parser",
-        "task",
-        "judge",
-        "judge_client",
-        "judge_model",
-        "judge_prompt",
-    }
+# The judge-related kwarg names a reward func may declare, sourced from a JudgeRubric.
+# Single source of truth for both ``_judge_kwargs`` and ``_AVAILABLE_REWARD_KWARGS``.
+_JUDGE_KWARG_NAMES = ("judge", "judge_client", "judge_model", "judge_prompt")
+
+# The kwargs this adapter can supply to a reward func. The non-judge keys are exactly the
+# ones built into the ``available`` dict in VerifiersEnvironment._reward_available; the judge
+# keys come from ``_judge_kwargs``. Deriving the frozenset from these shared names avoids the
+# manual "keep in sync" coupling (adding a kwarg below without updating the set would
+# re-trigger the false "requires unavailable arg" failure).
+_BASE_REWARD_KWARG_NAMES = (
+    "completion",
+    "prompt",
+    "answer",
+    "info",
+    "state",
+    "parser",
+    "task",
 )
+_AVAILABLE_REWARD_KWARGS = frozenset(_BASE_REWARD_KWARG_NAMES + _JUDGE_KWARG_NAMES)
 
 
 def _reward_requires_unavailable_args(func) -> str | None:
@@ -143,7 +145,7 @@ def _run_async(coro):
         return ex.submit(lambda: asyncio.run(coro)).result()
 
 
-def _call_dataset_getter(obj, method_names, *, seed: int):
+def _call_dataset_getter(obj, method_name: str, *, seed: int):
     """Call a verifiers dataset getter, binding (n, seed) when it declares them.
 
     verifiers exposes get_dataset/get_eval_dataset as get_X(n=-1, seed=0); some Hub envs
@@ -151,21 +153,19 @@ def _call_dataset_getter(obj, method_names, *, seed: int):
     dataset (a paid run over no data). Bind n=-1 (all rows — the adapter does its own fixed
     subset selection) and the seed when the signature declares them; a genuine failure
     propagates (fail loudly) instead of silently emptying the split."""
-    for name in method_names:
-        fn = getattr(obj, name, None)
-        if not callable(fn):
-            continue
-        try:
-            param_names = set(inspect.signature(fn).parameters)
-        except (TypeError, ValueError):
-            param_names = set()
-        kwargs = {}
-        if "n" in param_names:
-            kwargs["n"] = -1
-        if "seed" in param_names:
-            kwargs["seed"] = seed
-        return fn(**kwargs)
-    return None
+    fn = getattr(obj, method_name, None)
+    if not callable(fn):
+        return None
+    try:
+        param_names = set(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        param_names = set()
+    kwargs = {}
+    if "n" in param_names:
+        kwargs["n"] = -1
+    if "seed" in param_names:
+        kwargs["seed"] = seed
+    return fn(**kwargs)
 
 
 def _rows_to_list(ds) -> list[dict]:
@@ -222,12 +222,7 @@ def _judge_kwargs(judge_rubric) -> dict:
     """The judge-related kwargs a reward func may declare, sourced from a JudgeRubric."""
     if judge_rubric is None:
         return {}
-    return {
-        "judge": getattr(judge_rubric, "judge", None),
-        "judge_client": getattr(judge_rubric, "judge_client", None),
-        "judge_model": getattr(judge_rubric, "judge_model", None),
-        "judge_prompt": getattr(judge_rubric, "judge_prompt", None),
-    }
+    return {name: getattr(judge_rubric, name, None) for name in _JUDGE_KWARG_NAMES}
 
 
 def _invoke_reward(func, available: dict) -> float:
@@ -319,14 +314,12 @@ class VerifiersEnvironment(BaseEnvironment):
         vf_env,
         env_id: str,
         eval_vf_env=None,
-        eval_env_id: str | None = None,
         eval_examples: int | None = None,
         eval_seed: int = 12345,
     ):
         super().__init__(id=env_id)
         self._env = vf_env
         self._eval_env = eval_vf_env  # optional separate eval Hub env
-        self._eval_env_id = eval_env_id
         self._eval_examples = int(eval_examples) if eval_examples else 0
         self._eval_seed = int(eval_seed)
         self.multi_turn = _is_multi_turn(vf_env)
@@ -366,16 +359,16 @@ class VerifiersEnvironment(BaseEnvironment):
             # on training data. Only fall back when the eval source is genuinely *absent*
             # (None), not merely empty. ``get_eval_dataset``/``eval_dataset`` returning [] is
             # a deliberate empty eval set and must be honored as such.
-            eval_ds = _call_dataset_getter(src, ["get_eval_dataset"], seed=self._eval_seed)
+            eval_ds = _call_dataset_getter(src, "get_eval_dataset", seed=self._eval_seed)
             if eval_ds is None:
                 eval_ds = getattr(src, "eval_dataset", None)
             if eval_ds is None:  # no eval split configured at all: use the env's train split
-                eval_ds = _call_dataset_getter(src, ["get_dataset"], seed=self._eval_seed)
+                eval_ds = _call_dataset_getter(src, "get_dataset", seed=self._eval_seed)
                 if eval_ds is None:
                     eval_ds = getattr(src, "dataset", None)
             rows = _rows_to_list(eval_ds)
             return self._fixed_subset(rows)
-        ds = _call_dataset_getter(self._env, ["get_dataset"], seed=0)
+        ds = _call_dataset_getter(self._env, "get_dataset", seed=0)
         if ds is None:
             ds = getattr(self._env, "dataset", None)
         return _rows_to_list(ds)
@@ -486,8 +479,15 @@ class VerifiersEnvironment(BaseEnvironment):
             name = getattr(func, "__name__", str(func))
             score = float(weight) * _invoke_reward(func, available)
             # Collisions (two funcs share a name): keep them distinct so neither is lost.
+            # Probe for an unused exact key — a prefix/length heuristic can recompute a
+            # suffix that collides with an already-recorded key (e.g. ``score`` vs
+            # ``score_detail``) and silently overwrite a scorer.
             if name in breakdown:
-                name = f"{name}_{len([k for k in breakdown if k.startswith(name)])}"
+                base = name
+                i = 1
+                while name in breakdown:
+                    name = f"{base}_{i}"
+                    i += 1
             breakdown[name] = score
             total += score
         breakdown["total"] = total
@@ -556,9 +556,17 @@ class VerifiersEnvironment(BaseEnvironment):
         try:
             reply = _run_async(fn(messages, state))
         except NotImplementedError:
+            # Legitimate "this env has no env turn" signal -> no env reply.
             return []
-        except Exception:
-            return []
+        except Exception as exc:
+            # Mirror `_invoke_reward`: a genuine bug in the env's `env_response` must
+            # NOT be swallowed. Silently returning [] would collapse every multi-turn
+            # rollout to a single turn and train a paid GRPO run on degenerate
+            # transcripts. The rollout loop (multiturn_rollout.py) calls this directly
+            # with no surrounding swallow, so re-raising propagates and fails the run
+            # fast (and the context is printed first so it never vanishes silently).
+            print(f"[env_reply] env_response failed (turn={state.get('turn', 0)}): {exc!r}")
+            raise
         if reply is None:
             return []
         if isinstance(reply, dict):
@@ -579,8 +587,16 @@ class VerifiersEnvironment(BaseEnvironment):
             return True
         try:
             return bool(_run_async(fn(state)))
-        except Exception:
+        except NotImplementedError:
+            # Env doesn't implement a completion check -> rely on the turn cap only.
             return True
+        except Exception as exc:
+            # Mirror `_invoke_reward` / `env_reply`: a real bug in `is_completed` must
+            # not be silently treated as "done" (which would truncate every rollout and
+            # train on degenerate transcripts). Print context, then re-raise so the run
+            # fails fast (the rollout loop calls this directly with no surrounding swallow).
+            print(f"[rollout_done] is_completed failed (turn={state.get('turn', 0)}): {exc!r}")
+            raise
 
     def record_model_turn(self, state: dict, content: str) -> dict:
         """Append a model (assistant) turn to ``state`` before calling ``env_reply``."""
@@ -588,15 +604,6 @@ class VerifiersEnvironment(BaseEnvironment):
         state["completion"].append(msg)
         state.setdefault("responses", []).append(content)
         return msg
-
-    def describe(self) -> dict:
-        return {
-            "environment": self.id,
-            "eval_env": self._eval_env_id,
-            "multi_turn": self.multi_turn,
-            "judge": self._judge_rubric is not None,
-            "reward_funcs": [getattr(f, "__name__", str(f)) for f, w in self._reward_pairs if w],
-        }
 
 
 def _import_vf():
@@ -634,7 +641,6 @@ def load_verifiers_environment(
         vf_env,
         env_id,
         eval_vf_env=eval_vf_env,
-        eval_env_id=eval_ref,
         eval_examples=eval_examples,
         eval_seed=eval_seed,
     )

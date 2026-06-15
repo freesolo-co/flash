@@ -64,6 +64,8 @@ def estimate_vram_gb(params_b: float, algorithm: str, quant: str = "bf16") -> fl
 
     sft:  weights + activations/overhead
     grpo: trainer weights + (sleep-mode) colocated vLLM KV/scratch + overhead
+
+    ``algorithm`` accepts ``"rl"`` as an alias for ``"grpo"``.
     """
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     weights = params_b * bpp

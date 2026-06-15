@@ -1,29 +1,34 @@
-"""On-GPU fine-tuning worker (default RTX 5090). Modes: sft | rl.
+"""On-GPU fine-tuning worker (RunPod or Vast.ai). Modes: sft | rl.
 
-This module runs **on the RunPod GPU** provisioned by ``autoslm.providers.runpod``. It uses the
-shared recipe (``autoslm.engine.recipe``) so SFT targets and RL rewards are rendered
-and scored consistently.
+This module runs on the provisioned GPU (RunPod or Vast.ai) launched by the selected
+``autoslm.providers`` backend. It uses the shared recipe (``autoslm.engine.recipe``) so
+SFT targets and RL rewards are rendered and scored consistently.
 
 Artifacts (adapter, metrics.json, heartbeat.json, checkpoints) are streamed to a
 Hugging Face dataset repo. HF checkpoints give preemption resilience: if a worker is
 recycled mid-run we resume from the latest uploaded checkpoint. Metrics are also
-returned directly to the caller by the Flash endpoint.
+returned directly to the caller by the launching provider.
 
-Environment variables (set by the Flash endpoint / runner):
+Core environment variables (set by the launching provider / runner):
   RUN_MODE      sft|rl
   SEED          int
-  HF_REPO       Hugging Face dataset repo for artifacts (e.g. your-org/autoslm-runs)
+  HF_REPO       Hugging Face dataset repo for artifacts, populated per-run from the
+                JobSpec's [train] hf_repo by whichever provider launches the worker
   HUGGINGFACE_TOKEN
   RUN_ID        unique id for this run (namespacing in the repo)
-  RL_STEPS, SFT_EPOCHS   optional overrides
+
+The AUTOSLM_*/RL_*/SFT_* env vars are A/B overrides documented at their use sites; the
+JobSpec [train] table is the source of truth for per-run knobs.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import random
 import sys
+import threading
 import time
 import traceback
 
@@ -121,68 +126,60 @@ def hf_prefix() -> str:
     return f"{PHASE}/{RUN_ID}/seed{SEED}"
 
 
-def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False):
-    """Upload one file to the run's HF prefix.
+def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> None:
+    """Shared HF upload loop for files/folders: HF_REPO guard + retry/raise-or-warn.
 
-    ``required=True`` (the completion artifacts DONE/metrics.json) retries and finally
-    raises: a swallowed upload failure would make the control plane mark a finished run
-    failed or retry already-completed work.
+    ``required=True`` (completion artifacts DONE/metrics.json, the trained adapter) retries
+    and finally raises: a swallowed upload failure would make the control plane mark a
+    finished run failed/retried, or mark the run done while deployment can never download
+    the missing adapter. Optional artifacts (generations, logs) only warn.
     """
     if not HF_REPO:
         return
-    import time as _time
-
     attempts = 3 if required else 1
     for attempt in range(attempts):
         try:
-            hf_api().upload_file(
-                path_or_fileobj=local_path,
-                path_in_repo=f"{hf_prefix()}/{repo_subpath}",
-                repo_id=HF_REPO,
-                repo_type="dataset",
-            )
+            do_upload()
             return
         except Exception as e:
             if required and attempt + 1 < attempts:
-                print(f"hf_upload_file retry {attempt + 1}/{attempts}: {e}")
-                _time.sleep(5 * (attempt + 1))
+                print(f"{label} retry {attempt + 1}/{attempts}: {e}")
+                time.sleep(5 * (attempt + 1))
                 continue
             if required:
                 raise RuntimeError(f"required upload of {repo_subpath!r} failed: {e}") from e
-            print("hf_upload_file warn:", e)
+            print(f"{label} warn:", e)
             return
+
+
+def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False):
+    """Upload one file to the run's HF prefix."""
+    _hf_upload(
+        lambda: hf_api().upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=f"{hf_prefix()}/{repo_subpath}",
+            repo_id=HF_REPO,
+            repo_type="dataset",
+        ),
+        repo_subpath,
+        required,
+        "hf_upload_file",
+    )
 
 
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False):
-    """Upload a folder to the run's HF prefix.
-
-    ``required=True`` (the trained adapter) retries and finally raises on failure:
-    swallowing it would mark the run done while deployment can never download the
-    missing adapter. Optional artifacts (generations, logs) only warn.
-    """
-    if not HF_REPO:
-        return
-    import time as _time
-
-    attempts = 3 if required else 1
-    for attempt in range(attempts):
-        try:
-            hf_api().upload_folder(
-                folder_path=local_dir,
-                path_in_repo=f"{hf_prefix()}/{repo_subpath}",
-                repo_id=HF_REPO,
-                repo_type="dataset",
-            )
-            return
-        except Exception as e:
-            if required and attempt + 1 < attempts:
-                print(f"hf_upload_folder retry {attempt + 1}/{attempts}: {e}")
-                _time.sleep(5 * (attempt + 1))
-                continue
-            if required:
-                raise RuntimeError(f"required upload of {repo_subpath!r} failed: {e}") from e
-            print("hf_upload_folder warn:", e)
-            return
+    """Upload a folder to the run's HF prefix."""
+    _hf_upload(
+        lambda: hf_api().upload_folder(
+            folder_path=local_dir,
+            path_in_repo=f"{hf_prefix()}/{repo_subpath}",
+            repo_id=HF_REPO,
+            repo_type="dataset",
+        ),
+        repo_subpath,
+        required,
+        "hf_upload_folder",
+    )
 
 
 def hf_resume_checkpoint() -> str | None:
@@ -305,6 +302,16 @@ def make_checkpoint_upload_callback():
 _HB_LAST_UPLOAD = 0.0
 _HB_MIN_INTERVAL_S = float(os.environ.get("AUTOSLM_HEARTBEAT_MIN_S", "60"))
 _HB_THROTTLED_STAGES = frozenset({"rl_step"})
+# Serializes heartbeat.json writes and _HB_LAST_UPLOAD reads/updates. During GRPO,
+# heartbeat() is called concurrently from the trainer thread (reward callback) and the
+# checkpoint-upload daemon thread; without this lock two writers can interleave and
+# truncate/garble heartbeat.json (and race _HB_LAST_UPLOAD).
+_HB_LOCK = threading.Lock()
+# Serializes the actual HF upload (a slow network commit) SEPARATELY from _HB_LOCK so the
+# trainer's frequent local writes never block on the network. Without it, two heartbeat
+# threads can upload heartbeat.json concurrently: a slower upload could land AFTER a newer
+# one on HF (reorder), so this lock makes uploads strictly ordered.
+_HB_UPLOAD_LOCK = threading.Lock()
 
 
 def heartbeat(stage: str, **kw):
@@ -319,13 +326,42 @@ def heartbeat(stage: str, **kw):
     }
     os.makedirs("/tmp/hb", exist_ok=True)
     p = "/tmp/hb/heartbeat.json"
-    with open(p, "w") as f:
-        json.dump(payload, f)
-    now = time.time()
-    throttled = stage in _HB_THROTTLED_STAGES
-    if not throttled or (now - _HB_LAST_UPLOAD) >= _HB_MIN_INTERVAL_S:
-        hf_upload_file(p, "heartbeat.json")
-        _HB_LAST_UPLOAD = now
+    # _HB_LOCK guards ONLY the fast local work: the atomic write, the _HB_LAST_UPLOAD
+    # read/update, AND capturing the exact bytes to upload (snapshot). The slow HF network
+    # commit happens OUTSIDE it — holding _HB_LOCK across the upload would serialize the
+    # trainer's per-step reward callback behind the checkpoint-upload daemon's commit (a
+    # perf regression during GRPO). We capture the snapshot here so the upload sends the
+    # content we claimed the slot for, never a re-read of a file a newer heartbeat may have
+    # already replaced (stale-snapshot fix).
+    with _HB_LOCK:
+        # Atomic write: write to a temp file in the same dir, then os.replace() so a
+        # concurrent reader/writer never observes a partially written heartbeat.json.
+        tmp = p + f".{os.getpid()}.{threading.get_ident()}.tmp"
+        snapshot = json.dumps(payload)
+        with open(tmp, "w") as f:
+            f.write(snapshot)
+        os.replace(tmp, p)
+        now = time.time()
+        throttled = stage in _HB_THROTTLED_STAGES
+        upload_due = not throttled or (now - _HB_LAST_UPLOAD) >= _HB_MIN_INTERVAL_S
+        if upload_due:
+            # Claim the upload slot under the lock so a concurrent throttled heartbeat
+            # observing the same window doesn't also fire (the throttle stays atomic).
+            _HB_LAST_UPLOAD = now
+    if upload_due:
+        # Serialize the network commit under a SEPARATE lock so uploads can't reorder, and
+        # upload the captured snapshot (via a private temp file, since hf_upload_file takes
+        # a path) rather than re-reading p — which a newer heartbeat may already have
+        # overwritten between our slot-claim and this upload.
+        with _HB_UPLOAD_LOCK:
+            up = p + f".{os.getpid()}.{threading.get_ident()}.upload.tmp"
+            with open(up, "w") as f:
+                f.write(snapshot)
+            try:
+                hf_upload_file(up, "heartbeat.json")
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(up)
     print("HEARTBEAT", json.dumps(payload))
 
 
@@ -553,6 +589,18 @@ def quant_weights_repo(model_id: str) -> str:
         return ""
 
 
+def resolve_weights_id(model_id: str) -> str:
+    """Weights repo the trainer should load for ``model_id``.
+
+    For the 4bit-qlora tier this is the pre-quantized export when one exists (~3.5x
+    smaller download/disk); otherwise the base ``model_id``. The tokenizer/chat template
+    always come from the base ``model_id``. ``prequantized`` is then ``weights_id != model_id``.
+    """
+    if model_quant(model_id) == "4bit-qlora":
+        return quant_weights_repo(model_id) or model_id
+    return model_id
+
+
 def qlora_model_init_kwargs(prequantized: bool = False) -> dict:
     """Model-load kwargs for the 4-bit QLoRA tier (large MoEs on one consumer GPU).
 
@@ -615,9 +663,7 @@ def run_sft():
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
     # QLoRA tier may load a pre-quantized export (~3.5x smaller download/disk);
     # the tokenizer below still comes from the base id.
-    weights_id = model_id
-    if model_quant(model_id) == "4bit-qlora":
-        weights_id = quant_weights_repo(model_id) or model_id
+    weights_id = resolve_weights_id(model_id)
     download_seconds = prefetch_model(weights_id)
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
@@ -800,6 +846,10 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     prompts_per_step = max(1, int(prompts_per_step))
     per_device = max(1, int(per_device_comps))
     target_comps = prompts_per_step * group_size  # total completions / optimizer step
+    # Never let the per-device completion micro-batch exceed the target completion batch:
+    # a small prompts_per_step would otherwise overshoot it (mirrors run_sft's
+    # `min(per_device_bs, effective_batch)`). No-op at the default (prompts_per_step=64).
+    per_device = max(1, min(per_device, target_comps))
     grad_accum = max(1, target_comps // per_device)
     # TRL rejects a global completion batch (per_device * grad_accum) that is not
     # divisible by num_generations (= group_size), failing only AFTER the paid worker
@@ -898,7 +948,7 @@ def think_token_count(completion: str | None, tokenizer) -> int:
     return len(tokenizer(think_text, add_special_tokens=False)["input_ids"])
 
 
-def _init_adapter_model(model_id: str, tokenizer):
+def _init_adapter_model(model_id: str):
     """Base model + the ``train.init_from_adapter`` adapter loaded as a trainable
     PeftModel, or the plain ``model_id`` string + a fresh LoRA when it is unset.
 
@@ -963,7 +1013,7 @@ def run_rl():
     # QLoRA tier: prefetch a pre-quantized export when one exists (~3.5x smaller), else the
     # base bf16 checkpoint (vLLM/transformers quantize it to 4-bit NF4 at load).
     quant = model_quant(model_id)
-    weights_id = (quant_weights_repo(model_id) or model_id) if quant == "4bit-qlora" else model_id
+    weights_id = resolve_weights_id(model_id)
     download_seconds = prefetch_model(weights_id)
     rl = RECIPE.rl
     steps = int(os.environ.get("RL_STEPS", str(rl.num_steps)))
@@ -1185,7 +1235,7 @@ def run_rl():
     # loaded PeftModel) when train.init_from_adapter is set, else a fresh LoRA on the
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
     # to fp32 and double VRAM).
-    init_model, init_peft = _init_adapter_model(model_id, tok)
+    init_model, init_peft = _init_adapter_model(model_id)
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
         # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
@@ -1427,7 +1477,10 @@ def write_train_meta(
     # metrics only — loss/reward are streamed by the trainer; reward_history is in notes)
     # and write the completion sentinel. There is no separate eval phase.
     m = RunMetrics(
-        arm="runpod",
+        # Substrate the worker actually ran on. Each provider's launcher sets AUTOSLM_ARM
+        # in the worker env (runpod -> "runpod", vast -> "vast"); default to "runpod" only
+        # when unset so the persisted metrics correctly attribute the compute backend.
+        arm=os.environ.get("AUTOSLM_ARM", "runpod"),
         phase=phase,
         seed=SEED,
         model_id=model_id,

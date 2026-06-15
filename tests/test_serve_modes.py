@@ -83,6 +83,27 @@ def test_undeploy_uses_rest(monkeypatch):
     assert not [k for k in deploy_mod._ENDPOINT_CACHE if k.startswith(f"{name}:")]
 
 
+def test_undeploy_skips_substring_collision(monkeypatch):
+    # find_endpoints_by_name is a substring filter: another run's endpoint whose
+    # name merely CONTAINS the target as a substring must NOT be deleted, and must
+    # not appear in the returned `deleted` list.
+    from autoslm.providers.runpod import api as runpod
+    from autoslm.serve import deploy as deploy_mod
+
+    name = deploy_mod.serve_endpoint_name("RTX 5090", "autoslm-1-abc")
+    collision = name + "-other"  # a different endpoint that contains `name`
+    monkeypatch.setattr(
+        runpod,
+        "find_endpoints_by_name",
+        lambda n: [{"id": "exact", "name": name}, {"id": "collide", "name": collision}],
+    )
+    deleted_ids = []
+    monkeypatch.setattr(runpod, "delete_endpoint", lambda eid: deleted_ids.append(eid) or True)
+    out = undeploy_adapter("autoslm-1-abc", gpu_name="RTX 5090")
+    assert deleted_ids == ["exact"], "only the exact-name endpoint may be deleted"
+    assert out == [name]
+
+
 def test_deployment_roundtrip_dict():
     d = Deployment(
         run_id="r",

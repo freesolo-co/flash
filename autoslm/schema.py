@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 import tomllib
 from typing import Any
 
@@ -44,7 +43,12 @@ def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
 
 
 def _train_float(
-    train_raw: dict, key: str, *, minimum: float, exclusive: bool = False
+    train_raw: dict,
+    key: str,
+    *,
+    minimum: float,
+    exclusive: bool = False,
+    maximum: float | None = None,
 ) -> float | None:
     """Validate an optional float [train] knob -> ConfigError (HTTP 400). None stays None."""
     v = train_raw.get(key)
@@ -61,6 +65,8 @@ def _train_float(
         raise ConfigError(f"train.{key} must be > {minimum}")
     if not exclusive and v < minimum:
         raise ConfigError(f"train.{key} must be >= {minimum}")
+    if maximum is not None and v > maximum:
+        raise ConfigError(f"train.{key} must be between {minimum} and {maximum}")
     return v
 
 
@@ -84,6 +90,15 @@ class ConfigError(ValueError):
     pass
 
 
+def _require_slug(value: str, message: str) -> None:
+    """Require a Prime Hub-style "owner/name" slug: exactly one slash, both parts
+    non-empty. Raises ConfigError(message) otherwise. Centralizes the rule used for
+    [environment] id, eval_env_id, and train.hf_repo so they cannot drift apart."""
+    parts = value.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ConfigError(message)
+
+
 def load_toml(path: str) -> dict[str, Any]:
     with open(path, "rb") as f:
         return tomllib.load(f)
@@ -95,7 +110,6 @@ def spec_from_file(
     overrides: list[str] | None = None,
     extra_configs: list[str] | None = None,
 ) -> JobSpec:
-    base_dir = os.path.dirname(os.path.abspath(path))
     raw = load_toml(path)
     # Composed configs: later files override earlier keys (deep merge).
     for extra in extra_configs or []:
@@ -103,7 +117,7 @@ def spec_from_file(
     # `--set key=value` dotted overrides (highest precedence).
     for item in overrides or []:
         _apply_override(raw, item)
-    return spec_from_dict(raw, base_dir=base_dir, run_id=run_id)
+    return spec_from_dict(raw, run_id=run_id)
 
 
 def _deep_merge(base: dict, extra: dict) -> dict:
@@ -149,7 +163,7 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
-def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None = None) -> JobSpec:
+def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     try:
         model = raw["model"]
     except KeyError as exc:
@@ -194,9 +208,9 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
         raise ConfigError("gpu.allow_unvalidated must be a boolean")
     try:
         # Parse-time provisional: "cheapest"/"auto" resolve to the cheapest validated
-        # RunPod-static class that fits (deterministic offline; open models sized from
-        # HF metadata); concrete names are canonicalized. The submit-time allocator
-        # re-resolves policy words live across providers.
+        # GPU class that fits (across providers, deterministic offline; open models
+        # sized from HF metadata); concrete names are canonicalized. The submit-time
+        # allocator re-resolves policy words live across providers.
         gpu_type = resolve_gpu_policy(
             requested_gpu, model, allow_unvalidated=allow_unval, algorithm=algorithm
         )
@@ -249,10 +263,10 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
             pip=tuple(str(p) for p in env_raw.get("pip") or ()),
         ),
         train=TrainSpec(
-            steps=train_raw.get("steps"),
-            epochs=train_raw.get("epochs"),
-            lora_rank=int(train_raw.get("lora_rank", 32)),
-            lora_alpha=int(train_raw.get("lora_alpha", 64)),
+            steps=_train_int(train_raw, "steps", minimum=1),
+            epochs=_train_int(train_raw, "epochs", minimum=1),
+            lora_rank=_train_int(train_raw, "lora_rank", minimum=1) or 32,
+            lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
             seeds=tuple(int(s) for s in train_raw.get("seeds", (0,))),
             init_from_adapter=str(train_raw.get("init_from_adapter") or ""),
             hf_repo=str(train_raw.get("hf_repo") or ""),
@@ -266,7 +280,7 @@ def spec_from_dict(raw: dict[str, Any], base_dir: str = ".", run_id: str | None 
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
             advantage_clip=_train_float(train_raw, "advantage_clip", minimum=0.0),
             thinking_length_penalty_coef=_train_float(
-                train_raw, "thinking_length_penalty_coef", minimum=0.0
+                train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
             stop_sequences=_train_stops(train_raw),
         ),
@@ -314,19 +328,19 @@ def _validate_spec(spec: JobSpec) -> None:
     # The id must be a full Prime Hub slug "owner/name": exactly one slash, both parts
     # non-empty. A bare id like "gsm8k" passes the presence check but then the worker runs
     # `prime env install gsm8k` (invalid — Prime needs owner/name) and fails after provisioning.
-    id_parts = spec.environment.id.split("/")
-    if len(id_parts) != 2 or not all(id_parts):
-        raise ConfigError('[environment] id must be a published Prime Hub slug "owner/name"')
+    _require_slug(
+        spec.environment.id,
+        '[environment] id must be a published Prime Hub slug "owner/name"',
+    )
     # A separate eval env ([environment.params] eval_env_id / eval_env) is also prime-installed
     # on the worker (worker_hub_env_ids), so it must be a full "owner/name" slug too — else a
     # bare eval id passes --dry-run but fails `prime env install` after a GPU is provisioned.
     eval_ref = spec.environment.params.get("eval_env_id") or spec.environment.params.get("eval_env")
     if eval_ref:
-        eval_parts = str(eval_ref).split("/")
-        if len(eval_parts) != 2 or not all(eval_parts):
-            raise ConfigError(
-                '[environment.params] eval_env_id must be a published Prime Hub slug "owner/name"'
-            )
+        _require_slug(
+            str(eval_ref),
+            '[environment.params] eval_env_id must be a published Prime Hub slug "owner/name"',
+        )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")
     # The per-run HF artifact repo (adapters/checkpoints/code + serving) is required: there
@@ -337,25 +351,14 @@ def _validate_spec(spec: JobSpec) -> None:
             "train.hf_repo is required: the HF dataset repo for this run's adapters/checkpoints, "
             'e.g. "owner/name"'
         )
-    parts = spec.train.hf_repo.split("/")
-    if len(parts) != 2 or not all(parts):
-        raise ConfigError('train.hf_repo must be a HuggingFace repo of the form "owner/name"')
-    # GRPO recipe knobs (optional): validate the ones that are set. A None means
-    # "the worker applies its recipe default", so only constrain explicit values.
-    if spec.train.group_size is not None and spec.train.group_size <= 0:
-        raise ConfigError("train.group_size must be positive")
-    if spec.train.temperature is not None and spec.train.temperature < 0:
-        raise ConfigError("train.temperature must be non-negative")
-    if spec.train.max_tokens is not None and spec.train.max_tokens <= 0:
-        raise ConfigError("train.max_tokens must be positive")
-    if spec.train.kl_penalty_coef is not None and spec.train.kl_penalty_coef < 0:
-        raise ConfigError("train.kl_penalty_coef must be non-negative")
-    if spec.train.advantage_clip is not None and spec.train.advantage_clip < 0:
-        raise ConfigError("train.advantage_clip must be non-negative")
-    if spec.train.thinking_length_penalty_coef is not None and not (
-        0.0 <= spec.train.thinking_length_penalty_coef <= 1.0
-    ):
-        raise ConfigError("train.thinking_length_penalty_coef must be between 0 and 1")
+    _require_slug(
+        spec.train.hf_repo,
+        'train.hf_repo must be a HuggingFace repo of the form "owner/name"',
+    )
+    # GRPO recipe knobs (group_size/temperature/max_tokens/kl_penalty_coef/advantage_clip/
+    # thinking_length_penalty_coef) are range-validated at parse time by the _train_int/
+    # _train_float coercers above (including the thinking_length_penalty_coef <= 1.0 upper
+    # bound), so no re-check is needed here.
     # lora_alpha scales the adapter contribution; 0 (or negative) trains a paid run
     # that produces a no-op adapter (zero scaling at serve). Reject up front.
     if spec.train.lora_alpha <= 0:

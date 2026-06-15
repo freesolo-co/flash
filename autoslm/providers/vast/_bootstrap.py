@@ -54,9 +54,10 @@ def hf_upload(payload: dict, local_path: str, repo_subpath: str) -> None:
 def build_worker_env(payload: dict) -> dict:
     env = dict(os.environ)
     env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
-    # Pass a large spec via a file (a Freesolo bridge spec embeds the dataset records),
-    # not the environment: a multi-hundred-KB env var trips execve's "Argument list too
-    # long" when the worker subprocess starts. Mirrors runpod/train.py:_train_body.
+    # Pass a large spec via a file, not the environment: a job spec with large inline
+    # params can reach multiple hundred KB, and that big an env var trips execve's
+    # "Argument list too long" when the worker subprocess starts. Mirrors
+    # runpod/train.py:_train_body.
     spec_json = payload["job_spec_json"]
     if len(spec_json) > 96_000:
         with open("/tmp/job_spec.json", "w") as f:
@@ -67,6 +68,10 @@ def build_worker_env(payload: dict) -> dict:
         env["AUTOSLM_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
+    # Compute substrate for the RunMetrics record (engine.worker reads AUTOSLM_ARM). The
+    # payload env was built by the shared runpod env builder, which stamps "runpod"; this
+    # bootstrap runs on the Vast instance, so override it to the real backend.
+    env["AUTOSLM_ARM"] = "vast"
     env["PYTHONPATH"] = CODE_DIR + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
 
@@ -158,7 +163,7 @@ def main() -> int:
     try:
         extra_pip = payload.get("extra_pip") or []
         if extra_pip:
-            # check=True: a deterministic dependency failure (Freesolo GRPO / Prime Hub
+            # check=True: a deterministic dependency failure (GRPO / Prime Hub
             # / verifiers extras) must stop NOW with an actionable error, not proceed to
             # a later import crash while the paid instance runs (matches the RunPod path).
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)

@@ -6,11 +6,11 @@ grading, RunMetrics build, DONE finalize) to catch NameErrors / attribute / shap
 before spending GPU budget on the real run.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import types
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # Disable HF I/O in node_entry helpers (they early-return when HF_REPO is empty).
 os.environ["HF_REPO"] = ""
@@ -73,3 +73,127 @@ def test_reward_heartbeat_callback_accumulates_history():
             sys.modules.pop("transformers", None)
         else:
             sys.modules["transformers"] = saved
+
+
+def test_heartbeat_concurrent_writes_stay_atomic(monkeypatch):
+    """Regression: heartbeat() is called concurrently from the trainer reward callback and
+    the checkpoint-upload daemon during GRPO. It must serialize + write heartbeat.json
+    atomically (temp file + os.replace under a lock) so a reader never sees a truncated or
+    interleaved file, and no leftover .tmp files accumulate."""
+    import glob
+    import json
+    import threading as _threading
+
+    import autoslm.engine.worker as ne
+
+    os.environ["HF_REPO"] = ""  # keep heartbeat local
+    monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: None)
+
+    hb_dir = "/tmp/hb"
+    p = os.path.join(hb_dir, "heartbeat.json")
+    for stale in glob.glob(os.path.join(hb_dir, "heartbeat.json.*.tmp")):
+        os.unlink(stale)
+
+    errors: list[Exception] = []
+    barrier = _threading.Barrier(8)
+
+    def hammer(i: int):
+        try:
+            barrier.wait()
+            for j in range(40):
+                # vary stage so both the throttled and unthrottled branches run
+                stage = "rl_step" if (i + j) % 2 else "checkpoint_uploaded"
+                ne.heartbeat(stage, step=i * 1000 + j, payload="x" * 200)
+                # the file must always parse as complete JSON (never truncated/garbled)
+                with open(p) as f:
+                    obj = json.load(f)
+                assert obj["stage"] in ("rl_step", "checkpoint_uploaded")
+        except Exception as e:
+            errors.append(e)
+
+    threads = [_threading.Thread(target=hammer, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    # final file is valid JSON and no temp files were left behind
+    with open(p) as f:
+        json.load(f)
+    assert not glob.glob(os.path.join(hb_dir, "heartbeat.json.*.tmp"))
+
+
+def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
+    """Regression (HIGH): the slow HF upload runs OUTSIDE _HB_LOCK, so two heartbeat
+    threads could upload concurrently and reorder on HF, and a re-read could send a file a
+    newer heartbeat already replaced (stale snapshot). The fix serializes uploads under a
+    separate _HB_UPLOAD_LOCK and uploads the bytes captured under _HB_LOCK. This asserts:
+    (1) uploads never overlap (serialized), and (2) every upload's bytes match the payload
+    the caller wrote (no stale/re-read mismatch)."""
+    import glob
+    import json
+    import threading as _threading
+    import time
+
+    import autoslm.engine.worker as ne
+
+    os.environ["HF_REPO"] = ""
+
+    hb_dir = "/tmp/hb"
+    for stale in glob.glob(os.path.join(hb_dir, "heartbeat.json.*.tmp")):
+        os.unlink(stale)
+
+    inflight = 0
+    max_inflight = 0
+    seen_steps: set[int] = set()
+    mismatches: list[tuple] = []
+    guard = _threading.Lock()
+
+    # Force every call through the upload path: no throttling.
+    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
+
+    def fake_upload(local_path, repo_subpath, required=False):
+        nonlocal inflight, max_inflight
+        with guard:
+            inflight += 1
+            max_inflight = max(max_inflight, inflight)
+        # read the bytes this upload was handed (the captured snapshot temp file)
+        with open(local_path) as f:
+            obj = json.load(f)
+        time.sleep(0.001)  # widen the window for an overlap to be observed if it can happen
+        with guard:
+            seen_steps.add(obj["step"])
+            # the snapshot must be internally consistent: its step is the one written for it
+            if obj["stage"] not in ("rl_step", "ckpt"):
+                mismatches.append(("stage", obj))
+            inflight -= 1
+
+    monkeypatch.setattr(ne, "hf_upload_file", fake_upload)
+
+    barrier = _threading.Barrier(6)
+    errors: list[Exception] = []
+
+    def hammer(i: int):
+        try:
+            barrier.wait()
+            for j in range(20):
+                step = i * 1000 + j
+                ne.heartbeat("rl_step" if (i + j) % 2 else "ckpt", step=step)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [_threading.Thread(target=hammer, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    assert not mismatches, mismatches
+    # serialized: at most one upload in flight at any moment
+    assert max_inflight == 1, f"uploads overlapped (max_inflight={max_inflight})"
+    # every claimed slot uploaded a distinct, valid snapshot (120 calls, no throttle)
+    assert len(seen_steps) == 6 * 20
+    # the captured-snapshot temp files are cleaned up
+    assert not glob.glob(os.path.join(hb_dir, "*.upload.tmp"))

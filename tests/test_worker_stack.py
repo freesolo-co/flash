@@ -108,3 +108,28 @@ def test_heartbeat_commit_is_throttled(monkeypatch):
     w.heartbeat("rl_step", step=1)
     w.heartbeat("rl_step", step=2)
     assert len(calls) == 2
+
+
+def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
+    """Perf regression guard: the synchronous hf_upload_file network call must run OUTSIDE
+    _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward
+    callback behind the checkpoint daemon's HF commit during GRPO."""
+    monkeypatch.setenv("RUN_MODE", "rl")
+    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("autoslm.engine.worker", None)
+    import autoslm.engine.worker as w
+
+    # When hf_upload_file is invoked, the lock must be acquirable (i.e. not held).
+    lock_free_during_upload = []
+
+    def fake_upload(*a, **k):
+        acquired = w._HB_LOCK.acquire(blocking=False)
+        lock_free_during_upload.append(acquired)
+        if acquired:
+            w._HB_LOCK.release()
+
+    monkeypatch.setattr(w, "hf_upload_file", fake_upload)
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    w.heartbeat("rl_start")
+    assert lock_free_during_upload == [True], "hf_upload_file must run with _HB_LOCK released"

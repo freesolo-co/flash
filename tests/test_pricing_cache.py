@@ -4,10 +4,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
 def _fresh_pricing(monkeypatch, tmp_path):

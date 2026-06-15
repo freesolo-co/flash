@@ -11,12 +11,9 @@ exercised by the live smokes).
 
 from __future__ import annotations
 
-import os
 import sys
 
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from autoslm.schema import spec_from_dict
 from autoslm.spec import JobSpec
@@ -170,7 +167,6 @@ def test_opt_int_float_reject_bools() -> None:
 def test_verifiers_adapter_forwards_only_env_kwargs(monkeypatch) -> None:
     # environment.params is forwarded to vf.load_environment WITHOUT autoslm-reserved
     # keys (a stray grpo_config/mode/records/eval_* must be dropped, not passed through).
-    import sys
     import types
 
     captured = {}
@@ -352,3 +348,29 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
     for bad in bad_cases:
         with pytest.raises(ConfigError):
             spec_from_dict({**base, "train": {"seeds": [0], **bad}}, run_id="bad")
+
+
+def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
+    # steps/epochs must run through _train_int like every other integer knob: a
+    # non-integer (e.g. steps=1.5) must 400 at parse time, not slip through to the
+    # worker and crash int("1.5") AFTER a paid GPU is provisioned.
+    from autoslm.schema import ConfigError
+
+    base = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "model_policy": "allow",
+        "environment": {"id": "owner/env"},
+        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+    }
+    for bad in ({"steps": 1.5}, {"epochs": 2.5}, {"steps": 0}, {"epochs": -1}):
+        with pytest.raises(ConfigError):
+            spec_from_dict({**base, "train": {"seeds": [0], "hf_repo": "o/r", **bad}}, run_id="bad")
+
+    # Genuine integers still parse and round-trip.
+    spec = spec_from_dict(
+        {**base, "train": {"seeds": [0], "hf_repo": "o/r", "steps": 10, "epochs": 3}},
+        run_id="ok",
+    )
+    assert spec.train.steps == 10
+    assert spec.train.epochs == 3

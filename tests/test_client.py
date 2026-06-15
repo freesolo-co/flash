@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from autoslm.client import ApiClient, ApiError, ClientError
 
@@ -58,16 +54,16 @@ def stub():
 
 def test_bearer_header_and_payload(stub):
     url, seen = stub
-    client = ApiClient(url, "sk-autoslm-test")
+    client = ApiClient(url, "fslo-user-test")
     out = client.create_run({"model": "m"})
     assert out["run_id"] == "r1"
-    assert seen["auth"] == "Bearer sk-autoslm-test"
-    assert seen["body"] == {"spec": {"model": "m"}, "dry_run": False}
+    assert seen["auth"] == "Bearer fslo-user-test"
+    assert seen["body"] == {"spec": {"model": "m"}}
 
 
 def test_api_error_carries_server_detail(stub):
     url, _ = stub
-    client = ApiClient(url, "sk-autoslm-test")
+    client = ApiClient(url, "fslo-user-test")
     with pytest.raises(ApiError) as excinfo:
         client.get_run("missing")
     assert excinfo.value.status == 404
@@ -76,7 +72,7 @@ def test_api_error_carries_server_detail(stub):
 
 def test_logs_offset_in_query(stub):
     url, seen = stub
-    client = ApiClient(url, "sk-autoslm-test")
+    client = ApiClient(url, "fslo-user-test")
     page = client.get_logs("r1", offset=3)
     assert page["offset"] == 3
     assert page["logs"] == "hi\n"
@@ -84,6 +80,6 @@ def test_logs_offset_in_query(stub):
 
 
 def test_unreachable_server_is_actionable():
-    client = ApiClient("http://127.0.0.1:1", "sk-autoslm-test", timeout=2)
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     with pytest.raises(ClientError, match="AUTOSLM_API_URL"):
         client.health()

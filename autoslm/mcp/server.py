@@ -20,16 +20,12 @@ from autoslm.client.specs import spec_payload
 from autoslm.schema import spec_from_dict
 
 
-def _spec_from_args(args: dict, run_id: str | None = None):
-    return spec_from_dict(args, run_id=run_id)
-
-
 def list_models(args: dict) -> dict:
     return {"models": public_model_rows()}
 
 
 def create_train_run(args: dict) -> dict:
-    spec = _spec_from_args(args, run_id=args.get("run_id"))
+    spec = spec_from_dict(args, run_id=args.get("run_id"))
     if args.get("dry_run"):
         # Fully local: validate without credentials, a server, or a GPU.
         return {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}
@@ -54,12 +50,9 @@ def deploy_adapter_tool(args: dict) -> dict:
     )
 
 
-CREATE_RUN_TOOL = "create_" + "train" + "ing_run"
-
-
 TOOLS: dict[str, Callable[[dict], dict]] = {
     "list_models": list_models,
-    CREATE_RUN_TOOL: create_train_run,
+    "create_training_run": create_train_run,
     "get_run_status": get_run_status,
     "get_run_logs": get_run_logs,
     "deploy_adapter": deploy_adapter_tool,

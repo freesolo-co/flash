@@ -26,20 +26,9 @@ def _spec(**gpu_kw) -> JobSpec:
 
 
 def _offer_obj(offer_id=1, machine_id=10, gpu="RTX 3090", dph=0.25):
-    from autoslm.providers.vast.jobs import VastOffer
+    from tests._helpers.vast import make_vast_offer
 
-    return VastOffer(
-        offer_id=offer_id,
-        machine_id=machine_id,
-        gpu=gpu,
-        vram_gb=24,
-        dph_total=dph,
-        cuda_max_good=12.8,
-        disk_space=200.0,
-        reliability=0.99,
-        inet_down=5000.0,
-        geolocation="CZ",
-    )
+    return make_vast_offer(offer_id=offer_id, machine_id=machine_id, gpu=gpu, dph_total=dph)
 
 
 # ---------------------------------------------------------------------------
@@ -640,3 +629,35 @@ def test_sweep_orphans_label_safety(monkeypatch):
     out = vast.sweep_orphans(active_labels={"autoslm-1700-bbbb"})
     assert out == [1]
     assert destroyed == [1]
+
+
+def test_sweep_orphans_prefix_is_not_shielded_by_a_longer_run_id(monkeypatch):
+    """A live run id that is a STRING prefix of another run id must not shield the other
+    run's orphan. ``autoslm-100`` is a prefix of ``autoslm-1000-...`` but they are
+    distinct runs; the match has to land on the ``-s`` seed boundary, not raw startswith."""
+    from autoslm.providers.vast import api as vast_api
+    from autoslm.providers.vast import jobs as vast
+
+    instances = [
+        {"id": 1, "label": vast.instance_label("autoslm-100", 0, 0)},  # live run -> KEEP
+        {"id": 2, "label": vast.instance_label("autoslm-1000", 0, 0)},  # orphan -> destroy
+    ]
+    # Sanity: the orphan's label really does start with the live run's prefix as a raw
+    # string, so the old ``startswith`` would have wrongly shielded it.
+    assert instances[1]["label"].startswith(vast.run_label_prefix("autoslm-100"))
+    destroyed = []
+    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
+    out = vast.sweep_orphans(active_labels={"autoslm-100"})
+    assert out == [2]  # only the genuine orphan; the prefix-collision run is left alone
+
+
+def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
+    """The offers=None fallback indexes GPU_INFO by concrete class; a policy word
+    ("cheapest"/"auto") must fail with a clear error, not an opaque KeyError."""
+    from autoslm.providers.vast import api as vast_api
+    from autoslm.providers.vast import jobs as vast
+
+    spec = _spec(type="cheapest")
+    with pytest.raises(vast_api.VastApiError, match="concrete gpu class"):
+        vast.submit_run_vast(spec, seed=0)

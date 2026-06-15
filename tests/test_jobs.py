@@ -4,8 +4,6 @@ cross-process cancel, and attach (CPU-only; all network mocked)."""
 from __future__ import annotations
 
 import base64
-import importlib
-import os
 import sys
 import tempfile
 
@@ -241,26 +239,10 @@ def test_poll_job_tolerates_transient_api_errors(monkeypatch):
 # ---------------------------------------------------------------------------
 # Supervisor retry logic (runner) with mocked job submit
 # ---------------------------------------------------------------------------
-@pytest.fixture(autouse=True)
-def _restore_skip_net():
-    """Tests below exercise the network-shaped submit/poll path with mocks, so they
-    unset AUTOSLM_SKIP_NET locally — restore it afterwards for the rest of the suite."""
-    saved = os.environ.get("AUTOSLM_SKIP_NET")
-    yield
-    if saved is not None:
-        os.environ["AUTOSLM_SKIP_NET"] = saved
-
-
 def _fresh_orchestrator(tmp, monkeypatch):
-    os.environ.pop("AUTOSLM_SKIP_NET", None)
-    import autoslm.runner as orch
+    from tests._helpers.runner import fresh_runner
 
-    importlib.reload(orch)
-    # Storage roots are fixed constants now; redirect to tmp via monkeypatch so they're
-    # restored after the test (the module object is shared, so a bare assignment would leak).
-    monkeypatch.setattr(orch, "RUNS_DIR", os.path.join(tmp, "runs"))
-    monkeypatch.setattr(orch, "RESULTS_DIR", os.path.join(tmp, "results"))
-    return orch
+    return fresh_runner(tmp, monkeypatch)
 
 
 def _spec(run_id):

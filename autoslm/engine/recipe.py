@@ -7,17 +7,21 @@ Per-run TOML configs (parsed into a ``JobSpec``) override the relevant fields.
 
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 # ----------------------------------------------------------------------------
 # Model identity
 # ----------------------------------------------------------------------------
-# Default base model; override via env BENCH_HF_MODEL or the TOML `model` field.
-# A proven, dense, text-only instruction model that loads on the current worker stack
-# (transformers 5.x / TRL 1.x / vLLM 0.19.x). The natively-multimodal Qwen3.5/3.6
-# checkpoints are also in the catalog, trained/served text-only.
+# Recipe fallback base model. Model selection precedence on the worker is
+# JobSpec.model > env BENCH_HF_MODEL > this recipe default; worker.py resolves
+# JOB_SPEC.model first and only falls back to RECIPE.hf_model_id. The RunPod launcher
+# sets BENCH_HF_MODEL from the spec; Vast carries the model via the full JobSpec
+# (JOB_SPEC.model), which the worker resolves before this fallback. This literal is the
+# last-resort default when neither is present.
+# Keep it in sync with catalog.DEFAULT_MODEL (a proven dense text-only instruction model
+# that loads on the current worker stack: transformers 5.x / TRL 1.x / vLLM 0.19.x; the
+# natively-multimodal Qwen3.5/3.6 checkpoints are also catalog'd, trained/served text-only).
 HF_MODEL_ID = os.environ.get("BENCH_HF_MODEL", "Qwen/Qwen3.5-4B")  # catalog DEFAULT_MODEL
 
 
@@ -29,17 +33,9 @@ class LoRAConfig:
     rank: int = 32
     alpha: int = 64
     dropout: float = 0.0
-    # All linear projections (PEFT). The worker uses "all-linear" so this list is the
-    # documented default; `rank`/`alpha` are the main user-controllable knobs.
-    target_modules: tuple = (
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    )
+    # The worker adapts all linear projections, set via the LORA_TARGETS env var
+    # (default "all-linear" — see engine.worker); `rank`/`alpha` are the main
+    # user-controllable knobs here.
 
 
 # ----------------------------------------------------------------------------
@@ -83,13 +79,9 @@ class Recipe:
     """The complete shared recipe."""
 
     hf_model_id: str = HF_MODEL_ID
-    seeds: tuple = (0, 1)
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     sft: SFTConfig = field(default_factory=SFTConfig)
     rl: RLConfig = field(default_factory=RLConfig)
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, default=str)
 
 
 RECIPE = Recipe()

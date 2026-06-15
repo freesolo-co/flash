@@ -8,13 +8,10 @@ whole-dict, last-writer-wins and therefore unreliable across processes).
 
 from __future__ import annotations
 
-import contextlib
-import json
-import os
-import time
 import urllib.error
-import urllib.request
 from typing import Any
+
+from autoslm.providers._http import RestClient
 
 REST_BASE = "https://rest.runpod.io/v1"
 QUEUE_BASE = "https://api.runpod.ai/v2"
@@ -24,28 +21,18 @@ class RunpodApiError(RuntimeError):
     pass
 
 
+# Shared urllib client (full-URL form: callers pass absolute REST/QUEUE urls).
+# Env-only by design: ~/.autoslm/config.json holds the *AutoSLM* key (client-side),
+# never the RunPod key — the operator sets RUNPOD_API_KEY on the control-plane host.
+_CLIENT = RestClient(env_var="RUNPOD_API_KEY", error_cls=RunpodApiError)
+
+
 def _api_key() -> str:
-    # Env-only by design: ~/.autoslm/config.json holds the *AutoSLM* key (client-side),
-    # never the RunPod key — the operator sets RUNPOD_API_KEY on the control-plane host.
-    key = os.environ.get("RUNPOD_API_KEY")
-    if not key:
-        raise RunpodApiError("RUNPOD_API_KEY not configured on the control-plane host")
-    return key
+    return _CLIENT.api_key()
 
 
 def _request(url: str, method: str = "GET", body: dict | None = None, timeout: float = 30.0):
-    req = urllib.request.Request(
-        url,
-        method=method,
-        data=json.dumps(body).encode() if body is not None else None,
-        headers={
-            "Authorization": f"Bearer {_api_key()}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        return json.loads(raw) if raw else {}
+    return _CLIENT.request(url, method=method, body=body, timeout=timeout)
 
 
 def request_with_retries(
@@ -56,28 +43,9 @@ def request_with_retries(
     base_delay: float = 2.0,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
-    import random
-
-    last: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            return _request(url, method=method, body=body)
-        except urllib.error.HTTPError as e:
-            if e.code < 500 and e.code != 429:
-                # The response body usually carries the actionable error detail; e.reason
-                # alone (e.g. "Bad Request") is rarely enough to debug a 4xx.
-                detail = ""
-                with contextlib.suppress(Exception):
-                    detail = e.read().decode("utf-8", "replace")[:500].strip()
-                suffix = f": {detail}" if detail else ""
-                raise RunpodApiError(f"{method} {url} -> HTTP {e.code}: {e.reason}{suffix}") from e
-            last = e
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            last = e
-        if attempt < retries:
-            delay = min(base_delay * (2 ** min(attempt, 6)), 30.0)
-            time.sleep(delay * random.uniform(0.7, 1.3))
-    raise RunpodApiError(f"{method} {url} failed after {retries + 1} attempts: {last}")
+    return _CLIENT.request_with_retries(
+        url, method=method, body=body, retries=retries, base_delay=base_delay
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +64,28 @@ def delete_endpoint(endpoint_id: str) -> bool:
     try:
         request_with_retries(f"{REST_BASE}/endpoints/{endpoint_id}", method="DELETE", retries=2)
         return True
-    except RunpodApiError:
-        return False
+    except RunpodApiError as e:
+        # An already-gone endpoint is a clean teardown, not a failure: a 404 (or a body
+        # saying the endpoint "does not exist") means the desired end state — no such
+        # endpoint — already holds. Reporting False here makes undeploy_adapter surface a
+        # misleading "may still be running" 502 for something that's provably gone.
+        return _is_not_found(e)
+
+
+def _is_not_found(err: RunpodApiError) -> bool:
+    """True only when a RunpodApiError represents a genuine 404 (endpoint already gone).
+
+    request_with_retries chains the original urllib HTTPError as ``__cause__`` for every
+    fast-failed 4xx (``raise ... from e``), so the status code is authoritative when a
+    cause is present: a 404 is "already gone", anything else (403/401/5xx) is a real
+    failure and must NOT be swallowed — a body that merely *mentions* "does not exist" on a
+    403 is still a 403. We only fall back to a text match when there is no HTTPError cause
+    (e.g. the "failed after N attempts" path), and even then only on an unambiguous 404.
+    """
+    cause = err.__cause__
+    if isinstance(cause, urllib.error.HTTPError):
+        return cause.code == 404
+    return "http 404" in str(err).lower()
 
 
 def endpoint_health(endpoint_id: str) -> dict:

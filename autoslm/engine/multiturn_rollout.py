@@ -31,6 +31,30 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from typing import TypedDict
+
+
+class RolloutResult(TypedDict):
+    """Token-aligned fields returned per rollout for TRL's ``rollout_func``."""
+
+    prompt_ids: list[int]
+    completion_ids: list[int]
+    logprobs: list[float]
+    env_mask: list[int]
+    reward: float
+
+
+# Field names shared between a single RolloutResult and the batched dict-of-lists that
+# build_rollout_func returns. Kept as a plain tuple (not RolloutResult.__annotations__) so
+# the batch accumulator's key source isn't a single-rollout type whose value types (float,
+# list[int], ...) deliberately differ from the accumulator's list-of-those.
+_ROLLOUT_FIELDS: tuple[str, ...] = (
+    "prompt_ids",
+    "completion_ids",
+    "logprobs",
+    "env_mask",
+    "reward",
+)
 
 
 def _prompt_key(prompt) -> str:
@@ -66,7 +90,7 @@ def rollout_one(
     per_turn_max_tokens: int,
     engine_max_len: int | None = None,
     on_warn: Callable[[str], None] | None = None,
-) -> dict:
+) -> RolloutResult:
     """Run one multi-turn/tool rollout and return TRL ``rollout_func`` fields for it.
 
     Args:
@@ -220,13 +244,8 @@ def build_rollout_func(
                 lps.append(float(getattr(lp, "logprob", 0.0)) if lp is not None else 0.0)
             return token_ids, lps, comp.text
 
-        out: dict[str, list] = {
-            "prompt_ids": [],
-            "completion_ids": [],
-            "logprobs": [],
-            "env_mask": [],
-            "reward": [],
-        }
+        # One accumulator list per rollout field (batched dict-of-lists across all rollouts).
+        out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
         for prompt in prompts:
             example = examples_by_key.get(_prompt_key(prompt), {"prompt": prompt})
             for _ in range(num_gen):

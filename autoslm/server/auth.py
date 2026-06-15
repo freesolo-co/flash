@@ -1,8 +1,10 @@
-"""Key claiming + bearer auth for the managed control plane.
+"""Bearer auth for the managed control plane.
 
-Keys are claimed instantly (no billing yet): ``POST /v1/keys`` mints one and returns it
-once. The only abuse guard is a small in-memory per-IP throttle on claiming — the
-operator docs are explicit that an open control plane means open GPU spend.
+User authentication is freesolo API keys only — there is no native key system. A bearer
+token equal to the operator's shared ``FREESOLO_INTERNAL_KEY`` resolves to the service
+identity; any other token is verified against the freesolo backend and (on success)
+resolved to a per-token user identity. ``AUTOSLM_SKIP_NET`` is the offline bypass that
+disables the network verify (used by tests / air-gapped runs).
 """
 
 from __future__ import annotations
@@ -16,23 +18,29 @@ import urllib.request
 from . import db
 
 # Operators set this to the shared freesolo internal key; a bearer token equal to it
-# authenticates as the service identity (see db.ensure_internal_key). Unset -> only
-# minted sk-autoslm- keys are accepted.
+# authenticates as the service identity (see db.ensure_internal_key).
 INTERNAL_KEY_ENV = "FREESOLO_INTERNAL_KEY"
 
 # Freesolo USER-key acceptance: a user who `slm login`s with a freesolo API key sends it as
-# the bearer to this control plane. When freesolo auth is enabled (AUTOSLM_FREESOLO_AUTH
-# truthy OR FREESOLO_BASE_URL set), an unknown token is verified against the freesolo backend
-# and resolved to a per-token identity. AUTOSLM_SKIP_NET disables the network call entirely.
-FREESOLO_AUTH_ENV = "AUTOSLM_FREESOLO_AUTH"
+# the bearer to this control plane. Any non-internal token is verified against the freesolo
+# backend and (on success) resolved to a per-token identity. AUTOSLM_SKIP_NET disables the
+# network call entirely (offline bypass).
 FREESOLO_BASE_URL_ENV = "FREESOLO_BASE_URL"
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 _VERIFY_TIMEOUT_S = 5.0
 _VERIFY_CACHE_TTL_S = 300.0  # short TTL so it isn't a backend round-trip per request
-
-CLAIMS_PER_HOUR = 5
-_claims: dict[str, list[float]] = {}
-_claims_lock = threading.Lock()
+# Negative verdicts get a much SHORTER TTL than positives. The freesolo verify endpoint
+# returns 401 not only for a genuinely-bad key but also when the backend converts an
+# auth-LOOKUP infra exception (authenticate_api_key failure) into a 401 — a transient outage.
+# Caching such a negative for the full 300s would lock out an otherwise-valid key for 5
+# minutes after the backend recovers. A short negative TTL keeps persistent bad tokens
+# rate-limited (~30s, so they don't hammer the backend) while letting a transient 401 clear
+# quickly. Positives keep the long TTL.
+_VERIFY_CACHE_NEG_TTL_S = 30.0
+# Upper bound on a bearer token we'll cache/verify. Real freesolo API keys are short; an
+# arbitrarily long bearer is rejected up front so it can't bloat _verify_cache (keyed by the
+# raw token) or produce an oversized outbound Authorization header.
+_MAX_TOKEN_LEN = 256
 
 # In-process verify cache: token -> (verified_bool, expires_at). Caches positives AND
 # negatives so a burst of requests for the same token hits the backend at most once per TTL.
@@ -60,20 +68,14 @@ def _prune_verify_cache_locked(now: float) -> None:
             del _verify_cache[tok]
 
 
-def _truthy(value: str | None) -> bool:
-    return bool(value) and value not in ("0", "false", "False", "no", "")
-
-
-def _freesolo_auth_enabled() -> bool:
-    """Freesolo user-key verification is on only when explicitly configured."""
-    return _truthy(os.environ.get(FREESOLO_AUTH_ENV)) or bool(os.environ.get(FREESOLO_BASE_URL_ENV))
-
-
 def _freesolo_verify(token: str) -> bool:
     """Verify a token against the freesolo backend (cached, short TTL, network errors = False).
 
     Never raises and never makes a network call when AUTOSLM_SKIP_NET is set — a swallowed
     error or a skipped call is treated as "not authenticated" (returns False), never a 500."""
+    # Reject obviously-invalid oversized tokens before they touch the cache or the network.
+    if not token or len(token) > _MAX_TOKEN_LEN:
+        return False
     now = time.time()
     with _verify_cache_lock:
         cached = _verify_cache.get(token)
@@ -88,60 +90,48 @@ def _freesolo_verify(token: str) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=_VERIFY_TIMEOUT_S) as resp:
             verified = resp.status == 200
-    except urllib.error.HTTPError:
-        # A definitive rejection from the backend (401/403/…): cache it like a bad key.
+    except urllib.error.HTTPError as exc:
+        # Only a DEFINITIVE rejection (4xx other than 429) is a verdict worth caching as a bad
+        # key. A 5xx or 429 is a transient backend hiccup — treat it like a network error
+        # (return False WITHOUT caching) so a valid key isn't locked out for the whole TTL
+        # while the backend is briefly unhealthy.
+        if exc.code >= 500 or exc.code == 429:
+            return False
         verified = False
     except (urllib.error.URLError, OSError, ValueError):
         # A TRANSIENT network/connection error is NOT a verdict: don't cache it, so a valid
-        # key isn't locked out for the whole TTL after the backend recovers. (Never a 500.)
+        # key isn't locked out for the whole TTL after the backend recovers.
         return False
     with _verify_cache_lock:
         # Prune expired entries and cap the size before inserting so unbounded distinct
         # tokens can't grow the cache.
         _prune_verify_cache_locked(now)
-        _verify_cache[token] = (verified, now + _VERIFY_CACHE_TTL_S)
+        # Pick the TTL by verdict: positives last the full TTL; a negative (which may be a
+        # transient backend 401 rather than a real rejection) expires quickly so a valid key
+        # isn't locked out for 5 minutes after the backend recovers.
+        ttl = _VERIFY_CACHE_TTL_S if verified else _VERIFY_CACHE_NEG_TTL_S
+        _verify_cache[token] = (verified, now + ttl)
     return verified
-
-
-class ThrottledError(RuntimeError):
-    pass
-
-
-def claim_key(email: str | None = None, client_ip: str = "") -> dict:
-    """Mint a fresh API key (throttled per client IP)."""
-    now = time.time()
-    with _claims_lock:
-        recent = [t for t in _claims.get(client_ip, []) if now - t < 3600]
-        if len(recent) >= CLAIMS_PER_HOUR:
-            raise ThrottledError("too many key claims from this address; try again later")
-        recent.append(now)
-        _claims[client_ip] = recent
-        # Bound memory: drop IPs whose claims have all aged out so the throttle table
-        # doesn't grow unbounded as new client IPs hit /v1/keys over time.
-        for ip in [ip for ip, ts in _claims.items() if not any(now - t < 3600 for t in ts)]:
-            del _claims[ip]
-    return db.create_key(email=email)
 
 
 def authenticate(authorization: str | None) -> dict | None:
     """Resolve an ``Authorization: Bearer ...`` header to a key row.
 
-    Accepts a minted ``sk-autoslm-`` key, or — when the operator has configured
-    ``FREESOLO_INTERNAL_KEY`` — that shared internal key, resolved to a single service
-    identity. Finally, when freesolo auth is enabled, a token that is neither is verified
-    against the freesolo backend and (on success) resolved to a per-token user identity so a
-    user who ``slm login``s with their freesolo key can drive the control plane."""
+    Freesolo keys are the only user auth. When the operator has configured
+    ``FREESOLO_INTERNAL_KEY``, that shared internal key resolves to a single service
+    identity. Any other token is verified against the freesolo backend and (on success)
+    resolved to a per-token user identity so a user who ``slm login``s with their freesolo
+    key can drive the control plane. ``AUTOSLM_SKIP_NET`` short-circuits the verify (no
+    network call -> the token is treated as unverified)."""
     if not authorization or not authorization.startswith("Bearer "):
         return None
     token = authorization.removeprefix("Bearer ").strip()
     internal = os.environ.get(INTERNAL_KEY_ENV)
     if internal and token == internal:
         return db.lookup_key(token) or db.ensure_internal_key(token)
-    if token.startswith(db.KEY_PREFIX):
-        return db.lookup_key(token)
-    # Neither the internal key nor a minted key: try freesolo USER-key verification, but only
-    # when it's configured. (AUTOSLM_SKIP_NET / disabled flag => no network call, returns None.)
-    if _freesolo_auth_enabled() and _freesolo_verify(token):
+    # Any non-internal token is a freesolo USER key: verify it against the freesolo backend.
+    # (AUTOSLM_SKIP_NET => no network call, returns False => authenticate returns None.)
+    if _freesolo_verify(token):
         # A verified freesolo key gets its own per-token run-ownership identity.
         return db.lookup_key(token) or db.ensure_external_key(token)
     return None

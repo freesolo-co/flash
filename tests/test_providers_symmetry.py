@@ -26,8 +26,6 @@ PROVIDER_METHODS = (
     "destroy",
     "gc",
     "sweep_orphans",
-    "deploy_serve",
-    "undeploy_serve",
 )
 
 
@@ -184,9 +182,9 @@ def _mock_vast_offers(monkeypatch, offers):
 
 
 def _offer(gpu="RTX 3090", dph=0.10, oid=1, mid=1):
-    from autoslm.providers.vast.jobs import VastOffer
+    from tests._helpers.vast import make_vast_offer
 
-    return VastOffer(oid, mid, gpu, 24, dph, 12.8, 200.0, 0.99, 5000.0, "CZ")
+    return make_vast_offer(offer_id=oid, machine_id=mid, gpu=gpu, dph_total=dph)
 
 
 def test_allocator_picks_cheaper_vast_over_runpod(monkeypatch):

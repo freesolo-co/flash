@@ -1,6 +1,7 @@
 """Cost accounting + the standard run-metrics record for AutoSLM runs.
 
-GPU cost = gpu_hours * hourly_rate (RunPod per-second billing; artifacts go via HF).
+GPU cost = gpu_hours * hourly_rate (per-second billing on the selected provider —
+RunPod or Vast.ai; artifacts go via HF).
 """
 
 from __future__ import annotations
@@ -22,14 +23,10 @@ class RunMetrics:
     setup_seconds: float = 0.0  # cold start / provisioning + model load
     train_throughput_toks_per_s: float = 0.0
     # Token accounting
-    prefill_tokens: int = 0
-    sample_tokens: int = 0
     train_tokens: int = 0
     generated_tokens: int = 0  # RL: total sampled completion tokens
-    # Cost
-    cost_usd: float = 0.0
-    gpu_seconds: float = 0.0  # GPU-rental wall seconds
-    # Misc / friction
+    # Misc / friction. cost_usd is computed/stamped downstream by the runner from the
+    # provider's $/hr (see runner._persist_metrics), not by the worker.
     notes: dict = field(default_factory=dict)
 
     def to_json(self) -> str:

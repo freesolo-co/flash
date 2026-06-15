@@ -7,11 +7,10 @@ in. strip_think is applied once in worker.graded_text before the env rewards —
 works for every environment.
 """
 
+from __future__ import annotations
+
 import importlib
 import os
-import sys
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 _WORKER_ENV = (
     "HF_REPO",
@@ -104,3 +103,21 @@ def test_grpo_batching_rounds_up_to_divisible():
         assert (
             b["unique_prompts_per_step"] >= prompts or b["generations_per_step"] >= prompts * group
         )
+
+
+def test_grpo_batching_caps_per_device_at_target():
+    # A small prompts_per_step must not be overshot by an oversized per-device completion
+    # micro-batch: the global completion batch is capped at prompts_per_step * group_size,
+    # so the per-device micro-batch is clamped down to the target (mirrors run_sft).
+    import autoslm.engine.worker as ne
+
+    importlib.reload(ne)
+    # per_device (8) far exceeds target completions (1 * 2 = 2): must clamp, not overshoot.
+    b = ne.compute_grpo_batching(prompts_per_step=1, group_size=2, per_device_comps=8)
+    assert b["per_device_train_batch_size"] <= 2
+    assert b["generations_per_step"] <= 2
+    assert b["unique_prompts_per_step"] == 1
+    # The common default stays a no-op: per_device passes through unchanged.
+    b = ne.compute_grpo_batching(prompts_per_step=64, group_size=8, per_device_comps=2)
+    assert b["per_device_train_batch_size"] == 2
+    assert b["unique_prompts_per_step"] == 64

@@ -26,8 +26,9 @@ class VastProvider:
         from autoslm.providers.vast.auth import load_api_key
 
         # Vast needs its operator key AND a live network path: it is a live-market
-        # substrate (offer search), so AUTOSLM_SKIP_NET (offline/CI) disables it
-        # entirely, keeping offline allocation deterministic (RunPod-only).
+        # substrate (offer search), so AUTOSLM_SKIP_NET (offline/CI) disables Vast
+        # entirely; offline allocation then degrades deterministically to RunPod's
+        # static catalog.
         if os.environ.get("AUTOSLM_SKIP_NET"):
             return False
         return load_api_key() is not None
@@ -80,7 +81,21 @@ class VastProvider:
         vh = VastJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: vast instance={vh.instance_id}", file=log, flush=True)
-        return poll_vast_job(vh, spec, seed, log=log, heartbeat_reader=reader)
+        # Reattach must apply the SAME stall tuning + wall-cap deadline as submit_run_vast
+        # (see jobs.py), mirroring RunPod's reattach (runpod/__init__.py). Vast has no
+        # server-side execution timeout, so a recovered run that dropped the client-side
+        # deadline could bill unbounded.
+        stall = float(os.environ.get("AUTOSLM_STALL_AFTER_S", "1500"))
+        deadline = max(60, int(spec.gpu.max_wall_seconds)) + 1800
+        return poll_vast_job(
+            vh,
+            spec,
+            seed,
+            log=log,
+            heartbeat_reader=reader,
+            stall_after_s=stall,
+            deadline_s=deadline,
+        )
 
     def cancel(self, handle: JobHandle) -> None:
         from autoslm.providers.vast.jobs import cancel
@@ -104,15 +119,6 @@ class VastProvider:
         from autoslm.providers.vast.jobs import sweep_orphans
 
         return sweep_orphans(active_labels=active_labels)
-
-    def deploy_serve(self, *args: Any, **kwargs: Any) -> Any:
-        # Serving runs on RunPod Flash only (Vast has no serverless endpoint). The
-        # control plane falls back to a RunPod-validated class at deploy time
-        # (serve.deploy.servable_gpu), so this is a no-op hook for interface parity.
-        raise NotImplementedError("vast does not serve; serving runs on RunPod Flash")
-
-    def undeploy_serve(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError("vast does not serve; serving runs on RunPod Flash")
 
 
 PROVIDER: Provider = VastProvider()

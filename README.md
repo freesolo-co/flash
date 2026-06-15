@@ -1,8 +1,9 @@
 # AutoSLM
 
-Managed LoRA post-training service: SFT and GRPO on dedicated consumer GPUs
-(RunPod Flash, RTX 4090/5090 classes). The Freesolo SDK submits training jobs here
-instead of running Tinker loops client-side.
+Managed LoRA post-training service: SFT and GRPO on managed GPUs across multiple
+providers — RunPod Flash (serverless queue; RTX 4090/5090 classes) and Vast.ai
+(rented verified-datacenter instances; L40S / RTX Pro 4000 / A100 classes). The
+allocator picks the cheapest GPU class that fits the run across both providers.
 
 ## Scope
 
@@ -27,7 +28,9 @@ instead of running Tinker loops client-side.
 - `autoslm/schema.py`, `autoslm/spec.py` — TOML → `JobSpec`
 - `autoslm/runner.py` — server-side run supervisor (durable job handle,
   retries, cost guard, endpoint GC)
-- `autoslm/flash/` — RunPod Flash provisioning, durable submit/poll, pricing
+- `autoslm/providers/` — RunPod Flash + Vast.ai provider subtrees (pricing,
+  gpus, durable submit/poll, preflight) behind one `base.Provider` protocol,
+  with a cross-provider `allocator.py` that picks the cheapest fitting class
 - `autoslm/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
   shared recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
@@ -53,8 +56,9 @@ uv run slm --help
 uv run autoslm-server                      # control plane (operator-side, run once)
 ```
 
-The control plane owns provider credentials (`RUNPOD_API_KEY`,
-`HUGGINGFACE_TOKEN`, `HF_REPO`); clients authenticate with a claimed AutoSLM
-key (`slm login`). See `docs/config-reference.md` for the run TOML schema,
+The control plane owns provider credentials (`RUNPOD_API_KEY` and/or
+`VAST_API_KEY`, plus `HUGGINGFACE_TOKEN`); the artifact repo is per-run (the run TOML's
+`[train] hf_repo`), not an operator-wide env var. Clients authenticate with their
+freesolo API key (`slm login`). See `docs/config-reference.md` for the run TOML schema,
 `docs/algorithms.md` for choosing and tuning SFT/GRPO, and
 `docs/environments.md` for authoring a task.

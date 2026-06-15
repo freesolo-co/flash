@@ -1,12 +1,11 @@
 """Environment registry used by specs, worker, CLI, and server.
 
 Verifiers-only: every environment is a Prime Intellect ``verifiers`` env. There are no
-built-in task environments. ``load_environment`` resolves an env from one of two sources:
-
-  * a LOCAL verifiers env module (``path``) — a directory or ``*.py`` exposing
-    ``load_environment(**kwargs) -> verifiers.Environment``; or
-  * an INSTALLED / Hub verifiers env (``env_id``) resolvable by ``verifiers``
-    (installed via ``slm env install owner/name``, recorded in the manifest below).
+built-in task environments and no local-file environment mode (``schema.py`` rejects a
+``path`` key outright). ``load_environment`` resolves a single source: an installed /
+Prime Hub verifiers env referenced by its slug (``env_id``, ``owner/name``), resolvable
+by ``verifiers`` (installed via ``slm env install owner/name`` and recorded in the
+manifest below).
 """
 
 from __future__ import annotations
@@ -57,7 +56,7 @@ def _bare_wheel_name(env_ref: str) -> str:
     return env_ref.split("/", 1)[1] if "/" in env_ref else env_ref
 
 
-def worker_pip_for_env(env_id: str, params: dict | None = None) -> list[str]:
+def worker_pip_for_env(env_id: str) -> list[str]:
     """Pip deps the GPU worker needs to run ``env_id`` (a verifiers/Hub env): just ``verifiers``.
 
     The environment itself (and any separate eval env) is installed on the worker via the
