@@ -12,7 +12,7 @@ import json
 import os
 from pathlib import Path
 
-DEFAULT_API_URL = "https://api.autoslm.dev"
+DEFAULT_API_URL = "https://flash.freesolo.co"
 
 CONFIG_DIR = Path.home() / ".autoslm"
 CONFIG_PATH = CONFIG_DIR / "config.json"
