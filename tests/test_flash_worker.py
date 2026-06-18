@@ -56,6 +56,23 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
 
 
+def test_build_worker_env_forwards_midrun_eval_knobs(monkeypatch):
+    """The periodic mid-run eval knobs are read via os.environ on the worker, so they MUST be
+    on the forward allowlist or the feature silently no-ops on every remote run (RunPod + Vast,
+    which reuses this same build_worker_env)."""
+    from autoslm.providers.runpod.train import build_worker_env
+
+    knobs = {
+        "AUTOSLM_EVAL_EVERY_STEPS": "20",
+        "AUTOSLM_EVAL_NUM": "16",
+    }
+    for k, v in knobs.items():
+        monkeypatch.setenv(k, v)
+    env = build_worker_env(_spec(), 0)
+    for k, v in knobs.items():
+        assert env.get(k) == v, f"{k} not forwarded to worker"
+
+
 def test_build_worker_env_forwards_prime_api_key(monkeypatch):
     """The worker needs PRIME_API_KEY to `prime env install` the run's Hub env(s)."""
     from autoslm.providers.runpod.train import build_worker_env

@@ -677,6 +677,12 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "AUTOSLM_QUANT_REPO",
         "AUTOSLM_THINKING",
         "LORA_TARGETS",
+        # Periodic mid-run GRPO eval (engine/midrun_eval.eval_config): the cadence normally comes
+        # from the run's [train] eval_every_steps; AUTOSLM_EVAL_EVERY_STEPS is an operator override
+        # (>0 enables), and AUTOSLM_EVAL_NUM is a safety cap on held-out rows per eval. Everything
+        # else (eval set, grading, completion budget, threshold) comes from the environment/run.
+        "AUTOSLM_EVAL_EVERY_STEPS",
+        "AUTOSLM_EVAL_NUM",
     ):
         if os.environ.get(k):
             env[k] = os.environ[k]

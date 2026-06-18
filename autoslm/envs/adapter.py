@@ -145,14 +145,15 @@ def _run_async(coro):
         return ex.submit(lambda: asyncio.run(coro)).result()
 
 
-def _call_dataset_getter(obj, method_name: str, *, seed: int):
+def _call_dataset_getter(obj, method_name: str, *, seed: int, n: int = -1):
     """Call a verifiers dataset getter, binding (n, seed) when it declares them.
 
     verifiers exposes get_dataset/get_eval_dataset as get_X(n=-1, seed=0); some Hub envs
     declare them WITHOUT defaults, so a no-arg call raised TypeError, swallowed into an empty
-    dataset (a paid run over no data). Bind n=-1 (all rows — the adapter does its own fixed
-    subset selection) and the seed when the signature declares them; a genuine failure
-    propagates (fail loudly) instead of silently emptying the split."""
+    dataset (a paid run over no data). Bind ``n`` (default -1 = all rows — the adapter does its
+    own fixed subset selection; callers pass a positive cap to avoid materializing a huge split)
+    and the seed when the signature declares them; a genuine failure propagates (fail loudly)
+    instead of silently emptying the split."""
     fn = getattr(obj, method_name, None)
     if not callable(fn):
         return None
@@ -162,7 +163,7 @@ def _call_dataset_getter(obj, method_name: str, *, seed: int):
         param_names = set()
     kwargs = {}
     if "n" in param_names:
-        kwargs["n"] = -1
+        kwargs["n"] = n
     if "seed" in param_names:
         kwargs["seed"] = seed
     return fn(**kwargs)
@@ -349,21 +350,25 @@ class VerifiersEnvironment(BaseEnvironment):
         self._parser = getattr(vf_env, "parser", None)
 
     # -- data -------------------------------------------------------------
-    def dataset(self, split: str) -> list[dict]:
+    def dataset(self, split: str, limit: int | None = None) -> list[dict]:
         is_eval = split in {"eval", "validation", "test"}
         if is_eval:
             src = self._eval_env or self._env
+            # ``limit`` caps materialization at the source (mid-run eval only needs a small slice);
+            # a getter that ignores ``n`` still returns everything, so _fixed_subset / the caller's
+            # slice remain the backstop. -1 = all rows (the no-cap default).
+            n = limit if (limit is not None and limit > 0) else -1
             # Resolve the eval source with explicit ``is None`` checks (NOT ``or``): an
             # empty-but-configured eval split (``[]``) is falsy, so ``or`` would wrongly
             # fall through to the next source and ultimately to the TRAIN split — evaluating
             # on training data. Only fall back when the eval source is genuinely *absent*
             # (None), not merely empty. ``get_eval_dataset``/``eval_dataset`` returning [] is
             # a deliberate empty eval set and must be honored as such.
-            eval_ds = _call_dataset_getter(src, "get_eval_dataset", seed=self._eval_seed)
+            eval_ds = _call_dataset_getter(src, "get_eval_dataset", seed=self._eval_seed, n=n)
             if eval_ds is None:
                 eval_ds = getattr(src, "eval_dataset", None)
             if eval_ds is None:  # no eval split configured at all: use the env's train split
-                eval_ds = _call_dataset_getter(src, "get_dataset", seed=self._eval_seed)
+                eval_ds = _call_dataset_getter(src, "get_dataset", seed=self._eval_seed, n=n)
                 if eval_ds is None:
                     eval_ds = getattr(src, "dataset", None)
             rows = _rows_to_list(eval_ds)
@@ -372,6 +377,23 @@ class VerifiersEnvironment(BaseEnvironment):
         if ds is None:
             ds = getattr(self._env, "dataset", None)
         return _rows_to_list(ds)
+
+    def has_eval_split(self) -> bool:
+        """True when a DISTINCT held-out eval split exists (a separate eval env, or the env's
+        ``get_eval_dataset``/``eval_dataset``). False means :meth:`dataset` would fall back to
+        train rows — so a caller (mid-run eval) can warn instead of reporting train data as
+        held-out. Best-effort: a getter that raises is treated as no eval split."""
+        if self._eval_env is not None:
+            return True
+        try:
+            if (
+                _call_dataset_getter(self._env, "get_eval_dataset", seed=self._eval_seed)
+                is not None
+            ):
+                return True
+        except Exception:
+            return False
+        return getattr(self._env, "eval_dataset", None) is not None
 
     def _fixed_subset(self, rows: list[dict]) -> list[dict]:
         n = self._eval_examples
@@ -495,6 +517,49 @@ class VerifiersEnvironment(BaseEnvironment):
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(self.scores_breakdown(completion, example, state)["total"])
+
+    def evaluate(self, completion: str, example: dict, state: dict | None = None) -> dict:
+        """One pass over the rubric returning the training ``reward`` AND the env's separate
+        ``metrics`` — each ZERO-WEIGHT rubric func's raw (unweighted) score, by name.
+
+        Zero-weight funcs are how a verifiers ``environment.py`` expresses an EVALUATION signal
+        distinct from the GRPO reward: an ``exact_match`` / ``accuracy`` monitor added with
+        ``rubric.add_metric(fn, weight=0.0)`` does not shape training (weight 0) but measures
+        quality. :meth:`scores_breakdown`/:meth:`reward` deliberately omit these; mid-run eval
+        wants them, so this method surfaces them WITHOUT a second rubric pass (a ``JudgeRubric``
+        is sampled at most once). Weighted funcs still propagate exceptions (a broken weighted
+        reward fails the run); zero-weight monitors stay guarded (a thrown monitor is skipped,
+        never fails eval). Order is preserved so a monitor can prep shared ``state`` for a later
+        weighted func, exactly as in :meth:`scores_breakdown`.
+
+        Returns ``{"reward": <weighted total>, "metrics": {name: raw_score, ...}}``; an env with
+        no rubric falls back to the substring ``answer_match`` as both reward and (empty) metrics.
+        """
+        if not self._reward_pairs:
+            answer = str(example.get("answer") or "")
+            score = 1.0 if answer and answer in (completion or "") else 0.0
+            return {"reward": score, "metrics": {}}
+        available = self._reward_available(completion, example, state)
+        total = 0.0
+        metrics: dict[str, float] = {}
+        for func, weight in self._reward_pairs:
+            name = getattr(func, "__name__", str(func))
+            if not weight:
+                # Zero-weight = an eval/monitor metric: run it (guarded — a thrown monitor must
+                # not fail eval) and record its RAW score; it never touches the reward total.
+                try:
+                    raw = _invoke_reward(func, available)
+                except Exception:
+                    continue
+                key = name
+                i = 1
+                while key in metrics:  # keep colliding metric names distinct
+                    key = f"{name}_{i}"
+                    i += 1
+                metrics[key] = raw
+                continue
+            total += float(weight) * _invoke_reward(func, available)
+        return {"reward": total, "metrics": metrics}
 
     def tools(self) -> list:
         """The underlying ToolEnv's Python tool callables (``[]`` for non-tool envs).

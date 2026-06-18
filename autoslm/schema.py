@@ -283,6 +283,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
             stop_sequences=_train_stops(train_raw),
+            # minimum=0 so `eval_every_steps = 0` explicitly disables (matches "0/None disables");
+            # negatives are rejected.
+            eval_every_steps=_train_int(train_raw, "eval_every_steps", minimum=0),
         ),
         gpu=GpuSpec(
             type=gpu_type,
