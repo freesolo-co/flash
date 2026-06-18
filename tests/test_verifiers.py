@@ -57,6 +57,36 @@ def test_verifiers_adapter_mapping():
     assert env.sft_target({"answer": "4"}) == "4"
 
 
+def test_evaluate_surfaces_zero_weight_metrics_distinct_from_reward():
+    """``evaluate()`` returns the weighted training reward AND each zero-weight rubric func's RAW
+    score by name — so an env expresses an evaluation metric (e.g. accuracy) that differs from a
+    shaped GRPO reward, entirely in the environment's rubric. ``reward()`` stays metric-free."""
+    from autoslm.envs.adapter import VerifiersEnvironment
+
+    def shaped_reward(completion, answer):  # weight 1.0 -> drives training; partial credit
+        return 0.3 if answer in completion[-1]["content"] else 0.0
+
+    def accuracy(completion, answer):  # weight 0.0 -> eval metric only, NOT in the reward
+        return 1.0 if answer in completion[-1]["content"] else 0.0
+
+    class _Env(_FakeVfEnv):
+        def __init__(self):
+            super().__init__()
+            self.rubric = _FakeRubric([shaped_reward, accuracy], [1.0, 0.0])
+
+    env = VerifiersEnvironment(_Env(), "fake/env")
+    ex = {"answer": "4"}
+    out = env.evaluate("the answer is 4", ex)
+    assert out["reward"] == pytest.approx(0.3)  # shaped reward (weighted total)
+    assert out["metrics"] == {"accuracy": 1.0}  # zero-weight metric surfaced, raw + distinct
+    miss = env.evaluate("nope", ex)
+    assert miss["reward"] == 0.0
+    assert miss["metrics"] == {"accuracy": 0.0}
+    # reward()/scores_breakdown() are unchanged: weighted total only, no zero-weight metrics
+    assert env.reward("the answer is 4", ex) == pytest.approx(0.3)
+    assert "accuracy" not in env.scores_breakdown("the answer is 4", ex)
+
+
 def test_eval_split_uses_eval_dataset_not_train():
     """A populated eval_dataset is returned for the eval split (not the train split)."""
     from autoslm.envs.adapter import VerifiersEnvironment

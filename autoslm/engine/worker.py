@@ -911,6 +911,125 @@ def make_reward_heartbeat_callback():
     return _RewardHeartbeat()
 
 
+def _maybe_attach_periodic_eval(
+    trainer,
+    tok,
+    *,
+    is_multi_turn: bool,
+    is_tool_env: bool,
+    max_new_default: int,
+    stop: list[str] | None,
+    engine_max_len: int,
+    max_turns: int,
+):
+    """Attach periodic mid-run eval to the GRPO trainer when enabled — the run's
+    ``[train] eval_every_steps`` (or the ``AUTOSLM_EVAL_EVERY_STEPS`` operator override) > 0.
+
+    Returns the ``PeriodicEval`` (so the caller can persist its ``history`` into metrics.json),
+    or ``None`` when eval is disabled/unsupported for this run.
+
+    Every N optimizer steps it greedily evaluates the policy on a FIXED held-out split and
+    streams the result via ``heartbeat("rl_eval", ...)`` so the agent gets a live eval curve
+    between steps. Evaluation distinct from the reward comes from the env's zero-weight rubric
+    metrics (``rubric.add_metric``), surfaced via the adapter's ``evaluate``.
+
+    Generation uses the TRAINER'S model (``trainer.model.generate``), NOT the colocate vLLM
+    engine: an out-of-band ``engine.generate`` from a callback hangs GRPO (verified on a live
+    GPU run). The model path works on both backends and keeps memory bounded (one prompt at a
+    time). Tool envs are skipped in v1: TRL drives their tool loop natively and the greedy
+    single-shot path would mis-score them.
+    """
+    from autoslm.engine import midrun_eval as _me
+
+    # The cadence comes from the run's [train] eval_every_steps TOML (env var overrides). The
+    # eval queries + grading logic + completion budget all come from the environment / the run's
+    # normal settings, not config.
+    _train = JOB_SPEC.train if JOB_SPEC else None
+    cfg = _me.eval_config(max_new_default, spec_every=getattr(_train, "eval_every_steps", None))
+    if cfg["every_steps"] <= 0:
+        return None
+    if is_tool_env:
+        print("[rl][eval] mid-run eval is not supported for tool envs in v1; skipping")
+        return None
+    env = require_active_env()
+    # Materializing the eval split can raise (e.g. a separate Hub eval env whose get_eval_dataset
+    # fails) — this runs at training start, so a raise here would abort the whole paid run. Guard
+    # it: a broken eval split disables mid-run eval, never the training.
+    try:
+        # Pass the cap as `limit` so the env getter materializes at most num_examples rows (a huge
+        # Hub eval/train split isn't fully built just to be sliced); the slice is a backstop for
+        # envs whose getter ignores `n`.
+        _cap = cfg["num_examples"] or None
+        examples = env.dataset("eval", limit=_cap)[: cfg["num_examples"]]
+    except Exception as exc:  # never let an eval-split failure abort training
+        print(f"[rl][eval] could not materialize the eval split ({exc}); skipping mid-run eval")
+        return None
+    if not examples:
+        print("[rl][eval] env exposes no eval examples; skipping mid-run eval")
+        return None
+    # When the env has no DISTINCT eval split, the adapter falls back to train rows — warn AND
+    # record it (eval_on_train) so the persisted eval_history is flagged, not silently read as
+    # held-out generalization when it's actually training data.
+    eval_on_train = not getattr(env, "has_eval_split", lambda: True)()
+    if eval_on_train:
+        print(
+            "[rl][eval] WARNING: env has no held-out eval split; mid-run eval runs on "
+            "TRAIN-derived rows (rl_eval reflects training data, not generalization)"
+        )
+
+    def _render_messages(messages, add_generation_prompt):
+        text = tok.apply_chat_template(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=False,
+            enable_thinking=THINKING,
+        )
+        return [int(t) for t in tok(text, add_special_tokens=False).input_ids]
+
+    def _render_prompt_ids(example):
+        return _render_messages(env.prompt_messages(example), True)
+
+    def _build_score_one(model):
+        generate = _me.build_hf_greedy_generate(model, tok, stop=stop)
+        if is_multi_turn:
+            return _me.multi_turn_scorer(
+                env,
+                _render_messages,
+                generate,
+                max_turns=max_turns,
+                max_new_tokens=cfg["max_new_tokens"],
+                engine_max_len=engine_max_len,
+                on_warn=print,
+            )
+        return _me.single_turn_scorer(
+            env, _render_prompt_ids, generate, cfg["max_new_tokens"], graded_text
+        )
+
+    # eval_pass_rate threshold = the ENV's own pass_threshold (what adapter.grade uses), so an env
+    # with pass_threshold=0.8 isn't silently scored at 0.5; default 0.5 when the env defines none.
+    env_pass = getattr(getattr(env, "_env", None), "pass_threshold", None)
+    pass_threshold = float(env_pass) if env_pass is not None else 0.5
+
+    periodic = _me.PeriodicEval(
+        examples=examples,
+        score_one_builder=_build_score_one,
+        every_steps=cfg["every_steps"],
+        heartbeat_fn=heartbeat,
+        pass_threshold=pass_threshold,
+        on_warn=print,
+        eval_on_train=eval_on_train,
+    )
+    # Resolve the live model lazily at eval time (it's the trainer's own model, always present).
+    periodic.bind_model_getter(lambda: getattr(trainer, "model", None))
+    trainer.add_callback(_me.make_periodic_eval_callback(periodic))
+    print(
+        f"[rl][eval] mid-run eval every {cfg['every_steps']} steps on {len(examples)} held-out "
+        f"examples (greedy via trainer model, max_new={cfg['max_new_tokens']}, "
+        f"{'multi-turn' if is_multi_turn else 'single-turn'})"
+    )
+    return periodic
+
+
 def grpo_overrides() -> dict:
     """The GRPO recipe knobs, read off the job spec's ``[train]`` table (``TrainSpec``).
     A field left unset (None) is omitted here so the recipe default applies downstream.
@@ -1324,10 +1443,31 @@ def run_rl():
         callbacks=[hb_cb, make_checkpoint_upload_callback()],
         **extra_trainer_kwargs,
     )
+    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or AUTOSLM_EVAL_EVERY_STEPS,
+    # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
+    # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.
+    periodic_eval = _maybe_attach_periodic_eval(
+        trainer,
+        tok,
+        is_multi_turn=is_multi_turn,
+        is_tool_env=is_tool_env,
+        max_new_default=_max_completion,
+        stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
+        engine_max_len=vllm_max_len,
+        max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
+    )
     t_train = time.time()
     trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     reward_history = list(getattr(hb_cb, "reward_history", []))
+    # Final eval on the actually-saved policy: the cadence only fires on multiples of
+    # eval_every_steps, so when the run length isn't a multiple the last cadence eval predates the
+    # saved adapter. run_final adds one eval on the final model (no-ops if the last step already
+    # coincided with a cadence eval).
+    if periodic_eval is not None:
+        periodic_eval.run_final(int(getattr(trainer.state, "global_step", 0) or 0))
+    eval_history = periodic_eval.history_records() if periodic_eval is not None else []
+    eval_on_train = bool(getattr(periodic_eval, "eval_on_train", False))
 
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
@@ -1353,6 +1493,14 @@ def run_rl():
             "download_seconds": download_seconds,
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,
+            # The mid-run eval curve (per [train] eval_every_steps): each entry has step,
+            # eval_reward, eval_pass_rate, and eval_metrics{}. Empty when eval is off. The agent
+            # reads this to judge the run on held-out EVAL quality, not just the training reward.
+            "eval_history": eval_history,
+            # True when the env had no held-out eval split and eval_history was computed on
+            # TRAIN-derived rows — so it is NOT held-out generalization. Agents must not read
+            # eval_history as held-out when this is set.
+            "eval_on_train_fallback": eval_on_train,
             "gen_tokens_is_upper_bound": True,
             "thinking": THINKING,
             "max_completion_len": _max_completion,
