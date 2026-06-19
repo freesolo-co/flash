@@ -10,16 +10,13 @@ manifest below).
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from .._fileio import read_json_or_empty, secure_json_write
 from .base import Environment
 
 # Manifest of installed verifiers / Prime Hub environments (written by `slm env install`).
-INSTALLED_MANIFEST = Path(
-    os.environ.get("FLASH_ENVS_MANIFEST", str(Path.home() / ".flash" / "envs.json"))
-)
+INSTALLED_MANIFEST = Path.home() / ".flash" / "envs.json"
 
 
 def load_installed_manifest() -> dict:

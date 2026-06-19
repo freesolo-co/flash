@@ -7,22 +7,18 @@ Per-run TOML configs (parsed into a ``JobSpec``) override the relevant fields.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 
 # ----------------------------------------------------------------------------
 # Model identity
 # ----------------------------------------------------------------------------
-# Recipe fallback base model. Model selection precedence on the worker is
-# JobSpec.model > env BENCH_HF_MODEL > this recipe default; worker.py resolves
-# JOB_SPEC.model first and only falls back to RECIPE.hf_model_id. The RunPod launcher
-# sets BENCH_HF_MODEL from the spec; Vast carries the model via the full JobSpec
-# (JOB_SPEC.model), which the worker resolves before this fallback. This literal is the
-# last-resort default when neither is present.
+# Recipe fallback base model. The worker resolves JOB_SPEC.model (carried by the full
+# JobSpec) first and only falls back to RECIPE.hf_model_id; this literal is the
+# last-resort default when the spec carries no model.
 # Keep it in sync with catalog.DEFAULT_MODEL (a proven dense text-only instruction model
 # that loads on the current worker stack: transformers 5.x / TRL 1.x / vLLM 0.19.x; the
 # natively-multimodal Qwen3.5/3.6 checkpoints are also catalog'd, trained/served text-only).
-HF_MODEL_ID = os.environ.get("BENCH_HF_MODEL", "Qwen/Qwen3.5-4B")  # catalog DEFAULT_MODEL
+HF_MODEL_ID = "Qwen/Qwen3.5-4B"  # catalog DEFAULT_MODEL
 
 
 # ----------------------------------------------------------------------------
@@ -33,9 +29,8 @@ class LoRAConfig:
     rank: int = 32
     alpha: int = 64
     dropout: float = 0.0
-    # The worker adapts all linear projections, set via the LORA_TARGETS env var
-    # (default "all-linear" — see engine.worker); `rank`/`alpha` are the main
-    # user-controllable knobs here.
+    # The worker adapts all linear projections ("all-linear" — see engine.worker);
+    # `rank`/`alpha` are the main user-controllable knobs here.
 
 
 # ----------------------------------------------------------------------------

@@ -22,7 +22,7 @@ from flash._logging import get_logger
 
 logger = get_logger(__name__)
 
-CACHE_TTL_S = float(os.environ.get("FLASH_PRICE_TTL_S", str(6 * 3600)))
+CACHE_TTL_S = 6 * 3600.0  # 6h price cache
 _CACHE_PATH = Path.home() / ".flash" / "gpu_rates.json"
 _MEM: dict = {"ts": 0.0, "rates": {}}
 

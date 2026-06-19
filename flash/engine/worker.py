@@ -293,24 +293,16 @@ def make_checkpoint_upload_callback():
 # repo; committing every training step (the reward callback fires per step) blows HuggingFace's
 # per-repo commit rate limit (128/hour), especially when several runs share one HF_REPO. Only
 # the per-step "rl_step" stage is high-frequency, so throttle JUST that one to once per
-# FLASH_HEARTBEAT_MIN_S (default 60s); every other stage — including milestones and the
-# terminal done/already_done — always commits so the control plane never misses a transition.
+# 60s; every other stage — including milestones and the terminal done/already_done — always
+# commits so the control plane never misses a transition.
 # The local file + stdout line are always written regardless.
 _HB_LAST_UPLOAD = 0.0
 
 
 def _hb_min_interval_s() -> float:
-    """The rl_step heartbeat-upload throttle, in seconds. Operators raise FLASH_HEARTBEAT_MIN_S
-    to stay under HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO runs
-    share one HF_REPO; default 60s. A non-positive or unparseable value falls back to 60s."""
-    raw = os.environ.get("FLASH_HEARTBEAT_MIN_S")
-    if raw is None:
-        return 60.0
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return 60.0
-    return value if value > 0 else 60.0
+    """The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
+    128 commits/hour-per-repo limit when concurrent runs share one HF_REPO."""
+    return 60.0
 
 
 _HB_MIN_INTERVAL_S = _hb_min_interval_s()
@@ -655,18 +647,17 @@ def finalize_alloc_conf_for_sleep() -> None:
     """Sync the CUDA allocator conf with the worker's RESOLVED vLLM sleep default.
 
     The launcher (providers/*/train.py build_worker_env) must pick PYTORCH_ALLOC_CONF before this
-    process starts, but it can't always know the GRPO sleep decision: for a small model with
-    RL_VLLM_SLEEP unset the worker resolves sleep OFF (the speed default), yet the launcher
-    conservatively assumes sleep ON and picks the non-expandable conf (safe, but fragments a long
-    colocate run). When the launcher cedes the decision (it sets FLASH_ALLOC_AUTO=1 — only when
-    it applied a DEFAULT, never an operator override), we resolve the same sleep default here (we
+    process starts, but it can't always know the GRPO sleep decision: for a small model the worker
+    resolves sleep OFF (the speed default), yet the launcher conservatively assumes sleep ON and
+    picks the non-expandable conf (safe, but fragments a long colocate run). When the launcher cedes
+    the decision (it sets FLASH_ALLOC_AUTO=1 for RL runs), we resolve the same sleep default here (we
     have the model config + GPU) and, if sleep is OFF, switch to expandable_segments — which only
     crashes WITH sleep on, a case we've just ruled out. PYTORCH_ALLOC_CONF is read lazily at the
     first CUDA allocation, so this must run before any allocation (it does — called at boot)."""
     if os.environ.get("FLASH_ALLOC_AUTO") != "1":
         return
     try:
-        model_id = os.environ.get("BENCH_HF_MODEL", "")
+        model_id = JOB_SPEC.model if JOB_SPEC else ""
         # Resolve the GRPO context the SAME way the sleep gate does (run_rl): the run's
         # [train].max_length, so a long-context run gets the right sleep default + alloc conf.
         _spec_len = 0
@@ -858,8 +849,8 @@ def loraplus_optimizer_cls(optim_name: str):
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
-    (silent, the metrics.json artifact is still the source of truth). Sets a default project so runs
-    land in one place."""
+    (silent, the metrics.json artifact is still the source of truth). Pins the project so every run
+    lands in one place."""
     if not os.environ.get("WANDB_API_KEY"):
         return []
     import importlib.util
@@ -867,7 +858,7 @@ def wandb_report_to() -> list[str]:
     if importlib.util.find_spec("wandb") is None:
         print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
         return []
-    os.environ.setdefault("WANDB_PROJECT", "flash")
+    os.environ["WANDB_PROJECT"] = "flash"
     return ["wandb"]
 
 
@@ -958,17 +949,9 @@ def make_lora(model_id: str | None = None):
     ``lora_exclude_modules``)."""
     from peft import LoraConfig
 
-    # PEFT target_modules accepts the special string "all-linear" OR a LIST of module-name
-    # suffixes. A comma-separated env (e.g. "q_proj,k_proj,v_proj,o_proj" to adapt attention only
-    # and leave the MoE experts frozen) MUST be split into a list — else PEFT treats the whole
-    # string as ONE module name and raises "Target modules ... not found in the base model".
-    _parts = [
-        t.strip() for t in os.environ.get("LORA_TARGETS", "all-linear").split(",") if t.strip()
-    ]
-    # "all-linear" is a PEFT SPECIAL string, not a module name — keep it as a string (incl. when a
-    # stray trailing comma made it the sole element, e.g. "all-linear," -> ["all-linear"]). Any
-    # real multi-module value becomes a list of suffixes.
-    targets = "all-linear" if (not _parts or _parts == ["all-linear"]) else _parts
+    # Adapt every linear projection. "all-linear" is a PEFT SPECIAL string (not a module name)
+    # that PEFT expands to all linear layers — the right managed default across the catalog.
+    targets = "all-linear"
     rank = JOB_SPEC.train.lora_rank if JOB_SPEC else RECIPE.lora.rank
     alpha = JOB_SPEC.train.lora_alpha if JOB_SPEC else RECIPE.lora.alpha
     kwargs = {
@@ -996,10 +979,7 @@ def make_lora(model_id: str | None = None):
 
 
 def model_quant(model_id: str) -> str:
-    """Quantization tier for this model: catalog entry > FLASH_QUANT env > bf16."""
-    env_q = os.environ.get("FLASH_QUANT")
-    if env_q:
-        return env_q
+    """Quantization tier for this model: catalog entry > bf16 (managed; no override)."""
     try:
         from flash.catalog import MODELS
 
@@ -1107,15 +1087,15 @@ def run_sft():
     setup_seconds = time.time() - t_start
     heartbeat("sft_model_load", setup_seconds=setup_seconds)
 
-    default_epochs = (
+    # Epochs come from the run's [train] epochs (already in JOB_SPEC), else the recipe default.
+    epochs = int(
         JOB_SPEC.train.epochs
         if JOB_SPEC and JOB_SPEC.train.epochs is not None
         else RECIPE.sft.num_epochs
     )
-    epochs = int(os.environ.get("SFT_EPOCHS", str(default_epochs)))
-    # SDK [train] knobs override the recipe default; an operator env var still wins last.
+    # SDK [train] knobs override the recipe default.
     _t = JOB_SPEC.train if JOB_SPEC else None
-    per_device_bs = int(os.environ.get("SFT_PER_DEVICE_BS", "4"))
+    per_device_bs = 4
     # batch_size is the GLOBAL/effective batch: grad-accum is sized to reach it. Cap the
     # per-device micro-batch at the target (so a target < per_device doesn't overshoot) and
     # use CEIL division so the realized global batch is never BELOW the requested one (floor
@@ -1183,22 +1163,13 @@ def run_sft():
     # sdist-only; Dao-AILab wheels stop at torch 2.9) so it would build from source on every cold
     # start (~20 min, fragile) — it is NOT in the worker image. So _fa_ok is False on the current
     # stack and packing is effectively unavailable until flash-attn is baked into a prebuilt image.
-    # Default: packing ON when FA2 is importable; else SKIP (don't silently cross-contaminate).
-    # SFT_PACKING=0 disables; SFT_PACKING=1 forces (bfd under SDPA, with the contamination warning).
-    _packing_env = os.environ.get("SFT_PACKING")
-    _want_packing = (_packing_env or "1") not in ("0", "false", "False")
-    _packing_forced = _packing_env not in (None, "")
+    # Packing is ON when FA2 is importable (varlen keeps 'bfd' example boundaries correct); else
+    # SKIP — without a boundary-correct attn backend examples would cross-contaminate under SDPA.
     _fa_ok = _flash_attn_available()
-    if _want_packing and _fa_ok:
+    if _fa_ok:
         cfg_kwargs["packing"] = True
-        print("[sft] example packing enabled (FA2 varlen; SFT_PACKING=0 to disable)")
-    elif _want_packing and _packing_forced:
-        cfg_kwargs["packing"] = True
-        print(
-            "[sft] WARNING: packing forced without FA2 — 'bfd' boundaries need varlen; "
-            "examples may cross-contaminate under SDPA. Set SFT_PACKING=0 to disable."
-        )
-    elif _want_packing:
+        print("[sft] example packing enabled (FA2 varlen)")
+    else:
         print(
             "[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
             "2.10). Bake flash-attn into the worker image to enable FA2 varlen packing."
@@ -1458,10 +1429,10 @@ def rl_per_device_comps(
     This, not grad-accum, sets peak trainer VRAM: the logprob pass materializes fp32 logits
     of shape [per_device, completion_len, vocab]. At Qwen's ~152k vocab a long completion is
     enormous (measured: per_device 8 x 4096 tok x 152k x 4 B = ~20 GiB single alloc -> OOMs
-    a small card). So we MEMORY-CAP per_device to a logits budget (RL_LOGITS_BUDGET_GB,
-    default 6) for the given completion length, then push the difference into grad-accum
+    a small card). So we MEMORY-CAP per_device to a logits budget (6 GB) for the
+    given completion length, then push the difference into grad-accum
     (compute_grpo_batching) so the effective batch is unchanged. This keeps long-completion
-    GRPO on a cheaper GPU. RL_PER_DEVICE_PROMPTS forces an explicit value.
+    GRPO on a cheaper GPU.
 
     The logits budget is NOT the whole story: the per-device forward also holds the model's
     attention/activation memory (the Qwen3.5 GDN/FLA kernels peak per micro-batch even with
@@ -1472,12 +1443,10 @@ def rl_per_device_comps(
     TRAINS at 4. So for colocate, additionally cap per_device to the live card's VRAM scaled
     by model width (~sqrt(params)): ~vram_gb/8 at 2B-width, tightened for wider models (4B/9B).
     """
-    base = int(os.environ.get("RL_PER_DEVICE_PROMPTS", "2" if THINKING else "8"))
-    if "RL_PER_DEVICE_PROMPTS" in os.environ:
-        # Explicit operator force (A/B knob): bypass BOTH auto-caps -- they own the OOM risk.
-        return max(1, base)
+    # Default prompts/step; the auto-caps below (logits budget + colocate VRAM/width) handle OOM.
+    base = 2 if THINKING else 8
     if completion_len > 0:
-        budget = float(os.environ.get("RL_LOGITS_BUDGET_GB", "6")) * 1e9
+        budget = 6.0 * 1e9
         cap = max(1, int(budget / (max(1, completion_len) * vocab * 4)))
         base = min(base, cap)
     if use_vllm:
@@ -1533,7 +1502,7 @@ def _maybe_attach_periodic_eval(
     max_turns: int,
 ):
     """Attach periodic mid-run eval to the GRPO trainer when enabled — the run's
-    ``[train] eval_every_steps`` (or the ``FLASH_EVAL_EVERY_STEPS`` operator override) > 0.
+    ``[train] eval_every_steps`` > 0.
 
     Returns the ``PeriodicEval`` (so the caller can persist its ``history`` into metrics.json),
     or ``None`` when eval is disabled/unsupported for this run.
@@ -1555,7 +1524,11 @@ def _maybe_attach_periodic_eval(
     # eval queries + grading logic + completion budget all come from the environment / the run's
     # normal settings, not config.
     _train = JOB_SPEC.train if JOB_SPEC else None
-    cfg = _me.eval_config(max_new_default, spec_every=getattr(_train, "eval_every_steps", None))
+    cfg = _me.eval_config(
+        max_new_default,
+        spec_every=getattr(_train, "eval_every_steps", None),
+        spec_eval_examples=getattr(_train, "eval_examples", None),
+    )
     if cfg["every_steps"] <= 0:
         return None
     if is_tool_env:
@@ -1583,11 +1556,15 @@ def _maybe_attach_periodic_eval(
     # fails) — this runs at training start, so a raise here would abort the whole paid run. Guard
     # it: a broken eval split disables mid-run eval, never the training.
     try:
-        # Pass the cap as `limit` so the env getter materializes at most num_examples rows (a huge
-        # Hub eval/train split isn't fully built just to be sliced); the slice is a backstop for
-        # envs whose getter ignores `n`.
-        _cap = cfg["num_examples"] or None
-        examples = env.dataset("eval", limit=_cap)[: cfg["num_examples"]]
+        # Evaluate a RANDOM SAMPLE of num_examples held-out rows, not the whole split (generation
+        # is the cost; scoring the entire eval set every pass would dominate training) and not the
+        # first N (order-biased). Materialize a bounded pool (data load is cheap vs generation),
+        # then take a FIXED seeded subset so the same rows are scored every pass -> a comparable
+        # eval curve. `limit` bounds the pool; a verifiers getter that honors (n, seed) already
+        # returns a seeded slice, and the sample is the backstop for getters that ignore `n`.
+        n = cfg["num_examples"]
+        pool = env.dataset("eval", limit=max(n, _me.EVAL_POOL_CAP))
+        examples = _me.sample_eval_rows(pool, n)
     except Exception as exc:  # never let an eval-split failure abort training
         print(f"[rl][eval] could not materialize the eval split ({exc}); skipping mid-run eval")
         return None
@@ -1760,12 +1737,14 @@ def run_rl():
     quant = model_quant(model_id)
     download_seconds = prefetch_model(model_id)
     rl = RECIPE.rl
-    steps = int(os.environ.get("RL_STEPS", str(rl.num_steps)))
-    # Throughput/quality knobs (env-overridable): the number of prompts optimized per step,
-    # completions per prompt, and whether vLLM offloads weights between steps. Sleep mode
-    # frees memory for the optimizer but reloads ~weights each step (a large per-step cost);
-    # disable it (RL_VLLM_SLEEP=0) with a higher RL_VLLM_GPU_UTIL when both fit resident.
-    # SDK-supplied GRPO knobs (datums parity) override the recipe; env vars still win.
+    # Steps come from the run's [train] steps (already in JOB_SPEC), else the recipe default.
+    steps = int(
+        JOB_SPEC.train.steps if JOB_SPEC and JOB_SPEC.train.steps is not None else rl.num_steps
+    )
+    # Throughput/quality knobs: the number of prompts optimized per step, completions per
+    # prompt, and whether vLLM offloads weights between steps. Sleep mode frees memory for the
+    # optimizer but reloads ~weights each step (a large per-step cost); it's gated OFF by model
+    # size when both the policy and rollout engine fit resident.
     gcfg = grpo_overrides()
     _t = JOB_SPEC.train if JOB_SPEC else None
     # batch_size = prompts per optimizer step for GRPO.
@@ -1781,17 +1760,12 @@ def run_rl():
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     # vLLM sleep mode offloads the rollout engine's weights between steps to free memory for the
     # optimizer, but reloading each step is a large per-step cost — PR #174 measured ~2-2.6x faster
-    # GRPO with it OFF on models that fit. Default it by model size (same small=speed / large=memory
-    # gate as gradient checkpointing): OFF for small/fitting models, ON for large. RL_VLLM_SLEEP wins.
-    _sleep_env = os.environ.get("RL_VLLM_SLEEP")
-    if _sleep_env is not None:
-        sleep_mode = _sleep_env not in ("0", "false", "False")
-    else:
-        # Gate on the GRPO rollout context (the run's [train].max_length sizes the engine + KV
-        # cache): a long-context GRPO run is memory-tight and needs sleep mode. Matches the
-        # liger-loss gate below.
-        _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
-        sleep_mode = _memory_mode(model_id, _grpo_ctx)
+    # GRPO with it OFF on models that fit. Gate it by model size (same small=speed / large=memory
+    # gate as gradient checkpointing): OFF for small/fitting models, ON for large.
+    # Gate on the GRPO rollout context (the run's [train].max_length sizes the engine + KV cache):
+    # a long-context GRPO run is memory-tight and needs sleep mode. Matches the liger-loss gate below.
+    _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
+    sleep_mode = _memory_mode(model_id, _grpo_ctx)
     # Rollout backend: always colocated vLLM (fast). The whole supported catalog runs GRPO with
     # colocated vLLM; there is no transformers-generation fallback.
     use_vllm = True
@@ -1929,7 +1903,7 @@ def run_rl():
     per_device_comps = rl_per_device_comps(_max_completion, use_vllm=use_vllm, params_b=_params_b)
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
-        print("WARN: generation batch not divisible by group size; check RL_PER_DEVICE_PROMPTS")
+        print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
     print(
         f"[rl] GRPO batching: per_device={batching['per_device_train_batch_size']} "
         f"grad_accum={batching['gradient_accumulation_steps']} "
@@ -1998,12 +1972,12 @@ def run_rl():
     if use_vllm:
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
-        # the model's FULL context and won't start on a consumer GPU). RL_VLLM_GPU_UTIL
-        # sizes vLLM's pool; RL_VLLM_SLEEP offloads its weights between steps.
+        # the model's FULL context and won't start on a consumer GPU). vllm_gpu_memory_utilization
+        # sizes vLLM's pool; sleep mode offloads its weights between steps.
         grpo_kwargs.update(
             vllm_mode="colocate",
             vllm_max_model_length=vllm_max_len,
-            vllm_gpu_memory_utilization=float(os.environ.get("RL_VLLM_GPU_UTIL", "0.45")),
+            vllm_gpu_memory_utilization=0.45,
             vllm_enable_sleep_mode=sleep_mode,
         )
         # Rollout-memory + throughput knobs, applied ONLY if this TRL exposes the field (so an
