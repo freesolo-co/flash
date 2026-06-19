@@ -2510,14 +2510,17 @@ def run_rl():
         if _is_fsdp_launcher:
             init_model, init_peft = None, None
         else:
-            init_model, init_peft = _init_adapter_model(model_id)
             # Install the CLASS/FUNCTION-level opt-in chalk kernels (LoRA delta, fused MLP/QKV, RoPE)
-            # BEFORE GRPOTrainer builds the model so the patches apply to its freshly-built layers. The
-            # INSTANCE-level kernels (FP8 base, embedding, FP8 MLP) need the actual nn.Module and are
-            # installed AFTER construction (below) against trainer.model. Skipped on the FSDP launcher
-            # (it builds no trainer; the child ranks install their own). No-op unless a FLASH_* kernel
-            # flag is set and freesolo-chalk is installed.
+            # FIRST — they are global monkeypatches that must be in place BEFORE the model is built.
+            # This MUST run before _init_adapter_model: on the train.init_from_adapter continue path
+            # that call materializes the full PeftModel, so installing after it would miss those
+            # layers (the fresh-LoRA path returns only the model-id string, built later by TRL, so it
+            # was unaffected either way). The INSTANCE-level kernels (FP8 base, embedding, FP8 MLP)
+            # need the actual nn.Module and are installed AFTER GRPOTrainer construction (below)
+            # against trainer.model. Skipped on the FSDP launcher (it builds no trainer; the child
+            # ranks install their own). No-op unless a FLASH_* kernel flag is set and chalk is present.
             install_chalk_kernels()
+            init_model, init_peft = _init_adapter_model(model_id)
         if init_peft is not None:
             # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
             # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
