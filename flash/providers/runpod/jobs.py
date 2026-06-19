@@ -316,6 +316,7 @@ def poll_job(
     seen_heartbeat = False
     last_health_probe = 0.0
     unhealthy_since: float | None = None  # first time the worker was seen stuck UNHEALTHY
+    worker_initializing = False  # last probe saw a worker cold-starting the image (initializing)
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
@@ -357,6 +358,7 @@ def poll_job(
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
                 recovering = workers.get("initializing")
+                worker_initializing = bool(recovering)
                 if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
                     say(f"queued; workers: {workers}")
                 # Fail fast on a worker stuck UNHEALTHY: a dead worker / failed image pull won't
@@ -388,7 +390,17 @@ def poll_job(
         # of burning the whole retry budget on a class with zero free workers. Only fires while
         # still IN_QUEUE: once a worker picks the job up (status RUNNING) the slow-but-legit
         # cold start (image pull / dep install / model download) gets the full setup grace below.
-        if status == "IN_QUEUE" and time.time() - last_progress > queue_grace_s:
+        #
+        # SKIP it while a worker is `initializing`: a large baked image / slow pull can keep the
+        # job IN_QUEUE past queue_grace_s while a worker is ACTIVELY being brought up — that's a
+        # cold start, not capacity starvation, so deleting the endpoint here would throw away a
+        # worker about to run. The setup_grace_s stall window (and the unhealthy fast-path) still
+        # bound this, so a worker that never finishes initializing is not waited on forever.
+        if (
+            status == "IN_QUEUE"
+            and not worker_initializing
+            and time.time() - last_progress > queue_grace_s
+        ):
             return PollResult(
                 False,
                 failure="no_capacity",

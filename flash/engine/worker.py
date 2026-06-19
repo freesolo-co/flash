@@ -2004,8 +2004,16 @@ def run_rl():
         if not os.environ.get("FLASH_LORA_INIT"):
             os.environ["FLASH_LORA_INIT"] = "default"
     disaggregated = _rollout_split is not None and _rollout_split.mode == "disaggregated"
-    wait_for_gpu()
-    setup_perf_backends()
+    # The FSDP/DDP LAUNCHER builds NO trainer (it re-execs the worker under `accelerate launch` and
+    # returns) — but its CUDA_VISIBLE_DEVICES is pinned to ALL the train GPUs. wait_for_gpu()'s
+    # `torch.zeros(..., device="cuda")` would create and RETAIN a CUDA context on the first trainer
+    # card, and setup_perf_backends() likewise initializes the primary context; in a memory-tight
+    # 2:1/2:2 disaggregated run that idle launcher context steals VRAM from / OOMs rank 0 on the
+    # SAME card the accelerate child then trains on. Skip both probes on the launcher; each
+    # accelerate child runs them in its own (rank-local) process below.
+    if not _is_fsdp_launcher:
+        wait_for_gpu()
+        setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
     # QLoRA tier loads the base bf16 checkpoint; vLLM/transformers quantize it to 4-bit NF4 at load.
     quant = model_quant(model_id)
