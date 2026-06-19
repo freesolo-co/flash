@@ -132,7 +132,6 @@ class TrainSpec:
     # so the agent judges the run on held-out eval, not just the training reward. 0/None disables.
     # This cadence is the ONLY mid-run-eval knob: the eval queries and grading logic live in the
     # environment, and the completion budget matches the run's normal ``max_tokens``.
-    # (``FLASH_EVAL_EVERY_STEPS`` env var overrides it — operator/bench escape hatch.)
     eval_every_steps: int | None = None
 
 

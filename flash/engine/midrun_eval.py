@@ -32,7 +32,6 @@ emission are unit-tested without a GPU, tokenizer, or vLLM. Only :func:`build_hf
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -348,35 +347,24 @@ def make_periodic_eval_callback(periodic: PeriodicEval):
 # ---------------------------------------------------------------------------
 # GPU-side wiring (the only part that touches torch / the model). From worker.run_rl.
 # ---------------------------------------------------------------------------
+# Fixed safety cap on held-out rows scored per eval, so a huge env eval split can't dominate
+# training (the agent sizes the eval set via the environment).
+_EVAL_NUM_CAP = 64
+
+
 def eval_config(default_max_new: int, *, spec_every: int | None = None) -> dict:
-    """Resolve the mid-run-eval knobs. The CADENCE is the only real knob: it comes from the run's
-    ``[train] eval_every_steps`` TOML (``spec_every``), with ``FLASH_EVAL_EVERY_STEPS`` as an
-    operator override; 0/unset disables.
+    """Resolve the mid-run-eval knobs. The CADENCE is the only real knob and it comes from the run's
+    ``[train] eval_every_steps`` TOML (``spec_every``); 0/unset disables.
 
     Everything else comes from the ENVIRONMENT, not config: the eval queries are the env's
     held-out ``eval_dataset``, the grading is its rubric (reward + eval-metric metrics), the
     completion budget equals the run's normal ``max_tokens`` (``default_max_new``), and the pass
-    threshold is the env's own. ``num_examples`` is ONLY a safety cap so a huge env eval split
-    can't dominate training (``FLASH_EVAL_NUM``, default 64) — the agent sizes the eval set via
-    the environment, not here.
+    threshold is the env's own. ``num_examples`` is the fixed ``_EVAL_NUM_CAP`` safety cap.
     """
-
-    def _safe_int(value, fallback):
-        # A malformed FLASH_EVAL_* env var must not abort training at setup — fall back.
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return fallback
-
-    env_every = os.environ.get("FLASH_EVAL_EVERY_STEPS")
-    if env_every is not None and env_every.strip() != "":
-        every = _safe_int(env_every, spec_every)  # bad env var -> fall back to the TOML value
-    else:
-        every = spec_every
+    every = max(0, int(spec_every)) if spec_every is not None else 0
     return {
-        "every_steps": _safe_int(every, 0) if every is not None else 0,
-        # safety cap only (negative would hit Python negative-slicing semantics on the split)
-        "num_examples": max(0, _safe_int(os.environ.get("FLASH_EVAL_NUM"), 64)),
+        "every_steps": every,
+        "num_examples": _EVAL_NUM_CAP,  # safety cap only
         "max_new_tokens": max(1, int(default_max_new)),  # = the run's normal completion budget
     }
 

@@ -327,11 +327,7 @@ def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
     assert rl_per_device_comps(512, vocab=152_000, use_vllm=True) == 8
     # long completion: 6e9 / (4096*152000*4) ~ 2.4 -> capped to 2
     assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 2
-    # explicit override always wins (and disables the auto-caps)
-    monkeypatch.setenv("RL_PER_DEVICE_PROMPTS", "5")
-    assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 5
     # a tighter budget caps harder
-    monkeypatch.delenv("RL_PER_DEVICE_PROMPTS", raising=False)
     monkeypatch.setenv("RL_LOGITS_BUDGET_GB", "2")
     assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 1
 

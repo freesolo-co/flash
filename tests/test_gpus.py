@@ -188,4 +188,6 @@ def test_build_worker_env():
     env = build_worker_env(spec, 0)
     assert env["RUN_ID"] == "r1"
     assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3.5-4B"
-    assert env["RL_STEPS"] == "20"
+    # [train] steps/epochs are NOT forwarded as env vars — the worker reads them from JOB_SPEC.
+    assert "RL_STEPS" not in env
+    assert "SFT_EPOCHS" not in env
