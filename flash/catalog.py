@@ -153,13 +153,14 @@ MODELS: dict[str, ModelInfo] = {
         quant="4bit-qlora",
         recommended_gpu="A100 PCIe",
         thinking="hybrid",
-        # The worker prefetches the FULL bf16 checkpoint into the HF cache before 4-bit load
-        # (snapshot_download grabs every safetensor regardless of quant), and a 35B bf16
-        # checkpoint is ~70 GB — it overflows the 60/64 GB container default and the run fails
-        # in prefetch_model after a paid multi-GPU node is already provisioned. Floor the disk
-        # the same way the open-model policy does (~2 GB/B weights + 64 GB worker-stack/cache
-        # headroom): 35B -> ~134 GB; round to 140. The runner raises gpu.disk_gb to this.
-        min_disk_gb=140,
+        # This model's GRPO is DISAGGREGATED-ONLY (requires_disaggregated): the trainer AND a
+        # separate `trl vllm-serve` process BOTH materialize the full ~70 GB bf16 checkpoint on the
+        # same node, and the HF download (+ Xet temp + checkpoint saves) pushes PEAK disk to ~200 GB.
+        # A single-checkpoint heuristic (~70 GB) is far too low and still hits "No space left on
+        # device" after a paid multi-GPU rent. Floor to 300 GB — the value validated in live 35B
+        # disaggregated runs (campaign notes; the disk_gb=300 fix that cleared the OOD failures).
+        # The runner raises gpu.disk_gb to this out of the box.
+        min_disk_gb=300,
         # Re-added for the DISAGGREGATED (multi-GPU async) GRPO path only: it OOMs when the trainer
         # and the vLLM rollout are colocated on one card. With a dedicated inference GPU (35B served
         # 4-bit) + a sharded trainer on the rest, it fits. GRPO colocate for it is rejected.
