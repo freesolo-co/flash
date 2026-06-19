@@ -86,7 +86,7 @@ def test_explicit_sft_batch_is_still_forwarded_for_sizing():
 
 
 def test_offline_open_model_sized_from_parsed_id_not_24gb_fallback():
-    # Offline (AUTOSLM_SKIP_NET), HF metadata is unreadable, so the allocator's open-model
+    # Offline (FLASH_SKIP_NET), HF metadata is unreadable, so the allocator's open-model
     # path returns a flat 24 GB. But model_specs parses the size from the id, so an unlisted
     # 13B model must size WELL above 24 GB and route to a big card -- not a 24 GB A5000.
     big_open = RunConfig("vendor/foo-13b", "sft", 100)
@@ -174,7 +174,7 @@ def test_allow_unvalidated_widens_gpu_selection():
 def test_unspecified_allow_unvalidated_resolves_like_submit_time(monkeypatch):
     # ``allow_unvalidated`` is tri-state: an UNSPECIFIED value (None, the default and what a
     # spec with no gpu.allow_unvalidated key reconstructs to) must NOT be treated as a hard
-    # False. select_gpu resolves it via the SAME AUTOSLM_GPU_ALLOW_UNVALIDATED default the
+    # False. select_gpu resolves it via the SAME FLASH_GPU_ALLOW_UNVALIDATED default the
     # submit-time allocator uses (providers.base.unvalidated_allowed), so the estimate matches
     # the GPU a run the env var widened actually allocates -- the bug this guards against is a
     # missing flag silently pricing against the narrower validated-only pool.
@@ -185,11 +185,11 @@ def test_unspecified_allow_unvalidated_resolves_like_submit_time(monkeypatch):
     need = select_gpu(RunConfig(MID, "sft", 100, allow_unvalidated=False))[1]
 
     # Env off -> None resolves to validated-only (matches submit-time default).
-    monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
     assert select_gpu(cfg_unspecified)[0] == pick_gpu(need, allow_unvalidated=False)
 
     # Env on -> None widens to the unvalidated pool, exactly as the allocator would.
-    monkeypatch.setenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", "1")
+    monkeypatch.setenv("FLASH_GPU_ALLOW_UNVALIDATED", "1")
     assert select_gpu(cfg_unspecified)[0] == pick_gpu(need, allow_unvalidated=True)
 
 

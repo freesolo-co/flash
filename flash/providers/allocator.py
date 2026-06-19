@@ -10,7 +10,7 @@ cheapest:
 
 Allocation happens at SUBMIT time in the runner (offers are a volatile market);
 the parse-time resolution in schema is a RunPod-static provisional for
-validation/dry-run display. Offline (AUTOSLM_SKIP_NET) the allocator degrades to exactly
+validation/dry-run display. Offline (FLASH_SKIP_NET) the allocator degrades to exactly
 ``cheapest_gpu``'s deterministic static-rate answer (RunPod only — Vast is offline-off).
 
 Provider-agnostic by construction: it walks the registered providers and asks each for

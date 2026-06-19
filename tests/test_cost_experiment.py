@@ -1,7 +1,7 @@
 """Cost estimator: the prompt-convergence harness + report rendering.
 
 The unit tests drive the harness with a deterministic, network-free stub estimator;
-the one live test is opt-in (``AUTOSLM_LIVE=1`` + ``ANTHROPIC_API_KEY``).
+the one live test is opt-in (``FLASH_LIVE=1`` + ``ANTHROPIC_API_KEY``).
 """
 
 from __future__ import annotations

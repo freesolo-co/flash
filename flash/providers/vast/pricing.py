@@ -3,7 +3,7 @@
 RunPod prices a fixed class catalog; Vast is a live market, so a class's "rate" is the
 cheapest currently-usable offer for it (``usable_offers``). This module gives the
 provider interface a uniform ``hourly_rate(gpu)`` and a ``live_rates()`` map for the
-``slm gpus`` table. Offline-safe: AUTOSLM_SKIP_NET (or any failure) falls back to the
+``slm gpus`` table. Offline-safe: FLASH_SKIP_NET (or any failure) falls back to the
 static Vast snapshot carried on ``GpuClass.hourly_usd``.
 """
 
@@ -26,10 +26,10 @@ def _static_rates() -> dict[str, float]:
 def live_rates(refresh: bool = False) -> dict[str, float]:
     """Friendly-name -> cheapest live verified-datacenter $/hr (static fallback).
 
-    Offline-safe: AUTOSLM_SKIP_NET (or any fetch failure) returns the static rates.
+    Offline-safe: FLASH_SKIP_NET (or any fetch failure) returns the static rates.
     """
     static = _static_rates()
-    if os.environ.get("AUTOSLM_SKIP_NET") or not os.environ.get("VAST_API_KEY"):
+    if os.environ.get("FLASH_SKIP_NET") or not os.environ.get("VAST_API_KEY"):
         return static
     try:
         from flash.providers.vast.jobs import usable_offers

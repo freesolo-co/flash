@@ -136,7 +136,7 @@ Six suites under `tests/` (`test_cost_{hardware,models,analytical,estimate,promp
 all CPU-only — the experiment tests drive the harness with a deterministic offline stub.
 
 ```bash
-AUTOSLM_SKIP_NET=1 uv run pytest tests/test_cost_*.py
+FLASH_SKIP_NET=1 uv run pytest tests/test_cost_*.py
 ```
 
 Deps: the analytical model and tests need nothing extra; the LLM estimator and PNG are

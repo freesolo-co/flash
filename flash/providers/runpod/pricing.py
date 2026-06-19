@@ -22,7 +22,7 @@ from flash._logging import get_logger
 
 logger = get_logger(__name__)
 
-CACHE_TTL_S = float(os.environ.get("AUTOSLM_PRICE_TTL_S", str(6 * 3600)))
+CACHE_TTL_S = float(os.environ.get("FLASH_PRICE_TTL_S", str(6 * 3600)))
 _CACHE_PATH = Path.home() / ".flash" / "gpu_rates.json"
 _MEM: dict = {"ts": 0.0, "rates": {}}
 
@@ -69,10 +69,10 @@ def _fetch_live_rates() -> dict[str, float]:
 def live_rates(refresh: bool = False) -> dict[str, float]:
     """Friendly-name -> $/hr. Live (cached ``CACHE_TTL_S``) over the static snapshot.
 
-    Offline-safe: AUTOSLM_SKIP_NET (or any fetch failure) returns the static rates.
+    Offline-safe: FLASH_SKIP_NET (or any fetch failure) returns the static rates.
     """
     static = _static_rates()
-    if os.environ.get("AUTOSLM_SKIP_NET"):
+    if os.environ.get("FLASH_SKIP_NET"):
         return static
     now = time.time()
     if not refresh:

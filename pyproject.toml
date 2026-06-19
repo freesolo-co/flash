@@ -71,7 +71,7 @@ pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-q"
 markers = [
-  "live: hits real provider APIs; opt in with AUTOSLM_LIVE=1 (plus provider creds)",
+  "live: hits real provider APIs; opt in with FLASH_LIVE=1 (plus provider creds)",
 ]
 
 [tool.uv]

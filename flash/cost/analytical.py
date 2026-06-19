@@ -83,7 +83,7 @@ def _offline_open_model_vram_gb(config: RunConfig) -> int | None:
     """VRAM for an UNLISTED model whose size can't be read from HF (offline/no-creds).
 
     ``model_required_vram_gb`` sizes unlisted models from HF metadata and, when that's
-    unreadable, returns a flat 24 GB tier -- so offline (``AUTOSLM_SKIP_NET``) every
+    unreadable, returns a flat 24 GB tier -- so offline (``FLASH_SKIP_NET``) every
     open model lands on a 24 GB card even when its id clearly encodes a big size
     (``vendor/foo-70B``). ``model_specs`` parses that size, so here we mirror the
     allocator's OWN open-model branch (GRPO is the heavier phase; same long-context
@@ -100,10 +100,10 @@ def _offline_open_model_vram_gb(config: RunConfig) -> int | None:
         grpo_seq_escalation_gb,
     )
 
-    # Only the advertised offline mode (AUTOSLM_SKIP_NET) sizes from the parsed id. A transient
+    # Only the advertised offline mode (FLASH_SKIP_NET) sizes from the parsed id. A transient
     # HF/network failure must NOT silently switch strategy: the allocator still uses its flat 24 GB
     # open-model fallback at submit, so preflight GPU/cost would otherwise diverge from the real run.
-    if not os.environ.get("AUTOSLM_SKIP_NET"):
+    if not os.environ.get("FLASH_SKIP_NET"):
         return None
 
     if MODELS.get(config.model_id) is not None:
@@ -139,7 +139,7 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
             config.model_id, config.method, train=config.train_knobs(), thinking=config.thinking
         )
     # ``allow_unvalidated`` is tri-state. ``None`` means "unspecified", which the submit-time
-    # allocator resolves via ``unvalidated_allowed`` (the AUTOSLM_GPU_ALLOW_UNVALIDATED env
+    # allocator resolves via ``unvalidated_allowed`` (the FLASH_GPU_ALLOW_UNVALIDATED env
     # default) -- so resolve it the SAME way here instead of treating None as validated-only,
     # or a run the env widened would be priced against the narrower validated pool.
     gpu = pick_gpu(

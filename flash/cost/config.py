@@ -47,7 +47,7 @@ class RunConfig:
     # preflight estimate matches the allocator's pick for such specs. TRI-STATE, exactly
     # like the spec field and the submit-time allocator arg: ``None`` means "unspecified"
     # and is resolved at selection time via ``providers.base.unvalidated_allowed`` (which
-    # consults AUTOSLM_GPU_ALLOW_UNVALIDATED) -- the SAME default the runner applies. A
+    # consults FLASH_GPU_ALLOW_UNVALIDATED) -- the SAME default the runner applies. A
     # missing spec value must NOT be coerced to ``False`` here, or the estimate would
     # silently disagree with a run the env var widened.
     allow_unvalidated: bool | None = None
