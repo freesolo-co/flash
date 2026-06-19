@@ -853,9 +853,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # entity=), so without it a configured team run silently falls back to the API key's default
         # (personal) entity and service-account setups that require an explicit entity fail.
         "WANDB_ENTITY",
-        # Periodic mid-run GRPO eval cadence override (engine.worker reads it; >0 enables). The
-        # held-out sample size comes from the run's [train] eval_examples, not an env var.
-        "FLASH_EVAL_EVERY_STEPS",
+        # NB: mid-run GRPO eval cadence is NOT an env var — it comes solely from the run's
+        # [train] eval_every_steps (with eval_examples for the sample size); the worker resolves it
+        # via midrun_eval.eval_config(spec_every=...) and ignores any FLASH_EVAL_EVERY_STEPS env
+        # (see test_eval_config_ignores_env_cadence_override). So there is nothing to forward here.
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
         # the WORKER decides which installers to run from these flags. install_chalk_kernels runs
         # INSIDE the worker subprocess and reads them from its own process env, so a control-plane

@@ -2169,8 +2169,8 @@ def run_rl():
     # here (not on init_model) is what makes them reach the fresh-LoRA path, where init_model was
     # only the model-id string. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
     install_chalk_kernels(getattr(trainer, "model", None))
-    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or FLASH_EVAL_EVERY_STEPS,
-    # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
+    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps > 0): greedy eval on a
+    # held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
     # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.
     periodic_eval = _maybe_attach_periodic_eval(
         trainer,
