@@ -182,8 +182,8 @@ def rollout_one(
 def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:
     """Render ``messages`` with the chat template, then tokenize to a flat ``list[int]``.
 
-    Render to text first, then tokenize — apply_chat_template(tokenize=True) return shape
-    varies by tokenizer; tok(text).input_ids is reliably a flat list[int] (matches the
+    Render to text first, then tokenize — the return shape of apply_chat_template(tokenize=True)
+    varies by tokenizer, whereas tok(text).input_ids is reliably a flat list[int] (matches the
     single-turn render_prompt path). add_special_tokens=False because the template already
     emits the special tokens. Shared by the GRPO rollout closure and mid-run eval so both
     produce identical token alignment.
