@@ -142,6 +142,37 @@ def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
     assert worker.loraplus_optimizer_cls("paged_adamw_8bit")[0] is adamw
 
 
+def test_grpo_no_op_failure_empty_reward_no_resume(monkeypatch):
+    """Empty reward_history with no resume = the rollout scored nothing -> fail loudly (no-op run)."""
+    worker = _import_worker(monkeypatch)
+    assert worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
+
+
+def test_grpo_no_op_ok_when_rewards_present(monkeypatch):
+    """A non-empty reward_history means the reward path ran -> never a no-op failure."""
+    worker = _import_worker(monkeypatch)
+    assert worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10) is False
+    # An all-zero history (env returned all-zero rewards) still counts as real training.
+    assert worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0) is False
+
+
+def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
+    """A resume that already reached target steps has an empty fresh history but a trained policy."""
+    worker = _import_worker(monkeypatch)
+    assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=10) is True
+    # Empty history is tolerated -> NOT a no-op failure (finalize the completed policy).
+    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12) is False
+
+
+def test_grpo_no_op_failure_resume_did_not_reach_target(monkeypatch):
+    """A resume that did NOT reach the target steps with no reward is still a genuine no-op -> fail."""
+    worker = _import_worker(monkeypatch)
+    assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=3) is False
+    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
+    # No target steps configured can never count as a complete resume.
+    assert worker._grpo_resume_already_complete("ckpt", target_steps=0, steps_run=0) is False
+
+
 def test_heartbeat_commit_is_throttled(monkeypatch):
     """heartbeat() must rate-limit HF commits (per-step commits blow HF's 128/hour repo cap),
     while always committing milestone stages."""

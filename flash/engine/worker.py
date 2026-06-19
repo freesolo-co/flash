@@ -1315,11 +1315,6 @@ def run_sft():
                         print("[lora+] setup failed, falling back to default optimizer:", e)
                 return super().create_optimizer()
 
-    # Install any opt-in chalk kernels (selected via FLASH_* flags) before TRL builds the model, so the
-    # class/function-level patches (LoRA delta, fused MLP/QKV, RoPE) apply to it. No-op unless
-    # a FLASH_* kernel flag is set and freesolo-chalk is installed.
-    install_chalk_kernels()
-
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
     trainer = _SFT(
@@ -1330,9 +1325,10 @@ def run_sft():
         processing_class=tok,
         callbacks=[make_checkpoint_upload_callback()],
     )
-    # The class/function-level chalk kernels installed above patch the layers TRL just built; the
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
-    # SFT trainer.model — chalk composes on top of TRL's Liger. No-op unless chalk is installed.
+    # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
+    # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
+    # freesolo-chalk is installed.
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
 
     _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
@@ -1745,6 +1741,30 @@ def _init_adapter_model(model_id: str):
     return model, None
 
 
+def _grpo_resume_already_complete(resume_ckpt, target_steps: int, steps_run: int) -> bool:
+    """True when this worker resumed a checkpoint that already reached the target step count.
+
+    Such a resume legitimately performs ZERO new optimizer steps (so the fresh hb_cb has an empty
+    reward_history) yet the policy IS fully trained — it must NOT be flagged as a no-op failure.
+    """
+    return bool(resume_ckpt) and target_steps > 0 and steps_run >= target_steps
+
+
+def _grpo_is_no_op_failure(
+    reward_history, resume_ckpt, target_steps: int, steps_run: int
+) -> bool:
+    """True when a GRPO run trained NOTHING and must fail loudly instead of reporting as done.
+
+    An empty ``reward_history`` means the reward callback never fired — the rollout scored nothing
+    (e.g. vLLM silently returning no completions), so no real training happened. The sole exception
+    is a resume that already reached the target steps (see ``_grpo_resume_already_complete``): that
+    has an empty fresh history but a fully-trained policy, so it is NOT a failure.
+    """
+    if reward_history:
+        return False
+    return not _grpo_resume_already_complete(resume_ckpt, target_steps, steps_run)
+
+
 def run_rl():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -2062,14 +2082,11 @@ def run_rl():
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
     # to fp32 and double VRAM).
     init_model, init_peft = _init_adapter_model(model_id)
-    # Install the CLASS/FUNCTION-level opt-in chalk kernels (LoRA delta, fused MLP/QKV, RoPE)
-    # BEFORE GRPOTrainer builds the model so the patches apply to its freshly-built layers. The
-    # INSTANCE-level kernels (FP8 base, embedding, FP8 MLP) need the actual nn.Module and are
-    # installed AFTER construction (below) against trainer.model — on the fresh-LoRA path
+    # chalk's kernels are applied AFTER construction (below) against trainer.model: chalk's apply
+    # patches the LIVE nn.Module, so there is nothing to install pre-build. On the fresh-LoRA path
     # init_model is just the model-id string (TRL builds the module), and even on the
     # continue-adapter path TRL may rebuild/wrap the PeftModel, so trainer.model is the
-    # authoritative target. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
-    install_chalk_kernels()
+    # authoritative target.
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
         # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
@@ -2213,8 +2230,8 @@ def run_rl():
     # though the policy IS fully trained. Don't fail those — finalize from the resumed state. The
     # no-op guard below is only for a run that genuinely trained nothing (no resume, or the resume
     # didn't reach the target steps).
-    _resumed_complete = bool(resume_ckpt) and steps > 0 and _steps_run >= steps
-    if not reward_history and not _resumed_complete:
+    _resumed_complete = _grpo_resume_already_complete(resume_ckpt, steps, _steps_run)
+    if _grpo_is_no_op_failure(reward_history, resume_ckpt, steps, _steps_run):
         raise RuntimeError(
             f"GRPO scored no reward in {train_wall:.1f}s over {_steps_run} step(s) — the rollout "
             "produced no completions, so the policy was never actually trained. Failing loudly "

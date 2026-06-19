@@ -109,9 +109,8 @@ def install_chalk_kernels(model=None) -> dict:
     default-on). Returns chalk's per-kernel report, or ``{}`` when every kernel is disabled, there is
     no model yet, or freesolo-chalk isn't installed.
 
-    The worker calls this twice (pre-build ``model=None`` then post-build ``model=trainer.model``);
-    chalk's apply patches the LIVE module, so all the work happens on the post-build pass and the
-    pre-build call (``model is None``) is a safe no-op.
+    chalk's apply patches the LIVE module, so the worker calls this AFTER TRL builds the trainer
+    (``model=trainer.model``); ``model is None`` is a safe no-op kept for defensive callers.
     """
     if model is None:
         # chalk's apply patches the materialized module -> nothing to do before the model is built.
