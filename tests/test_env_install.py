@@ -23,8 +23,8 @@ class _FakeProc:
 def test_env_install_prime_hub_slug(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setenv("AUTOSLM_ENVS_MANIFEST", os.path.join(tmp, "envs.json"))
-        import autoslm.envs.registry as registry
-        from autoslm.cli import main as cli
+        import flash.envs.registry as registry
+        from flash.cli import main as cli
 
         importlib.reload(registry)
 
@@ -61,7 +61,7 @@ def test_env_install_prime_hub_slug(monkeypatch):
 def test_env_install_rejects_bare_id(monkeypatch, capsys):
     # The managed service is Prime Hub slug-only (`owner/name`). A bare id can't be resolved,
     # so `cmd_env_install` must reject it (return 1) WITHOUT shelling out to prime/pip.
-    from autoslm.cli import main as cli
+    from flash.cli import main as cli
 
     called = {"n": 0}
     monkeypatch.setattr("subprocess.run", lambda *a, **k: called.__setitem__("n", called["n"] + 1))

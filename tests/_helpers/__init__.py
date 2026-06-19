@@ -1,1 +1,1 @@
-"""Shared test helpers for the autoslm suite (importable via ``tests._helpers``)."""
+"""Shared test helpers for the flash suite (importable via ``tests._helpers``)."""

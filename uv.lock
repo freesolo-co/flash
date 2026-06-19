@@ -270,7 +270,7 @@ wheels = [
 ]
 
 [[package]]
-name = "autoslm-train"
+name = "flash"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
@@ -316,7 +316,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'gpu'", specifier = ">=1.4" },
-    { name = "autoslm-train", extras = ["gpu", "server"], marker = "extra == 'all'" },
+    { name = "flash", extras = ["gpu", "server"], marker = "extra == 'all'" },
     { name = "bitsandbytes", marker = "extra == 'gpu'", specifier = ">=0.49" },
     { name = "datasets", specifier = ">=2.19" },
     { name = "fastapi", marker = "extra == 'server'" },

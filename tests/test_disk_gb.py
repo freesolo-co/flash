@@ -18,7 +18,7 @@ class _FakeConfig:
 
 
 def test_apply_disk_gb_raises_disk():
-    from autoslm.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.jobs import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, 160)
@@ -27,7 +27,7 @@ def test_apply_disk_gb_raises_disk():
 
 def test_apply_disk_gb_never_shrinks():
     """Configs carry a historical disk_gb=60 default; it must not shrink the 64 default."""
-    from autoslm.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.jobs import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, 60)
@@ -35,7 +35,7 @@ def test_apply_disk_gb_never_shrinks():
 
 
 def test_apply_disk_gb_noops():
-    from autoslm.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.jobs import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, None)
@@ -46,7 +46,7 @@ def test_apply_disk_gb_noops():
 
 def test_default_catalog_models_need_no_disk_bump():
     """The dense Qwen3.5 catalog fits the platform's default container disk (min_disk_gb == 0)."""
-    from autoslm.catalog import MODELS
+    from flash.catalog import MODELS
 
     assert all(m.min_disk_gb == 0 for m in MODELS.values())
 
@@ -54,9 +54,9 @@ def test_default_catalog_models_need_no_disk_bump():
 def test_submit_raises_disk_to_model_min(monkeypatch):
     """submit_job (dry-run) bumps gpu.disk_gb to a catalog model's min_disk_gb. No shipping model
     needs a bump now, so inject a synthetic big-checkpoint entry to exercise the mechanism."""
-    from autoslm import runner
-    from autoslm.catalog import MODELS, ModelInfo
-    from autoslm.spec import JobSpec
+    from flash import runner
+    from flash.catalog import MODELS, ModelInfo
+    from flash.spec import JobSpec
 
     monkeypatch.setitem(
         MODELS,

@@ -14,7 +14,7 @@ import pytest
 
 
 def _spec():
-    from autoslm.spec import JobSpec, TrainSpec
+    from flash.spec import JobSpec, TrainSpec
 
     return JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -26,7 +26,7 @@ def _spec():
 def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
     """DEFECT: RL_VLLM_GPU_UTIL / RL_PER_DEVICE_PROMPTS (and the others) were never added to
     the forward list, so the docs' OOM-fix advice couldn't reach the worker."""
-    from autoslm.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.train import build_worker_env
 
     knobs = {
         "RL_VLLM_GPU_UTIL": "0.40",
@@ -46,7 +46,7 @@ def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
 
 
 def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
-    from autoslm.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
     env = build_worker_env(_spec(), 0)
@@ -57,7 +57,7 @@ def test_build_worker_env_forwards_midrun_eval_knobs(monkeypatch):
     """The periodic mid-run eval knobs are read via os.environ on the worker, so they MUST be
     on the forward allowlist or the feature silently no-ops on every remote run (RunPod + Vast,
     which reuses this same build_worker_env)."""
-    from autoslm.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.train import build_worker_env
 
     knobs = {
         "AUTOSLM_EVAL_EVERY_STEPS": "20",
@@ -74,7 +74,7 @@ def test_build_worker_env_forwards_heartbeat_throttle(monkeypatch):
     """AUTOSLM_HEARTBEAT_MIN_S is read by engine.worker on the GPU side to throttle rl_step
     heartbeat commits under HuggingFace's 128/hr-per-repo cap; operators raise it when several
     concurrent GRPO runs share one HF_REPO, so it MUST be on the forward allowlist."""
-    from autoslm.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("AUTOSLM_HEARTBEAT_MIN_S", "180")
     assert build_worker_env(_spec(), 0).get("AUTOSLM_HEARTBEAT_MIN_S") == "180"
@@ -86,7 +86,7 @@ def test_build_worker_env_forwards_judge_model(monkeypatch):
     """The optimizer-authored verifiers env reads AUTOSLM_JUDGE_MODEL on the worker to pick its
     JudgeRubric client model (SFT-eval / GRPO-reward / rejection-sampling); the control-plane
     override must be forwarded, else the env silently falls back to its generated default."""
-    from autoslm.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("AUTOSLM_JUDGE_MODEL", "openai/gpt-oss-120b")
     assert build_worker_env(_spec(), 0).get("AUTOSLM_JUDGE_MODEL") == "openai/gpt-oss-120b"
@@ -96,7 +96,7 @@ def test_build_worker_env_forwards_judge_model(monkeypatch):
 
 def test_build_worker_env_forwards_prime_api_key(monkeypatch):
     """The worker needs PRIME_API_KEY to `prime env install` the run's Hub env(s)."""
-    from autoslm.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("PRIME_API_KEY", "pit-secret")
     assert build_worker_env(_spec(), 0).get("PRIME_API_KEY") == "pit-secret"
@@ -108,8 +108,8 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
     ignored — the worker reads its own seeded value, sourced from the spec."""
-    from autoslm.providers.runpod.train import build_worker_env
-    from autoslm.spec import JobSpec, TrainSpec
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
 
     # an operator HF_REPO in the env must NOT leak into the worker env
     monkeypatch.setenv("HF_REPO", "operator/default")
@@ -127,7 +127,7 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
 def test_alloc_conf_default_avoids_expandable_under_grpo_sleep(monkeypatch):
     # vLLM sleep-mode CuMemAllocator is incompatible with expandable_segments; GRPO with sleep
     # ON (the default) must NOT default to expandable_segments or the run crashes at engine init.
-    from autoslm.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -138,7 +138,7 @@ def test_alloc_conf_default_avoids_expandable_under_grpo_sleep(monkeypatch):
 
 
 def test_alloc_conf_default_expandable_when_sleep_off(monkeypatch):
-    from autoslm.providers.runpod.train import build_worker_env
+    from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -148,8 +148,8 @@ def test_alloc_conf_default_expandable_when_sleep_off(monkeypatch):
 
 
 def test_alloc_conf_default_expandable_for_sft(monkeypatch):
-    from autoslm.providers.runpod.train import build_worker_env
-    from autoslm.spec import JobSpec, TrainSpec
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -162,7 +162,7 @@ def test_runpod_backoff_no_overflow_on_long_runs():
     """DEFECT: runpod_flash computed base*(2**attempt) then clamped, so a long poll loop
     overflowed (~80 min in) and killed a healthy job. The patch caps the exponent first."""
     pytest.importorskip("runpod_flash")
-    from autoslm.providers.runpod.train import _patch_runpod_backoff
+    from flash.providers.runpod.train import _patch_runpod_backoff
 
     _patch_runpod_backoff()
     from runpod_flash.core.utils import backoff
@@ -180,7 +180,7 @@ def test_serve_execution_timeout_is_fixed():
     """DEFECT: serve execution cap (10 min) was shorter than a cold serving worker's startup, so
     the first slm chat/deploy failed with 'executionTimeout exceeded'. It is now a fixed, generous
     constant (no env override)."""
-    from autoslm.serve import deploy
+    from flash.serve import deploy
 
     assert deploy.serve_execution_timeout_ms() >= 20 * 60 * 1000
 
@@ -189,7 +189,7 @@ def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():
     """Multi-turn GRPO with vLLM disabled (the 35B tier's grpo_use_vllm=False, or RL_USE_VLLM=0)
     must fail fast — the rollout closure reads trainer.vllm_generation.llm, which only exists
     when use_vllm=True, so otherwise it would AttributeError deep in the first rollout turn."""
-    from autoslm.engine.worker import require_vllm_for_rollout_func
+    from flash.engine.worker import require_vllm_for_rollout_func
 
     with pytest.raises(RuntimeError, match="needs colocated vLLM"):
         require_vllm_for_rollout_func(True, False, "Qwen/Qwen3.6-35B-A3B")
@@ -201,7 +201,7 @@ def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():
 
 def test_error_artifact_name_is_per_phase():
     """Per-phase error files keep the root-cause train traceback under a stable name."""
-    from autoslm.engine.worker import error_artifact_name
+    from flash.engine.worker import error_artifact_name
 
     names = {error_artifact_name(m) for m in ("sft", "rl")}
     assert len(names) == 2  # distinct per phase -> no clobber
@@ -215,7 +215,7 @@ def test_train_body_imports_every_name_it_uses():
     import ast
     import inspect
 
-    from autoslm.providers.runpod import train
+    from flash.providers.runpod import train
 
     tree = ast.parse(inspect.getsource(train._train_body))
     fn = tree.body[0]
@@ -237,7 +237,7 @@ def test_train_body_installs_prime_only_when_absent():
     behind `shutil.which("prime") is None`."""
     import inspect
 
-    from autoslm.providers.runpod import train
+    from flash.providers.runpod import train
 
     src = inspect.getsource(train._train_body)
     assert 'shutil.which("prime")' in src

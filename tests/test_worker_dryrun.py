@@ -23,7 +23,7 @@ def test_grpo_batching_matches_prompts_per_step():
     """Regression guard for the GRPO batch bug: TRL sizes batches in COMPLETIONS, so
     grad-accum must include the group size. Each optimizer step must optimize the intended
     number of *unique prompts* (64), not prompts_per_step/group_size (the old 8/step bug)."""
-    import autoslm.engine.worker as ne
+    import flash.engine.worker as ne
 
     for per_device in (8, 4, 16, 1):
         b = ne.compute_grpo_batching(prompts_per_step=64, group_size=8, per_device_comps=per_device)
@@ -51,7 +51,7 @@ def test_reward_heartbeat_callback_accumulates_history():
     sys.modules["transformers"] = tfm
     try:
         os.environ["HF_REPO"] = ""  # heartbeat stays local (no HF upload) in tests
-        import autoslm.engine.worker as ne
+        import flash.engine.worker as ne
 
         cb = ne.make_reward_heartbeat_callback()
 
@@ -84,7 +84,7 @@ def test_heartbeat_concurrent_writes_stay_atomic(monkeypatch):
     import json
     import threading as _threading
 
-    import autoslm.engine.worker as ne
+    import flash.engine.worker as ne
 
     os.environ["HF_REPO"] = ""  # keep heartbeat local
     monkeypatch.setattr(ne, "hf_upload_file", lambda *a, **k: None)
@@ -136,7 +136,7 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
     import threading as _threading
     import time
 
-    import autoslm.engine.worker as ne
+    import flash.engine.worker as ne
 
     os.environ["HF_REPO"] = ""
 

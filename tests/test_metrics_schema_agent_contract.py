@@ -1,4 +1,4 @@
-"""Cross-folder contract: the metrics record autoslm's GPU worker writes
+"""Cross-folder contract: the metrics record flash's GPU worker writes
 (engine/worker.py write_train_meta -> RunMetrics + notes) must keep carrying the
 keys the freesolo agent and SDK consume.
 
@@ -14,7 +14,7 @@ verification or the W&B dashboard link silently break. This test pins the metric
 schema (the keys write_train_meta emits via RunMetrics + the SFT/RL `notes`) against
 the fields those consumers depend on.
 
-Run: cd autoslm && AUTOSLM_SKIP_NET=1 .venv/bin/python -m pytest \
+Run: cd flash && AUTOSLM_SKIP_NET=1 .venv/bin/python -m pytest \
         tests/test_metrics_schema_agent_contract.py -q
 """
 
@@ -30,7 +30,7 @@ _AGENT_SRC = Path(__file__).resolve().parents[2] / "agent" / "src"
 if _AGENT_SRC.is_dir() and str(_AGENT_SRC) not in sys.path:
     sys.path.insert(0, str(_AGENT_SRC))
 
-from autoslm.engine.accounting import RunMetrics
+from flash.engine.accounting import RunMetrics
 
 # The `notes` dicts engine/worker.py write_train_meta() is called with, mirrored from
 # the SFT (worker.py ~L1293) and RL (worker.py ~L1942) finalize blocks. wandb_run_info()
@@ -82,7 +82,7 @@ def _run_metrics_with_notes(phase: str, notes: dict) -> dict:
         generated_tokens=5_000,
         notes={
             **notes,
-            "renderer": "autoslm_env",
+            "renderer": "flash_env",
             "train_wall": 191.9,
             "model_id": "Qwen/Qwen3.5-4B",
             "environment": "owner/name",
@@ -136,7 +136,7 @@ def test_rl_metrics_carry_reward_history_and_wandb_link() -> None:
 def test_agent_training_schema_reward_fields_are_numeric_or_null() -> None:
     """The agent's training output schema (codex/outputs.py) declares
     summary.baseline_reward / summary.final_reward as number|null and run_id as
-    string|null. The metrics those map from (reward_history entries; the autoslm run
+    string|null. The metrics those map from (reward_history entries; the flash run
     id) are numeric / string — assert the schema still declares them so a schema
     rename can't drift from what the metrics provide.
     """
@@ -152,9 +152,9 @@ def test_agent_training_schema_reward_fields_are_numeric_or_null() -> None:
     for field in ("baseline_reward", "final_reward"):
         assert field in summary["required"], f"training summary lost required {field!r}"
         assert props[field]["type"] == ["number", "null"]
-    # run_id maps from the autoslm new_run_id()/tracker value: string|null.
+    # run_id maps from the flash new_run_id()/tracker value: string|null.
     assert schema["properties"]["run_id"]["type"] == ["string", "null"]
-    # algorithm enum must include the autoslm algorithms the worker stamps in phase.
+    # algorithm enum must include the flash algorithms the worker stamps in phase.
     assert set(props["algorithm"]["enum"]) >= {"sft", "grpo"}
 
 
@@ -164,7 +164,7 @@ def test_worker_phase_matches_agent_algorithm_enum() -> None:
     algorithm<->phase mapping the agent relies on holds, so the agent can map a
     reported run's phase back to its algorithm.
     """
-    from autoslm.spec import JobSpec
+    from flash.spec import JobSpec
 
     assert JobSpec(algorithm="grpo").phase == "rl"
     assert JobSpec(algorithm="sft").phase == "sft"

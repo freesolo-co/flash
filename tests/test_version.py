@@ -8,12 +8,12 @@ import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-from autoslm import __version__
+from flash import __version__
 
 
 def _run(args):
     return subprocess.run(
-        [sys.executable, "-m", "autoslm.cli.main", *args],
+        [sys.executable, "-m", "flash.cli.main", *args],
         cwd=ROOT,
         text=True,
         stdout=subprocess.PIPE,

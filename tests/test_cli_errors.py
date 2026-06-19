@@ -16,7 +16,7 @@ def _run(args, env=None):
     if env:
         full_env.update(env)
     return subprocess.run(
-        [sys.executable, "-m", "autoslm.cli.main", *args],
+        [sys.executable, "-m", "flash.cli.main", *args],
         cwd=ROOT,
         text=True,
         env=full_env,
@@ -28,7 +28,7 @@ def _run(args, env=None):
 def _logged_out_env(tmp):
     home = os.path.join(tmp, "home")
     os.makedirs(home, exist_ok=True)
-    return {"HOME": home}  # no ~/.autoslm/config.json -> no AutoSLM key
+    return {"HOME": home}  # no ~/.flash/config.json -> no Flash key
 
 
 def test_logged_out_status_is_friendly():

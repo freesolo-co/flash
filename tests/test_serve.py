@@ -12,7 +12,7 @@ import pytest
 
 
 def test_deploy_dry_run():
-    from autoslm.serve.deploy import deploy_adapter
+    from flash.serve.deploy import deploy_adapter
 
     dep = deploy_adapter(
         run_id="r1",
@@ -25,15 +25,15 @@ def test_deploy_dry_run():
     d = dep.to_dict()
     assert d["state"] == "dry_run"
     assert d["gpu"] == "RTX 4090"
-    assert d["openai_model"] == "autoslm-r1"
-    assert d["endpoint_name"] == "autoslm-serve-4090-r1"  # per-run endpoint
+    assert d["openai_model"] == "flash-r1"
+    assert d["endpoint_name"] == "flash-serve-4090-r1"  # per-run endpoint
 
 
 def test_deploy_qlora_dry_run_is_not_rejected():
     """A QLoRA tier (9B) is deployable: it serves the bf16 base + LoRA via --enable-lora just like
     a bf16 tier (vLLM folds the bf16 LoRA delta into the bf16 base at load), instead of being
     rejected up front. Dry-run resolves a Deployment instead of raising."""
-    from autoslm.serve.deploy import deploy_adapter
+    from flash.serve.deploy import deploy_adapter
 
     dep = deploy_adapter(
         run_id="q1",
@@ -47,8 +47,8 @@ def test_deploy_qlora_dry_run_is_not_rejected():
 
 
 def test_deploy_rejects_unsupported_gpu():
-    from autoslm.providers.base import UnsupportedGpuError
-    from autoslm.serve.deploy import deploy_adapter
+    from flash.providers.base import UnsupportedGpuError
+    from flash.serve.deploy import deploy_adapter
 
     with pytest.raises(UnsupportedGpuError):
         deploy_adapter(
@@ -65,8 +65,8 @@ def test_deploy_unvalidated_class_falls_back_to_runpod():
     # Serving is RunPod-only: a run trained on a class that isn't RunPod-validated
     # (RTX 3090, 24 GB) serves from the cheapest RunPod-VALIDATED class with >= that
     # VRAM — not directly on the unvalidated class (which can fail on first chat).
-    from autoslm.providers.base import GPU_INFO, is_validated
-    from autoslm.serve.deploy import deploy_adapter
+    from flash.providers.base import GPU_INFO, is_validated
+    from flash.serve.deploy import deploy_adapter
 
     dep = deploy_adapter(
         run_id="r1",
@@ -206,12 +206,12 @@ def test_serve_body_openai_shape():
         "model": "Qwen/Qwen3.5-0.8B",
         "adapter_prefix": "sft/r1/seed0",
         "token": "x",
-        "served_model": "autoslm-r1",
+        "served_model": "flash-r1",
         "messages": [{"role": "user", "content": "2+2?"}],
         "max_tokens": 8,
     }
     try:
-        import autoslm.serve.deploy as d
+        import flash.serve.deploy as d
 
         for k in ("_AUTOSLM_KEY", "_AUTOSLM_PROC"):
             d.__dict__.pop(k, None)
@@ -222,7 +222,7 @@ def test_serve_body_openai_shape():
         server.shutdown()
         sys.modules.pop("huggingface_hub", None)
     assert resp["object"] == "chat.completion"
-    assert resp["model"] == "autoslm-r1"
+    assert resp["model"] == "flash-r1"
     assert resp["choices"][0]["message"]["content"] == "hi there"
     assert resp["choices"][0]["message"]["role"] == "assistant"
     # thinking disabled by default; the run's flag turns it on
@@ -280,7 +280,7 @@ def test_serve_body_drops_template_kwargs_on_old_vllm():
     orig_popen = _sub.Popen
     _sub.Popen = lambda *a, **k: _FakeProc()
     try:
-        import autoslm.serve.deploy as d
+        import flash.serve.deploy as d
 
         for k in ("_AUTOSLM_KEY", "_AUTOSLM_PROC"):
             d.__dict__.pop(k, None)
@@ -290,7 +290,7 @@ def test_serve_body_drops_template_kwargs_on_old_vllm():
                 "model": "Qwen/Qwen3.5-0.8B",
                 "adapter_prefix": "sft/r1/seed0",
                 "token": "x",
-                "served_model": "autoslm-r1",
+                "served_model": "flash-r1",
                 "messages": [{"role": "user", "content": "2+2?"}],
                 "max_tokens": 8,
             }

@@ -18,8 +18,8 @@ import time
 
 import pytest
 
-from autoslm import runner as _orch
-from autoslm.server import db as _db_mod
+from flash import runner as _orch
+from flash.server import db as _db_mod
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
@@ -52,9 +52,9 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
     monkeypatch.setenv("PRIME_API_KEY", "pit-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
-    import autoslm.runner as runner
-    import autoslm.server.auth as auth_mod
-    import autoslm.server.db as db_mod
+    import flash.runner as runner
+    import flash.server.auth as auth_mod
+    import flash.server.db as db_mod
 
     importlib.reload(runner)
     # The storage roots are fixed constants (not env-configurable); redirect them to tmp for
@@ -62,7 +62,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
-    import autoslm.server.app as app_mod
+    import flash.server.app as app_mod
 
     importlib.reload(app_mod)
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. The real
@@ -123,7 +123,7 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
     # A user who `slm login`s with a freesolo key sends it as the bearer. With the token
     # verified by the backend it authenticates and resolves to a stable per-token identity
     # (its own run-ownership row).
-    import autoslm.server.auth as auth_mod
+    import flash.server.auth as auth_mod
 
     auth_mod._verify_cache.clear()
     calls = {"n": 0}
@@ -149,8 +149,8 @@ def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     # must be rejected as 401 (authenticate -> None), not raise a 500.
     import sqlite3
 
-    import autoslm.server.auth as auth_mod
-    import autoslm.server.db as db_mod
+    import flash.server.auth as auth_mod
+    import flash.server.db as db_mod
 
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
@@ -170,7 +170,7 @@ def test_freesolo_verify_does_not_cache_network_errors(monkeypatch):
     # locked out for the whole TTL. The next call (backend recovered) must succeed.
     import urllib.error
 
-    import autoslm.server.auth as auth_mod
+    import flash.server.auth as auth_mod
 
     # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
     importlib.reload(auth_mod)
@@ -205,7 +205,7 @@ def test_freesolo_verify_5xx_transient_but_4xx_cached(monkeypatch):
     # NOT be cached, so a valid key recovers immediately. A definitive 4xx (401/403) IS cached.
     import urllib.error
 
-    import autoslm.server.auth as auth_mod
+    import flash.server.auth as auth_mod
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
@@ -253,7 +253,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
     # a positive keeps the long TTL.
     import urllib.error
 
-    import autoslm.server.auth as auth_mod
+    import flash.server.auth as auth_mod
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
@@ -310,7 +310,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
 def test_freesolo_verify_rejects_oversized_token(monkeypatch):
     # An oversized bearer must be rejected before it touches the cache or the network, so it
     # can't bloat _verify_cache (keyed by the raw token) or send a huge Authorization header.
-    import autoslm.server.auth as auth_mod
+    import flash.server.auth as auth_mod
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
@@ -328,7 +328,7 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
 def test_freesolo_user_key_no_network_when_skip_net(api, monkeypatch):
     # AUTOSLM_SKIP_NET set: _freesolo_verify short-circuits before any network call (urlopen is
     # patched to blow up to prove it's never called) and authenticate returns None.
-    import autoslm.server.auth as auth_mod
+    import flash.server.auth as auth_mod
 
     auth_mod._verify_cache.clear()
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
@@ -345,7 +345,7 @@ def test_freesolo_user_key_no_network_when_skip_net(api, monkeypatch):
 def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
     # The in-process cache means a second authenticate for the same token doesn't re-hit the
     # backend within the TTL (positives and negatives are both cached).
-    import autoslm.server.auth as auth_mod
+    import flash.server.auth as auth_mod
 
     # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
     importlib.reload(auth_mod)
@@ -381,7 +381,7 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
     # grow it without bound. Each write prunes expired entries and caps the cache size.
     import time
 
-    import autoslm.server.auth as auth_mod
+    import flash.server.auth as auth_mod
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
@@ -499,7 +499,7 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     # A finished run (state="done") MUST be deployable: mark_deployed has to record the
     # deployment and flip to "deployed". But a cancelled/failed run must never be flipped
     # to "deployed" (a /cancel racing always-on provisioning persisted the terminal state).
-    import autoslm.runner as runner
+    import flash.runner as runner
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -526,7 +526,7 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     # Redeploy finalization must NOT clobber an undeploy that raced in mid-warmup: the
     # undeploy wrote `done`/undeployed and deleted the endpoint, so a final mark_deployed
     # that still expects "deployed" must refuse to re-advertise the deleted endpoint.
-    import autoslm.runner as runner
+    import flash.runner as runner
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -558,7 +558,7 @@ def test_deploy_lock_is_usable_and_weakly_cleaned():
     # would TypeError on the first deploy). It must also re-enter and serialize.
     import gc
 
-    from autoslm.server import app as app_mod
+    from flash.server import app as app_mod
 
     lk = app_mod._deploy_lock("run-xyz")
     assert app_mod._deploy_lock("run-xyz") is lk  # same lock for the same run while alive
@@ -576,14 +576,14 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
     # A recoverable run with no persisted handle (crash between endpoint
     # registration and on_handle) must have its reconstructable RunPod endpoint
     # GC'd before being failed, so it doesn't hold worker quota until manual cleanup.
-    import autoslm.runner as runner
-    import autoslm.server.db as db_mod
+    import flash.runner as runner
+    import flash.server.db as db_mod
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import autoslm.server.app as app_mod
+    import flash.server.app as app_mod
 
     importlib.reload(app_mod)
 

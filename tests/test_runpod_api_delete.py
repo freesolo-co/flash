@@ -23,7 +23,7 @@ def _http_error(code: int, body: bytes = b""):
 
 
 def _patch_urlopen(monkeypatch, error):
-    from autoslm.providers import _http
+    from flash.providers import _http
 
     def fake_urlopen(req, timeout=None):
         raise error
@@ -33,7 +33,7 @@ def _patch_urlopen(monkeypatch, error):
 
 
 def test_delete_endpoint_404_reports_success(monkeypatch):
-    from autoslm.providers.runpod import api as runpod_api
+    from flash.providers.runpod import api as runpod_api
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-test")
     _patch_urlopen(monkeypatch, _http_error(404, b'{"error": "endpoint does not exist"}'))
@@ -42,7 +42,7 @@ def test_delete_endpoint_404_reports_success(monkeypatch):
 
 
 def test_delete_endpoint_other_error_reports_failure(monkeypatch):
-    from autoslm.providers.runpod import api as runpod_api
+    from flash.providers.runpod import api as runpod_api
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-test")
     _patch_urlopen(monkeypatch, _http_error(403, b'{"error": "forbidden"}'))
@@ -50,7 +50,7 @@ def test_delete_endpoint_other_error_reports_failure(monkeypatch):
 
 
 def test_delete_endpoint_5xx_exhausted_reports_failure(monkeypatch):
-    from autoslm.providers.runpod import api as runpod_api
+    from flash.providers.runpod import api as runpod_api
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-test")
     # 5xx retries then raises "failed after N attempts" (no __cause__ HTTPError, no 404 text).
@@ -60,7 +60,7 @@ def test_delete_endpoint_5xx_exhausted_reports_failure(monkeypatch):
 
 def test_delete_endpoint_403_with_not_found_text_reports_failure(monkeypatch):
     """A 403 whose body says "does not exist" is still a 403 — must NOT be swallowed."""
-    from autoslm.providers.runpod import api as runpod_api
+    from flash.providers.runpod import api as runpod_api
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-test")
     _patch_urlopen(monkeypatch, _http_error(403, b'{"error": "endpoint does not exist"}'))
@@ -68,7 +68,7 @@ def test_delete_endpoint_403_with_not_found_text_reports_failure(monkeypatch):
 
 
 def test_is_not_found_uses_cause_code_not_message():
-    from autoslm.providers.runpod import api as runpod_api
+    from flash.providers.runpod import api as runpod_api
 
     # Genuine 404 cause -> True even with a terse message.
     err_404 = runpod_api.RunpodApiError("DELETE x -> HTTP 404: Not Found")

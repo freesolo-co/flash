@@ -30,7 +30,7 @@ PROVIDER_METHODS = (
 
 
 def test_registry_lists_both_providers():
-    from autoslm.providers import PROVIDER_NAMES, get_provider
+    from flash.providers import PROVIDER_NAMES, get_provider
 
     assert PROVIDER_NAMES == ("runpod", "vast")
     assert {get_provider(n).name for n in PROVIDER_NAMES} == {"runpod", "vast"}
@@ -40,8 +40,8 @@ def test_registry_lists_both_providers():
 
 
 def test_both_providers_implement_the_interface():
-    from autoslm.providers import PROVIDER_NAMES, get_provider
-    from autoslm.providers.base import Provider
+    from flash.providers import PROVIDER_NAMES, get_provider
+    from flash.providers.base import Provider
 
     for prov in [get_provider(n) for n in PROVIDER_NAMES]:
         assert isinstance(prov, Provider)  # runtime_checkable Protocol
@@ -53,8 +53,8 @@ def test_both_providers_implement_the_interface():
 def test_identical_module_layout(provider):
     """Both subpackages expose the SAME public module set (the symmetry contract)."""
     for mod in PROVIDER_MODULES:
-        importlib.import_module(f"autoslm.providers.{provider}.{mod}")
-    pkg = importlib.import_module(f"autoslm.providers.{provider}")
+        importlib.import_module(f"flash.providers.{provider}.{mod}")
+    pkg = importlib.import_module(f"flash.providers.{provider}")
     assert hasattr(pkg, "PROVIDER")
 
 
@@ -62,7 +62,7 @@ def test_method_signatures_match_across_providers():
     """The interface methods take the same parameters on both providers (swappable)."""
     import inspect
 
-    from autoslm.providers import get_provider
+    from flash.providers import get_provider
 
     rp, va = get_provider("runpod"), get_provider("vast")
     for meth in (
@@ -85,8 +85,8 @@ def test_method_signatures_match_across_providers():
 def test_gpu_classes_partition_the_table():
     """Each provider owns its rows of the shared table: runpod == enum_member rows,
     vast == vast_name rows; the Vast-only classes are present only on vast."""
-    from autoslm.providers import get_provider
-    from autoslm.providers.base import GPU_INFO
+    from flash.providers import get_provider
+    from flash.providers.base import GPU_INFO
 
     rp = {g.name for g in get_provider("runpod").gpu_classes()}
     va = {g.name for g in get_provider("vast").gpu_classes()}
@@ -102,19 +102,19 @@ def test_sweep_orphans_is_part_of_the_protocol():
     """sweep_orphans is a base.Provider method on BOTH providers (Fix #9): RunPod is a
     no-op (serverless endpoints self-reap), Vast reaps instances. The server iterates
     providers generically through this hook — never a hardcoded `get_provider('vast')`."""
-    from autoslm.providers import PROVIDER_NAMES, get_provider
-    from autoslm.providers.base import Provider
+    from flash.providers import PROVIDER_NAMES, get_provider
+    from flash.providers.base import Provider
 
     for prov in [get_provider(n) for n in PROVIDER_NAMES]:
         assert hasattr(prov, "sweep_orphans")
     # RunPod's is a no-op and never raises (no live API call).
-    assert get_provider("runpod").sweep_orphans(active_labels={"autoslm-x"}) == []
+    assert get_provider("runpod").sweep_orphans(active_labels={"flash-x"}) == []
     # The method is part of the runtime-checkable protocol surface.
     assert "sweep_orphans" in dir(Provider)
 
 
 def test_validated_on_is_per_provider():
-    from autoslm.providers.base import GPU_INFO
+    from flash.providers.base import GPU_INFO
 
     assert GPU_INFO["RTX 3090"].validated_on == ("vast",)
     assert GPU_INFO["RTX 4090"].validated_on == ("runpod",)
@@ -126,14 +126,14 @@ def test_validated_on_is_per_provider():
 def test_static_pricing_offline(provider, monkeypatch):
     """Offline, every provider's hourly_rate falls back to the static snapshot."""
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
-    pricing = importlib.import_module(f"autoslm.providers.{provider}.pricing")
+    pricing = importlib.import_module(f"flash.providers.{provider}.pricing")
     rate = pricing.hourly_rate("RTX 5090")
     assert rate == pytest.approx(0.99)  # the static GpuClass.hourly_usd snapshot
 
 
 def test_runpod_live_pricing_mock(monkeypatch):
     """Live RunPod rates override the static snapshot (mocked SDK)."""
-    from autoslm.providers.runpod import pricing
+    from flash.providers.runpod import pricing
 
     monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
     monkeypatch.setattr(pricing, "_fetch_live_rates", lambda: {"RTX 5090": 1.23})
@@ -144,13 +144,13 @@ def test_runpod_live_pricing_mock(monkeypatch):
 
 def test_vast_live_pricing_from_offers_mock(monkeypatch):
     """Vast's hourly_rate is the cheapest live offer for the class (mocked offers)."""
-    from autoslm.providers.vast import jobs, pricing
+    from flash.providers.vast import jobs, pricing
 
     monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
     monkeypatch.setenv("VAST_API_KEY", "vk")
 
     def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):
-        from autoslm.providers.vast.jobs import VastOffer
+        from flash.providers.vast.jobs import VastOffer
 
         return [
             VastOffer(1, 1, "RTX 3090", 24, 0.19, 12.8, 200.0, 0.99, 5000.0, "CZ"),
@@ -166,17 +166,17 @@ def test_vast_live_pricing_from_offers_mock(monkeypatch):
 # ---------------------------------------------------------------------------
 def _mock_both_available(monkeypatch):
     """Make BOTH providers 'available' regardless of env/network for ranking tests."""
-    import autoslm.providers as P
+    import flash.providers as P
 
     monkeypatch.setattr(P, "available_providers", lambda: ("runpod", "vast"))
     # allocator imports available_providers by name, so patch its module ref too.
-    from autoslm.providers import allocator
+    from flash.providers import allocator
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "vast"))
 
 
 def _mock_vast_offers(monkeypatch, offers):
-    from autoslm.providers.vast import jobs
+    from flash.providers.vast import jobs
 
     monkeypatch.setattr(jobs, "usable_offers", lambda *a, **k: list(offers))
 
@@ -188,7 +188,7 @@ def _offer(gpu="RTX 3090", dph=0.10, oid=1, mid=1):
 
 
 def test_allocator_picks_cheaper_vast_over_runpod(monkeypatch):
-    from autoslm.providers.allocator import allocate
+    from flash.providers.allocator import allocate
 
     _mock_both_available(monkeypatch)
     # a cheap vast RTX 3090 offer undercuts the cheapest runpod validated 24 GB class
@@ -201,7 +201,7 @@ def test_allocator_picks_cheaper_vast_over_runpod(monkeypatch):
 
 
 def test_allocator_prefers_runpod_on_price_tie(monkeypatch):
-    from autoslm.providers.allocator import allocate
+    from flash.providers.allocator import allocate
 
     _mock_both_available(monkeypatch)
     # vast RTX A5000 at the same price as runpod's RTX A5000 ($0.27 static): runpod wins
@@ -212,7 +212,7 @@ def test_allocator_prefers_runpod_on_price_tie(monkeypatch):
 
 
 def test_allocator_provider_pin_vast(monkeypatch):
-    from autoslm.providers.allocator import allocate
+    from flash.providers.allocator import allocate
 
     _mock_both_available(monkeypatch)
     _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 3090", dph=0.50)])
@@ -221,8 +221,8 @@ def test_allocator_provider_pin_vast(monkeypatch):
 
 
 def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):
-    from autoslm.providers.allocator import allocate
-    from autoslm.providers.vast import jobs
+    from flash.providers.allocator import allocate
+    from flash.providers.vast import jobs
 
     _mock_both_available(monkeypatch)
 
@@ -240,7 +240,7 @@ def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):
 
 def test_allocator_gpu_pin_chooses_provider(monkeypatch):
     """Pinning a vast-only class routes to vast; the class is honored, provider derived."""
-    from autoslm.providers.allocator import allocate
+    from flash.providers.allocator import allocate
 
     _mock_both_available(monkeypatch)
     _mock_vast_offers(monkeypatch, [_offer(gpu="L40S", dph=0.80)])
@@ -252,8 +252,8 @@ def test_allocator_pinned_larger_gpu_searches_at_pin_size(monkeypatch):
     """Fix #5: pinning a larger Vast class for a small model searches offers at the
     PINNED class's VRAM, not the (smaller) model requirement — otherwise the cheapest-N
     offer window can fill with small cards and never surface the pinned class."""
-    from autoslm.providers import allocator
-    from autoslm.providers.base import GPU_INFO
+    from flash.providers import allocator
+    from flash.providers.base import GPU_INFO
 
     _mock_both_available(monkeypatch)
     captured = {}
@@ -262,7 +262,7 @@ def test_allocator_pinned_larger_gpu_searches_at_pin_size(monkeypatch):
         captured["min_vram_gb"] = min_vram_gb
         return [_offer(gpu="A40", dph=0.40)]  # A40 = 48 GB, the pinned class
 
-    from autoslm.providers.vast import jobs
+    from flash.providers.vast import jobs
 
     monkeypatch.setattr(jobs, "usable_offers", fake_offers)
     # Qwen3-0.6B needs ~24 GB, but the user pinned the 48 GB A40 -> search at 48
@@ -274,8 +274,8 @@ def test_allocator_pinned_larger_gpu_searches_at_pin_size(monkeypatch):
 def test_allocation_summary_non_vast_provider(monkeypatch):
     """Fix #6: allocation_summary treats `offer` as an opaque per-provider hint — it only
     formats Vast specifics when provider=='vast', never misformatting/raising otherwise."""
-    from autoslm.providers.allocator import allocation_summary
-    from autoslm.providers.base import Allocation, Candidate
+    from flash.providers.allocator import allocation_summary
+    from flash.providers.base import Allocation, Candidate
 
     # A non-vast allocation carrying a NON-vast offer object (no offer_id/geolocation):
     # allocation_summary must not touch it.
@@ -298,7 +298,7 @@ def test_allocation_summary_non_vast_provider(monkeypatch):
 # handle round-trip through the interface
 # ---------------------------------------------------------------------------
 def test_jobhandle_roundtrip_tags_provider():
-    from autoslm.providers.base import JobHandle
+    from flash.providers.base import JobHandle
 
     for name, extra in (
         ("runpod", {"endpoint_id": "ep", "job_id": "j"}),
@@ -316,11 +316,11 @@ def test_jobhandle_roundtrip_tags_provider():
 
 def test_provider_cancel_destroy_dispatch(monkeypatch):
     """cancel/destroy on each provider hit that provider's REST surface."""
-    from autoslm.providers import get_provider
-    from autoslm.providers.base import JobHandle
+    from flash.providers import get_provider
+    from flash.providers.base import JobHandle
 
     # runpod
-    from autoslm.providers.runpod import api as rp_api
+    from flash.providers.runpod import api as rp_api
 
     cancelled, deleted = [], []
     monkeypatch.setattr(rp_api, "cancel_job", lambda e, j: cancelled.append((e, j)))
@@ -332,7 +332,7 @@ def test_provider_cancel_destroy_dispatch(monkeypatch):
     assert deleted == ["ep"]
 
     # vast
-    from autoslm.providers.vast import api as v_api
+    from flash.providers.vast import api as v_api
 
     destroyed = []
     monkeypatch.setattr(v_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)

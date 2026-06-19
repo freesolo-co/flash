@@ -1,4 +1,4 @@
-"""CPU tests for the AutoSLM MVP package."""
+"""CPU tests for the Flash MVP package."""
 
 from __future__ import annotations
 
@@ -13,14 +13,14 @@ import pytest
 
 
 def test_catalog_validation():
-    from autoslm.catalog import get_model, validate_model_for_algorithm
+    from flash.catalog import get_model, validate_model_for_algorithm
 
     info = get_model("Qwen/Qwen3.5-4B")
     assert "grpo" in info.algos
     # 9B is the QLoRA GRPO tier (4-bit NF4 base on a ~24-32 GB card).
     assert validate_model_for_algorithm("Qwen/Qwen3.5-9B", "grpo").id == "Qwen/Qwen3.5-9B"
     # An sft-only model still rejects grpo (inject one — no catalog entry is sft-only now).
-    from autoslm.catalog import MODELS, ModelInfo
+    from flash.catalog import MODELS, ModelInfo
 
     MODELS["test/sft-only"] = ModelInfo(
         id="test/sft-only", display_name="x", params="1B", algos=("sft",), min_vram_gb=12
@@ -33,7 +33,7 @@ def test_catalog_validation():
 
 
 def test_config_to_job_spec():
-    from autoslm.schema import spec_from_file
+    from flash.schema import spec_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "run.toml")
@@ -57,7 +57,7 @@ def test_config_to_job_spec():
 
 
 def test_environment_registry():
-    from autoslm.envs.registry import load_environment
+    from flash.envs.registry import load_environment
 
     # Verifiers-only: there are no builtin envs and no default — an empty id is a hard
     # error (env loading itself is covered in test_envs_coverage).
@@ -67,12 +67,12 @@ def test_environment_registry():
 
 def test_orchestrator_dry_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import autoslm.runner as runner
+        import flash.runner as runner
 
         importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from autoslm.spec import JobSpec
+        from flash.spec import JobSpec
 
         spec = JobSpec(run_id="dry", model="Qwen/Qwen3.5-4B", algorithm="grpo")
         status = runner.submit_job(spec, dry_run=True)
@@ -82,8 +82,8 @@ def test_orchestrator_dry_run(monkeypatch):
 
 def test_mcp_handler_dry_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import autoslm.mcp.server as mcp
-        import autoslm.runner as runner
+        import flash.mcp.server as mcp
+        import flash.runner as runner
 
         importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
@@ -124,7 +124,7 @@ def test_cli_train_dry_run():
             )
         env = os.environ.copy()
         proc = subprocess.run(
-            [sys.executable, "-m", "autoslm.cli.main", "train", config, "--dry-run"],
+            [sys.executable, "-m", "flash.cli.main", "train", config, "--dry-run"],
             cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
             env=env,
             text=True,

@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import os
 
-from autoslm.catalog import DEFAULT_MODEL, MODELS, get_model
-from autoslm.providers.base import SUPPORTED, canonical_gpu
+from flash.catalog import DEFAULT_MODEL, MODELS, get_model
+from flash.providers.base import SUPPORTED, canonical_gpu
 
 
 def test_recommended_gpu_is_supported():
-    # Every catalog entry must recommend a GPU AutoSLM actually manages (RTX 4090 / 5090).
+    # Every catalog entry must recommend a GPU Flash actually manages (RTX 4090 / 5090).
     for model_id, info in MODELS.items():
         assert canonical_gpu(info.recommended_gpu) in SUPPORTED, (
             f"{model_id} recommends unsupported GPU {info.recommended_gpu!r}"
@@ -28,8 +28,8 @@ def test_default_model_is_supported():
 
 
 def test_recipe_and_jobspec_defaults_match_catalog_default():
-    from autoslm.engine.recipe import RECIPE
-    from autoslm.spec import JobSpec
+    from flash.engine.recipe import RECIPE
+    from flash.spec import JobSpec
 
     # When BENCH_HF_MODEL isn't overriding it, the recipe + JobSpec default to the catalog default.
     if not os.environ.get("BENCH_HF_MODEL"):
