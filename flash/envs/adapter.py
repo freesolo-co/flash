@@ -371,6 +371,14 @@ class VerifiersEnvironment(BaseEnvironment):
                 if eval_ds is None:
                     eval_ds = getattr(src, "dataset", None)
             rows = _rows_to_list(eval_ds)
+            # An explicit positive ``limit`` means the caller (mid-run eval) wants a RAW pool of up
+            # to ``limit`` rows and does its OWN seeded sampling on top — so don't also apply the
+            # ``[environment.params] eval_examples`` subset here, which would silently shrink the
+            # pool below ``limit`` and starve the caller's sample (it already capped the pool size
+            # via ``limit``). ``_fixed_subset`` still governs the plain ``dataset("eval")`` path
+            # (the "eval on a different env" feature, where the param IS the intended sample size).
+            if limit is not None and limit > 0:
+                return rows
             return self._fixed_subset(rows)
         ds = _call_dataset_getter(self._env, "get_dataset", seed=0)
         if ds is None:
