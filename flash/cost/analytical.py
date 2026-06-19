@@ -91,18 +91,19 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     gen_tokens = completions * n.completion_len
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_TRAIN)
-    # Reward graders run in parallel, but only as many slots as there are completions to
-    # grade: the effective concurrency is min(completions, REWARD_CONCURRENCY). With fewer
-    # completions than slots (e.g. a batch_size=1, group_size=4 GRPO step = 4 completions),
-    # dividing by the full 16 would model a fraction of a wave and undercount the reward wall
-    # -- at least one completion's full latency must elapse. For completions >= the slot count
-    # this is identical to dividing by REWARD_CONCURRENCY, so larger steps are unaffected.
-    reward_concurrency = min(completions, REWARD_CONCURRENCY)
-    reward_s = (
-        completions
-        * reward_seconds_per_completion(n.environment, n.reward_seconds_per_completion)
-        / reward_concurrency
-    )
+    # Reward graders run in parallel over REWARD_CONCURRENCY slots, so the wall is the number
+    # of grading WAVES x the per-completion latency: ceil(completions / slots) waves, each of
+    # which takes one full per-completion latency to drain (a partial final wave still occupies
+    # the slots for a whole latency -- a 16-slot grader holding 17 completions needs 2 waves,
+    # not 1.06). This is why dividing by min(completions, slots) -- which models a fraction of a
+    # wave for non-multiples -- undercounts heavy-reward steps with 17-31, 33-47, ... completions;
+    # the wave count rounds up instead. It coincides with the old min()/division at the two
+    # endpoints (completions <= slots => 1 wave = one latency; an exact multiple => completions/
+    # slots waves), so all the real measured configs (4, 16, 128, 256, 512 completions) are
+    # unchanged -- only the fractional-wave configs in between are now priced for the full wave.
+    latency = reward_seconds_per_completion(n.environment, n.reward_seconds_per_completion)
+    reward_waves = math.ceil(completions / REWARD_CONCURRENCY)
+    reward_s = reward_waves * latency
     return gen_s + reward_s + update_s
 
 
