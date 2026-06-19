@@ -57,6 +57,6 @@ uv run flash-server                      # control plane (operator-side, run onc
 
 The control plane owns provider credentials: `RUNPOD_API_KEY` is always required
 (RunPod is the default substrate), `VAST_API_KEY` is opt-in (only checked when set),
-plus the shared `HF_TOKEN` (the legacy `HUGGINGFACE_TOKEN` name is still accepted).
+plus the shared `HF_TOKEN`.
 The artifact repo is per-run (the run TOML's `[train] hf_repo`), not an
 operator-wide env var. Clients authenticate with their freesolo API key (`slm login`).

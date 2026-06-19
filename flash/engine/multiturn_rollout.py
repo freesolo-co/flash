@@ -179,6 +179,24 @@ def rollout_one(
     }
 
 
+def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:
+    """Render ``messages`` with the chat template, then tokenize to a flat ``list[int]``.
+
+    Render to text first, then tokenize — the return shape of apply_chat_template(tokenize=True)
+    varies by tokenizer, whereas tok(text).input_ids is reliably a flat list[int] (matches the
+    single-turn render_prompt path). add_special_tokens=False because the template already
+    emits the special tokens. Shared by the GRPO rollout closure and mid-run eval so both
+    produce identical token alignment.
+    """
+    text = tok.apply_chat_template(
+        messages,
+        add_generation_prompt=add_generation_prompt,
+        tokenize=False,
+        enable_thinking=thinking,
+    )
+    return [int(t) for t in tok(text, add_special_tokens=False).input_ids]
+
+
 def build_rollout_func(
     *,
     active_env,
@@ -191,7 +209,6 @@ def build_rollout_func(
     stop: list[str] | None,
     thinking: bool,
     engine_max_len: int | None = None,
-    num_generations_attr: str = "num_generations",
 ):
     """Return a TRL ``rollout_func`` closure that drives ``active_env`` on the colocate engine.
 
@@ -202,21 +219,11 @@ def build_rollout_func(
     from vllm import SamplingParams  # gpu-only; imported lazily so the module loads on CPU
 
     def render(messages: list, add_generation_prompt: bool) -> list[int]:
-        # Render to text first, then tokenize — apply_chat_template(tokenize=True) return
-        # shape varies by tokenizer; tok(text).input_ids is reliably a flat list[int]
-        # (matches the single-turn render_prompt path). add_special_tokens=False because the
-        # template already emits the special tokens.
-        text = tok.apply_chat_template(
-            messages,
-            add_generation_prompt=add_generation_prompt,
-            tokenize=False,
-            enable_thinking=thinking,
-        )
-        return [int(t) for t in tok(text, add_special_tokens=False).input_ids]
+        return render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
 
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
-        num_gen = int(getattr(trainer, num_generations_attr, 1) or 1)
+        num_gen = int(getattr(trainer, "num_generations", 1) or 1)
 
         def generate(prefix_ids: list[int], max_tokens: int):
             sp = SamplingParams(

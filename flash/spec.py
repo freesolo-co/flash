@@ -49,6 +49,26 @@ def _coerce_str_map(value: Any) -> dict[str, str]:
     return {str(k): str(v) for k, v in value.items()}
 
 
+def _coerce_wandb(value: Any) -> WandbSpec:
+    """Coerce a loosely-typed ``wandb`` spec field into a ``WandbSpec``.
+
+    A malformed/older persisted spec can set ``wandb`` to a non-dict (e.g. a bare string), and
+    ``(value or {}).get(...)`` would crash ``from_dict`` with AttributeError on the worker. Treat
+    a non-dict as empty (default naming), mirroring ``_coerce_str_map``. String-coerce + trim the
+    leaves so a non-string label can't reach the W&B SDK / run-name path; blank -> None (default).
+    """
+    if not isinstance(value, dict):
+        return WandbSpec()
+
+    def _label(v: Any) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    return WandbSpec(project=_label(value.get("project")), run_name=_label(value.get("run_name")))
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
@@ -200,6 +220,16 @@ class GpuSpec:
 
 
 @dataclass(frozen=True)
+class WandbSpec:
+    # Optional W&B naming, defined in the [wandb] config table (first-class spec config, NOT
+    # env vars). project/run_name are non-secret labels; the actual WANDB_API_KEY stays an
+    # env-var secret. None -> the worker's defaults ("flash" project, "flash-<phase>-<run_id>-
+    # seedN" run name).
+    project: str | None = None
+    run_name: str | None = None
+
+
+@dataclass(frozen=True)
 class JobSpec:
     model: str = DEFAULT_MODEL
     algorithm: str = "grpo"
@@ -219,6 +249,9 @@ class JobSpec:
     # identically by SFT rendering, RL rollouts, and serving (decoding parity). OFF by default
     # (operator preference: training defaults to no-reasoning; set thinking = true to enable).
     thinking: bool = False
+    # Optional W&B run naming from the [wandb] config table. Carried as typed spec config
+    # (round-tripped in the job-spec JSON the worker reads), not as environment variables.
+    wandb: WandbSpec = field(default_factory=WandbSpec)
 
     @property
     def phase(self) -> str:
@@ -292,6 +325,7 @@ class JobSpec:
             worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
             thinking=_coerce_bool(data.get("thinking", False)),
+            wandb=_coerce_wandb(data.get("wandb")),
         )
 
     @classmethod

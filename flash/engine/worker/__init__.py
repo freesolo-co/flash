@@ -35,8 +35,49 @@ import traceback
 from flash.engine.accounting import RunMetrics
 
 # Shared, substrate-neutral fine-tuning internals (live in this same package).
-from flash.engine.chalk_kernels import install_chalk_kernels
+from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
+
+# Re-export the pure helpers split into the leaf submodules ``.perf`` and ``.lora``.
+# CRITICAL: the readers below (run_sft / run_rl / make_lora / _init_adapter_model / ...) call
+# these by their bare name, which resolves through THIS module's namespace — so a test's
+# ``monkeypatch.setattr(worker, "<name>", ...)`` still reaches the readers. Names actually used
+# by the retained readers are imported plainly; names re-exported only for API / test access
+# (no retained reader uses them) are marked unused for the linter.
+from flash.engine.worker.lora import (
+    _VL_EXCLUDE_SEGMENTS,  # noqa: F401
+    _patch_peft_weight_converter_compat,
+    is_vl_checkpoint,  # noqa: F401
+    lora_exclude_modules,
+    model_quant,
+    patch_vllm_language_model_only,
+    vllm_language_model_only_kwargs,  # noqa: F401
+)
+from flash.engine.worker.perf import (
+    _LIGER_MIN_PARAMS,  # noqa: F401
+    _LONG_CONTEXT_TOKENS,  # noqa: F401
+    _attn_impl_for_capability,  # noqa: F401
+    _drop_fla_on_hopper,
+    _estimate_params,  # noqa: F401
+    _flash_attn_available,
+    _GpuPeakSampler,
+    _liger_default_for_model,  # noqa: F401
+    _memory_mode,
+    _metric_curve,
+    _peak_gpu_gb,
+    _remove_fla_from_disk,  # noqa: F401
+    _reset_peak_gpu,
+    _sdpa_cudnn_ctx,
+    free_gpu,
+    fused_optim_name,
+    gpu_diagnostics,
+    grad_checkpointing_on,
+    liger_on,
+    loraplus_optimizer_cls,
+    optimal_attn_impl,
+    setup_perf_backends,
+    wait_for_gpu,
+)
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
 
@@ -251,8 +292,6 @@ def make_checkpoint_upload_callback():
     older checkpoints are deleted in the same commit. If an upload is still in flight
     when the next save fires, the new save is skipped (the following one catches up).
     """
-    import threading
-
     from transformers import TrainerCallback
 
     lock = threading.Lock()
@@ -314,13 +353,9 @@ def make_checkpoint_upload_callback():
 _HB_LAST_UPLOAD = 0.0
 
 
-def _hb_min_interval_s() -> float:
-    """The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
-    128 commits/hour-per-repo limit when concurrent runs share one HF_REPO."""
-    return 60.0
-
-
-_HB_MIN_INTERVAL_S = _hb_min_interval_s()
+# The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
+# 128 commits/hour-per-repo limit when concurrent runs share one HF_REPO.
+_HB_MIN_INTERVAL_S = 60.0
 _HB_THROTTLED_STAGES = frozenset({"rl_step"})
 # Terminal transitions the control plane must never miss — always committed.
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
@@ -439,223 +474,39 @@ def graded_text(completion: str | None) -> str | None:
     return strip_think(completion) if THINKING else completion
 
 
-def _patch_peft_weight_converter_compat() -> None:
-    """peft 0.19.1 x transformers 5.6-5.10: make MoE adapter loading work.
-
-    peft's ``build_peft_weight_mapping`` reconstructs transformers ``WeightConverter``
-    objects passing ``distributed_operation=`` / ``quantization_operation=`` — kwargs
-    the WeightConverter in transformers <5.11 doesn't accept (init=False dataclass
-    fields), so loading a LoRA adapter onto any arch WITH weight conversions dies with
-    ``TypeError: unexpected keyword argument 'distributed_operation'`` (observed on a
-    weight-converting checkpoint eval). The
-    worker can't take transformers>=5.11 (vllm 0.19.1 compat), so accept-and-drop
-    unknown kwargs; on a single GPU those fields are unused. No-op once signatures
-    match.
-    """
-    import inspect
-
-    try:
-        from transformers import core_model_loading as cml
-    except Exception:  # pragma: no cover - older stacks have no converter module
-        return
-    converter = getattr(cml, "WeightConverter", None)
-    if converter is None or getattr(converter, "_flash_compat", False):
-        return
-    accepted = set(inspect.signature(converter.__init__).parameters)
-    if "distributed_operation" in accepted:
-        return
-    orig_init = converter.__init__
-
-    def _compat_init(self, *args, **kwargs):
-        dropped = [k for k in kwargs if k not in accepted]
-        for k in dropped:
-            kwargs.pop(k)
-        orig_init(self, *args, **kwargs)
-
-    converter.__init__ = _compat_init
-    converter._flash_compat = True
-    print("[compat] WeightConverter patched (peft<->transformers signature drift)")
 
 
 # ---------------------------------------------------------------------------
 # SFT
 # ---------------------------------------------------------------------------
-# Module-path segments that must never receive LoRA on natively-multimodal checkpoints
-# trained text-only: the vision tower / projector / MTP head. Critically, adapters that
-# DO touch them cannot be loaded by vLLM in text-only (language_model_only) serving —
-# its LoRA loader rejects "unexpected modules" (observed with Qwen3.5-2B).
-_VL_EXCLUDE_SEGMENTS = ("visual", "vision_tower", "multi_modal_projector", "mtp")
 
 
-def lora_exclude_modules(model_id: str) -> str | None:
-    """Regex (peft fullmatch semantics) excluding vision-tower modules from LoRA.
 
-    Returns None when no exclusion is needed (pure text architectures). NOTE: peft's
-    list-form exclude_modules uses suffix matching (like target_modules), which does
-    NOT match leaf modules under 'visual.*' — a regex string is required.
-    """
-    excludes = {
-        "qwen3_5": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_5_moe": _VL_EXCLUDE_SEGMENTS,
-        "qwen3_6": _VL_EXCLUDE_SEGMENTS,
-    }
-    try:
-        from transformers import AutoConfig
+def force_vllm_backend_for_sm120() -> str | None:
+    """On RTX 5090 / consumer Blackwell (sm120), force a PTX-independent vLLM attention backend.
 
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        model_type = getattr(cfg, "model_type", "") or ""
-    except Exception as e:
-        print("lora_exclude_modules: config probe failed:", e)
-        return None
-    segments = excludes.get(model_type)
-    if not segments:
-        return None
-    alt = "|".join(segments)
-    return rf"(^|.*\.)({alt})(\..*|$)"
-
-
-def is_vl_checkpoint(model_id: str) -> bool:
-    """True for natively-multimodal checkpoints we train/serve text-only (Qwen3.5/3.6)."""
-    return bool(lora_exclude_modules(model_id))
-
-
-def vllm_language_model_only_kwargs(model_id: str) -> dict:
-    """Engine kwargs to skip the vision tower for VL checkpoints (vLLM >= 0.19).
-
-    Besides wasting VRAM, the vision tower's attention path hardcodes vLLM's bundled
-    flash-attn, whose PTX needs a newer driver JIT than many RTX 5090 hosts have
-    ("PTX compiled with unsupported toolchain") — text-only loading sidesteps it and
-    is the officially supported way to run Qwen3.5 as a pure LLM.
-    """
-    return {"language_model_only": True} if is_vl_checkpoint(model_id) else {}
-
-
-def _attn_impl_for_capability(major: int, minor: int) -> str | None:
-    """Map a CUDA compute capability to the trainer ``attn_implementation``.
-
-    Attention uses PyTorch SDPA (its flash/efficient backend is already selected automatically
-    on Ampere/Ada/Hopper) — the HF Kernels-Hub FA path is disabled because the torch2.10-
-    compatible ``kernels`` versions break transformers' import. So:
-      sm120 (Blackwell consumer 5090/RTX Pro) -> "sdpa" (forced to the cuDNN backend at train
-      time — its default SDPA can fall to the slow math kernel); all other archs -> None (let
-      transformers pick SDPA, which already flash-backs on Ampere/Ada/Hopper). The big LoRA
-      win comes from the Liger fused kernels, not the attention path. Pure function (no torch)
-      so it's unit-testable on CPU; override the whole thing with FLASH_ATTN_IMPL.
-    """
-    if major == 12:  # Blackwell consumer: force cuDNN SDPA (avoid the math fallback)
-        return "sdpa"
-    return None
-
-
-def _flash_attn_available() -> bool:
-    """True when the ``flash_attn`` wheel is importable (our worker image builds it from source).
-
-    Gates the packing default: TRL's ``packing_strategy='bfd'`` produces flattened/padding-free
-    batches whose example boundaries are carried by ``position_ids`` and enforced ONLY by an
-    attention impl that honors them (FlashAttention-2 varlen / flex_attention). Under plain SDPA,
-    packed examples attend ACROSS boundaries (silent quality loss). find_spec only — no import side
-    effects (and no CUDA init)."""
-    try:
-        import importlib.util
-
-        return importlib.util.find_spec("flash_attn") is not None
-    except Exception:
-        return False
-
-
-def optimal_attn_impl() -> str | None:
-    """Best ``attn_implementation`` for the live GPU (None = leave transformers' default)."""
+    vLLM's default rollout backend is flash-attn, whose PRE-BUILT PTX needs a newer driver JIT than
+    many 5090 RunPod hosts have — when the JIT fails the colocated rollout silently produces NO
+    completions (empty reward_history, ~1.4 s "done"; a whole 22-run sweep hit this on every 5090).
+    FLASHINFER is vLLM's Blackwell-native backend (no flash-attn PTX dependency) and trains on a 5090
+    (measured: FLASHINFER/TORCH_SDPA/TRITON_ATTN all train, ~116 s). This mirrors the trainer's
+    cuDNN-SDPA forcing on sm120 (``_attn_impl_for_capability``). The GRPO no-op guard remains the
+    backstop. Returns the backend set (None if not sm120, or the operator already pinned one)."""
+    if os.environ.get("VLLM_ATTENTION_BACKEND"):
+        return None  # operator override wins
     try:
         import torch
 
-        if not torch.cuda.is_available():
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 12:
             return None
-        major, minor = torch.cuda.get_device_capability(0)
     except Exception as e:
-        print("optimal_attn_impl probe failed:", e)
+        print("[rl] sm120 vLLM backend probe skipped:", e)
         return None
-    impl = _attn_impl_for_capability(major, minor)
-    if impl:
-        print(f"[attn] sm{major}{minor} -> attn_implementation={impl}")
-    return impl
+    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+    print("[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
+          "on consumer Blackwell hosts -> empty-rollout failures)")
+    return "FLASHINFER"
 
-
-# Liger's fused linear cross-entropy is a MEMORY optimization (it never materializes the fp32
-# [B,T,vocab] logits), not a fixed-batch speed win. PR #174 ledger: on a 1B model at fixed batch
-# it is a measured NET LOSS on EVERY arch (min-of-3: A100 0.86x, H100 0.90x, RTX 3090 0.78x,
-# RTX 4090 0.83x, RTX 5090 0.79x) — the per-step Triton overhead isn't repaid because the small
-# model's logits don't dominate memory. Its value appears on LARGE models (lets a bigger batch
-# fit / avoids OOM). So gate by estimated model size.
-_LIGER_MIN_PARAMS = 3e9  # ~3B; 1B-class models measured net-negative -> Liger off below this
-
-
-def _estimate_params(cfg) -> float:
-    """Rough param count from a HF config: embeddings (+untied lm_head) + transformer blocks.
-    For multimodal checkpoints (e.g. Qwen3.5-VL) the LM dims live under ``text_config`` — read it
-    when the top-level dims are absent, else the gate underestimates and wrongly disables the
-    memory path (GC/Liger) for the 4B/9B tiers."""
-    tc = getattr(cfg, "text_config", None)
-    src = cfg if getattr(cfg, "hidden_size", 0) else (tc or cfg)
-    h = getattr(src, "hidden_size", 0) or 0
-    v = getattr(src, "vocab_size", 0) or getattr(cfg, "vocab_size", 0) or 0
-    n = getattr(src, "num_hidden_layers", 0) or 0
-    tied = getattr(src, "tie_word_embeddings", getattr(cfg, "tie_word_embeddings", False))
-    emb = v * h * (1 if tied else 2)
-    blocks = n * 12 * h * h  # ~12 h^2 per transformer block (attn + MLP)
-    return float(emb + blocks)
-
-
-def _liger_default_for_model(model_id: str) -> bool:
-    """Default Liger ON only for models large enough that fused-CE's memory win pays off
-    (≥ _LIGER_MIN_PARAMS, ~3B). 1B-class models measured net-negative -> default OFF."""
-    try:
-        from transformers import AutoConfig
-
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        return _estimate_params(cfg) >= _LIGER_MIN_PARAMS
-    except Exception as e:
-        print("liger model-size probe failed (default off):", e)
-        return False
-
-
-def liger_on(default_on: bool) -> bool:
-    """Whether to enable a Liger kernel path. ``default_on`` is the model-size decision (on only
-    for models large enough that fused-CE's memory win pays off; 1B-class is a measured net loss).
-    Even when on, require a CUDA GPU AND that ``liger_kernel`` is importable — the local
-    ``flash[gpu]`` extra doesn't ship it, so blindly setting use_liger_kernel would crash a
-    local GPU run. No GPU / absent -> off."""
-    if not default_on:
-        return False
-    try:
-        import importlib.util
-
-        import torch
-
-        return bool(
-            torch.cuda.is_available() and importlib.util.find_spec("liger_kernel") is not None
-        )
-    except Exception:
-        return False
-
-
-def setup_perf_backends() -> None:
-    """Universal, arch-agnostic throughput knobs — safe on every CUDA arch, no JIT/compile cost.
-
-    - TF32 for fp32 matmuls/cuDNN (Ampere+): the residual fp32 ops in a bf16 LoRA run (some
-      norms, the optimizer's fp32 master step, any fp32 GEMM) run on the TF32 tensor cores at
-      ~no accuracy cost. No-op on pre-Ampere.
-    """
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return
-        torch.set_float32_matmul_precision("high")  # TF32 for fp32 matmuls
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print("[perf] TF32 matmul/cuDNN enabled")
-    except Exception as e:
-        print("setup_perf_backends skipped:", e)
 
 
 def finalize_alloc_conf_for_sleep() -> None:
@@ -693,179 +544,21 @@ def finalize_alloc_conf_for_sleep() -> None:
         print("[alloc] auto-conf skipped:", e)
 
 
-def _remove_fla_from_disk() -> tuple[list[str], bool]:
-    """Physically delete every importable ``fla`` package dir from the worker's REAL sys.path.
-
-    Loops until ``find_spec('fla')`` is clean (removing one copy can expose another further down
-    the path) and invalidates import caches so transformers' is_fla_available() probe sees it
-    gone. ``pip uninstall`` alone is unreliable here — it targets one site-packages but the base
-    image bakes ``fla`` into another dir on the path (and can report success while leaving the
-    package dir). Returns ``(removed_dirs, still_importable)``. Used by the Hopper auto-drop.
-    """
-    import importlib
-    import importlib.util
-    import shutil
-
-    removed: list[str] = []
-    for _ in range(6):  # a few passes: removing one copy can reveal another earlier on the path
-        importlib.invalidate_caches()
-        spec = importlib.util.find_spec("fla")
-        if spec is None:
-            break
-        # Resolve the package directory (submodule_search_locations for a package, else the file dir).
-        locs = list(getattr(spec, "submodule_search_locations", None) or [])
-        if not locs and spec.origin:
-            locs = [os.path.dirname(spec.origin)]
-        progressed = False
-        for loc in locs:
-            if loc and os.path.isdir(loc) and os.path.basename(loc.rstrip("/")) == "fla":
-                try:
-                    shutil.rmtree(loc)
-                    removed.append(loc)
-                    progressed = True
-                except Exception as e:
-                    print(f"[fla] could not remove {loc}: {e}", flush=True)
-        if not progressed:
-            break
-    importlib.invalidate_caches()
-    return removed, importlib.util.find_spec("fla") is not None
 
 
-# Long-context runs are memory-bound (activations + vLLM KV cache scale with sequence length), so
-# they need the memory features even on a SMALL model — PR #174 measured a 1B model OOM on GRPO at
-# 4096 ctx in speed mode, but it fits in memory mode. So "memory mode" = large model OR long ctx.
-_LONG_CONTEXT_TOKENS = 2048
-
-
-def _memory_mode(model_id: str, max_length: int = 0) -> bool:
-    """Whether to default the memory-saving features (Liger, grad-checkpointing, vLLM sleep) ON:
-    a large model (fused-CE memory win) OR a long context (activations/KV dominate). Small model +
-    short context -> off (optimize for speed)."""
-    if max_length and max_length >= _LONG_CONTEXT_TOKENS:
-        return True
-    return _liger_default_for_model(model_id)
-
-
-def grad_checkpointing_on(model_id: str, max_length: int = 0) -> bool:
-    """Gradient checkpointing recomputes the forward in backward (~25% slower) to save activation
-    memory — a MEMORY feature, not speed. ON for large models / long context that need the
-    headroom; OFF for small+short runs that fit without it (the speed win)."""
-    return _memory_mode(model_id, max_length)
-
-
-def fused_optim_name() -> str:
-    """TRL/HF ``optim`` value: 8-bit paged AdamW (bitsandbytes int8 optimizer state paged to host
-    RAM). It fits a smaller/cheaper GPU and is the better default across the catalog."""
-    return "paged_adamw_8bit"
-
-
-def _reset_peak_gpu() -> None:
-    """Reset the CUDA peak-memory counter so a subsequent ``_peak_gpu_gb`` measures only the work
-    that follows (e.g. the train loop, isolating the optimizer-state A/B from setup/model load)."""
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-    except Exception:
-        pass
-
-
-def _peak_gpu_gb() -> float:
-    """Peak torch-allocated CUDA memory (GB) since the last reset; 0.0 if no CUDA. Note: bnb paged
-    8-bit optimizer state lives in unified/managed memory outside torch's caching allocator and is
-    NOT counted here — so this OVERSTATES the 8-bit saving. _GpuPeakSampler measures the true
-    device footprint (incl. bnb managed pages) for the honest A/B number."""
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            return round(torch.cuda.max_memory_allocated() / 1e9, 3)
-    except Exception:
-        pass
-    return 0.0
-
-
-class _GpuPeakSampler:
-    """Background sampler of true device memory (GB) = (total - free) from cuda.mem_get_info, which
-    DOES include bitsandbytes managed/paged optimizer pages while they're GPU-resident (torch's
-    max_memory_allocated does not). This is the honest peak for the fp32-vs-8-bit optimizer A/B."""
-
-    def __init__(self, interval: float = 0.25):
-        self.interval = interval
-        self.peak_used = 0
-        self._stop = False
-        self._thread = None
-
-    def _run(self):
-        import torch
-
-        while not self._stop:
-            try:
-                free, total = torch.cuda.mem_get_info()
-                self.peak_used = max(self.peak_used, total - free)
-            except Exception:
-                pass
-            time.sleep(self.interval)
-
-    def start(self):
-        try:
-            import threading
-
-            import torch
-
-            if not torch.cuda.is_available():
-                return self
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
-        except Exception:
-            pass
-        return self
-
-    def stop_gb(self) -> float:
-        self._stop = True
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-        return round(self.peak_used / 1e9, 3)
-
-
-def loraplus_optimizer_cls(optim_name: str):
-    """Optimizer class for the LoRA+ ``create_optimizer`` override (returns ``(cls, extra_kwargs)``).
-
-    The LoRA+ override has to *build* the optimizer itself (PEFT splits the LoRA A/B matrices into
-    separate param groups with different LRs), so it cannot inherit TRL's ``optim=`` string — it has
-    to choose a concrete class. Historically it always built a full-precision ``torch.optim.AdamW``,
-    which silently discarded the catalog's ``paged_adamw_8bit`` setting whenever LoRA+ was on.
-
-    PEFT's ``create_loraplus_optimizer`` accepts ANY ``optimizer_cls`` — including bitsandbytes 8-bit
-    optimizers (it registers embedding overrides with bnb's ``GlobalOptimManager`` to keep them
-    32-bit) — so LoRA+ and the 8-bit paged optimizer state coexist. An ``8bit`` ``optim`` value
-    (the fleet default; ``fused_optim_name`` -> ``paged_adamw_8bit``) selects
-    ``bnb.optim.PagedAdamW8bit``; a non-8-bit ``optim`` keeps fp32 AdamW. This simply mirrors the
-    configured ``optim`` — there is no separate toggle: an on-GPU A/B (Qwen3.5-4B SFT, rank-128
-    LoRA, same seed/data/init) measured the 8-bit paged state at -75% optimizer memory
-    (1359 -> 346 MB) and -0.72 GB peak with NO convergence penalty (final loss 10.64 vs 11.16 from
-    an identical start), so it's unconditionally the default wherever ``optim`` is 8-bit. Falls
-    back to fp32 AdamW only if bitsandbytes is missing."""
-    import torch as _torch
-
-    # case-insensitive + str-safe: TRL normalizes optim to an OptimizerNames enum whose str() is
-    # "OptimizerNames.PAGED_ADAMW_8BIT" (uppercase), so a bare `"8bit" in optim_name` would miss it.
-    if "8bit" in str(optim_name or "").lower():
-        try:
-            import bitsandbytes as bnb
-
-            return bnb.optim.PagedAdamW8bit, {}
-        except Exception as e:  # bnb missing / no CUDA build -> safe fp32 fallback
-            print(f"[lora+] bitsandbytes 8-bit optimizer unavailable ({e}); using fp32 AdamW")
-    return _torch.optim.AdamW, {}
 
 
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
-    (silent, the metrics.json artifact is still the source of truth). Pins the project so every run
-    lands in one place."""
+    (silent, the metrics.json artifact is still the source of truth).
+
+    Project + run name come ONLY from the typed ``[wandb]`` config (``JOB_SPEC.wandb``) — there is
+    NO WANDB_PROJECT / WANDB_NAME environment variable. HF's WandbCallback has no project argument
+    and would read WANDB_PROJECT from the env, so we initialize the run directly via the wandb SDK
+    here (``wandb.init(project=..., name=...)``); the Trainer's callback then reuses that run. The
+    run's entity is the API key's default account/team (we don't pass ``entity=``), so the only
+    W&B env var is the WANDB_API_KEY credential."""
     if not os.environ.get("WANDB_API_KEY"):
         return []
     import importlib.util
@@ -873,12 +566,30 @@ def wandb_report_to() -> list[str]:
     if importlib.util.find_spec("wandb") is None:
         print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
         return []
-    os.environ["WANDB_PROJECT"] = "flash"
+    # Best-effort, like the bitsandbytes import above: a partial/broken wandb install or an
+    # init failure (auth, network, runtime import error) must NOT abort training — W&B logging is
+    # optional and metrics.json is the source of truth. Any failure -> no W&B logging ([]).
+    try:
+        import wandb
+
+        if wandb.run is None:  # init from the spec so the project needs no WANDB_PROJECT env
+            project = (JOB_SPEC.wandb.project if JOB_SPEC else None) or "flash"
+            wandb.init(project=project, name=wandb_run_name())
+    except Exception as e:
+        print(f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)")
+        return []
     return ["wandb"]
 
 
 def wandb_run_name() -> str:
-    """Stable, human-readable W&B run name tying the dashboard run to the Flash run id."""
+    """W&B run name, from the typed ``[wandb] run_name`` config (``JOB_SPEC.wandb.run_name``) only —
+    no WANDB_NAME environment variable. An explicit name is used verbatim (the user owns the
+    naming); otherwise a stable id tying the dashboard run to the Flash run
+    (``flash-<phase>-<run_id>-seed<N>``). Passed to the Trainer via ``TrainingArguments.run_name``
+    and to ``wandb.init`` above."""
+    configured = JOB_SPEC.wandb.run_name if JOB_SPEC else None
+    if configured and configured.strip():
+        return configured.strip()
     return f"flash-{PHASE}-{RUN_ID}-seed{SEED}"
 
 
@@ -901,58 +612,7 @@ def wandb_run_info() -> dict:
         return {}
 
 
-def _sdpa_cudnn_ctx(attn_impl: str | None):
-    """Context forcing the cuDNN SDPA backend (real Blackwell-consumer kernels) when we fell
-    back to plain SDPA on sm120; a no-op context otherwise. Best-effort."""
-    if attn_impl != "sdpa":
-        return contextlib.nullcontext()
-    try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
 
-        # Priority-ordered: prefer the fast cuDNN/flash/efficient kernels, but ALWAYS include MATH
-        # as the final fallback. Restricting to only [CUDNN, EFFICIENT] makes sm120 GRPO crash with
-        # "RuntimeError: No available kernel" when neither has a kernel for the completion-batch
-        # attention shape (MEASURED: Qwen3.5 GRPO on RTX 5090). MATH is universal, so the candidate
-        # set is never empty; set_priority keeps cuDNN first whenever it CAN serve the shape (SFT
-        # fast path unchanged), only falling through for the shapes cuDNN/efficient reject.
-        return sdpa_kernel(
-            [
-                SDPBackend.CUDNN_ATTENTION,
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-                SDPBackend.MATH,
-            ],
-            set_priority=True,
-        )
-    except Exception as e:
-        print("[attn] cuDNN SDPA backend unavailable, using default SDPA:", e)
-        return contextlib.nullcontext()
-
-
-def patch_vllm_language_model_only(model_id: str) -> bool:
-    """Force ``language_model_only=True`` on vLLM engines created by third-party code
-    (TRL's colocated GRPO rollout engine) for VL checkpoints. Returns True if patched."""
-    extra = vllm_language_model_only_kwargs(model_id)
-    if not extra:
-        return False
-    try:
-        import vllm
-
-        if getattr(vllm.LLM.__init__, "_flash_lmo_patched", False):
-            return True
-        orig = vllm.LLM.__init__
-
-        def patched(self, *args, **kwargs):
-            kwargs.setdefault("language_model_only", True)
-            return orig(self, *args, **kwargs)
-
-        patched._flash_lmo_patched = True
-        vllm.LLM.__init__ = patched
-        print(f"[vllm] language_model_only patch active for {model_id}")
-        return True
-    except Exception as e:
-        print("patch_vllm_language_model_only warn:", e)
-        return False
 
 
 def make_lora(model_id: str | None = None):
@@ -976,9 +636,9 @@ def make_lora(model_id: str | None = None):
         "target_modules": targets,
         "task_type": "CAUSAL_LM",
     }
-    # Adapter initialization (convergence lever, always-on: measured -35% train loss in A/B
-    # (gpu-bench)). PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds)
-    # so LoRA converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
+    # Adapter initialization (convergence lever: measured -35% train loss in A/B (gpu-bench)).
+    # PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds) so LoRA
+    # converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
     # NOTE: PiSSA mutates the effective base, so the saved adapter is a PiSSA-residual unless
     # converted — fine for our train+eval+serve-same-stack flow.
     # PiSSA's SVD-based init fails inside the DISAGGREGATED trainer (which is CVD-pinned to a
@@ -990,9 +650,11 @@ def make_lora(model_id: str | None = None):
     # back too, else init_lora_weights="" (or "   ") reaches PEFT as an invalid value, not a real init.
     _lora_init = (os.environ.get("FLASH_LORA_INIT") or "").strip() or "pissa_niter_16"
     # PiSSA's SVD init requires an UNQUANTIZED base ("Please initialize PiSSA under
-    # float32/float16/bfloat16"); it raises on a 4-bit (qlora) base at adapter creation. Force
-    # standard init for qlora models regardless of the configured default, so the 4-bit trainers
-    # (Qwen3.5-9B, Qwen3.6-35B-A3B) don't crash — this hit 9B colocate (asb-esc-q9b-coloB).
+    # float32/float16/bfloat16"); it raises on a 4-bit (qlora) base at adapter creation. The
+    # catalog's 9B is 4bit-qlora by default, so every 9B run died here. Force standard init for
+    # qlora models regardless of the configured default, so the 4-bit trainers (Qwen3.5-9B,
+    # Qwen3.6-35B-A3B) don't crash — this hit 9B colocate (asb-esc-q9b-coloB). PiSSA stays on for
+    # the bf16/LoRA tier.
     if (
         model_id
         and model_quant(model_id) == "4bit-qlora"
@@ -1007,6 +669,7 @@ def make_lora(model_id: str | None = None):
         kwargs["init_lora_weights"] = _lora_init
         print(f"[lora] init_lora_weights={_lora_init}, rsLoRA scaling enabled")
     # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
+    # Quant-independent (just the alpha/sqrt(r) scale), so on for both tiers.
     kwargs["use_rslora"] = True
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
@@ -1016,17 +679,6 @@ def make_lora(model_id: str | None = None):
     return LoraConfig(**kwargs)
 
 
-def model_quant(model_id: str) -> str:
-    """Quantization tier for this model: catalog entry > bf16 (managed; no override)."""
-    try:
-        from flash.catalog import MODELS
-
-        info = MODELS.get(model_id)
-        if info is not None:
-            return info.quant
-    except Exception as e:
-        print("model_quant: catalog probe failed:", e)
-    return "bf16"
 
 
 def qlora_model_init_kwargs() -> dict:
@@ -1321,11 +973,6 @@ def run_sft():
                         print("[lora+] setup failed, falling back to default optimizer:", e)
                 return super().create_optimizer()
 
-    # Install any opt-in chalk kernels (selected via FLASH_* flags) before TRL builds the model, so the
-    # class/function-level patches (LoRA delta, fused MLP/QKV, RoPE) apply to it. No-op unless
-    # a FLASH_* kernel flag is set and freesolo-chalk is installed.
-    install_chalk_kernels()
-
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
     trainer = _SFT(
@@ -1336,10 +983,11 @@ def run_sft():
         processing_class=tok,
         callbacks=[make_checkpoint_upload_callback()],
     )
-    # The class/function-level chalk kernels installed above patch the layers TRL just built; the
-    # INSTANCE-level ones (FP8 base, embedding, FP8 MLP) need the materialized module, so install
-    # them now against the SFT trainer.model. No-op unless a FLASH_* kernel flag is set and chalk present.
-    install_chalk_kernels(getattr(trainer, "model", None))
+    # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
+    # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
+    # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
+    # freesolo-chalk is installed.
+    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
 
     _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. bnb managed optimizer pages
@@ -1397,6 +1045,9 @@ def run_sft():
                 else loraplus_optimizer_cls(fused_optim_name())[0].__name__
             ),
             "loraplus_applied": getattr(trainer, "_loraplus_applied", False),
+            # Which chalk gap-filling kernels actually ENGAGED (empty/None = chalk not installed or
+            # every kernel fell back) — verifies the chalk stack without the console.
+            "chalk_kernels": active_kernels(_chalk_report) or None,
             **wandb_run_info(),
         },
     )
@@ -1593,7 +1244,7 @@ def _maybe_attach_periodic_eval(
     """
     from flash.engine import midrun_eval as _me
 
-    # The cadence comes from the run's [train] eval_every_steps TOML (env var overrides). The
+    # The cadence comes from the run's [train] eval_every_steps TOML. The
     # eval queries + grading logic + completion budget all come from the environment / the run's
     # normal settings, not config.
     _train = JOB_SPEC.train if JOB_SPEC else None
@@ -1644,14 +1295,10 @@ def _maybe_attach_periodic_eval(
     if not examples:
         print("[rl][eval] env exposes no eval examples; skipping mid-run eval")
         return None
+    from flash.engine.multiturn_rollout import render_message_ids
+
     def _render_messages(messages, add_generation_prompt):
-        text = tok.apply_chat_template(
-            messages,
-            add_generation_prompt=add_generation_prompt,
-            tokenize=False,
-            enable_thinking=THINKING,
-        )
-        return [int(t) for t in tok(text, add_special_tokens=False).input_ids]
+        return render_message_ids(tok, messages, add_generation_prompt, thinking=THINKING)
 
     def _render_prompt_ids(example):
         return _render_messages(env.prompt_messages(example), True)
@@ -1983,6 +1630,30 @@ def _pin_trainer_devices_for_disaggregated() -> None:
         f"{os.environ['CUDA_VISIBLE_DEVICES']} (node {total} GPUs, {inference_gpus} for inference; "
         f"server gets device(s) {','.join(map(str, split.infer_devices))})"
     )
+
+
+def _grpo_resume_already_complete(resume_ckpt, target_steps: int, steps_run: int) -> bool:
+    """True when this worker resumed a checkpoint that already reached the target step count.
+
+    Such a resume legitimately performs ZERO new optimizer steps (so the fresh hb_cb has an empty
+    reward_history) yet the policy IS fully trained — it must NOT be flagged as a no-op failure.
+    """
+    return bool(resume_ckpt) and target_steps > 0 and steps_run >= target_steps
+
+
+def _grpo_is_no_op_failure(
+    reward_history, resume_ckpt, target_steps: int, steps_run: int
+) -> bool:
+    """True when a GRPO run trained NOTHING and must fail loudly instead of reporting as done.
+
+    An empty ``reward_history`` means the reward callback never fired — the rollout scored nothing
+    (e.g. vLLM silently returning no completions), so no real training happened. The sole exception
+    is a resume that already reached the target steps (see ``_grpo_resume_already_complete``): that
+    has an empty fresh history but a fully-trained policy, so it is NOT a failure.
+    """
+    if reward_history:
+        return False
+    return not _grpo_resume_already_complete(resume_ckpt, target_steps, steps_run)
 
 
 def run_rl():
@@ -2554,6 +2225,10 @@ def run_rl():
                 f"FLASH_VLLM_GROUP_PORT={_group_port} on the trainer side (stays TRL default 51216)"
             )
     elif use_vllm:
+        # RTX 5090 / sm120: pin a PTX-independent vLLM attention backend (FLASHINFER) BEFORE TRL
+        # builds the colocated engine — else the rollout can silently produce no completions on
+        # old-driver Blackwell hosts (flash-attn PTX JIT failure). No-op off sm120 / if pinned.
+        force_vllm_backend_for_sm120()
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
         # the model's FULL context and won't start on a consumer GPU). vllm_gpu_memory_utilization
@@ -2815,8 +2490,9 @@ def run_rl():
             # base, embedding, FP8 MLP) against the actual module GRPOTrainer optimizes (trainer.model).
             # Doing it here (not on init_model) is what makes them reach the fresh-LoRA path, where
             # init_model was only the model-id string. No-op unless a FLASH_* kernel flag is set and
-            # freesolo-chalk is installed.
-            install_chalk_kernels(getattr(trainer, "model", None))
+            # freesolo-chalk is installed. Capture the install report so the engaged kernels land in
+            # metrics (chalk_kernels via active_kernels below).
+            _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
             # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or
             # FLASH_EVAL_EVERY_STEPS, > 0): greedy eval on a held-out split, streamed via
             # heartbeat("rl_eval", ...) AND accumulated into metrics.json so the agent reads
@@ -2877,6 +2553,32 @@ def run_rl():
         return
     train_wall = time.time() - t_train
     reward_history = list(getattr(hb_cb, "reward_history", []))
+    # A GRPO run that finishes WITHOUT the reward callback ever firing (empty reward_history)
+    # produced NO real training — the rollout scored nothing (e.g. vLLM generation silently
+    # returning no completions, observed on RTX 5090 / sm120: ~1.4 s wall, empty reward + loss
+    # curves, but the run otherwise "succeeds"). That is a FAILURE, not a success: a no-op run with
+    # an unchanged adapter must not be reported as done — fail loudly so the operator/agent doesn't
+    # trust it. (An env returning all-zero rewards still appends 0.0s, so an EMPTY history uniquely
+    # means the reward path never ran.)
+    _steps_run = int(getattr(trainer.state, "global_step", 0) or 0)
+    # A resume that already reached the target steps legitimately performs ZERO new optimizer
+    # steps: the previous worker uploaded the final checkpoint (and scored its rewards) but died
+    # before writing metrics/DONE, so this worker's fresh hb_cb has an empty reward_history even
+    # though the policy IS fully trained. Don't fail those — finalize from the resumed state. The
+    # no-op guard below is only for a run that genuinely trained nothing (no resume, or the resume
+    # didn't reach the target steps).
+    _resumed_complete = _grpo_resume_already_complete(resume_ckpt, steps, _steps_run)
+    if _grpo_is_no_op_failure(reward_history, resume_ckpt, steps, _steps_run):
+        raise RuntimeError(
+            f"GRPO scored no reward in {train_wall:.1f}s over {_steps_run} step(s) — the rollout "
+            "produced no completions, so the policy was never actually trained. Failing loudly "
+            "instead of reporting a no-op run as done (seen on RTX 5090/sm120 vLLM rollout)."
+        )
+    if not reward_history and _resumed_complete:
+        print(
+            f"[resume] no new reward in this worker but resumed checkpoint already reached "
+            f"{_steps_run}/{steps} step(s) — finalizing the completed policy instead of failing."
+        )
     # Final eval on the actually-saved policy: the cadence only fires on multiples of
     # eval_every_steps, so when the run length isn't a multiple the last cadence eval predates the
     # saved adapter. run_final adds one eval on the final model (no-ops if the last step already
@@ -2926,6 +2628,9 @@ def run_rl():
             "rollout_split": _rollout_split.label if _rollout_split else "colocate",
             "inference_gpus": _inference_gpus,
             "loss_curve": _metric_curve(trainer, "loss"),
+            # Which chalk gap-filling kernels actually ENGAGED (None = chalk not installed or every
+            # kernel fell back) — verifies the chalk stack on a GRPO run without the console.
+            "chalk_kernels": active_kernels(_chalk_report) or None,
             **wandb_run_info(),
             # The mid-run eval curve (per [train] eval_every_steps): each entry has step,
             # eval_reward, eval_pass_rate, and eval_metrics{}. Empty when eval is off. The agent
@@ -2957,90 +2662,6 @@ def run_rl():
 # ---------------------------------------------------------------------------
 # Completion: train phase writes metrics.json + the DONE sentinel (see _finalize).
 # ---------------------------------------------------------------------------
-def gpu_diagnostics() -> dict:
-    """Collect CUDA/driver diagnostics to pin down GPU init failures on rented nodes."""
-    diag = {}
-    try:
-        import torch
-
-        diag["torch"] = torch.__version__
-        diag["torch_cuda"] = torch.version.cuda
-        diag["cuda_available"] = torch.cuda.is_available()
-        try:
-            diag["device_count"] = torch.cuda.device_count()
-            diag["device_name"] = torch.cuda.get_device_name(0)
-        except Exception as e:
-            diag["device_query_err"] = str(e)[:160]
-    except Exception as e:
-        diag["torch_import_err"] = str(e)[:160]
-    try:
-        import subprocess
-
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version,name,memory.total", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        diag["nvidia_smi"] = (out.stdout or out.stderr).strip()[:200]
-    except Exception as e:
-        diag["nvidia_smi_err"] = str(e)[:160]
-    return diag
-
-
-def wait_for_gpu(max_tries=12, sleep_s=10):
-    """Rented nodes sometimes report 'CUDA device not ready' transiently at startup.
-    Poll a trivial CUDA op until it succeeds before doing real work; raise if never ready."""
-    import time as _t
-
-    last = None
-    for i in range(max_tries):
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                # Force an actual kernel launch (alloc + add) to confirm the GPU is live.
-                _ = torch.zeros(8, device="cuda") + 1
-                torch.cuda.synchronize()
-                print(f"GPU ready after {i} retries: {torch.cuda.get_device_name(0)}")
-                return True
-            last = "cuda not available"
-        except Exception as e:
-            last = str(e)[:160]
-        print(f"GPU not ready (try {i + 1}/{max_tries}): {last}; sleeping {sleep_s}s")
-        _t.sleep(sleep_s)
-    raise RuntimeError(f"GPU never became ready after {max_tries} tries: {last}")
-
-
-def free_gpu(trainer=None):
-    try:
-        import gc
-
-        import torch
-
-        try:
-            if trainer is not None and hasattr(trainer, "model"):
-                trainer.model = None
-        except Exception:
-            # Best-effort VRAM release before gc; any failure here is non-fatal cleanup.
-            pass
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception as e:
-        print("free_gpu warn:", e)
-
-
-def _metric_curve(trainer, key: str, cap: int = 400) -> list:
-    """The logged values of `key` (e.g. 'loss' or 'reward') from the trainer's log history,
-    rounded + capped. Lets metrics.json carry the convergence/reward curve for an A/B without
-    relying on a checkpoint's trainer_state.json (only written on save_steps) or the console
-    (only uploaded on failure). Never raises."""
-    try:
-        vals = [round(float(h[key]), 4) for h in trainer.state.log_history if key in h]
-        return vals[:cap]
-    except Exception:
-        return []
 
 
 def write_train_meta(
@@ -3091,7 +2712,7 @@ def write_train_meta(
             "job_spec": JOB_SPEC.to_dict() if JOB_SPEC else None,
         },
     )
-    _finalize(m, adapter_dir)
+    _finalize(m)
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
@@ -3110,7 +2731,7 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
     return adir if os.path.isdir(adir) else None
 
 
-def _finalize(metrics: RunMetrics, adapter_dir: str):
+def _finalize(metrics: RunMetrics):
     metrics.save("/tmp/metrics.json")
     # Required: a swallowed upload would make the control plane fail/retry a finished run.
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
@@ -3120,53 +2741,6 @@ def _finalize(metrics: RunMetrics, adapter_dir: str):
     hf_upload_file("/tmp/DONE", "DONE", required=True)
     heartbeat("done")
     print("NODE DONE:", metrics.to_json())
-
-
-def _drop_fla_on_hopper() -> None:
-    """Remove flash-linear-attention when running on a Hopper GPU (sm90, H100).
-
-    fla's gated chunk_bwd Triton kernel is miscomputed on Hopper with Triton>=3.4 and
-    HARD-RAISES (fla #640), so every gated-delta (Qwen3.5/3.6 family) GRPO backward crashes.
-    The worker base image BAKES fla in, and per-run installs (extra_pip / `prime env install`)
-    can pull it back, so the only reliable place to drop it is HERE: in the worker process,
-    after all installs and BEFORE any model import. transformers then uses the correct
-    pure-PyTorch delta rule (2-3x slower but it RUNS). Runs on BOTH substrates (RunPod and
-    Vast both exec this module). importlib caches are invalidated so the later
-    is_fla_available() probe sees it gone. Ampere/Ada/Blackwell keep fla for the speedup.
-    """
-    import importlib.util
-    import subprocess
-
-    # The multi-trainer DDP launcher trains NOTHING (it re-execs the worker under accelerate and
-    # waits) so it has no fla backward to protect — and it stays alive the whole run, so the
-    # get_device_capability() probe below would bind a retained CUDA context on the first trainer card
-    # and starve/OOM rank 0 (the very hazard run_rl avoids by skipping wait_for_gpu/perf_backends on
-    # the launcher). Each accelerate child runs _drop_fla_on_hopper in its own rank-local process.
-    if _is_disaggregated_ddp_launcher():
-        print("[hopper] disaggregated DDP launcher: skip fla probe (children drop it rank-local)")
-        return
-
-    try:
-        import torch
-
-        if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
-            return  # not Hopper: fla's Triton kernel is correct here, keep it.
-    except Exception:
-        return
-
-    if importlib.util.find_spec("fla") is None:
-        return
-    # pip first (clears metadata); _remove_fla_from_disk then deletes any package dir pip left
-    # behind (incomplete RECORD / non-pip base-image install / a copy on another sys.path entry).
-    subprocess.run(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "flash-linear-attention"], check=False
-    )
-    removed, still = _remove_fla_from_disk()
-    print(
-        f"[hopper] fla removed {removed or 'nothing'} (still_importable={still}) -> "
-        f"{'WARNING fla remains' if still else 'pure-PyTorch delta rule'} (fla #640)",
-        flush=True,
-    )
 
 
 def main():
@@ -3216,7 +2790,16 @@ def main():
         # "same CUDA device ... for multiple distinct roles"). CUDA_VISIBLE_DEVICES only takes
         # effect before the first context, so this is the earliest safe point.
         _pin_trainer_devices_for_disaggregated()
-        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
+        # Hopper fla guard (see _drop_fla_on_hopper). SKIP on the multi-trainer DDP launcher: it
+        # trains NOTHING (re-execs the worker under accelerate and waits) so it has no fla backward
+        # to protect, and it stays alive the whole run — the get_device_capability() probe inside
+        # _drop_fla_on_hopper would bind a retained CUDA context on the first trainer card and
+        # starve/OOM rank 0 (the hazard run_rl avoids by skipping wait_for_gpu/perf_backends on the
+        # launcher). Each accelerate child runs the guard in its own rank-local process.
+        if _is_disaggregated_ddp_launcher():
+            print("[hopper] disaggregated DDP launcher: skip fla probe (children drop it rank-local)")
+        else:
+            _drop_fla_on_hopper()
         heartbeat("boot")
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
@@ -3263,3 +2846,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

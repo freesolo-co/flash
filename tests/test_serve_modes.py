@@ -67,7 +67,7 @@ def test_undeploy_calls_freesolo_delete(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr(deploy_mod.httpx, "delete", fake_delete)
-    out = undeploy_adapter("flash-1-abc", gpu_name="RTX 5090")
+    out = undeploy_adapter("flash-1-abc")
     assert out == ["flash-1-abc"]
     assert deleted_urls == ["https://serve.example/adapters/flash-1-abc"]
 
@@ -83,7 +83,7 @@ def test_undeploy_404_is_clean(monkeypatch):
             raise AssertionError("404 must not raise")
 
     monkeypatch.setattr(deploy_mod.httpx, "delete", lambda *a, **k: _Resp())
-    assert undeploy_adapter("flash-1-gone", gpu_name="RTX 5090") == []
+    assert undeploy_adapter("flash-1-gone") == []
 
 
 def test_serve_endpoint_name_is_cosmetic_label():

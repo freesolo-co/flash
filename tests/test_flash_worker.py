@@ -23,14 +23,11 @@ def _spec():
 
 
 def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
-    """DEFECT: RL_VLLM_GPU_UTIL / RL_PER_DEVICE_PROMPTS (and the others) were never added to
-    the forward list, so the docs' OOM-fix advice couldn't reach the worker."""
+    """The worker-side knobs the worker / vLLM actually read are forwarded to the GPU worker."""
     from flash.providers.runpod.train import build_worker_env
 
     knobs = {
-        "RL_VLLM_GPU_UTIL": "0.40",
         "RL_VLLM_SLEEP": "1",
-        "RL_PER_DEVICE_PROMPTS": "2",
         "VLLM_USE_V1": "0",
         "SFT_PER_DEVICE_BS": "4",
     }
@@ -52,33 +49,14 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
 
 
-def test_build_worker_env_forwards_midrun_eval_knobs(monkeypatch):
-    """The periodic mid-run eval knobs are read via os.environ on the worker, so they MUST be
-    on the forward allowlist or the feature silently no-ops on every remote run (RunPod + Vast,
-    which reuses this same build_worker_env)."""
+def test_build_worker_env_does_not_forward_eval_cadence(monkeypatch):
+    """Mid-run eval cadence is NOT an env var: the worker resolves it from the run's
+    [train] eval_every_steps and ignores FLASH_EVAL_EVERY_STEPS (see
+    test_eval_config_ignores_env_cadence_override), so build_worker_env must NOT forward it."""
     from flash.providers.runpod.train import build_worker_env
 
-    knobs = {
-        "FLASH_EVAL_EVERY_STEPS": "20",
-        "FLASH_EVAL_NUM": "16",
-    }
-    for k, v in knobs.items():
-        monkeypatch.setenv(k, v)
-    env = build_worker_env(_spec(), 0)
-    for k, v in knobs.items():
-        assert env.get(k) == v, f"{k} not forwarded to worker"
-
-
-def test_build_worker_env_forwards_heartbeat_throttle(monkeypatch):
-    """FLASH_HEARTBEAT_MIN_S is read by engine.worker on the GPU side to throttle rl_step
-    heartbeat commits under HuggingFace's 128/hr-per-repo cap; operators raise it when several
-    concurrent GRPO runs share one HF_REPO, so it MUST be on the forward allowlist."""
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.setenv("FLASH_HEARTBEAT_MIN_S", "180")
-    assert build_worker_env(_spec(), 0).get("FLASH_HEARTBEAT_MIN_S") == "180"
-    monkeypatch.delenv("FLASH_HEARTBEAT_MIN_S", raising=False)
-    assert "FLASH_HEARTBEAT_MIN_S" not in build_worker_env(_spec(), 0)
+    monkeypatch.setenv("FLASH_EVAL_EVERY_STEPS", "20")
+    assert "FLASH_EVAL_EVERY_STEPS" not in build_worker_env(_spec(), 0)
 
 
 def test_build_worker_env_forwards_judge_model(monkeypatch):
@@ -103,21 +81,31 @@ def test_build_worker_env_forwards_prime_api_key(monkeypatch):
     assert "PRIME_API_KEY" not in build_worker_env(_spec(), 0)
 
 
-def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
-    """The opt-in chalk-kernel install hook (engine.chalk_kernels) runs inside the worker
-    subprocess and selects which install-on-call chalk installers to run from FLASH_* flags read
-    from its OWN process env, so an operator-set FLASH_* selection (and FLASH_CHALK_SPEC) MUST be
-    forwarded by the allowlist or every chalk kernel silently no-ops on every remote run."""
+def test_build_worker_env_forwards_upload_console(monkeypatch):
+    """FLASH_UPLOAD_CONSOLE (upload the worker console on SUCCESS, not just on crash) is read on the
+    worker by run_mode() from the forwarded env dict — RunPod _train_body AND the Vast bootstrap,
+    both of which reuse this build_worker_env. It MUST be on the allowlist or the success-console
+    upload silently no-ops on every remote run."""
     from flash.providers.runpod.train import build_worker_env
 
+    monkeypatch.setenv("FLASH_UPLOAD_CONSOLE", "1")
+    assert build_worker_env(_spec(), 0).get("FLASH_UPLOAD_CONSOLE") == "1"
+    monkeypatch.delenv("FLASH_UPLOAD_CONSOLE", raising=False)
+    assert "FLASH_UPLOAD_CONSOLE" not in build_worker_env(_spec(), 0)
+
+
+def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
+    """The chalk-kernel install hook (engine.chalk_kernels) runs inside the worker subprocess and
+    resolves which chalk kernels to apply from FLASH_* flags read from its OWN process env (gap-
+    fillers default-on; FLASH_* are overrides). So an operator-set FLASH_* override (and
+    FLASH_CHALK_SPEC) MUST be forwarded by the allowlist or it silently no-ops on every remote run."""
+    from flash.providers.runpod.train import build_worker_env
+
+    # Exactly the per-kernel boolean flags in chalk_kernels._KERNELS (one per
+    # apply_chalk_kernel_to_qwen35 keyword) plus the chalk install spec.
     flags = {
         "FLASH_MLP_KERNEL": "1",
-        "FLASH_MLP_FP8": "1",
-        "FLASH_MLP_FP8_DOWN": "0",
         "FLASH_FP8_BASE": "1",
-        "FLASH_FP8_BASE_ATTN": "0",
-        "FLASH_FP8_BASE_MLP": "1",
-        "FLASH_FP8_BASE_MIN_K": "512",
         "FLASH_TRITON_LORA": "1",
         "FLASH_EMBED_KERNEL": "1",
         "FLASH_QKV_KERNEL": "1",
@@ -139,7 +127,6 @@ def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
 def _clear_chalk_flags(monkeypatch):
     for k in (
         "FLASH_MLP_KERNEL",
-        "FLASH_MLP_FP8",
         "FLASH_FP8_BASE",
         "FLASH_TRITON_LORA",
         "FLASH_EMBED_KERNEL",
@@ -150,23 +137,32 @@ def _clear_chalk_flags(monkeypatch):
         monkeypatch.delenv(k, raising=False)
 
 
-def test_chalk_extra_pip_empty_without_flags(monkeypatch):
-    """No FLASH_* kernel flag -> nothing added to the worker's extra_pip (default = no chalk)."""
+# The three default-on gap-filler flags (chalk_kernels._KERNELS): disabling exactly these
+# deselects chalk. QKV/MLP/FP8 base are opt-in (default-off) and need no flag to stay off.
+_DEFAULT_ON_CHALK_FLAGS = ("FLASH_ROPE_KERNEL", "FLASH_TRITON_LORA", "FLASH_EMBED_KERNEL")
+
+
+def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
+    """Default (no FLASH_* flags) -> chalk's gap-fillers are ON, so a set FLASH_CHALK_SPEC IS
+    appended to extra_pip (chalk installs + auto-applies, like Liger)."""
     from flash.providers.runpod.train import chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")  # spec alone must not opt in
-    assert chalk_extra_pip() == []
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")
+    assert chalk_extra_pip() == ["freesolo-chalk"]
 
 
-def test_chalk_extra_pip_empty_without_spec(monkeypatch):
-    """A kernel flag is set but FLASH_CHALK_SPEC is unset -> nothing added (chalk is unpublished,
-    can't auto-install) — install_chalk_kernels then safely no-ops on the worker."""
-    from flash.providers.runpod.train import chalk_extra_pip
+def test_chalk_extra_pip_defaults_to_pypi_without_spec(monkeypatch):
+    """chalk is published on PyPI, so a SELECTED run with FLASH_CHALK_SPEC unset auto-installs the
+    VERSION-PINNED PyPI package by default (just like Liger) — no operator spec required, and a
+    breaking release can't silently land (the pin is bounded)."""
+    from flash.providers.runpod.train import DEFAULT_CHALK_SPEC, chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
     monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
-    assert chalk_extra_pip() == []
+    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
+    assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk")
+    assert "<" in DEFAULT_CHALK_SPEC  # bounded range, not an unpinned floating install
 
 
 def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):
@@ -180,12 +176,15 @@ def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):
     assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
 
 
-def test_chalk_extra_pip_falsey_flag_does_not_opt_in(monkeypatch):
-    """FLASH_*=0 is inert: a leftover 0 must not pull chalk in even with a spec set."""
+def test_chalk_extra_pip_all_kernels_disabled_adds_nothing(monkeypatch):
+    """Disabling every default-on gap-filler (FLASH_<K>=0 on ROPE/TRITON_LORA/EMBED) -> chalk not
+    selected -> nothing added, even with a spec set. The opt-in kernels (QKV/MLP/FP8 base) are
+    default-off, so they need no flag to keep chalk deselected."""
     from flash.providers.runpod.train import chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "0")
+    for k in _DEFAULT_ON_CHALK_FLAGS:
+        monkeypatch.setenv(k, "0")
     monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")
     assert chalk_extra_pip() == []
 
@@ -202,22 +201,17 @@ def _spec_worker_env(worker_env: dict):
     )
 
 
-def test_chalk_extra_pip_detects_per_run_worker_env_optin(monkeypatch):
-    """DEFECT: a run that enables chalk only via its [worker_env] block (not the control-plane
-    process env) was NOT detected — chalk_extra_pip read bare os.environ, so the spec was never
-    appended and the kernels never installed for that run. The effective worker env (worker_env
-    merged over os.environ) must be what decides selection + the FLASH_CHALK_SPEC lookup."""
-    from flash.providers.runpod.train import chalk_extra_pip
+def test_chalk_extra_pip_per_run_worker_env_spec_override(monkeypatch):
+    """A per-run [worker_env] FLASH_CHALK_SPEC overrides the PyPI default for THAT run — resolved
+    against the effective worker env (worker_env merged over os.environ), not bare os.environ, so a
+    per-run source pin actually reaches the worker's extra_pip."""
+    from flash.providers.runpod.train import DEFAULT_CHALK_SPEC, chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)  # nothing in os.environ
-    spec = _spec_worker_env(
-        {
-            "FLASH_FP8_BASE": "1",
-            "FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main",
-        }
-    )
-    # bare process env -> nothing; the opt-in lives only in [worker_env]
-    assert chalk_extra_pip() == []
+    spec = _spec_worker_env({"FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main"})
+    # bare env: chalk's gap-fillers are default-on -> the version-pinned PyPI default installs
+    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
+    # the per-run [worker_env] spec overrides the source for that run
     assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
 
 
@@ -267,17 +261,17 @@ def test_chalk_extra_pip_worker_env_spec_with_os_env_flag(monkeypatch):
 
 
 def test_chalk_extra_pip_worker_env_overrides_os_env_flag(monkeypatch):
-    """[worker_env] wins over os.environ (same precedence build_worker_env applies): a per-run
-    FLASH_*=0 must DISABLE a chalk flag set globally, so chalk is not installed for that run."""
+    """[worker_env] wins over os.environ. chalk is default-on, so to turn it OFF for a run, every
+    default-on gap-filler (ROPE/TRITON_LORA/EMBED) must be disabled via [worker_env] (selection is
+    binary: install chalk or not). The opt-in kernels are default-off and need no flag."""
     from flash.providers.runpod.train import chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # global opt-in
     monkeypatch.setenv("FLASH_CHALK_SPEC", "git+https://github.com/freesolo-co/chalk@main")
-    # without an override the global flag opts in
+    # default-on -> chalk selected, spec appended
     assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
-    # a per-run [worker_env] FLASH_MLP_KERNEL=0 turns it OFF for this run
-    spec = _spec_worker_env({"FLASH_MLP_KERNEL": "0"})
+    # a per-run [worker_env] disabling every default-on gap-filler turns chalk off for that run
+    spec = _spec_worker_env(dict.fromkeys(_DEFAULT_ON_CHALK_FLAGS, "0"))
     assert chalk_extra_pip(spec) == []
 
 

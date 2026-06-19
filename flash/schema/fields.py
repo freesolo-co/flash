@@ -1,0 +1,231 @@
+"""Field-level validators/coercers for Flash TOML config parsing.
+
+Leaf helpers split out of ``flash.schema``: the ``ConfigError`` type, the [train] scalar
+validators, the slug/worker-env/wandb validators, and the ``--set`` scalar coercer. None
+reference the rest of the schema package; the package ``__init__`` re-exports them.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+from flash.spec import WandbSpec
+
+
+def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
+    """Validate an optional integer [train] knob (>= minimum) -> ConfigError (HTTP 400).
+
+    None stays None (recipe default). Rejects bools, non-numbers, non-integers, and
+    out-of-range values at parse time instead of letting them reach a provisioned worker.
+    """
+    v = train_raw.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ConfigError(f"train.{key} must be an integer")
+    # Check finiteness BEFORE int(v): int(inf) raises OverflowError and int(nan) ValueError
+    # (the former would be a 500); reject both as a clean 400.
+    if not math.isfinite(v) or float(v) != int(v):
+        raise ConfigError(f"train.{key} must be a finite integer")
+    v = int(v)
+    if v < minimum:
+        raise ConfigError(f"train.{key} must be >= {minimum}")
+    return v
+
+
+def _require_int(value: Any, label: str, *, minimum: int, default: int) -> int:
+    """Coerce a TOML scalar to a finite integer >= minimum, rejecting bools/non-numbers/non-integer floats.
+
+    Shares the [train]-knob discipline (see _train_int): a bare ``int()`` silently truncates
+    ``2.9`` -> ``2`` and accepts ``true`` as ``1``, which for a topology field like ``[gpu] count``
+    would provision a different split than requested instead of failing validation. An
+    integer-valued float (e.g. ``2.0``) is accepted (it equals its truncation); only non-integer
+    floats are rejected. Missing/None falls back to ``default``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{label} must be an integer")
+    if not math.isfinite(value) or float(value) != int(value):
+        raise ConfigError(f"{label} must be a finite integer")
+    v = int(value)
+    if v < minimum:
+        raise ConfigError(f"{label} must be >= {minimum}")
+    return v
+
+
+def _train_float(
+    train_raw: dict,
+    key: str,
+    *,
+    minimum: float,
+    exclusive: bool = False,
+    maximum: float | None = None,
+) -> float | None:
+    """Validate an optional float [train] knob -> ConfigError (HTTP 400). None stays None."""
+    v = train_raw.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ConfigError(f"train.{key} must be a number")
+    v = float(v)
+    # nan/inf slip past the range checks below (nan compares false, inf passes any minimum)
+    # and would reach TRL optimizer/sampling settings; reject them as a 400 here.
+    if not math.isfinite(v):
+        raise ConfigError(f"train.{key} must be a finite number")
+    if exclusive and v <= minimum:
+        raise ConfigError(f"train.{key} must be > {minimum}")
+    if not exclusive and v < minimum:
+        raise ConfigError(f"train.{key} must be >= {minimum}")
+    if maximum is not None and v > maximum:
+        raise ConfigError(f"train.{key} must be between {minimum} and {maximum}")
+    return v
+
+
+def _train_stops(train_raw: dict) -> tuple[str, ...]:
+    """Validate stop_sequences -> ConfigError. A string is ONE stop (never char-split);
+    a list must hold strings; empties are dropped; anything else is rejected."""
+    v = train_raw.get("stop_sequences")
+    if v is None:
+        return ()
+    if isinstance(v, str):
+        return (v,) if v else ()
+    if not isinstance(v, (list, tuple)):
+        raise ConfigError("train.stop_sequences must be a string or a list of strings")
+    for s in v:
+        if not isinstance(s, str):
+            raise ConfigError("train.stop_sequences entries must be strings")
+    return tuple(s for s in v if s)
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def _require_slug(value: str, message: str) -> None:
+    """Require a Prime Hub-style "owner/name" slug: exactly one slash, both parts
+    non-empty. Raises ConfigError(message) otherwise. Centralizes the rule used for
+    [environment] id, eval_env_id, and train.hf_repo so they cannot drift apart."""
+    parts = value.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ConfigError(message)
+
+
+def _coerce_scalar(value: str):
+    low = value.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _worker_env(raw: Any) -> dict[str, str]:
+    """Parse the optional [worker_env] table: per-run worker env overrides (string-valued)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("[worker_env] must be a table of string key/values")
+    env = {str(k): str(v) for k, v in raw.items()}
+    # Env var NAMES must be usable by subprocess.Popen(env=...) on the worker, which raises
+    # ValueError for an empty name or one containing '=' or a NUL byte (and whitespace breaks most
+    # shells). Reject these at parse time so a malformed [worker_env] (e.g. a TOML quoted key like
+    # "BAD=KEY", or an empty key) fails on config load — not after a worker has been provisioned.
+    bad_names = sorted(repr(k) for k in env if (not k) or any(c in k for c in "=\0 \t\n\r"))
+    if bad_names:
+        raise ConfigError(
+            f"[worker_env] has invalid environment variable name(s): {', '.join(bad_names)}; an "
+            "env var name must be non-empty and contain no '=', whitespace, or NUL byte"
+        )
+    # [worker_env] is serialized into job_spec_json (persisted + logged), so it must NOT carry
+    # secrets — they would leak into run artifacts. Reject secret-looking keys; operators set
+    # those as real process environment variables (forwarded to the worker out-of-band) instead.
+    # Detect by `_`-delimited WORD components (not substring): flag a secret WORD, or `KEY`
+    # qualified by a credential context. This catches HF_TOKEN, *_API_KEY, SECRET_KEY, INTERNAL_KEY,
+    # CREDENTIAL, AWS_SECRET_ACCESS_KEY, GITHUB_PAT (PAT word), and credential keys like SSH_KEY /
+    # DEPLOY_KEY / GPG_KEY (KEY qualified by a credential context) — while allowing legit knobs whose
+    # names merely contain a marker (RL_VLLM_MAX_BATCHED_TOKENS -> word TOKENS, not TOKEN; a bare
+    # SORT_KEY -> KEY without a secret qualifier).
+    _secret_words = {
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PASSPHRASE",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "APIKEY",
+        "PRIVATEKEY",
+        "PAT",  # personal access token (e.g. GITHUB_PAT, GH_PAT)
+    }
+    _key_qualifiers = {
+        "API",
+        "SECRET",
+        "PRIVATE",
+        "ACCESS",
+        "INTERNAL",
+        "AUTH",
+        "SIGNING",
+        "ENCRYPTION",
+        # credential-key contexts: SSH_KEY, DEPLOY_KEY, GPG_KEY, RSA_KEY, TLS/SSL/PEM keys, etc.
+        "SSH",
+        "DEPLOY",
+        "GPG",
+        "PGP",
+        "RSA",
+        "PEM",
+        "SSL",
+        "TLS",
+    }
+
+    def _is_secret_key(name: str) -> bool:
+        words = set(name.upper().split("_"))
+        return bool(words & _secret_words) or ("KEY" in words and bool(words & _key_qualifiers))
+
+    secrets = sorted(k for k in env if _is_secret_key(k))
+    if secrets:
+        raise ConfigError(
+            f"[worker_env] must not contain secret-bearing keys ({', '.join(secrets)}); these are "
+            "serialized into run artifacts — set them as real environment variables instead"
+        )
+    return env
+
+
+# Allowed [wandb] config keys -> typed JobSpec.wandb fields (first-class spec config, NOT env vars).
+_WANDB_KEYS = ("project", "run_name")
+
+
+def _wandb_spec(raw: Any) -> WandbSpec:
+    """Parse the optional ``[wandb]`` table into a typed ``WandbSpec`` (project / run_name).
+
+    These are non-secret W&B naming labels carried as first-class spec config (round-tripped in
+    the job-spec JSON the worker reads), NOT environment variables. The worker honors them in
+    ``engine.worker.wandb_report_to`` / ``wandb_run_name``, so a run can land in its own W&B
+    project under its own run name instead of the hardcoded ``flash`` / ``flash-…`` defaults.
+    Settable in TOML (``[wandb] project = …``) or via ``slm train cfg.toml --set
+    wandb.project=… --set wandb.run_name=…``. The actual W&B credential (WANDB_API_KEY) stays an
+    env-var secret — only the naming config lives here."""
+    if raw is None:
+        return WandbSpec()
+    if not isinstance(raw, dict):
+        raise ConfigError('[wandb] must be a table (e.g. project = "my-project")')
+    unknown = sorted(set(raw) - set(_WANDB_KEYS))
+    if unknown:
+        raise ConfigError(
+            f"[wandb] unknown key(s): {', '.join(unknown)} (allowed: {', '.join(_WANDB_KEYS)})"
+        )
+    values: dict[str, str] = {}
+    for key in _WANDB_KEYS:
+        if key not in raw:
+            continue
+        val = raw[key]
+        if not isinstance(val, str) or not val.strip():
+            raise ConfigError(f"[wandb] {key} must be a non-empty string")
+        values[key] = val.strip()
+    return WandbSpec(**values)

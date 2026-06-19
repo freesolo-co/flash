@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import math
 import os
 import tomllib
 from typing import Any
 
-from .catalog import MODELS, normalize_algorithm, resolve_model
-from .providers import PROVIDER_NAMES
-from .providers.base import (
+from flash.catalog import MODELS, normalize_algorithm, resolve_model
+from flash.providers import PROVIDER_NAMES
+from flash.providers.base import (
     POLICY_NAMES,
     SUPPORTED,
     UnsupportedGpuError,
@@ -19,106 +18,18 @@ from .providers.base import (
     resolve_gpu_policy,
     unvalidated_allowed,
 )
-from .spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
-
-
-def _require_int(value: Any, label: str, *, minimum: int, default: int) -> int:
-    """Coerce a TOML scalar to a finite integer >= minimum, rejecting bools/non-numbers/non-integer floats.
-
-    Shares the [train]-knob discipline (see _train_int): a bare ``int()`` silently truncates
-    ``2.9`` -> ``2`` and accepts ``true`` as ``1``, which for a topology field like ``[gpu] count``
-    would provision a different split than requested instead of failing validation. An
-    integer-valued float (e.g. ``2.0``) is accepted (it equals its truncation); only non-integer
-    floats are rejected. Missing/None falls back to ``default``.
-    """
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ConfigError(f"{label} must be an integer")
-    if not math.isfinite(value) or float(value) != int(value):
-        raise ConfigError(f"{label} must be a finite integer")
-    v = int(value)
-    if v < minimum:
-        raise ConfigError(f"{label} must be >= {minimum}")
-    return v
-
-
-def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
-    """Validate an optional integer [train] knob (>= minimum) -> ConfigError (HTTP 400).
-
-    None stays None (recipe default). Rejects bools, non-numbers, non-integers, and
-    out-of-range values at parse time instead of letting them reach a provisioned worker.
-    """
-    v = train_raw.get(key)
-    if v is None:
-        return None
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        raise ConfigError(f"train.{key} must be an integer")
-    # Check finiteness BEFORE int(v): int(inf) raises OverflowError and int(nan) ValueError
-    # (the former would be a 500); reject both as a clean 400.
-    if not math.isfinite(v) or float(v) != int(v):
-        raise ConfigError(f"train.{key} must be a finite integer")
-    v = int(v)
-    if v < minimum:
-        raise ConfigError(f"train.{key} must be >= {minimum}")
-    return v
-
-
-def _train_float(
-    train_raw: dict,
-    key: str,
-    *,
-    minimum: float,
-    exclusive: bool = False,
-    maximum: float | None = None,
-) -> float | None:
-    """Validate an optional float [train] knob -> ConfigError (HTTP 400). None stays None."""
-    v = train_raw.get(key)
-    if v is None:
-        return None
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        raise ConfigError(f"train.{key} must be a number")
-    v = float(v)
-    # nan/inf slip past the range checks below (nan compares false, inf passes any minimum)
-    # and would reach TRL optimizer/sampling settings; reject them as a 400 here.
-    if not math.isfinite(v):
-        raise ConfigError(f"train.{key} must be a finite number")
-    if exclusive and v <= minimum:
-        raise ConfigError(f"train.{key} must be > {minimum}")
-    if not exclusive and v < minimum:
-        raise ConfigError(f"train.{key} must be >= {minimum}")
-    if maximum is not None and v > maximum:
-        raise ConfigError(f"train.{key} must be between {minimum} and {maximum}")
-    return v
-
-
-def _train_stops(train_raw: dict) -> tuple[str, ...]:
-    """Validate stop_sequences -> ConfigError. A string is ONE stop (never char-split);
-    a list must hold strings; empties are dropped; anything else is rejected."""
-    v = train_raw.get("stop_sequences")
-    if v is None:
-        return ()
-    if isinstance(v, str):
-        return (v,) if v else ()
-    if not isinstance(v, (list, tuple)):
-        raise ConfigError("train.stop_sequences must be a string or a list of strings")
-    for s in v:
-        if not isinstance(s, str):
-            raise ConfigError("train.stop_sequences entries must be strings")
-    return tuple(s for s in v if s)
-
-
-class ConfigError(ValueError):
-    pass
-
-
-def _require_slug(value: str, message: str) -> None:
-    """Require a Prime Hub-style "owner/name" slug: exactly one slash, both parts
-    non-empty. Raises ConfigError(message) otherwise. Centralizes the rule used for
-    [environment] id, eval_env_id, and train.hf_repo so they cannot drift apart."""
-    parts = value.split("/")
-    if len(parts) != 2 or not all(parts):
-        raise ConfigError(message)
+from flash.schema.fields import (
+    ConfigError,
+    _coerce_scalar,
+    _require_int,
+    _require_slug,
+    _train_float,
+    _train_int,
+    _train_stops,
+    _wandb_spec,
+    _worker_env,
+)
+from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
 
 def load_toml(path: str) -> dict[str, Any]:
@@ -151,20 +62,6 @@ def _deep_merge(base: dict, extra: dict) -> dict:
     return base
 
 
-def _coerce_scalar(value: str):
-    low = value.strip().lower()
-    if low in ("true", "false"):
-        return low == "true"
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    try:
-        return float(value)
-    except ValueError:
-        return value
-
-
 def _apply_override(raw: dict, item: str) -> None:
     if "=" not in item:
         raise ConfigError(f"--set must be key=value, got {item!r}")
@@ -178,7 +75,13 @@ def _apply_override(raw: dict, item: str) -> None:
     leaf = parts[-1]
     # support list values like seeds=[0,1]
     val = value.strip()
-    if val.startswith("[") and val.endswith("]"):
+    # [wandb] leaves are string-valued labels (project / run name); a numeric- or
+    # bool-looking value like `--set wandb.run_name=123` is still the string label the
+    # user intends. Preserve it as a string instead of coercing it to int/float/bool
+    # (which _wandb_spec's string validation would otherwise reject).
+    if parts[0] == "wandb":
+        node[leaf] = val
+    elif val.startswith("[") and val.endswith("]"):
         inner = val[1:-1].strip()
         node[leaf] = [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
     else:
@@ -283,6 +186,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true"
         )
 
+    # worker_env is the lower-level per-run escape hatch ([worker_env] table, string-valued,
+    # secret-guarded). The optional [wandb] naming table is a separate, typed spec field
+    # (JobSpec.wandb) — NOT folded into worker_env env vars.
+    worker_env = _worker_env(raw.get("worker_env"))
+    wandb_spec = _wandb_spec(raw.get("wandb"))
+
     spec = JobSpec(
         model=model,
         algorithm=algorithm,
@@ -348,8 +257,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             datacenter=gpu_raw.get("datacenter"),
         ),
         run_id=run_id or raw.get("run_id", "local"),
+        worker_env=worker_env,
         model_policy=model_policy,
         thinking=thinking,
+        wandb=wandb_spec,
     )
     _validate_spec(spec)
     return spec
@@ -528,7 +439,7 @@ def _validate_spec(spec: JobSpec) -> None:
     # /spec parse, CLI --dry-run via load) reject a 35B-A3B colocate or multi-trainer split here
     # instead of letting it pass dry-run and fail only at submit.
     if spec.model in MODELS:
-        from .engine.rollout_bench import validate_disaggregated_requirement
+        from flash.engine.rollout_bench import validate_disaggregated_requirement
 
         _info = MODELS[spec.model]
         try:
