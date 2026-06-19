@@ -133,11 +133,13 @@ def _is_moe_model(model_id: str) -> bool:
 
     The catalog is consulted first, but an open model (``model_policy="allow"``, not listed) the
     worker would still detect as MoE via ``AutoConfig`` is invisible to a catalog-only test — so we
-    fall back to the SAME HF probe the worker uses (``num_experts`` / ``n_routed_experts`` /
-    ``model_type`` contains "moe"). An unknown model whose probe is uncertain (offline /
-    FLASH_SKIP_NET / config unreadable) is treated as dense — the conservative side, matching the
-    worker's own uncertain-path downgrade to TP, since TP sizing shards the server and never
-    under-provisions a dense card."""
+    fall back to the same expert-count HF probe the worker uses (``num_experts`` /
+    ``n_routed_experts`` / ``model_type`` contains "moe"), but with ``trust_remote_code=False``:
+    the control plane must not run a model's arbitrary remote config code merely to size a rollout.
+    An unknown model whose probe is uncertain (offline / FLASH_SKIP_NET / config unreadable, incl.
+    a custom-architecture MoE that needs remote code) is treated as dense — the conservative side,
+    matching the worker's own uncertain-path downgrade to TP, since TP sizing shards the server and
+    never under-provisions a dense card."""
     try:
         from flash.catalog import get_model
 
@@ -153,7 +155,12 @@ def _is_moe_model(model_id: str) -> bool:
     try:
         from transformers import AutoConfig
 
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        # trust_remote_code=False on the CONTROL PLANE: this sizing probe must not execute a
+        # model's arbitrary remote config code just to read expert counts. A custom-architecture
+        # MoE whose config only loads with remote code can't be probed here and falls through to
+        # the conservative dense/TP side below — which never under-provisions (TP shards the
+        # server), matching the worker's own uncertain-path downgrade to TP.
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
         return bool(
             getattr(cfg, "num_experts", 0) or getattr(cfg, "n_routed_experts", 0)
         ) or "moe" in (getattr(cfg, "model_type", "") or "").lower()

@@ -1199,6 +1199,83 @@ def test_attach_no_capacity_excludes_recovered_class_on_reprovision(monkeypatch)
         assert gpus_seen[0] != "RTX 5090"
 
 
+def test_resume_run_carries_persisted_starved_exclusion(monkeypatch):
+    # PR #4 review (thread 2): the no_capacity recovery branch clears `remote` and records
+    # `resume_seed_index` for a control-plane restart, but it ALSO persists the just-starved
+    # (provider, class) into `resume_starved`. If the control plane restarts in the handle-less
+    # re-provision gap, recover_runs dispatches to resume_run (no live job to attach to), which
+    # starts a FRESH seed loop. Without rehydrating `resume_starved` that loop has an empty
+    # exclusion and can immediately re-pick the throttled class. Assert resume_run feeds the
+    # persisted pair into the FIRST allocation and lands on a different class.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+
+        spec = JobSpec(
+            run_id="resstarve",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", requested="cheapest", provider="runpod", max_retries=2),
+        )
+        # Persist the post-recovery, handle-less resume state the no_capacity branch leaves:
+        # remote cleared, resume_seed_index recorded, and the starved pair stashed.
+        status = orch.RunStatus(
+            run_id="resstarve",
+            state="running",
+            spec=spec.to_dict(),
+            remote=None,
+            resume_seed_index=0,
+            resume_starved=[["runpod", "RTX 5090"]],
+        )
+        orch._save_status(status)
+
+        # Round-trip through disk to prove the field survives (de)serialization, as it would
+        # across a real control-plane restart.
+        reloaded = orch.get_status("resstarve")
+        assert reloaded.resume_starved == [["runpod", "RTX 5090"]]
+
+        real_allocate = allocator.allocate
+        excluded_seen: list[frozenset] = []
+
+        def spy_allocate(*a, **k):
+            excluded_seen.append(frozenset(k.get("exclude_gpu_classes", frozenset())))
+            return real_allocate(*a, **k)
+
+        monkeypatch.setattr(allocator, "allocate", spy_allocate)
+
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep2", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        st = orch.resume_run("resstarve", log_stream=sys.stderr)
+
+        assert st.state == "done"
+        # The FIRST resumed allocation excluded the persisted, provider-scoped starved pair.
+        assert excluded_seen, "resume did not re-allocate"
+        assert ("runpod", "RTX 5090") in excluded_seen[0]
+        # And it landed on a different class than the one that starved.
+        assert gpus_seen
+        assert gpus_seen[0] != "RTX 5090"
+        # Terminal done clears the persisted exclusion so it can't leak into a later resume.
+        assert st.resume_starved is None
+
+
 # ---------------------------------------------------------------------------
 # Cross-process cancel via REST handle + attach
 # ---------------------------------------------------------------------------

@@ -72,6 +72,13 @@ class RunStatus:
     # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds
     # after an inter-seed restart instead of failing the run (losing completed work).
     resume_seed_index: int | None = None
+    # (provider, class) pairs proven capacity-starved that the resumed seed's FIRST
+    # capacity walk must exclude. Persisted (as [[provider, class], ...] — JSON has no
+    # tuples) ONLY by the no_capacity recovery branch, so a control-plane restart in the
+    # handle-less re-provision gap resumes via recover_runs -> resume_run WITHOUT
+    # re-picking the throttled class. Cleared once a fresh next seed is recorded (the new
+    # seed re-allocates against a clean market) and on terminal done.
+    resume_starved: list[list[str]] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -347,17 +354,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 resume_index = 0
             # Drop the now-dead handle so a cancel / restart in the re-provision gap can't reattach
             # to the deleted endpoint; _run_seed_loop's next on_handle records the fresh one.
-            # Record the resume index too: in the handle-less re-provision gap a control-plane
-            # restart must RESUME this seed (recover_runs' resume_seed_index branch) rather than
-            # fall through to "server restarted before job submission" and fail the run.
-            # _run_seed_loop advances/clears resume_seed_index as it goes, so no stale index lingers.
-            _update(run_id, "running", remote=None, resume_seed_index=resume_index)
-            print(
-                f"recovery: {run_id} seed {seed} was IN_QUEUE with no capacity; "
-                "re-provisioning via the capacity walk instead of failing",
-                file=log,
-                flush=True,
-            )
             # Carry the recovered (provider, class) into the resumed seed's capacity-walk
             # exclusion: it just proved ``no_capacity``, so the first allocation must not
             # re-pick it and burn another queue grace before walking. Scoped to the failing
@@ -366,6 +362,27 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 frozenset({(handle.provider, allocated_gpu)})
                 if allocated_gpu
                 else frozenset()
+            )
+            # Record the resume index AND the just-starved exclusion: in the handle-less
+            # re-provision gap a control-plane restart must RESUME this seed (recover_runs'
+            # resume_seed_index branch) rather than fall through to "server restarted before
+            # job submission". And resume_run starts a FRESH seed loop, so the starved pair
+            # has to be persisted here — otherwise the restarted walk has an empty exclusion
+            # and can immediately re-pick the throttled class. Persist as a list of lists
+            # (JSON has no tuples); resume_run rehydrates it. _run_seed_loop clears both as it
+            # advances to a fresh next seed, so no stale exclusion lingers past this seed.
+            _update(
+                run_id,
+                "running",
+                remote=None,
+                resume_seed_index=resume_index,
+                resume_starved=[list(pair) for pair in starved],
+            )
+            print(
+                f"recovery: {run_id} seed {seed} was IN_QUEUE with no capacity; "
+                "re-provisioning via the capacity walk instead of failing",
+                file=log,
+                flush=True,
             )
             _run_seed_loop(
                 spec,
@@ -450,12 +467,21 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
     spec = JobSpec.from_dict(status.spec)
     log = log_stream or sys.stderr
     print(f"resuming {run_id}: remaining seeds from index {status.resume_seed_index}", file=log)
+    # Rehydrate any proven-starved (provider, class) exclusion the no_capacity recovery
+    # branch persisted, so a restart in the re-provision gap doesn't re-pick the throttled
+    # class on the resumed seed's first capacity walk. Normal inter-seed resumes carry no
+    # such exclusion (the field is cleared when a fresh next seed is recorded), so this is
+    # an empty frozenset for them.
+    initial_starved = frozenset(
+        (pair[0], pair[1]) for pair in (status.resume_starved or []) if len(pair) == 2
+    )
     try:
         _run_seed_loop(
             spec,
             log,
             start_index=status.resume_seed_index,
             prior_cost=float(status.cost_usd or 0.0),
+            initial_starved=initial_starved,
         )
     except _RunCancelled:
         pass  # cancel_run already set the terminal state
@@ -1001,7 +1027,15 @@ def _run_seed_loop(
             spec.run_id,
             "running",
             cost_usd=total_cost,
-            **({"remote": None, "resume_seed_index": i + 1} if more_seeds else {}),
+            # Clear any persisted starved exclusion as we advance: the recovered seed it
+            # belonged to is done, and the next seed re-allocates against a clean market
+            # (mirrors the in-memory `starved` reset at the top of this loop). Leaving it
+            # would wrongly pre-exclude a now-recovered class on the next resumed seed.
+            **(
+                {"remote": None, "resume_seed_index": i + 1, "resume_starved": None}
+                if more_seeds
+                else {}
+            ),
         )
         print(
             f"seed={seed} done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}",
@@ -1019,6 +1053,7 @@ def _run_seed_loop(
         cost_usd=total_cost,
         artifacts_dir=artifacts_dir(spec),
         resume_seed_index=None,
+        resume_starved=None,
     )
 
 
