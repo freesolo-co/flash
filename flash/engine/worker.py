@@ -1391,7 +1391,11 @@ def _maybe_attach_periodic_eval(
     # eval queries + grading logic + completion budget all come from the environment / the run's
     # normal settings, not config.
     _train = JOB_SPEC.train if JOB_SPEC else None
-    cfg = _me.eval_config(max_new_default, spec_every=getattr(_train, "eval_every_steps", None))
+    cfg = _me.eval_config(
+        max_new_default,
+        spec_every=getattr(_train, "eval_every_steps", None),
+        spec_eval_examples=getattr(_train, "eval_examples", None),
+    )
     if cfg["every_steps"] <= 0:
         return None
     if is_tool_env:
@@ -1419,11 +1423,15 @@ def _maybe_attach_periodic_eval(
     # fails) — this runs at training start, so a raise here would abort the whole paid run. Guard
     # it: a broken eval split disables mid-run eval, never the training.
     try:
-        # Pass the cap as `limit` so the env getter materializes at most num_examples rows (a huge
-        # Hub eval/train split isn't fully built just to be sliced); the slice is a backstop for
-        # envs whose getter ignores `n`.
-        _cap = cfg["num_examples"] or None
-        examples = env.dataset("eval", limit=_cap)[: cfg["num_examples"]]
+        # Evaluate a RANDOM SAMPLE of num_examples held-out rows, not the whole split (generation
+        # is the cost; scoring the entire eval set every pass would dominate training) and not the
+        # first N (order-biased). Materialize a bounded pool (data load is cheap vs generation),
+        # then take a FIXED seeded subset so the same rows are scored every pass -> a comparable
+        # eval curve. `limit` bounds the pool; a verifiers getter that honors (n, seed) already
+        # returns a seeded slice, and the sample is the backstop for getters that ignore `n`.
+        n = cfg["num_examples"]
+        pool = env.dataset("eval", limit=max(n, _me.EVAL_POOL_CAP))
+        examples = _me.sample_eval_rows(pool, n)
     except Exception as exc:  # never let an eval-split failure abort training
         print(f"[rl][eval] could not materialize the eval split ({exc}); skipping mid-run eval")
         return None
