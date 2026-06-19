@@ -1303,7 +1303,13 @@ def compute_grpo_batching(
     # divided by num_processes; otherwise the effective batch (and unique_prompts/step) scales with
     # the rank count, and a small dataset can't fill even one step (the FSDP 0-real-steps bug seen on
     # 2:2). num_processes=1 (colocate / single-trainer 1:1/1:2) is unchanged.
-    grad_accum = max(1, target_comps // (per_device * nproc))
+    # Round UP (ceil), not floor: when target_comps is not an exact multiple of the global
+    # micro-batch (per_device * nproc) — e.g. batch_size=5, group=8, per_device=8, nproc=2 targets
+    # 40 completions but 40 // 16 == 2 yields only 32 (4 prompts, not the configured 5) — floor
+    # division silently trains a SMALLER batch than [train].batch_size requested. Ceiling reaches at
+    # least the configured prompts/step; the divisibility rounding below only ever raises it further.
+    _global_micro = per_device * nproc
+    grad_accum = max(1, -(-target_comps // _global_micro))
     # TRL rejects a GLOBAL completion batch (per_device * grad_accum * num_processes) that is not
     # divisible by num_generations (= group_size), failing only AFTER the paid worker is
     # provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the next multiple
@@ -1334,6 +1340,7 @@ def rl_per_device_comps(
     vocab: int = 152_000,
     *,
     use_vllm: bool = True,
+    colocated: bool = True,
     params_b: float | None = None,
 ) -> int:
     """Per-device *completion* micro-batch for GRPO (TRL counts completions, not prompts).
@@ -1354,6 +1361,12 @@ def rl_per_device_comps(
     MEASURED: Qwen3.5-2B (width ~1.41) group8 seq2048 OOMs a 32 GB card at per_device=8 but
     TRAINS at 4. So for colocate, additionally cap per_device to the live card's VRAM scaled
     by model width (~sqrt(params)): ~vram_gb/8 at 2B-width, tightened for wider models (4B/9B).
+
+    ``colocated`` gates ONLY that activation cap. In DISAGGREGATED mode the vLLM rollout server
+    runs on a SEPARATE GPU, so the trainer card carries neither the engine nor its KV pool/2nd
+    weight copy — the colocate activation cap would needlessly shrink per_device, inflating
+    grad-accum and undermining the very throughput the split is meant to measure. The logits
+    budget (a real per-device VRAM term) still applies in both modes. Defaults True (colocate).
     """
     base = int(os.environ.get("RL_PER_DEVICE_PROMPTS", "2" if THINKING else "8"))
     if "RL_PER_DEVICE_PROMPTS" in os.environ:
@@ -1363,7 +1376,7 @@ def rl_per_device_comps(
         budget = float(os.environ.get("RL_LOGITS_BUDGET_GB", "6")) * 1e9
         cap = max(1, int(budget / (max(1, completion_len) * vocab * 4)))
         base = min(base, cap)
-    if use_vllm:
+    if use_vllm and colocated:
         try:
             import torch
 
@@ -1661,6 +1674,28 @@ def _require_full_node_for_disaggregated(total_gpus: int, inference_gpus: int) -
         )
 
 
+def _bind_trainer_rank_local(where: str) -> None:
+    """Bind THIS accelerate rank to its LOCAL_RANK CUDA device before any CUDA context forms.
+
+    ``accelerate launch`` sets ONE comma-separated CUDA_VISIBLE_DEVICES for the whole trainer-only
+    child group and selects each rank's GPU via LOCAL_RANK — it does NOT slice CVD per rank. So
+    without an explicit set_device, every CUDA probe (e.g. _drop_fla_on_hopper's
+    get_device_capability in main(), wait_for_gpu, setup_perf_backends) lands on the group's cuda:0,
+    stacking every rank's startup context on the FIRST train GPU and starving/OOMing rank 0 on tight
+    DDP ratios. Idempotent — safe to call once early (main()) and again in run_rl (the Trainer later
+    selects the same device)."""
+    _local_rank = os.environ.get("LOCAL_RANK")
+    if _local_rank is None or not _local_rank.isdigit():
+        return
+    try:
+        import torch as _torch_rank
+
+        _torch_rank.cuda.set_device(int(_local_rank))
+        print(f"[rl][disagg] trainer-only child bound to cuda:{_local_rank} (LOCAL_RANK, {where})")
+    except Exception as _e:
+        print(f"[rl][disagg][warn] could not set_device(LOCAL_RANK={_local_rank}, {where}): {_e}")
+
+
 def _pin_trainer_devices_for_disaggregated() -> None:
     """Pin CUDA_VISIBLE_DEVICES to the TRAINER's devices before any CUDA context is created.
 
@@ -1681,6 +1716,12 @@ def _pin_trainer_devices_for_disaggregated() -> None:
     # rank see all train GPUs and collide. Leave the env exactly as accelerate set it.
     if _disagg.trainer_only_mode():
         print("[rl][disagg] trainer-only child: accelerate manages CUDA_VISIBLE_DEVICES; skip pin")
+        # Do NOT override CVD (accelerate's --gpu_ids already pinned the group), but DO bind this rank
+        # to its LOCAL_RANK device NOW: main() calls _drop_fla_on_hopper (get_device_capability) right
+        # after this, which would otherwise create the rank's CUDA context on the group's cuda:0 —
+        # before run_rl's set_device runs — stacking every rank on the first train GPU (fla #640 probe
+        # + DDP starvation). Binding here makes that earlier probe rank-local.
+        _bind_trainer_rank_local("early")
         return
     inference_gpus = int(JOB_SPEC.train.inference_gpus) if (JOB_SPEC and JOB_SPEC.train) else 0
     inference_gpus = _env_inference_gpus(inference_gpus)
@@ -1786,22 +1827,11 @@ def run_rl():
                 f"[rl][disagg] trainer-only child rank={os.environ.get('RANK','0')} "
                 f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} (accelerate-pinned)"
             )
-            # accelerate launch sets ONE comma-separated CUDA_VISIBLE_DEVICES for the whole child
-            # group and selects each rank's GPU via LOCAL_RANK — it does NOT slice CVD per rank. So
-            # without an explicit set_device, the CUDA probes below (wait_for_gpu's `device="cuda"`,
-            # setup_perf_backends) all land on the group's cuda:0, stacking every rank's startup
-            # context on the FIRST train GPU and starving/OOMing rank 0 on tight DDP ratios. Bind
-            # this rank to its LOCAL_RANK device up front so all subsequent CUDA work is rank-local
-            # (the Trainer/Accelerator later selects the same device).
-            _local_rank = os.environ.get("LOCAL_RANK")
-            if _local_rank is not None and _local_rank.isdigit():
-                try:
-                    import torch as _torch_rank
-
-                    _torch_rank.cuda.set_device(int(_local_rank))
-                    print(f"[rl][disagg] trainer-only child bound to cuda:{_local_rank} (LOCAL_RANK)")
-                except Exception as _e:
-                    print(f"[rl][disagg][warn] could not set_device(LOCAL_RANK={_local_rank}): {_e}")
+            # Re-affirm the rank-local binding (already done in main()'s early pin) so all CUDA work
+            # here (wait_for_gpu's `device="cuda"`, setup_perf_backends) is rank-local rather than
+            # stacking on the group's cuda:0. Idempotent; the Trainer/Accelerator later selects the
+            # same device.
+            _bind_trainer_rank_local("run_rl")
         # PiSSA's SVD init crashes in the CVD-pinned (non-zero device) disaggregated trainer
         # (peft set_data incompatible-tensor-type); fall back to standard LoRA init. setdefault so
         # an explicit operator [worker_env] FLASH_LORA_INIT still wins. Init method is irrelevant
@@ -1990,7 +2020,13 @@ def run_rl():
     # a per-device cap -> colocate OOM. Best-effort: stays None offline, keeping prior behavior.
     if _params_b is None:
         _params_b = fetch_hf_params_b(model_id)
-    per_device_comps = rl_per_device_comps(_max_completion, use_vllm=use_vllm, params_b=_params_b)
+    # colocated=not disaggregated: the colocate activation cap only applies when the rollout engine
+    # shares the trainer GPU. Disaggregated runs the engine on a separate card, so skip that cap (the
+    # logits-budget cap still applies) — otherwise per_device is shrunk and grad-accum inflated, which
+    # would cancel out the throughput the split exists to deliver.
+    per_device_comps = rl_per_device_comps(
+        _max_completion, use_vllm=use_vllm, colocated=not disaggregated, params_b=_params_b
+    )
     # In the FSDP trainer child the optimizer runs across train_gpus ranks, so the per-rank grad_accum
     # must be divided by that count (else the global batch over-scales and a small dataset yields 0
     # real steps). The single-process paths (colocate, 1:1/1:2 with one trainer GPU, and the launcher
@@ -2067,6 +2103,23 @@ def run_rl():
         grpo_kwargs["use_liger_kernel"] = True
         print("[rl] liger fused GRPO loss enabled")
     vllm_proc = None
+    # Reject an unsupported multi-turn / no-tool config BEFORE launching the paid rollout server.
+    # is_multi_turn, is_tool_env, and disaggregated are all known here; the tools accessor is pure.
+    # The wiring block far below re-derives the same use_rollout_func, but by then (in disaggregated
+    # mode) the standalone vllm-serve has already been booted + health-checked — minutes of a large
+    # rollout server, possibly surfacing a server-boot error instead of this config error. Decide it
+    # up front. (build_rollout_func/index building still happens at the wiring site for colocate.)
+    _tools_for_guard = ACTIVE_ENV.tools() if is_tool_env else []
+    use_rollout_func = is_multi_turn and not (is_tool_env and _tools_for_guard)
+    if use_rollout_func and disaggregated:
+        # The multi-turn rollout_func drives generation through TRL's IN-PROCESS vLLM engine; in
+        # disaggregated mode vLLM is a separate server (vllm_mode="server") with no in-process
+        # engine, so the rollout would fail at the first custom turn. Fail fast BEFORE server launch.
+        raise RuntimeError(
+            "multi-turn GRPO (custom rollout_func) is not supported with disaggregated rollout "
+            "(inference_gpus>0): it needs an in-process vLLM engine, but disaggregated runs vLLM as "
+            "a separate server. Use colocated GRPO (inference_gpus=0) for multi-turn / tool envs."
+        )
     if use_vllm and disaggregated:
         # Disaggregated: a separate `trl vllm-serve` process owns the inference GPU(s); the trainer
         # connects over loopback (vllm_mode="server") and TRL syncs the (PEFT-merged) policy weights
@@ -2379,22 +2432,15 @@ def run_rl():
         # tool-call loop natively; pure multi-turn envs hand TRL a rollout_func that drives the
         # env's own turn loop on the colocate engine (env_mask masks the non-model tokens).
         extra_trainer_kwargs: dict = {}
-        tools = ACTIVE_ENV.tools() if is_tool_env else []
+        # tools / use_rollout_func were already computed (and the disaggregated incompatibility
+        # rejected) ABOVE, before the rollout server launched, so reuse them here rather than
+        # re-deriving (single source of truth; the disaggregated raise can't reach this point).
+        tools = _tools_for_guard
         # A tool env exposing NO tools would silently degrade to single-shot under tools=[]; drive
         # it through the rollout_func turn loop instead so it isn't mis-trained as single-turn.
         if is_tool_env and not tools:
             print("[rl][warn] tool env exposes no tools — using the multi-turn rollout_func path")
-        use_rollout_func = is_multi_turn and not (is_tool_env and tools)
         require_vllm_for_rollout_func(use_rollout_func, use_vllm, model_id)
-        if use_rollout_func and disaggregated:
-            # The multi-turn rollout_func drives generation through TRL's IN-PROCESS vLLM engine; in
-            # disaggregated mode vLLM is a separate server (vllm_mode="server") with no in-process
-            # engine, so the rollout would fail at the first custom turn. Fail fast at setup.
-            raise RuntimeError(
-                "multi-turn GRPO (custom rollout_func) is not supported with disaggregated rollout "
-                "(inference_gpus>0): it needs an in-process vLLM engine, but disaggregated runs vLLM as "
-                "a separate server. Use colocated GRPO (inference_gpus=0) for multi-turn / tool envs."
-            )
         if is_tool_env and tools:
             extra_trainer_kwargs["tools"] = tools
             print(f"[rl] tool env: handing {len(tools)} tool(s) to TRL's native tool loop")

@@ -73,6 +73,47 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
+@pytest.mark.parametrize(
+    "key", ["FLASH_INFERENCE_GPUS", "FLASH_DISAGG_PARALLEL", "flash_disagg_parallel"]
+)
+def test_worker_env_rejects_topology_overrides(key) -> None:
+    """The disaggregated GPU split is sized/allocated/billed at submit time from
+    [train].inference_gpus; a per-run [worker_env] topology override would change the worker's split
+    after provisioning (OOM / mis-bill), so it must be rejected at parse (case-insensitively)."""
+    raw = _raw()
+    raw["worker_env"] = {key: "1"}
+    with pytest.raises(ConfigError, match="must not set the disaggregated-rollout topology"):
+        spec_from_dict(raw)
+
+
+def test_worker_env_allows_ordinary_knobs() -> None:
+    """A legit per-run knob (e.g. a kernel A/B flag) still passes through [worker_env]."""
+    raw = _raw()
+    raw["worker_env"] = {"FLASH_LORA_INIT": "default", "RL_VLLM_GPU_UTIL": "0.5"}
+    spec = spec_from_dict(raw)
+    assert spec.worker_env == {"FLASH_LORA_INIT": "default", "RL_VLLM_GPU_UTIL": "0.5"}
+
+
+def test_invalid_tensor_parallel_split_rejected_at_submit() -> None:
+    """A TP split the catalog model's head count can't satisfy must fail at submit (before renting),
+    not only at the worker's pre-server-boot guard. MiniCPM5-1B has 16 heads, so inference_gpus=3
+    (TP=3) is impossible (16 % 3 != 0)."""
+    raw = _raw(model="openbmb/MiniCPM5-1B")
+    raw["train"]["inference_gpus"] = 3
+    raw["gpu"]["count"] = 4
+    with pytest.raises(ConfigError, match="invalid tensor-parallel split"):
+        spec_from_dict(raw)
+
+
+def test_valid_tensor_parallel_split_accepted_at_submit() -> None:
+    """A divisible TP split passes: MiniCPM5-1B (16 heads) with inference_gpus=2 (16 % 2 == 0)."""
+    raw = _raw(model="openbmb/MiniCPM5-1B")
+    raw["train"]["inference_gpus"] = 2
+    raw["gpu"]["count"] = 3
+    spec = spec_from_dict(raw)
+    assert spec.train.inference_gpus == 2
+
+
 def test_disaggregated_topology_accepted() -> None:
     # A valid multi-GPU disaggregated GRPO config (2 GPUs: 1 train + 1 infer) parses.
     s = spec_from_dict(_raw(**{"train.inference_gpus": 1, "gpu.count": 2}))

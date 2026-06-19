@@ -6,7 +6,7 @@ import math
 import tomllib
 from typing import Any
 
-from .catalog import normalize_algorithm, resolve_model
+from .catalog import MODELS, normalize_algorithm, resolve_model
 from .providers import PROVIDER_NAMES
 from .providers.base import (
     POLICY_NAMES,
@@ -352,6 +352,23 @@ def _worker_env(raw: Any) -> dict[str, str]:
             f"[worker_env] must not contain secret-bearing keys ({', '.join(secrets)}); these are "
             "serialized into run artifacts — set them as real environment variables instead"
         )
+    # The disaggregated-rollout TOPOLOGY is fixed at submit time: the allocator sizes per-GPU VRAM,
+    # picks the GPU class/provider, and bills the multi-GPU node from [train].inference_gpus (+ the
+    # auto-derived inference parallelism). A per-run [worker_env] FLASH_INFERENCE_GPUS /
+    # FLASH_DISAGG_PARALLEL would silently change the worker's split AFTER all of that — e.g. a 35B
+    # sized as TP=2 onto 80 GB cards then started DP (full server per card) or as inference_gpus=1
+    # (unsharded server needing the whole per-card footprint), OOMing the rented node; or =0 falling
+    # back to colocate while still billing a multi-GPU node. Reject them in [worker_env]: set
+    # [train].inference_gpus (the sized field) and let the parallelism auto-derive (operators can
+    # still pin FLASH_DISAGG_PARALLEL as a real control-plane env var, which the allocator reads).
+    _topology = sorted(k for k in env if k.upper() in {"FLASH_INFERENCE_GPUS", "FLASH_DISAGG_PARALLEL"})
+    if _topology:
+        raise ConfigError(
+            f"[worker_env] must not set the disaggregated-rollout topology ({', '.join(_topology)}): "
+            "the GPU split is sized, allocated, and billed at submit time from [train].inference_gpus. "
+            "Set [train].inference_gpus instead (a per-run override here would mis-size/mis-bill the "
+            "provisioned node)"
+        )
     return env
 
 
@@ -455,3 +472,20 @@ def _validate_spec(spec: JobSpec) -> None:
             )
         # train_gpus>1 (2:1, 3:1, 2:2) runs the trainer as an FSDP group via `accelerate launch`
         # (run_rl's disaggregated launcher re-execs the worker across the train devices). Supported.
+        # Reject a tensor-parallel split the model's head count can't satisfy BEFORE renting: vLLM
+        # requires num_attention_heads % inference_gpus == 0 for TP (inference_gpus>1). For a catalog
+        # model with a declared head count this is known at submit time — e.g. MiniCPM5-1B (16 heads)
+        # with inference_gpus=3 is impossible (16 % 3 != 0). Catching it here avoids charging the user
+        # for a multi-GPU node that only fails at the worker's pre-server-boot guard. (The default
+        # parallelism is TP; the dp opt-in is MoE-only and those entries declare no head count, so
+        # they skip this. Open-model runs declare none too and rely on the worker guard.)
+        if spec.train.inference_gpus > 1 and spec.model in MODELS:
+            _heads = int(getattr(MODELS[spec.model], "num_attention_heads", 0) or 0)
+            if _heads and _heads % spec.train.inference_gpus != 0:
+                _valid = [d for d in range(1, _heads + 1) if _heads % d == 0 and d < spec.gpu.count]
+                raise ConfigError(
+                    f"train.inference_gpus ({spec.train.inference_gpus}) is an invalid tensor-parallel "
+                    f"split for {spec.model}: it has {_heads} attention heads and vLLM requires "
+                    f"heads % inference_gpus == 0. Valid inference_gpus for this model (and gpu.count "
+                    f"= {spec.gpu.count}): {_valid}"
+                )

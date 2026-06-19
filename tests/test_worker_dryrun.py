@@ -226,3 +226,17 @@ def test_grpo_batching_per_device_cap_respects_rank_count():
     b = compute_grpo_batching(prompts_per_step=4, group_size=8, per_device_comps=32, num_processes=2)
     assert b["unique_prompts_per_step"] == 4
     assert b["divisible_by_group"]
+
+
+def test_grpo_batching_rounds_accum_up_not_down():
+    """grad_accum must round UP (ceil), not floor: when the target completion batch isn't an exact
+    multiple of the global micro-batch, floor division silently trains FEWER prompts than configured.
+    Reviewer's example: batch_size=5, group=8, per_device=8, nproc=2 targets 40 completions; floor
+    (40 // 16 == 2) trains only 32 (4 prompts), undershooting the configured 5."""
+    from flash.engine.worker import compute_grpo_batching
+
+    b = compute_grpo_batching(prompts_per_step=5, group_size=8, per_device_comps=8, num_processes=2)
+    # reaches at LEAST the configured 5 prompts/step (40 completions), never fewer
+    assert b["unique_prompts_per_step"] >= 5
+    assert b["generations_per_step"] >= 5 * 8
+    assert b["divisible_by_group"]

@@ -140,3 +140,35 @@ def test_grpo_batching_caps_per_device_at_target():
     b = ne.compute_grpo_batching(prompts_per_step=64, group_size=8, per_device_comps=2)
     assert b["per_device_train_batch_size"] == 2
     assert b["unique_prompts_per_step"] == 64
+
+
+def test_rl_per_device_comps_colocated_flag(monkeypatch):
+    """The colocate activation cap (which shrinks per_device for a colocated rollout engine) must be
+    gated by ``colocated``: in disaggregated mode the engine is on a separate GPU, so passing
+    colocated=False must NOT apply that cap (else grad-accum inflates and the split's throughput is
+    cancelled). The logits-budget cap (a real per-device VRAM term) still applies in both modes.
+
+    The cap is CUDA-gated, so on a CPU runner force the cap branch via a fake torch to prove the
+    flag actually gates it: colocated=True clamps to the tiny fake-VRAM act_cap; colocated=False
+    keeps the (larger) base/logits value."""
+    import types
+
+    import flash.engine.worker as ne
+
+    importlib.reload(ne)
+    monkeypatch.delenv("RL_PER_DEVICE_PROMPTS", raising=False)
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_properties=lambda _i: types.SimpleNamespace(total_memory=8 * 1024**3),
+        )
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+
+    colocated = ne.rl_per_device_comps(use_vllm=True, colocated=True, params_b=4.0)
+    disagg = ne.rl_per_device_comps(use_vllm=True, colocated=False, params_b=4.0)
+    # disaggregated skips the activation cap, so it is at least as large as the colocated value
+    assert disagg >= colocated
+    # and on this tiny fake card the cap actually bites, so the two genuinely differ
+    assert disagg > colocated

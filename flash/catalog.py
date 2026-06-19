@@ -56,6 +56,14 @@ class ModelInfo:
     # vLLM rollout on one GPU. A GRPO request for such a model must set ``[train].inference_gpus>0``
     # on a multi-GPU node (see engine.rollout_bench); colocate GRPO is rejected. SFT is unaffected.
     requires_disaggregated: bool = False
+    # Attention-head count, used to REJECT an invalid tensor-parallel disaggregated split at SUBMIT
+    # time (before renting): vLLM requires num_attention_heads % inference_gpus == 0 for TP, so e.g.
+    # MiniCPM5-1B (16 heads) with inference_gpus=3 is impossible. 0 = unknown -> the submit-time
+    # check is skipped and the worker's pre-server-boot guard (engine.worker.run_rl) is the catch-all
+    # (it also covers open-model-policy runs, whose head count isn't known until the worker reads the
+    # config). Declared for catalog entries whose head count is verified, so a known-invalid ratio
+    # fails validation instead of charging the user for a node that can never run.
+    num_attention_heads: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,6 +83,9 @@ MODELS: dict[str, ModelInfo] = {
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
         thinking="hybrid",
+        # 16 attention heads -> valid TP / inference_gpus are {1, 2, 4, 8}; a 1:3 (TP=3) split is
+        # mathematically invalid (16 % 3 != 0) and is rejected at submit time (docs/async-rollout).
+        num_attention_heads=16,
         notes="On-device class SLM (131k ctx); standard Llama architecture.",
     ),
     # ---- Qwen3.5 dense family: validated on the modern worker stack ----
@@ -142,6 +153,13 @@ MODELS: dict[str, ModelInfo] = {
         quant="4bit-qlora",
         recommended_gpu="A100 PCIe",
         thinking="hybrid",
+        # The worker prefetches the FULL bf16 checkpoint into the HF cache before 4-bit load
+        # (snapshot_download grabs every safetensor regardless of quant), and a 35B bf16
+        # checkpoint is ~70 GB — it overflows the 60/64 GB container default and the run fails
+        # in prefetch_model after a paid multi-GPU node is already provisioned. Floor the disk
+        # the same way the open-model policy does (~2 GB/B weights + 64 GB worker-stack/cache
+        # headroom): 35B -> ~134 GB; round to 140. The runner raises gpu.disk_gb to this.
+        min_disk_gb=140,
         # Re-added for the DISAGGREGATED (multi-GPU async) GRPO path only: it OOMs when the trainer
         # and the vLLM rollout are colocated on one card. With a dedicated inference GPU (35B served
         # 4-bit) + a sharded trainer on the rest, it fits. GRPO colocate for it is rejected.

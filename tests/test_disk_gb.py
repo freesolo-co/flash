@@ -45,10 +45,17 @@ def test_apply_disk_gb_noops():
 
 
 def test_default_catalog_models_need_no_disk_bump():
-    """The dense Qwen3.5 catalog fits the platform's default container disk (min_disk_gb == 0)."""
+    """The small/dense catalog (MiniCPM5, the Qwen3.5 family) fits the platform's default container
+    disk (min_disk_gb == 0); only the 35B MoE — whose full bf16 checkpoint (~70 GB) overflows the
+    default before 4-bit load — carries an explicit disk floor."""
     from flash.catalog import MODELS
 
-    assert all(m.min_disk_gb == 0 for m in MODELS.values())
+    for mid, m in MODELS.items():
+        if mid == "Qwen/Qwen3.6-35B-A3B":
+            # ~2 GB/B weights + worker-stack/cache headroom (mirrors the open-model disk heuristic).
+            assert m.min_disk_gb >= 134, m
+        else:
+            assert m.min_disk_gb == 0, mid
 
 
 def test_submit_raises_disk_to_model_min(monkeypatch):
