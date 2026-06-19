@@ -1,4 +1,4 @@
-"""Serving modes: deploy kwargs, per-run endpoints, undeploy (CPU-only)."""
+"""Serving modes + the freesolo-serving client surface (CPU-only, no network)."""
 
 from __future__ import annotations
 
@@ -8,22 +8,26 @@ from flash.serve.deploy import (
     MODES,
     Deployment,
     deploy_adapter,
-    resolve_serve_deps,
     serve_endpoint_name,
+    serving_base_url,
     undeploy_adapter,
 )
 
 
-def test_serve_endpoint_name_is_per_run():
-    a = serve_endpoint_name("RTX 5090", "flash-123-abcd1234")
-    b = serve_endpoint_name("RTX 5090", "flash-456-ffff0000")
-    assert a != b
-    assert a.startswith("flash-serve-5090-")
+def test_serving_base_url_default_and_override(monkeypatch):
+    from flash.serve.deploy import DEFAULT_FREESOLO_SERVING_URL
+
+    monkeypatch.delenv("FREESOLO_SERVING_URL", raising=False)
+    assert serving_base_url() == DEFAULT_FREESOLO_SERVING_URL
+    # Override wins; a trailing slash is stripped so f"{base}/adapters" is well-formed.
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/")
+    assert serving_base_url() == "https://serve.example"
 
 
 def test_deploy_dry_run_modes():
     dev = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090", dry_run=True)
     assert dev.mode == "dev"
+    # freesolo serving scales to zero per base model — no flash-side idle billing, in any mode.
     assert dev.est_idle_cost_usd_per_day == 0.0
     warm = deploy_adapter(
         "r1",
@@ -35,9 +39,7 @@ def test_deploy_dry_run_modes():
         dry_run=True,
     )
     assert warm.mode == "always-on"
-    from flash.providers.runpod.pricing import hourly_rate
-
-    assert warm.est_idle_cost_usd_per_day == pytest.approx(hourly_rate("RTX 4090") * 24, rel=0.01)
+    assert warm.est_idle_cost_usd_per_day == 0.0
 
 
 def test_deploy_rejects_unknown_mode():
@@ -46,62 +48,49 @@ def test_deploy_rejects_unknown_mode():
     assert set(MODES) == {"dev", "always-on"}
 
 
-def test_resolve_serve_deps(monkeypatch):
-    monkeypatch.delenv("FLASH_SERVE_DEPS", raising=False)
-    assert any("vllm==0.19" in d for d in resolve_serve_deps())  # the single pinned stack
-    monkeypatch.setenv("FLASH_SERVE_DEPS", "vllm==9.9")  # explicit override wins
-    assert resolve_serve_deps() == ["vllm==9.9"]
+def test_undeploy_calls_freesolo_delete(monkeypatch):
+    """undeploy issues a single DELETE to the serving app keyed by run_id and returns the
+    removed id; an unrelated run is unaffected (the serving app keys by adapterId)."""
+    import flash.serve.deploy as deploy_mod
 
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    deleted_urls = []
 
-def test_resolve_serve_deps_preserves_comma_ranges(monkeypatch):
-    # A PEP 440 range like transformers>=5.6,<5.11 must NOT be comma-split into two
-    # pip args. Whitespace-separated string and JSON list both keep it intact.
-    monkeypatch.setenv("FLASH_SERVE_DEPS", "torch==2.10.0 transformers>=5.6,<5.11 vllm==0.19.1")
-    assert resolve_serve_deps() == ["torch==2.10.0", "transformers>=5.6,<5.11", "vllm==0.19.1"]
-    monkeypatch.setenv("FLASH_SERVE_DEPS", '["transformers>=5.6,<5.11", "vllm==0.19.1"]')
-    assert resolve_serve_deps() == ["transformers>=5.6,<5.11", "vllm==0.19.1"]
+    class _Resp:
+        status_code = 200
 
+        def raise_for_status(self):
+            return None
 
-def test_undeploy_uses_rest(monkeypatch):
-    from flash.providers.runpod import api as runpod
-    from flash.serve import deploy as deploy_mod
+    def fake_delete(url, headers=None, timeout=None):
+        deleted_urls.append(url)
+        return _Resp()
 
-    monkeypatch.setattr(
-        runpod,
-        "find_endpoints_by_name",
-        lambda name: [{"id": "ep1", "name": name}],
-    )
-    deleted_ids = []
-    monkeypatch.setattr(runpod, "delete_endpoint", lambda eid: deleted_ids.append(eid) or True)
-    # A stale cache entry for this run+gpu must be dropped on undeploy so a later
-    # redeploy builds a fresh endpoint instead of reusing the deleted one.
-    name = deploy_mod.serve_endpoint_name("RTX 5090", "flash-1-abc")
-    deploy_mod._ENDPOINT_CACHE[f"{name}:dev:300"] = object()
+    monkeypatch.setattr(deploy_mod.httpx, "delete", fake_delete)
     out = undeploy_adapter("flash-1-abc", gpu_name="RTX 5090")
-    assert deleted_ids == ["ep1"]
-    assert len(out) == 1
-    assert not [k for k in deploy_mod._ENDPOINT_CACHE if k.startswith(f"{name}:")]
+    assert out == ["flash-1-abc"]
+    assert deleted_urls == ["https://serve.example/adapters/flash-1-abc"]
 
 
-def test_undeploy_skips_substring_collision(monkeypatch):
-    # find_endpoints_by_name is a substring filter: another run's endpoint whose
-    # name merely CONTAINS the target as a substring must NOT be deleted, and must
-    # not appear in the returned `deleted` list.
-    from flash.providers.runpod import api as runpod
-    from flash.serve import deploy as deploy_mod
+def test_undeploy_404_is_clean(monkeypatch):
+    """A 404 (adapter already deregistered) is a clean no-op, returning []."""
+    import flash.serve.deploy as deploy_mod
 
-    name = deploy_mod.serve_endpoint_name("RTX 5090", "flash-1-abc")
-    collision = name + "-other"  # a different endpoint that contains `name`
-    monkeypatch.setattr(
-        runpod,
-        "find_endpoints_by_name",
-        lambda n: [{"id": "exact", "name": name}, {"id": "collide", "name": collision}],
-    )
-    deleted_ids = []
-    monkeypatch.setattr(runpod, "delete_endpoint", lambda eid: deleted_ids.append(eid) or True)
-    out = undeploy_adapter("flash-1-abc", gpu_name="RTX 5090")
-    assert deleted_ids == ["exact"], "only the exact-name endpoint may be deleted"
-    assert out == [name]
+    class _Resp:
+        status_code = 404
+
+        def raise_for_status(self):  # pragma: no cover - must not be called on 404
+            raise AssertionError("404 must not raise")
+
+    monkeypatch.setattr(deploy_mod.httpx, "delete", lambda *a, **k: _Resp())
+    assert undeploy_adapter("flash-1-gone", gpu_name="RTX 5090") == []
+
+
+def test_serve_endpoint_name_is_cosmetic_label():
+    # serve_endpoint_name is retained for back-compat (importers/CLI); the freesolo app
+    # serves all adapters on one endpoint, so this is just a stable per-run label now.
+    a = serve_endpoint_name("RTX 5090", "flash-123-abcd1234")
+    assert a.startswith("flash-serve-5090-")
 
 
 def test_deployment_roundtrip_dict():
@@ -110,8 +99,9 @@ def test_deployment_roundtrip_dict():
         model="m",
         adapter_hf_prefix="p",
         gpu="RTX 4090",
-        openai_model="flash-r",
-        endpoint_name="e",
+        openai_model="r",
+        endpoint_name="https://serve.example",
         mode="dev",
     )
     assert d.to_dict()["mode"] == "dev"
+    assert d.to_dict()["est_idle_cost_usd_per_day"] == 0.0
