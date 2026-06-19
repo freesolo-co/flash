@@ -2464,12 +2464,25 @@ def run_rl():
             # AUTOSLM_EVAL_EVERY_STEPS, > 0): greedy eval on a held-out split, streamed via
             # heartbeat("rl_eval", ...) AND accumulated into metrics.json so the agent reads
             # the eval curve (not just the noisy reward) when judging a run.
-            # In a disaggregated multi-trainer (DDP) group EVERY rank builds this trainer; only
-            # rank 0 should run held-out eval + emit rl_eval heartbeats (the others would do
-            # redundant generation and duplicate-commit the same eval). is_main_rank is True for
-            # single-process / train_gpus==1, so their behavior is unchanged.
+            #
+            # DISABLE it entirely on a multi-trainer (DDP) group (disaggregated train_gpus>1). The
+            # eval callback runs heavy on_step_end generation on the trainer's model: attaching it on
+            # ALL ranks would duplicate the work + race the HF commits, but attaching it on rank 0
+            # ONLY desyncs the process group — rank 0 stalls in generation / run_final while the other
+            # ranks advance into the next step's (or save_model's) NCCL collective, hanging the group.
+            # A per-rank callback fundamentally can't do unsynchronized work in DDP, so skip eval for
+            # the multi-trainer ratios (the reward heartbeat is symmetric — every rank's on_log
+            # returns fast off-rank-0 — so it stays). Single-trainer (colocate, 1:1, 1:2) is
+            # unaffected and keeps the full eval curve.
+            _multi_trainer = _rollout_split is not None and _rollout_split.train_gpus > 1
             periodic_eval = None
-            if _disagg.is_main_rank():
+            if _multi_trainer:
+                print(
+                    "[rl][eval] mid-run eval is disabled for multi-trainer (DDP) disaggregated runs "
+                    "(a per-rank eval callback would desync the NCCL process group); use a "
+                    "single-trainer ratio (e.g. 1:2) for the eval curve"
+                )
+            else:
                 periodic_eval = _maybe_attach_periodic_eval(
                     trainer,
                     tok,
