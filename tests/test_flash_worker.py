@@ -157,14 +157,14 @@ def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
     assert chalk_extra_pip() == ["freesolo-chalk"]
 
 
-def test_chalk_extra_pip_empty_without_spec(monkeypatch):
-    """A kernel flag is set but FLASH_CHALK_SPEC is unset -> nothing added (chalk is unpublished,
-    can't auto-install) — install_chalk_kernels then safely no-ops on the worker."""
+def test_chalk_extra_pip_defaults_to_pypi_without_spec(monkeypatch):
+    """chalk is published on PyPI, so a SELECTED run with FLASH_CHALK_SPEC unset auto-installs the
+    PyPI package by default (just like Liger) — no operator spec required."""
     from flash.providers.runpod.train import chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
     monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
-    assert chalk_extra_pip() == []
+    assert chalk_extra_pip() == ["freesolo-chalk"]
 
 
 def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):

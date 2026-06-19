@@ -79,14 +79,13 @@ WORKER_DEPS = [
     # NB: fla's gated chunk_bwd is broken on HOPPER (H100) with Triton >= 3.4 (fla #640), so
     # resolve_worker_deps DROPS fla on sm90 (the correct pure-PyTorch delta rule runs instead). The
     # dense Qwen3.5 GDN models route to consumer cards by default, where fla works.
-    # NB: freesolo-chalk (custom Triton/CUDA kernels, install-on-call — calling an installer IS
-    # the opt-in; chalk reads NO env vars) is NOT baked in by default — it isn't on PyPI yet, and a
-    # bad/inaccessible spec here would abort worker boot. flash auto-detects chalk if present
-    # (flash/engine/chalk_kernels.py). To enable kernels on a DEFAULT remote run: set the per-kernel
-    # FLASH_* selection flags (FLASH_MLP_KERNEL, FLASH_FP8_BASE, FLASH_TRITON_LORA, ...) AND set
-    # FLASH_CHALK_SPEC to an installable chalk spec (a git URL with access, or a wheel). The submit
-    # path (chalk_extra_pip) then appends that spec to the worker's `extra_pip`, which the worker
-    # pip-installs for EVERY job (baked-image RunPod _train_body + Vast bootstrap). Do NOT rely on
+    # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
+    # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
+    # (chalk_extra_pip) appends ``freesolo-chalk`` from PyPI to the worker's `extra_pip` for EVERY
+    # job by default — installed + applied automatically, like Liger. Override the source with
+    # FLASH_CHALK_SPEC (a pinned version / git URL / wheel), or disable every kernel (FLASH_<K>=0) to
+    # skip the install. The worker pip-installs extra_pip for EVERY job (baked-image RunPod
+    # _train_body + Vast bootstrap). Do NOT rely on
     # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS for this: the durable baked-image submit path
     # (jobs.build_function_input) returns the raw payload and never consults resolve_worker_deps, so
     # those vars don't reach a default run; and FLASH_WORKER_DEPS would also REPLACE the whole stack.
@@ -203,21 +202,15 @@ def chalk_extra_pip(spec=None) -> list[str]:
     process will see (``build_worker_env``) and a per-run ``[worker_env]`` opt-in installs chalk.
 
     Chalk's gap-fillers are default-on, so chalk is selected for a normal run even with no FLASH_*
-    flags set. freesolo-chalk is unpublished, so there is no auto-installable default: the operator
-    MUST set ``FLASH_CHALK_SPEC`` to an installable spec (a git URL with access, or a wheel/path).
-    When chalk is selected but ``FLASH_CHALK_SPEC`` is empty we log at info and add nothing —
-    ``install_chalk_kernels`` then finds no chalk on the worker and safely no-ops.
+    flags set. freesolo-chalk is published on PyPI, so it auto-installs by DEFAULT (just like Liger):
+    when chalk is selected and ``FLASH_CHALK_SPEC`` is unset we add ``freesolo-chalk``. Set
+    ``FLASH_CHALK_SPEC`` to override the source (a pinned version, a git URL, or a wheel/path), or
+    disable every kernel (``FLASH_<K>=0``) to skip the install.
     """
     if not _chalk_selected(spec):
         return []
-    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip()
-    if not spec_str:
-        logger.info(
-            "chalk gap-filling kernels are default-on but FLASH_CHALK_SPEC is unset; freesolo-chalk "
-            "is unpublished so it can't be auto-installed — set FLASH_CHALK_SPEC to an installable "
-            "spec (git URL or wheel) to actually run the kernels (they no-op safely until then)."
-        )
-        return []
+    # PyPI default — chalk is published, so a normal run installs + applies it automatically.
+    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or "freesolo-chalk"
     import shlex
 
     return [d for d in shlex.split(spec_str) if d.strip()]
