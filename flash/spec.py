@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -52,14 +53,34 @@ def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
     Rejects JSON booleans: ``bool`` is an ``int`` subclass in Python, so ``int(True)`` would
-    silently coerce a stray boolean train knob to 1 (and ``False`` to 0). Mirrors the
-    bool rejection in schema._train_int — a bool is a type error, not a number.
+    silently coerce a stray boolean train knob to 1 (and ``False`` to 0). Also rejects
+    non-integer floats (e.g. ``2.9``) instead of silently truncating to ``2`` — for a topology
+    knob like ``train.inference_gpus`` that would re-hydrate a different rollout split than the
+    schema validated. Mirrors the bool + finite-integer rejection in schema._train_int — a
+    bool is a type error, and a fractional value is not an integer.
     """
     if value is None:
         return None
     if isinstance(value, bool):
         raise TypeError(f"expected a number, got bool {value!r}")
+    if isinstance(value, float):
+        if not math.isfinite(value) or float(value) != int(value):
+            raise TypeError(f"expected an integer, got non-integer float {value!r}")
+        return int(value)
     return int(value)
+
+
+def _req_int(value: Any, *, default: int) -> int:
+    """Parse a required int from a loosely-typed spec source, applying ``default`` for None.
+
+    Like ``_opt_int`` but never returns None — for re-hydrating topology fields such as
+    ``gpu.count`` that drive paid multi-GPU provisioning. A bare ``int()`` there would accept
+    ``True`` as ``1`` and truncate ``2.9`` -> ``2``, silently provisioning a different topology
+    than the schema (schema._require_int) validated on the inbound request.
+    """
+    if value is None:
+        return default
+    return _opt_int(value)  # type: ignore[return-value]  # non-None in -> non-None out
 
 
 def _opt_float(value: Any) -> float | None:
@@ -256,7 +277,7 @@ class JobSpec:
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),
-                count=int(gpu.get("count", 1)),
+                count=_req_int(gpu.get("count"), default=1),
                 provider=gpu.get("provider", "auto"),
                 requested=gpu.get("requested", ""),
                 allow_unvalidated=gpu.get("allow_unvalidated"),

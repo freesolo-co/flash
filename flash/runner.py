@@ -336,7 +336,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 resume_index = 0
             # Drop the now-dead handle so a cancel / restart in the re-provision gap can't reattach
             # to the deleted endpoint; _run_seed_loop's next on_handle records the fresh one.
-            _update(run_id, "running", remote=None)
+            # Record the resume index too: in the handle-less re-provision gap a control-plane
+            # restart must RESUME this seed (recover_runs' resume_seed_index branch) rather than
+            # fall through to "server restarted before job submission" and fail the run.
+            # _run_seed_loop advances/clears resume_seed_index as it goes, so no stale index lingers.
+            _update(run_id, "running", remote=None, resume_seed_index=resume_index)
             print(
                 f"recovery: {run_id} seed {seed} was IN_QUEUE with no capacity; "
                 "re-provisioning via the capacity walk instead of failing",
