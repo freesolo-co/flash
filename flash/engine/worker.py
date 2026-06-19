@@ -1269,6 +1269,31 @@ def run_sft():
                         opt_cls, extra = loraplus_optimizer_cls(
                             getattr(self.args.optim, "value", self.args.optim)
                         )
+                        # Forward the TrainingArguments optimizer config that the default HF
+                        # create_optimizer path would have applied. Building the optimizer
+                        # ourselves means we must replicate it explicitly, or LoRA+ runs would
+                        # silently use the optimizer class's own defaults instead of the
+                        # configured betas/eps/weight_decay. betas/eps go straight to the optimizer
+                        # constructor (alongside any `extra` from loraplus_optimizer_cls);
+                        # weight_decay is handled separately below.
+                        fwd = dict(extra)
+                        _betas = (
+                            getattr(self.args, "adam_beta1", None),
+                            getattr(self.args, "adam_beta2", None),
+                        )
+                        if None not in _betas:
+                            fwd.setdefault("betas", _betas)
+                        _eps = getattr(self.args, "adam_epsilon", None)
+                        if _eps is not None:
+                            fwd.setdefault("eps", _eps)
+                        # PEFT does NOT read args.weight_decay; it applies decay via its own LoRA+
+                        # param groups, keyed off the loraplus_weight_decay kwarg (which it pops
+                        # before constructing the optimizer). Pass it as a top-level kwarg so it
+                        # isn't forwarded into the optimizer constructor.
+                        lp_extra: dict[str, object] = {}
+                        _wd = getattr(self.args, "weight_decay", None)
+                        if _wd is not None:
+                            lp_extra["loraplus_weight_decay"] = _wd
                         # PEFT's create_loraplus_optimizer forwards extra kwargs to the optimizer;
                         # the lr keyword name has shifted across PEFT versions, so pass it via
                         # optimizer_kwargs (the stable form) and fall back to a top-level lr=.
@@ -1276,8 +1301,9 @@ def run_sft():
                             self.optimizer = create_loraplus_optimizer(
                                 model=self.model,
                                 optimizer_cls=opt_cls,
-                                optimizer_kwargs={"lr": self.args.learning_rate, **extra},
+                                optimizer_kwargs={"lr": self.args.learning_rate, **fwd},
                                 loraplus_lr_ratio=_lp_ratio,
+                                **lp_extra,
                             )
                         except TypeError:
                             self.optimizer = create_loraplus_optimizer(
@@ -1285,7 +1311,8 @@ def run_sft():
                                 optimizer_cls=opt_cls,
                                 lr=self.args.learning_rate,
                                 loraplus_lr_ratio=_lp_ratio,
-                                **extra,
+                                **fwd,
+                                **lp_extra,
                             )
                         self._loraplus_applied = True
                         print(
