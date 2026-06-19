@@ -920,7 +920,11 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # [worker_env] override RUN_ID/HF_REPO would make the worker upload under a different repo/prefix
     # and orphan the artifacts (the poller would never find DONE/metrics, deploy can't locate the
     # adapter). FLASH_ARM identifies the substrate (Vast rewrites it in its own bootstrap).
-    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
+    # FLASH_GPU_COUNT is the control-plane topology hint (= the sized/billed [gpu].count); the worker
+    # falls back to it when nvidia-smi is unavailable and honors it over an over-exposed node, so a
+    # [worker_env] override would let the worker compute a different disaggregated split than was
+    # provisioned/billed (or fail as under-provisioned if it exceeds the visible GPUs).
+    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM", "FLASH_GPU_COUNT"}
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         if str(k).upper() in _RESERVED_WORKER_ENV:
             continue  # control plane owns run identity; a per-run override would orphan artifacts

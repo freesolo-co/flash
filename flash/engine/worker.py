@@ -2622,6 +2622,14 @@ def run_rl():
                 grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
             if _attn:
                 grpo_kwargs["model_init_kwargs"]["attn_implementation"] = _attn
+        elif _is_fsdp_launcher:
+            # The DDP launcher (train_gpus>1) builds no trainer and never uses _attn (only the
+            # else-branch trainer.train() below reads it via _sdpa_cudnn_ctx). optimal_attn_impl()
+            # calls torch.cuda.get_device_capability(0), which would bind a RETAINED CUDA context on
+            # the first trainer card while the accelerate child trains on it (VRAM theft / rank-0 OOM
+            # on tight ratios) — the same reason the fp8-KV probe above takes the CUDA-free path on the
+            # launcher. So skip the probe entirely here.
+            _attn = None
         else:
             _attn = optimal_attn_impl()
         # stop_sequences: TRL forwards generation_kwargs to the (vLLM) sampler, whose

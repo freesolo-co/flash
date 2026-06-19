@@ -21,6 +21,26 @@ from .providers.base import (
 from .spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
 
+def _require_int(value: Any, label: str, *, minimum: int, default: int) -> int:
+    """Coerce a TOML scalar to a finite integer >= minimum, rejecting bools/floats/non-numbers.
+
+    Shares the [train]-knob discipline (see _train_int): a bare ``int()`` silently truncates
+    ``2.9`` -> ``2`` and accepts ``true`` as ``1``, which for a topology field like ``[gpu] count``
+    would provision a different split than requested instead of failing validation. Missing/None
+    falls back to ``default``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{label} must be an integer")
+    if not math.isfinite(value) or float(value) != int(value):
+        raise ConfigError(f"{label} must be a finite integer")
+    v = int(value)
+    if v < minimum:
+        raise ConfigError(f"{label} must be >= {minimum}")
+    return v
+
+
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
     """Validate an optional integer [train] knob (>= minimum) -> ConfigError (HTTP 400).
 
@@ -311,7 +331,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         ),
         gpu=GpuSpec(
             type=gpu_type,
-            count=int(gpu_raw.get("count", 1)),
+            # count is the paid multi-GPU topology (trainer + inference_gpus); reject non-integer /
+            # bool values up front rather than silently truncating (2.9 -> 2) or coercing (true -> 1)
+            # and provisioning a different split than requested. (>=1 is re-asserted in _validate_spec.)
+            count=_require_int(gpu_raw.get("count"), "gpu.count", minimum=1, default=1),
             provider=provider,
             requested=requested_gpu,
             allow_unvalidated=allow_unval,
