@@ -235,8 +235,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError(
             f"gpu type {gpu_type!r} has not passed Flash's live validation smoke"
             f"{' on ' + provider if provider != 'auto' else ''} "
-            f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true "
-            f"(or FLASH_GPU_ALLOW_UNVALIDATED=1) to use it anyway."
+            f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true to use it anyway."
         )
     try:
         info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
@@ -315,43 +314,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             datacenter=gpu_raw.get("datacenter"),
         ),
         run_id=run_id or raw.get("run_id", "local"),
-        worker_env=_worker_env(raw.get("worker_env")),
         model_policy=model_policy,
         thinking=thinking,
     )
     _validate_spec(spec)
     return spec
-
-
-def _worker_env(raw: Any) -> dict[str, str]:
-    """Parse the optional [worker_env] table: per-run worker env overrides (string-valued)."""
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise ConfigError("[worker_env] must be a table of string key/values")
-    env = {str(k): str(v) for k, v in raw.items()}
-    # [worker_env] is serialized into job_spec_json (persisted + logged), so it must NOT carry
-    # secrets — they would leak into run artifacts. Reject secret-looking keys; operators set
-    # those as real process environment variables (forwarded to the worker out-of-band) instead.
-    # Detect by `_`-delimited WORD components (not substring): flag a secret WORD, or `KEY`
-    # qualified by API/SECRET/PRIVATE/ACCESS/INTERNAL/AUTH. This catches HF_TOKEN, *_API_KEY,
-    # SECRET_KEY, INTERNAL_KEY, CREDENTIAL, AWS_SECRET_ACCESS_KEY while allowing legit knobs whose
-    # names merely contain a marker (RL_VLLM_MAX_BATCHED_TOKENS -> word TOKENS, not TOKEN; a bare
-    # SORT_KEY -> KEY without a secret qualifier).
-    _secret_words = {"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS", "APIKEY", "PRIVATEKEY"}
-    _key_qualifiers = {"API", "SECRET", "PRIVATE", "ACCESS", "INTERNAL", "AUTH", "SIGNING", "ENCRYPTION"}
-
-    def _is_secret_key(name: str) -> bool:
-        words = set(name.upper().split("_"))
-        return bool(words & _secret_words) or ("KEY" in words and bool(words & _key_qualifiers))
-
-    secrets = sorted(k for k in env if _is_secret_key(k))
-    if secrets:
-        raise ConfigError(
-            f"[worker_env] must not contain secret-bearing keys ({', '.join(secrets)}); these are "
-            "serialized into run artifacts — set them as real environment variables instead"
-        )
-    return env
 
 
 def _validate_spec(spec: JobSpec) -> None:

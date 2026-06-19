@@ -434,11 +434,8 @@ def min_cuda_for(friendly_gpu: str) -> str:
     unsupported toolchain" on driver 570.x). CUDA-13 drivers JIT it fine, so those
     classes are pinned to >=13.0 on the modern stack (per-GPU ``min_cuda_modern`` in
     providers.base.GPU_INFO). Ampere/Ada/Hopper have SASS in the wheels and run on 12.8.
-    Override with FLASH_MIN_CUDA.
+    Fully managed per-GPU (no override).
     """
-    explicit = os.environ.get("FLASH_MIN_CUDA")
-    if explicit:
-        return explicit
     from flash.providers.base import min_cuda_modern
 
     return min_cuda_modern(friendly_gpu)
@@ -654,53 +651,34 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
 
 
 def build_worker_env(spec: JobSpec, seed: int) -> dict:
-    """Per-run env passed to the worker (secrets + recipe overrides)."""
+    """Per-run env passed to the worker (secrets + run identity)."""
     # CUDA allocator conf. Colocate (TRL trainer + vLLM on one GPU) fragments over a long run,
     # so expandable_segments (which reclaims fragmentation) is the right default — EXCEPT under
     # GRPO vLLM sleep mode, whose CuMemAllocator memory pool is incompatible with
-    # expandable_segments (vLLM asserts and the run crashes at engine init). So for RL with
-    # sleep mode ON (the default), default to a non-expandable conf instead; SFT and
-    # sleep-off RL keep expandable_segments. A per-run [worker_env] pin always wins.
+    # expandable_segments (vLLM asserts and the run crashes at engine init). The launcher can't
+    # know the worker's sleep decision (it's resolved from model size + context), so RL runs get
+    # the conservative non-expandable conf here plus FLASH_ALLOC_AUTO=1, ceding the final choice to
+    # the worker — which upgrades to expandable_segments once it resolves sleep OFF
+    # (engine.worker.finalize_alloc_conf_for_sleep). SFT keeps expandable_segments outright.
     _is_rl = str(getattr(spec, "algorithm", "")).lower() not in ("sft",)
-    # RL_VLLM_SLEEP may be pinned per-run via the [worker_env] TOML table (merged into the worker
-    # env later). When pinned it counts as explicit: otherwise _sleep_set stays false,
-    # FLASH_ALLOC_AUTO=1 is sent, and the worker can upgrade to expandable_segments while run_rl
-    # still enables vLLM sleep, hitting the CuMemAllocator incompatibility after provisioning.
-    _sleep_raw = (spec.worker_env or {}).get("RL_VLLM_SLEEP")
-    _sleep_set = _sleep_raw is not None
-    _sleep_on = (_sleep_raw if _sleep_raw is not None else "1") not in ("0", "false", "False")
-    _alloc_default = (
+    _alloc_conf = (
         "garbage_collection_threshold:0.8,max_split_size_mb:256"
-        if (_is_rl and _sleep_on)
+        if _is_rl
         else "expandable_segments:True"
     )
     # torch >= 2.10 renamed the env to PYTORCH_ALLOC_CONF — set BOTH names for either stack.
-    # A per-run [worker_env] alloc conf counts as an explicit pin HERE (else _alloc_override stays
-    # falsy, FLASH_ALLOC_AUTO=1 is sent, and finalize_alloc_conf_for_sleep overwrites the run's pin).
-    _we = spec.worker_env or {}
-    _alloc_override = _we.get("PYTORCH_ALLOC_CONF") or _we.get("PYTORCH_CUDA_ALLOC_CONF")
-    _alloc_conf = _alloc_override or _alloc_default
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
         # Compute substrate, read back by engine.worker for the RunMetrics record. Vast's
         # on-instance bootstrap overrides this to "vast" (it reuses this same env builder).
         "FLASH_ARM": "runpod",
-        "BENCH_HF_MODEL": spec.model,
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
-        # We picked a DEFAULT alloc conf above without knowing the worker's resolved vLLM sleep
-        # decision (RL + RL_VLLM_SLEEP unset + no operator override). Cede the final choice to the
-        # worker, which resolves sleep from the model config and upgrades to expandable_segments
-        # when sleep is OFF (engine.worker.finalize_alloc_conf_for_sleep). Never set when the
-        # operator pinned an alloc conf or RL_VLLM_SLEEP explicitly — their choice is authoritative.
-        **(
-            {"FLASH_ALLOC_AUTO": "1"}
-            if (_is_rl and not _sleep_set and not _alloc_override)
-            else {}
-        ),
-        # Escape hatch for torch.compile/inductor spikes (Qwen3.5 DeltaNet kernels compile at first
-        # forward and can OOM a tight colocate budget); pinnable per-run via [worker_env].
-        **({"TORCHDYNAMO_DISABLE": _we["TORCHDYNAMO_DISABLE"]} if _we.get("TORCHDYNAMO_DISABLE") else {}),
+        # We picked the conservative non-expandable conf above without knowing the worker's resolved
+        # vLLM sleep decision. Cede the final choice to the worker, which resolves sleep from the
+        # model config and upgrades to expandable_segments when sleep is OFF
+        # (engine.worker.finalize_alloc_conf_for_sleep). RL only.
+        **({"FLASH_ALLOC_AUTO": "1"} if _is_rl else {}),
     }
     # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub env(s),
     # public + private) + reward-judge creds: a verifiers env whose rubric calls an LLM judge needs
@@ -717,25 +695,12 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # volume instead of per run).
     if getattr(spec.gpu, "network_volume", None):
         env["HF_HOME"] = "/runpod-volume/hf-cache"
-    # Forward W&B credentials/routing to the worker. Run TUNING is NOT an operator env knob: flash
-    # is fully managed — the worker uses the optimal default for every setting, and the only per-run
-    # configuration is the run spec (the structured [train] fields + the [worker_env] TOML table
-    # merged in below). No control-plane process-env override reaches the worker.
-    for k in ("WANDB_API_KEY", "WANDB_ENTITY"):
-        if os.environ.get(k) is not None:
-            env[k] = os.environ[k]
-    # Per-run worker_env overrides win over the global os.environ allowlist: this is what lets
-    # ONE run differ (e.g. a per-run optimizer or LoRA-init A/B) while every other concurrent run
-    # keeps the global default. Run-IDENTITY keys are control-plane-owned and excluded: the poller,
-    # deploy, and artifact paths all key off spec.run_id / spec.train.hf_repo, so letting a
-    # [worker_env] override RUN_ID/HF_REPO would make the worker upload under a different repo/prefix
-    # and orphan the artifacts (the poller would never find DONE/metrics, deploy can't locate the
-    # adapter). FLASH_ARM identifies the substrate (Vast rewrites it in its own bootstrap).
-    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
-    for k, v in (getattr(spec, "worker_env", None) or {}).items():
-        if str(k).upper() in _RESERVED_WORKER_ENV:
-            continue  # control plane owns run identity; a per-run override would orphan artifacts
-        env[str(k)] = str(v)
+    # Forward W&B credentials to the worker. Run tuning is NOT an operator env knob: flash is fully
+    # managed — the worker uses the optimal default for every setting, and the only per-run
+    # configuration is the run spec's structured [train] fields. No control-plane process-env
+    # override reaches the worker.
+    if os.environ.get("WANDB_API_KEY") is not None:
+        env["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
     return env
 
 
