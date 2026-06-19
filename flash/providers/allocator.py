@@ -10,7 +10,7 @@ cheapest:
 
 Allocation happens at SUBMIT time in the runner (offers are a volatile market);
 the parse-time resolution in schema is a RunPod-static provisional for
-validation/dry-run display. Offline (AUTOSLM_SKIP_NET) the allocator degrades to exactly
+validation/dry-run display. Offline (FLASH_SKIP_NET) the allocator degrades to exactly
 ``cheapest_gpu``'s deterministic static-rate answer (RunPod only — Vast is offline-off).
 
 Provider-agnostic by construction: it walks the registered providers and asks each for
@@ -92,7 +92,7 @@ def required_vram_gb(
         pb = _params_b_for_vram(model_id)
         if pb:
             infer = max(1, _ig)
-            # Inference parallelism (must match build_vllm_serve_cmd's default + AUTOSLM_DISAGG_PARALLEL):
+            # Inference parallelism (must match build_vllm_serve_cmd's default + FLASH_DISAGG_PARALLEL):
             #   TP (DEFAULT): the rollout server shards BOTH the bf16 weights and the KV cache across the
             #     inference GPUs (--tensor_parallel_size=infer), so each card holds ~1/infer of the
             #     server -> divide by infer (a 35B TP=2 fits 2x A100-80G instead of demanding 94GB/card).
@@ -100,7 +100,7 @@ def required_vram_gb(
             #     (--data_parallel_size=infer, tp=1), so each card needs the WHOLE server -> do NOT
             #     divide (dividing would under-provision into an OOM, esp. for the 35B MoE).
             # infer==1 collapses both to the full-weight single-card need.
-            _dp = (os.environ.get("AUTOSLM_DISAGG_PARALLEL") or "").strip().lower() == "dp"
+            _dp = (os.environ.get("FLASH_DISAGG_PARALLEL") or "").strip().lower() == "dp"
             _shards = 1 if _dp else infer
             server_need = int(pb * 2.0 * 1.2 / _shards)  # per-card bf16 (full for dp, shard for tp) + ~20% KV/overhead
             disagg_need = max(server_need, int(colocate * 0.7))

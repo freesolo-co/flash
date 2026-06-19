@@ -195,16 +195,16 @@ def test_job_spec_json_round_trip() -> None:
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
     spec = spec_from_dict(_raw(), run_id="env-1")
 
-    monkeypatch.setenv("AUTOSLM_JOB_SPEC_JSON", spec.to_json())
+    monkeypatch.setenv("FLASH_JOB_SPEC_JSON", spec.to_json())
     assert load_job_spec_from_env() == spec
 
-    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON")
     path = tmp_path / "spec.json"
     path.write_text(spec.to_json(), encoding="utf-8")
-    monkeypatch.setenv("AUTOSLM_JOB_SPEC_PATH", str(path))
+    monkeypatch.setenv("FLASH_JOB_SPEC_PATH", str(path))
     assert load_job_spec_from_env() == spec
 
-    monkeypatch.delenv("AUTOSLM_JOB_SPEC_PATH")
+    monkeypatch.delenv("FLASH_JOB_SPEC_PATH")
     assert load_job_spec_from_env() is None
 
 
@@ -289,7 +289,7 @@ def test_vram_sft_honors_per_device_bs_env(monkeypatch) -> None:
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
     from flash.engine import vram
 
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     assert vram.fetch_hf_params_b("any/model") is None
 
 
@@ -310,9 +310,9 @@ def test_get_logger_namespacing() -> None:
 def test_log_level_from_env(monkeypatch) -> None:
     from flash import _logging
 
-    monkeypatch.setenv("AUTOSLM_LOG_LEVEL", "debug")
+    monkeypatch.setenv("FLASH_LOG_LEVEL", "debug")
     assert _logging._level_from_env() == logging.DEBUG
-    monkeypatch.setenv("AUTOSLM_LOG_LEVEL", "15")
+    monkeypatch.setenv("FLASH_LOG_LEVEL", "15")
     assert _logging._level_from_env() == 15
-    monkeypatch.delenv("AUTOSLM_LOG_LEVEL")
+    monkeypatch.delenv("FLASH_LOG_LEVEL")
     assert _logging._level_from_env(logging.WARNING) == logging.WARNING

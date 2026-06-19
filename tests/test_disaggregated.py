@@ -102,10 +102,10 @@ def test_server_env_multi_infer():
 
 
 def test_detect_total_gpus_prefers_explicit_env():
-    assert detect_total_gpus({"AUTOSLM_GPU_COUNT": "4"}) == 4
-    assert detect_total_gpus({"AUTOSLM_GPU_COUNT": "1"}) == 1
+    assert detect_total_gpus({"FLASH_GPU_COUNT": "4"}) == 4
+    assert detect_total_gpus({"FLASH_GPU_COUNT": "1"}) == 1
     # a garbage value falls through (does not crash); without nvidia-smi/torch it returns >=1
-    assert detect_total_gpus({"AUTOSLM_GPU_COUNT": "not-a-number"}) >= 1
+    assert detect_total_gpus({"FLASH_GPU_COUNT": "not-a-number"}) >= 1
 
 
 def test_accelerate_launch_cmd_2to1():
@@ -141,8 +141,8 @@ def test_is_main_rank_defaults_true_without_rank():
 
 def test_trainer_only_mode_flag():
     assert trainer_only_mode({}) is False
-    assert trainer_only_mode({"AUTOSLM_RL_TRAINER_ONLY": "1"}) is True
-    assert trainer_only_mode({"AUTOSLM_RL_TRAINER_ONLY": "0"}) is False
+    assert trainer_only_mode({"FLASH_RL_TRAINER_ONLY": "1"}) is True
+    assert trainer_only_mode({"FLASH_RL_TRAINER_ONLY": "0"}) is False
 
 
 # ---------------------------------------------------------------------------

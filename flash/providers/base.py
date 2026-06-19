@@ -340,7 +340,7 @@ def unvalidated_allowed(explicit: bool | None = None) -> bool:
         return explicit
     # Truthy allowlist (not a falsey denylist): only an explicit truthy value opts in, so
     # "false"/"False"/"no"/"off"/"0"/"" all correctly leave unvalidated GPUs disabled.
-    return os.environ.get("AUTOSLM_GPU_ALLOW_UNVALIDATED", "").strip().lower() in (
+    return os.environ.get("FLASH_GPU_ALLOW_UNVALIDATED", "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -400,7 +400,7 @@ def resolve_gpu_policy(
     key = (requested or "").strip().lower()
     if key not in POLICY_NAMES:
         return canonical_gpu(requested)
-    # Use the allocator's disaggregated-AWARE sizing (which itself honors AUTOSLM_VRAM_HEADROOM
+    # Use the allocator's disaggregated-AWARE sizing (which itself honors FLASH_VRAM_HEADROOM
     # via vram_headroom, so parse-time matches submit-time exactly — PR #176). For a
     # disaggregated GRPO run ([train].inference_gpus>0) the rollout server is tensor-parallel
     # across the inference GPUs and the trainer is on separate cards, so the binding PER-GPU need

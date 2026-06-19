@@ -408,9 +408,9 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         # Force the deterministic static ranking (no live pricing fetch) and the
-        # validated-only pool, so a stray AUTOSLM_GPU_ALLOW_UNVALIDATED in the dev's
+        # validated-only pool, so a stray FLASH_GPU_ALLOW_UNVALIDATED in the dev's
         # environment can't add cheaper unvalidated cards and reorder the walk.
-        monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
 
         gpus_seen: list[str] = []
@@ -457,7 +457,7 @@ def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-        monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         gpus_seen: list[str] = []
 
@@ -498,7 +498,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-        monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
 
         real_allocate = allocator.allocate

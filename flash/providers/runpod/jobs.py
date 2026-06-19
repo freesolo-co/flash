@@ -168,11 +168,11 @@ def deploy_train_endpoint(
     name = endpoint_name(friendly, name_suffix)
     # The baked WORKER_IMAGE is now a self-contained RunPod Serverless worker (its CMD runs
     # rp_handler.py, which reads job["input"] and runs the training) — deploy it directly (Flash
-    # "client mode"). build_function_input then sends the payload as the job input. AUTOSLM_WORKER_IMAGE
+    # "client mode"). build_function_input then sends the payload as the job input. FLASH_WORKER_IMAGE
     # overrides the baked image (e.g. a hotfix tag); since WORKER_IMAGE is a non-empty constant the
     # image is always set, so the boot-install/live-function path is only reachable if both are
     # explicitly cleared (not a normal configuration).
-    image = os.environ.get("AUTOSLM_WORKER_IMAGE") or WORKER_IMAGE
+    image = os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
     # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
@@ -222,7 +222,7 @@ def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict
     of fla's #640-buggy GDN Triton kernel. A bare call would reinstall the generic deps and
     reintroduce that sm90 correctness issue even when the endpoint was configured correctly.
     """
-    if os.environ.get("AUTOSLM_WORKER_IMAGE") or WORKER_IMAGE:
+    if os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE:
         # Baked serverless-worker image (client mode): the image's rp_handler reads job["input"]
         # and calls _train_body, so the job input IS the train payload (submit_job wraps it in
         # {"input": ...}). No live-function source, no boot-install deps.

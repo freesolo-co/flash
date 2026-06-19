@@ -87,7 +87,7 @@ def usable_offers(
     num_gpus: int = 1,
 ) -> list[VastOffer]:
     """Verified datacenter offers able to run the job, cheapest first (community hosts only
-    when ``AUTOSLM_VAST_ALLOW_COMMUNITY=1`` opts in — secrets ship to the box).
+    when ``FLASH_VAST_ALLOW_COMMUNITY=1`` opts in — secrets ship to the box).
 
     ``num_gpus`` (default 1) rents an instance with exactly that many GPUs — the disaggregated
     async GRPO path needs a multi-GPU node ([gpu] count). ``min_vram_gb`` is the PER-GPU floor
@@ -105,10 +105,10 @@ def usable_offers(
     # Host tier: DEFAULT datacenter-only (hosting_type==1). The onstart payload ships run secrets
     # (HF_TOKEN, PRIME_API_KEY, OpenRouter/OpenAI/W&B creds) to the box, so verified-but-lower-trust
     # community/marketplace hosts (hosting_type 0) are an explicit operator opt-in via
-    # AUTOSLM_VAST_ALLOW_COMMUNITY=1 — needed for scarce classes whose verified-DATACENTER supply is
+    # FLASH_VAST_ALLOW_COMMUNITY=1 — needed for scarce classes whose verified-DATACENTER supply is
     # empty (e.g. B200) while the RunPod equivalent is capacity-throttled. Community offers are still
     # verified + reliability-floored (RELIABILITY_FLOOR above); datacenter-only is the safe default.
-    allow_community = os.environ.get("AUTOSLM_VAST_ALLOW_COMMUNITY") in ("1", "true", "True")
+    allow_community = os.environ.get("FLASH_VAST_ALLOW_COMMUNITY") in ("1", "true", "True")
     out: list[VastOffer] = []
     for r in rows:
         gpu = vast_gpu_for_offer(str(r.get("gpu_name") or ""), float(r.get("gpu_ram") or 0))
@@ -299,11 +299,11 @@ set -x
 export PIP_BREAK_SYSTEM_PACKAGES=1
 PYBIN=/opt/conda/bin/python; [ -x "$PYBIN" ] || PYBIN=/usr/local/bin/python; [ -x "$PYBIN" ] || PYBIN=$(command -v python3)
 mkdir -p /root/flash
-cat > /root/flash/payload.b64 <<'AUTOSLM_PAYLOAD_EOF'
-{payload_b64}AUTOSLM_PAYLOAD_EOF
+cat > /root/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
+{payload_b64}FLASH_PAYLOAD_EOF
 base64 -d /root/flash/payload.b64 > /root/flash/payload.json
-cat > /root/flash/bootstrap.py <<'AUTOSLM_BOOTSTRAP_EOF'
-{bootstrap_src}AUTOSLM_BOOTSTRAP_EOF
+cat > /root/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
+{bootstrap_src}FLASH_BOOTSTRAP_EOF
 # A base worker-stack install failure must STOP the script: continuing into
 # bootstrap.py with a partially installed env turns a deterministic dependency
 # failure into a later import/model crash (or a missing HF marker if
@@ -312,15 +312,15 @@ cat > /root/flash/bootstrap.py <<'AUTOSLM_BOOTSTRAP_EOF'
 # check=True path). The no-deps branch (":") always succeeds, so this is a no-op there.
 {pip_line} || {{ echo "AUTOSLM: base worker dependency install failed" >&2; sleep 600; exit 1; }}
 "$PYBIN" /root/flash/bootstrap.py
-AUTOSLM_RC=$?
+FLASH_RC=$?
 # On failure, hold the box for 10 min so the control plane can pull the container
 # log tail (the only home of early-bootstrap errors); it destroys us much sooner
 # when alive. Success self-destroys immediately.
-[ "$AUTOSLM_RC" -ne 0 ] && sleep 600
+[ "$FLASH_RC" -ne 0 ] && sleep 600
 # Self-destroy backstop (the control plane's destroy is primary). CONTAINER_API_KEY
 # is the Vast-injected instance-scoped key — the operator key never ships here.
 # python, not curl: the worker image is not guaranteed to carry curl.
-"$PYBIN" - <<'AUTOSLM_DESTROY_EOF'
+"$PYBIN" - <<'FLASH_DESTROY_EOF'
 import os, urllib.request
 iid, key = os.environ.get("CONTAINER_ID"), os.environ.get("CONTAINER_API_KEY")
 if iid and key:
@@ -333,8 +333,8 @@ if iid and key:
         urllib.request.urlopen(req, timeout=30)
     except Exception as exc:
         print("self-destroy warn:", exc)
-AUTOSLM_DESTROY_EOF
-exit $AUTOSLM_RC
+FLASH_DESTROY_EOF
+exit $FLASH_RC
 """
 
 

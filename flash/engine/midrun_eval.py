@@ -350,25 +350,25 @@ def make_periodic_eval_callback(periodic: PeriodicEval):
 # ---------------------------------------------------------------------------
 def eval_config(default_max_new: int, *, spec_every: int | None = None) -> dict:
     """Resolve the mid-run-eval knobs. The CADENCE is the only real knob: it comes from the run's
-    ``[train] eval_every_steps`` TOML (``spec_every``), with ``AUTOSLM_EVAL_EVERY_STEPS`` as an
+    ``[train] eval_every_steps`` TOML (``spec_every``), with ``FLASH_EVAL_EVERY_STEPS`` as an
     operator override; 0/unset disables.
 
     Everything else comes from the ENVIRONMENT, not config: the eval queries are the env's
     held-out ``eval_dataset``, the grading is its rubric (reward + eval-metric metrics), the
     completion budget equals the run's normal ``max_tokens`` (``default_max_new``), and the pass
     threshold is the env's own. ``num_examples`` is ONLY a safety cap so a huge env eval split
-    can't dominate training (``AUTOSLM_EVAL_NUM``, default 64) — the agent sizes the eval set via
+    can't dominate training (``FLASH_EVAL_NUM``, default 64) — the agent sizes the eval set via
     the environment, not here.
     """
 
     def _safe_int(value, fallback):
-        # A malformed AUTOSLM_EVAL_* env var must not abort training at setup — fall back.
+        # A malformed FLASH_EVAL_* env var must not abort training at setup — fall back.
         try:
             return int(value)
         except (TypeError, ValueError):
             return fallback
 
-    env_every = os.environ.get("AUTOSLM_EVAL_EVERY_STEPS")
+    env_every = os.environ.get("FLASH_EVAL_EVERY_STEPS")
     if env_every is not None and env_every.strip() != "":
         every = _safe_int(env_every, spec_every)  # bad env var -> fall back to the TOML value
     else:
@@ -376,7 +376,7 @@ def eval_config(default_max_new: int, *, spec_every: int | None = None) -> dict:
     return {
         "every_steps": _safe_int(every, 0) if every is not None else 0,
         # safety cap only (negative would hit Python negative-slicing semantics on the split)
-        "num_examples": max(0, _safe_int(os.environ.get("AUTOSLM_EVAL_NUM"), 64)),
+        "num_examples": max(0, _safe_int(os.environ.get("FLASH_EVAL_NUM"), 64)),
         "max_new_tokens": max(1, int(default_max_new)),  # = the run's normal completion budget
     }
 

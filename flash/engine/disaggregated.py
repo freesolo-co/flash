@@ -38,11 +38,11 @@ DEFAULT_SERVER_GPU_UTIL = 0.90
 
 
 def server_port() -> int:
-    return int(os.environ.get("AUTOSLM_VLLM_SERVER_PORT", DEFAULT_SERVER_PORT))
+    return int(os.environ.get("FLASH_VLLM_SERVER_PORT", DEFAULT_SERVER_PORT))
 
 
 def group_port() -> int:
-    return int(os.environ.get("AUTOSLM_VLLM_GROUP_PORT", DEFAULT_GROUP_PORT))
+    return int(os.environ.get("FLASH_VLLM_GROUP_PORT", DEFAULT_GROUP_PORT))
 
 
 def server_base_url(port: int | None = None) -> str:
@@ -55,11 +55,11 @@ def detect_total_gpus(env: dict | None = None) -> int:
     ``torch.cuda.device_count()`` is avoided on the hot path because the disaggregated split must
     set ``CUDA_VISIBLE_DEVICES`` on the trainer process *before* any CUDA context is created;
     querying torch here could bind the context to all visible devices first. Prefer the explicit
-    ``AUTOSLM_GPU_COUNT`` the provisioner sets (= ``[gpu] count``), else count ``nvidia-smi -L``.
+    ``FLASH_GPU_COUNT`` the provisioner sets (= ``[gpu] count``), else count ``nvidia-smi -L``.
     """
     env = env if env is not None else os.environ
     # GROUND TRUTH = the GPUs actually visible to THIS container (`nvidia-smi -L`, CUDA-free, honors
-    # the container's NVIDIA_VISIBLE_DEVICES). The provisioner's AUTOSLM_GPU_COUNT (= [gpu] count)
+    # the container's NVIDIA_VISIBLE_DEVICES). The provisioner's FLASH_GPU_COUNT (= [gpu] count)
     # is only the REQUESTED count — a provider can rent a 2-GPU offer yet expose 1 GPU to the
     # container (observed on Vast), so trusting it would make the split assign a nonexistent device.
     # We take the real count and only fall back to the hint when nvidia-smi is unavailable.
@@ -72,12 +72,12 @@ def detect_total_gpus(env: dict | None = None) -> int:
             f"[rl][disagg][diag] nvidia-smi -L:\n{out.stdout.strip()}\n"
             f"[rl][disagg][diag] CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')!r} "
             f"NVIDIA_VISIBLE_DEVICES={env.get('NVIDIA_VISIBLE_DEVICES')!r} "
-            f"AUTOSLM_GPU_COUNT={env.get('AUTOSLM_GPU_COUNT')!r}"
+            f"FLASH_GPU_COUNT={env.get('FLASH_GPU_COUNT')!r}"
         )
         lines = [ln for ln in out.stdout.splitlines() if ln.strip().startswith("GPU ")]
         if lines:
             real = len(lines)
-            hint = env.get("AUTOSLM_GPU_COUNT")
+            hint = env.get("FLASH_GPU_COUNT")
             if hint and hint.isdigit() and int(hint) != real:
                 _note = (
                     "The provider under-provisioned the node."
@@ -91,7 +91,7 @@ def detect_total_gpus(env: dict | None = None) -> int:
             return real
     except Exception:
         pass
-    explicit = env.get("AUTOSLM_GPU_COUNT")
+    explicit = env.get("FLASH_GPU_COUNT")
     if explicit and explicit.isdigit() and int(explicit) >= 1:
         return int(explicit)
     try:
@@ -157,7 +157,7 @@ def build_vllm_serve_cmd(
     sync, so trainer-4-bit + server-bf16 stays consistent. ``quant`` is accepted for signature
     stability / sizing notes but does not change the server command.
     """
-    bin_ = trl_bin or os.environ.get("AUTOSLM_TRL_BIN", "trl")
+    bin_ = trl_bin or os.environ.get("FLASH_TRL_BIN", "trl")
     if parallel == "dp":
         # DP replicas: server load-balances generation across infer_gpus full copies. vLLM ONLY
         # allows offline DP for MoE models -> reserve this for the 35B-A3B; dense models must use TP.
@@ -242,7 +242,7 @@ def build_accelerate_launch_cmd(
     weight-sync gather does not support). The disaggregated launcher brings the vLLM rollout server
     up on the inference GPUs first, then re-execs the worker's RL phase under this command so
     ``accelerate`` shards the trainer across ``split.train_gpus`` with FSDP and the trainer connects
-    to the already-running server (``AUTOSLM_RL_TRAINER_ONLY=1`` in the child env).
+    to the already-running server (``FLASH_RL_TRAINER_ONLY=1`` in the child env).
 
     ``--gpu_ids`` pins the child group to the GLOBAL train device indices (so it never touches the
     inference card), and ``--num_processes`` == train_gpus (one rank per train GPU). FSDP (vs DDP)
@@ -312,7 +312,7 @@ def is_main_rank(env: dict | None = None) -> bool:
 def trainer_only_mode(env: dict | None = None) -> bool:
     """True inside the accelerate-launched trainer child (server already up; skip the launcher)."""
     env = env if env is not None else os.environ
-    return str(env.get("AUTOSLM_RL_TRAINER_ONLY", "")) in ("1", "true", "True")
+    return str(env.get("FLASH_RL_TRAINER_ONLY", "")) in ("1", "true", "True")
 
 
 def server_subprocess_env(base_env: dict, split: RolloutSplit) -> dict:
@@ -324,7 +324,7 @@ def server_subprocess_env(base_env: dict, split: RolloutSplit) -> dict:
     """
     env = dict(base_env)
     env["CUDA_VISIBLE_DEVICES"] = _cvd(split.infer_devices)
-    env.setdefault("AUTOSLM_VLLM_GROUP_PORT", str(group_port()))
+    env.setdefault("FLASH_VLLM_GROUP_PORT", str(group_port()))
     # Force vLLM's worker/inspection subprocesses to SPAWN (not fork). `trl vllm-serve` runs its
     # llm_worker as a multiprocessing.Process and vLLM forks a further subprocess to inspect the
     # model architecture; a fork after the parent has touched CUDA/NVML corrupts the NVML handle in

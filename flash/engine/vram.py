@@ -327,7 +327,7 @@ def model_required_vram_gb(
 
 def fetch_hf_params_b(model_id: str) -> float | None:
     """Total params (billions) from the HF API safetensors metadata (no download)."""
-    if os.environ.get("AUTOSLM_SKIP_NET"):
+    if os.environ.get("FLASH_SKIP_NET"):
         return None
     try:
         from huggingface_hub import HfApi

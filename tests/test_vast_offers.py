@@ -57,7 +57,7 @@ def test_usable_offers_filters_and_order(monkeypatch):
         return list(FIXTURE)
 
     monkeypatch.setattr(vast_api, "search_offers", fake_search)
-    monkeypatch.delenv("AUTOSLM_VAST_ALLOW_COMMUNITY", raising=False)
+    monkeypatch.delenv("FLASH_VAST_ALLOW_COMMUNITY", raising=False)
     out = vast.usable_offers(24, disk_gb=60)
     # community host (id=10) dropped by default — datacenter-only unless opted in
     assert [o.offer_id for o in out] == [1, 2, 17, 3, 4, 5]  # dph ascending, junk gone
@@ -74,12 +74,12 @@ def test_usable_offers_filters_and_order(monkeypatch):
 
 
 def test_usable_offers_community_opt_in(monkeypatch):
-    """AUTOSLM_VAST_ALLOW_COMMUNITY=1 widens the gate to verified community hosts."""
+    """FLASH_VAST_ALLOW_COMMUNITY=1 widens the gate to verified community hosts."""
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
-    monkeypatch.setenv("AUTOSLM_VAST_ALLOW_COMMUNITY", "1")
+    monkeypatch.setenv("FLASH_VAST_ALLOW_COMMUNITY", "1")
     out = vast.usable_offers(24, disk_gb=60)
     # opted in: the verified community host (id=10) is now the cheapest survivor
     assert [o.offer_id for o in out] == [10, 1, 2, 17, 3, 4, 5]

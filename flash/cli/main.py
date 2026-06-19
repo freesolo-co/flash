@@ -36,7 +36,7 @@ logger = get_logger(__name__)
 
 
 # Exceptions that represent expected user/config errors: report them as a clean one-line
-# message instead of a Python traceback (use --debug / AUTOSLM_DEBUG=1 to see the full trace).
+# message instead of a Python traceback (use --debug / FLASH_DEBUG=1 to see the full trace).
 _USER_ERRORS = (
     ConfigError,
     ClientError,
@@ -55,14 +55,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="show full tracebacks on error (or set AUTOSLM_DEBUG=1)",
+        help="show full tracebacks on error (or set FLASH_DEBUG=1)",
     )
     parser.add_argument(
         "-v",
         "--verbose",
         action="count",
         default=0,
-        help="increase log verbosity (-v for info, -vv for debug; or set AUTOSLM_LOG_LEVEL)",
+        help="increase log verbosity (-v for info, -vv for debug; or set FLASH_LOG_LEVEL)",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         help="freesolo backend base URL (default: FREESOLO_BASE_URL or https://api.freesolo.co)",
     )
     login.add_argument(
-        "--api-url", help="flash control-plane URL for training calls (default: AUTOSLM_API_URL)"
+        "--api-url", help="flash control-plane URL for training calls (default: FLASH_API_URL)"
     )
     login.set_defaults(func=cmd_login)
 
@@ -205,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
-    debug = getattr(args, "debug", False) or _coerce_bool(os.environ.get("AUTOSLM_DEBUG", ""))
+    debug = getattr(args, "debug", False) or _coerce_bool(os.environ.get("FLASH_DEBUG", ""))
     try:
         return args.func(args)
     except _USER_ERRORS as exc:
@@ -556,7 +556,7 @@ def _push_slug_from(env_dir, output: str) -> str | None:
 
 
 def _config_env_name(config_path) -> str | None:
-    """The `name` part of a sibling autoslm.toml's `[environment] id = "owner/name"`, or None.
+    """The `name` part of a sibling flash.toml's `[environment] id = "owner/name"`, or None.
 
     Used so a bare `environment.py` re-publishes under its EXISTING Hub env (minting a new
     version) instead of deriving a fresh name from the file stem. Owner still comes from the

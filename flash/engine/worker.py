@@ -17,7 +17,7 @@ Core environment variables (set by the launching provider / runner):
   HF_TOKEN
   RUN_ID        unique id for this run (namespacing in the repo)
 
-The AUTOSLM_*/RL_*/SFT_* env vars are A/B overrides documented at their use sites; the
+The FLASH_*/RL_*/SFT_* env vars are A/B overrides documented at their use sites; the
 JobSpec [train] table is the source of truth for per-run knobs.
 """
 
@@ -82,7 +82,7 @@ def require_active_env():
     """Return the run's loaded environment, or raise a CLEAR error when there is none.
 
     ``ACTIVE_ENV`` is None on the no-JobSpec path (the module is imported with no
-    AUTOSLM_JOB_SPEC_JSON/PATH, e.g. a misconfigured worker launch). Every train/eval consumer
+    FLASH_JOB_SPEC_JSON/PATH, e.g. a misconfigured worker launch). Every train/eval consumer
     needs a real env; without this guard the first ``ACTIVE_ENV.<attr>`` access dies with an
     opaque ``AttributeError: 'NoneType' object has no attribute ...``. Fail loudly with an
     actionable message instead — mirrors the explicit RuntimeError raised when a JobSpec is
@@ -91,7 +91,7 @@ def require_active_env():
     if ACTIVE_ENV is None:
         raise RuntimeError(
             "no environment is loaded: this worker was started without a JobSpec "
-            "(AUTOSLM_JOB_SPEC_JSON / AUTOSLM_JOB_SPEC_PATH is unset). A train/eval run must "
+            "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
             "carry a JobSpec naming [environment] id (a verifiers/Prime Hub slug, e.g. "
             "'owner/name')."
         )
@@ -298,17 +298,17 @@ def make_checkpoint_upload_callback():
 # repo; committing every training step (the reward callback fires per step) blows HuggingFace's
 # per-repo commit rate limit (128/hour), especially when several runs share one HF_REPO. Only
 # the per-step "rl_step" stage is high-frequency, so throttle JUST that one to once per
-# AUTOSLM_HEARTBEAT_MIN_S (default 60s); every other stage — including milestones and the
+# FLASH_HEARTBEAT_MIN_S (default 60s); every other stage — including milestones and the
 # terminal done/already_done — always commits so the control plane never misses a transition.
 # The local file + stdout line are always written regardless.
 _HB_LAST_UPLOAD = 0.0
 
 
 def _hb_min_interval_s() -> float:
-    """The rl_step heartbeat-upload throttle, in seconds. Operators raise AUTOSLM_HEARTBEAT_MIN_S
+    """The rl_step heartbeat-upload throttle, in seconds. Operators raise FLASH_HEARTBEAT_MIN_S
     to stay under HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO runs
     share one HF_REPO; default 60s. A non-positive or unparseable value falls back to 60s."""
-    raw = os.environ.get("AUTOSLM_HEARTBEAT_MIN_S")
+    raw = os.environ.get("FLASH_HEARTBEAT_MIN_S")
     if raw is None:
         return 60.0
     try:
@@ -538,7 +538,7 @@ def _attn_impl_for_capability(major: int, minor: int) -> str | None:
       time — its default SDPA can fall to the slow math kernel); all other archs -> None (let
       transformers pick SDPA, which already flash-backs on Ampere/Ada/Hopper). The big LoRA
       win comes from the Liger fused kernels, not the attention path. Pure function (no torch)
-      so it's unit-testable on CPU; override the whole thing with AUTOSLM_ATTN_IMPL.
+      so it's unit-testable on CPU; override the whole thing with FLASH_ATTN_IMPL.
     """
     if major == 12:  # Blackwell consumer: force cuDNN SDPA (avoid the math fallback)
         return "sdpa"
@@ -663,12 +663,12 @@ def finalize_alloc_conf_for_sleep() -> None:
     process starts, but it can't always know the GRPO sleep decision: for a small model with
     RL_VLLM_SLEEP unset the worker resolves sleep OFF (the speed default), yet the launcher
     conservatively assumes sleep ON and picks the non-expandable conf (safe, but fragments a long
-    colocate run). When the launcher cedes the decision (it sets AUTOSLM_ALLOC_AUTO=1 — only when
+    colocate run). When the launcher cedes the decision (it sets FLASH_ALLOC_AUTO=1 — only when
     it applied a DEFAULT, never an operator override), we resolve the same sleep default here (we
     have the model config + GPU) and, if sleep is OFF, switch to expandable_segments — which only
     crashes WITH sleep on, a case we've just ruled out. PYTORCH_ALLOC_CONF is read lazily at the
     first CUDA allocation, so this must run before any allocation (it does — called at boot)."""
-    if os.environ.get("AUTOSLM_ALLOC_AUTO") != "1":
+    if os.environ.get("FLASH_ALLOC_AUTO") != "1":
         return
     try:
         model_id = os.environ.get("BENCH_HF_MODEL", "")
@@ -888,12 +888,12 @@ def make_lora(model_id: str | None = None):
     # converted — fine for our train+eval+serve-same-stack flow.
     # PiSSA's SVD-based init fails inside the DISAGGREGATED trainer (which is CVD-pinned to a
     # non-zero device so the vLLM server can own device 0): peft's pissa_init hits
-    # "set_data ... incompatible tensor type" there. AUTOSLM_LORA_INIT=default falls back to the
+    # "set_data ... incompatible tensor type" there. FLASH_LORA_INIT=default falls back to the
     # standard LoRA init (Kaiming-A / zero-B) — the disaggregated worker sets this. The init METHOD
     # does not affect rollout/step THROUGHPUT, which is the whole point of the disaggregated path.
-    # `or` (not a get-default): a present-but-blank AUTOSLM_LORA_INIT must fall back too, else
+    # `or` (not a get-default): a present-but-blank FLASH_LORA_INIT must fall back too, else
     # init_lora_weights="" reaches PEFT as an invalid value instead of a real init method.
-    _lora_init = os.environ.get("AUTOSLM_LORA_INIT") or "pissa_niter_16"
+    _lora_init = os.environ.get("FLASH_LORA_INIT") or "pissa_niter_16"
     # PiSSA's SVD init requires an UNQUANTIZED base ("Please initialize PiSSA under
     # float32/float16/bfloat16"); it raises on a 4-bit (qlora) base at adapter creation. Force
     # standard init for qlora models regardless of the configured default, so the 4-bit trainers
@@ -922,8 +922,8 @@ def make_lora(model_id: str | None = None):
 
 
 def model_quant(model_id: str) -> str:
-    """Quantization tier for this model: catalog entry > AUTOSLM_QUANT env > bf16."""
-    env_q = os.environ.get("AUTOSLM_QUANT")
+    """Quantization tier for this model: catalog entry > FLASH_QUANT env > bf16."""
+    env_q = os.environ.get("FLASH_QUANT")
     if env_q:
         return env_q
     try:
@@ -1422,7 +1422,7 @@ def _maybe_attach_periodic_eval(
     max_turns: int,
 ):
     """Attach periodic mid-run eval to the GRPO trainer when enabled — the run's
-    ``[train] eval_every_steps`` (or the ``AUTOSLM_EVAL_EVERY_STEPS`` operator override) > 0.
+    ``[train] eval_every_steps`` (or the ``FLASH_EVAL_EVERY_STEPS`` operator override) > 0.
 
     Returns the ``PeriodicEval`` (so the caller can persist its ``history`` into metrics.json),
     or ``None`` when eval is disabled/unsupported for this run.
@@ -1623,20 +1623,20 @@ def _init_adapter_model(model_id: str):
 
 
 def _env_inference_gpus(default: int) -> int:
-    """``AUTOSLM_INFERENCE_GPUS`` as an int, tolerating a present-but-BLANK value.
+    """``FLASH_INFERENCE_GPUS`` as an int, tolerating a present-but-BLANK value.
 
     A ``[worker_env]`` table serializes every value via ``str(v)``, so an empty/whitespace
-    ``AUTOSLM_INFERENCE_GPUS`` reaches the worker as ``""`` — a bare ``int("")`` would raise
+    ``FLASH_INFERENCE_GPUS`` reaches the worker as ``""`` — a bare ``int("")`` would raise
     ValueError and abort the worker before any clear config error. Treat blank/unparseable as
     "no override" (keep the spec default) instead of crashing."""
-    raw = os.environ.get("AUTOSLM_INFERENCE_GPUS")
+    raw = os.environ.get("FLASH_INFERENCE_GPUS")
     if raw is None or not raw.strip():
         return default
     try:
         return int(raw.strip())
     except ValueError:
         print(
-            f"[rl][disagg][warn] AUTOSLM_INFERENCE_GPUS={raw!r} is not an integer; "
+            f"[rl][disagg][warn] FLASH_INFERENCE_GPUS={raw!r} is not an integer; "
             f"using inference_gpus={default}"
         )
         return default
@@ -1651,7 +1651,7 @@ def _require_full_node_for_disaggregated(total_gpus: int, inference_gpus: int) -
     that exposes only 3 GPUs collapses to 1:2 — one trainer instead of two, skipping the FSDP/DDP
     multi-trainer path the user paid for, while the VRAM was sized for the full ratio. Refuse the
     degraded split (the node is torn down on raise) instead of quietly mis-running the config."""
-    hint = os.environ.get("AUTOSLM_GPU_COUNT")
+    hint = os.environ.get("FLASH_GPU_COUNT")
     if hint and hint.isdigit() and int(hint) > total_gpus:
         raise RuntimeError(
             f"[rl][disagg] node under-provisioned: [gpu] count requested {hint} GPU(s) but the "
@@ -1669,7 +1669,7 @@ def _pin_trainer_devices_for_disaggregated() -> None:
     CUDA_VISIBLE_DEVICES is honored only before the first context. The vLLM server (a separate
     subprocess) gets the inference devices via its own env (server_subprocess_env); the trainer
     must NOT also land on device 0 or TRL aborts the weight-sync init with "same CUDA device ...
-    for multiple distinct roles/ranks". detect_total_gpus reads AUTOSLM_GPU_COUNT / nvidia-smi (no
+    for multiple distinct roles/ranks". detect_total_gpus reads FLASH_GPU_COUNT / nvidia-smi (no
     torch context), so this stays CUDA-free. run_rl recomputes the same split (deterministic)."""
     if RUN_MODE != "rl":
         return
@@ -1735,7 +1735,7 @@ def run_rl():
     _inference_gpus = int(JOB_SPEC.train.inference_gpus) if (JOB_SPEC and JOB_SPEC.train) else 0
     _inference_gpus = _env_inference_gpus(_inference_gpus)
     # Re-validate against the EFFECTIVE inference_gpus: submit-time validation only saw the spec
-    # value, but AUTOSLM_INFERENCE_GPUS (via [worker_env]) can change it here — e.g. =0 would force
+    # value, but FLASH_INFERENCE_GPUS (via [worker_env]) can change it here — e.g. =0 would force
     # colocated GRPO for a requires_disaggregated model that OOMs colocated. Fail fast on the worker.
     from flash.catalog import MODELS as _CATALOG_RL
 
@@ -1770,7 +1770,7 @@ def run_rl():
         #   LAUNCHER (this run, train_gpus>1, RANK unset): launches the vLLM server below, then at the
         #     trainer-build point re-execs the worker under `accelerate launch` (FSDP) across the
         #     train devices and waits — it does NOT build a trainer itself.
-        #   TRAINER child (AUTOSLM_RL_TRAINER_ONLY=1, RANK set by accelerate): skips the server launch
+        #   TRAINER child (FLASH_RL_TRAINER_ONLY=1, RANK set by accelerate): skips the server launch
         #     (connects to the launcher's server via env port) and runs the FSDP GRPOTrainer; only
         #     rank 0 writes artifacts. train_gpus==1 keeps the simple single-process path untouched.
         _trainer_only = _disagg.trainer_only_mode()
@@ -1804,13 +1804,13 @@ def run_rl():
                     print(f"[rl][disagg][warn] could not set_device(LOCAL_RANK={_local_rank}): {_e}")
         # PiSSA's SVD init crashes in the CVD-pinned (non-zero device) disaggregated trainer
         # (peft set_data incompatible-tensor-type); fall back to standard LoRA init. setdefault so
-        # an explicit operator [worker_env] AUTOSLM_LORA_INIT still wins. Init method is irrelevant
+        # an explicit operator [worker_env] FLASH_LORA_INIT still wins. Init method is irrelevant
         # to the throughput this path measures.
         # setdefault would NOT override an operator-set BLANK value, leaving make_lora with an
         # invalid empty init (and PiSSA would still be attempted in this CVD-pinned trainer);
         # treat blank/unset as "use standard init" so the fallback actually engages.
-        if not os.environ.get("AUTOSLM_LORA_INIT"):
-            os.environ["AUTOSLM_LORA_INIT"] = "default"
+        if not os.environ.get("FLASH_LORA_INIT"):
+            os.environ["FLASH_LORA_INIT"] = "default"
     disaggregated = _rollout_split is not None and _rollout_split.mode == "disaggregated"
     wait_for_gpu()
     setup_perf_backends()
@@ -2093,8 +2093,8 @@ def run_rl():
         # bandwidth -> faster, larger-batch generation, which is how 1:2 / 1:3 ratios clear the
         # rollout bottleneck on a generation-bound step. Works for dense AND MoE. Data-parallel
         # (replicas) is REJECTED by vLLM for dense models ("Offline data parallel ... not supported
-        # ... for dense models"), so reserve AUTOSLM_DISAGG_PARALLEL=dp for the MoE 35B-A3B only.
-        _parallel = (os.environ.get("AUTOSLM_DISAGG_PARALLEL") or "tp").strip().lower()
+        # ... for dense models"), so reserve FLASH_DISAGG_PARALLEL=dp for the MoE 35B-A3B only.
+        _parallel = (os.environ.get("FLASH_DISAGG_PARALLEL") or "tp").strip().lower()
         if _parallel not in ("dp", "tp"):
             _parallel = "tp"
         if _parallel == "dp":
@@ -2115,7 +2115,7 @@ def run_rl():
                 print(f"[rl][disagg] MoE probe failed ({_e}); assuming dense", flush=True)
             if not _is_moe:
                 print(
-                    f"[rl][disagg] WARNING: AUTOSLM_DISAGG_PARALLEL=dp is MoE-only (vLLM rejects "
+                    f"[rl][disagg] WARNING: FLASH_DISAGG_PARALLEL=dp is MoE-only (vLLM rejects "
                     f"data-parallel for dense models); {model_id} is dense -> using tp.",
                     flush=True,
                 )
@@ -2159,10 +2159,10 @@ def run_rl():
         # Optional --enforce_eager: skip vLLM CUDA-graph capture at server boot. For very large
         # models (e.g. the 35B-A3B MoE) graph capture dominates the boot window and can blow past
         # RL_VLLM_SERVER_TIMEOUT before the server is ever healthy; eager trades a little decode
-        # throughput for a tractable boot. Opt-in via AUTOSLM_RL_VLLM_ENFORCE_EAGER so small models
+        # throughput for a tractable boot. Opt-in via FLASH_RL_VLLM_ENFORCE_EAGER so small models
         # keep graphs (their boot is cheap and they want the decode speed).
         _vllm_extra: list[str] = []
-        if os.environ.get("AUTOSLM_RL_VLLM_ENFORCE_EAGER", "").strip().lower() in ("1", "true", "yes"):
+        if os.environ.get("FLASH_RL_VLLM_ENFORCE_EAGER", "").strip().lower() in ("1", "true", "yes"):
             _vllm_extra += ["--enforce_eager", "true"]
         _cmd = _disagg.build_vllm_serve_cmd(
             model_id,
@@ -2215,7 +2215,7 @@ def run_rl():
             vllm_server_timeout=_server_timeout,
         )
         # Keep the trainer's NCCL weight-sync group port in lockstep with the server's. Both default
-        # to TRL's 51216, but AUTOSLM_VLLM_GROUP_PORT overrides the SERVER (server_subprocess_env);
+        # to TRL's 51216, but FLASH_VLLM_GROUP_PORT overrides the SERVER (server_subprocess_env);
         # the trainer's VLLMClient must use the same port or sync_weights can't rendezvous. Set the
         # field only if this TRL exposes it (older TRL rejects unknown GRPOConfig kwargs).
         _group_port = _disagg.group_port()
@@ -2224,7 +2224,7 @@ def run_rl():
         elif _group_port != _disagg.DEFAULT_GROUP_PORT:
             print(
                 f"[rl][disagg][warn] this TRL has no GRPOConfig.vllm_group_port; cannot honor "
-                f"AUTOSLM_VLLM_GROUP_PORT={_group_port} on the trainer side (stays TRL default 51216)"
+                f"FLASH_VLLM_GROUP_PORT={_group_port} on the trainer side (stays TRL default 51216)"
             )
     elif use_vllm:
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
@@ -2422,9 +2422,9 @@ def run_rl():
             # single-trainer 1:1 path, so DDP covers all the 2:1/2:2/3:1 ratios.
             _acc_cmd = _disagg.build_accelerate_launch_cmd(_rollout_split, use_fsdp=False)
             _child_env = dict(os.environ)
-            _child_env["AUTOSLM_RL_TRAINER_ONLY"] = "1"
-            _child_env["AUTOSLM_VLLM_SERVER_PORT"] = str(_port)
-            _child_env["AUTOSLM_VLLM_GROUP_PORT"] = str(_disagg.group_port())
+            _child_env["FLASH_RL_TRAINER_ONLY"] = "1"
+            _child_env["FLASH_VLLM_SERVER_PORT"] = str(_port)
+            _child_env["FLASH_VLLM_GROUP_PORT"] = str(_disagg.group_port())
             # The launcher pinned CUDA_VISIBLE_DEVICES to all train devices; the child must NOT inherit
             # that (accelerate's --gpu_ids assigns one GPU per rank). Drop it so accelerate controls
             # device placement across the train GPUs.
@@ -2461,7 +2461,7 @@ def run_rl():
                 **extra_trainer_kwargs,
             )
             # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or
-            # AUTOSLM_EVAL_EVERY_STEPS, > 0): greedy eval on a held-out split, streamed via
+            # FLASH_EVAL_EVERY_STEPS, > 0): greedy eval on a held-out split, streamed via
             # heartbeat("rl_eval", ...) AND accumulated into metrics.json so the agent reads
             # the eval curve (not just the noisy reward) when judging a run.
             #
@@ -2709,10 +2709,10 @@ def write_train_meta(
     # metrics only — loss/reward are streamed by the trainer; reward_history is in notes)
     # and write the completion sentinel. There is no separate eval phase.
     m = RunMetrics(
-        # Substrate the worker actually ran on. Each provider's launcher sets AUTOSLM_ARM
+        # Substrate the worker actually ran on. Each provider's launcher sets FLASH_ARM
         # in the worker env (runpod -> "runpod", vast -> "vast"); default to "runpod" only
         # when unset so the persisted metrics correctly attribute the compute backend.
-        arm=os.environ.get("AUTOSLM_ARM", "runpod"),
+        arm=os.environ.get("FLASH_ARM", "runpod"),
         phase=phase,
         seed=SEED,
         model_id=model_id,

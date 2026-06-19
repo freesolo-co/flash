@@ -38,13 +38,13 @@ The benchmark NUMBERS require a worker container with ≥2 CUDA-usable GPUs. Mea
   runtime fixes GPU visibility at container-launch from the **image's** ENV, not a runtime env var.
   Baked `ENV NVIDIA_VISIBLE_DEVICES=all` into the image and TESTED it (built `:cu128-mgpu` via
   `crane mutate` of `:cu128` — added the env, reused all layers, no rebuild; ran with
-  `AUTOSLM_TRAIN_WORKER_IMAGE=:cu128-mgpu`): the container **STILL exposed only 1 GPU**.
+  `FLASH_TRAIN_WORKER_IMAGE=:cu128-mgpu`): the container **STILL exposed only 1 GPU**.
   **CONCLUSION: Vast multi-GPU is NOT achievable from the client.** The instance has 2 GPUs but the
   container's device cgroup is limited to 1 — neither the create-time `env` nor the image `ENV`
   changes it. This is a Vast `runtype=args` / fractional-machine container behavior that needs a
   Vast-side fix (or their support). The remaining route to multi-GPU is a **RunPod Pods**
   provisioner (real multi-GPU nodes; flash only uses RunPod Flash serverless today, which
-  throttles for multi-GPU). `AUTOSLM_TRAIN_WORKER_IMAGE` (override) + the baked image ENV are kept —
+  throttles for multi-GPU). `FLASH_TRAIN_WORKER_IMAGE` (override) + the baked image ENV are kept —
   both are correct and will help the moment a substrate actually hands the container ≥2 GPUs.
 - **RunPod Flash (serverless)**: A100×2 (and the classes the fallback walked to) **throttle** — no
   free multi-GPU serverless worker; the run fast-fails `no_capacity`. RunPod's true multi-GPU is

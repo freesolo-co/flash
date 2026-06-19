@@ -26,10 +26,10 @@ class VastProvider:
         from flash.providers.vast.auth import load_api_key
 
         # Vast needs its operator key AND a live network path: it is a live-market
-        # substrate (offer search), so AUTOSLM_SKIP_NET (offline/CI) disables Vast
+        # substrate (offer search), so FLASH_SKIP_NET (offline/CI) disables Vast
         # entirely; offline allocation then degrades deterministically to RunPod's
         # static catalog.
-        if os.environ.get("AUTOSLM_SKIP_NET"):
+        if os.environ.get("FLASH_SKIP_NET"):
             return False
         return load_api_key() is not None
 
