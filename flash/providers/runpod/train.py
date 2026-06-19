@@ -796,6 +796,14 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
+    # Forward every operator-set CHALK_* flag (opt-in freesolo-chalk kernels:
+    # CHALK_MLP_KERNEL, CHALK_FP8_BASE, CHALK_TRITON_LORA, CHALK_EMBED_KERNEL, ...). The chalk
+    # install hook (engine.chalk_kernels.install_chalk_kernels) runs INSIDE the worker subprocess
+    # and reads these flags from its own process env, so a control-plane CHALK_* override must be
+    # forwarded or it silently no-ops on every remote run. Use a prefix pass-through (not an
+    # explicit list) so new chalk flags reach the worker without touching this allowlist; the flag
+    # names are owned by the freesolo-chalk package, not enumerated here.
+    env.update({k: v for k, v in os.environ.items() if k.startswith("CHALK_")})
     # Per-run worker_env overrides win over the global os.environ allowlist: this is what lets
     # ONE run differ (e.g. a per-run optimizer or LoRA-init A/B) while every other concurrent run
     # keeps the global default. Run-IDENTITY keys are control-plane-owned and excluded: the poller,
