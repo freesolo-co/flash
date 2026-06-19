@@ -695,12 +695,17 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # volume instead of per run).
     if getattr(spec.gpu, "network_volume", None):
         env["HF_HOME"] = "/runpod-volume/hf-cache"
-    # Forward W&B credentials to the worker. Run tuning is NOT an operator env knob: flash is fully
-    # managed — the worker uses the optimal default for every setting, and the only per-run
-    # configuration is the run spec's structured [train] fields. No control-plane process-env
-    # override reaches the worker.
-    if os.environ.get("WANDB_API_KEY") is not None:
-        env["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
+    # Forward W&B account routing to the worker: the API key AND the optional WANDB_ENTITY that
+    # routes runs into a team/service-account workspace. These are operator ACCOUNT config (where
+    # the dashboards land), not training tuning — without the entity, `wandb_report_to()` still
+    # enables W&B under the key's default (personal) entity, so team runs vanish from the configured
+    # workspace and service-account setups that require an explicit entity can fail. (Run TUNING is
+    # still NOT an operator env knob: flash is fully managed — every training setting uses the
+    # optimal default and the only per-run config is the spec's structured [train] fields. The
+    # worker also pins WANDB_PROJECT itself.)
+    for _wb in ("WANDB_API_KEY", "WANDB_ENTITY"):
+        if os.environ.get(_wb):
+            env[_wb] = os.environ[_wb]
     return env
 
 

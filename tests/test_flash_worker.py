@@ -38,9 +38,13 @@ def test_build_worker_env_does_not_forward_tuning_knobs(monkeypatch):
     env = build_worker_env(_spec(), 0)
     for k in managed:
         assert k not in env, f"{k} should not be forwarded (tuning is managed)"
-    # W&B credential/routing is still forwarded; fragmentation-safe allocator default still set
+    # W&B account routing is still forwarded (credential AND the team/workspace entity) — that is
+    # operator account config, not training tuning; fragmentation-safe allocator default still set.
     monkeypatch.setenv("WANDB_API_KEY", "wb")
-    assert build_worker_env(_spec(), 0)["WANDB_API_KEY"] == "wb"
+    monkeypatch.setenv("WANDB_ENTITY", "my-team")
+    wb_env = build_worker_env(_spec(), 0)
+    assert wb_env["WANDB_API_KEY"] == "wb"
+    assert wb_env["WANDB_ENTITY"] == "my-team"  # team/service-account routing must reach the worker
     assert "PYTORCH_CUDA_ALLOC_CONF" in env
 
 
