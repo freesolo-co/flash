@@ -316,9 +316,10 @@ def poll_job(
     seen_heartbeat = False
     last_health_probe = 0.0
     unhealthy_since: float | None = None  # first time the worker was seen stuck UNHEALTHY
-    worker_initializing = False  # last probe saw a worker cold-starting the image (initializing)
-    init_probe_fresh = False  # a health probe in THIS IN_QUEUE episode succeeded since last fired
-    capacity_confirmed = False  # a good probe in THIS episode saw an empty, non-initializing queue
+    # A good probe in THIS IN_QUEUE episode saw a CONFIRMED-empty queue: no usable worker
+    # (running/ready/idle) AND none initializing. This (and only this) gates the no_capacity
+    # fast-path; it latches across a single probe flake (see the except below).
+    capacity_confirmed = False
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
@@ -337,11 +338,9 @@ def poll_job(
         # The initializing flag (and its freshness) is meaningful only WHILE queued and is set
         # solely by the IN_QUEUE health probe. Clear it whenever the job is not IN_QUEUE so a
         # later re-queue (e.g. RUNNING -> the worker dies -> back to IN_QUEUE) starts from a clean
-        # slate instead of inheriting a stale `initializing=True` that would suppress the
-        # no_capacity fast-path for a now-genuinely-throttled queue until the next probe.
+        # slate instead of inheriting a stale confirmation that would let the no_capacity fast-path
+        # fire on a stale read for a queue that is now genuinely cold-starting again.
         if status != "IN_QUEUE":
-            worker_initializing = False
-            init_probe_fresh = False
             capacity_confirmed = False
         if status in TERMINAL_OK:
             try:
@@ -369,12 +368,14 @@ def poll_job(
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
                 recovering = workers.get("initializing")
-                worker_initializing = bool(recovering)
-                init_probe_fresh = True  # this episode has a successful probe to trust
-                # Latch a CONFIRMED capacity-starved read: an empty queue with no worker even
-                # initializing. This survives a later probe flake (see except below) so a single
-                # transient probe error at the queue_grace_s boundary can't revive false "maybe
-                # initializing" doubt and defer the no_capacity fast-path by the full setup grace.
+                # Latch a CONFIRMED capacity-starved read: an empty queue with NO usable worker
+                # (running/ready/idle) AND none initializing. Requiring `not usable` here is what
+                # keeps a backlog/scheduling delay (job IN_QUEUE while usable workers EXIST) from
+                # being misread as capacity starvation. This survives a later probe flake (see
+                # except below) so a single transient probe error at the queue_grace_s boundary
+                # can't revive false "maybe initializing" doubt and defer the fast-path by the full
+                # setup grace. A flake never *sets* it True (only a good probe can), so a stale-False
+                # read can't fire the fast-path either.
                 capacity_confirmed = not usable and not recovering
                 if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
                     say(f"queued; workers: {workers}")
@@ -399,17 +400,13 @@ def poll_job(
                     unhealthy_since = None  # recovered / usable worker appeared
             except Exception:
                 # Health surfacing is diagnostic only; a probe failure must not stop polling.
-                # The no_capacity fast-path needs a CONFIRMED-empty queue, never an unverified
-                # stale `worker_initializing=False`. A flake leaves `worker_initializing` at its
-                # (possibly stale) prior value, so normally we drop `init_probe_fresh` to keep the
-                # safe failure direction — a probe-blind window won't delete an endpoint whose
-                # worker may be actively initializing (setup_grace_s still bounds the wait).
-                # EXCEPTION: if a prior good probe in THIS episode already *confirmed* an empty,
-                # non-initializing queue (`capacity_confirmed`), preserve that trustworthy verdict —
-                # a single transient flake at the queue_grace_s boundary must not erase a real
-                # capacity-starved read and defer the fast-path by the full setup grace (~50 min).
-                if not capacity_confirmed:
-                    init_probe_fresh = False
+                # The no_capacity fast-path needs a CONFIRMED-empty queue (`capacity_confirmed`),
+                # which only a successful probe can set True — so a flake can never spuriously fire
+                # the fast-path. And we deliberately do NOT reset `capacity_confirmed` here: if a
+                # prior good probe in THIS episode already confirmed an empty, non-initializing
+                # queue, that trustworthy verdict survives a single transient flake at the
+                # queue_grace_s boundary instead of being deferred by the full setup grace (~50 min).
+                pass
         # CAPACITY FAST-PATH: a job that can't even LEAVE the queue (no worker ever assigned)
         # is on a capacity-starved GPU class — RunPod keeps the worker `throttled` and the job
         # IN_QUEUE indefinitely. Fail FAST with ``no_capacity`` (well before the multi-minute
@@ -424,14 +421,17 @@ def poll_job(
         # worker about to run. The setup_grace_s stall window (and the unhealthy fast-path) still
         # bound this, so a worker that never finishes initializing is not waited on forever.
         #
-        # Require ``init_probe_fresh``: only fire on a CONFIRMED-empty queue (a successful probe in
-        # THIS IN_QUEUE episode that saw no initializing worker). If every probe in the window
-        # errored we have no trustworthy view, so we don't delete the endpoint on a stale/unverified
-        # `worker_initializing=False`; setup_grace_s still bounds the wait either way.
+        # Require ``capacity_confirmed``: only fire on a CONFIRMED-empty queue — a successful probe
+        # in THIS IN_QUEUE episode that saw NO usable worker (running/ready/idle) AND none
+        # initializing. ``capacity_confirmed`` already encodes both (``not usable and not
+        # recovering``) and latches across a single probe flake, so a backlog/scheduling delay that
+        # keeps the job IN_QUEUE while usable workers EXIST can't be misread as capacity starvation
+        # (those still bound by stall_after_s/setup_grace_s below). If every probe in the window
+        # errored we have no trustworthy view (capacity_confirmed stays False), so we don't delete
+        # the endpoint on a stale/unverified read; setup_grace_s bounds the wait either way.
         if (
             status == "IN_QUEUE"
-            and init_probe_fresh
-            and not worker_initializing
+            and capacity_confirmed
             and time.time() - last_progress > queue_grace_s
         ):
             return PollResult(

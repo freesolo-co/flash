@@ -95,6 +95,16 @@ def test_server_env_forces_spawn():
     assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
 
 
+def test_server_env_overrides_stale_multiproc_method():
+    # Re-review guard: an incompatible value carried in base_env (e.g. `fork` from the host/image or
+    # the [worker_env] TOML stringification) must be OVERWRITTEN, not preserved (setdefault would
+    # keep it and reintroduce the NVML-corruption fork crash this guard exists to prevent).
+    env = server_subprocess_env(
+        {"VLLM_WORKER_MULTIPROC_METHOD": "fork"}, select_rollout_split(2, 1)
+    )
+    assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+
 def test_server_env_multi_infer():
     split = select_rollout_split(3, 2)  # infer (0,1), train (2,)
     env = server_subprocess_env({}, split)
@@ -170,7 +180,7 @@ def test_accelerate_launch_cmd_2to1():
     # 2:1 split (2 trainer GPUs : 1 infer). accelerate launches one rank per TRAIN GPU, pinned to
     # the global train device ids, FSDP-sharded, running the worker module.
     split = select_rollout_split(3, 1)  # total 3, infer 1 -> train_gpus=2
-    cmd = build_accelerate_launch_cmd(split, python_bin="python")
+    cmd = build_accelerate_launch_cmd(split)
     assert cmd[0:2] == ["accelerate", "launch"]
     # FSDP implies multi-GPU; accelerate REJECTS --multi_gpu alongside --use_fsdp, so it must be absent
     assert "--multi_gpu" not in cmd

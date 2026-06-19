@@ -211,6 +211,39 @@ def test_poll_job_initializing_worker_suppresses_no_capacity(monkeypatch):
     assert res.metrics == {"acc": 1.0}
 
 
+def test_poll_job_usable_workers_suppress_no_capacity(monkeypatch):
+    # Re-review guard: a job stuck IN_QUEUE past queue_grace_s while the pool reports USABLE workers
+    # (running/ready/idle) is a backlog / scheduling delay, NOT capacity starvation. The no_capacity
+    # fast-path must NOT fire here (it gates on a CONFIRMED-empty pool, i.e. no usable worker AND
+    # none initializing) — deleting an endpoint that has live workers would walk GPU classes blindly.
+    # It is bounded by setup_grace_s instead -> a stall, never no_capacity.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        # A usable worker exists (idle), nothing initializing — but the job hasn't left the queue.
+        lambda eid: {"workers": {"idle": 1, "running": 0, "ready": 0, "initializing": 0}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        queue_grace_s=200.0,  # small: WOULD trip no_capacity if the fast-path ignored usable workers
+        setup_grace_s=600.0,  # the real bound while a usable worker is present
+    )
+    assert not res.ok
+    assert res.failure == "stalled"  # NOT no_capacity
+    assert "setup" in res.detail
+
+
 def test_poll_job_probe_error_does_not_premature_no_capacity(monkeypatch):
     # If every endpoint_health probe ERRORS while IN_QUEUE we have no trustworthy view of the
     # worker pool, so the no_capacity fast-path must NOT fire on a stale/unverified

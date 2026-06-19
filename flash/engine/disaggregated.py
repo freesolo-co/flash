@@ -265,21 +265,26 @@ def build_accelerate_launch_cmd(
     worker_module: str = "flash.engine.worker",
     mixed_precision: str = "bf16",
     use_fsdp: bool = True,
-    python_bin: str | None = None,
 ) -> list[str]:
-    """``accelerate launch`` argv that runs the GRPO trainer across the TRAIN devices (FSDP).
+    """``accelerate launch`` argv that runs the GRPO trainer across the TRAIN devices.
 
     For a train_gpus>1 ratio (2:1, 3:1, 2:2) the trainer must be a *distributed* process group, not
     a single process spanning many GPUs (that silently becomes nn.DataParallel, which TRL's
     weight-sync gather does not support). The disaggregated launcher brings the vLLM rollout server
     up on the inference GPUs first, then re-execs the worker's RL phase under this command so
-    ``accelerate`` shards the trainer across ``split.train_gpus`` with FSDP and the trainer connects
-    to the already-running server (``FLASH_RL_TRAINER_ONLY=1`` in the child env).
+    ``accelerate`` runs the trainer across ``split.train_gpus`` and the trainer connects to the
+    already-running server (``FLASH_RL_TRAINER_ONLY=1`` in the child env).
 
     ``--gpu_ids`` pins the child group to the GLOBAL train device indices (so it never touches the
-    inference card), and ``--num_processes`` == train_gpus (one rank per train GPU). FSDP (vs DDP)
-    is the default because it shards the base weights — required for the 35B-A3B whose base does not
-    fit one card replicated; for small models it is still correct, just less memory-critical.
+    inference card), and ``--num_processes`` == train_gpus (one rank per train GPU).
+
+    SHIPPED PATH: the worker calls this with ``use_fsdp=False`` (DDP — replicate the policy per
+    rank), because TRL's per-step LoRA-merge weight sync (``merge_adapter()`` ->
+    ``get_delta_weight``) breaks under FSDP param sharding. Every model that runs a multi-trainer
+    ratio (1-9B) fits replicated on one trainer card, so DDP covers all the 2:1/3:1/2:2 ratios; the
+    only model that wouldn't (35B) takes the single-trainer 1:1 path. The ``use_fsdp=True`` branch
+    (FSDP SHARD_GRAD_OP, for a base too big to replicate) is kept for a future TRL patch that gathers
+    LoRA before the merge, but is not currently exercised by the launcher.
     """
     cmd = [
         "accelerate",
@@ -369,8 +374,11 @@ def server_subprocess_env(base_env: dict, split: RolloutSplit) -> dict:
     # model architecture; a fork after the parent has touched CUDA/NVML corrupts the NVML handle in
     # the child -> `NVMLError_InvalidArgument` during ModelConfig inspection ("architectures failed
     # to be inspected"). Spawn gives each child a clean CUDA/NVML state. (The colocate path is
-    # in-process so it never hit this.)
-    env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    # in-process so it never hit this.) ASSIGN (not setdefault): a stale/incompatible value carried
+    # in base_env (e.g. `fork` from the host/image or the [worker_env] TOML stringification) would
+    # otherwise be preserved and reintroduce the exact NVML corruption this guard prevents — the
+    # same reason the group-port line above overwrites rather than setdefaults.
+    env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     return env
 
 

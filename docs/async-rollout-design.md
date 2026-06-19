@@ -62,8 +62,10 @@ Run matrix (the ratios):
 - **colocate (1 GPU)** — MEASURED baseline (107.4 s/step, MiniCPM5-1B heavy).
 - **1:1 / 1:2 / 1:3** (train_gpus==1) — provisioning SOLVED (whole-machine multi-GPU 5090s rented);
   1:1 (1.02×) + 1:2 (**1.33×**) MEASURED, 1:3 in flight. See the benchmark table below.
-- **2:1 / 3:1 / 2:2** (train_gpus>1) — REMAINING: need the accelerate-FSDP multi-trainer launch
-  (guarded with a clear error today).
+- **2:1 / 3:1 / 2:2** (train_gpus>1) — IMPLEMENTED via a DDP multi-trainer group (`run_rl` re-execs
+  the worker under `accelerate launch --multi_gpu`, one rank per train GPU). DDP (not FSDP) because
+  TRL's per-step LoRA-merge weight sync is incompatible with FSDP param sharding; FSDP sharding (for
+  a base too big to replicate, e.g. 35B) remains out of scope. A 2:1 MiniCPM validation run is in flight.
 
 ## Why
 
@@ -191,8 +193,10 @@ full colocate-vs-1:2 comparison on the 5090.
 
 The Qwen3.5 `*ForConditionalGeneration` (VL) models load on the standalone `trl vllm-serve` without
 the colocate-only language-model-only patch, so disaggregation works across the catalog. The
-**train_gpus>1 ratios (2:1/3:1/2:2)** are now wired via an accelerate-FSDP trainer group (`run_rl`
-launcher re-execs the worker under `accelerate launch`); a 2:1 MiniCPM validation run is in flight.
+**train_gpus>1 ratios (2:1/3:1/2:2)** are now wired via a DDP trainer group (`run_rl` launcher
+re-execs the worker under `accelerate launch --multi_gpu`, one rank per train GPU). DDP (not FSDP)
+because TRL's LoRA-merge weight sync breaks under FSDP param sharding; FSDP sharding for a base too
+big to replicate (35B) is out of scope. A 2:1 MiniCPM validation run is in flight.
 
 **Ratio validity is model-dependent (TP must divide the attention-head count).** vLLM requires
 `num_attention_heads % tensor_parallel_size == 0`, and TP = `inference_gpus`. MiniCPM5-1B has 16
@@ -231,11 +235,11 @@ efficient multi-GPU RL. Each lever below maps a verl mechanism to a concrete fla
 
 | verl mechanism | What it does in verl | flash adoption |
 |---|---|---|
-| **3D-HybridEngine** (actor resharding) | reshapes actor weights between the **train** layout (FSDP/Megatron sharding) and the **rollout** layout (vLLM TP) with *zero redundancy* and minimal comm during the train→generate transition | the disaggregated weight-sync step pushes only the resharded delta to the vLLM server each step, not a full state-dict copy |
+| **3D-HybridEngine** (actor resharding) | reshapes actor weights between the **train** layout (FSDP/Megatron sharding) and the **rollout** layout (vLLM TP) with *zero redundancy* and minimal comm during the train→generate transition | NOT adopted: the disaggregated weight sync uses TRL's per-step **full bf16 broadcast** (every named param, every step) to the vLLM server — the current scaling ceiling. A verl-style zero-redundancy resharded-delta push is future work |
 | **Flexible device mapping / placement** | a `ResourcePool` assigns actor vs rollout to arbitrary GPU sets (colocated **or** split) | `select_rollout_split` is the same idea: `inference_gpus` carves the node into trainer vs vLLM-server device sets |
 | **Async rollout (one-step-off)** | generation for the next batch overlaps the current optimizer step; the rollout engine runs continuously | **NOT available in TRL** — TRL `vllm_mode="server"` is synchronous (generate→train→sync, no overlap flag), so this verl lever is unrealized here and 1:1 ≈ colocate (measured 1.02×). The speedup instead comes from **inference TP throughput** (next row), not overlap. A true one-step-off would need a custom trainer loop (future) |
 | **Continuous batching in the rollout engine** | vLLM/SGLang server batches across requests, keeping the inference GPU saturated | the dedicated vLLM server (vs colocate's per-step burst then idle) keeps the infer GPU busy |
-| **TP rollout + FSDP/Megatron train** | inference is tensor-parallel across its GPUs; training is sharded across the rest | vLLM `tensor_parallel_size = infer_gpus` (**the measured 1.33× win at 1:2**); trainer FSDP across `train_gpus` is the REMAINING piece for train_gpus>1 ratios |
+| **TP rollout + FSDP/Megatron train** | inference is tensor-parallel across its GPUs; training is sharded across the rest | vLLM `tensor_parallel_size = infer_gpus` (**the measured 1.33× win at 1:2**); the trainer runs **DDP** (replicated, not sharded) across `train_gpus` for the train_gpus>1 ratios — DDP, not FSDP, because TRL's LoRA-merge weight sync breaks under FSDP param sharding. FSDP sharding (for a base too big to replicate) remains out of scope |
 | **Single-controller orchestration** | one process drives the dataflow; workers are stateless | the worker stays the single controller; only the vLLM-serve subprocess is added |
 
 The benchmark's job is to find, per model, the `inference_gpus` split where the inference-TP
