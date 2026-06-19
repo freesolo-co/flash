@@ -23,12 +23,13 @@ from .spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 
 
 def _require_int(value: Any, label: str, *, minimum: int, default: int) -> int:
-    """Coerce a TOML scalar to a finite integer >= minimum, rejecting bools/floats/non-numbers.
+    """Coerce a TOML scalar to a finite integer >= minimum, rejecting bools/non-numbers/non-integer floats.
 
     Shares the [train]-knob discipline (see _train_int): a bare ``int()`` silently truncates
     ``2.9`` -> ``2`` and accepts ``true`` as ``1``, which for a topology field like ``[gpu] count``
-    would provision a different split than requested instead of failing validation. Missing/None
-    falls back to ``default``.
+    would provision a different split than requested instead of failing validation. An
+    integer-valued float (e.g. ``2.0``) is accepted (it equals its truncation); only non-integer
+    floats are rejected. Missing/None falls back to ``default``.
     """
     if value is None:
         return default

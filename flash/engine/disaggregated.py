@@ -74,8 +74,10 @@ def detect_total_gpus(env: dict | None = None) -> int:
 
     ``torch.cuda.device_count()`` is avoided on the hot path because the disaggregated split must
     set ``CUDA_VISIBLE_DEVICES`` on the trainer process *before* any CUDA context is created;
-    querying torch here could bind the context to all visible devices first. Prefer the explicit
-    ``FLASH_GPU_COUNT`` the provisioner sets (= ``[gpu] count``), else count ``nvidia-smi -L``.
+    querying torch here could bind the context to all visible devices first. Ground truth is the
+    real ``nvidia-smi -L`` count (what the container actually sees); the explicit
+    ``FLASH_GPU_COUNT`` the provisioner sets (= ``[gpu] count``) is only the *requested* count, so
+    it is used as a fallback when ``nvidia-smi`` is unavailable and to cap an over-exposed node.
     """
     env = env if env is not None else os.environ
     # GROUND TRUTH = the GPUs actually visible to THIS container (`nvidia-smi -L`, CUDA-free, honors
