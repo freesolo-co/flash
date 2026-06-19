@@ -11,7 +11,13 @@ reproducible without provider creds.
 
 from __future__ import annotations
 
-from flash.providers.base import GPU_INFO, POLICY_NAMES, GpuClass, canonical_gpu
+from flash.providers.base import (
+    GPU_INFO,
+    POLICY_NAMES,
+    GpuClass,
+    canonical_gpu,
+    providers_for,
+)
 
 # Peak bf16 dense tensor-core throughput (TFLOPS) per managed class. Vendor spec sheets
 # (no 2:4 sparsity). Only relative magnitudes and the calibrated MFU in ``analytical``
@@ -88,21 +94,29 @@ def pick_gpu(
     ``resolve_gpu_policy`` only canonicalizes a non-policy value).
 
     When ``provider`` pins a substrate ("runpod"/"vast"), candidates are restricted to
-    classes the provider can serve (``validated_on``), mirroring the allocator's
-    per-provider filter -- so e.g. a RunPod-only class isn't priced as a Vast pick. This
-    provider filter holds even with ``allow_unvalidated=True``: that flag only relaxes the
-    validation-status gate (it lets unvalidated-but-provisionable classes through), it
-    does NOT let a class be quoted on a substrate that can't provision it.
+    classes the provider can PROVISION (``providers_for`` -- RunPod has the ``GpuType``
+    enum_member, Vast has the ``vast_name``), mirroring the allocator's per-provider filter
+    (it walks ``provider.gpu_classes()``) -- so e.g. a Vast-only class isn't priced as a
+    RunPod pick. This provisionability filter holds even with ``allow_unvalidated=True``:
+    that flag only relaxes the validation-status gate (it lets unvalidated-but-provisionable
+    classes through), it does NOT let a class be quoted on a substrate that can't provision
+    it. Provisionability is NOT ``validated_on``: a class can be provisionable on a provider
+    yet validated only elsewhere (e.g. the RTX 3090 is RunPod-provisionable but vast-
+    validated), and ``allow_unvalidated=True`` brings those into the pinned provider's pool.
     """
 
     def _selectable(g: GpuClass) -> bool:
         # Two independent gates, mirroring ``allocator.allocate``: a per-provider
-        # provisionability filter AND a validation-status filter. ``allow_unvalidated``
+        # PROVISIONABILITY filter AND a validation-status filter. ``allow_unvalidated``
         # only relaxes the latter -- it never lets a class be priced on a substrate that
         # can't serve it. So a Vast-only class is never quoted under ``provider="runpod"``,
-        # even with ``allow_unvalidated=True`` (the allocator walks ``provider.gpu_classes()``
-        # per provider; ``validated_on`` is the static registry's proxy for that membership).
-        if provider not in (None, "auto") and provider not in g.validated_on:
+        # even with ``allow_unvalidated=True``. Provisionability is membership in the
+        # provider's own ``gpu_classes()`` (RunPod = has a ``GpuType`` enum_member; Vast =
+        # has a ``vast_name``), exposed by ``providers_for`` -- NOT ``validated_on``. The two
+        # diverge: e.g. the RTX 3090 (enum_member set, validated only on vast) is RunPod-
+        # provisionable-but-unvalidated, so the allocator prices it under ``provider="runpod",
+        # allow_unvalidated=True`` -- and the estimator must match, not exclude it.
+        if provider not in (None, "auto") and provider not in providers_for(g.name):
             return False
         if allow_unvalidated:
             return True

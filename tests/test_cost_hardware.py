@@ -15,7 +15,7 @@ from flash.cost.hardware import (
     gpu_vram_gb,
     pick_gpu,
 )
-from flash.providers.base import GPU_INFO, UnsupportedGpuError
+from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
 
 
 def test_compute_table_only_lists_real_classes():
@@ -117,13 +117,44 @@ def test_pick_gpu_provider_pin_restricts_to_validated_on():
 
 
 def test_pick_gpu_provider_pin_holds_under_allow_unvalidated():
-    # allow_unvalidated relaxes the validation-status gate, NOT the per-provider filter:
-    # a class the pinned provider can't serve must never be quoted, even unvalidated.
-    # Mirrors allocator.allocate (it walks one provider's gpu_classes()), so a runpod pin
-    # never prices a Vast-only class and vice versa.
+    # allow_unvalidated relaxes the validation-status gate, NOT the per-provider
+    # PROVISIONABILITY filter: a class the pinned provider can't *provision* must never be
+    # quoted, even unvalidated. Mirrors allocator.allocate (it walks one provider's
+    # gpu_classes()), so a runpod pin never prices a Vast-only class and vice versa.
+    # Provisionability is providers_for() (enum_member / vast_name), NOT validated_on.
     runpod_pick = pick_gpu(24, provider="runpod", allow_unvalidated=True)
-    assert "runpod" in GPU_INFO[runpod_pick].validated_on
+    assert "runpod" in providers_for(runpod_pick)
     vast_pick = pick_gpu(24, provider="vast", allow_unvalidated=True)
-    assert "vast" in GPU_INFO[vast_pick].validated_on
+    assert "vast" in providers_for(vast_pick)
     # Without a provider pin, allow_unvalidated still widens across the whole registry.
     assert pick_gpu(12, allow_unvalidated=True) == "RTX 2000 Ada"
+
+
+def test_pick_gpu_provider_filter_is_provisionability_not_validation():
+    # The per-provider filter is PROVISIONABILITY (providers_for), not validation status,
+    # matching the allocator (it walks gpu_classes(), gated separately by validated_on).
+    # A Vast-only class (no enum_member) is never quoted on a runpod pin, even unvalidated.
+    vast_only = [n for n, g in GPU_INFO.items() if g.vast_name and not g.enum_member]
+    assert vast_only, "expected at least one Vast-only class in the registry"
+    for need in (16, 24, 48, 80):
+        try:
+            runpod_pick = pick_gpu(need, provider="runpod", allow_unvalidated=True)
+        except ValueError:
+            continue  # nothing runpod-provisionable fits this tier; fine
+        assert "runpod" in providers_for(runpod_pick)
+        assert runpod_pick not in vast_only
+
+    # And the inverse of the old bug: an unvalidated-but-provisionable class IS now in the
+    # pinned provider's pool under allow_unvalidated. The RTX 3090 is runpod-provisionable
+    # (enum_member set) yet validated only on Vast -- the allocator prices it on a runpod
+    # pin with allow_unvalidated=True, so the estimator must consider it too. With the old
+    # validated_on-based filter it would have been silently excluded.
+    g3090 = GPU_INFO["RTX 3090"]
+    assert g3090.enum_member  # runpod-provisionable
+    assert "runpod" not in g3090.validated_on  # but not runpod-validated
+    runpod_pool = [
+        n
+        for n, g in GPU_INFO.items()
+        if g.vram_gb >= 24 and "runpod" in providers_for(n)
+    ]
+    assert "RTX 3090" in runpod_pool
