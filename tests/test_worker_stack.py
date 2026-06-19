@@ -344,3 +344,38 @@ def test_make_lora_skips_pissa_on_4bit_qlora(monkeypatch):
     worker.make_lora("Qwen/Qwen3.5-0.8B")
     assert captured.get("init_lora_weights") == "pissa_niter_16"
     assert captured.get("use_rslora") is True
+
+
+def test_force_vllm_backend_for_sm120(monkeypatch):
+    """RTX 5090 / sm120 -> FLASHINFER pinned (PTX-independent rollout); an operator override and a
+    non-sm120 GPU leave VLLM_ATTENTION_BACKEND untouched. Regression for the empty-5090-rollout."""
+    import os
+    import sys
+    import types
+
+    worker = _import_worker(monkeypatch)
+
+    def _fake_torch(major):
+        t = types.ModuleType("torch")
+        t.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda *a: (major, 0),
+        )
+        return t
+
+    # sm120, backend unset -> FLASHINFER is forced
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(12))
+    assert worker.force_vllm_backend_for_sm120() == "FLASHINFER"
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
+
+    # operator override wins (not clobbered)
+    monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
+    assert worker.force_vllm_backend_for_sm120() is None
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "TRITON_ATTN"
+
+    # non-sm120 (sm90 Hopper) -> untouched
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(9))
+    assert worker.force_vllm_backend_for_sm120() is None
+    assert "VLLM_ATTENTION_BACKEND" not in os.environ

@@ -565,6 +565,32 @@ def optimal_attn_impl() -> str | None:
     return impl
 
 
+def force_vllm_backend_for_sm120() -> str | None:
+    """On RTX 5090 / consumer Blackwell (sm120), force a PTX-independent vLLM attention backend.
+
+    vLLM's default rollout backend is flash-attn, whose PRE-BUILT PTX needs a newer driver JIT than
+    many 5090 RunPod hosts have — when the JIT fails the colocated rollout silently produces NO
+    completions (empty reward_history, ~1.4 s "done"; a whole 22-run sweep hit this on every 5090).
+    FLASHINFER is vLLM's Blackwell-native backend (no flash-attn PTX dependency) and trains on a 5090
+    (measured: FLASHINFER/TORCH_SDPA/TRITON_ATTN all train, ~116 s). This mirrors the trainer's
+    cuDNN-SDPA forcing on sm120 (``_attn_impl_for_capability``). The GRPO no-op guard remains the
+    backstop. Returns the backend set (None if not sm120, or the operator already pinned one)."""
+    if os.environ.get("VLLM_ATTENTION_BACKEND"):
+        return None  # operator override wins
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 12:
+            return None
+    except Exception as e:
+        print("[rl] sm120 vLLM backend probe skipped:", e)
+        return None
+    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+    print("[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
+          "on consumer Blackwell hosts -> empty-rollout failures)")
+    return "FLASHINFER"
+
+
 # Liger's fused linear cross-entropy is a MEMORY optimization (it never materializes the fp32
 # [B,T,vocab] logits), not a fixed-batch speed win. PR #174 ledger: on a 1B model at fixed batch
 # it is a measured NET LOSS on EVERY arch (min-of-3: A100 0.86x, H100 0.90x, RTX 3090 0.78x,
@@ -2025,6 +2051,10 @@ def run_rl():
         grpo_kwargs["use_liger_kernel"] = True
         print("[rl] liger fused GRPO loss enabled")
     if use_vllm:
+        # RTX 5090 / sm120: pin a PTX-independent vLLM attention backend (FLASHINFER) BEFORE TRL
+        # builds the colocated engine — else the rollout can silently produce no completions on
+        # old-driver Blackwell hosts (flash-attn PTX JIT failure). No-op off sm120 / if pinned.
+        force_vllm_backend_for_sm120()
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
         # the model's FULL context and won't start on a consumer GPU). vllm_gpu_memory_utilization
