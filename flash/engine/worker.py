@@ -822,16 +822,6 @@ class _GpuPeakSampler:
         return round(self.peak_used / 1e9, 3)
 
 
-# Whether LoRA+ DEFAULTS to the 8-bit paged optimizer (the combination this change enables). The
-# combination is always AVAILABLE per-run via FLASH_LORAPLUS_8BIT=1 / [worker_env]; this sets the
-# fleet default. Default True: an on-GPU A/B (Qwen3.5-4B SFT, rank-128 LoRA, 170M trainable, same
-# seed/data/init) measured LoRA+ on PagedAdamW8bit vs fp AdamW at -75% optimizer state (1359 ->
-# 346 MB) and -0.72 GB peak device memory (17.04 -> 16.33 GB) with NO convergence penalty (final
-# loss 10.64 vs 11.16 from an identical 14.45 start). A free memory win, so it's the default; set
-# FLASH_LORAPLUS_8BIT=0 to fall back to fp AdamW per-run.
-_LORAPLUS_8BIT_DEFAULT = True
-
-
 def loraplus_optimizer_cls(optim_name: str):
     """Optimizer class for the LoRA+ ``create_optimizer`` override (returns ``(cls, extra_kwargs)``).
 
@@ -842,22 +832,19 @@ def loraplus_optimizer_cls(optim_name: str):
 
     PEFT's ``create_loraplus_optimizer`` accepts ANY ``optimizer_cls`` — including bitsandbytes 8-bit
     optimizers (it registers embedding overrides with bnb's ``GlobalOptimManager`` to keep them
-    32-bit) — so LoRA+ and the 8-bit paged optimizer state CAN coexist.
-
-    Whether the 8-bit combination is the DEFAULT is gated by ``_LORAPLUS_8BIT_DEFAULT`` (set from the
-    on-GPU A/B, see that constant). When enabled, an ``8bit`` ``optim`` value selects
-    ``bnb.optim.PagedAdamW8bit``; otherwise (or for a non-8-bit ``optim``) LoRA+ keeps fp32 AdamW.
-    Either way ``FLASH_LORAPLUS_8BIT`` forces the choice (1 -> 8-bit, 0 -> fp32), so the
-    combination is always available on demand. Falls back to fp32 AdamW if bitsandbytes is missing."""
+    32-bit) — so LoRA+ and the 8-bit paged optimizer state coexist. An ``8bit`` ``optim`` value
+    (the fleet default; ``fused_optim_name`` -> ``paged_adamw_8bit``) selects
+    ``bnb.optim.PagedAdamW8bit``; a non-8-bit ``optim`` keeps fp32 AdamW. This simply mirrors the
+    configured ``optim`` — there is no separate toggle: an on-GPU A/B (Qwen3.5-4B SFT, rank-128
+    LoRA, same seed/data/init) measured the 8-bit paged state at -75% optimizer memory
+    (1359 -> 346 MB) and -0.72 GB peak with NO convergence penalty (final loss 10.64 vs 11.16 from
+    an identical start), so it's unconditionally the default wherever ``optim`` is 8-bit. Falls
+    back to fp32 AdamW only if bitsandbytes is missing."""
     import torch as _torch
 
     # case-insensitive + str-safe: TRL normalizes optim to an OptimizerNames enum whose str() is
     # "OptimizerNames.PAGED_ADAMW_8BIT" (uppercase), so a bare `"8bit" in optim_name` would miss it.
-    want_8bit = _LORAPLUS_8BIT_DEFAULT and "8bit" in str(optim_name or "").lower()
-    override = os.environ.get("FLASH_LORAPLUS_8BIT")
-    if override is not None:
-        want_8bit = override.strip().lower() in ("1", "true", "yes", "on")
-    if want_8bit:
+    if "8bit" in str(optim_name or "").lower():
         try:
             import bitsandbytes as bnb
 
