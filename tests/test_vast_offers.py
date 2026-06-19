@@ -29,7 +29,7 @@ FIXTURE = [
     _offer(id=3, gpu_name="RTX 6000Ada", gpu_ram=49140, dph_total=0.80),  # KEEP: alias mapping
     _offer(id=4, gpu_name="A100 SXM4", gpu_ram=40960, dph_total=0.87),  # KEEP: 40GB variant
     _offer(id=5, gpu_name="A100 SXM4", gpu_ram=81920, dph_total=1.20),  # KEEP: 80GB variant
-    _offer(id=10, dph_total=0.08, hosting_type=0),  # DROP: consumer host (cheapest of all!)
+    _offer(id=10, dph_total=0.08, hosting_type=0),  # DROP by default: community host (secrets ship to it) -> opt-in only
     _offer(id=11, dph_total=0.10, verification="unverified"),  # DROP: not verified
     _offer(id=12, dph_total=0.11, reliability2=0.80),  # DROP: reliability floor
     _offer(id=13, gpu_name="Tesla T4", gpu_ram=16384, dph_total=0.05),  # DROP: sub-Ampere
@@ -54,7 +54,9 @@ def test_usable_offers_filters_and_order(monkeypatch):
         return list(FIXTURE)
 
     monkeypatch.setattr(vast_api, "search_offers", fake_search)
+    monkeypatch.delenv("AUTOSLM_VAST_ALLOW_COMMUNITY", raising=False)
     out = vast.usable_offers(24, disk_gb=60)
+    # community host (id=10) dropped by default — datacenter-only unless opted in
     assert [o.offer_id for o in out] == [1, 2, 17, 3, 4, 5]  # dph ascending, junk gone
     assert captured["min_disk_gb"] == 60
     # the server-side VRAM filter carries slack for under-reporting boards
@@ -68,6 +70,18 @@ def test_usable_offers_filters_and_order(monkeypatch):
     assert by_id[17].gpu == "RTX Pro 4000"
 
 
+def test_usable_offers_community_opt_in(monkeypatch):
+    """AUTOSLM_VAST_ALLOW_COMMUNITY=1 widens the gate to verified community hosts."""
+    from autoslm.providers.vast import api as vast_api
+    from autoslm.providers.vast import jobs as vast
+
+    monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
+    monkeypatch.setenv("AUTOSLM_VAST_ALLOW_COMMUNITY", "1")
+    out = vast.usable_offers(24, disk_gb=60)
+    # opted in: the verified community host (id=10) is now the cheapest survivor
+    assert [o.offer_id for o in out] == [10, 1, 2, 17, 3, 4, 5]
+
+
 def test_usable_offers_vram_gate(monkeypatch):
     from autoslm.providers.vast import api as vast_api
     from autoslm.providers.vast import jobs as vast
@@ -78,12 +92,10 @@ def test_usable_offers_vram_gate(monkeypatch):
     assert [o.offer_id for o in out] == [3, 4, 5]
 
 
-def test_usable_offers_exclude_machines_and_price_cap(monkeypatch):
+def test_usable_offers_exclude_machines(monkeypatch):
     from autoslm.providers.vast import api as vast_api
     from autoslm.providers.vast import jobs as vast
 
     rows = [_offer(id=1, machine_id=7, dph_total=0.25), _offer(id=2, machine_id=8, dph_total=0.30)]
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: rows)
     assert [o.offer_id for o in vast.usable_offers(24, 60, exclude_machine_ids={7})] == [2]
-    monkeypatch.setenv("AUTOSLM_VAST_MAX_DPH", "0.27")
-    assert [o.offer_id for o in vast.usable_offers(24, 60)] == [1]

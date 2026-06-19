@@ -24,9 +24,9 @@ def _raw(model="Qwen/Qwen3.5-0.8B", **kw):
     return d
 
 
-def test_thinking_defaults_true():
-    spec = spec_from_dict(_raw())  # reasoning mode is ON by default
-    assert spec.thinking is True
+def test_thinking_defaults_false():
+    spec = spec_from_dict(_raw())  # reasoning mode is OFF by default (operator preference)
+    assert spec.thinking is False
 
 
 def test_thinking_can_be_disabled():
@@ -74,8 +74,8 @@ def test_always_thinking_model_requires_flag(monkeypatch):
     )
     monkeypatch.setattr("autoslm.schema.resolve_model", lambda *a, **k: info)
     monkeypatch.setattr("autoslm.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
-    # An always-thinker can't run with thinking explicitly OFF (thinking now defaults ON, so
-    # the rejection only triggers on an explicit thinking=false).
+    # An always-thinker can't run with thinking OFF (the default); the rejection triggers on the
+    # default-off as well as an explicit thinking=false.
     with pytest.raises(ConfigError) as ei:
         spec_from_dict(_raw(model="acme/r1-distill", model_policy="allow", thinking=False))
     assert "thinking = true" in str(ei.value)
@@ -111,8 +111,8 @@ def test_thinking_roundtrips_through_dict():
     spec = spec_from_dict(_raw(thinking=True))
     spec2 = JobSpec.from_dict(spec.to_dict())
     assert spec2.thinking is True
-    # a dict without the field gets the default (now True)
-    assert JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B"}).thinking is True
+    # a dict without the field gets the default (OFF)
+    assert JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B"}).thinking is False
 
 
 def test_thinking_set_override(tmp_path):

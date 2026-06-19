@@ -17,8 +17,8 @@ def test_catalog_validation():
 
     info = get_model("Qwen/Qwen3.5-4B")
     assert "grpo" in info.algos
-    # Qwen3.6-35B-A3B is GRPO-capable (QLoRA on an 80 GB A100, transformers generation).
-    assert validate_model_for_algorithm("Qwen/Qwen3.6-35B-A3B", "grpo").id == "Qwen/Qwen3.6-35B-A3B"
+    # 9B is the QLoRA GRPO tier (4-bit NF4 base on a ~24-32 GB card).
+    assert validate_model_for_algorithm("Qwen/Qwen3.5-9B", "grpo").id == "Qwen/Qwen3.5-9B"
     # An sft-only model still rejects grpo (inject one — no catalog entry is sft-only now).
     from autoslm.catalog import MODELS, ModelInfo
 

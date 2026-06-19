@@ -133,3 +133,94 @@ def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
     w.heartbeat("rl_start")
     assert lock_free_during_upload == [True], "hf_upload_file must run with _HB_LOCK released"
+
+
+def test_heartbeat_terminal_only_mode(monkeypatch):
+    """TERMINAL_ONLY mode throttles every non-terminal stage (not just rl_step) so a fan-out of
+    runs sharing one HF_REPO stays under the 128-commits/hour cap; terminal done/error_* still
+    always commit so the control plane never misses a transition."""
+    monkeypatch.setenv("RUN_MODE", "sft")
+    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("autoslm.engine.worker", None)
+    import autoslm.engine.worker as w
+
+    calls = []
+    def _fake_upload(*a, **k):
+        calls.append(a[1])
+        return True  # simulate a successful commit so the throttle clock advances
+
+    monkeypatch.setattr(w, "hf_upload_file", _fake_upload)
+    monkeypatch.setattr(w, "_HB_TERMINAL_ONLY", True)
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 9999.0)
+    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+
+    # Short interval: terminal-only must STILL suppress non-terminal after the first, NOT
+    # leak a commit once the window elapses (the bot-caught 128/hr re-breach).
+    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    w.heartbeat("sft_start")  # first non-terminal -> commits (last_upload==0)
+    w.heartbeat("sft_model_load")  # suppressed despite 0s interval
+    w.heartbeat("sft_trained")  # suppressed
+    assert len(calls) == 1
+    w.heartbeat("error_sft", error="boom")  # terminal -> always commits
+    w.heartbeat("done")  # terminal -> always commits
+    assert calls.count("heartbeat.json") == 3
+
+
+def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
+    """optimal_attn_impl picks the arch-best backend for the live GPU; with no CUDA (CI) it
+    leaves transformers' default (None). There is no env override."""
+    monkeypatch.setenv("RUN_MODE", "sft")
+    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("autoslm.engine.worker", None)
+    import autoslm.engine.worker as w
+
+    assert w.optimal_attn_impl() is None
+
+
+def test_liger_on_requires_default_and_gpu(monkeypatch):
+    """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
+    liger_kernel (both absent in CI), so it's off here too."""
+    monkeypatch.setenv("RUN_MODE", "sft")
+    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("autoslm.engine.worker", None)
+    import autoslm.engine.worker as w
+
+    assert w.liger_on(False) is False
+    assert w.liger_on(True) is False  # no CUDA / liger_kernel in CI
+
+
+def test_liger_default_model_size_gate(monkeypatch):
+    """Liger default is OFF for small models (1B-class, measured net loss PR #174) and ON only
+    for models ≥ ~3B where fused-CE's memory win pays off."""
+    monkeypatch.setenv("RUN_MODE", "sft")
+    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("autoslm.engine.worker", None)
+    import autoslm.engine.worker as w
+
+    # _estimate_params: ~1B vs ~4B configs
+    small = types.SimpleNamespace(
+        hidden_size=1536, vocab_size=130560, num_hidden_layers=24, tie_word_embeddings=False
+    )
+    big = types.SimpleNamespace(
+        hidden_size=2560, vocab_size=151936, num_hidden_layers=36, tie_word_embeddings=False
+    )
+    assert w._estimate_params(small) < 3e9
+    assert w._estimate_params(big) >= 3e9
+
+    def fake_cfg(cfg):
+        fake = types.SimpleNamespace(AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg))
+        monkeypatch.setitem(sys.modules, "transformers", fake)
+
+    fake_cfg(small)
+    assert w._liger_default_for_model("openbmb/MiniCPM5-1B") is False
+    # grad checkpointing follows the same small=speed(off) / large=memory(on) principle
+    assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B") is False
+    fake_cfg(big)
+    assert w._liger_default_for_model("Qwen/Qwen3-4B") is True
+    assert w.grad_checkpointing_on("Qwen/Qwen3-4B") is True
+    # context-aware: a SMALL model at LONG context is memory-bound -> memory mode ON (PR #174:
+    # 1B GRPO OOMs at 4096 in speed mode, fits in memory mode).
+    fake_cfg(small)
+    assert w._memory_mode("openbmb/MiniCPM5-1B", 512) is False
+    assert w._memory_mode("openbmb/MiniCPM5-1B", 4096) is True
+    assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B", 4096) is True

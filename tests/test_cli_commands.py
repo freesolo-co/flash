@@ -34,7 +34,7 @@ class _FakeClient:
             }
         ]
         if include_experimental:
-            rows.append({**rows[0], "id": "Qwen/Qwen3.6-35B-A3B", "experimental": True})
+            rows.append({**rows[0], "id": "test/experimental-model", "experimental": True})
         return rows
 
     def list_runs(self) -> list[dict]:
@@ -108,7 +108,7 @@ def test_models_table(fake_client, capsys) -> None:
     out = capsys.readouterr().out
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
-    assert "Qwen/Qwen3.6-35B-A3B" in out
+    assert "Qwen/Qwen3.5-9B" in out
 
 
 def test_status_ps_cost_and_logs(fake_client, capsys) -> None:

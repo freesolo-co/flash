@@ -12,6 +12,24 @@ import pytest
 from autoslm.spec import JobSpec
 
 
+def test_reliability_and_inet_floors_are_fixed_defaults(monkeypatch):
+    """The reliability floor and inet-speed minimum are fixed correctness defaults (0.995 / 200
+    Mbps) — NOT operator-tunable. Setting the old AUTOSLM_VAST_MIN_* env vars has no effect."""
+    import importlib
+
+    from autoslm.providers.vast import jobs as vast
+
+    monkeypatch.setenv("AUTOSLM_VAST_MIN_RELIABILITY", "0.999")
+    monkeypatch.setenv("AUTOSLM_VAST_MIN_INET_MBPS", "1000")
+    importlib.reload(vast)
+    # The env vars are no longer read: the floors stay at their fixed defaults.
+    assert vast.RELIABILITY_FLOOR == 0.995
+    assert vast.MIN_INET_MBPS == 200.0
+    monkeypatch.delenv("AUTOSLM_VAST_MIN_RELIABILITY", raising=False)
+    monkeypatch.delenv("AUTOSLM_VAST_MIN_INET_MBPS", raising=False)
+    importlib.reload(vast)  # restore module defaults for other tests
+
+
 def _spec(**gpu_kw) -> JobSpec:
     gpu = {"type": "RTX 3090", "provider": "vast", "max_wall_seconds": 3600, **gpu_kw}
     return JobSpec.from_dict(
@@ -187,20 +205,23 @@ def _bootstrap_with_hub_env(monkeypatch, prime_present):
     return vb, cmds
 
 
-def test_bootstrap_skips_prime_install_when_present(monkeypatch):
-    # `prime` baked into the image -> no per-run `pip install prime`; still runs `prime env install`.
+def test_bootstrap_installs_prime_into_worker_python(monkeypatch):
+    # When `prime` is already present (baked into the image), don't reinstall it; run the
+    # LOCATED prime binary and install the env into THIS python via `--with pip` so the
+    # trainer can import the env module at load_environment.
     vb, cmds = _bootstrap_with_hub_env(monkeypatch, prime_present=True)
     assert vb.main() == 0
     assert not any(c[-1] == "prime" and "install" in c for c in cmds)
-    assert ["prime", "env", "install", "owner/env"] in cmds
+    assert ["/usr/bin/prime", "env", "install", "owner/env", "--with", "pip"] in cmds
 
 
-def test_bootstrap_installs_prime_when_absent(monkeypatch):
-    # `prime` not on the image -> install it once, then `prime env install`.
+def test_bootstrap_installs_prime_when_missing(monkeypatch):
+    # When `prime` isn't already on PATH, the bootstrap installs it and then proceeds to the env
+    # install (rather than silently skipping it, which would crash later with ModuleNotFoundError).
     vb, cmds = _bootstrap_with_hub_env(monkeypatch, prime_present=False)
     assert vb.main() == 0
     assert any(c[-1] == "prime" and "install" in c for c in cmds)
-    assert ["prime", "env", "install", "owner/env"] in cmds
+    assert ["prime", "env", "install", "owner/env", "--with", "pip"] in cmds
 
 
 # ---------------------------------------------------------------------------

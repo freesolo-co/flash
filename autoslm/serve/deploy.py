@@ -69,7 +69,7 @@ DEFAULT_IDLE_TIMEOUT_S = 300
 
 
 def serve_execution_timeout_ms() -> int:
-    return int(os.environ.get("AUTOSLM_SERVE_TIMEOUT_MS", str(_DEFAULT_SERVE_TIMEOUT_MS)))
+    return _DEFAULT_SERVE_TIMEOUT_MS
 
 
 def resolve_serve_deps() -> list[str]:
@@ -110,9 +110,12 @@ class Deployment:
 
 
 def _language_model_only(model: str) -> bool:
-    """Natively-multimodal checkpoints are served text-only (the family-name check
-    mirrors the worker's config-based one; the client can't load the HF config)."""
-    return any(s in model for s in ("Qwen3.5", "Qwen3.6"))
+    """Natively-multimodal checkpoints are served text-only. Approximated here by
+    family name (the client can't load the HF config); the worker does the precise
+    config-based check (engine.worker.is_vl_checkpoint, which covers Qwen3.5/3.6).
+    Both families must match here or a Qwen3.6 checkpoint served via model_policy="allow"
+    loses the text-only guard and re-hits the vision-tower VRAM/flash-attn issues."""
+    return "Qwen3.5" in model or "Qwen3.6" in model
 
 
 def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
@@ -222,6 +225,12 @@ def _serve_body(input_data: dict) -> dict:
         old = g.get("_AUTOSLM_PROC")
         if old is not None and old.poll() is None:
             old.kill()
+        # Serve the bf16 base with the LoRA adapter attached (--enable-lora). This works for BOTH
+        # bf16 LoRA and 4-bit QLoRA adapters: vLLM folds the bf16 LoRA delta into the bf16 base at
+        # load, which for a QLoRA adapter is exactly the standard "apply onto bf16 base" recipe (the
+        # frozen base's NF4 error is near-lossless per the QLoRA paper). No merged checkpoint is
+        # needed — and a merged checkpoint can't be served for the multimodal Qwen3.5/3.6 catalog
+        # anyway (a text-only merge saves a Qwen3_5TextConfig, which vLLM's qwen3_5 path rejects).
         cmd = [
             sys.executable,
             "-m",
@@ -257,15 +266,15 @@ def _serve_body(input_data: dict) -> dict:
             g["_AUTOSLM_PROC"] = subprocess.Popen(
                 cmd, stdout=log, stderr=subprocess.STDOUT, env=env
             )
-        # Align the vLLM boot budget with the endpoint execution cap: large MoE
-        # tiers can take 15-25 min to load on a cold host, and a hard-coded 900 s
-        # would 502 a first chat / fail an always-on warmup while the RunPod request
-        # still has time budget. Leave ~60 s of the window for the first generation.
-        # Read the env DIRECTLY (with the same default as serve_execution_timeout_ms):
-        # Flash serializes _serve_body and runs it standalone, so the module-level
-        # helper is out of scope on the worker (see _tail_serve_log) and a bare call
-        # would NameError before vLLM gets a chance to boot.
-        serve_timeout_ms = int(os.environ.get("AUTOSLM_SERVE_TIMEOUT_MS", str(25 * 60 * 1000)))
+        # Align the vLLM boot budget with the endpoint execution cap: a large model can take
+        # several minutes to load on a cold host, and a hard-coded 900 s would 502 a first chat /
+        # fail an always-on warmup while the RunPod request still has time budget. Leave ~60 s of
+        # the window for the first generation.
+        # Inline the timeout as a constant (must stay in sync with serve_execution_timeout_ms):
+        # Flash serializes _serve_body and runs it standalone, so the module-level helper is out of
+        # scope on the worker (see _tail_serve_log) and a bare call would NameError before vLLM gets
+        # a chance to boot — so the value is hardcoded here rather than read via the helper/env.
+        serve_timeout_ms = 25 * 60 * 1000
         default_boot = max(900, serve_timeout_ms // 1000 - 60)
         deadline = time.time() + float(input_data.get("boot_timeout_s") or default_boot)
         while time.time() < deadline:
@@ -372,23 +381,6 @@ def _get_serve_endpoint(
         return handler
 
 
-def _reject_qlora_serving(model: str) -> None:
-    """vLLM serving boots the base in bf16; a 4-bit-QLoRA-only tier won't fit.
-
-    Eval/train use the 4-bit transformers path for those models, but there is
-    no quantized vLLM serving path, so reject up front instead of provisioning
-    an endpoint that fails on first chat."""
-    from autoslm.catalog import MODELS
-
-    info = MODELS.get(model)
-    if info is not None and info.quant == "4bit-qlora":
-        raise ValueError(
-            f"{model} is a 4-bit-QLoRA-only tier and cannot be served bf16 by vLLM; "
-            "merge the adapter into a full model (`build_hf_model`) and deploy that, "
-            "or use a smaller bf16 model."
-        )
-
-
 def deploy_adapter(
     run_id: str,
     model: str,
@@ -404,7 +396,6 @@ def deploy_adapter(
     """Provision a serving endpoint for a trained adapter (managed, no Docker)."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
-    _reject_qlora_serving(model)
     friendly = servable_gpu(gpu_name, model)
     from autoslm.runner import _gpu_rate
 
@@ -432,7 +423,7 @@ def deploy_adapter(
             "hf_repo": hf_repo,
             "model": model,
             "adapter_prefix": adapter_prefix,
-            "token": os.environ.get("HUGGINGFACE_TOKEN", ""),
+            "token": os.environ.get("HF_TOKEN", ""),
             "max_lora_rank": max(64, int(lora_rank)),
             "language_model_only": _language_model_only(model),
             # warm the engine with the run's thinking flag so the first real chat (same
@@ -501,7 +492,7 @@ def chat(
         "hf_repo": hf_repo,
         "model": model,
         "adapter_prefix": adapter_prefix,
-        "token": os.environ.get("HUGGINGFACE_TOKEN", ""),
+        "token": os.environ.get("HF_TOKEN", ""),
         "served_model": f"autoslm-{run_id}",
         "messages": messages,
         "temperature": temperature,

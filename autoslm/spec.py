@@ -36,6 +36,18 @@ def _coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _coerce_str_map(value: Any) -> dict[str, str]:
+    """Coerce a loosely-typed spec field into a ``dict[str, str]``.
+
+    A malformed persisted spec (or programmatic caller) can set a mapping field to a non-dict;
+    `.items()` on that would crash `from_dict` with AttributeError. Treat a non-dict as empty,
+    mirroring how the other nested fields tolerate missing/garbage input.
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): str(v) for k, v in value.items()}
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
@@ -87,7 +99,7 @@ class TrainSpec:
     init_from_adapter: str = ""
     # Per-run HuggingFace artifact repo ("owner/name") for this run's adapter/checkpoint/
     # code storage AND serving. REQUIRED (validated in schema._validate_spec); there is no
-    # operator-wide default. The operator's HUGGINGFACE_TOKEN must have write access to it.
+    # operator-wide default. The operator's HF_TOKEN must have write access to it.
     hf_repo: str = ""
     # Optimizer/batching knobs (SFT + GRPO). None -> the worker's tuned recipe default.
     # batch_size is the GLOBAL/effective batch (SFT: grad-accum is sized to hit it; GRPO:
@@ -97,6 +109,10 @@ class TrainSpec:
     batch_size: int | None = None
     max_length: int | None = None
     save_every: int | None = None
+    # SFT caps (None/0 -> no cap). max_steps caps optimizer steps (cheap pre-flight smoke);
+    # max_examples truncates the SFT dataset.
+    max_steps: int | None = None
+    max_examples: int | None = None
     # GRPO recipe knobs (datums parity), shipped by the SDK in [train] (NOT in
     # [environment.params], which is forwarded verbatim to the verifiers env loader).
     # None/() -> recipe default. group_size = completions per prompt; temperature = rollout
@@ -112,7 +128,7 @@ class TrainSpec:
     stop_sequences: tuple[str, ...] = ()
     # Periodic mid-run eval cadence (GRPO ONLY; ignored for SFT): every ``eval_every_steps``
     # optimizer steps, greedily evaluate the policy on the ENVIRONMENT's held-out ``eval_dataset``
-    # with the env's rubric (reward + zero-weight metrics) and record the curve into metrics.json,
+    # with the env's rubric (reward + eval-metric metrics) and record the curve into metrics.json,
     # so the agent judges the run on held-out eval, not just the training reward. 0/None disables.
     # This cadence is the ONLY mid-run-eval knob: the eval queries and grading logic live in the
     # environment, and the completion budget matches the run's normal ``max_tokens``.
@@ -157,11 +173,18 @@ class JobSpec:
     train: TrainSpec = field(default_factory=TrainSpec)
     gpu: GpuSpec = field(default_factory=GpuSpec)
     run_id: str = "local"
+    # Per-run worker-environment overrides merged into the GPU worker's env (highest precedence
+    # over the control-plane os.environ allowlist). The escape hatch for A/B kernel experiments
+    # that must differ PER RUN, not globally: e.g. an optimizer or LoRA-init override on just the
+    # experiment run while others keep the global default. Forwarded verbatim (string values);
+    # never set secrets here.
+    worker_env: dict[str, str] = field(default_factory=dict)
     # "catalog" (curated models only) or "allow" (any HF model that fits the GPU).
     model_policy: str = "catalog"
     # Thinking/reasoning mode (thinking-capable models only). One flag per run, consumed
-    # identically by SFT rendering, RL rollouts, and serving (decoding parity). ON by default.
-    thinking: bool = True
+    # identically by SFT rendering, RL rollouts, and serving (decoding parity). OFF by default
+    # (operator preference: training defaults to no-reasoning; set thinking = true to enable).
+    thinking: bool = False
 
     @property
     def phase(self) -> str:
@@ -205,6 +228,8 @@ class JobSpec:
                 batch_size=_opt_int(train.get("batch_size")),
                 max_length=_opt_int(train.get("max_length")),
                 save_every=_opt_int(train.get("save_every")),
+                max_steps=_opt_int(train.get("max_steps")),
+                max_examples=_opt_int(train.get("max_examples")),
                 group_size=_opt_int(train.get("group_size")),
                 temperature=_opt_float(train.get("temperature")),
                 max_tokens=_opt_int(train.get("max_tokens")),
@@ -227,8 +252,9 @@ class JobSpec:
                 datacenter=gpu.get("datacenter"),
             ),
             run_id=data.get("run_id", "local"),
+            worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
-            thinking=_coerce_bool(data.get("thinking", True)),
+            thinking=_coerce_bool(data.get("thinking", False)),
         )
 
     @classmethod

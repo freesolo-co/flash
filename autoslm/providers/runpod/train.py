@@ -39,7 +39,7 @@ FLASH_SDK_LOCK = threading.Lock()
 # multi-turn hooks used for verifiers ToolEnv / MultiTurnEnv training), vllm 0.19.1
 # (Qwen3.5/3.6 archs, native RL APIs, transformers-5
 # compatible metadata), transformers 5.x (qwen3_5/qwen3_5_moe model types),
-# bitsandbytes (QLoRA tier for the 35B-A3B MoE). trl 1.6 requires transformers>=4.56,
+# bitsandbytes (4-bit NF4 QLoRA tier). trl 1.6 requires transformers>=4.56,
 # satisfied by the 5.6+ pin; GRPOConfig is field-compatible with the 1.5 usage here.
 # Resolver/driver notes: vllm 0.17/0.18 hard-pin transformers<5 (uv refuses the
 # combo), so the first transformers-5-compatible vllm line is 0.19.1. vllm >=0.20
@@ -52,7 +52,7 @@ FLASH_SDK_LOCK = threading.Lock()
 # RTX 4090/5090 workers before promotion to default (see bench/results/phase1).
 WORKER_DEPS = [
     "torch==2.10.0",
-    "transformers>=5.6,<5.11",
+    "transformers>=5.6,<5.13",
     "trl>=1.6,<1.7",
     "peft>=0.19",
     "vllm==0.19.1",
@@ -60,10 +60,25 @@ WORKER_DEPS = [
     "datasets>=4.7,<6",
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
+    # NB: the HF `kernels` Hub package is intentionally NOT pinned here — the versions
+    # compatible with torch2.10 break transformers 5.6-5.10's hub_kernels integration at IMPORT
+    # (LayerRepository now requires a version; transformers passes none -> ValueError on every
+    # `import transformers`). FlashAttention via the Hub is therefore disabled; attention uses
+    # SDPA (already a flash/efficient backend on Ampere/Ada) + the Liger fused kernels below,
+    # which are the dominant LoRA speedup anyway. (FA via a pinned flash-attn wheel is a future
+    # per-arch experiment, kept out of the default deps to avoid a fragile cold-start install.)
+    # Liger fused Triton kernels (pure Triton -> JITs on every arch incl. Blackwell): fused
+    # linear cross-entropy for SFT (use_liger_kernel) and the chunked GRPO loss
+    # (use_liger_loss) — the big large-vocab (Qwen ~152k) memory/throughput win.
+    "wandb>=0.17",
+    "liger-kernel>=0.5",
     # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this,
     # transformers falls back to a pure-PyTorch delta rule and GRPO trainer steps are
     # 2-3x slower (measured A/B on Qwen3.5-2B: ~65 s/step -> ~20 s/step steady).
     "flash-linear-attention==0.5.0",
+    # NB: fla's gated chunk_bwd is broken on HOPPER (H100) with Triton >= 3.4 (fla #640), so
+    # resolve_worker_deps DROPS fla on sm90 (the correct pure-PyTorch delta rule runs instead). The
+    # dense Qwen3.5 GDN models route to consumer cards by default, where fla works.
 ]
 # NOTE on download speed: Flash's runtime already ships hf_transfer and exports
 # HF_HUB_ENABLE_HF_TRANSFER=1 on workers (measured: Qwen3-4B's ~8 GB pulled in 6.3 s,
@@ -72,16 +87,27 @@ WORKER_DEPS = [
 # (whitespace-separated, or a JSON list for specs containing commas).
 WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
+# The prebuilt worker image (full training stack baked in; built by Dockerfile.worker /
+# .github/workflows/worker-image.yml). PUBLIC under the org namespace, so no registry login is
+# ever needed. Always used on both Vast and RunPod — there is no operator override and no generic
+# fallback image. Must be published to GHCR + made public before runs can pull it.
+WORKER_IMAGE = "ghcr.io/freesolo-co/autoslm-worker:cu128"
 
-def resolve_worker_deps() -> list[str]:
+
+def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
     """The dependency list Flash installs on the GPU worker for this run.
 
     Precedence: AUTOSLM_WORKER_DEPS (explicit list) > the pinned ``WORKER_DEPS``.
+
+    GPU-specific: on HOPPER (sm90, H100), DROP flash-linear-attention — its gated
+    chunk_bwd Triton kernel is miscomputed there (Triton>=3.4, fla #640). Without fla,
+    transformers uses the correct pure-PyTorch delta rule (slower but correct).
+    Ampere/Ada/Blackwell keep fla for the speedup.
     """
     explicit = os.environ.get("AUTOSLM_WORKER_DEPS")
     if explicit:
         # JSON list (use this for specs containing commas, e.g.
-        # "transformers>=5.6,<5.11") or a whitespace-separated string.
+        # "transformers>=5.6,<5.13") or a whitespace-separated string.
         if explicit.strip().startswith("["):
             import json as _json
 
@@ -94,8 +120,20 @@ def resolve_worker_deps() -> list[str]:
             deps = [d for d in shlex.split(explicit) if d.strip()]
         if deps:
             return deps
-    deps = WORKER_DEPS
-    # Additive per-run extras (e.g. liger-kernel for the SFT_LIGER A/B) without
+    deps = list(WORKER_DEPS)
+    # Hopper (sm90) fla strategy: DROP flash-linear-attention -> the correct pure-PyTorch delta
+    # rule. fla's gated chunk_bwd Triton kernel is miscomputed on Hopper (Triton>=3.4, fla #640),
+    # so on H100 we run without it (the dense Qwen3.5 GDN models route to consumer cards by
+    # default, where fla stays). Ampere/Ada/Blackwell keep fla for the speedup.
+    if friendly_gpu:
+        try:
+            from autoslm.providers.base import get_gpu_info
+
+            if get_gpu_info(friendly_gpu).sm == "sm90":
+                deps = [d for d in deps if not d.startswith("flash-linear-attention")]
+        except Exception:
+            pass
+    # Additive per-run extras (e.g. an extra pinned wheel for an A/B) without
     # restating the whole pinned stack the way AUTOSLM_WORKER_DEPS requires.
     extra = os.environ.get("AUTOSLM_WORKER_EXTRA_DEPS")
     if extra:
@@ -105,9 +143,7 @@ def resolve_worker_deps() -> list[str]:
     return deps
 
 
-DEFAULT_EXECUTION_TIMEOUT_MS = int(
-    os.environ.get("AUTOSLM_EXECUTION_TIMEOUT_MS", str(6 * 3600 * 1000))
-)
+DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
 
 _ENDPOINT_CACHE: dict[str, Any] = {}
 
@@ -135,10 +171,22 @@ def upload_code(repo: str | None = None) -> str:
         raise RuntimeError(
             "hf_repo must be set (the run's [train] hf_repo: HF dataset repo for code + artifacts)"
         )
-    token = os.environ.get("HUGGINGFACE_TOKEN")
+    token = os.environ.get("HF_TOKEN")
     pkg_dir = os.path.dirname(os.path.abspath(autoslm.__file__))
     api = HfApi(token=token)
-    api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True)
+    # Worker pulls code/** by HTTP; HF FREE-TIER accounts cannot serve PRIVATE dataset
+    # downloads (worker gets 403), so operators on a free tier must publish artifact repos
+    # public. Default private (paid-tier safe); set AUTOSLM_HF_REPO_PRIVATE=0 to create public.
+    private = os.environ.get("AUTOSLM_HF_REPO_PRIVATE", "1") not in ("0", "false", "False")
+    api.create_repo(repo, repo_type="dataset", exist_ok=True, private=private)
+    # create_repo(exist_ok=True) is a no-op on an EXISTING repo, so it never flips a repo that
+    # already exists private back to public. When the operator wants public (free-tier: workers
+    # 403 on private downloads), force visibility explicitly so a reused private repo is fixed.
+    if not private:
+        try:
+            api.update_repo_settings(repo_id=repo, repo_type="dataset", private=False)
+        except Exception as e:
+            logger.warning("could not ensure %s is public (free-tier worker may 403): %s", repo, e)
     api.upload_folder(
         folder_path=pkg_dir,
         path_in_repo="code/autoslm",
@@ -164,12 +212,21 @@ def _train_body(input_data: dict) -> dict:
 
     from huggingface_hub import snapshot_download
 
+    # NB: the Hopper fla guard lives in engine.worker._drop_fla_on_hopper (runs in the worker
+    # process AFTER all installs, before any model import) — doing it here would be undone by a
+    # later extra_pip / `prime env install` that pulls fla back, and depends on a handler redeploy.
+
     # Extra pip deps for verifiers / Prime Hub environments (installed per-run).
     extra_pip = input_data.get("extra_pip") or []
     if extra_pip:
         # check=True: a deterministic dependency failure should fail fast here,
         # not after model download + worker startup with a less actionable error.
         subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
+
+    # NB: fla is dropped on Hopper (sm90) automatically — resolve_worker_deps omits it from the
+    # install list, and engine.worker._drop_fla_on_hopper removes any baked-in copy at worker
+    # startup (fla's GDN backward is miscomputed on sm90, #640). No env toggle: fla only ever runs
+    # on the consumer archs where its Triton kernel is correct.
 
     # Install the run's verifiers environment(s) from the Prime Hub via the authenticated
     # `prime` CLI. The public pip index does not serve PRIVATE env wheels, so a plain pip
@@ -188,9 +245,20 @@ def _train_body(input_data: dict) -> dict:
         # failure point every run.
         if shutil.which("prime") is None:
             subprocess.run([sys.executable, "-m", "pip", "install", "prime"], check=True)
-        install_env = {**os.environ, "PRIME_API_KEY": prime_key, "PRIME_DISABLE_VERSION_CHECK": "1"}
+        # --with pip: install the env into THIS (the trainer's) python via pip. The default
+        # (`--with uv`) installs into prime's own isolated uv env, so the trainer then can't
+        # import the env module (ModuleNotFoundError at load_environment). PIP_BREAK_SYSTEM_PACKAGES
+        # lets pip write to a PEP-668 "externally-managed" base python (the worker image's).
+        install_env = {
+            **os.environ,
+            "PRIME_API_KEY": prime_key,
+            "PRIME_DISABLE_VERSION_CHECK": "1",
+            "PIP_BREAK_SYSTEM_PACKAGES": "1",
+        }
         for env_id in hub_env_ids:
-            subprocess.run(["prime", "env", "install", env_id], check=True, env=install_env)
+            subprocess.run(
+                ["prime", "env", "install", env_id, "--with", "pip"], check=True, env=install_env
+            )
 
     overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
     snapshot_download(
@@ -198,7 +266,7 @@ def _train_body(input_data: dict) -> dict:
         repo_type="dataset",
         allow_patterns=["code/**"],
         local_dir="/runcode",
-        token=overrides.get("HUGGINGFACE_TOKEN"),
+        token=overrides.get("HF_TOKEN"),
     )
     code_dir = "/runcode/code"
 
@@ -251,7 +319,7 @@ def _train_body(input_data: dict) -> dict:
                     tail = f.read()[-64_000:]
                 with open(console + ".tail", "w") as f:
                     f.write(tail)
-                HfApi(token=env.get("HUGGINGFACE_TOKEN")).upload_file(
+                HfApi(token=env.get("HF_TOKEN")).upload_file(
                     path_or_fileobj=console + ".tail",
                     path_in_repo=f"{prefix}/console_{mode}.txt",
                     repo_id=input_data["hf_repo"],
@@ -370,7 +438,7 @@ def _patch_runpod_backoff() -> None:
 def min_cuda_for(friendly_gpu: str) -> str:
     """Minimum host CUDA (driver) version for this GPU class on the active stack.
 
-    Blackwell classes (sm_120/sm_100 — RTX 5090, RTX Pro 6000, B200): pypi wheels for
+    Blackwell classes (sm_120 — RTX 5090, RTX Pro 6000): pypi wheels for
     the modern stack (vllm 0.19) ship no Blackwell SASS, so every custom CUDA kernel
     is PTX-JIT'd by the driver — and their PTX is built with a newer toolchain than
     CUDA-12.8-era drivers can JIT (observed: "the provided PTX was compiled with an
@@ -435,13 +503,15 @@ def get_train_endpoint(
         workers=(0, 1),  # one dedicated worker per run; scale to zero when idle
         **volume_endpoint_kwargs(spec),
     )
-    # Optional prebuilt image (deps baked in) cuts the cold-start dep install. Otherwise
-    # Flash installs WORKER_DEPS on first use (cached as an artifact across calls).
+    # RunPod Flash needs its serverless runtime baked into the worker image; the prebuilt
+    # WORKER_IMAGE is Vast's cold-start image (no Flash runtime) and leaves the worker unhealthy if
+    # forced. RunPod boot-installs WORKER_DEPS on Flash's default template instead (cached as a
+    # Flash artifact). Optional AUTOSLM_WORKER_IMAGE override for a RunPod-serverless-compatible image.
     image = os.environ.get("AUTOSLM_WORKER_IMAGE")
     if image:
         kwargs["image"] = image
     else:
-        kwargs["dependencies"] = resolve_worker_deps()
+        kwargs["dependencies"] = resolve_worker_deps(friendly)
         kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
     ep = Endpoint(**kwargs)
     handler = ep(_train_body)  # register the queue-based handler; returns the callable
@@ -449,16 +519,29 @@ def get_train_endpoint(
     # carries through to the deploy that the first handler call triggers.
     from autoslm.providers.runpod.jobs import apply_disk_gb
 
-    apply_disk_gb(ep._build_resource_config(), disk_gb)
+    cfg = ep._build_resource_config()
+    apply_disk_gb(cfg, disk_gb)
     _ENDPOINT_CACHE[name] = handler
     return handler
 
 
 def _run_suffix(run_id: str | None) -> str | None:
-    """Short, unique-per-run endpoint suffix derived from the run id tail."""
+    """Short, COLLISION-FREE per-run endpoint suffix.
+
+    Must be unique per run_id: the endpoint name is ``endpoint_name(friendly, suffix)`` and
+    RunPod reuses an endpoint by name -- two runs with the same suffix share one endpoint (and
+    its cached image/deps/registry-auth/template), so a later run silently reuses the earlier
+    one's config. The old ``run_id.split("-")[-1]`` only worked for hash-tailed default ids; a
+    descriptive run_id ending in e.g. the card name (``...-a100``) collided across every run.
+    Use a stable short hash of the WHOLE run_id, with a sanitized prefix for readability."""
     if not run_id:
         return None
-    return run_id.split("-")[-1]
+    import hashlib
+    import re
+
+    h = hashlib.sha1(run_id.encode()).hexdigest()[:8]
+    prefix = re.sub(r"[^a-z0-9]", "", run_id.lower())[-12:]
+    return f"{prefix}{h}" if prefix else h
 
 
 def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
@@ -590,16 +673,33 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # sleep mode ON (the default), default to a non-expandable conf instead; SFT and
     # sleep-off RL keep expandable_segments. An explicit operator override always wins.
     _is_rl = str(getattr(spec, "algorithm", "")).lower() not in ("sft",)
-    _sleep_on = os.environ.get("RL_VLLM_SLEEP", "1") not in ("0", "false", "False")
+    # RL_VLLM_SLEEP may be pinned per-run via [worker_env] (highest precedence, merged into the
+    # worker env later) OR via the control-plane process env. Resolve it from BOTH here — with
+    # worker_env winning — so a per-run explicit pin counts as explicit: otherwise _sleep_set stays
+    # false, AUTOSLM_ALLOC_AUTO=1 is sent, and the worker can upgrade to expandable_segments while
+    # run_rl still enables vLLM sleep, hitting the CuMemAllocator incompatibility after provisioning.
+    _sleep_raw = (spec.worker_env or {}).get("RL_VLLM_SLEEP", os.environ.get("RL_VLLM_SLEEP"))
+    _sleep_set = _sleep_raw is not None
+    _sleep_on = (_sleep_raw if _sleep_raw is not None else "1") not in ("0", "false", "False")
     _alloc_default = (
         "garbage_collection_threshold:0.8,max_split_size_mb:256"
         if (_is_rl and _sleep_on)
         else "expandable_segments:True"
     )
     # torch >= 2.10 renamed the env to PYTORCH_ALLOC_CONF — set BOTH names for either stack.
-    _alloc_conf = os.environ.get(
-        "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", _alloc_default)
+    # Resolve the override from [worker_env] AND the control-plane process env (worker_env wins,
+    # mirroring RL_VLLM_SLEEP above): a per-run [worker_env] PYTORCH_ALLOC_CONF is merged into the
+    # worker env later (and would win), but if it isn't counted as an explicit override HERE,
+    # _alloc_override stays falsy, AUTOSLM_ALLOC_AUTO=1 is sent, and finalize_alloc_conf_for_sleep
+    # overwrites the operator's per-run pin.
+    _we = spec.worker_env or {}
+    _alloc_override = (
+        _we.get("PYTORCH_ALLOC_CONF")
+        or _we.get("PYTORCH_CUDA_ALLOC_CONF")
+        or os.environ.get("PYTORCH_ALLOC_CONF")
+        or os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
     )
+    _alloc_conf = _alloc_override or _alloc_default
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
         # Compute substrate, read back by engine.worker for the RunMetrics record. Vast's
@@ -608,6 +708,16 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "BENCH_HF_MODEL": spec.model,
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
+        # We picked a DEFAULT alloc conf above without knowing the worker's resolved vLLM sleep
+        # decision (RL + RL_VLLM_SLEEP unset + no operator override). Cede the final choice to the
+        # worker, which resolves sleep from the model config and upgrades to expandable_segments
+        # when sleep is OFF (engine.worker.finalize_alloc_conf_for_sleep). Never set when the
+        # operator pinned an alloc conf or RL_VLLM_SLEEP explicitly — their choice is authoritative.
+        **(
+            {"AUTOSLM_ALLOC_AUTO": "1"}
+            if (_is_rl and not _sleep_set and not _alloc_override)
+            else {}
+        ),
         # Escape hatch for torch.compile/inductor spikes (Qwen3.5 DeltaNet kernels
         # compile at first forward and can OOM a tight colocate budget).
         **(
@@ -619,13 +729,17 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub
     # env(s), public + private) + optional reward-judge creds: a verifiers env whose rubric
     # calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
-    # where the reward runs. Forward any that the operator has set; absent ones are simply
-    # not passed.
+    # where the reward runs. AUTOSLM_JUDGE_MODEL is the judge model id the optimizer-authored env
+    # reads (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's
+    # control-plane override so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
+    # back to the env's generated default. Forward any that the operator has set; absent ones are
+    # simply not passed (the env then uses its own default model).
     for key in (
-        "HUGGINGFACE_TOKEN",
+        "HF_TOKEN",
         "PRIME_API_KEY",
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
+        "AUTOSLM_JUDGE_MODEL",
     ):
         if os.environ.get(key):
             env[key] = os.environ[key]
@@ -633,10 +747,6 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # code storage + heartbeats). The worker reads HF_REPO from its own process env; that env
     # is now sourced from the spec, not the operator's HF_REPO.
     env["HF_REPO"] = spec.train.hf_repo
-    # snapshot_download / from_pretrained / load_dataset / vLLM read HF_TOKEN, not
-    # HUGGINGFACE_TOKEN, so private/gated model+data pulls need it under that name.
-    if os.environ.get("HUGGINGFACE_TOKEN") and not env.get("HF_TOKEN"):
-        env["HF_TOKEN"] = os.environ["HUGGINGFACE_TOKEN"]
     # Opt-in network volume: point the whole HF cache at the persistent mount so
     # model weights survive across runs (the download becomes a one-time cost per
     # volume instead of per run).
@@ -650,32 +760,20 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # RL_VLLM_GPU_UTIL / RL_PER_DEVICE_PROMPTS are the colocate-memory knobs the docs tell
     # users to set to fix vLLM OOM/KV-cache errors; they were previously dropped here.
     for k in (
-        "SFT_MAX_STEPS",
-        "SFT_MAX_EXAMPLES",
         "SFT_PER_DEVICE_BS",
-        "SFT_SAVE_STEPS",
         "SFT_PACKING",
-        "SFT_LIGER",
-        "RL_MAX_COMPLETION",
+        # Colocate-memory knobs the docs tell users to set to fix vLLM OOM / KV-cache errors.
         "RL_VLLM_GPU_UTIL",
         "RL_VLLM_SLEEP",
-        "RL_USE_VLLM",
-        "RL_VLLM_MAX_LEN",
         "RL_PER_DEVICE_PROMPTS",
-        "RL_PROMPTS_PER_STEP",
-        "RL_GROUP_SIZE",
-        "RL_SAVE_STEPS",
-        # Min seconds between heartbeat.json HF commits — raise it when several runs share one
-        # HF_REPO to stay under HuggingFace's 128-commits/hour-per-repo limit.
-        "AUTOSLM_HEARTBEAT_MIN_S",
         "VLLM_USE_V1",
         # Attention-backend escape hatch: vllm's bundled flash-attn PTX can be newer
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
         "AUTOSLM_QUANT",
-        "AUTOSLM_QUANT_REPO",
-        "AUTOSLM_THINKING",
+        "WANDB_API_KEY",
+        "WANDB_ENTITY",
         "LORA_TARGETS",
         # Periodic mid-run GRPO eval (engine/midrun_eval.eval_config): the cadence normally comes
         # from the run's [train] eval_every_steps; AUTOSLM_EVAL_EVERY_STEPS is an operator override
@@ -683,9 +781,26 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # else (eval set, grading, completion budget, threshold) comes from the environment/run.
         "AUTOSLM_EVAL_EVERY_STEPS",
         "AUTOSLM_EVAL_NUM",
+        # rl_step heartbeat-upload throttle (engine.worker._hb_min_interval_s). Operators raise this
+        # to stay under HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO
+        # runs share one HF_REPO; the worker no-op's a non-positive/unparseable value back to 60s.
+        "AUTOSLM_HEARTBEAT_MIN_S",
     ):
-        if os.environ.get(k):
+        # Forward when SET, even if empty: an explicit "" is a meaningful override.
+        if os.environ.get(k) is not None:
             env[k] = os.environ[k]
+    # Per-run worker_env overrides win over the global os.environ allowlist: this is what lets
+    # ONE run differ (e.g. a per-run optimizer or LoRA-init A/B) while every other concurrent run
+    # keeps the global default. Run-IDENTITY keys are control-plane-owned and excluded: the poller,
+    # deploy, and artifact paths all key off spec.run_id / spec.train.hf_repo, so letting a
+    # [worker_env] override RUN_ID/HF_REPO would make the worker upload under a different repo/prefix
+    # and orphan the artifacts (the poller would never find DONE/metrics, deploy can't locate the
+    # adapter). AUTOSLM_ARM identifies the substrate (Vast rewrites it in its own bootstrap).
+    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "AUTOSLM_ARM"}
+    for k, v in (getattr(spec, "worker_env", None) or {}).items():
+        if str(k).upper() in _RESERVED_WORKER_ENV:
+            continue  # control plane owns run identity; a per-run override would orphan artifacts
+        env[str(k)] = str(v)
     return env
 
 

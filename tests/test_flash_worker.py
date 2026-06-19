@@ -32,9 +32,6 @@ def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
         "RL_VLLM_GPU_UTIL": "0.40",
         "RL_VLLM_SLEEP": "1",
         "RL_PER_DEVICE_PROMPTS": "2",
-        "RL_PROMPTS_PER_STEP": "16",
-        "RL_GROUP_SIZE": "8",
-        "RL_MAX_COMPLETION": "512",
         "VLLM_USE_V1": "0",
         "SFT_PER_DEVICE_BS": "4",
     }
@@ -71,6 +68,30 @@ def test_build_worker_env_forwards_midrun_eval_knobs(monkeypatch):
     env = build_worker_env(_spec(), 0)
     for k, v in knobs.items():
         assert env.get(k) == v, f"{k} not forwarded to worker"
+
+
+def test_build_worker_env_forwards_heartbeat_throttle(monkeypatch):
+    """AUTOSLM_HEARTBEAT_MIN_S is read by engine.worker on the GPU side to throttle rl_step
+    heartbeat commits under HuggingFace's 128/hr-per-repo cap; operators raise it when several
+    concurrent GRPO runs share one HF_REPO, so it MUST be on the forward allowlist."""
+    from autoslm.providers.runpod.train import build_worker_env
+
+    monkeypatch.setenv("AUTOSLM_HEARTBEAT_MIN_S", "180")
+    assert build_worker_env(_spec(), 0).get("AUTOSLM_HEARTBEAT_MIN_S") == "180"
+    monkeypatch.delenv("AUTOSLM_HEARTBEAT_MIN_S", raising=False)
+    assert "AUTOSLM_HEARTBEAT_MIN_S" not in build_worker_env(_spec(), 0)
+
+
+def test_build_worker_env_forwards_judge_model(monkeypatch):
+    """The optimizer-authored verifiers env reads AUTOSLM_JUDGE_MODEL on the worker to pick its
+    JudgeRubric client model (SFT-eval / GRPO-reward / rejection-sampling); the control-plane
+    override must be forwarded, else the env silently falls back to its generated default."""
+    from autoslm.providers.runpod.train import build_worker_env
+
+    monkeypatch.setenv("AUTOSLM_JUDGE_MODEL", "openai/gpt-oss-120b")
+    assert build_worker_env(_spec(), 0).get("AUTOSLM_JUDGE_MODEL") == "openai/gpt-oss-120b"
+    monkeypatch.delenv("AUTOSLM_JUDGE_MODEL", raising=False)
+    assert "AUTOSLM_JUDGE_MODEL" not in build_worker_env(_spec(), 0)
 
 
 def test_build_worker_env_forwards_prime_api_key(monkeypatch):
@@ -155,16 +176,13 @@ def test_runpod_backoff_no_overflow_on_long_runs():
     assert serverless.get_backoff_delay(100000, max_seconds=5) <= 5 * 1.2 + 1e-9
 
 
-def test_serve_execution_timeout_default_and_override(monkeypatch):
-    """DEFECT: serve execution cap (10 min) was shorter than a cold serving worker's
-    startup, so the first slm chat/deploy failed with 'executionTimeout exceeded'."""
+def test_serve_execution_timeout_is_fixed():
+    """DEFECT: serve execution cap (10 min) was shorter than a cold serving worker's startup, so
+    the first slm chat/deploy failed with 'executionTimeout exceeded'. It is now a fixed, generous
+    constant (no env override)."""
     from autoslm.serve import deploy
 
-    monkeypatch.delenv("AUTOSLM_SERVE_TIMEOUT_MS", raising=False)
-    assert deploy.serve_execution_timeout_ms() >= 20 * 60 * 1000  # generous default
-
-    monkeypatch.setenv("AUTOSLM_SERVE_TIMEOUT_MS", str(30 * 60 * 1000))
-    assert deploy.serve_execution_timeout_ms() == 30 * 60 * 1000
+    assert deploy.serve_execution_timeout_ms() >= 20 * 60 * 1000
 
 
 def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():

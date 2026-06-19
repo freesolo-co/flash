@@ -172,7 +172,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     # 40 GB SXM4 boards share Vast's "A100 SXM4" name with the 80 GB variant; offers
     # are split by gpu_ram (vast_gpu_for_offer). Not a RunPod Flash class -> Vast-only.
     GpuClass("A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 0.89, vast_name="A100 SXM4"),
-    # Validated 2026-06-11: 0.6B SFT smoke + full Qwen3.6-35B-A3B QLoRA SFT (phase6).
+    # Validated 2026-06-11: 0.6B SFT smoke (phase6).
     GpuClass(
         "A100 PCIe",
         "NVIDIA_A100_80GB_PCIe",
@@ -187,7 +187,12 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "A100 SXM", "NVIDIA_A100_SXM4_80GB", 80, "a100sxm", "sm80", 1.49, vast_name="A100 SXM4"
     ),
     GpuClass("H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29, vast_name="H100 SXM"),
-    GpuClass("H200", "NVIDIA_H200", 141, "h200", "sm90", 4.39, vast_name="H200"),
+    # H100 NVL (94 GB) has no RunPod Flash GpuType member -> Vast-only. Cheaper than the
+    # 80 GB SXM H100 on the live market and carries 14 GB more VRAM, so it's a strong
+    # cost/VRAM pick for big-context GRPO tiers.
+    GpuClass(
+        "H100 NVL", None, 94, "h100nvl", "sm90", 2.39, validated_on=("vast",), vast_name="H100 NVL"
+    ),
     GpuClass(
         "RTX Pro 6000",
         "NVIDIA_RTX_PRO_6000_BLACKWELL_SERVER_EDITION",
@@ -197,7 +202,20 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         2.09,
         min_cuda_modern="13.0",
     ),
-    GpuClass("B200", "NVIDIA_B200", 180, "b200", "sm100", 5.89, min_cuda_modern="13.0"),
+    # RTX Pro 6000 Blackwell Workstation Edition: same 96 GB die as the Server Edition,
+    # a distinct RunPod GpuType, typically a touch cheaper. Also offered on Vast. The
+    # single biggest non-datacenter 96 GB option -> cheapest 80 GB-floor GRPO host.
+    GpuClass(
+        "RTX Pro 6000 WK",
+        "NVIDIA_RTX_PRO_6000_BLACKWELL_WORKSTATION_EDITION",
+        96,
+        "pro6000wk",
+        "sm120",
+        1.79,
+        validated_on=("runpod", "vast"),
+        min_cuda_modern="13.0",
+        vast_name="RTX PRO 6000",
+    ),
 )
 
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
@@ -248,8 +266,6 @@ _ALIASES.update(
         "a100": "A100 PCIe",
         "nvidia h100 80gb hbm3": "H100",
         "h100 80gb hbm3": "H100",
-        "nvidia h200": "H200",
-        "nvidia b200": "B200",
         "rtx pro 6000 blackwell": "RTX Pro 6000",
         "nvidia rtx pro 6000 blackwell server edition": "RTX Pro 6000",
     }
@@ -370,6 +386,9 @@ def resolve_gpu_policy(
     model_id: str,
     allow_unvalidated: bool | None = None,
     algorithm: str = "sft",
+    *,
+    train=None,
+    thinking: bool = False,
 ) -> str:
     """Resolve ``gpu.type`` (a concrete class or a policy word) to a friendly name.
 
@@ -381,18 +400,14 @@ def resolve_gpu_policy(
     key = (requested or "").strip().lower()
     if key not in POLICY_NAMES:
         return canonical_gpu(requested)
-    from autoslm.catalog import catalog_min_vram_gb
+    from autoslm.engine.vram import model_required_vram_gb
+    from autoslm.providers.allocator import vram_headroom
 
-    # Catalog models carry a measured floor (shared with the submit-time
-    # allocator via catalog.catalog_min_vram_gb); open models get the coarse
-    # parse-time estimate (no headroom — the allocator re-resolves live).
-    min_vram = catalog_min_vram_gb(model_id, algorithm)
-    if min_vram is None:
-        from autoslm.engine.vram import estimate_vram_gb, fetch_hf_params_b
-
-        params_b = fetch_hf_params_b(model_id)
-        # No metadata (offline / private) -> keep the conservative 24 GB floor.
-        min_vram = int(estimate_vram_gb(params_b, algorithm)) if params_b else 24
+    # Honor AUTOSLM_VRAM_HEADROOM here too so parse-time sizing matches the submit-time
+    # allocator exactly (PR #176 review: they previously diverged on the headroom knob).
+    min_vram = model_required_vram_gb(
+        model_id, algorithm, train=train, thinking=thinking, headroom=vram_headroom()
+    )
     return cheapest_gpu(min_vram, include_unvalidated=unvalidated_allowed(allow_unvalidated))
 
 

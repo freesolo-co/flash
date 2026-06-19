@@ -9,17 +9,16 @@ to workers (the instance self-destroy backstop uses the Vast-injected, instance-
 
 from __future__ import annotations
 
-import os
+from .._auth import ensure_provider_auth, load_provider_key
+
+_ENV_VAR = "VAST_API_KEY"
 
 
 def load_api_key() -> str | None:
-    """Vast API key from the environment (operator configuration)."""
-    return os.environ.get("VAST_API_KEY") or None
+    """API key from the environment (operator configuration)."""
+    return load_provider_key(_ENV_VAR)
 
 
 def ensure_auth() -> str:
     """Ensure ``VAST_API_KEY`` is set; raise if unavailable."""
-    key = load_api_key()
-    if not key:
-        raise RuntimeError("no Vast API key found; set VAST_API_KEY on the control-plane host")
-    return key
+    return ensure_provider_auth(_ENV_VAR, "no Vast API key found; set VAST_API_KEY on the control-plane host")

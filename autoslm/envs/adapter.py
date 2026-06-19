@@ -34,7 +34,7 @@ Hub conveniences handled here so the *documented* flow (``slm env install owner/
 ``[environment] id = "owner/name"``) works on real Prime Intellect envs:
   * the ``owner/name`` Hub slug is mapped to the bare ``verifiers`` load id;
   * a ``RubricGroup`` (rubrics-of-rubrics) is flattened so the real reward funcs are found;
-    zero-weight monitor funcs still run (for shared-state side effects / logging) with their
+    eval-metric monitor funcs still run (for shared-state side effects / logging) with their
     exceptions guarded, but contribute 0 — only weighted funcs count toward the reward;
   * a ``JudgeRubric``'s judge client/model/prompt is supplied to reward funcs that declare a
     ``judge``/``judge_client``/``judge_model``/``judge_prompt`` arg, so judge-based rewards run;
@@ -108,7 +108,6 @@ def vf_load_id(env_ref: str) -> str:
 _RESERVED_ENV_PARAM_KEYS = frozenset(
     {
         "eval_env_id",
-        "eval_env",
         "eval_examples",
         "eval_seed",
         "grpo_config",
@@ -233,7 +232,7 @@ def _invoke_reward(func, available: dict) -> float:
     exception here is a real (weighted) reward func genuinely failing (e.g. a JudgeRubric judge
     raising on an API/rate-limit error, or a parse error on row data). Swallowing it as 0.0
     would silently train/score on an all-zero signal and waste a paid run, so we fail loudly
-    instead. Zero-weight (optional/monitor) funcs are run through ``_run_zero_weight_reward``,
+    instead. Eval-metric (optional/monitor) funcs are run through ``_run_eval_metric``,
     which swallows their exceptions — they contribute 0 either way and may exist only for their
     side effects (mutating shared ``state`` / logging), so a thrown monitor must not fail a run.
     """
@@ -251,8 +250,8 @@ def _invoke_reward(func, available: dict) -> float:
     return float(result or 0.0)
 
 
-def _run_zero_weight_reward(func, available: dict) -> None:
-    """Run a zero-weight monitor/diagnostic reward func, swallowing any exception.
+def _run_eval_metric(func, available: dict) -> None:
+    """Run a eval-metric monitor/diagnostic reward func, swallowing any exception.
 
     Per verifiers semantics every reward func RUNS, even weight-0 ones: they may mutate the
     shared ``state`` (so a later weighted func sees their work) or simply be logged. They never
@@ -334,7 +333,7 @@ class VerifiersEnvironment(BaseEnvironment):
         self._judge_rubric = _find_judge_rubric(rubric)
         # Fail fast on a group/batch reward func: the worker scores one completion at a time
         # and cannot supply its plural batch args, so it would silently score 0.0 and train a
-        # paid run on an all-zero signal. Only weighted funcs matter (zero-weight ones skip).
+        # paid run on an all-zero signal. Only weighted funcs matter (eval-metric ones skip).
         for func, weight in self._reward_pairs:
             if not weight:
                 continue
@@ -477,11 +476,11 @@ class VerifiersEnvironment(BaseEnvironment):
         ``"total"`` is their sum (== :meth:`reward`). Used to preserve the frontend per-scorer
         breakdown + W&B series instead of collapsing to a single binary ``correct``.
 
-        Per verifiers semantics EVERY reward func runs, including zero-weight ones — they may
+        Per verifiers semantics EVERY reward func runs, including eval-metric ones — they may
         mutate the shared ``state`` (so a subsequent weighted func sees their work) or exist
-        only to be logged. Zero-weight funcs run with GUARDED exceptions (a thrown monitor must
+        only to be logged. Eval-metric funcs run with GUARDED exceptions (a thrown monitor must
         not fail the run) and contribute 0, so they are not added to the breakdown/total; the
-        order is preserved so a zero-weight func can prepare state for a later weighted one.
+        order is preserved so a eval-metric func can prepare state for a later weighted one.
         Weighted funcs propagate exceptions (a thrown weighted reward fails the run).
         """
         breakdown: dict[str, float] = {}
@@ -493,10 +492,10 @@ class VerifiersEnvironment(BaseEnvironment):
         total = 0.0
         for func, weight in self._reward_pairs:
             if not weight:
-                # Zero-weight monitor/diagnostic func: RUN it (for its side effects on shared
+                # Eval-metric monitor/diagnostic func: RUN it (for its side effects on shared
                 # state / logging) with guarded exceptions, but it contributes 0 and is not in
                 # the named breakdown.
-                _run_zero_weight_reward(func, available)
+                _run_eval_metric(func, available)
                 continue
             name = getattr(func, "__name__", str(func))
             score = float(weight) * _invoke_reward(func, available)
@@ -520,15 +519,15 @@ class VerifiersEnvironment(BaseEnvironment):
 
     def evaluate(self, completion: str, example: dict, state: dict | None = None) -> dict:
         """One pass over the rubric returning the training ``reward`` AND the env's separate
-        ``metrics`` — each ZERO-WEIGHT rubric func's raw (unweighted) score, by name.
+        ``metrics`` — each EVAL-METRIC rubric func's raw (unweighted) score, by name.
 
-        Zero-weight funcs are how a verifiers ``environment.py`` expresses an EVALUATION signal
+        Eval-metric funcs are how a verifiers ``environment.py`` expresses an EVALUATION signal
         distinct from the GRPO reward: an ``exact_match`` / ``accuracy`` monitor added with
         ``rubric.add_metric(fn, weight=0.0)`` does not shape training (weight 0) but measures
         quality. :meth:`scores_breakdown`/:meth:`reward` deliberately omit these; mid-run eval
         wants them, so this method surfaces them WITHOUT a second rubric pass (a ``JudgeRubric``
         is sampled at most once). Weighted funcs still propagate exceptions (a broken weighted
-        reward fails the run); zero-weight monitors stay guarded (a thrown monitor is skipped,
+        reward fails the run); eval-metric monitors stay guarded (a thrown monitor is skipped,
         never fails eval). Order is preserved so a monitor can prep shared ``state`` for a later
         weighted func, exactly as in :meth:`scores_breakdown`.
 
@@ -545,7 +544,7 @@ class VerifiersEnvironment(BaseEnvironment):
         for func, weight in self._reward_pairs:
             name = getattr(func, "__name__", str(func))
             if not weight:
-                # Zero-weight = an eval/monitor metric: run it (guarded — a thrown monitor must
+                # Eval-metric = an eval/monitor metric: run it (guarded — a thrown monitor must
                 # not fail eval) and record its RAW score; it never touches the reward total.
                 try:
                     raw = _invoke_reward(func, available)
@@ -686,7 +685,6 @@ def _import_vf():
 def load_verifiers_environment(
     env_id: str,
     eval_env_id: str | None = None,
-    eval_env: str | None = None,
     eval_examples: int | None = None,
     eval_seed: int = 12345,
     **kwargs,
@@ -694,13 +692,13 @@ def load_verifiers_environment(
     """Load an installed / Hub verifiers environment by id and wrap it for AutoSLM.
 
     ``env_id`` may be a Hub slug (``owner/name``); it is mapped to the bare verifiers load id.
-    Pass ``eval_env_id`` (alias ``eval_env``) to evaluate on a *different* Hub env, with
-    ``eval_examples`` / ``eval_seed`` selecting a fixed eval subset. Remaining ``kwargs`` are
-    forwarded to the train env's ``vf.load_environment``.
+    Pass ``eval_env_id`` to evaluate on a *different* Hub env, with ``eval_examples`` /
+    ``eval_seed`` selecting a fixed eval subset. Remaining ``kwargs`` are forwarded to the train
+    env's ``vf.load_environment``.
     """
     vf = _import_vf()
     vf_env = vf.load_environment(vf_load_id(env_id), **_drop_reserved_kwargs(kwargs))
-    eval_ref = eval_env_id or eval_env
+    eval_ref = eval_env_id
     eval_vf_env = vf.load_environment(vf_load_id(eval_ref)) if eval_ref else None
     return VerifiersEnvironment(
         vf_env,

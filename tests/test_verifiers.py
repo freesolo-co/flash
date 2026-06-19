@@ -57,8 +57,8 @@ def test_verifiers_adapter_mapping():
     assert env.sft_target({"answer": "4"}) == "4"
 
 
-def test_evaluate_surfaces_zero_weight_metrics_distinct_from_reward():
-    """``evaluate()`` returns the weighted training reward AND each zero-weight rubric func's RAW
+def test_evaluate_surfaces_eval_metric_metrics_distinct_from_reward():
+    """``evaluate()`` returns the weighted training reward AND each eval-metric rubric func's RAW
     score by name — so an env expresses an evaluation metric (e.g. accuracy) that differs from a
     shaped GRPO reward, entirely in the environment's rubric. ``reward()`` stays metric-free."""
     from autoslm.envs.adapter import VerifiersEnvironment
@@ -78,11 +78,11 @@ def test_evaluate_surfaces_zero_weight_metrics_distinct_from_reward():
     ex = {"answer": "4"}
     out = env.evaluate("the answer is 4", ex)
     assert out["reward"] == pytest.approx(0.3)  # shaped reward (weighted total)
-    assert out["metrics"] == {"accuracy": 1.0}  # zero-weight metric surfaced, raw + distinct
+    assert out["metrics"] == {"accuracy": 1.0}  # eval-metric metric surfaced, raw + distinct
     miss = env.evaluate("nope", ex)
     assert miss["reward"] == 0.0
     assert miss["metrics"] == {"accuracy": 0.0}
-    # reward()/scores_breakdown() are unchanged: weighted total only, no zero-weight metrics
+    # reward()/scores_breakdown() are unchanged: weighted total only, no eval-metric metrics
     assert env.reward("the answer is 4", ex) == pytest.approx(0.3)
     assert "accuracy" not in env.scores_breakdown("the answer is 4", ex)
 
@@ -164,7 +164,7 @@ def test_install_manifest_and_worker_deps():
             "owner/eval",
         ]
         # The train env doubling as the eval env is installed once.
-        assert registry.worker_hub_env_ids("owner/x", {"eval_env": "owner/x"}) == ["owner/x"]
+        assert registry.worker_hub_env_ids("owner/x", {"eval_env_id": "owner/x"}) == ["owner/x"]
 
         os.environ.pop("AUTOSLM_ENVS_MANIFEST", None)
         importlib.reload(registry)
@@ -202,9 +202,9 @@ def test_load_verifiers_environment_uses_bare_ids(monkeypatch):
     assert seen == ["hendrycks-math"]  # owner stripped
 
 
-def test_rubric_group_is_flattened_and_zero_weight_skipped():
+def test_rubric_group_is_flattened_and_eval_metric_skipped():
     """DEFECT: a RubricGroup's top-level funcs is empty, so reward was always 0; and a
-    zero-weight monitor func (e.g. num_turns) crashed on missing state."""
+    eval-metric monitor func (e.g. num_turns) crashed on missing state."""
     from autoslm.envs.adapter import VerifiersEnvironment, _flatten_rubric
 
     def correct(completion, answer):
@@ -236,8 +236,8 @@ def test_rubric_group_is_flattened_and_zero_weight_skipped():
 def test_reward_from_weighted_func_propagates_exception():
     """A WEIGHTED reward func that raises must PROPAGATE (fail loudly), not be swallowed as
     0.0 — a raise in a weighted func is a real reward failure (e.g. judge API error) that would
-    otherwise train/score on an all-zero signal. (Zero-weight funcs run with guarded exceptions
-    instead — see test_reward_zero_weight_crashing_func_runs_with_guarded_exception.)"""
+    otherwise train/score on an all-zero signal. (Eval-metric funcs run with guarded exceptions
+    instead — see test_reward_eval_metric_crashing_func_runs_with_guarded_exception.)"""
     from autoslm.envs.adapter import VerifiersEnvironment
 
     def boom(**kwargs):
@@ -256,8 +256,8 @@ def test_reward_from_weighted_func_propagates_exception():
         env.reward("anything", {"answer": "4"})
 
 
-def test_reward_zero_weight_crashing_func_runs_with_guarded_exception():
-    """Per verifiers semantics a zero-weight monitor func RUNS (it may mutate shared state /
+def test_reward_eval_metric_crashing_func_runs_with_guarded_exception():
+    """Per verifiers semantics a eval-metric monitor func RUNS (it may mutate shared state /
     be logged), but its exceptions are GUARDED (swallowed) — a thrown monitor must not fail the
     run — and it contributes 0 to the reward."""
     from autoslm.envs.adapter import VerifiersEnvironment
@@ -273,24 +273,24 @@ def test_reward_zero_weight_crashing_func_runs_with_guarded_exception():
 
     class _Rubric:
         funcs = (good, boom)
-        weights = (1.0, 0.0)  # boom is zero-weight -> runs, guarded, contributes 0
+        weights = (1.0, 0.0)  # boom is eval-metric -> runs, guarded, contributes 0
 
     class _Env:
         rubric = _Rubric()
         parser = None
 
     env = VerifiersEnvironment(_Env(), "owner/x")
-    # The crashing zero-weight func runs (its exception is swallowed) and contributes nothing.
+    # The crashing eval-metric func runs (its exception is swallowed) and contributes nothing.
     assert env.reward("the answer is 4", {"answer": "4"}) == 1.0
     assert calls == ["boom"]
 
 
-def test_zero_weight_func_runs_and_can_mutate_shared_state():
-    """A zero-weight func runs BEFORE a later weighted func and may set shared ``state`` the
+def test_eval_metric_func_runs_and_can_mutate_shared_state():
+    """A eval-metric func runs BEFORE a later weighted func and may set shared ``state`` the
     weighted func then reads. It still contributes 0 itself and is absent from the breakdown."""
     from autoslm.envs.adapter import VerifiersEnvironment
 
-    def monitor(state, **kwargs):  # zero-weight: seeds shared state, returns nothing useful
+    def monitor(state, **kwargs):  # eval-metric: seeds shared state, returns nothing useful
         state["seen"] = True
         return 0.0
 
@@ -309,7 +309,7 @@ def test_zero_weight_func_runs_and_can_mutate_shared_state():
     state = {}
     breakdown = env.scores_breakdown("anything", {"answer": "4"}, state)
     assert breakdown["total"] == 1.0  # weighted func saw the monitor's state mutation
-    assert breakdown == {"scored": 1.0, "total": 1.0}  # zero-weight monitor not in breakdown
+    assert breakdown == {"scored": 1.0, "total": 1.0}  # eval-metric monitor not in breakdown
     assert state["seen"] is True
 
 
@@ -410,7 +410,7 @@ def test_group_reward_func_is_rejected_at_construction():
     with pytest.raises(ValueError, match="completions"):
         VerifiersEnvironment(_Env(), "owner/x")
 
-    # A zero-weight group func is skipped (never invoked), so it must NOT block load.
+    # A eval-metric group func is skipped (never invoked), so it must NOT block load.
     class _RubricZero:
         funcs = (group_reward,)
         weights = (0.0,)

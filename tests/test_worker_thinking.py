@@ -10,6 +10,7 @@ works for every environment.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 
 _WORKER_ENV = (
@@ -27,8 +28,16 @@ _WORKER_ENV = (
 def _set_thinking_worker_env():
     saved = {k: os.environ.get(k) for k in _WORKER_ENV}
     os.environ.update({"HF_REPO": "", "RUN_MODE": "rl", "PHASE": "rl", "SEED": "0"})
-    os.environ["AUTOSLM_THINKING"] = "1"  # no-JobSpec env fallback (bench path)
-    for k in ("AUTOSLM_JOB_SPEC_JSON", "AUTOSLM_JOB_SPEC_PATH", "RL_PER_DEVICE_PROMPTS"):
+    # thinking is a run-config field (TOML `thinking`), not an env knob: drive it via the JobSpec.
+    os.environ["AUTOSLM_JOB_SPEC_JSON"] = json.dumps(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "thinking": True,
+            "environment": {"id": "stub/env"},
+        }
+    )
+    for k in ("AUTOSLM_THINKING", "AUTOSLM_JOB_SPEC_PATH", "RL_PER_DEVICE_PROMPTS"):
         os.environ.pop(k, None)
     return saved
 
@@ -57,7 +66,10 @@ def test_strip_think_unit():
     assert ne.strip_think("<think>still going 42") == ""
 
 
-def test_thinking_budget_selection():
+def test_thinking_budget_selection(monkeypatch):
+    # A JobSpec with an env id makes the worker resolve ACTIVE_ENV at import; stub the loader so
+    # this CPU dry-run doesn't reach the Prime Hub. We only exercise THINKING / micro-batch here.
+    monkeypatch.setattr("autoslm.envs.registry.load_environment", lambda *a, **k: object())
     saved = _set_thinking_worker_env()
     import autoslm.engine.worker as ne
 
@@ -75,14 +87,21 @@ def test_thinking_budget_selection():
         assert ne.rl_per_device_comps() == 4
     finally:
         _restore_env(saved)
-    # thinking off (explicit, since the env fallback now defaults ON): original micro-batch
-    os.environ["AUTOSLM_THINKING"] = "0"
+    # thinking off: a JobSpec with thinking=false -> original (larger) micro-batch
+    os.environ["AUTOSLM_JOB_SPEC_JSON"] = json.dumps(
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "algorithm": "grpo",
+            "thinking": False,
+            "environment": {"id": "stub/env"},
+        }
+    )
     try:
         importlib.reload(ne)
         assert ne.THINKING is False
         assert ne.rl_per_device_comps() == 8
     finally:
-        os.environ.pop("AUTOSLM_THINKING", None)
+        os.environ.pop("AUTOSLM_JOB_SPEC_JSON", None)
         importlib.reload(ne)
 
 

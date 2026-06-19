@@ -50,7 +50,7 @@ def test_expanded_gpu_table():
     assert canonical_gpu("A100") == "A100 PCIe"
     assert canonical_gpu("rtx a5000") == "RTX A5000"
     assert canonical_gpu("NVIDIA GeForce RTX 3090") == "RTX 3090"
-    assert canonical_gpu("h200") == "H200"
+    assert canonical_gpu("h100") == "H100"
     assert get_gpu_info("A40").vram_gb == 48
     # endpoint-name tokens stay single-word safe
     assert gpu_short("A100 PCIe") == "a100pcie"
@@ -63,7 +63,6 @@ def test_blackwell_min_cuda_pin():
     from autoslm.providers.base import min_cuda_modern
 
     assert min_cuda_modern("RTX 5090") == "13.0"
-    assert min_cuda_modern("B200") == "13.0"
     assert min_cuda_modern("RTX Pro 6000") == "13.0"
     assert min_cuda_modern("RTX 4090") == "12.8"
     assert min_cuda_modern("A100 SXM") == "12.8"
@@ -92,11 +91,12 @@ def test_resolve_gpu_policy(monkeypatch):
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
-    # small (12GB) model -> cheapest validated class (A5000); 32GB model -> 5090
-    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-0.8B") == "RTX A5000"
-    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-9B") == "RTX 5090"
+    # small model GRPO -> cheapest validated 24 GB class (A5000); 9B GRPO needs the 32 GB
+    # tier (5090). (resolve_gpu_policy sizes for the passed algorithm; 9B SFT is lighter.)
+    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX A5000"
+    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-9B", algorithm="grpo") == "RTX 5090"
     # concrete names pass through canonicalization
-    assert resolve_gpu_policy("rtx5090", "Qwen/Qwen3.5-9B") == "RTX 5090"
+    assert resolve_gpu_policy("rtx5090", "Qwen/Qwen3.5-4B") == "RTX 5090"
 
 
 def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
@@ -172,7 +172,7 @@ def test_config_defaults_gpu_from_model():
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    assert spec.gpu.type == "RTX 5090"  # 9B needs >=32GB
+    assert spec.gpu.type == "RTX A5000"  # 9B is 4-bit QLoRA now -> fits 24GB
 
 
 def test_build_worker_env():

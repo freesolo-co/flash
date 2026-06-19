@@ -7,10 +7,10 @@ touching the file: ``FREESOLO_API_KEY`` for the key, ``AUTOSLM_API_URL`` for the
 
 from __future__ import annotations
 
-import contextlib
-import json
 import os
 from pathlib import Path
+
+from .._fileio import read_json_or_empty, secure_json_write
 
 DEFAULT_API_URL = "https://flash.freesolo.co"
 
@@ -19,10 +19,7 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 
 
 def _read_config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text())
-    except (OSError, ValueError):
-        return {}
+    return read_json_or_empty(CONFIG_PATH)
 
 
 def load_credentials() -> tuple[str, str | None]:
@@ -45,16 +42,5 @@ def save_credentials(api_key: str, api_url: str | None = None) -> Path:
             cfg.pop("api_url", None)
         else:
             cfg["api_url"] = api_url.rstrip("/")
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(CONFIG_DIR, 0o700)
-    # Create/truncate with 0600 from the start so the key is never briefly world-readable.
-    # O_NOFOLLOW (where available): refuse to follow a symlink planted at CONFIG_PATH, so
-    # saving the key can't be redirected to clobber an arbitrary file.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(CONFIG_PATH, flags, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(cfg, f, indent=2, sort_keys=True)
-    with contextlib.suppress(OSError):
-        os.chmod(CONFIG_PATH, 0o600)
+    secure_json_write(CONFIG_PATH, cfg)
     return CONFIG_PATH

@@ -9,6 +9,7 @@ and `--dry-run` stay fully local.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import sys
@@ -32,12 +33,6 @@ from autoslm.schema import ConfigError, spec_from_file
 from autoslm.spec import _coerce_bool
 
 logger = get_logger(__name__)
-
-
-def _env_flag(name: str) -> bool:
-    """Truthiness of an env var, honoring the project's falsey convention
-    (``""``/``0``/``false``/``no``/``off`` are all False)."""
-    return _coerce_bool(os.environ.get(name, ""))
 
 
 # Exceptions that represent expected user/config errors: report them as a clean one-line
@@ -210,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
-    debug = getattr(args, "debug", False) or _env_flag("AUTOSLM_DEBUG")
+    debug = getattr(args, "debug", False) or _coerce_bool(os.environ.get("AUTOSLM_DEBUG", ""))
     try:
         return args.func(args)
     except _USER_ERRORS as exc:
@@ -441,8 +436,15 @@ def cmd_env_list(args) -> int:
     return 0
 
 
-# Prime Intellect Environments Hub pip index (used by default for owner/name Hub slugs).
-PRIME_HUB_INDEX = "https://hub.primeintellect.ai/primeintellect/simple/"
+# Prime Intellect Environments Hub pip index. Each org's wheels live under ITS OWN namespace
+# (e.g. freesolo-co/autoslm-bench -> .../freesolo-co/simple/), so derive the index from the
+# slug owner — a hardcoded `primeintellect` index 404s on any non-primeintellect env.
+PRIME_HUB_INDEX_TMPL = "https://hub.primeintellect.ai/{owner}/simple/"
+
+
+def _prime_hub_index(env_id: str) -> str:
+    owner = env_id.split("/", 1)[0] if "/" in env_id else "primeintellect"
+    return PRIME_HUB_INDEX_TMPL.format(owner=owner)
 
 
 def cmd_env_install(args) -> int:
@@ -467,9 +469,7 @@ def cmd_env_install(args) -> int:
     # managed worker does NOT reinstall from this record — it installs Hub envs itself via an
     # authenticated `prime env install` on the GPU box. A Hub slug `owner/name` maps to the pip
     # wheel `name` on the Prime Intellect Hub index; we record that index alongside the env.
-    # env_id is a validated "owner/name" slug (checked above), so it always maps to the Prime
-    # Hub index wheel; record that index alongside the env.
-    extras = {"extra_index_url": PRIME_HUB_INDEX}
+    extras = {"extra_index_url": _prime_hub_index(env_id)}
     if shutil.which("prime"):
         # The `prime` CLI resolves the Hub + index itself (and is the only path that can fetch a
         # PRIVATE Hub env — autoslm publishes envs PRIVATE).
@@ -491,7 +491,7 @@ def cmd_env_install(args) -> int:
             if shutil.which("uv")
             else [sys.executable, "-m", "pip", "install"]
         )
-        cmd = [*installer, _bare_wheel_name(env_id), "--extra-index-url", PRIME_HUB_INDEX]
+        cmd = [*installer, _bare_wheel_name(env_id), "--extra-index-url", extras["extra_index_url"]]
     print("running:", " ".join(cmd))
     rc = subprocess.run(cmd).returncode
     if rc != 0:
@@ -578,6 +578,51 @@ def _config_env_name(config_path) -> str | None:
     return None
 
 
+def _config_env_name_from_dir(config_dir) -> str | None:
+    """The Hub env name declared by the sibling per-phase autoslm configs
+    (``autoslm_grpo.toml``/``autoslm_sft.toml``). Without this, pushing ``environment.py`` finds
+    no id and mints a brand-new env, so the run trains against the stale id in the configs.
+    """
+    config_dir = Path(config_dir)
+    for cfg in ("autoslm_grpo.toml", "autoslm_sft.toml"):
+        name = _config_env_name(config_dir / cfg)
+        if name:
+            return name
+    return None
+
+
+def _with_syspath_bootstrap(env_source: str) -> str:
+    """Prepend a sys.path bootstrap so a published env (run as the package __init__) can resolve
+    BARE absolute imports of its shipped sibling helpers (`import config` / `from utils import x`)
+    even without its own sys.path.insert — otherwise `prime env install`/load_environment fails
+    with ModuleNotFoundError. Inserted AFTER the module docstring and any `from __future__` imports
+    (which must stay first). Mirrors the platform hub publisher."""
+    bootstrap = (
+        "import os as _autoslm_os, sys as _autoslm_sys\n"
+        "_autoslm_sys.path.insert(0, _autoslm_os.path.dirname(__file__))\n"
+    )
+    try:
+        tree = ast.parse(env_source)
+    except SyntaxError:
+        return bootstrap + env_source
+    insert_after = 0
+    body = tree.body
+    i = 0
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(getattr(body[0], "value", None), ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        insert_after = body[0].end_lineno or 0
+        i = 1
+    while i < len(body) and isinstance(body[i], ast.ImportFrom) and body[i].module == "__future__":
+        insert_after = body[i].end_lineno or insert_after
+        i += 1
+    lines = env_source.splitlines(keepends=True)
+    return "".join(lines[:insert_after]) + bootstrap + "".join(lines[insert_after:])
+
+
 def _run_prime_push(env_dir, *, is_new: bool, name: str | None = None) -> int:
     """Run `prime env push` on a packaged env dir (always PRIVATE), climbing past conflicts.
 
@@ -648,12 +693,17 @@ def cmd_env_push(args) -> int:
     # env that reads a `__file__`-relative data file still resolves once installed.
     if src.is_file() and src.suffix == ".py":
         module_source = src.read_text()
-        # Re-publish to the SAME Hub env when a sibling autoslm.toml names one: use its
+        # Re-publish to the SAME Hub env when a sibling autoslm config names one: use its
         # `[environment] id` name part so an edited environment.py mints a new version of the
         # existing env instead of creating a fresh env from the file stem.
-        sibling_name = _config_env_name(src.parent / "autoslm.toml")
+        sibling_name = _config_env_name_from_dir(src.parent)
         env_name = sibling_name or _push_env_name(src.stem)
         data_dir = src.parent / "datasets"
+        # Ship the env's sibling helper modules (config.py/utils.py/...) so an environment.py that
+        # does `sys.path.insert(0, dir(__file__)); import utils` resolves once installed.
+        sibling_modules = [
+            p for p in sorted(src.parent.glob("*.py")) if p != src and not p.name.startswith("__")
+        ]
         # A sibling config id means we're re-publishing an EXISTING Hub env: auto-bump from the
         # first attempt so it doesn't restart at 0.1.0 and climb through version conflicts.
         is_new = sibling_name is None
@@ -670,6 +720,7 @@ def cmd_env_push(args) -> int:
         module_source = modules[0].read_text()
         env_name = _push_env_name(src.name)
         data_dir = src / "datasets"
+        sibling_modules = []
         is_new = True
     else:
         print(f"cannot publish {src}: expected a verifiers .py module or an env directory.")
@@ -682,12 +733,14 @@ def cmd_env_push(args) -> int:
     with tempfile.TemporaryDirectory(prefix="slm-env-push-") as tmp:
         pkg = Path(tmp)
         (pkg / module).mkdir()
-        (pkg / module / "__init__.py").write_text(module_source)
+        (pkg / module / "__init__.py").write_text(_with_syspath_bootstrap(module_source))
         # Ship committed sibling data inside the package dir (it lands at <module>/datasets/, so a
         # `os.path.dirname(__file__)/datasets/...` read resolves on the worker); the whole package
         # dir ships via `[tool.hatch.build.targets.wheel] packages = ["<module>"]`.
         if data_dir.is_dir() and any(data_dir.iterdir()):
             shutil.copytree(data_dir, pkg / module / "datasets")
+        for mod in sibling_modules:
+            shutil.copy2(mod, pkg / module / mod.name)
         (pkg / "pyproject.toml").write_text(
             _ENV_PUSH_PYPROJECT.format(name=env_name, module=module, version=_PUSH_INITIAL_VERSION)
         )

@@ -10,11 +10,10 @@ manifest below).
 
 from __future__ import annotations
 
-import contextlib
-import json
 import os
 from pathlib import Path
 
+from .._fileio import read_json_or_empty, secure_json_write
 from .base import Environment
 
 # Manifest of installed verifiers / Prime Hub environments (written by `slm env install`).
@@ -24,10 +23,7 @@ INSTALLED_MANIFEST = Path(
 
 
 def load_installed_manifest() -> dict:
-    try:
-        return json.loads(INSTALLED_MANIFEST.read_text())
-    except (OSError, ValueError):
-        return {}
+    return read_json_or_empty(INSTALLED_MANIFEST)
 
 
 def list_installed_verifiers_envs() -> list[str]:
@@ -38,17 +34,8 @@ def list_installed_verifiers_envs() -> list[str]:
 def record_installed_env(env_id: str, package: str, extras: dict | None = None) -> None:
     manifest = load_installed_manifest()
     manifest[env_id] = {"package": package, **(extras or {})}
-    INSTALLED_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    # The manifest can hold a credentialed --extra-index-url. Create/truncate with 0600
-    # from the start (not write_text + chmod, which leaves it umask-readable in between);
-    # O_NOFOLLOW refuses a symlink planted at the path. chmod after covers a pre-existing
-    # file created before this code path.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(INSTALLED_MANIFEST, flags, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-    with contextlib.suppress(OSError):
-        os.chmod(INSTALLED_MANIFEST, 0o600)
+    # The manifest can hold a credentialed --extra-index-url, so write it with private perms.
+    secure_json_write(INSTALLED_MANIFEST, manifest)
 
 
 def _bare_wheel_name(env_ref: str) -> str:
@@ -70,12 +57,12 @@ def worker_pip_for_env(env_id: str) -> list[str]:
 def worker_hub_env_ids(env_id: str, params: dict | None = None) -> list[str]:
     """The Prime Hub env ids the worker must ``prime env install`` for this run.
 
-    The training env plus a separate **eval** Hub env (``[environment.params] eval_env_id``,
-    alias ``eval_env``) when configured. ``prime env install`` is authenticated by
-    ``PRIME_API_KEY`` and installs public and private envs alike.
+    The training env plus a separate **eval** Hub env (``[environment.params] eval_env_id``)
+    when configured. ``prime env install`` is authenticated by ``PRIME_API_KEY`` and installs
+    public and private envs alike.
     """
     params = params or {}
-    ids = [env_id, params.get("eval_env_id") or params.get("eval_env")]
+    ids = [env_id, params.get("eval_env_id")]
     return list(dict.fromkeys(str(i) for i in ids if i))
 
 

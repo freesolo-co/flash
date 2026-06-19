@@ -1,0 +1,102 @@
+# AutoSLM prebuilt WORKER image — the full training stack baked in so Vast/RunPod cold-start
+# skips the per-host dep install (the dominant cold-start cost; measured 7-86s on fresh Vast).
+# The worker still fetches the autoslm `code/**` from HF at runtime, so only DEPS live here.
+#
+# This image is ALWAYS used (no operator override) and is referenced by name in
+# providers/runpod/train.py:WORKER_IMAGE. It MUST be published to GHCR and the package set PUBLIC
+# (no registry login is configured) — otherwise Vast/RunPod can't pull it. Normally built by
+# .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
+#
+#   docker build -f Dockerfile.worker -t ghcr.io/freesolo-co/autoslm-worker:cu128 .
+#   docker push ghcr.io/freesolo-co/autoslm-worker:cu128
+#   # then make the GHCR package public (org packages settings) once.
+#
+# Base is torch 2.10 / cu12.8 / cudnn9 (-devel = has nvcc for any source builds); it ships the
+# CUDA 12.8 runtime libs the PyPI wheels link against. The pinned stack mirrors
+# providers/runpod/train.py:WORKER_DEPS.
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PYTHONUNBUFFERED=1
+
+# build-essential for Triton/Inductor (Liger) + any source builds; git for pip VCS installs.
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# The pinned worker stack (torch already in the base image, version-matched so pip skips it).
+RUN pip install --no-cache-dir \
+    "transformers>=5.6,<5.13" \
+    "trl>=1.6,<1.7" \
+    "peft>=0.19" \
+    "vllm==0.19.1" \
+    "bitsandbytes>=0.49" \
+    "datasets>=4.7,<6" \
+    "huggingface_hub>=0.25" \
+    "accelerate>=1.4" \
+    "wandb>=0.17" \
+    "liger-kernel>=0.5" \
+    "flash-linear-attention==0.5.0" \
+    "hf_transfer" \
+    "verifiers>=0.1.10" \
+    "prime" \
+    "runpod"
+# Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels, which are correct
+# on consumer cards (Ampere/Ada/Blackwell). On Hopper (sm90) fla's GDN chunk_bwd is miscomputed
+# (fla #640) and its cumsum kernels hit a num_warps=8 LinearLayout assertion (fla #734); both fixes
+# are unreleased (post-0.5.0 git main) and #640's backward correctness is unconfirmed, so on Hopper
+# the worker DROPS fla (engine.worker._drop_fla_on_hopper) and transformers uses its native
+# pure-PyTorch delta rule — slower but correct.
+
+# FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
+# but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC
+# (see .github/workflows/worker-image.yml). Installing a wheel takes seconds and gives full arch
+# coverage. Compiling FA2 from source instead is enormous (tens of GB RAM, ~1h for 5 arches) and
+# OOM-killed/starved every CI runner we tried — so the source path is only a LOCAL fallback.
+# FLASH_ATTN_SPEC is a pip spec: a wheel URL (preferred), a pinned "flash-attn==X", or the default
+# unpinned "flash-attn" (source build). Best-effort either way: on failure the image still works via
+# the SDPA fallback, so the layer never blocks the cold-start win.
+ARG FLASH_ATTN_SPEC=flash-attn
+# Source-build fallback only (ignored when FLASH_ATTN_SPEC is a wheel): bound the compile so it
+# doesn't OOM. TORCH_CUDA_ARCH_LIST restricts to the catalog's arches — Ampere (8.0 A100 / 8.6
+# 3090/A40), Ada (8.9 4090), Hopper (9.0 H100), Blackwell (12.0 RTX 5090; sm120); MAX_JOBS bounds
+# peak compile memory. (A from-source build still needs a big-RAM host; the wheel avoids all of it.)
+RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" MAX_JOBS=4 \
+    pip install --no-cache-dir "${FLASH_ATTN_SPEC}" --no-build-isolation \
+    && echo "flash-attn: installed (${FLASH_ATTN_SPEC})" || echo "flash-attn: build failed, SDPA fallback"
+
+# Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
+# Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/
+# bootstrap code + the WORKER_DEPS list above): the core stack, the optimizer/accelerator libs
+# (liger, flash-linear-attention=fla, flash_attn, bitsandbytes, triton), and the HF/env libs. A
+# missing or ABI-broken package fails the build HERE instead of silently shipping (the FA wheel in
+# particular can install yet fail to import against this torch). cuDNN comes from the base image.
+# `prime` is a CLI dist (no importable top-level module) and the worker never imports it, so we
+# verify its PRESENCE via metadata rather than importing it. Everything else the worker imports at
+# runtime is imported strictly here.
+# flash_attn is BEST-EFFORT (the install above tolerates a build failure -> SDPA fallback), so it
+# is imported optionally here: a missing FA must NOT abort the build, or the SDPA-fallback image
+# could never be produced. The rest of the stack is mandatory.
+RUN python -c "import importlib.metadata as M; \
+import torch, transformers, trl, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
+liger_kernel, fla, bitsandbytes, hf_transfer, triton, verifiers, runpod; \
+import importlib; \
+fa_ok = False; \
+exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
+cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into torch'; \
+ver = lambda n: M.version(n); \
+print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)'); \
+[print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','datasets','huggingface-hub', \
+'accelerate','wandb','liger-kernel','flash-linear-attention','bitsandbytes', \
+'hf-transfer','verifiers','prime','runpod']]"
+
+# RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
+# from the real _train_body source (single source of truth) and run it as the container CMD so the
+# image is a self-contained RunPod Serverless worker. On Vast the image is launched in args-mode
+# (`bash -c <onstart>`), which OVERRIDES this CMD — so ONE image serves both providers (Vast bash
+# bootstrap vs RunPod serverless handler reading job["input"]). Build context is the repo root.
+COPY autoslm/autoslm/providers/runpod/train.py autoslm/docker/make_rp_handler.py /tmp/rpgen/
+RUN python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/train.py /rp_handler.py \
+    && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"
+CMD ["python", "-u", "/rp_handler.py"]

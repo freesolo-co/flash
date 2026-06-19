@@ -32,26 +32,18 @@ def _missing_hf_credentials() -> list[str]:
             "`prime env install` the run's Hub environment (public + private), e.g. "
             "`export PRIME_API_KEY=pit_...`"
         )
-    if not os.environ.get("HUGGINGFACE_TOKEN"):
+    if not os.environ.get("HF_TOKEN"):
         problems.append(
-            "  - HUGGINGFACE_TOKEN: a token with write access to each run's "
-            "`[train] hf_repo`, e.g. `export HUGGINGFACE_TOKEN=hf_...`"
+            "  - HF_TOKEN: a token with write access to each run's "
+            "`[train] hf_repo`, e.g. `export HF_TOKEN=hf_...`"
         )
     return problems
 
 
 def _preflight_provider_names() -> set[str]:
-    """The providers whose operator config this control plane must satisfy.
-
-    Honors the ``AUTOSLM_PROVIDERS`` pin: a Vast-only control plane
-    (``AUTOSLM_PROVIDERS=vast``) must NOT demand RUNPOD_API_KEY, and conversely.
-    Without a pin, RunPod is always required (the default substrate) and Vast is opt-in
-    (preflighted only when VAST_API_KEY signals intent)."""
-    from autoslm.providers import PROVIDER_NAMES, pinned_provider_names
-
-    pinned = pinned_provider_names()
-    if pinned is not None:
-        return {n for n in PROVIDER_NAMES if n in pinned}
+    """The providers whose operator config this control plane must satisfy. RunPod is always
+    required (the default substrate); Vast is opt-in (preflighted only when VAST_API_KEY signals
+    intent)."""
     names = {"runpod"}  # always-on default substrate
     if os.environ.get("VAST_API_KEY"):
         names.add("vast")  # opt-in: a partial vast config signals intent
@@ -61,11 +53,9 @@ def _preflight_provider_names() -> set[str]:
 def check_run_preflight(require_hf: bool = True) -> None:
     """Validate operator config across the configured providers; raise on missing.
 
-    Only the providers this control plane actually uses are checked: the
-    ``AUTOSLM_PROVIDERS`` pin selects the substrate set, so a Vast-only deployment never
-    fails on a missing RUNPOD_API_KEY (and vice versa). Unpinned, RunPod's requirements
-    (RUNPOD_API_KEY + the shared PRIME_API_KEY/HUGGINGFACE_TOKEN) are always checked
-    and a configured Vast key adds its own check. The HF dataset repo is per-run
+    Only the providers this control plane actually uses are checked: RunPod's requirements
+    (RUNPOD_API_KEY + the shared PRIME_API_KEY/HF_TOKEN) are always checked, and a configured
+    Vast key (VAST_API_KEY) adds its own check. The HF dataset repo is per-run
     (``[train] hf_repo``), not an operator var.
     """
     selected = _preflight_provider_names()
