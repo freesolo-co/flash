@@ -2,8 +2,9 @@
 # skips the per-host dep install (the dominant cold-start cost; measured 7-86s on fresh Vast).
 # The worker still fetches the flash `code/**` from HF at runtime, so only DEPS live here.
 #
-# This image is ALWAYS used (no operator override) and is referenced by name in
-# providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be published to GHCR and the package set PUBLIC
+# This image is the default worker image — Vast always uses it; on RunPod, FLASH_WORKER_IMAGE
+# overrides it and the Flash live-endpoint path boot-installs deps instead. It is referenced by name
+# in providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be published to GHCR and the package set PUBLIC
 # (no registry login is configured) — otherwise Vast/RunPod can't pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
 #
