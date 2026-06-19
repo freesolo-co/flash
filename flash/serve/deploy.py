@@ -212,6 +212,11 @@ def chat(
         "messages": messages,
         "max_tokens": int(max_tokens),
         "temperature": float(temperature),
+        # Per-run thinking parity: a run trained with thinking must serve with thinking, so
+        # forward the flag to the chat template (enable_thinking is the kwarg the renderer and
+        # rollout path use, e.g. multiturn_rollout.build_rollout_func). Without this the served
+        # completions diverge from training behavior even though the caller passes thinking=.
+        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
     }
     # Cold starts (scale-from-zero per base model) can take minutes; give it room.
     resp = httpx.post(f"{base}/v1/chat/completions", json=body, timeout=30 * 60.0)
