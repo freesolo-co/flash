@@ -10,10 +10,10 @@ import tempfile
 import types
 
 
-def test_login_writes_private_config():
+def test_login_writes_private_config(monkeypatch):
     saved_home = os.environ.get("HOME")
     try:
-        _check_login()
+        _check_login(monkeypatch)
     finally:
         if saved_home is not None:
             os.environ["HOME"] = saved_home
@@ -22,7 +22,7 @@ def test_login_writes_private_config():
         importlib.reload(client_config)
 
 
-def _check_login():
+def _check_login(monkeypatch):
     with tempfile.TemporaryDirectory() as home:
         os.environ["HOME"] = home
         import flash.client.config as client_config
@@ -33,8 +33,10 @@ def _check_login():
         # Login verifies the freesolo key against the freesolo backend, then stores it. Stub
         # the network verify so the test stays offline; an invalid key would raise instead.
         verified: dict = {}
-        cli.commands.verify_freesolo_key = lambda api_key, base_url=None: verified.update(
-            api_key=api_key, base_url=base_url
+        monkeypatch.setattr(
+            cli.commands,
+            "verify_freesolo_key",
+            lambda api_key, base_url=None: verified.update(api_key=api_key, base_url=base_url),
         )
         args = types.SimpleNamespace(api_key="fs-secret-123", api_url=None, freesolo_url=None)
         rc = cli.cmd_login(args)
