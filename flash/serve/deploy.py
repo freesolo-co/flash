@@ -73,7 +73,7 @@ def serve_execution_timeout_ms() -> int:
 
 
 def resolve_serve_deps() -> list[str]:
-    explicit = os.environ.get("AUTOSLM_SERVE_DEPS")
+    explicit = os.environ.get("FLASH_SERVE_DEPS")
     if explicit:
         # JSON list (use this for specs containing commas, e.g.
         # "transformers>=5.6,<5.11") or a whitespace-separated string. NOT comma-split:
@@ -201,7 +201,7 @@ def _serve_body(input_data: dict) -> dict:
     key = (input_data["model"], input_data["adapter_prefix"], thinking)
 
     def server_alive() -> bool:
-        proc = g.get("_AUTOSLM_PROC")
+        proc = g.get("_FLASH_PROC")
         if proc is None or proc.poll() is not None:
             return False
         try:
@@ -210,7 +210,7 @@ def _serve_body(input_data: dict) -> dict:
         except Exception:
             return False
 
-    if g.get("_AUTOSLM_KEY") != key or not server_alive():
+    if g.get("_FLASH_KEY") != key or not server_alive():
         from huggingface_hub import snapshot_download
 
         prefix = input_data["adapter_prefix"]
@@ -222,7 +222,7 @@ def _serve_body(input_data: dict) -> dict:
             token=input_data.get("token"),
         )
         adapter_dir = f"/adapter/{prefix}/adapter"
-        old = g.get("_AUTOSLM_PROC")
+        old = g.get("_FLASH_PROC")
         if old is not None and old.poll() is None:
             old.kill()
         # Serve the bf16 base with the LoRA adapter attached (--enable-lora). This works for BOTH
@@ -263,7 +263,7 @@ def _serve_body(input_data: dict) -> dict:
         # Popen dups the fd into the child, so the parent handle can close
         # immediately while vLLM keeps writing to the log.
         with open("/tmp/vllm_serve.log", "w") as log:
-            g["_AUTOSLM_PROC"] = subprocess.Popen(
+            g["_FLASH_PROC"] = subprocess.Popen(
                 cmd, stdout=log, stderr=subprocess.STDOUT, env=env
             )
         # Align the vLLM boot budget with the endpoint execution cap: a large model can take
@@ -278,7 +278,7 @@ def _serve_body(input_data: dict) -> dict:
         default_boot = max(900, serve_timeout_ms // 1000 - 60)
         deadline = time.time() + float(input_data.get("boot_timeout_s") or default_boot)
         while time.time() < deadline:
-            if g["_AUTOSLM_PROC"].poll() is not None:
+            if g["_FLASH_PROC"].poll() is not None:
                 tail = _tail_serve_log()
                 raise RuntimeError(f"vLLM server exited during boot:\n{tail}")
             try:
@@ -289,7 +289,7 @@ def _serve_body(input_data: dict) -> dict:
         else:
             tail = _tail_serve_log()
             raise RuntimeError(f"vLLM server did not become healthy in time:\n{tail}")
-        g["_AUTOSLM_KEY"] = key
+        g["_FLASH_KEY"] = key
 
     # always-on warmup: pay the cold start (download + vLLM boot) at deploy time
     # so the user's first real chat is warm, then return without a completion.
@@ -369,7 +369,7 @@ def _get_serve_endpoint(
             "flashboot": True,
             "execution_timeout_ms": serve_execution_timeout_ms(),
         }
-        image = os.environ.get("AUTOSLM_WORKER_IMAGE")
+        image = os.environ.get("FLASH_WORKER_IMAGE")
         if image:
             kwargs["image"] = image
         else:

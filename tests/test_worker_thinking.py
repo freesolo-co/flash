@@ -18,9 +18,9 @@ _WORKER_ENV = (
     "RUN_MODE",
     "PHASE",
     "SEED",
-    "AUTOSLM_THINKING",
-    "AUTOSLM_JOB_SPEC_JSON",
-    "AUTOSLM_JOB_SPEC_PATH",
+    "FLASH_THINKING",
+    "FLASH_JOB_SPEC_JSON",
+    "FLASH_JOB_SPEC_PATH",
     "RL_PER_DEVICE_PROMPTS",
 )
 
@@ -29,7 +29,7 @@ def _set_thinking_worker_env():
     saved = {k: os.environ.get(k) for k in _WORKER_ENV}
     os.environ.update({"HF_REPO": "", "RUN_MODE": "rl", "PHASE": "rl", "SEED": "0"})
     # thinking is a run-config field (TOML `thinking`), not an env knob: drive it via the JobSpec.
-    os.environ["AUTOSLM_JOB_SPEC_JSON"] = json.dumps(
+    os.environ["FLASH_JOB_SPEC_JSON"] = json.dumps(
         {
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
@@ -37,7 +37,7 @@ def _set_thinking_worker_env():
             "environment": {"id": "stub/env"},
         }
     )
-    for k in ("AUTOSLM_THINKING", "AUTOSLM_JOB_SPEC_PATH", "RL_PER_DEVICE_PROMPTS"):
+    for k in ("FLASH_THINKING", "FLASH_JOB_SPEC_PATH", "RL_PER_DEVICE_PROMPTS"):
         os.environ.pop(k, None)
     return saved
 
@@ -88,7 +88,7 @@ def test_thinking_budget_selection(monkeypatch):
     finally:
         _restore_env(saved)
     # thinking off: a JobSpec with thinking=false -> original (larger) micro-batch
-    os.environ["AUTOSLM_JOB_SPEC_JSON"] = json.dumps(
+    os.environ["FLASH_JOB_SPEC_JSON"] = json.dumps(
         {
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
@@ -101,7 +101,7 @@ def test_thinking_budget_selection(monkeypatch):
         assert ne.THINKING is False
         assert ne.rl_per_device_comps() == 8
     finally:
-        os.environ.pop("AUTOSLM_JOB_SPEC_JSON", None)
+        os.environ.pop("FLASH_JOB_SPEC_JSON", None)
         importlib.reload(ne)
 
 

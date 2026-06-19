@@ -15,7 +15,7 @@ socket is opened, but the client's request building, JSON (de)serialisation and
 on either side -- a renamed RunStatus field, a tightened spec validator, a
 changed status code -- fails here.
 
-Runs offline (``AUTOSLM_SKIP_NET=1 uv run pytest``); ``_run_job`` is stubbed so
+Runs offline (``FLASH_SKIP_NET=1 uv run pytest``); ``_run_job`` is stubbed so
 ``create_run`` never provisions a GPU.
 """
 
