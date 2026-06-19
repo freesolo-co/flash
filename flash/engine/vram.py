@@ -53,15 +53,14 @@ _SFT_PER_DEVICE_BS_DEFAULT = 4
 def _sft_per_device_bs() -> int:
     """The worker's per-device SFT micro-batch — the activation-peak driver to size against.
 
-    Honors the operator's ``SFT_PER_DEVICE_BS`` env (the same value ``build_worker_env`` forwards
-    to the worker, read from this same control-plane process), so raising that knob above the
-    default 4 sizes the allocation UP instead of OOMing a card picked for micro-batch 4. Falls back
-    to the default on unset/malformed values."""
-    try:
-        v = int(os.environ.get("SFT_PER_DEVICE_BS", _SFT_PER_DEVICE_BS_DEFAULT))
-        return v if v >= 1 else _SFT_PER_DEVICE_BS_DEFAULT
-    except (TypeError, ValueError):
-        return _SFT_PER_DEVICE_BS_DEFAULT
+    SFT micro-batch is a MANAGED default: the control plane no longer forwards
+    ``SFT_PER_DEVICE_BS`` to the worker (build_worker_env dropped the tuning allowlist), and the
+    worker's own process env never carries it, so the worker always runs the fixed default. The
+    allocator must size against that SAME fixed value — reading the control-plane process env here
+    would size a card for a micro-batch the worker never uses, under-routing an
+    ``SFT_PER_DEVICE_BS=1`` operator env to a too-small GPU that then OOMs at the default
+    micro-batch 4 (the asymmetry the env-knobs cleanup removed everywhere else)."""
+    return _SFT_PER_DEVICE_BS_DEFAULT
 # Colocated-GRPO vLLM KV pool: grows with the engine's max context (seq) and model
 # width, but vLLM bounds the pool to a fraction of the card and PAGES rather than OOMs,
 # so it's capped (_KV_CAP) instead of growing without bound at long context.

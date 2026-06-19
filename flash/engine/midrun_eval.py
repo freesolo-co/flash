@@ -352,9 +352,12 @@ DEFAULT_EVAL_NUM = 64
 # Fixed seed for the held-out random sample, so every eval pass scores the SAME subset and the
 # eval curve is comparable across steps.
 EVAL_SAMPLE_SEED = 12345
-# Upper bound on rows MATERIALIZED to sample from (data load is cheap; only generation is the
-# real cost). The random sample is drawn from this pool, so a multi-million-row Hub split isn't
-# fully built just to pick a few-dozen-row sample.
+# Default pool size to MATERIALIZE and sample from when `eval_examples` is small (data load is
+# cheap; only generation is the real cost), so a multi-million-row Hub split isn't fully built just
+# to pick a few-dozen-row sample. The pool must hold at least `n` rows to draw an n-row sample, so
+# the caller materializes max(n, EVAL_POOL_CAP): this cap is the FLOOR for the common small-n case,
+# not a ceiling — a run that explicitly sets eval_examples ABOVE the cap is asking to score that
+# many rows and gets exactly that (the bound is only a default for the few-dozen-row default n).
 EVAL_POOL_CAP = 2048
 
 

@@ -241,19 +241,22 @@ def test_vram_estimate_scales_with_params_and_algorithm() -> None:
     assert sft_small < sft_big < grpo_big  # GRPO colocates vLLM on top of the trainer
 
 
-def test_vram_sft_honors_per_device_bs_env(monkeypatch) -> None:
-    # The SFT activation term must track the worker's SFT_PER_DEVICE_BS (the operator env that
-    # build_worker_env forwards): raising it must size the estimate UP, not stay capped at 4.
+def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
+    # SFT micro-batch is a MANAGED default: build_worker_env no longer forwards SFT_PER_DEVICE_BS,
+    # so the worker always runs the fixed default and the allocator must size against that SAME
+    # fixed value. A control-plane process-env SFT_PER_DEVICE_BS must NOT move the estimate — sizing
+    # a card for a micro-batch the worker never uses would under-route an SFT_PER_DEVICE_BS=1 env to
+    # a too-small GPU that then OOMs at the default micro-batch 4.
     from flash.engine import vram
 
     monkeypatch.delenv("SFT_PER_DEVICE_BS", raising=False)
     base = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
     monkeypatch.setenv("SFT_PER_DEVICE_BS", "8")
-    bigger = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
-    assert bigger > base  # micro-batch 8 reserves more activation VRAM than the default 4
-    # a malformed value falls back to the default (no crash, same as base)
+    assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32) == base  # env ignored
+    monkeypatch.setenv("SFT_PER_DEVICE_BS", "1")
+    assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32) == base  # env ignored
     monkeypatch.setenv("SFT_PER_DEVICE_BS", "not-an-int")
-    assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32) == base
+    assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32) == base  # env ignored
 
 
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
