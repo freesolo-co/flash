@@ -74,7 +74,17 @@ def test_spec_validation_rejections(overrides, match) -> None:
 
 
 @pytest.mark.parametrize(
-    "key", ["FLASH_INFERENCE_GPUS", "FLASH_DISAGG_PARALLEL", "flash_disagg_parallel"]
+    "key",
+    [
+        "FLASH_INFERENCE_GPUS",
+        "FLASH_DISAGG_PARALLEL",
+        "flash_disagg_parallel",
+        # FLASH_GPU_COUNT is the submit-time node-size hint (= [gpu].count) the control plane sets
+        # in build_worker_env; a per-run override there would replace the allocated count AFTER
+        # sizing, changing the split / over-provisioning past the visible GPUs.
+        "FLASH_GPU_COUNT",
+        "flash_gpu_count",
+    ],
 )
 def test_worker_env_rejects_topology_overrides(key) -> None:
     """The disaggregated GPU split is sized/allocated/billed at submit time from

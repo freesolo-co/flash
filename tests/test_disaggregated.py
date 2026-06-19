@@ -108,6 +108,44 @@ def test_detect_total_gpus_prefers_explicit_env():
     assert detect_total_gpus({"FLASH_GPU_COUNT": "not-a-number"}) >= 1
 
 
+def _fake_nvidia_smi_l(n: int):
+    """A subprocess.run stub that mimics `nvidia-smi -L` listing ``n`` GPUs."""
+
+    class _Out:
+        stdout = "\n".join(f"GPU {i}: NVIDIA Whatever (UUID: GPU-{i})" for i in range(n))
+
+    def _run(cmd, *a, **k):
+        return _Out()
+
+    return _run
+
+
+def test_detect_total_gpus_caps_to_hint_when_overexposed(monkeypatch):
+    # The host exposes MORE GPUs than [gpu].count sized/billed (e.g. a shared 8-GPU box rented as 2).
+    # The split topology was fixed at submit time, so HONOR the requested count and ignore the extra
+    # cards — never silently expand into a 7:1 DDP run the experiment was not sized for.
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.setattr(_d.subprocess, "run", _fake_nvidia_smi_l(8))
+    assert detect_total_gpus({"FLASH_GPU_COUNT": "2"}) == 2
+
+
+def test_detect_total_gpus_uses_real_when_underprovisioned(monkeypatch):
+    # The provider UNDER-provisioned (fewer visible GPUs than rented, observed on Vast): use the real
+    # count — the missing devices don't exist, so assigning them would target a nonexistent card.
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.setattr(_d.subprocess, "run", _fake_nvidia_smi_l(1))
+    assert detect_total_gpus({"FLASH_GPU_COUNT": "2"}) == 1
+
+
+def test_detect_total_gpus_matches_real_when_hint_agrees(monkeypatch):
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.setattr(_d.subprocess, "run", _fake_nvidia_smi_l(2))
+    assert detect_total_gpus({"FLASH_GPU_COUNT": "2"}) == 2
+
+
 def test_accelerate_launch_cmd_2to1():
     # 2:1 split (2 trainer GPUs : 1 infer). accelerate launches one rank per TRAIN GPU, pinned to
     # the global train device ids, FSDP-sharded, running the worker module.

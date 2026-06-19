@@ -79,15 +79,30 @@ def detect_total_gpus(env: dict | None = None) -> int:
             real = len(lines)
             hint = env.get("FLASH_GPU_COUNT")
             if hint and hint.isdigit() and int(hint) != real:
-                _note = (
-                    "The provider under-provisioned the node."
-                    if real < int(hint)
-                    else "The node exposes more GPUs than requested."
-                )
+                hint_n = int(hint)
+                if real < hint_n:
+                    # UNDER-provisioned: the provider exposed fewer GPUs than rented (observed on
+                    # Vast). Use the real count — the missing devices don't exist, so the requested
+                    # split is impossible; run_rl's select_rollout_split then raises if the smaller
+                    # node can't satisfy inference_gpus, with a clear message.
+                    print(
+                        f"[rl][disagg] WARNING: [gpu] count requested {hint} but the container "
+                        f"exposes {real} GPU(s) (nvidia-smi) — using {real}. The provider "
+                        f"under-provisioned the node."
+                    )
+                    return real
+                # OVER-exposed: the host shows MORE GPUs than the allocator sized/billed (e.g. a
+                # shared 8-GPU box rented as 2). The topology — world size, effective batch, and the
+                # split — was fixed at submit time from [gpu].count, so HONOR the requested count and
+                # ignore the extra devices rather than silently expanding into GPUs the experiment
+                # was not sized for (a 7:1 DDP run instead of the intended 1:1). trainer_devices /
+                # infer_devices index the FIRST GPUs, so capping is safe.
                 print(
-                    f"[rl][disagg] WARNING: [gpu] count requested {hint} but the container exposes "
-                    f"{real} GPU(s) (nvidia-smi) — using {real}. {_note}"
+                    f"[rl][disagg] WARNING: the container exposes {real} GPU(s) (nvidia-smi) but "
+                    f"[gpu] count requested {hint} — using {hint_n} (the sized/billed topology); "
+                    f"ignoring the extra device(s)."
                 )
+                return hint_n
             return real
     except Exception:
         pass

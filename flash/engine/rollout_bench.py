@@ -85,19 +85,47 @@ def select_rollout_split(total_gpus: int, inference_gpus: int) -> RolloutSplit:
 
 
 def validate_disaggregated_requirement(
-    *, requires_disaggregated: bool, algorithm: str, inference_gpus: int
+    *,
+    requires_disaggregated: bool,
+    algorithm: str,
+    inference_gpus: int,
+    single_trainer_only: bool = False,
+    gpu_count: int | None = None,
 ) -> None:
-    """Reject colocated GRPO for a model that needs the disaggregated path.
+    """Reject an unfittable disaggregated GRPO topology at SUBMIT time (before renting).
 
     A ``requires_disaggregated`` model (e.g. Qwen3.6-35B-A3B) OOMs when the trainer and the vLLM
     rollout share one GPU, so its GRPO runs must dedicate inference GPUs (``inference_gpus>0`` on a
-    multi-GPU node). SFT has no rollout engine and is unaffected. Raising here fails a bad config at
-    submit instead of mid-run on a paid GPU.
+    multi-GPU node). SFT has no rollout engine and is unaffected.
+
+    A ``single_trainer_only`` model additionally cannot be REPLICATED across multiple trainer cards:
+    the disaggregated trainer is plain DDP (TRL's per-step LoRA merge breaks under FSDP sharding), so
+    >1 trainer card would load the whole policy once per rank — host-RAM/OOM for a model this large.
+    Reject any multi-trainer ratio (train_gpus = gpu_count - inference_gpus > 1) so a 2:2 / 2:1 split
+    fails here instead of crashing the DDP launch on a paid multi-GPU node. Only 1:N is allowed.
+
+    Raising here fails a bad config at submit instead of mid-run on a paid GPU.
     """
-    if requires_disaggregated and (algorithm or "").lower() == "grpo" and inference_gpus <= 0:
+    algo = (algorithm or "").lower()
+    if requires_disaggregated and algo == "grpo" and inference_gpus <= 0:
         raise ValueError(
             "this model requires the disaggregated GRPO path: set [train].inference_gpus>0 on a "
             "multi-GPU node ([gpu] count = train_gpus + inference_gpus). Colocated GRPO OOMs for it."
+        )
+    if (
+        single_trainer_only
+        and algo == "grpo"
+        and inference_gpus > 0
+        and gpu_count is not None
+        and (gpu_count - inference_gpus) > 1
+    ):
+        train_gpus = gpu_count - inference_gpus
+        raise ValueError(
+            f"this model only supports a SINGLE-trainer disaggregated split (1:N), but [gpu] count "
+            f"({gpu_count}) - [train].inference_gpus ({inference_gpus}) = {train_gpus} trainer GPUs. "
+            f"The disaggregated trainer replicates the whole policy on every trainer card (plain DDP), "
+            f"which OOMs for a model this large. Set [gpu] count = inference_gpus + 1 (e.g. a 1:1 or "
+            f"1:2 split) — one trainer card, the rest for the rollout server."
         )
 
 

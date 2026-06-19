@@ -129,14 +129,19 @@ def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
 def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     across the configured providers (RunPod Flash or Vast); dry-run only records state."""
-    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
-    # Fail fast: a disaggregated-only model (e.g. Qwen3.6-35B-A3B) can't run colocated GRPO.
+    info = resolve_model(
+        spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type, train=spec.train
+    )
+    # Fail fast: a disaggregated-only model (e.g. Qwen3.6-35B-A3B) can't run colocated GRPO, and a
+    # single-trainer-only model (the 35B) can't use a multi-trainer (>1 trainer card) DDP split.
     from .engine.rollout_bench import validate_disaggregated_requirement
 
     validate_disaggregated_requirement(
         requires_disaggregated=info.requires_disaggregated,
         algorithm=spec.algorithm,
         inference_gpus=spec.train.inference_gpus,
+        single_trainer_only=getattr(info, "single_trainer_only", False),
+        gpu_count=spec.gpu.count,
     )
     spec = JobSpec.from_dict(
         {**_with_model_disk(spec, info), "run_id": spec.run_id or new_run_id()}

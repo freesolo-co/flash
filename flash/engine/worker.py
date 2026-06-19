@@ -1858,6 +1858,37 @@ def _bind_trainer_rank_local(where: str) -> None:
         print(f"[rl][disagg][warn] could not set_device(LOCAL_RANK={_local_rank}, {where}): {_e}")
 
 
+def _fp8_native_no_cuda_context() -> bool | None:
+    """Is this node's GPU fp8-native (compute capability >= 8.9) WITHOUT creating a CUDA context?
+
+    ``torch.cuda.get_device_capability()`` binds (and RETAINS) a CUDA context on the current device.
+    On the disaggregated DDP LAUNCHER that context lands on the first TRAINER card and stays alive
+    while the accelerate child trains on that same card — stealing VRAM / OOMing rank 0 on a tight
+    2:1/2:2 ratio (same hazard the launcher already avoids by skipping wait_for_gpu/perf_backends).
+    So read compute_cap from ``nvidia-smi`` (CUDA-free) instead. The trainer card is the same class
+    as the inference card (whole-machine node), so it is a valid proxy for the rollout server's fp8
+    KV decision. Returns True/False on a clean read, or None when nvidia-smi is unavailable/unparsable
+    (caller then falls back to the safe default — no fp8)."""
+    import subprocess as _sp
+
+    try:
+        out = _sp.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        for ln in out.stdout.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            major_s, _, minor_s = ln.partition(".")
+            return (int(major_s), int(minor_s or 0)) >= (8, 9)
+    except Exception:
+        return None
+    return None
+
+
 def _pin_trainer_devices_for_disaggregated() -> None:
     """Pin CUDA_VISIBLE_DEVICES to the TRAINER's devices before any CUDA context is created.
 
@@ -1978,6 +2009,19 @@ def run_rl():
         #     rank 0 writes artifacts. train_gpus==1 keeps the simple single-process path untouched.
         _trainer_only = _disagg.trainer_only_mode()
         _is_fsdp_launcher = _rollout_split.train_gpus > 1 and not _trainer_only
+        # Defense-in-depth (submit-time validate_disaggregated_requirement is the primary gate): a
+        # single-trainer-only model (e.g. the 35B) must NOT take the multi-trainer DDP launcher path
+        # — it replicates the whole policy per trainer rank (host-RAM/OOM). FLASH_GPU_COUNT /
+        # FLASH_INFERENCE_GPUS are reserved in [worker_env], but reject here too rather than crash
+        # the DDP launch on a paid node, in case the effective split still resolves >1 trainer GPU.
+        if _rollout_split.train_gpus > 1 and bool(getattr(_info_rl, "single_trainer_only", False)):
+            raise RuntimeError(
+                f"[rl][disagg] {JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id} only supports a "
+                f"single-trainer (1:N) disaggregated split, but this node resolves "
+                f"{_rollout_split.train_gpus} trainer GPUs ({_rollout_split.label}). The multi-trainer "
+                f"DDP launcher replicates the full policy per rank, which OOMs for a model this large. "
+                f"Use [gpu] count = inference_gpus + 1."
+            )
         _disagg_base_env = dict(os.environ)  # clean snapshot for the server subprocess
         if not _trainer_only:
             # The launcher (and the train_gpus==1 path) pin the trainer away from the inference card.
@@ -2305,12 +2349,22 @@ def run_rl():
         # capability >= 8.9: Ada/Hopper/Blackwell) ~halves the server's KV pool. The trainer GPU is
         # the same class as the inference GPU (whole-machine node), so its capability is a valid
         # proxy. Ampere (A100/3090, sm80) lacks fp8 -> stay fp16.
-        try:
-            import torch as _torch
+        # On the DDP LAUNCHER (train_gpus>1, not trainer_only) a torch CUDA probe here would bind a
+        # context on the first trainer card that lingers while the accelerate child trains on it
+        # (VRAM theft / rank-0 OOM on tight ratios — the same reason wait_for_gpu/perf_backends are
+        # skipped on the launcher). Use the CUDA-free nvidia-smi compute_cap read there; only the
+        # single-process / trainer-child paths (already bound to their own device) take the torch
+        # probe. nvidia-smi unavailable -> default to no fp8 (safe: a larger fp16 KV pool, never OOM).
+        if _is_fsdp_launcher:
+            _fp8 = _fp8_native_no_cuda_context()
+            _server_kv = "fp8" if _fp8 else None
+        else:
+            try:
+                import torch as _torch
 
-            _server_kv = "fp8" if _torch.cuda.get_device_capability() >= (8, 9) else None
-        except Exception:
-            _server_kv = None
+                _server_kv = "fp8" if _torch.cuda.get_device_capability() >= (8, 9) else None
+            except Exception:
+                _server_kv = None
         # Inference parallelism across the rollout GPUs. DEFAULT = tensor-parallel: shard the model
         # across infer_gpus so the decode (memory-bandwidth bound) gets their aggregate HBM
         # bandwidth -> faster, larger-batch generation, which is how 1:2 / 1:3 ratios clear the

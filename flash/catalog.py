@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 ALGORITHMS = ("sft", "grpo")
@@ -64,6 +64,14 @@ class ModelInfo:
     # config). Declared for catalog entries whose head count is verified, so a known-invalid ratio
     # fails validation instead of charging the user for a node that can never run.
     num_attention_heads: int = 0
+    # The disaggregated trainer cannot be REPLICATED across multiple trainer cards (plain DDP) for
+    # this model: the worker's multi-trainer path replicates the whole policy on every trainer rank,
+    # and a model this large (e.g. the 35B) blows host RAM / OOMs when loaded once per rank. Such a
+    # model must use a SINGLE trainer card (train_gpus = [gpu].count - inference_gpus <= 1), i.e.
+    # only 1:N ratios. Rejected at SUBMIT time (validate_disaggregated_requirement) so a multi-trainer
+    # ratio fails before renting the paid node instead of crashing the DDP launch mid-run. A future
+    # sharded (FSDP) trainer would lift this; until then it is a hard submit-time floor.
+    single_trainer_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -165,8 +173,14 @@ MODELS: dict[str, ModelInfo] = {
         # and the vLLM rollout are colocated on one card. With a dedicated inference GPU (35B served
         # 4-bit) + a sharded trainer on the rest, it fits. GRPO colocate for it is rejected.
         requires_disaggregated=True,
-        notes="MoE; GRPO requires the disaggregated multi-GPU node ([train].inference_gpus>0). "
-        "The 35B is served 4-bit on the inference GPU while a sharded trainer runs on the rest.",
+        # The disaggregated trainer is plain DDP (replicated per trainer rank — TRL's per-step LoRA
+        # merge breaks under FSDP sharding), and the 35B is too large to load once PER trainer card
+        # (host-RAM / OOM). So only SINGLE-trainer ratios (1:N) are valid; a 2:2 / 2:1 multi-trainer
+        # split is rejected at submit (see validate_disaggregated_requirement) before renting.
+        single_trainer_only=True,
+        notes="MoE; GRPO requires the disaggregated multi-GPU node ([train].inference_gpus>0), "
+        "single-trainer (1:N) only. The 35B is served 4-bit on the inference GPU while the "
+        "trainer runs on ONE other card.",
     ),
 }
 
@@ -192,12 +206,19 @@ def resolve_model(
     algorithm: str,
     policy: str = "catalog",
     gpu: str | None = None,
+    *,
+    train=None,
 ) -> ModelInfo:
     """Resolve a model under the configured policy.
 
     ``catalog`` (default): the model must be a curated catalog entry.
     ``allow``: any HF model is accepted; a coarse VRAM-fit estimate (HF safetensors
     metadata, no download) blocks only provably-impossible fits and warns on tight ones.
+
+    ``train`` (TrainSpec or raw [train] dict) supplies the disaggregated context: for a
+    disaggregated GRPO run ([train].inference_gpus>0) the open-model fit check must use the
+    per-GPU split sizing (allocator.required_vram_gb), not the colocate total, so a large HF
+    model that fits as a split is not rejected as too_big here.
     """
     algo = normalize_algorithm(algorithm)
     if model_id in MODELS:
@@ -205,10 +226,10 @@ def resolve_model(
     if policy != "allow":
         # Reuse get_model's error (includes the open-model hint).
         return get_model(model_id)
-    return _resolve_open_model(model_id, algo, gpu)
+    return _resolve_open_model(model_id, algo, gpu, train=train)
 
 
-def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
+def _resolve_open_model(model_id: str, algo: str, gpu: str | None, *, train=None) -> ModelInfo:
     """Synthesize a ModelInfo for the open-model "allow" policy from a coarse VRAM-fit
     estimate (HF safetensors metadata, no download). Blocks provably-impossible fits and
     warns on tight ones. Isolates the engine.vram dependency + disk-floor heuristic from
@@ -216,6 +237,36 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
     from flash.engine.vram import check_fit
 
     est = check_fit(model_id, algo, gpu or DEFAULT_GPU)
+    # Disaggregated GRPO ([train].inference_gpus>0) splits the model across the node's GPUs, so
+    # the per-card need is far below the colocate total. check_fit's verdict is colocated, so a
+    # big HF model sized for a split would be wrongly rejected as too_big here — exactly the GPU
+    # the disaggregated-aware resolve_gpu_policy/allocator already sized for. Re-check the fit
+    # against the SAME disaggregated per-GPU estimate (allocator.required_vram_gb) the policy GPU
+    # resolution and submit-time allocator use, so the two paths agree. (Falls back to the plain
+    # colocate verdict when inference_gpus==0 or the param count is unreadable.)
+    _ig = 0
+    if train is not None:
+        _raw_ig = train.get("inference_gpus") if isinstance(train, dict) else getattr(train, "inference_gpus", 0)
+        try:
+            _ig = int(_raw_ig or 0)
+        except (TypeError, ValueError):
+            _ig = 0
+    if est.verdict == "too_big" and _ig > 0 and est.est_gb:
+        from flash.engine.vram import GPU_VRAM_GB
+        from flash.providers.allocator import required_vram_gb
+
+        disagg_need = required_vram_gb(model_id, algo, train=train)
+        gpu_gb = GPU_VRAM_GB.get(gpu or DEFAULT_GPU, 32)
+        if disagg_need <= gpu_gb * 1.15:
+            # Fits as a disaggregated split on this per-role card: clear the colocate too_big and
+            # let provisioning size the multi-GPU node. Surface the split need so the operator sees
+            # the per-GPU figure rather than the (rejected) colocate total.
+            print(
+                f"warning: open-model policy ({model_id}): colocate estimate exceeds the GPU but a "
+                f"disaggregated split ([train].inference_gpus={_ig}) needs ~{disagg_need} GB/GPU "
+                f"<= {gpu or DEFAULT_GPU} ({gpu_gb} GB) — proceeding as a split rollout."
+            )
+            est = replace(est, verdict="tight")
     if est.verdict == "too_big":
         raise ValueError(
             f"{model_id} does not fit the requested GPU: {est.describe()}. "

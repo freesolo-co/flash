@@ -41,6 +41,27 @@ def test_allow_policy_blocks_provably_too_big(monkeypatch):
         resolve_model("acme/huge-70b", "sft", policy="allow", gpu="RTX 4090")
 
 
+def test_allow_policy_disaggregated_clears_colocate_too_big(monkeypatch, capsys):
+    # A 20B model is too_big for colocated GRPO on an 80 GB A100, but with [train].inference_gpus=2
+    # it fits as a disaggregated split (server bf16 weights sharded TP across 2 cards + a separate
+    # trainer). The open-model fit check must use that disaggregated sizing — matching the
+    # disaggregated-aware resolve_gpu_policy / submit-time allocator — not reject it on the colocate
+    # total (which would block a model the GPU policy already sized for).
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 20.0, raising=True)
+    monkeypatch.setattr(
+        "flash.providers.allocator._params_b_for_vram", lambda model_id: 20.0, raising=True
+    )
+    # Sanity: colocated, the same model IS rejected (no disaggregated context).
+    with pytest.raises(ValueError, match="does not fit"):
+        resolve_model("acme/big-20b", "grpo", policy="allow", gpu="A100 PCIe")
+    # With a disaggregated split it resolves.
+    info = resolve_model(
+        "acme/big-20b", "grpo", policy="allow", gpu="A100 PCIe", train={"inference_gpus": 2}
+    )
+    assert info.id == "acme/big-20b"
+    assert "disaggregated split" in capsys.readouterr().out
+
+
 def test_allow_policy_unknown_size_warns_but_allows(monkeypatch, capsys):
     monkeypatch.setattr(
         "flash.engine.vram.fetch_hf_params_b", lambda model_id: None, raising=True

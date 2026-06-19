@@ -222,6 +222,40 @@ def test_chalk_extra_pip_detects_per_run_worker_env_optin(monkeypatch):
     assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
 
 
+def _fake_smi_compute_cap(value: str):
+    """subprocess.run stub mimicking `nvidia-smi --query-gpu=compute_cap` (one line per GPU)."""
+
+    class _Out:
+        stdout = value
+
+    def _run(cmd, *a, **k):
+        return _Out()
+
+    return _run
+
+
+def test_fp8_native_no_cuda_context_reads_nvidia_smi(monkeypatch):
+    """The DDP-launcher fp8 KV decision must read compute_cap from nvidia-smi (CUDA-free), NOT
+    torch.cuda.get_device_capability (which binds a context on the first trainer card and lingers
+    while the accelerate child trains on it — VRAM theft / rank-0 OOM on tight ratios)."""
+    import subprocess
+
+    from flash.engine.worker import _fp8_native_no_cuda_context
+
+    monkeypatch.setattr(subprocess, "run", _fake_smi_compute_cap("9.0\n"))  # Hopper sm90
+    assert _fp8_native_no_cuda_context() is True
+    monkeypatch.setattr(subprocess, "run", _fake_smi_compute_cap("8.9\n"))  # Ada sm89
+    assert _fp8_native_no_cuda_context() is True
+    monkeypatch.setattr(subprocess, "run", _fake_smi_compute_cap("8.0\n"))  # Ampere sm80
+    assert _fp8_native_no_cuda_context() is False
+
+    def _boom(*a, **k):  # nvidia-smi unavailable -> None (caller defaults to no fp8)
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    assert _fp8_native_no_cuda_context() is None
+
+
 def test_chalk_extra_pip_worker_env_spec_with_os_env_flag(monkeypatch):
     """Mixed source: the kernel flag is in the control-plane env but FLASH_CHALK_SPEC is pinned
     per-run in [worker_env]. The merged effective env resolves both, so the spec is added."""

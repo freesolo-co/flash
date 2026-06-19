@@ -239,7 +239,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"(or FLASH_GPU_ALLOW_UNVALIDATED=1) to use it anyway."
         )
     try:
-        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
+        # Pass [train] so the open-model ("allow") fit check is disaggregated-aware: an
+        # inference_gpus>0 run sizes per-GPU (a big HF model fits as a split), matching the
+        # disaggregated-aware resolve_gpu_policy above instead of rejecting it on the colocate total.
+        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type, train=train_raw)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if thinking and info.thinking == "none":
@@ -353,15 +356,23 @@ def _worker_env(raw: Any) -> dict[str, str]:
             "serialized into run artifacts — set them as real environment variables instead"
         )
     # The disaggregated-rollout TOPOLOGY is fixed at submit time: the allocator sizes per-GPU VRAM,
-    # picks the GPU class/provider, and bills the multi-GPU node from [train].inference_gpus (+ the
-    # auto-derived inference parallelism). A per-run [worker_env] FLASH_INFERENCE_GPUS /
-    # FLASH_DISAGG_PARALLEL would silently change the worker's split AFTER all of that — e.g. a 35B
-    # sized as TP=2 onto 80 GB cards then started DP (full server per card) or as inference_gpus=1
-    # (unsharded server needing the whole per-card footprint), OOMing the rented node; or =0 falling
-    # back to colocate while still billing a multi-GPU node. Reject them in [worker_env]: set
-    # [train].inference_gpus (the sized field) and let the parallelism auto-derive (operators can
-    # still pin FLASH_DISAGG_PARALLEL as a real control-plane env var, which the allocator reads).
-    _topology = sorted(k for k in env if k.upper() in {"FLASH_INFERENCE_GPUS", "FLASH_DISAGG_PARALLEL"})
+    # picks the GPU class/provider, and bills the multi-GPU node from [train].inference_gpus and
+    # [gpu].count (+ the auto-derived inference parallelism). A per-run [worker_env]
+    # FLASH_INFERENCE_GPUS / FLASH_DISAGG_PARALLEL / FLASH_GPU_COUNT would silently change the
+    # worker's split AFTER all of that — e.g. a 35B sized as TP=2 onto 80 GB cards then started DP
+    # (full server per card) or as inference_gpus=1 (unsharded server needing the whole per-card
+    # footprint), OOMing the rented node; or =0 falling back to colocate while still billing a
+    # multi-GPU node; or FLASH_GPU_COUNT replacing the allocated node size after sizing (a larger
+    # value over-provisions the split past the visible GPUs, a smaller one shrinks it). The control
+    # plane sets FLASH_GPU_COUNT from [gpu].count in build_worker_env, and the per-run merge there
+    # would let this override win — so reject all three here. Set [train].inference_gpus / [gpu].count
+    # (the sized fields) and let the parallelism auto-derive (operators can still pin
+    # FLASH_DISAGG_PARALLEL as a real control-plane env var, which the allocator reads).
+    _topology = sorted(
+        k
+        for k in env
+        if k.upper() in {"FLASH_INFERENCE_GPUS", "FLASH_DISAGG_PARALLEL", "FLASH_GPU_COUNT"}
+    )
     if _topology:
         raise ConfigError(
             f"[worker_env] must not set the disaggregated-rollout topology ({', '.join(_topology)}): "

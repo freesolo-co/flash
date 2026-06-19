@@ -93,11 +93,45 @@ def test_disaggregated_requirement_rejects_colocate_grpo():
     )
 
 
+def test_single_trainer_only_rejects_multi_trainer_split():
+    # single_trainer_only (the 35B) cannot replicate the policy across >1 trainer card (plain DDP).
+    # A 2:2 split (count=4, inference_gpus=2 -> 2 trainer GPUs) must be rejected at submit.
+    with pytest.raises(ValueError, match="SINGLE-trainer"):
+        validate_disaggregated_requirement(
+            requires_disaggregated=True,
+            algorithm="grpo",
+            inference_gpus=2,
+            single_trainer_only=True,
+            gpu_count=4,
+        )
+    # 1:N (single trainer) is allowed: count=3, inference_gpus=2 -> 1 trainer GPU.
+    validate_disaggregated_requirement(
+        requires_disaggregated=True,
+        algorithm="grpo",
+        inference_gpus=2,
+        single_trainer_only=True,
+        gpu_count=3,
+    )
+    # gpu_count omitted (old callers) -> the multi-trainer check is skipped, no crash.
+    validate_disaggregated_requirement(
+        requires_disaggregated=True, algorithm="grpo", inference_gpus=1, single_trainer_only=True
+    )
+    # a non-single-trainer model can take a multi-trainer split.
+    validate_disaggregated_requirement(
+        requires_disaggregated=False,
+        algorithm="grpo",
+        inference_gpus=2,
+        single_trainer_only=False,
+        gpu_count=4,
+    )
+
+
 def test_catalog_35b_is_disaggregated_only():
     from flash.catalog import get_model
 
     m = get_model("Qwen/Qwen3.6-35B-A3B")
     assert m.requires_disaggregated is True
+    assert m.single_trainer_only is True
     assert "grpo" in m.algos
 
 
