@@ -193,11 +193,9 @@ def cancel_run(run_id: str) -> RunStatus:
     entered_deployed = status.state == "deployed"
     spec = JobSpec.from_dict(status.spec)
     remote = status.remote or {}
-    # A deployed run also owns a serving endpoint (flash-serve-*) that the
-    # training-endpoint GC below does not touch; tear it down too so a
-    # cancelled run can't leave a billable deployment registered. Serving is
-    # RunPod-only, so use the class actually deployed (a Vast-only training class
-    # falls back to a RunPod class at deploy time).
+    # A deployed run also owns a serving registration with the freesolo serving
+    # app that the training-endpoint GC below does not touch; deregister it too so
+    # a cancelled run can't leave a deployment registered as active.
     if status.state == "deployed":
         try:
             from flash.serve.deploy import undeploy_adapter

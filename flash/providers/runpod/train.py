@@ -859,15 +859,16 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "WANDB_API_KEY",
         "WANDB_ENTITY",
         "LORA_TARGETS",
-        # Periodic mid-run GRPO eval (engine/midrun_eval.eval_config): the cadence normally comes
-        # from the run's [train] eval_every_steps; FLASH_EVAL_EVERY_STEPS is an operator override
-        # (>0 enables), and FLASH_EVAL_NUM is a safety cap on held-out rows per eval. Everything
-        # else (eval set, grading, completion budget, threshold) comes from the environment/run.
+        # Periodic mid-run GRPO eval cadence (engine/midrun_eval.eval_config) comes from the run's
+        # [train] eval_every_steps / eval_examples. NB: the worker no longer reads these
+        # FLASH_EVAL_* env vars (the eval knobs are taken from the structured [train] spec only);
+        # forwarding them is presently a no-op kept for backward/operator compatibility.
         "FLASH_EVAL_EVERY_STEPS",
         "FLASH_EVAL_NUM",
-        # rl_step heartbeat-upload throttle (engine.worker._hb_min_interval_s). Operators raise this
-        # to stay under HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO
-        # runs share one HF_REPO; the worker no-op's a non-positive/unparseable value back to 60s.
+        # rl_step heartbeat-upload throttle. Forwarded for operators who want to stay under
+        # HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO runs share one
+        # HF_REPO. NB: the worker currently uses a FIXED 60s throttle (engine.worker._HB_MIN_INTERVAL_S)
+        # and does not read this var, so forwarding it is presently a no-op on the worker side.
         "FLASH_HEARTBEAT_MIN_S",
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
         # the WORKER decides which installers to run from these flags. install_chalk_kernels runs

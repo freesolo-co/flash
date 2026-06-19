@@ -66,7 +66,7 @@ class _RunLock:
 
 # Per-run lock serializing deploy vs undeploy: always-on provisioning is slow and runs
 # OUTSIDE the status lock, so without this the two could interleave — a racing undeploy
-# could leave a billable endpoint unrecorded, or a deploy's rollback could clobber another.
+# could leave a billable endpoint unrecorded, or a deploy's cleanup of a raced finalize could clobber another.
 # WeakValueDictionary so an entry is dropped once no request holds the lock — the map
 # can't grow unboundedly with one entry per distinct run_id over the server's lifetime.
 _DEPLOY_LOCKS: weakref.WeakValueDictionary[str, _RunLock] = weakref.WeakValueDictionary()
@@ -365,8 +365,9 @@ def create_app():
                 status_code=409,
                 detail=f"run {run_id} has no active deployment; `slm deploy {run_id}` first",
             )
-        # Legacy run with no artifact repo: reject early with a clear 409 rather than letting
-        # serve_chat's adapter download fail deep as an opaque 502 (mirrors /deploy).
+        # Legacy run with no artifact repo (mirrors the /deploy guard): a run that never had a
+        # [train].hf_repo was never registered with freesolo serving, so reject early with a
+        # clear 409 instead of an opaque downstream inference error.
         if not spec.train.hf_repo:
             raise HTTPException(
                 status_code=409,

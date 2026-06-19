@@ -519,7 +519,7 @@ def _attn_impl_for_capability(major: int, minor: int) -> str | None:
       time — its default SDPA can fall to the slow math kernel); all other archs -> None (let
       transformers pick SDPA, which already flash-backs on Ampere/Ada/Hopper). The big LoRA
       win comes from the Liger fused kernels, not the attention path. Pure function (no torch)
-      so it's unit-testable on CPU; override the whole thing with FLASH_ATTN_IMPL.
+      so it's unit-testable on CPU.
     """
     if major == 12:  # Blackwell consumer: force cuDNN SDPA (avoid the math fallback)
         return "sdpa"
@@ -1514,7 +1514,7 @@ def _maybe_attach_periodic_eval(
     """
     from flash.engine import midrun_eval as _me
 
-    # The cadence comes from the run's [train] eval_every_steps TOML (env var overrides). The
+    # The cadence comes from the run's [train] eval_every_steps TOML. The
     # eval queries + grading logic + completion budget all come from the environment / the run's
     # normal settings, not config.
     _train = JOB_SPEC.train if JOB_SPEC else None
@@ -2136,7 +2136,7 @@ def run_rl():
     # here (not on init_model) is what makes them reach the fresh-LoRA path, where init_model was
     # only the model-id string. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
     install_chalk_kernels(getattr(trainer, "model", None))
-    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or FLASH_EVAL_EVERY_STEPS,
+    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps
     # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
     # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.
     periodic_eval = _maybe_attach_periodic_eval(
