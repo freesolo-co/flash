@@ -1565,14 +1565,10 @@ def _maybe_attach_periodic_eval(
     if not examples:
         print("[rl][eval] env exposes no eval examples; skipping mid-run eval")
         return None
+    from flash.engine.multiturn_rollout import render_message_ids
+
     def _render_messages(messages, add_generation_prompt):
-        text = tok.apply_chat_template(
-            messages,
-            add_generation_prompt=add_generation_prompt,
-            tokenize=False,
-            enable_thinking=THINKING,
-        )
-        return [int(t) for t in tok(text, add_special_tokens=False).input_ids]
+        return render_message_ids(tok, messages, add_generation_prompt, thinking=THINKING)
 
     def _render_prompt_ids(example):
         return _render_messages(env.prompt_messages(example), True)

@@ -298,7 +298,7 @@ def _is_multi_turn(vf_env) -> bool:
         return True
     if multi is not None and isinstance(vf_env, multi):
         # SingleTurnEnv subclasses MultiTurnEnv in verifiers; exempt it.
-        return not (single is not None and isinstance(vf_env, single))
+        return single is None or not isinstance(vf_env, single)
     return False
 
 
