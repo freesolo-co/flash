@@ -142,6 +142,37 @@ def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
     assert worker.loraplus_optimizer_cls("paged_adamw_8bit")[0] is adamw
 
 
+def test_grpo_no_op_failure_empty_reward_no_resume(monkeypatch):
+    """Empty reward_history with no resume = the rollout scored nothing -> fail loudly (no-op run)."""
+    worker = _import_worker(monkeypatch)
+    assert worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
+
+
+def test_grpo_no_op_ok_when_rewards_present(monkeypatch):
+    """A non-empty reward_history means the reward path ran -> never a no-op failure."""
+    worker = _import_worker(monkeypatch)
+    assert worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10) is False
+    # An all-zero history (env returned all-zero rewards) still counts as real training.
+    assert worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0) is False
+
+
+def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
+    """A resume that already reached target steps has an empty fresh history but a trained policy."""
+    worker = _import_worker(monkeypatch)
+    assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=10) is True
+    # Empty history is tolerated -> NOT a no-op failure (finalize the completed policy).
+    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12) is False
+
+
+def test_grpo_no_op_failure_resume_did_not_reach_target(monkeypatch):
+    """A resume that did NOT reach the target steps with no reward is still a genuine no-op -> fail."""
+    worker = _import_worker(monkeypatch)
+    assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=3) is False
+    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
+    # No target steps configured can never count as a complete resume.
+    assert worker._grpo_resume_already_complete("ckpt", target_steps=0, steps_run=0) is False
+
+
 def test_heartbeat_commit_is_throttled(monkeypatch):
     """heartbeat() must rate-limit HF commits (per-step commits blow HF's 128/hour repo cap),
     while always committing milestone stages."""
@@ -284,3 +315,67 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w._memory_mode("openbmb/MiniCPM5-1B", 512) is False
     assert w._memory_mode("openbmb/MiniCPM5-1B", 4096) is True
     assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B", 4096) is True
+
+
+def test_make_lora_skips_pissa_on_4bit_qlora(monkeypatch):
+    """PiSSA init raises on a 4-bit base (peft TypeError -> the whole run crashed), so make_lora
+    must SKIP PiSSA on the QLoRA tier (catalog 9B) and keep it on the bf16/LoRA tier. rsLoRA stays
+    on for both. Regression for the Qwen3.5-9B QLoRA training crash."""
+    captured = {}
+    fake_peft = types.ModuleType("peft")
+    fake_peft.LoraConfig = lambda **kw: (captured.update(kw), kw)[1]
+    monkeypatch.setitem(sys.modules, "peft", fake_peft)
+
+    worker = _import_worker(monkeypatch)
+    monkeypatch.setattr(worker, "lora_exclude_modules", lambda m: None)
+
+    # 4-bit QLoRA tier -> NO PiSSA of ANY variant (any pissa_* init crashes on a 4-bit base);
+    # rsLoRA still on.
+    monkeypatch.setattr(worker, "model_quant", lambda m: "4bit-qlora")
+    captured.clear()
+    worker.make_lora("Qwen/Qwen3.5-9B")
+    _init = str(captured.get("init_lora_weights", "")).lower()
+    assert not _init.startswith("pissa"), f"PiSSA must be skipped on 4-bit, got {_init!r}"
+    assert captured.get("use_rslora") is True
+
+    # bf16/LoRA tier -> PiSSA on
+    monkeypatch.setattr(worker, "model_quant", lambda m: "bf16")
+    captured.clear()
+    worker.make_lora("Qwen/Qwen3.5-0.8B")
+    assert captured.get("init_lora_weights") == "pissa_niter_16"
+    assert captured.get("use_rslora") is True
+
+
+def test_force_vllm_backend_for_sm120(monkeypatch):
+    """RTX 5090 / sm120 -> FLASHINFER pinned (PTX-independent rollout); an operator override and a
+    non-sm120 GPU leave VLLM_ATTENTION_BACKEND untouched. Regression for the empty-5090-rollout."""
+    import os
+    import sys
+    import types
+
+    worker = _import_worker(monkeypatch)
+
+    def _fake_torch(major):
+        t = types.ModuleType("torch")
+        t.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda *a: (major, 0),
+        )
+        return t
+
+    # sm120, backend unset -> FLASHINFER is forced
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(12))
+    assert worker.force_vllm_backend_for_sm120() == "FLASHINFER"
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
+
+    # operator override wins (not clobbered)
+    monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
+    assert worker.force_vllm_backend_for_sm120() is None
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "TRITON_ATTN"
+
+    # non-sm120 (sm90 Hopper) -> untouched
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(9))
+    assert worker.force_vllm_backend_for_sm120() is None
+    assert "VLLM_ATTENTION_BACKEND" not in os.environ
