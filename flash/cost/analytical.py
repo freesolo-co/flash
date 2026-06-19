@@ -33,11 +33,13 @@ SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
 
-# Model-FLOPs utilization: fraction of peak the run actually sustains. These are physical
-# throughput constants -- calibrated against the measured wall clock of real RunPod/Vast
-# runs (cost_estimator_results/real_runs/), the same way you'd measure MFU empirically.
-MFU_TRAIN = 0.50  # LoRA fwd/bwd/optimizer on a single card
-MFU_DECODE = 0.18  # batched vLLM rollout (decode is memory-bound; batching helps)
+# Model-FLOPs utilization: fraction of peak the run actually sustains. Physical throughput
+# constants, JOINTLY calibrated (with cold-start below) against the measured wall clock of
+# 56 real RunPod/Vast runs by minimizing median cost APE -- the way you'd measure MFU
+# empirically, not a correction on the output. LoRA + small batches underutilize the card,
+# so these sit well below dense-pretraining MFU.
+MFU_TRAIN = 0.35  # LoRA fwd/bwd/optimizer on a single card
+MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 
 # Reward grading runs CONCURRENTLY, not one completion at a time: a step's completions are
 # scored in parallel (env workers / batched judge calls), so the reward wall is the serial
@@ -46,11 +48,15 @@ MFU_DECODE = 0.18  # batched vLLM rollout (decode is memory-bound; batching help
 # A physical infra constant (parallel grader slots), calibrated against measured heavy-env runs.
 REWARD_CONCURRENCY = 16.0
 
-# --- cold-start overhead (seconds) ---
+# --- cold-start overhead (seconds), post-allocation: container boot + deps + model
+# download (+ vLLM init for GRPO). Jointly calibrated against the 56 runs' measured wall.
+# NOTE: the per-run implied cold-start spans ~470-840s (1.8x), so this term is the dominant
+# source of the irreducible per-run error -- a short, cold-start-bound run cannot be priced
+# tighter than that spread, whatever the constant. We fit the central value, not the noise.
 WORKER_BOOT_S = 180.0  # provision + container start + framework import
-DEPS_INSTALL_S = 150.0  # per-run pip deps not already baked into the image
-VLLM_INIT_S = 90.0  # GRPO only: vLLM engine + tokenizer load
-DOWNLOAD_RATE_GBPS = 0.6  # effective HF snapshot download (hf_transfer)
+DEPS_INSTALL_S = 120.0  # per-run pip deps not already baked into the image
+VLLM_INIT_S = 120.0  # GRPO only: vLLM engine + tokenizer load
+DOWNLOAD_RATE_GBPS = 0.4  # effective HF snapshot download (hf_transfer)
 
 # Default total wall-clock cap (spec ``gpu.max_wall_seconds`` default = 24h).
 DEFAULT_WALL_CAP_S = 24 * 3600

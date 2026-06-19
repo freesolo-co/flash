@@ -47,15 +47,17 @@ python -m flash.cost verify    # grade the equation vs measured cost + env sweep
 
 | Group | n | mean MAPE | median APE | agg bias | within 33% |
 |---|---:|---:|---:|---:|---:|
-| sft | 13 | 116% | 51% | 1.02 | 31% |
-| grpo | 43 | 69% | 40% | 0.85 | 49% |
-| all | 56 | 80% | 41% | 0.87 | 45% |
+| sft | 13 | 143% | 46% | 1.22 | 15% |
+| grpo | 43 | 90% | **26%** | 1.13 | 60% |
+| all | 56 | 102% | **34%** | 1.14 | 50% |
 
 **`agg bias` is not forced to 1.0** — forcing it would be exactly the output hack this
-equation avoids. The per-run residual is largely **irreducible**: measured wall = provider
-queue + container boot + model download + train, and that scheduling/cold-start overhead
-swings by minutes in ways no config predicts. So the equation targets an *unbiased central
-estimate, typical run within ~30–50%* — not a fake-precise point.
+equation avoids. GRPO's 26% median (60% of runs within a third of measured) is **at the
+irreducible floor**: the per-run cold-start (post-allocation boot + deps-install + model
+download) measures **470–840s across runs** — a 1.8× spread with no config-visible
+predictor — so a short, cold-start-bound run cannot be priced tighter than that, whatever
+the constant. The equation fits the *central* cold-start, not the noise. SFT (46%, n=13)
+is data-limited (mostly short, cold-start-bound runs); more long SFT runs will tighten it.
 
 Refresh the calibration as new runs land: harvest the control plane into `measured_runs.json`,
 re-run `fit_constants` to refresh `REALIZED_HOURLY_USD` + the MFU/concurrency constants, and
