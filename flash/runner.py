@@ -319,6 +319,34 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # first so a recovery thread can't overwrite the user's terminal `cancelled`.
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
+        if not res.ok and res.failure == "no_capacity":
+            # The recovered job is stuck IN_QUEUE on a capacity-starved / throttled class with
+            # no usable worker (a control-plane restart landed mid-queue). The fresh-submit path
+            # WALKS to the next-cheapest available class on no_capacity; recovery must do the same
+            # instead of terminally failing on a transient market condition. Tear down the stale
+            # endpoint (its worker never started, so nothing is lost) and resume THIS seed through
+            # the supervised submit, which owns the capacity walk + crash budget.
+            with contextlib.suppress(Exception):
+                from flash.providers import get_provider as _gp
+
+                _gp(handle.provider).destroy(handle)
+            try:
+                resume_index = list(spec.train.seeds).index(seed)
+            except ValueError:
+                resume_index = 0
+            # Drop the now-dead handle so a cancel / restart in the re-provision gap can't reattach
+            # to the deleted endpoint; _run_seed_loop's next on_handle records the fresh one.
+            _update(run_id, "running", remote=None)
+            print(
+                f"recovery: {run_id} seed {seed} was IN_QUEUE with no capacity; "
+                "re-provisioning via the capacity walk instead of failing",
+                file=log,
+                flush=True,
+            )
+            _run_seed_loop(
+                spec, log, start_index=resume_index, prior_cost=float(status.cost_usd or 0.0)
+            )
+            return get_status(run_id)
         if not res.ok:
             _update(run_id, "failed", error=f"{res.failure}: {res.detail}")
             return get_status(run_id)

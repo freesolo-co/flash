@@ -362,6 +362,56 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
     assert seen_kwargs.get("deadline_s") == max(60, int(spec.gpu.max_wall_seconds)) + 1800
 
 
+def test_attach_no_capacity_walks_instead_of_failing(orch, monkeypatch):
+    """Recovery review fix: a control-plane restart that reattaches to a RunPod job still
+    IN_QUEUE on a capacity-starved class must NOT terminally fail — it must tear down the
+    stale endpoint and re-provision the seed through the supervised submit (which owns the
+    capacity walk to the next-cheapest class), mirroring the fresh-submit path."""
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod import train as rp_train
+
+    # The recovered poll reports the class is capacity-starved (no usable worker, stuck IN_QUEUE).
+    monkeypatch.setattr(
+        rp_jobs,
+        "poll_job",
+        lambda *a, **k: PollResult(
+            False, failure="no_capacity", detail="no worker assigned; throttled class"
+        ),
+    )
+    deleted = []
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e) or True)
+    monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
+    # The capacity walk re-provisions and this time the seed succeeds.
+    resubmitted = []
+    monkeypatch.setattr(
+        orch,
+        "_submit_seed_supervised",
+        lambda spec, seed, log: resubmitted.append(seed)
+        or {"train_tokens": 4096, "cost_usd": 0.4},
+    )
+
+    spec = _spec()
+    st = _seed_status(orch, spec)
+    st.state = "running"
+    st.cost_usd = 0.0
+    st.remote = {
+        "provider": "runpod",
+        "endpoint_id": "ep-stuck",
+        "endpoint_name": "n",
+        "job_id": "j-queued",
+        "seed": 0,
+    }
+    orch._save_status(st)
+    out = orch.attach_run(spec.run_id, log_stream=io.StringIO())
+    # Re-provisioned the in-flight seed instead of failing the run.
+    assert resubmitted == [0]
+    assert "ep-stuck" in deleted  # the capacity-starved endpoint was torn down
+    assert out.state == "done"
+    assert out.cost_usd == 0.4
+
+
 # ---------------------------------------------------------------------------
 # config: provider fields
 # ---------------------------------------------------------------------------

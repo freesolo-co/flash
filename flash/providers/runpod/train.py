@@ -935,6 +935,13 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     #     try to connect as a trainer child to a server that never comes up (hang/fail).
     #   RANK / LOCAL_RANK     — accelerate-assigned distributed ranks; is_artifact_writer() keys off
     #     RANK=="0", so a forwarded RANK can suppress the ONLY process that writes the adapter/DONE.
+    #   FLASH_DISAGG_PARALLEL — the rollout split (tp default vs dp MoE-only). The allocator's
+    #     required_vram_gb() sizes the inference card from the SUBMITTER os.environ: tp divides the
+    #     bf16 server footprint by inference_gpus, dp does NOT (each card is a full replica). A
+    #     per-run override applied here (after sizing) would let a TP-sized provision start DP
+    #     replicas that each need the whole server footprint -> the paid worker OOMs. Topology-owned
+    #     like FLASH_INFERENCE_GPUS, so it must be set via the submitter env (it IS forwarded from
+    #     os.environ in build_worker_env), never per-run.
     _RESERVED_WORKER_ENV = {
         "RUN_ID",
         "HF_REPO",
@@ -942,6 +949,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "FLASH_GPU_COUNT",
         "FLASH_INFERENCE_GPUS",
         "FLASH_RL_TRAINER_ONLY",
+        "FLASH_DISAGG_PARALLEL",
         "RANK",
         "LOCAL_RANK",
     }

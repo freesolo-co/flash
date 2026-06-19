@@ -281,6 +281,26 @@ def test_chalk_extra_pip_worker_env_overrides_os_env_flag(monkeypatch):
     assert chalk_extra_pip(spec) == []
 
 
+def test_build_worker_env_drops_reserved_disagg_parallel(monkeypatch):
+    """Review fix: FLASH_DISAGG_PARALLEL is topology-owned. The allocator's required_vram_gb()
+    sizes the inference card from the SUBMITTER os.environ (tp divides the server footprint by
+    inference_gpus, dp does not). A per-run [worker_env] override applied AFTER sizing would let a
+    tp-sized provision start full-footprint dp replicas -> the paid worker OOMs. So it must be
+    reserved and NOT forwardable per run (set it via the submitter env instead)."""
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.delenv("FLASH_DISAGG_PARALLEL", raising=False)
+    # A per-run override is dropped (run sizing owns it; submitter env is the only valid source).
+    spec = _spec_worker_env({"FLASH_DISAGG_PARALLEL": "dp"})
+    assert "FLASH_DISAGG_PARALLEL" not in build_worker_env(spec, 0)
+    # Sanity: a NON-reserved per-run key still flows through, so the drop is targeted.
+    spec2 = _spec_worker_env({"FLASH_DISAGG_PARALLEL": "dp", "FOO_PER_RUN": "1"})
+    assert build_worker_env(spec2, 0).get("FOO_PER_RUN") == "1"
+    # The submitter env IS the valid channel: a global value is still forwarded.
+    monkeypatch.setenv("FLASH_DISAGG_PARALLEL", "tp")
+    assert build_worker_env(_spec_worker_env({}), 0).get("FLASH_DISAGG_PARALLEL") == "tp"
+
+
 def test_build_worker_env_reserves_disaggregated_role_and_rank_keys(monkeypatch):
     """The disaggregated ROLE / TOPOLOGY / RANK keys are control-plane- and launcher-owned and a
     per-run [worker_env] must NOT be able to forward them: FLASH_INFERENCE_GPUS would change the
