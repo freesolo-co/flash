@@ -33,6 +33,12 @@ def install_chalk_kernels(model=None) -> dict:
     except ImportError:
         # chalk not installed (control plane, or a worker without the gpu extra) — nothing to do.
         return {}
+    except Exception as e:
+        # A partially-installed / version-incompatible chalk can raise non-ImportError errors at
+        # import time (e.g. a Triton/torch mismatch surfaced on import of a kernel module). This
+        # hook is documented as always safe and must never abort training, so degrade to a no-op.
+        log.warning("chalk import failed (ignored, kernels disabled): %s", e)
+        return {}
 
     results: dict[str, object] = {}
 

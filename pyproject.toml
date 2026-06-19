@@ -39,8 +39,9 @@ gpu = [
 # freesolo-chalk (Freesolo's custom Triton/CUDA kernels, complements Liger) is an OPTIONAL,
 # separately-installed package — it is not on PyPI yet, so it is deliberately NOT a hard
 # dependency here (that would break resolution). flash auto-detects it at runtime and no-ops
-# when it's absent (see flash/engine/chalk_kernels.py). Enable it on a worker by adding an
-# installable spec via AUTOSLM_WORKER_DEPS (once published, or a git URL with access).
+# when it's absent (see flash/engine/chalk_kernels.py). Enable it on a worker by APPENDING an
+# installable spec via AUTOSLM_WORKER_EXTRA_DEPS (the additive override; a git URL with access,
+# or the published wheel) — not AUTOSLM_WORKER_DEPS, which replaces the whole pinned stack.
 server = ["fastapi", "uvicorn"]
 # Convenience aggregate of all optional runtime extras.
 all = ["flash[gpu,server]"]
