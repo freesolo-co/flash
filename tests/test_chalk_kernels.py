@@ -1,225 +1,170 @@
 """flash <-> chalk wiring (CPU-safe).
 
-chalk is install-on-call (it reads NO env vars), so flash's install_chalk_kernels must decide
-*which* chalk installers to call from per-kernel FLASH_* selection flags. These tests verify the
-FLASH_-flag -> installer mapping (incl. kwargs), the default no-op (no flags), the no-op when chalk
-is absent, the two-pass split (PRE-build model=None -> class/fn-level only; POST-build model set ->
-instance-level only, so the worker's two calls install each kernel exactly once with no double
-global patch), and that an installer error never aborts training.
+flash applies chalk via chalk's Liger-style ``apply_chalk_kernel_to_qwen35(model, liger=False, ...)``
+on the POST-build pass (chalk patches the live module). These tests verify: the gap-fillers are ON
+by default and map to the right apply kwargs; FLASH_<K>=0 disables a default-on kernel and
+FLASH_<K>=1 enables an opt-in one; the pre-build pass (model=None) is a no-op; the no-op when chalk
+is absent or every kernel is disabled; and that a chalk apply error never aborts training.
 """
 
 import sys
 import types
 
-from flash.engine.chalk_kernels import install_chalk_kernels
+from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels, is_chalk_enabled
 
-# (chalk installer name, needs_model). Mirrors the real chalk.transformers signatures:
-#   install_qwen35_mlp(model=None), install_qwen35_qkv(model=None), install_lora(),
-#   install_qwen35_rope(), install_qwen35_mlp_fp8(model,*,down=True),
-#   install_fp8_base(model,*,attn=True,mlp=True,min_k=256), install_qwen35_embedding(model)
-_INSTALLERS = {
-    "install_lora": False,
-    "install_qwen35_mlp": False,
-    "install_qwen35_qkv": False,
-    "install_qwen35_rope": False,
-    "install_qwen35_mlp_fp8": True,
-    "install_fp8_base": True,
-    "install_qwen35_embedding": True,
-}
+# Every FLASH_* kernel flag (so a test can clear leftovers from the environment).
+_ALL_FLAGS = (
+    "FLASH_ROPE_KERNEL",
+    "FLASH_TRITON_LORA",
+    "FLASH_EMBED_KERNEL",
+    "FLASH_MLP_KERNEL",
+    "FLASH_QKV_KERNEL",
+    "FLASH_FP8_BASE",
+)
 
-# All FLASH_* kernel-selection flags -> every installer on.
-_ALL_FLAGS = {
-    "FLASH_TRITON_LORA": "1",
-    "FLASH_MLP_KERNEL": "1",
-    "FLASH_QKV_KERNEL": "1",
-    "FLASH_ROPE_KERNEL": "1",
-    "FLASH_MLP_FP8": "1",
-    "FLASH_FP8_BASE": "1",
-    "FLASH_EMBED_KERNEL": "1",
+# The apply kwargs flash should pass for a DEFAULT run (gap-fillers on, overlap/situational off).
+_DEFAULT_KWARGS = {
+    "rope": True,
+    "fused_lora_delta": True,
+    "fused_embedding": True,
+    "fused_mlp": False,
+    "attn_epilogue": False,
+    "fp8_frozen_base": False,
 }
 
 
-def _install_fake_chalk(monkeypatch, calls, *, raise_in=None):
+def _clear_flags(monkeypatch):
+    for k in _ALL_FLAGS:
+        monkeypatch.delenv(k, raising=False)
+
+
+def _install_fake_chalk(monkeypatch, calls, *, raise_in_apply=False, report=None):
+    """Inject a fake ``chalk.transformers`` whose apply records (model, kwargs) and returns report."""
     ck = types.ModuleType("chalk.transformers")
 
-    def make(name):
-        # Accept model positionally + arbitrary kwargs so we can assert what flash forwards.
-        def fn(model=None, **kwargs):
-            calls.append((name, model, kwargs))
-            if raise_in == name:
-                raise RuntimeError("boom")
-            return True
+    def apply_chalk_kernel_to_qwen35(model, **kwargs):
+        calls.append((model, kwargs))
+        if raise_in_apply:
+            raise RuntimeError("boom")
+        return report if report is not None else {k: v for k, v in kwargs.items() if v is True}
 
-        return fn
-
-    for name in _INSTALLERS:
-        setattr(ck, name, make(name))
-
+    ck.apply_chalk_kernel_to_qwen35 = apply_chalk_kernel_to_qwen35
     chalk_pkg = types.ModuleType("chalk")
     chalk_pkg.transformers = ck
     monkeypatch.setitem(sys.modules, "chalk", chalk_pkg)
     monkeypatch.setitem(sys.modules, "chalk.transformers", ck)
 
 
-def _clear_flags(monkeypatch):
-    for k in (
-        "FLASH_TRITON_LORA",
-        "FLASH_MLP_KERNEL",
-        "FLASH_QKV_KERNEL",
-        "FLASH_ROPE_KERNEL",
-        "FLASH_MLP_FP8",
-        "FLASH_MLP_FP8_DOWN",
-        "FLASH_FP8_BASE",
-        "FLASH_FP8_BASE_ATTN",
-        "FLASH_FP8_BASE_MLP",
-        "FLASH_FP8_BASE_MIN_K",
-        "FLASH_EMBED_KERNEL",
-    ):
-        monkeypatch.delenv(k, raising=False)
+def test_default_on_applies_gap_fillers(monkeypatch):
+    """Default (no FLASH_* flags), post-build -> apply is called once with liger=False and the
+    gap-fillers ON (rope/fused_lora_delta/fused_embedding), the overlap/situational kernels OFF."""
+    _clear_flags(monkeypatch)
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    model = object()
+    install_chalk_kernels(model)
+    assert len(calls) == 1
+    got_model, kwargs = calls[0]
+    assert got_model is model
+    assert kwargs.pop("liger") is False  # TRL owns Liger; chalk composes on top
+    assert kwargs == _DEFAULT_KWARGS
 
 
-def test_no_flags_calls_nothing(monkeypatch):
-    """Default (no FLASH_* flag set) -> install nothing, even if chalk is importable."""
+def test_pre_build_pass_is_noop(monkeypatch):
+    """The pre-build pass (model=None) does nothing — chalk's apply patches the live module."""
     _clear_flags(monkeypatch)
     calls = []
     _install_fake_chalk(monkeypatch, calls)
     assert install_chalk_kernels() == {}
-    assert install_chalk_kernels(object()) == {}
-    assert calls == []  # chalk wasn't even consulted
+    assert install_chalk_kernels(None) == {}
+    assert calls == []  # chalk not consulted before the model exists
 
 
 def test_noop_when_chalk_absent(monkeypatch):
-    """A flag is set but chalk isn't installed -> warn + no-op (returns {})."""
+    """Gap-fillers are default-on, but if freesolo-chalk isn't installed -> no-op (returns {})."""
     _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
-    monkeypatch.setitem(sys.modules, "chalk", None)  # force ImportError on `import chalk.transformers`
-    assert install_chalk_kernels() == {}
+    monkeypatch.setitem(sys.modules, "chalk", None)  # force ImportError on `from chalk.transformers ...`
     assert install_chalk_kernels(object()) == {}
 
 
-def test_only_selected_installers_are_called(monkeypatch):
-    """Only the chalk installers whose FLASH_* flag is set get called."""
+def test_flag_zero_disables_default_on_kernel(monkeypatch):
+    """FLASH_<K>=0/false disables a default-ON gap-filler; the others stay on."""
     _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
-    monkeypatch.setenv("FLASH_TRITON_LORA", "1")
+    monkeypatch.setenv("FLASH_ROPE_KERNEL", "0")
+    monkeypatch.setenv("FLASH_EMBED_KERNEL", "false")
     calls = []
     _install_fake_chalk(monkeypatch, calls)
-    install_chalk_kernels()  # model=None
-    names = {n for n, _, _ in calls}
-    assert names == {"install_qwen35_mlp", "install_lora"}
-    # unselected installers (including instance-level FP8 base/embedding) were NOT called
-    assert "install_fp8_base" not in names
-    assert "install_qwen35_qkv" not in names
+    install_chalk_kernels(object())
+    _, kwargs = calls[0]
+    assert kwargs["rope"] is False
+    assert kwargs["fused_embedding"] is False
+    assert kwargs["fused_lora_delta"] is True  # still default-on
 
 
-def test_falsey_flag_value_does_not_select(monkeypatch):
-    """FLASH_*=0/false/empty must NOT enable the kernel (so a leftover 0 is inert)."""
+def test_optin_flag_enables_extra_kernel(monkeypatch):
+    """A default-OFF kernel turns on with FLASH_<K>=1, alongside the default-on gap-fillers."""
     _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "0")
-    monkeypatch.setenv("FLASH_QKV_KERNEL", "false")
-    monkeypatch.setenv("FLASH_TRITON_LORA", "")
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # opt in to the fused MLP
+    monkeypatch.setenv("FLASH_FP8_BASE", "1")  # opt in to FP8 frozen base
     calls = []
     _install_fake_chalk(monkeypatch, calls)
-    assert install_chalk_kernels() == {}
-    assert calls == []
+    install_chalk_kernels(object())
+    _, kwargs = calls[0]
+    assert kwargs["fused_mlp"] is True
+    assert kwargs["fp8_frozen_base"] is True
+    assert kwargs["rope"] is True  # gap-fillers still on
 
 
-def test_model_none_runs_only_class_level_installers(monkeypatch):
-    """PRE-build pass (model=None): the class/fn-level global patches run; the instance-level
-    installers are skipped (no built module yet)."""
+def test_all_kernels_disabled_is_noop(monkeypatch):
+    """Disabling every gap-filler (FLASH_<K>=0) -> apply is never called, returns {}."""
     _clear_flags(monkeypatch)
-    for k, v in _ALL_FLAGS.items():
-        monkeypatch.setenv(k, v)
+    for k in ("FLASH_ROPE_KERNEL", "FLASH_TRITON_LORA", "FLASH_EMBED_KERNEL"):
+        monkeypatch.setenv(k, "0")
     calls = []
     _install_fake_chalk(monkeypatch, calls)
-    res = install_chalk_kernels(None)
-    names = {n for n, _, _ in calls}
-    # class/fn-level installers all ran, each with no model
-    assert names == {"install_lora", "install_qwen35_mlp", "install_qwen35_qkv", "install_qwen35_rope"}
-    assert all(model is None for _, model, _ in calls)
-    # instance-level installers are skipped when there's no model
-    assert "install_fp8_base" not in names
-    assert "install_qwen35_embedding" not in names
-    assert "install_qwen35_mlp_fp8" not in names
-    assert res  # non-empty result map
+    assert install_chalk_kernels(object()) == {}
+    assert calls == []  # nothing enabled -> chalk not even imported
 
 
-def test_model_present_runs_only_instance_installers_with_model(monkeypatch):
-    """POST-build pass (model present): ONLY the instance-level installers run, each receiving the
-    model. The class/fn-level global patches were applied on the pre-build pass and must NOT be
-    re-installed here (that would double-patch the already-patched global)."""
+def test_apply_error_is_swallowed(monkeypatch):
+    """A chalk apply that raises must not abort training; install returns {} instead of propagating."""
     _clear_flags(monkeypatch)
-    for k, v in _ALL_FLAGS.items():
-        monkeypatch.setenv(k, v)
     calls = []
-    _install_fake_chalk(monkeypatch, calls)
-    sentinel = object()
-    install_chalk_kernels(sentinel)
-    by_name = {n: model for n, model, _ in calls}
-    # instance-level installers ran with the model
-    assert by_name == {
-        "install_fp8_base": sentinel,
-        "install_qwen35_embedding": sentinel,
-        "install_qwen35_mlp_fp8": sentinel,
+    _install_fake_chalk(monkeypatch, calls, raise_in_apply=True)
+    assert install_chalk_kernels(object()) == {}
+    assert len(calls) == 1  # it was attempted, then swallowed
+
+
+def test_returns_chalk_report(monkeypatch):
+    """install_chalk_kernels returns chalk's per-kernel report verbatim."""
+    _clear_flags(monkeypatch)
+    rep = {"rope": True, "fused_lora_delta": 12, "fused_embedding": False, "liger": False}
+    calls = []
+    _install_fake_chalk(monkeypatch, calls, report=rep)
+    assert install_chalk_kernels(object()) == rep
+
+
+def test_is_chalk_enabled(monkeypatch):
+    """is_chalk_enabled is True by default (gap-fillers on) and False only when all are disabled."""
+    _clear_flags(monkeypatch)
+    import os
+
+    assert is_chalk_enabled(os.environ) is True
+    disabled = {"FLASH_ROPE_KERNEL": "0", "FLASH_TRITON_LORA": "0", "FLASH_EMBED_KERNEL": "0"}
+    assert is_chalk_enabled(disabled) is False
+    # a single opt-in flag is enough to need chalk installed
+    assert is_chalk_enabled({**disabled, "FLASH_MLP_KERNEL": "1"}) is True
+
+
+def test_active_kernels_filters_report():
+    """active_kernels keeps only the kernels that ENGAGED (truthy, non-error) and drops liger."""
+    rep = {
+        "liger": False,  # TRL owns Liger — excluded
+        "rope": True,
+        "fused_lora_delta": 12,  # a count is "engaged"
+        "fused_embedding": False,  # fell back
+        "fused_mlp": {"error": "boom"},  # errored
     }
-    # class/fn-level installers were NOT re-run on the post-build pass
-    assert "install_lora" not in by_name
-    assert "install_qwen35_mlp" not in by_name
-    assert "install_qwen35_qkv" not in by_name
-    assert "install_qwen35_rope" not in by_name
-
-
-def test_two_pass_install_runs_each_kernel_exactly_once(monkeypatch):
-    """The worker calls install_chalk_kernels() pre-build then install_chalk_kernels(model)
-    post-build. Across BOTH passes each selected kernel installs exactly once — the global
-    class/fn-level patches are not re-applied on the second pass."""
-    _clear_flags(monkeypatch)
-    for k, v in _ALL_FLAGS.items():
-        monkeypatch.setenv(k, v)
-    calls = []
-    _install_fake_chalk(monkeypatch, calls)
-    install_chalk_kernels()  # pre-build: class/fn-level only
-    install_chalk_kernels(object())  # post-build: instance-level only
-    counts: dict[str, int] = {}
-    for n, _, _ in calls:
-        counts[n] = counts.get(n, 0) + 1
-    # every selected installer was called exactly once across the two passes (no double-install)
-    assert counts == dict.fromkeys(_INSTALLERS, 1)
-
-
-def test_per_kernel_kwargs_are_forwarded(monkeypatch):
-    """Operator FP8 scope knobs (FLASH_FP8_BASE_*, FLASH_MLP_FP8_DOWN) reach the chalk kwargs."""
-    _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_FP8_BASE", "1")
-    monkeypatch.setenv("FLASH_FP8_BASE_ATTN", "0")
-    monkeypatch.setenv("FLASH_FP8_BASE_MLP", "1")
-    monkeypatch.setenv("FLASH_FP8_BASE_MIN_K", "512")
-    monkeypatch.setenv("FLASH_MLP_FP8", "1")
-    monkeypatch.setenv("FLASH_MLP_FP8_DOWN", "0")
-    calls = []
-    _install_fake_chalk(monkeypatch, calls)
-    install_chalk_kernels(object())
-    kw = {n: kwargs for n, _, kwargs in calls}
-    assert kw["install_fp8_base"] == {"attn": False, "mlp": True, "min_k": 512}
-    assert kw["install_qwen35_mlp_fp8"] == {"down": False}
-
-
-def test_fp8_base_uses_chalk_defaults_when_no_knobs(monkeypatch):
-    """FLASH_FP8_BASE alone -> no kwargs forwarded, so chalk's own defaults apply."""
-    _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_FP8_BASE", "1")
-    calls = []
-    _install_fake_chalk(monkeypatch, calls)
-    install_chalk_kernels(object())
-    kw = {n: kwargs for n, _, kwargs in calls}
-    assert kw["install_fp8_base"] == {}
-
-
-def test_installer_error_is_swallowed(monkeypatch):
-    """An installer raising must not abort training; the error is recorded, not propagated."""
-    _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # class/fn-level -> runs on the model=None pass
-    calls = []
-    _install_fake_chalk(monkeypatch, calls, raise_in="install_qwen35_mlp")
-    res = install_chalk_kernels()  # pre-build pass; must not raise
-    assert str(res["install_qwen35_mlp"]).startswith("error:")
+    assert active_kernels(rep) == ["fused_lora_delta", "rope"]
+    assert active_kernels({}) == []
+    assert active_kernels(None) == []
