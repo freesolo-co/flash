@@ -589,7 +589,7 @@ def get_train_endpoint(
     # WORKER_IMAGE is Vast's cold-start image (no Flash runtime) and leaves the worker unhealthy if
     # forced. RunPod boot-installs WORKER_DEPS on Flash's default template instead (cached as a
     # Flash artifact). Optional FLASH_WORKER_IMAGE override for a RunPod-serverless-compatible image.
-    image = os.environ.get("FLASH_WORKER_IMAGE")
+    image = (os.environ.get("FLASH_WORKER_IMAGE") or "").strip()
     if image:
         kwargs["image"] = image
     else:

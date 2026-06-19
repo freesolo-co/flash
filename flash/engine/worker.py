@@ -2005,9 +2005,11 @@ def run_rl():
     is_tool_env = getattr(ACTIVE_ENV, "is_tool_env", False)
     is_multi_turn = getattr(ACTIVE_ENV, "multi_turn", False)
     conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
-    # ---- Disaggregated (multi-GPU async) rollout: device split (BEFORE any CUDA context) ----
-    # [train].inference_gpus>0 dedicates GPUs to a separate vLLM rollout server so generation
-    # overlaps the optimizer step instead of time-sharing one card (verl async rollout). The
+    # ---- Disaggregated (multi-GPU) rollout: device split (BEFORE any CUDA context) ----
+    # [train].inference_gpus>0 dedicates GPUs to a separate vLLM rollout server so generation runs
+    # on whole card(s) (full TP throughput, no sleep-mode offload) instead of time-sharing one card
+    # with the trainer. Server mode stays synchronous (no optimizer/generation overlap; see the
+    # num_iterations note below for why the async one-step-off path is separate). The
     # trainer process MUST pin CUDA_VISIBLE_DEVICES to its train devices before wait_for_gpu() (or
     # any torch.cuda call) binds the context to all visible cards. The server is launched later (it
     # needs the engine length); here we only compute the split + pin the trainer + snapshot a clean
@@ -2386,8 +2388,9 @@ def run_rl():
     if use_vllm and disaggregated:
         # Disaggregated: a separate `trl vllm-serve` process owns the inference GPU(s); the trainer
         # connects over loopback (vllm_mode="server") and TRL syncs the (PEFT-merged) policy weights
-        # to it via NCCL each generation batch (sync_weights), so generation for the next batch
-        # overlaps this step's optimizer instead of time-sharing one card (verl async rollout).
+        # to it via NCCL each generation batch (sync_weights). Server mode is SYNCHRONOUS — the
+        # trainer blocks on generation each step (no optimizer overlap; that async one-step-off path
+        # is separate, see the num_iterations note below); the win is the dedicated inference card.
         # The server gets the whole inference card (no colocate util cap), stays resident (no sleep),
         # and its KV cache is bounded by --max_model_len = the GRPO engine length.
         _port = _disagg.server_port()

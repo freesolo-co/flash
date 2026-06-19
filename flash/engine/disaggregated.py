@@ -1,6 +1,9 @@
-"""Disaggregated (multi-GPU async) GRPO rollout: launch a ``trl vllm-serve`` rollout server on
-the inference GPUs and point the GRPO trainer at it (``vllm_mode="server"``), so generation for
-the next batch overlaps the current optimizer step instead of time-sharing one GPU.
+"""Disaggregated (multi-GPU) GRPO rollout: launch a ``trl vllm-serve`` rollout server on the
+inference GPUs and point the GRPO trainer at it (``vllm_mode="server"``), so generation runs on
+dedicated card(s) (whole-GPU TP throughput, no sleep-mode weight offload) instead of time-sharing
+one GPU with the trainer. Server mode is still SYNCHRONOUS — the trainer blocks on each generation
+batch; the win here is scaling (more inference TP + more DDP trainers), not optimizer/generation
+overlap (one-step-off async overlap, verl HybridEngine / TRL AsyncGRPOTrainer, is a separate path).
 
 verl ref (3D-HybridEngine / flexible device mapping + async rollout):
 https://github.com/verl-project/verl
