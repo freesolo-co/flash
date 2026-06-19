@@ -401,7 +401,7 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     # extra_pip), so the opt-in chalk spec is appended here to reach default runs.
     extra_pip = (
         list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
-    ) + chalk_extra_pip()
+    ) + chalk_extra_pip(spec)
     worker_env = build_worker_env(spec, seed)
     endpoint_id, name = deploy_train_endpoint(
         spec.gpu.type,

@@ -230,7 +230,7 @@ def build_payload(spec, seed: int, attempt: int) -> dict:
         # The Vast bootstrap pip-installs extra_pip for every job (provider/vast/_bootstrap.py),
         # so the opt-in chalk spec rides along here to reach default runs — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
-        + chalk_extra_pip(),
+        + chalk_extra_pip(spec),
         "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
         "hf_prefix": f"{spec.phase}/{spec.run_id}/seed{seed}",
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
