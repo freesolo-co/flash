@@ -35,6 +35,7 @@ import traceback
 from flash.engine.accounting import RunMetrics
 
 # Shared, substrate-neutral fine-tuning internals (live in this same package).
+from flash.engine.chalk_kernels import install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
@@ -1181,6 +1182,11 @@ def run_sft():
                         print("[lora+] setup failed, falling back to default optimizer:", e)
                 return super().create_optimizer()
 
+    # Install any opt-in chalk kernels (CHALK_* flags) before TRL builds the model, so the
+    # class/function-level patches (LoRA delta, fused MLP/QKV, RoPE) apply to it. No-op unless
+    # a CHALK_* flag is set and freesolo-chalk is installed.
+    install_chalk_kernels()
+
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
     trainer = _SFT(
@@ -1891,6 +1897,10 @@ def run_rl():
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
     # to fp32 and double VRAM).
     init_model, init_peft = _init_adapter_model(model_id)
+    # Install any opt-in chalk kernels (CHALK_* flags). init_model is the built base, so the
+    # instance-level kernels (FP8 base, embedding, FP8 MLP) can patch its frozen Linears too.
+    # No-op unless a CHALK_* flag is set and freesolo-chalk is installed.
+    install_chalk_kernels(init_model)
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
         # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
