@@ -159,8 +159,14 @@ def _offline_open_model_vram_gb(config: RunConfig) -> int | None:
     return need
 
 
-def select_gpu(config: RunConfig) -> tuple[str, int]:
-    """(chosen GPU class, required VRAM GB) for the run, offline/deterministic."""
+def select_gpu(config: RunConfig, *, pin_must_fit: bool = True) -> tuple[str, int]:
+    """(chosen GPU class, required VRAM GB) for the run, offline/deterministic.
+
+    ``pin_must_fit`` is True for a forward estimate (a too-small pin escalates to a fitting
+    class). The calibration grader passes False so a measured run is priced on the card it
+    *actually ran on* even when the offline VRAM heuristic over-estimates and would drop it
+    (see ``pick_gpu``) -- otherwise the measured bill is graded against a different GPU.
+    """
     need = _offline_open_model_vram_gb(config)
     if need is None:
         need = required_vram_gb(
@@ -175,6 +181,7 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
         pin=config.gpu,
         provider=config.provider,
         allow_unvalidated=unvalidated_allowed(config.allow_unvalidated),
+        pin_must_fit=pin_must_fit,
     )
     return gpu, need
 
@@ -215,9 +222,17 @@ def _notes(
     return tuple(notes)
 
 
-def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
-    """Deterministic pre-flight cost estimate -- the experiment's ground truth."""
-    gpu, need = select_gpu(config)
+def estimate_cost(
+    config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S, pin_must_fit: bool = True
+) -> CostEstimate:
+    """Deterministic pre-flight cost estimate -- the experiment's ground truth.
+
+    ``pin_must_fit`` defaults True (forward estimate: a too-small GPU pin escalates). The
+    calibration grader passes False to price a measured run on the card it actually ran on
+    even when the offline VRAM heuristic over-estimates the requirement (see ``select_gpu``
+    / ``pick_gpu``), so the measured bill isn't compared against a different GPU's price.
+    """
+    gpu, need = select_gpu(config, pin_must_fit=pin_must_fit)
     hourly = realized_hourly_usd(gpu)  # market (spot/queue) rate runs are billed at
     # The wall cap is ``gpu.max_wall_seconds`` from the spec (default 24h); fall back to the
     # caller's ``wall_cap_s`` (the module default) when the config doesn't pin one.

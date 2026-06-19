@@ -57,13 +57,16 @@ def _config_of(run: dict) -> RunConfig:
 
     The measured ``gpu`` is a record of fact -- the card the run *did* run on -- so it must
     be honored even when that class isn't in the default validated pool (e.g. a Vast
-    ``A100 SXM`` / ``RTX 6000 Ada`` run). ``pick_gpu`` only keeps a pin that survives both
-    its provisionability gate (per ``provider``) and its validation gate, so pass the run's
-    own ``provider`` and ``allow_unvalidated=True`` -- otherwise an unvalidated pinned class
-    is dropped and the run is re-priced on a *different* GPU, corrupting its accuracy/bias.
-    Forward ``max_wall_seconds`` when the dataset carries it so a capped run is graded
-    against the same wall cap the runner applied (the current dataset records none, so this
-    is a no-op until a measured row includes one -- a cap is never invented here).
+    ``A100 SXM`` / ``RTX 6000 Ada`` run). ``pick_gpu`` keeps a pin only if it survives its
+    provisionability gate (per ``provider``), its validation gate, AND the VRAM-fit gate, so
+    pass the run's own ``provider`` and ``allow_unvalidated=True`` to clear the first two.
+    The VRAM-fit gate is cleared at grading time by ``estimate_cost(..., pin_must_fit=False)``
+    in ``verify_accuracy`` -- the recorded card is proof the run fit, so it must not be dropped
+    for a cheaper/larger one when the offline VRAM heuristic over-estimates (that would re-price
+    the bill on a *different* GPU, corrupting its accuracy/bias). Forward ``max_wall_seconds``
+    when the dataset carries it so a capped run is graded against the same wall cap the runner
+    applied (the current dataset records none, so this is a no-op until a measured row includes
+    one -- a cap is never invented here).
     """
     return RunConfig(
         run["model"],
@@ -138,7 +141,11 @@ def verify_accuracy(path: Path | str | None = None) -> dict:
             continue
         apes, sum_est, sum_meas = [], 0.0, 0.0
         for r in sub:
-            est = estimate_cost(_config_of(r)).total_usd
+            # ``pin_must_fit=False``: the run's recorded GPU is the card it DEMONSTRABLY ran on,
+            # so honor it even when the offline VRAM heuristic over-estimates and would drop it
+            # for a cheaper/larger class -- otherwise a measured bill (e.g. a real RTX-5090 GRPO
+            # row) is graded against a DIFFERENT GPU's price, corrupting the accuracy/bias here.
+            est = estimate_cost(_config_of(r), pin_must_fit=False).total_usd
             meas = r["cost_usd"]
             apes.append(100 * abs(est - meas) / meas)
             sum_est += est

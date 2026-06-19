@@ -62,6 +62,31 @@ def test_verify_accuracy_reports_unforced_bias():
     assert 0.0 <= acc["all"]["within_33pct"] <= 1.0
 
 
+def test_measured_rows_graded_on_the_gpu_they_actually_ran_on():
+    # The grader must price each measured run on its RECORDED card -- the run demonstrably ran
+    # there. The offline VRAM heuristic over-estimates some real GRPO rows (e.g. Qwen3.5-4B
+    # 64x8 completions sizes to ~35 GB > the RTX 5090's 32 GB), and the FORWARD pick would drop
+    # the 5090 pin for a cheaper/larger card -- which would grade the measured 5090 bill against
+    # a DIFFERENT GPU's price. verify_accuracy passes pin_must_fit=False so that can't happen.
+    from flash.cost.analytical import select_gpu
+    from flash.cost.calibration import _config_of, _load_runs, _ran_its_work
+
+    affected = []  # real runs whose forward pick would diverge from the recorded card
+    for r in _load_runs():
+        if not _ran_its_work(r):
+            continue
+        cfg = _config_of(r)
+        forward, _ = select_gpu(cfg, pin_must_fit=True)
+        graded, _ = select_gpu(cfg, pin_must_fit=False)
+        # The graded card is ALWAYS the one the run actually ran on (a record of fact).
+        assert graded == r["gpu"], f"{r['run_id']} graded on {graded}, ran on {r['gpu']}"
+        if forward != r["gpu"]:
+            affected.append(r["run_id"])
+    # The two real RTX-5090 GRPO rows whose VRAM estimate exceeds 32 GB are exactly the rows
+    # the forward pick would have mis-graded -- the regression this fix guards against.
+    assert {"autoslm-1781832449-942dc159", "autoslm-1781845796-30891f05"} <= set(affected)
+
+
 def test_fit_constants_realized_rates_match_hardcoded():
     """The realized $/hr the equation prices at must track the measured billing data."""
     from flash.cost.hardware import REALIZED_HOURLY_USD

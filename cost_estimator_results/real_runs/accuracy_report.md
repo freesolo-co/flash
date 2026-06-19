@@ -10,12 +10,12 @@ gives.
 
 | Group | n | mean MAPE | median APE | agg bias (Σest/Σmeas) | within 33% | within 50% |
 |---|---:|---:|---:|---:|---:|---:|
-| all | 56 | 112% | 34% | 1.137 | 50% | 64% |
+| all | 56 | 111% | 34% | 1.180 | 50% | 64% |
 | sft | 13 | 186% | 51% | 1.535 | 15% | 46% |
-| grpo | 43 | 90% | 26% | 1.102 | 60% | 70% |
-| real | 39 | 39% | 23% | 0.853 | 64% | 79% |
+| grpo | 43 | 89% | 23% | 1.150 | 60% | 70% |
+| real | 39 | 38% | 22% | 0.902 | 64% | 79% |
 | real_sft | 6 | 50% | 47% | 0.999 | 17% | 50% |
-| real_grpo | 33 | 37% | 22% | 0.842 | 73% | 85% |
+| real_grpo | 33 | 35% | 22% | 0.894 | 73% | 85% |
 
 `agg bias` is **not forced to 1.0** -- forcing it would be exactly the output hack this
 equation avoids. The meaningful rows are **`real_*`** (runs >= 500s that actually executed

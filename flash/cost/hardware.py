@@ -99,6 +99,7 @@ def pick_gpu(
     pin: str | None = None,
     provider: str | None = None,
     allow_unvalidated: bool = False,
+    pin_must_fit: bool = True,
 ) -> str:
     """Cheapest GPU class that fits ``required_vram_gb``.
 
@@ -117,6 +118,17 @@ def pick_gpu(
     or an empty/``None`` value) are NOT GPU names -- they mean "let the allocator pick",
     so they fall through to cheapest-fit selection instead of raising (mirrors how
     ``resolve_gpu_policy`` only canonicalizes a non-policy value).
+
+    ``pin_must_fit`` is True for a FORWARD estimate (a too-small pin escalates -- you
+    can't run on a card that doesn't fit). It is set False only when GRADING a MEASURED
+    run, where the pin is the card the run *actually ran on*: that's proof it fit, so the
+    pin is honored even when the offline VRAM heuristic over-estimates the requirement and
+    would otherwise drop it. Without this, a real RTX-5090 GRPO row whose heuristic VRAM
+    just exceeds 32 GB is silently re-priced on a cheaper, larger card (e.g. A40) -- so the
+    measured 5090 bill is compared against a *different* GPU's price, corrupting the
+    calibration accuracy/bias. Only a concrete, known pin is force-honored; sentinels/None
+    still auto-select (a measured row always records a concrete card, so this never invents
+    one).
 
     When ``provider`` pins a substrate ("runpod"/"vast"), candidates are restricted to
     classes the provider can PROVISION (``providers_for`` -- RunPod has the ``GpuType``
@@ -161,6 +173,12 @@ def pick_gpu(
         pinned = [g for g in candidates if g.name == canonical]
         if pinned:
             candidates = pinned
+        elif not pin_must_fit:
+            # Grading a measured run: the pin is the card the run demonstrably ran on, so the
+            # offline VRAM heuristic over-estimated the requirement and dropped a card that
+            # actually fit. Force the recorded class back in rather than re-pricing the bill on
+            # a different GPU. canonical_gpu already validated it's a real managed class.
+            return GPU_INFO[canonical].name
     if not candidates:
         raise ValueError(
             f"no GPU class fits >= {required_vram_gb} GB (allow_unvalidated={allow_unvalidated})"
