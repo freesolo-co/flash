@@ -236,7 +236,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"gpu type {gpu_type!r} has not passed Flash's live validation smoke"
             f"{' on ' + provider if provider != 'auto' else ''} "
             f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true "
-            f"(or AUTOSLM_GPU_ALLOW_UNVALIDATED=1) to use it anyway."
+            f"(or FLASH_GPU_ALLOW_UNVALIDATED=1) to use it anyway."
         )
     try:
         info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
