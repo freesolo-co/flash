@@ -500,3 +500,23 @@ def _validate_spec(spec: JobSpec) -> None:
                     f"heads % inference_gpus == 0. Valid inference_gpus for this model (and gpu.count "
                     f"= {spec.gpu.count}): {_valid}"
                 )
+    # Catalog-level disaggregation requirements (requires_disaggregated / single_trainer_only).
+    # These live on the catalog entry, so they apply only to catalog models and are known here
+    # WITHOUT resolving/renting. submit_job re-runs this on the resolved ModelInfo, but doing it at
+    # parse time too means local-only validators (the MCP create_training_run dry-run, the server's
+    # /spec parse, CLI --dry-run via load) reject a 35B-A3B colocate or multi-trainer split here
+    # instead of letting it pass dry-run and fail only at submit.
+    if spec.model in MODELS:
+        from .engine.rollout_bench import validate_disaggregated_requirement
+
+        _info = MODELS[spec.model]
+        try:
+            validate_disaggregated_requirement(
+                requires_disaggregated=bool(getattr(_info, "requires_disaggregated", False)),
+                algorithm=spec.algorithm,
+                inference_gpus=spec.train.inference_gpus,
+                single_trainer_only=bool(getattr(_info, "single_trainer_only", False)),
+                gpu_count=spec.gpu.count,
+            )
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
