@@ -361,7 +361,7 @@ EVAL_SAMPLE_SEED = 12345
 EVAL_POOL_CAP = 2048
 
 
-def sample_eval_rows(pool: list, n: int, seed: int = EVAL_SAMPLE_SEED) -> list:
+def sample_eval_rows(pool: list, n: int) -> list:
     """A FIXED seeded random sample of ``n`` rows from ``pool`` (kept in original order).
 
     The whole pool is returned when ``n <= 0`` or ``n >= len(pool)`` (asking for at least as many
@@ -370,7 +370,7 @@ def sample_eval_rows(pool: list, n: int, seed: int = EVAL_SAMPLE_SEED) -> list:
     """
     if n <= 0 or n >= len(pool):
         return pool
-    idx = sorted(random.Random(seed).sample(range(len(pool)), n))
+    idx = sorted(random.Random(EVAL_SAMPLE_SEED).sample(range(len(pool)), n))
     return [pool[i] for i in idx]
 
 

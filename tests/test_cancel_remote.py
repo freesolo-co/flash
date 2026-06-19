@@ -279,7 +279,7 @@ def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
         held["locked"] = ftrain.FLASH_SDK_LOCK.locked()
         raise RuntimeError("short-circuit before the real SDK lookup")
 
-    monkeypatch.setattr(ftrain, "isolate_flash_state", rec_isolate)
+    monkeypatch.setattr(ftrain.endpoints, "isolate_flash_state", rec_isolate)
     out = ftrain.terminate_endpoint("RTX 5090", "flash-1-abcd1234")
     assert held.get("locked") is True, "isolate_flash_state must run while holding FLASH_SDK_LOCK"
     assert ftrain.FLASH_SDK_LOCK.locked() is False, "lock must be released after terminate"
