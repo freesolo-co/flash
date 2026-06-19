@@ -83,7 +83,7 @@ def _enabled_kwargs() -> dict[str, bool]:
     return {kw: _kernel_on(flag, default_on) for flag, kw, default_on in _KERNELS}
 
 
-def active_kernels(report: Mapping) -> list[str]:
+def active_kernels(report: Mapping[str, object] | None) -> list[str]:
     """The chalk kernels that actually ENGAGED (truthy, non-error result) in an apply report.
 
     For a metrics note recording which kernels ran (so chalk engagement is verifiable without the
