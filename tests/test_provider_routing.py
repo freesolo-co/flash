@@ -383,13 +383,19 @@ def test_attach_no_capacity_walks_instead_of_failing(orch, monkeypatch):
     deleted = []
     monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e) or True)
     monkeypatch.setattr(rp_train, "terminate_endpoint", lambda *a, **k: [])
-    # The capacity walk re-provisions and this time the seed succeeds.
+    # The capacity walk re-provisions and this time the seed succeeds. The recovered
+    # (provider, class) must reach the supervised submit's capacity-walk exclusion so the
+    # first re-allocation can't re-pick the just-starved class.
     resubmitted = []
+    starved_seen = []
     monkeypatch.setattr(
         orch,
         "_submit_seed_supervised",
-        lambda spec, seed, log: resubmitted.append(seed)
-        or {"train_tokens": 4096, "cost_usd": 0.4},
+        lambda spec, seed, log, *, initial_starved=frozenset(): (
+            resubmitted.append(seed)
+            or starved_seen.append(initial_starved)
+            or {"train_tokens": 4096, "cost_usd": 0.4}
+        ),
     )
 
     spec = _spec()
@@ -402,12 +408,16 @@ def test_attach_no_capacity_walks_instead_of_failing(orch, monkeypatch):
         "endpoint_name": "n",
         "job_id": "j-queued",
         "seed": 0,
+        "allocated_gpu": "RTX 5090",
     }
     orch._save_status(st)
     out = orch.attach_run(spec.run_id, log_stream=io.StringIO())
     # Re-provisioned the in-flight seed instead of failing the run.
     assert resubmitted == [0]
     assert "ep-stuck" in deleted  # the capacity-starved endpoint was torn down
+    # The recovered (provider, class) was carried into the re-provision's capacity-walk
+    # exclusion, so the first allocation can't re-pick the just-starved class.
+    assert starved_seen == [frozenset({("runpod", "RTX 5090")})]
     assert out.state == "done"
     assert out.cost_usd == 0.4
 

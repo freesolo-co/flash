@@ -358,8 +358,21 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 file=log,
                 flush=True,
             )
+            # Carry the recovered (provider, class) into the resumed seed's capacity-walk
+            # exclusion: it just proved ``no_capacity``, so the first allocation must not
+            # re-pick it and burn another queue grace before walking. Scoped to the failing
+            # provider (matching the fresh-submit path) and applied only to this resumed seed.
+            starved = (
+                frozenset({(handle.provider, allocated_gpu)})
+                if allocated_gpu
+                else frozenset()
+            )
             _run_seed_loop(
-                spec, log, start_index=resume_index, prior_cost=float(status.cost_usd or 0.0)
+                spec,
+                log,
+                start_index=resume_index,
+                prior_cost=float(status.cost_usd or 0.0),
+                initial_starved=starved,
             )
             return get_status(run_id)
         if not res.ok:
@@ -573,7 +586,9 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
+def _submit_seed_supervised(
+    spec: JobSpec, seed: int, log, *, initial_starved: frozenset[tuple[str, str]] = frozenset()
+) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
     Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
@@ -590,6 +605,12 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
     immediately. The offline test/CI marker FLASH_SKIP_NET takes the blocking
     in-process submit instead (the job poll path is network-only).
+
+    ``initial_starved`` pre-seeds the capacity-walk exclusion with (provider, class)
+    pairs already proven to have no capacity. Recovery uses it: a job recovered from
+    ``no_capacity`` resumes through this path, and without the exclusion the live
+    re-ranking could re-pick the very class that just starved — burning another
+    queue grace before walking.
     """
     from flash.providers.base import PollResult
     from flash.providers.runpod.train import submit_train
@@ -652,7 +673,10 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     # RunPod-only queue result (Vast has no IN_QUEUE), so a RunPod A100 queue-starvation must not
     # drop an available Vast A100 offer — under provider="auto" that could needlessly skip, or
     # even fail, a run whose only remaining capacity is the same class on the other provider.
-    starved_classes: set[tuple[str, str]] = set()
+    # Seed with classes the caller already proved starved (recovery passes the recovered
+    # handle's provider/class so the first allocation can't re-pick the just-starved pair
+    # and burn another queue grace before walking).
+    starved_classes: set[tuple[str, str]] = set(initial_starved)
     # Two independent budgets. ``crash_retries`` (bounded by max_retries) covers genuine
     # infra flakes (host died, network timeout) where we re-provision the SAME-or-next class.
     # ``capacity walks`` are different: a ``no_capacity`` (throttled / stuck IN_QUEUE) result
@@ -922,15 +946,30 @@ def _run_job_inner(spec: JobSpec, log_path: str, upload_code) -> None:
         raise
 
 
-def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -> None:
+def _run_seed_loop(
+    spec: JobSpec,
+    log,
+    *,
+    start_index: int,
+    prior_cost: float,
+    initial_starved: frozenset[tuple[str, str]] = frozenset(),
+) -> None:
     """Run spec.train.seeds[start_index:] under supervision; finalize the run.
 
     Shared by a fresh submit (start_index=0) and post-restart recovery, which
-    resumes the remaining seeds after the in-flight one completes."""
+    resumes the remaining seeds after the in-flight one completes.
+
+    ``initial_starved`` pre-excludes (provider, class) pairs from the FIRST resumed
+    seed's capacity walk — recovery of a ``no_capacity`` job passes the just-starved
+    class so the allocation doesn't immediately re-pick it. Later seeds are fresh
+    submissions on a possibly-recovered market, so the exclusion does not carry over."""
     total_cost = prior_cost
     seeds = spec.train.seeds
     for i in range(start_index, len(seeds)):
         seed = seeds[i]
+        # Only the recovered (in-flight) seed inherits the proven-starved exclusion; a
+        # later seed re-allocates against the live market with a clean slate.
+        starved = initial_starved if i == start_index else frozenset()
         # An early cancel (before any remote handle existed) sets `cancelled`;
         # do not overwrite it with `running` and submit the GPU job anyway.
         if get_status(spec.run_id).state == "cancelled":
@@ -941,7 +980,7 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
             file=log,
             flush=True,
         )
-        metrics = _submit_seed_supervised(spec, seed, log)
+        metrics = _submit_seed_supervised(spec, seed, log, initial_starved=starved)
         total_cost += _persist_metrics(spec, seed, metrics)
         # A cancel can land while this thread writes metrics — after the supervised
         # late-cancel check. Re-read before the post-seed status writes so a late

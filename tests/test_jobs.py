@@ -1118,6 +1118,87 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         assert st.cost_usd > hourly_rate("RTX 4090")
 
 
+def test_attach_no_capacity_excludes_recovered_class_on_reprovision(monkeypatch):
+    # PR #4 review (thread): a run recovered from `no_capacity` re-provisions via the
+    # supervised submit. Without carrying the recovered (provider, class) into the capacity
+    # walk, the first re-allocation could immediately re-pick the just-starved class and burn
+    # another queue grace before walking. Assert the recovered (runpod, allocated_gpu) pair is
+    # excluded from the FIRST re-provision allocation, and the run lands on a different class.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+
+        spec = JobSpec(
+            run_id="recap",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", requested="cheapest", provider="runpod", max_retries=2),
+        )
+        # Persist a handle whose allocated class is the one that starved IN_QUEUE.
+        status = orch.RunStatus(
+            run_id="recap",
+            state="running",
+            spec=spec.to_dict(),
+            remote={
+                "endpoint_id": "epR",
+                "endpoint_name": "n",
+                "job_id": "jR",
+                "seed": 0,
+                "allocated_gpu": "RTX 5090",
+            },
+        )
+        orch._save_status(status)
+
+        # The recovered poll reports the class is capacity-starved -> recovery re-provisions.
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(
+                False, failure="no_capacity", detail="no worker assigned; throttled"
+            ),
+        )
+
+        real_allocate = allocator.allocate
+        excluded_seen: list[frozenset] = []
+
+        def spy_allocate(*a, **k):
+            excluded_seen.append(frozenset(k.get("exclude_gpu_classes", frozenset())))
+            return real_allocate(*a, **k)
+
+        monkeypatch.setattr(allocator, "allocate", spy_allocate)
+
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep2", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        st = orch.attach_run("recap", log_stream=sys.stderr)
+
+        assert st.state == "done"
+        # The very first re-provision allocation excluded the recovered, just-starved pair,
+        # provider-scoped (runpod) — so the walk can't re-pick it on a live re-ranking.
+        assert excluded_seen, "recovery did not re-allocate"
+        assert ("runpod", "RTX 5090") in excluded_seen[0]
+        # And it landed on a different class than the one that starved.
+        assert gpus_seen
+        assert gpus_seen[0] != "RTX 5090"
+
+
 # ---------------------------------------------------------------------------
 # Cross-process cancel via REST handle + attach
 # ---------------------------------------------------------------------------
