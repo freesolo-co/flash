@@ -281,6 +281,32 @@ def test_chalk_extra_pip_worker_env_overrides_os_env_flag(monkeypatch):
     assert chalk_extra_pip(spec) == []
 
 
+def test_build_worker_env_reserves_disaggregated_role_and_rank_keys(monkeypatch):
+    """The disaggregated ROLE / TOPOLOGY / RANK keys are control-plane- and launcher-owned and a
+    per-run [worker_env] must NOT be able to forward them: FLASH_INFERENCE_GPUS would change the
+    effective rollout split away from the sized/billed topology, FLASH_RL_TRAINER_ONLY would make
+    the paid launcher skip starting vllm-serve, and RANK/LOCAL_RANK would suppress the only
+    artifact-writing process (is_artifact_writer keys off RANK==0)."""
+    from flash.providers.runpod.train import build_worker_env
+
+    spec = _spec_worker_env(
+        {
+            "FLASH_INFERENCE_GPUS": "0",  # would collapse a provisioned split to colocate
+            "FLASH_RL_TRAINER_ONLY": "1",  # would make the launcher act as a trainer child
+            "RANK": "3",  # would move artifact writing off the real rank 0
+            "LOCAL_RANK": "3",
+            "FLASH_USER_KNOB": "ok",  # a genuine per-run override still passes through
+        }
+    )
+    env = build_worker_env(spec, 0)
+    # None of the per-run override VALUES ("0"/"1"/"3") may leak through for a reserved key.
+    forwarded = {env.get(k) for k in ("FLASH_INFERENCE_GPUS", "FLASH_RL_TRAINER_ONLY", "RANK", "LOCAL_RANK")}
+    assert forwarded.isdisjoint({"0", "1", "3"}), (
+        f"reserved disaggregated role/rank keys must not be overridable via [worker_env]: {forwarded}"
+    )
+    assert env["FLASH_USER_KNOB"] == "ok"  # non-reserved keys are still forwarded
+
+
 def test_chalk_selection_matches_what_worker_env_forwards(monkeypatch):
     """Consistency: the SAME effective env that decides chalk install must be what the worker
     process sees. A [worker_env] chalk opt-in both (a) triggers chalk_extra_pip and (b) reaches

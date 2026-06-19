@@ -62,6 +62,30 @@ def test_allow_policy_disaggregated_clears_colocate_too_big(monkeypatch, capsys)
     assert "disaggregated split" in capsys.readouterr().out
 
 
+def test_allow_policy_disaggregated_raises_disk_floor(monkeypatch):
+    # A disaggregated split materializes TWO bf16 checkpoint copies (trainer + standalone
+    # `trl vllm-serve`) on the same node plus the HF download/Xet temp/checkpoint-save peak, so the
+    # synthesized open-model disk floor must exceed the colocate single-checkpoint heuristic
+    # (~2 GB/param + 64) — otherwise a paid multi-GPU node provisions and then dies with "No space
+    # left on device". Mirrors the curated 35B entry's validated 300 GB floor.
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 20.0, raising=True)
+    monkeypatch.setattr(
+        "flash.providers.allocator._params_b_for_vram", lambda model_id: 20.0, raising=True
+    )
+    # the 20B model as a disaggregated split -> the elevated two-copies + temp/save floor.
+    split = resolve_model(
+        "acme/big-20b", "grpo", policy="allow", gpu="A100 PCIe", train={"inference_gpus": 2}
+    )
+    assert split.min_disk_gb == 20 * 6 + 96  # 216 GB: trainer + server copies + headroom
+    # and it must exceed the colocate single-checkpoint heuristic (~2 GB/param + 64) for this size.
+    assert split.min_disk_gb > 20 * 2 + 64
+
+    # a small model that DOES fit colocated keeps the lower single-checkpoint floor (no regression).
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 1.2, raising=True)
+    small = resolve_model("acme/tiny-1b", "grpo", policy="allow", gpu="RTX 4090")
+    assert small.min_disk_gb == int(1.2 * 2) + 64
+
+
 def test_allow_policy_unknown_size_warns_but_allows(monkeypatch, capsys):
     monkeypatch.setattr(
         "flash.engine.vram.fetch_hf_params_b", lambda model_id: None, raising=True

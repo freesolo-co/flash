@@ -280,7 +280,24 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None, *, train=None
     # provision a paid worker and then fail in prefetch_model when the checkpoint
     # overflows the 64 GB container default. 0 (unknown size) leaves the default
     # (the user can still raise it with gpu.disk_gb).
-    min_disk = int(est.params_b * 2) + 64 if est.params_b else 0
+    #
+    # A DISAGGREGATED split (we just cleared too_big via inference_gpus>0 above) needs a far
+    # higher floor than this colocate heuristic: the trainer AND a separate `trl vllm-serve`
+    # process BOTH materialize the full bf16 checkpoint on the SAME node, and the HF download
+    # (+ Xet temp + per-step checkpoint saves) pushes PEAK disk well past a single copy — the
+    # exact failure mode the curated 35B entry floors to 300 GB for (~70 GB single checkpoint).
+    # Mirror that ratio for unlisted split models so they don't provision a paid multi-GPU node
+    # and then die with "No space left on device": the trainer + server materialize TWO bf16
+    # copies (~4 GB/param) and the HF download lands a third (~2 GB/param) -> ~6 GB/param, plus
+    # Xet-temp / per-step-checkpoint-save headroom (~96 GB). That reproduces the curated 35B
+    # entry's validated 300 GB floor (6*35 + 96 ~= 306) and scales down for smaller splits.
+    if est.params_b:
+        _split = _ig > 0 and est.verdict in ("tight", "unknown")
+        per_param = 6 if _split else 2
+        headroom = 96 if _split else 64
+        min_disk = int(est.params_b * per_param) + headroom
+    else:
+        min_disk = 0
     return ModelInfo(
         id=model_id,
         display_name=model_id,

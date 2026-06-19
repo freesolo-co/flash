@@ -924,7 +924,27 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # falls back to it when nvidia-smi is unavailable and honors it over an over-exposed node, so a
     # [worker_env] override would let the worker compute a different disaggregated split than was
     # provisioned/billed (or fail as under-provisioned if it exceeds the visible GPUs).
-    _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM", "FLASH_GPU_COUNT"}
+    # The disaggregated ROLE / TOPOLOGY / RANK keys are control-plane- and launcher-owned too and
+    # must NOT be forwardable per run (worker.py asserts FLASH_INFERENCE_GPUS is "reserved in
+    # [worker_env]"):
+    #   FLASH_INFERENCE_GPUS  — _env_inference_gpus() reads it from os.environ and lets it OVERRIDE
+    #     the spec value, so a per-run override changes the effective rollout split away from the
+    #     sized/billed topology (e.g. =0 forces colocate on a model provisioned for a split).
+    #   FLASH_RL_TRAINER_ONLY — the role flag the launcher sets ONLY on its accelerate trainer
+    #     children; forwarded on the parent it makes the paid launcher skip starting vllm-serve and
+    #     try to connect as a trainer child to a server that never comes up (hang/fail).
+    #   RANK / LOCAL_RANK     — accelerate-assigned distributed ranks; is_artifact_writer() keys off
+    #     RANK=="0", so a forwarded RANK can suppress the ONLY process that writes the adapter/DONE.
+    _RESERVED_WORKER_ENV = {
+        "RUN_ID",
+        "HF_REPO",
+        "FLASH_ARM",
+        "FLASH_GPU_COUNT",
+        "FLASH_INFERENCE_GPUS",
+        "FLASH_RL_TRAINER_ONLY",
+        "RANK",
+        "LOCAL_RANK",
+    }
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         if str(k).upper() in _RESERVED_WORKER_ENV:
             continue  # control plane owns run identity; a per-run override would orphan artifacts
