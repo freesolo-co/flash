@@ -202,22 +202,17 @@ def _spec_worker_env(worker_env: dict):
     )
 
 
-def test_chalk_extra_pip_detects_per_run_worker_env_optin(monkeypatch):
-    """DEFECT: a run that enables chalk only via its [worker_env] block (not the control-plane
-    process env) was NOT detected — chalk_extra_pip read bare os.environ, so the spec was never
-    appended and the kernels never installed for that run. The effective worker env (worker_env
-    merged over os.environ) must be what decides selection + the FLASH_CHALK_SPEC lookup."""
+def test_chalk_extra_pip_per_run_worker_env_spec_override(monkeypatch):
+    """A per-run [worker_env] FLASH_CHALK_SPEC overrides the PyPI default for THAT run — resolved
+    against the effective worker env (worker_env merged over os.environ), not bare os.environ, so a
+    per-run source pin actually reaches the worker's extra_pip."""
     from flash.providers.runpod.train import chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)  # nothing in os.environ
-    spec = _spec_worker_env(
-        {
-            "FLASH_FP8_BASE": "1",
-            "FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main",
-        }
-    )
-    # bare process env -> nothing; the opt-in lives only in [worker_env]
-    assert chalk_extra_pip() == []
+    spec = _spec_worker_env({"FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main"})
+    # bare env: chalk's gap-fillers are default-on -> the PyPI default installs
+    assert chalk_extra_pip() == ["freesolo-chalk"]
+    # the per-run [worker_env] spec overrides the source for that run
     assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
 
 
