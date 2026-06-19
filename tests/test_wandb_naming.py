@@ -182,3 +182,32 @@ def test_report_to_inits_wandb_from_spec_without_env(monkeypatch):
     assert calls["project"] == "my-proj"  # project from the spec, via wandb.init
     assert calls["name"] == "my-run"  # run name from the spec
     assert "WANDB_PROJECT" not in os.environ  # the env var is fully gone
+
+
+def test_report_to_is_best_effort_when_wandb_init_fails(monkeypatch):
+    # W&B logging is optional: a broken wandb install / init failure (auth, network) must NOT
+    # abort training — wandb_report_to falls back to [] instead of propagating the exception.
+    import importlib.util
+    import sys
+    import types
+
+    from flash.engine import worker
+
+    fake = types.ModuleType("wandb")
+    fake.run = None
+
+    def _boom(**kw):
+        raise RuntimeError("wandb backend unreachable")
+
+    fake.init = _boom
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    _orig_find = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a, **k: (object() if name == "wandb" else _orig_find(name, *a, **k)),
+    )
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(project="p", run_name="r")))
+
+    assert worker.wandb_report_to() == []  # degrades to no W&B logging, no crash

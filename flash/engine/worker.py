@@ -863,11 +863,18 @@ def wandb_report_to() -> list[str]:
     if importlib.util.find_spec("wandb") is None:
         print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
         return []
-    import wandb
+    # Best-effort, like the bitsandbytes import above: a partial/broken wandb install or an
+    # init failure (auth, network, runtime import error) must NOT abort training — W&B logging is
+    # optional and metrics.json is the source of truth. Any failure -> no W&B logging ([]).
+    try:
+        import wandb
 
-    if wandb.run is None:  # init the run from the spec so the project needs no WANDB_PROJECT env
-        project = (JOB_SPEC.wandb.project if JOB_SPEC else None) or "flash"
-        wandb.init(project=project, name=wandb_run_name())
+        if wandb.run is None:  # init from the spec so the project needs no WANDB_PROJECT env
+            project = (JOB_SPEC.wandb.project if JOB_SPEC else None) or "flash"
+            wandb.init(project=project, name=wandb_run_name())
+    except Exception as e:
+        print(f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)")
+        return []
     return ["wandb"]
 
 

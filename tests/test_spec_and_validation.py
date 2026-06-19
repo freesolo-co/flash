@@ -290,3 +290,46 @@ def test_configure_logging_verbosity() -> None:
     assert logging.getLogger("flash").level == logging.INFO
     _logging.configure_logging(verbosity=2)
     assert logging.getLogger("flash").level == logging.DEBUG
+
+
+# ---------------------------------------------------------------------------
+# [worker_env] secret-key policy — [worker_env] is serialized into job_spec_json
+# (persisted + logged), so secret-bearing keys must be rejected at parse time and set
+# as real env vars instead. These cases pin the _is_secret_key heuristic so it doesn't
+# drift into false positives (legit knobs) or false negatives (real secrets).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "HF_TOKEN",  # secret WORD: TOKEN
+        "OPENAI_API_KEY",  # KEY qualified by API
+        "AWS_SECRET_ACCESS_KEY",  # SECRET word + KEY qualified by SECRET/ACCESS
+        "DB_PASSWORD",  # PASSWORD word
+        "PRIME_API_KEY",
+        "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
+        "MY_CREDENTIAL",
+        "AUTH_KEY",  # KEY qualified by AUTH
+    ],
+)
+def test_worker_env_rejects_secret_keys(key: str) -> None:
+    with pytest.raises(ConfigError, match="must not contain secret-bearing keys"):
+        spec_from_dict(_raw(worker_env={key: "x"}))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "RL_VLLM_GPU_UTIL",  # plain knob
+        "SFT_PACKING",
+        "RL_VLLM_MAX_BATCHED_TOKENS",  # word TOKENS, not the secret word TOKEN
+        "SORT_KEY",  # bare KEY without a secret qualifier
+        "WANDB_ENTITY",  # account routing, not a secret
+        "FLASH_MLP_KERNEL",
+        "VLLM_ATTENTION_BACKEND",
+    ],
+)
+def test_worker_env_allows_non_secret_keys(key: str) -> None:
+    spec = spec_from_dict(_raw(worker_env={key: "v"}))
+    assert spec.worker_env[key] == "v"
