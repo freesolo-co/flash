@@ -2,7 +2,7 @@
 #
 #   docker build -t flash-server .
 #   docker run -p 8080:8080 \
-#     -e RUNPOD_API_KEY=... -e HUGGINGFACE_TOKEN=... -e HF_REPO=org/flash-runs \
+#     -e RUNPOD_API_KEY=... -e HF_TOKEN=... \
 #     -v flash-state:/root/.flash flash-server
 #
 # All persistent state (key DB, run records, results) lives under ~/.flash (fixed paths,

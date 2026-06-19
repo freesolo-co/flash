@@ -4,7 +4,6 @@ estimates, and logging namespace helpers."""
 
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import os
@@ -184,13 +183,9 @@ def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
 
 
 def _fresh_orchestrator(tmp_path, monkeypatch):
-    import flash.runner as runner
+    from tests._helpers.runner import fresh_runner
 
-    importlib.reload(runner)
-    # Storage roots are fixed constants now; redirect to tmp for isolation.
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-    return runner
+    return fresh_runner(tmp_path, monkeypatch)
 
 
 def test_runs_file_path_rejects_traversal(tmp_path, monkeypatch) -> None:
@@ -290,3 +285,57 @@ def test_configure_logging_verbosity() -> None:
     assert logging.getLogger("flash").level == logging.INFO
     _logging.configure_logging(verbosity=2)
     assert logging.getLogger("flash").level == logging.DEBUG
+
+
+# ---------------------------------------------------------------------------
+# [worker_env] secret-key policy — [worker_env] is serialized into job_spec_json
+# (persisted + logged), so secret-bearing keys must be rejected at parse time and set
+# as real env vars instead. These cases pin the _is_secret_key heuristic so it doesn't
+# drift into false positives (legit knobs) or false negatives (real secrets).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "HF_TOKEN",  # secret WORD: TOKEN
+        "OPENAI_API_KEY",  # KEY qualified by API
+        "AWS_SECRET_ACCESS_KEY",  # SECRET word + KEY qualified by SECRET/ACCESS
+        "DB_PASSWORD",  # PASSWORD word
+        "PRIME_API_KEY",
+        "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
+        "MY_CREDENTIAL",
+        "AUTH_KEY",  # KEY qualified by AUTH
+        "SSH_KEY",  # KEY qualified by SSH
+        "DEPLOY_KEY",  # KEY qualified by DEPLOY
+        "GITHUB_PAT",  # PAT word (personal access token)
+    ],
+)
+def test_worker_env_rejects_secret_keys(key: str) -> None:
+    with pytest.raises(ConfigError, match="must not contain secret-bearing keys"):
+        spec_from_dict(_raw(worker_env={key: "x"}))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "RL_VLLM_GPU_UTIL",  # plain knob
+        "SFT_PACKING",
+        "RL_VLLM_MAX_BATCHED_TOKENS",  # word TOKENS, not the secret word TOKEN
+        "SORT_KEY",  # bare KEY without a secret qualifier
+        "WANDB_ENTITY",  # account routing, not a secret
+        "FLASH_MLP_KERNEL",
+        "VLLM_ATTENTION_BACKEND",
+    ],
+)
+def test_worker_env_allows_non_secret_keys(key: str) -> None:
+    spec = spec_from_dict(_raw(worker_env={key: "v"}))
+    assert spec.worker_env[key] == "v"
+
+
+@pytest.mark.parametrize("name", ["BAD=KEY", "", "BAD KEY", "X\tY"])
+def test_worker_env_rejects_invalid_env_names(name: str) -> None:
+    # Names subprocess.Popen(env=...) would reject on the worker (empty / '=' / whitespace) must
+    # fail at parse time, not after a worker has been provisioned.
+    with pytest.raises(ConfigError, match="invalid environment variable name"):
+        spec_from_dict(_raw(worker_env={name: "v"}))
