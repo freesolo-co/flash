@@ -88,7 +88,7 @@ class _FakeClient:
 @pytest.fixture
 def fake_client(monkeypatch) -> _FakeClient:
     client = _FakeClient()
-    monkeypatch.setattr(cli, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: client)
     return client
 
 
@@ -154,7 +154,7 @@ def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None
         def get_run(self, run_id: str) -> dict:
             raise ApiError(404, "unknown run")
 
-    monkeypatch.setattr(cli, "client_from_config", lambda *a, **k: _Erroring())
+    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _Erroring())
     assert _run(["status", "nope"]) != 0
     assert "unknown run" in capsys.readouterr().err
 

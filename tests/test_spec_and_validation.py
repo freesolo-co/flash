@@ -4,7 +4,6 @@ estimates, and logging namespace helpers."""
 
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import os
@@ -184,13 +183,9 @@ def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
 
 
 def _fresh_orchestrator(tmp_path, monkeypatch):
-    import flash.runner as runner
+    from tests._helpers.runner import fresh_runner
 
-    importlib.reload(runner)
-    # Storage roots are fixed constants now; redirect to tmp for isolation.
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-    return runner
+    return fresh_runner(tmp_path, monkeypatch)
 
 
 def test_runs_file_path_rejects_traversal(tmp_path, monkeypatch) -> None:
