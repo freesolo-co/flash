@@ -2195,6 +2195,20 @@ def run_rl():
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     reward_history = list(getattr(hb_cb, "reward_history", []))
+    # A GRPO run that finishes WITHOUT the reward callback ever firing (empty reward_history)
+    # produced NO real training — the rollout scored nothing (e.g. vLLM generation silently
+    # returning no completions, observed on RTX 5090 / sm120: ~1.4 s wall, empty reward + loss
+    # curves, but the run otherwise "succeeds"). That is a FAILURE, not a success: a no-op run with
+    # an unchanged adapter must not be reported as done — fail loudly so the operator/agent doesn't
+    # trust it. (An env returning all-zero rewards still appends 0.0s, so an EMPTY history uniquely
+    # means the reward path never ran.)
+    _steps_run = int(getattr(trainer.state, "global_step", 0) or 0)
+    if not reward_history:
+        raise RuntimeError(
+            f"GRPO scored no reward in {train_wall:.1f}s over {_steps_run} step(s) — the rollout "
+            "produced no completions, so the policy was never actually trained. Failing loudly "
+            "instead of reporting a no-op run as done (seen on RTX 5090/sm120 vLLM rollout)."
+        )
     # Final eval on the actually-saved policy: the cadence only fires on multiples of
     # eval_every_steps, so when the run length isn't a multiple the last cadence eval predates the
     # saved adapter. run_final adds one eval on the final model (no-ops if the last step already
