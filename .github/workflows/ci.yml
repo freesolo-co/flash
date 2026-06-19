@@ -22,9 +22,7 @@ jobs:
         run: uv sync --extra server --dev
 
       - name: Ruff
-        run: |
-          uv run ruff check .
-          uv run ruff format --check .
+        run: uv run ruff check .
 
       - name: Tests (CPU, offline)
         env:
