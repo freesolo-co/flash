@@ -12,20 +12,20 @@ from flash.providers.runpod.train import (
 
 
 def test_resolve_worker_deps_default(monkeypatch):
-    monkeypatch.delenv("AUTOSLM_WORKER_DEPS", raising=False)
+    monkeypatch.delenv("FLASH_WORKER_DEPS", raising=False)
     # The single pinned stack is the validated default (bench/results/phase1 matrix).
     assert resolve_worker_deps() == WORKER_DEPS
 
 
 def test_resolve_worker_deps_explicit_list_wins(monkeypatch):
     # Whitespace-separated; a comma is part of a PEP 440 range, not a delimiter.
-    monkeypatch.setenv("AUTOSLM_WORKER_DEPS", "torch==2.99  vllm==9.9.9   transformers>=5.6,<5.11")
+    monkeypatch.setenv("FLASH_WORKER_DEPS", "torch==2.99  vllm==9.9.9   transformers>=5.6,<5.11")
     assert resolve_worker_deps() == ["torch==2.99", "vllm==9.9.9", "transformers>=5.6,<5.11"]
 
 
 def test_resolve_worker_deps_json_list_supports_comma_specs(monkeypatch):
     monkeypatch.setenv(
-        "AUTOSLM_WORKER_DEPS", '["torch==2.10.0", "transformers>=5.6,<5.11", "fla==0.5.0"]'
+        "FLASH_WORKER_DEPS", '["torch==2.10.0", "transformers>=5.6,<5.11", "fla==0.5.0"]'
     )
     assert resolve_worker_deps() == ["torch==2.10.0", "transformers>=5.6,<5.11", "fla==0.5.0"]
 
@@ -43,7 +43,7 @@ def test_worker_stack_pins_qwen35_capable_versions():
 # ---------------------------------------------------------------------------
 def _import_worker(monkeypatch):
     monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as worker
 
@@ -86,7 +86,7 @@ def test_heartbeat_commit_is_throttled(monkeypatch):
     """heartbeat() must rate-limit HF commits (per-step commits blow HF's 128/hour repo cap),
     while always committing milestone stages."""
     monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as w
 
@@ -115,7 +115,7 @@ def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward
     callback behind the checkpoint daemon's HF commit during GRPO."""
     monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as w
 
@@ -140,7 +140,7 @@ def test_heartbeat_terminal_only_mode(monkeypatch):
     runs sharing one HF_REPO stays under the 128-commits/hour cap; terminal done/error_* still
     always commit so the control plane never misses a transition."""
     monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as w
 
@@ -170,7 +170,7 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
     """optimal_attn_impl picks the arch-best backend for the live GPU; with no CUDA (CI) it
     leaves transformers' default (None). There is no env override."""
     monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as w
 
@@ -181,7 +181,7 @@ def test_liger_on_requires_default_and_gpu(monkeypatch):
     """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
     liger_kernel (both absent in CI), so it's off here too."""
     monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as w
 
@@ -193,7 +193,7 @@ def test_liger_default_model_size_gate(monkeypatch):
     """Liger default is OFF for small models (1B-class, measured net loss PR #174) and ON only
     for models ≥ ~3B where fused-CE's memory win pays off."""
     monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as w
 
