@@ -1,0 +1,17 @@
+model = "openbmb/MiniCPM5-1B"
+algorithm = "sft"
+[environment]
+id = "freesolo-co/flash-bench"
+pip = ["verifiers", "flash-bench", "--extra-index-url", "https://hub.primeintellect.ai/freesolo-co/simple/"]
+[train]
+seeds = [0]
+epochs = 2
+max_examples = 512
+batch_size = 16
+max_length = 1024
+hf_repo = "DavidBShan/asb-costtest"
+[gpu]
+type = "A100 PCIe"
+provider = "auto"
+allow_unvalidated = true
+max_wall_seconds = 3000

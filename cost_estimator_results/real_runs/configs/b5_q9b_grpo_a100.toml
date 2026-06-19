@@ -1,0 +1,18 @@
+model = "Qwen/Qwen3.5-9B"
+algorithm = "grpo"
+[environment]
+id = "freesolo-co/flash-bench"
+pip = ["verifiers", "flash-bench", "--extra-index-url", "https://hub.primeintellect.ai/freesolo-co/simple/"]
+[train]
+seeds = [0]
+steps = 16
+group_size = 4
+batch_size = 8
+max_tokens = 256
+max_length = 768
+hf_repo = "DavidBShan/asb-costtest"
+[gpu]
+type = "A100 PCIe"
+provider = "auto"
+allow_unvalidated = true
+max_wall_seconds = 3000
