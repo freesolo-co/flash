@@ -855,7 +855,8 @@ def wandb_report_to() -> list[str]:
     NO WANDB_PROJECT / WANDB_NAME environment variable. HF's WandbCallback has no project argument
     and would read WANDB_PROJECT from the env, so we initialize the run directly via the wandb SDK
     here (``wandb.init(project=..., name=...)``); the Trainer's callback then reuses that run. The
-    only W&B env var is the WANDB_API_KEY credential."""
+    run's entity is the API key's default account/team (we don't pass ``entity=``), so the only
+    W&B env var is the WANDB_API_KEY credential."""
     if not os.environ.get("WANDB_API_KEY"):
         return []
     import importlib.util
@@ -2178,9 +2179,10 @@ def run_rl():
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
     # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
+    # Capture the install report so the engaged kernels land in metrics (active_kernels below).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
-    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or FLASH_EVAL_EVERY_STEPS,
-    # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
+    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps > 0): greedy eval on a
+    # held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
     # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.
     periodic_eval = _maybe_attach_periodic_eval(
         trainer,

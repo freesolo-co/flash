@@ -176,10 +176,11 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 def _chalk_selected(spec=None) -> bool:
     """True if ANY chalk kernel would run on the worker -> chalk must be installed.
 
-    chalk's gap-fillers (RoPE/QKV/LoRA/embedding) are ON BY DEFAULT (engine.chalk_kernels), so this
+    chalk's gap-fillers (RoPE/LoRA/embedding) are ON BY DEFAULT (engine.chalk_kernels), so this
     is True for a normal run. It is False only when every kernel that would otherwise be enabled is
-    explicitly set to 0 — i.e. all four default-on gap-fillers disabled via ``FLASH_<K>=0`` (the
-    default-off opt-in kernels need no flag to stay off). Resolved against the EFFECTIVE worker env
+    explicitly set to 0 — i.e. the three default-on gap-fillers (ROPE/TRITON_LORA/EMBED) disabled
+    via ``FLASH_<K>=0`` (the default-off opt-in kernels — QKV/MLP/FP8 base — need no flag to stay
+    off, so deselecting chalk does NOT require setting them to 0). Resolved against the EFFECTIVE worker env
     — the run's ``[worker_env]`` merged over ``os.environ`` so a per-run override is honored (see
     ``_effective_worker_env``). Delegates to ``chalk_kernels.is_chalk_enabled`` (the single source
     of truth for the flag/default logic) rather than re-parsing the kernel table here.
@@ -834,12 +835,14 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
-        # W&B credential that enables logging. The project + run name come from the spec's typed
-        # [wandb] config, NOT env vars (see engine.worker.wandb_report_to / wandb_run_name).
+        # W&B credential that enables logging. Project + run name come from the spec's typed
+        # [wandb] config (NOT env vars); the run's entity is the API key's default account/team
+        # (wandb_report_to does not pass entity=).
         "WANDB_API_KEY",
-        # Periodic mid-run GRPO eval cadence override (engine.worker reads it; >0 enables). The
-        # held-out sample size comes from the run's [train] eval_examples, not an env var.
-        "FLASH_EVAL_EVERY_STEPS",
+        # NB: mid-run GRPO eval cadence is NOT an env var — it comes solely from the run's
+        # [train] eval_every_steps (with eval_examples for the sample size); the worker resolves it
+        # via midrun_eval.eval_config(spec_every=...) and ignores any FLASH_EVAL_EVERY_STEPS env
+        # (see test_eval_config_ignores_env_cadence_override). So there is nothing to forward here.
         # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
         # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
         # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a
@@ -847,18 +850,15 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # Without this it silently no-ops on success.
         "FLASH_UPLOAD_CONSOLE",
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
-        # the WORKER decides which installers to run from these flags. install_chalk_kernels runs
+        # the WORKER decides which kernels to enable from these flags. install_chalk_kernels runs
         # INSIDE the worker subprocess and reads them from its own process env, so a control-plane
         # FLASH_* selection must be forwarded here or every chalk kernel silently no-ops on every
-        # remote run. FLASH_CHALK_SPEC is the install spec install_chalk_kernels points operators
-        # at (and is also consumed at submit time to add chalk to the worker's extra_pip).
+        # remote run. These are exactly the per-kernel boolean flags in chalk_kernels._KERNELS
+        # (one per apply_chalk_kernel_to_qwen35 keyword); FLASH_<K>=0/1 overrides the kernel's
+        # default. FLASH_CHALK_SPEC is the install spec install_chalk_kernels points operators at
+        # (and is also consumed at submit time to add chalk to the worker's extra_pip).
         "FLASH_MLP_KERNEL",
-        "FLASH_MLP_FP8",
-        "FLASH_MLP_FP8_DOWN",
         "FLASH_FP8_BASE",
-        "FLASH_FP8_BASE_ATTN",
-        "FLASH_FP8_BASE_MLP",
-        "FLASH_FP8_BASE_MIN_K",
         "FLASH_TRITON_LORA",
         "FLASH_EMBED_KERNEL",
         "FLASH_QKV_KERNEL",
