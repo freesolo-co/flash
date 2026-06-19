@@ -445,3 +445,49 @@ def test_train_body_installs_prime_only_when_absent():
     install_idx = src.index('"install", "prime"')
     guard_idx = src.index('shutil.which("prime") is None')
     assert guard_idx < install_idx, "the prime install must be gated by the which() check"
+
+
+def _launcher_worker(monkeypatch, *, inference_gpus, total_gpus, trainer_only=False):
+    """Configure the worker module globals so _is_disaggregated_ddp_launcher can be exercised
+    CPU-only: an rl JobSpec with the given inference_gpus, a stubbed nvidia-smi GPU count, and the
+    trainer-only role flag toggled. Returns the worker module."""
+    import flash.engine.worker as ne
+    from flash.spec import JobSpec, TrainSpec
+
+    monkeypatch.setattr(ne, "RUN_MODE", "rl", raising=False)
+    monkeypatch.setattr(
+        ne,
+        "JOB_SPEC",
+        JobSpec(
+            model="Qwen/Qwen3.5-4B",
+            algorithm="grpo",
+            train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs", inference_gpus=inference_gpus),
+        ),
+        raising=False,
+    )
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.setattr(_d, "detect_total_gpus", lambda env=None: total_gpus)
+    monkeypatch.setattr(_d, "trainer_only_mode", lambda env=None: trainer_only)
+    # _env_inference_gpus consults FLASH_INFERENCE_GPUS; keep it unset so the spec value is used.
+    monkeypatch.delenv("FLASH_INFERENCE_GPUS", raising=False)
+    return ne
+
+
+def test_is_disaggregated_ddp_launcher_only_for_multi_trainer(monkeypatch):
+    """The launcher detector (which gates the fla CUDA-probe skip) must be True ONLY for the
+    multi-trainer (train_gpus>1) disaggregated launcher and False for the trainer child, the
+    single-trainer (1:N) split, and the colocate path — so a single-process trainer still drops
+    fla on Hopper while the always-alive launcher never binds an idle, rank-0-starving CUDA context."""
+    # 2 train : 1 infer (total 3, inference_gpus 1) -> multi-trainer launcher
+    ne = _launcher_worker(monkeypatch, inference_gpus=1, total_gpus=3)
+    assert ne._is_disaggregated_ddp_launcher() is True
+    # The accelerate child of that same split IS a trainer -> must NOT skip (drops fla rank-local)
+    ne = _launcher_worker(monkeypatch, inference_gpus=1, total_gpus=3, trainer_only=True)
+    assert ne._is_disaggregated_ddp_launcher() is False
+    # 1 train : 1 infer (total 2) -> single-trainer, single process -> not a launcher
+    ne = _launcher_worker(monkeypatch, inference_gpus=1, total_gpus=2)
+    assert ne._is_disaggregated_ddp_launcher() is False
+    # colocate (inference_gpus=0) -> not a launcher
+    ne = _launcher_worker(monkeypatch, inference_gpus=0, total_gpus=1)
+    assert ne._is_disaggregated_ddp_launcher() is False

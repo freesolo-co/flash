@@ -1889,6 +1889,36 @@ def _fp8_native_no_cuda_context() -> bool | None:
     return None
 
 
+def _is_disaggregated_ddp_launcher() -> bool:
+    """True when THIS main() process is the multi-trainer (train_gpus>1) disaggregated DDP launcher.
+
+    The launcher builds no trainer: it starts the vLLM rollout server, then re-execs the worker under
+    ``accelerate launch`` and waits while the children train. It STAYS ALIVE the whole run, so any
+    CUDA context it binds (e.g. _drop_fla_on_hopper's get_device_capability) sits idle on the first
+    trainer card and steals VRAM from / OOMs rank 0 on a tight 2:1/2:2 split — the same hazard run_rl
+    already avoids by skipping wait_for_gpu/setup_perf_backends on the launcher. Computed CUDA-FREE
+    (env + nvidia-smi only) so the check itself never creates the context it is guarding against."""
+    if RUN_MODE != "rl":
+        return False
+    from flash.engine import disaggregated as _disagg
+
+    if _disagg.trainer_only_mode():
+        return False  # the accelerate child IS a trainer; it must drop fla and bind its rank device
+    inference_gpus = int(JOB_SPEC.train.inference_gpus) if (JOB_SPEC and JOB_SPEC.train) else 0
+    inference_gpus = _env_inference_gpus(inference_gpus)
+    if inference_gpus <= 0:
+        return False
+    try:
+        from flash.engine.rollout_bench import select_rollout_split
+
+        total = _disagg.detect_total_gpus()
+        if inference_gpus >= total:
+            return False  # invalid split; run_rl raises with a clear message
+        return select_rollout_split(total, inference_gpus).train_gpus > 1
+    except Exception:
+        return False
+
+
 def _pin_trainer_devices_for_disaggregated() -> None:
     """Pin CUDA_VISIBLE_DEVICES to the TRAINER's devices before any CUDA context is created.
 
@@ -3071,6 +3101,15 @@ def _drop_fla_on_hopper() -> None:
     """
     import importlib.util
     import subprocess
+
+    # The multi-trainer DDP launcher trains NOTHING (it re-execs the worker under accelerate and
+    # waits) so it has no fla backward to protect — and it stays alive the whole run, so the
+    # get_device_capability() probe below would bind a retained CUDA context on the first trainer card
+    # and starve/OOM rank 0 (the very hazard run_rl avoids by skipping wait_for_gpu/perf_backends on
+    # the launcher). Each accelerate child runs _drop_fla_on_hopper in its own rank-local process.
+    if _is_disaggregated_ddp_launcher():
+        print("[hopper] disaggregated DDP launcher: skip fla probe (children drop it rank-local)")
+        return
 
     try:
         import torch

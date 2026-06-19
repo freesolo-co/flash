@@ -380,6 +380,36 @@ def _worker_env(raw: Any) -> dict[str, str]:
             "Set [train].inference_gpus instead (a per-run override here would mis-size/mis-bill the "
             "provisioned node)"
         )
+    # The disaggregated launcher sets these INTERNAL role/rank flags itself when it re-execs the
+    # worker under `accelerate launch` (FLASH_RL_TRAINER_ONLY marks the accelerate child; RANK /
+    # LOCAL_RANK / WORLD_SIZE / MASTER_* are the distributed-rendezvous coordinates accelerate
+    # injects per rank; FLASH_VLLM_GROUP_PORT is the trainer<->server NCCL rendezvous port). A per-run
+    # [worker_env] override is merged into the worker env (build_worker_env), so e.g.
+    # FLASH_RL_TRAINER_ONLY=1 would make the paid LAUNCHER process take the trainer-only branch —
+    # skipping the rollout-server launch and then hanging while GRPO connects to a server that was
+    # never started (or a stray RANK/group-port would corrupt the real children's rendezvous). These
+    # are control-plane/launcher-owned, never operator-set; reject them at parse.
+    _role = sorted(
+        k
+        for k in env
+        if k.upper()
+        in {
+            "FLASH_RL_TRAINER_ONLY",
+            "FLASH_VLLM_GROUP_PORT",
+            "RANK",
+            "LOCAL_RANK",
+            "WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+        }
+    )
+    if _role:
+        raise ConfigError(
+            f"[worker_env] must not set the disaggregated trainer role/rank flags ({', '.join(_role)}): "
+            "these are injected by the launcher / accelerate when it spawns the trainer ranks. A "
+            "per-run override would hijack the paid launcher into a broken trainer-only process (no "
+            "rollout server is started) or corrupt the distributed rendezvous"
+        )
     return env
 
 

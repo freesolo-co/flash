@@ -96,6 +96,30 @@ def test_worker_env_rejects_topology_overrides(key) -> None:
         spec_from_dict(raw)
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "FLASH_RL_TRAINER_ONLY",
+        "flash_rl_trainer_only",
+        "FLASH_VLLM_GROUP_PORT",
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    ],
+)
+def test_worker_env_rejects_role_rank_flags(key) -> None:
+    """The launcher / accelerate inject the disaggregated trainer role + distributed-rank flags when
+    they spawn the trainer ranks. A per-run [worker_env] override is merged into the worker env, so
+    e.g. FLASH_RL_TRAINER_ONLY=1 would hijack the paid launcher into a broken trainer-only process
+    (no rollout server is started). Reject them at parse (case-insensitively)."""
+    raw = _raw()
+    raw["worker_env"] = {key: "1"}
+    with pytest.raises(ConfigError, match="must not set the disaggregated trainer role/rank flags"):
+        spec_from_dict(raw)
+
+
 def test_worker_env_allows_ordinary_knobs() -> None:
     """A legit per-run knob (e.g. a kernel A/B flag) still passes through [worker_env]."""
     raw = _raw()
