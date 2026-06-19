@@ -178,22 +178,16 @@ def _chalk_selected(spec=None) -> bool:
     """True if ANY chalk kernel would run on the worker -> chalk must be installed.
 
     chalk's gap-fillers (RoPE/QKV/LoRA/embedding) are ON BY DEFAULT (engine.chalk_kernels), so this
-    is True for a normal run and False only when EVERY kernel is explicitly disabled (``FLASH_<K>=0``)
-    in the EFFECTIVE worker env — the run's ``[worker_env]`` merged over ``os.environ`` so a per-run
-    override is honored (see ``_effective_worker_env``). Mirrors ``chalk_kernels._kernel_on``.
+    is True for a normal run. It is False only when every kernel that would otherwise be enabled is
+    explicitly set to 0 — i.e. all four default-on gap-fillers disabled via ``FLASH_<K>=0`` (the
+    default-off opt-in kernels need no flag to stay off). Resolved against the EFFECTIVE worker env
+    — the run's ``[worker_env]`` merged over ``os.environ`` so a per-run override is honored (see
+    ``_effective_worker_env``). Delegates to ``chalk_kernels.is_chalk_enabled`` (the single source
+    of truth for the flag/default logic) rather than re-parsing the kernel table here.
     """
-    from flash.engine.chalk_kernels import _KERNELS
+    from flash.engine.chalk_kernels import is_chalk_enabled
 
-    env = _effective_worker_env(spec)
-    for flag, _installer, _needs_model, default_on in _KERNELS:
-        v = env.get(flag)
-        if v is None or not v.strip():
-            on = default_on
-        else:
-            on = v.strip().lower() not in ("0", "false", "no", "off")
-        if on:
-            return True
-    return False
+    return is_chalk_enabled(_effective_worker_env(spec))
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
@@ -208,9 +202,10 @@ def chalk_extra_pip(spec=None) -> list[str]:
     the run's ``[worker_env]`` merged over ``os.environ`` — so it matches exactly what the worker
     process will see (``build_worker_env``) and a per-run ``[worker_env]`` opt-in installs chalk.
 
-    freesolo-chalk is unpublished, so there is no auto-installable default: the operator MUST set
-    ``FLASH_CHALK_SPEC`` to an installable spec (a git URL with access, or a wheel/path). When a
-    chalk kernel flag is set but ``FLASH_CHALK_SPEC`` is empty we log a warning and add nothing —
+    Chalk's gap-fillers are default-on, so chalk is selected for a normal run even with no FLASH_*
+    flags set. freesolo-chalk is unpublished, so there is no auto-installable default: the operator
+    MUST set ``FLASH_CHALK_SPEC`` to an installable spec (a git URL with access, or a wheel/path).
+    When chalk is selected but ``FLASH_CHALK_SPEC`` is empty we log at info and add nothing —
     ``install_chalk_kernels`` then finds no chalk on the worker and safely no-ops.
     """
     if not _chalk_selected(spec):

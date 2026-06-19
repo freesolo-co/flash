@@ -24,10 +24,15 @@ degrades to a no-op.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 
 from flash._logging import get_logger
 
 log = get_logger(__name__)
+
+# Set once we've logged the "freesolo-chalk not installed" notice — install_chalk_kernels runs
+# twice per training run (pre-/post-build), and this keeps the notice to a single line per process.
+_MISSING_CHALK_LOGGED = False
 
 
 def _truthy(name: str) -> bool:
@@ -69,13 +74,29 @@ _KERNELS: list[tuple[str, str, bool, bool]] = [
 ]
 
 
-def _kernel_on(flag: str, default_on: bool) -> bool:
-    """A kernel is ON when its FLASH_* flag is set truthy, OFF when set falsey, and the DEFAULT
-    when the flag is unset — so the gap-fillers run by default and FLASH_<K>=0 disables them."""
-    v = os.environ.get(flag)
-    if v is None or not v.strip():
+def _flag_on(value: str | None, default_on: bool) -> bool:
+    """Resolve one FLASH_* flag value: ON when set truthy, OFF when set falsey, and the DEFAULT
+    when the flag is UNSET *or empty/whitespace* (an empty value reads as unset, not OFF) — so the
+    gap-fillers run by default and FLASH_<K>=0 disables them."""
+    if value is None or not value.strip():
         return default_on
-    return v.strip().lower() not in ("0", "false", "no", "off")
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _kernel_on(flag: str, default_on: bool) -> bool:
+    """As :func:`_flag_on`, reading ``flag`` from this process's ``os.environ``."""
+    return _flag_on(os.environ.get(flag), default_on)
+
+
+def is_chalk_enabled(env: Mapping[str, str]) -> bool:
+    """True if ANY chalk kernel is enabled in ``env`` (so chalk must be installed).
+
+    Resolves every kernel's FLASH_* flag in ``env`` against its default (gap-fillers default-on),
+    so it is True for a normal run and False only when every otherwise-enabled kernel is explicitly
+    set to 0. The single source of truth for "is chalk selected"; ``providers.runpod.train`` uses
+    this instead of re-implementing the flag parsing against the ``_KERNELS`` table.
+    """
+    return any(_flag_on(env.get(flag), default_on) for flag, _i, _n, default_on in _KERNELS)
 
 
 def _selected_installers() -> list[tuple[str, bool, dict]]:
@@ -137,11 +158,15 @@ def install_chalk_kernels(model=None) -> dict:
     except ImportError:
         # chalk's gap-fillers are default-on, but freesolo-chalk isn't installed on this worker
         # (no FLASH_CHALK_SPEC, or running on the control plane). Documented as always safe: the
-        # kernels degrade to the eager/Liger path. Log once at info so it's visible but not noisy.
-        log.info(
-            "chalk gap-filling kernels are default-on but freesolo-chalk is not installed "
-            "(set FLASH_CHALK_SPEC to an installable spec on the worker); using eager/Liger."
-        )
+        # kernels degrade to the eager/Liger path. install_chalk_kernels is called twice per run
+        # (pre- and post-build), so gate this to ONCE per process to avoid duplicate log lines.
+        global _MISSING_CHALK_LOGGED
+        if not _MISSING_CHALK_LOGGED:
+            _MISSING_CHALK_LOGGED = True
+            log.info(
+                "chalk gap-filling kernels are default-on but freesolo-chalk is not installed "
+                "(set FLASH_CHALK_SPEC to an installable spec on the worker); using eager/Liger."
+            )
         return {}
     except Exception as e:
         # A partially-installed / version-incompatible chalk can raise non-ImportError errors at
