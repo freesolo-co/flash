@@ -1,162 +1,150 @@
 """Optional chalk GPU kernels (the ``freesolo-chalk`` package).
 
-Chalk holds Freesolo's hand-written Triton/CUDA kernels that complement Liger
-(fused GEMMs, the LoRA-delta matmuls, the QKV norm+RoPE epilogue, embedding gather,
-FP8 frozen-base GEMMs).
+Chalk holds Freesolo's hand-written Triton/CUDA kernels that complement Liger: the RoPE the
+qwen3.5 hybrid arch needs (Liger refuses it), the LoRA-delta matmul, fused MLP, the QKV
+norm+RoPE attention epilogue, embedding gather, and FP8 frozen-base GEMMs.
 
-Chalk follows the **install-on-call** model (mirroring Liger's
-``apply_liger_kernel_to_qwen3``): chalk reads NO env vars — *calling* an installer IS
-the opt-in. Each installer then arch-gates itself, runs a numeric self-test on install,
-patches only frozen ``nn.Linear`` layers, and silently falls back to the eager / Liger
-path (a no-op on CPU / the control plane) on any failure.
+Chalk ships a Liger-style one-call entry point, ``apply_chalk_kernel_to_qwen35(model, ...)``,
+mirroring ``apply_liger_kernel_to_qwen3``: enablement is the call itself (no env flag), each kernel
+is a boolean keyword, and it NEVER raises on a kernel failure (every installer self-tests +
+arch-gates and falls back to the eager/Liger path; a no-op off-GPU). flash applies it
+AUTOMATICALLY — like Liger — after the trainer builds the model, with the **gap-filling** kernels
+Liger leaves on the eager path ON BY DEFAULT: RoPE, the LoRA-delta matmul, and embedding gather.
+The kernels that OVERLAP Liger (fused MLP / SwiGLU — Liger owns MLP) or are situational (the
+eval-only QKV epilogue, the Hopper-only FP8 frozen base) stay OPT-IN.
 
-Because chalk no longer gates itself, the FLASH WORKER must decide *which* installers to
-call. :func:`install_chalk_kernels` reads per-kernel ``FLASH_*`` selection flags (set by
-the operator, forwarded to the worker by ``providers.runpod.train.build_worker_env``) and
-calls ONLY the selected chalk installers. With NO flags set (the default) it calls
-nothing, so it is always safe to invoke; and if ``freesolo-chalk`` isn't installed at all
-(e.g. on the control plane, or a worker without a chalk spec) the whole module degrades to
-a no-op.
+Liger is applied by TRL (``use_liger_kernel``); chalk composes ON TOP of the live Liger modules,
+so flash calls chalk with ``liger=False``. Per-kernel ``FLASH_*`` flags are OVERRIDES:
+``FLASH_<K>=0`` disables a default-on kernel, ``FLASH_<K>=1`` enables an opt-in one. If
+``freesolo-chalk`` isn't installed (no ``FLASH_CHALK_SPEC``, or on the control plane) the whole
+module degrades to a no-op.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 
 from flash._logging import get_logger
 
 log = get_logger(__name__)
 
+# Chalk kernel table: (FLASH_* flag, apply_chalk_kernel_to_qwen35 keyword, default_on).
+# The GAP-FILLERS that complement Liger are ON BY DEFAULT — applied automatically like
+# apply_liger_kernel — because each chalk installer self-tests on install and falls back to the
+# eager/Liger path on any failure, so always-applying them is safe:
+#   * rope             — the RoPE Liger REFUSES on the qwen3.5 hybrid arch (its only real gap)
+#   * fused_lora_delta — the LoRA-delta matmul on the trainable path (Liger doesn't touch adapters)
+#   * fused_embedding  — the embedding gather (Liger doesn't touch it)
+# The OVERLAPPING / situational kernels stay OPT-IN (default off): the fused MLP overlaps Liger's
+# SwiGLU (Liger owns MLP), the attn epilogue is eval-only (needs q/k/v out of LORA_TARGETS), and the
+# FP8 frozen base is Hopper sm_90+ only. FLASH_<K>=0 turns a default-on kernel OFF; FLASH_<K>=1
+# turns a default-off one ON. The keyword is exactly chalk's apply_chalk_kernel_to_qwen35 kwarg.
+_KERNELS: list[tuple[str, str, bool]] = [
+    ("FLASH_ROPE_KERNEL", "rope", True),
+    ("FLASH_TRITON_LORA", "fused_lora_delta", True),
+    ("FLASH_EMBED_KERNEL", "fused_embedding", True),
+    ("FLASH_MLP_KERNEL", "fused_mlp", False),  # opt-in (Liger owns MLP/SwiGLU)
+    ("FLASH_QKV_KERNEL", "attn_epilogue", False),  # opt-in (eval-only; needs q/k/v out of LoRA)
+    ("FLASH_FP8_BASE", "fp8_frozen_base", False),  # opt-in (Hopper sm_90+ only)
+]
 
-def _truthy(name: str) -> bool:
-    """A FLASH_* flag counts as ON when set to a non-empty, non-false value."""
-    v = os.environ.get(name)
-    return v is not None and v.strip().lower() not in ("", "0", "false", "no", "off")
+
+def _flag_on(value: str | None, default_on: bool) -> bool:
+    """Resolve one FLASH_* flag value: ON when set truthy, OFF when set falsey, and the DEFAULT
+    when the flag is UNSET *or empty/whitespace* (an empty value reads as unset, not OFF) — so the
+    gap-fillers run by default and FLASH_<K>=0 disables them."""
+    if value is None or not value.strip():
+        return default_on
+    return value.strip().lower() not in ("0", "false", "no", "off")
 
 
-def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return int(raw.strip())
-    except ValueError:
-        log.warning("ignoring non-integer %s=%r (using %d)", name, raw, default)
-        return default
+def _kernel_on(flag: str, default_on: bool) -> bool:
+    """As :func:`_flag_on`, reading ``flag`` from this process's ``os.environ``."""
+    return _flag_on(os.environ.get(flag), default_on)
 
 
-def _selected_installers() -> list[tuple[str, bool, dict]]:
-    """The chalk installers the operator selected via ``FLASH_*`` flags.
+def is_chalk_enabled(env: Mapping[str, str]) -> bool:
+    """True if ANY chalk kernel is enabled in ``env`` (so chalk must be installed).
 
-    Returns ``(installer_name, needs_model, kwargs)`` for each ENABLED kernel. ``needs_model``
-    marks the instance-level installers (they patch the materialized ``nn.Module`` and must be
-    skipped when no model is available yet); the class/function-level ones install with no model.
-
-    Default (no flags set) is an empty list -> :func:`install_chalk_kernels` calls nothing.
+    Resolves every kernel's FLASH_* flag in ``env`` against its default (gap-fillers default-on),
+    so it is True for a normal run and False only when every otherwise-enabled kernel is explicitly
+    set to 0. The single source of truth for "is chalk selected"; ``providers.runpod.train`` uses
+    this instead of re-implementing the flag parsing against the ``_KERNELS`` table.
     """
-    selected: list[tuple[str, bool, dict]] = []
-    # Class/function-level kernels (patch the model class / a global fn; no model arg needed).
-    # chalk signatures: install_qwen35_mlp(model=None), install_qwen35_qkv(model=None),
-    # install_lora() [no model param], install_qwen35_rope() [no model param].
-    if _truthy("FLASH_MLP_KERNEL"):
-        selected.append(("install_qwen35_mlp", False, {}))
-    if _truthy("FLASH_QKV_KERNEL"):
-        selected.append(("install_qwen35_qkv", False, {}))
-    if _truthy("FLASH_TRITON_LORA"):
-        selected.append(("install_lora", False, {}))
-    if _truthy("FLASH_ROPE_KERNEL"):
-        selected.append(("install_qwen35_rope", False, {}))
-    # Instance-level kernels (need the built nn.Module).
-    # chalk signatures: install_qwen35_mlp_fp8(model, *, down=True),
-    # install_fp8_base(model, *, attn=True, mlp=True, min_k=256),
-    # install_qwen35_embedding(model).
-    if _truthy("FLASH_MLP_FP8"):
-        # FLASH_MLP_FP8_DOWN selects whether the down-projection is fused too (chalk default True).
-        down = os.environ.get("FLASH_MLP_FP8_DOWN")
-        kwargs = {} if down is None else {"down": _truthy("FLASH_MLP_FP8_DOWN")}
-        selected.append(("install_qwen35_mlp_fp8", True, kwargs))
-    if _truthy("FLASH_FP8_BASE"):
-        # Per-kernel scope knobs mirror chalk's install_fp8_base kwargs; only forward the ones the
-        # operator set so chalk's own defaults (attn=True, mlp=True, min_k=256) apply otherwise.
-        kwargs = {}
-        if os.environ.get("FLASH_FP8_BASE_ATTN") is not None:
-            kwargs["attn"] = _truthy("FLASH_FP8_BASE_ATTN")
-        if os.environ.get("FLASH_FP8_BASE_MLP") is not None:
-            kwargs["mlp"] = _truthy("FLASH_FP8_BASE_MLP")
-        if os.environ.get("FLASH_FP8_BASE_MIN_K") is not None:
-            kwargs["min_k"] = _int_env("FLASH_FP8_BASE_MIN_K", 256)
-        selected.append(("install_fp8_base", True, kwargs))
-    if _truthy("FLASH_EMBED_KERNEL"):
-        selected.append(("install_qwen35_embedding", True, {}))
-    return selected
+    return any(_flag_on(env.get(flag), default_on) for flag, _kw, default_on in _KERNELS)
+
+
+def _enabled_kwargs() -> dict[str, bool]:
+    """The ``apply_chalk_kernel_to_qwen35`` boolean kwargs resolved from the FLASH_* flags.
+
+    Gap-fillers default-on, overlapping/situational kernels default-off; FLASH_<K> overrides.
+    """
+    return {kw: _kernel_on(flag, default_on) for flag, kw, default_on in _KERNELS}
+
+
+def active_kernels(report: Mapping[str, object] | None) -> list[str]:
+    """The chalk kernels that actually ENGAGED (truthy, non-error result) in an apply report.
+
+    For a metrics note recording which kernels ran (so chalk engagement is verifiable without the
+    console). Excludes ``liger`` (TRL applies Liger; chalk's report carries it as False here).
+    """
+    return sorted(
+        k
+        for k, v in (report or {}).items()
+        if k != "liger" and v not in (False, None) and not (isinstance(v, dict) and "error" in v)
+    )
 
 
 def install_chalk_kernels(model=None) -> dict:
-    """Install the chalk kernels the operator selected via ``FLASH_*`` flags.
+    """Apply chalk's gap-filling kernels to ``model`` — ON by default (like Liger), flags override.
 
-    chalk reads NO env vars (install-on-call), so the WORKER decides which installers to call:
-    each enabled ``FLASH_*`` flag maps to one chalk installer (see :func:`_selected_installers`).
-    With no flags set this calls nothing and returns ``{}``.
+    Uses chalk's Liger-style entry point ``apply_chalk_kernel_to_qwen35(model, liger=False, ...)``:
+    Liger is already applied by TRL (``use_liger_kernel``), so chalk composes on top of the live
+    Liger modules. Each kernel is a boolean resolved from its ``FLASH_*`` flag (gap-fillers
+    default-on). Returns chalk's per-kernel report, or ``{}`` when every kernel is disabled, there is
+    no model yet, or freesolo-chalk isn't installed.
 
-    Call this TWICE per training run — exactly the two passes the worker makes — and each kernel
-    installs on the ONE pass it belongs to (never twice):
-
-    * ``install_chalk_kernels()`` (``model is None``, the PRE-build pass) installs only the
-      class/function-level kernels (LoRA delta, fused MLP/QKV, RoPE) — global monkeypatches that
-      must be in place before the trainer builds the model. Instance-level kernels are skipped (no
-      module yet).
-    * ``install_chalk_kernels(trainer.model)`` (``model is not None``, the POST-build pass) installs
-      only the instance-level kernels (FP8 base, embedding, FP8 MLP) against the materialized
-      module. The class/function-level monkeypatches were already applied on the pre-build pass, so
-      re-running them here would double-patch — they are deliberately NOT re-run.
-
-    Returns a ``{installer_name: result}`` map for the installers that ran ON THIS PASS (``{}`` when
-    no flag is set, chalk isn't installed, or no selected kernel belongs to this pass).
+    chalk's apply patches the LIVE module, so the worker calls this AFTER TRL builds the trainer
+    (``model=trainer.model``); ``model is None`` is a safe no-op kept for defensive callers.
     """
-    selected = _selected_installers()
-    if not selected:
-        # No FLASH_* kernel flag set -> the operator opted into nothing. Don't even import chalk.
+    if model is None:
+        # chalk's apply patches the materialized module -> nothing to do before the model is built.
+        return {}
+
+    kwargs = _enabled_kwargs()
+    if not any(kwargs.values()):
+        # Every kernel explicitly disabled (FLASH_<K>=0 across the gap-fillers) -> nothing to do.
         return {}
 
     try:
-        import chalk.transformers as ck
+        from chalk.transformers import apply_chalk_kernel_to_qwen35
     except ImportError:
-        # A FLASH_* flag is set but chalk isn't installed (control plane, or a worker without a
-        # chalk spec in FLASH_CHALK_SPEC/extra_pip). Documented as always safe — warn and no-op.
-        log.warning(
-            "FLASH_* chalk kernel(s) requested but freesolo-chalk is not installed "
-            "(set FLASH_CHALK_SPEC to an installable spec on the worker); skipping."
+        # chalk is installed by default (PyPI; chalk_extra_pip), so this only fires if an install
+        # was disabled/failed. Always safe: the kernels degrade to the eager/Liger path. Only the
+        # post-build call reaches this import (the pre-build pass returns early), so it logs at most
+        # once per run — no per-process dedup needed.
+        log.info(
+            "freesolo-chalk is not installed on this worker (set FLASH_CHALK_SPEC to an installable "
+            "spec, or check the default PyPI install); chalk kernels off, using eager/Liger."
         )
         return {}
     except Exception as e:
         # A partially-installed / version-incompatible chalk can raise non-ImportError errors at
-        # import time (e.g. a Triton/torch mismatch surfaced on import of a kernel module). This
-        # hook is documented as always safe and must never abort training, so degrade to a no-op.
+        # import time (e.g. a Triton/torch mismatch). This hook must never abort training.
         log.warning("chalk import failed (ignored, kernels disabled): %s", e)
         return {}
 
-    results: dict[str, object] = {}
-    for name, needs_model, kwargs in selected:
-        # Each kernel installs on exactly ONE of the two passes, so the second call never
-        # re-applies what the first already installed:
-        #   * class/function-level (needs_model=False): global monkeypatches -> PRE-build pass only
-        #     (model is None). Skipping them when a model is present avoids re-installing the global
-        #     patch the pre-build call already applied (double-patch).
-        #   * instance-level (needs_model=True): patch the built nn.Module -> POST-build pass only
-        #     (model is not None); there is no module to patch on the pre-build pass.
-        if needs_model != (model is not None):
-            continue
-        fn = getattr(ck, name, None)
-        if fn is None:
-            log.warning("chalk has no installer %s (skipping)", name)
-            continue
-        try:
-            results[name] = fn(model, **kwargs) if needs_model else fn(**kwargs)
-        except Exception as e:  # never block training on an optional kernel
-            log.warning("chalk %s failed (ignored): %s", name, e)
-            results[name] = f"error: {e}"
+    try:
+        # liger=False: TRL already applied Liger (use_liger_kernel); chalk composes on the live
+        # Liger modules. apply_chalk_kernel_to_qwen35 never raises on a per-kernel failure, but
+        # guard the call itself so a chalk API/version skew can never abort training.
+        report = apply_chalk_kernel_to_qwen35(model, liger=False, **kwargs)
+    except Exception as e:  # never block training on the optional kernel stack
+        log.warning("chalk apply failed (ignored, kernels disabled): %s", e)
+        return {}
 
-    enabled = {k: v for k, v in results.items() if v not in (False, None) and not str(v).startswith("error")}
-    if enabled:
-        log.info("chalk kernels active: %s", ", ".join(enabled))
-    return results
+    active = active_kernels(report)
+    if active:
+        log.info("chalk kernels active: %s", ", ".join(active))
+    return report or {}

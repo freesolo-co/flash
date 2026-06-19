@@ -79,14 +79,14 @@ WORKER_DEPS = [
     # NB: fla's gated chunk_bwd is broken on HOPPER (H100) with Triton >= 3.4 (fla #640), so
     # resolve_worker_deps DROPS fla on sm90 (the correct pure-PyTorch delta rule runs instead). The
     # dense Qwen3.5 GDN models route to consumer cards by default, where fla works.
-    # NB: freesolo-chalk (custom Triton/CUDA kernels, install-on-call — calling an installer IS
-    # the opt-in; chalk reads NO env vars) is NOT baked in by default — it isn't on PyPI yet, and a
-    # bad/inaccessible spec here would abort worker boot. flash auto-detects chalk if present
-    # (flash/engine/chalk_kernels.py). To enable kernels on a DEFAULT remote run: set the per-kernel
-    # FLASH_* selection flags (FLASH_MLP_KERNEL, FLASH_FP8_BASE, FLASH_TRITON_LORA, ...) AND set
-    # FLASH_CHALK_SPEC to an installable chalk spec (a git URL with access, or a wheel). The submit
-    # path (chalk_extra_pip) then appends that spec to the worker's `extra_pip`, which the worker
-    # pip-installs for EVERY job (baked-image RunPod _train_body + Vast bootstrap). Do NOT rely on
+    # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
+    # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
+    # (chalk_extra_pip) appends the version-pinned ``freesolo-chalk`` (DEFAULT_CHALK_SPEC) from PyPI
+    # to the worker's `extra_pip` for EVERY job by default — installed + applied automatically, like
+    # Liger. Override the source with FLASH_CHALK_SPEC (an exact version / git URL / wheel), or
+    # disable every kernel (FLASH_<K>=0) to skip the install. The worker pip-installs extra_pip for
+    # EVERY job (baked-image RunPod
+    # _train_body + Vast bootstrap). Do NOT rely on
     # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS for this: the durable baked-image submit path
     # (jobs.build_function_input) returns the raw payload and never consults resolve_worker_deps, so
     # those vars don't reach a default run; and FLASH_WORKER_DEPS would also REPLACE the whole stack.
@@ -154,19 +154,6 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
     return deps
 
 
-# FLASH_* flags that select a chalk install-on-call kernel (see engine.chalk_kernels). Any one
-# of these being set means the run opted into chalk, so chalk must be installed on the worker.
-_CHALK_KERNEL_FLAGS = (
-    "FLASH_MLP_KERNEL",
-    "FLASH_MLP_FP8",
-    "FLASH_FP8_BASE",
-    "FLASH_TRITON_LORA",
-    "FLASH_EMBED_KERNEL",
-    "FLASH_QKV_KERNEL",
-    "FLASH_ROPE_KERNEL",
-)
-
-
 def _effective_worker_env(spec=None) -> dict[str, str]:
     """The env the WORKER process will actually see, for chalk-selection decisions.
 
@@ -188,17 +175,27 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 
 
 def _chalk_selected(spec=None) -> bool:
-    """True if any FLASH_* chalk kernel-selection flag is truthy in the EFFECTIVE worker env.
+    """True if ANY chalk kernel would run on the worker -> chalk must be installed.
 
-    Reads the per-run ``[worker_env]`` (``spec.worker_env``) merged over ``os.environ`` so a chalk
-    opt-in set only in the run's ``[worker_env]`` block is detected (see ``_effective_worker_env``).
+    chalk's gap-fillers (RoPE/LoRA/embedding) are ON BY DEFAULT (engine.chalk_kernels), so this
+    is True for a normal run. It is False only when every kernel that would otherwise be enabled is
+    explicitly set to 0 — i.e. the three default-on gap-fillers (ROPE/TRITON_LORA/EMBED) disabled
+    via ``FLASH_<K>=0`` (the default-off opt-in kernels — QKV/MLP/FP8 base — need no flag to stay
+    off, so deselecting chalk does NOT require setting them to 0). Resolved against the EFFECTIVE worker env
+    — the run's ``[worker_env]`` merged over ``os.environ`` so a per-run override is honored (see
+    ``_effective_worker_env``). Delegates to ``chalk_kernels.is_chalk_enabled`` (the single source
+    of truth for the flag/default logic) rather than re-parsing the kernel table here.
     """
-    env = _effective_worker_env(spec)
-    for name in _CHALK_KERNEL_FLAGS:
-        v = env.get(name)
-        if v is not None and v.strip().lower() not in ("", "0", "false", "no", "off"):
-            return True
-    return False
+    from flash.engine.chalk_kernels import is_chalk_enabled
+
+    return is_chalk_enabled(_effective_worker_env(spec))
+
+
+# Default chalk install spec when FLASH_CHALK_SPEC is unset. VERSION-PINNED (bounded range, like the
+# rest of WORKER_DEPS) so a default run is reproducible and a breaking freesolo-chalk release can't
+# silently land on production jobs — 0.1.x patches are allowed, 0.2 is not. Bump intentionally after
+# validating a new line; an operator can pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z.
+DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.1.0,<0.2.0"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
@@ -213,21 +210,17 @@ def chalk_extra_pip(spec=None) -> list[str]:
     the run's ``[worker_env]`` merged over ``os.environ`` — so it matches exactly what the worker
     process will see (``build_worker_env``) and a per-run ``[worker_env]`` opt-in installs chalk.
 
-    freesolo-chalk is unpublished, so there is no auto-installable default: the operator MUST set
-    ``FLASH_CHALK_SPEC`` to an installable spec (a git URL with access, or a wheel/path). When a
-    chalk kernel flag is set but ``FLASH_CHALK_SPEC`` is empty we log a warning and add nothing —
-    ``install_chalk_kernels`` then finds no chalk on the worker and safely no-ops.
+    Chalk's gap-fillers are default-on, so chalk is selected for a normal run even with no FLASH_*
+    flags set. freesolo-chalk is published on PyPI, so it auto-installs by DEFAULT (just like Liger):
+    when chalk is selected and ``FLASH_CHALK_SPEC`` is unset we add the version-pinned
+    :data:`DEFAULT_CHALK_SPEC`. Set ``FLASH_CHALK_SPEC`` to override the source (an exact version, a
+    git URL, or a wheel/path), or disable every kernel (``FLASH_<K>=0``) to skip the install.
     """
     if not _chalk_selected(spec):
         return []
-    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip()
-    if not spec_str:
-        logger.warning(
-            "a FLASH_* chalk kernel is selected but FLASH_CHALK_SPEC is unset; freesolo-chalk is "
-            "unpublished so it can't be auto-installed — set FLASH_CHALK_SPEC to an installable "
-            "spec (git URL or wheel) or the chalk kernels will no-op on the worker."
-        )
-        return []
+    # PyPI default (version-pinned for reproducibility) — chalk is published, so a normal run
+    # installs + applies it automatically. An explicit FLASH_CHALK_SPEC overrides the source.
+    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
     import shlex
 
     return [d for d in shlex.split(spec_str) if d.strip()]
@@ -369,10 +362,11 @@ def _train_body(input_data: dict) -> dict:
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
 
     def run_mode(mode: str, check: bool) -> int:
-        """Run one worker process, tee its console to a file, and on failure upload the
-        tail to HF as console_<mode>.txt — the engine-core root cause of crashes like
-        vLLM EngineDeadError only ever appears on the subprocess console, never in the
-        Python traceback."""
+        """Run one worker process, tee its console to a file, and upload the tail to HF as
+        console_<mode>.txt on failure — the engine-core root cause of crashes like vLLM
+        EngineDeadError only ever appears on the subprocess console, never in the Python
+        traceback. With FLASH_UPLOAD_CONSOLE=1 (forwarded via build_worker_env) the console
+        is also uploaded on SUCCESS, so an operator can verify which optimizations engaged."""
         console = f"/tmp/console_{mode}.txt"
         with open(console, "w") as cf:
             proc = subprocess.Popen(
@@ -387,7 +381,13 @@ def _train_body(input_data: dict) -> dict:
                 print(line, end="")  # keep streaming to the platform console
                 cf.write(line)
             proc.wait()
-        if proc.returncode != 0:
+        # Console is uploaded on FAILURE (crash root-cause). FLASH_UPLOAD_CONSOLE=1 also uploads it
+        # on SUCCESS so an operator can verify which optimizations engaged — LoRA+/8-bit-AdamW/
+        # Liger/PiSSA/rsLoRA/fla/chalk all log their engagement (or fallback) to the console.
+        _force_console = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
+            "", "0", "false", "no", "off",
+        )
+        if proc.returncode != 0 or _force_console:
             try:
                 from huggingface_hub import HfApi
 
@@ -406,11 +406,11 @@ def _train_body(input_data: dict) -> dict:
                 )
             except Exception as up_err:
                 print("console upload warn:", up_err)
-            if check:
-                raise RuntimeError(
-                    f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
-                    f"and error_{mode}.txt in the HF dataset repo"
-                )
+        if proc.returncode != 0 and check:
+            raise RuntimeError(
+                f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
+                f"and error_{mode}.txt in the HF dataset repo"
+            )
         return proc.returncode
 
     # A warm worker can carry a previous seed's metrics files; a stale metrics.json
@@ -852,19 +852,22 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # [train] eval_every_steps (with eval_examples for the sample size); the worker resolves it
         # via midrun_eval.eval_config(spec_every=...) and ignores any FLASH_EVAL_EVERY_STEPS env
         # (see test_eval_config_ignores_env_cadence_override). So there is nothing to forward here.
+        # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
+        # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
+        # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a
+        # control-plane `FLASH_UPLOAD_CONSOLE=1` only reaches run_mode if it's forwarded here.
+        # Without this it silently no-ops on success.
+        "FLASH_UPLOAD_CONSOLE",
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
-        # the WORKER decides which installers to run from these flags. install_chalk_kernels runs
+        # the WORKER decides which kernels to enable from these flags. install_chalk_kernels runs
         # INSIDE the worker subprocess and reads them from its own process env, so a control-plane
         # FLASH_* selection must be forwarded here or every chalk kernel silently no-ops on every
-        # remote run. FLASH_CHALK_SPEC is the install spec install_chalk_kernels points operators
-        # at (and is also consumed at submit time to add chalk to the worker's extra_pip).
+        # remote run. These are exactly the per-kernel boolean flags in chalk_kernels._KERNELS
+        # (one per apply_chalk_kernel_to_qwen35 keyword); FLASH_<K>=0/1 overrides the kernel's
+        # default. FLASH_CHALK_SPEC is the install spec install_chalk_kernels points operators at
+        # (and is also consumed at submit time to add chalk to the worker's extra_pip).
         "FLASH_MLP_KERNEL",
-        "FLASH_MLP_FP8",
-        "FLASH_MLP_FP8_DOWN",
         "FLASH_FP8_BASE",
-        "FLASH_FP8_BASE_ATTN",
-        "FLASH_FP8_BASE_MLP",
-        "FLASH_FP8_BASE_MIN_K",
         "FLASH_TRITON_LORA",
         "FLASH_EMBED_KERNEL",
         "FLASH_QKV_KERNEL",
