@@ -276,6 +276,34 @@ def test_poll_job_probe_error_does_not_premature_no_capacity(monkeypatch):
     assert "setup" in res.detail
 
 
+def test_poll_job_empty_worker_summary_does_not_confirm_capacity(monkeypatch):
+    # A /health response whose `workers` summary carries NONE of the expected counter keys (an empty
+    # `{}` or a partial/malformed payload) is UNKNOWN, not a confirmed-empty pool: every `.get(...)`
+    # would return None and naively read as "no usable, none initializing" -> capacity_confirmed.
+    # The fast-path must treat it like a probe flake (no confirmation) and stay bounded by
+    # setup_grace_s, never deleting a healthy endpoint on data we never actually saw.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: {"workers": {}})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        queue_grace_s=200.0,  # small: WOULD trip no_capacity if an empty summary confirmed capacity
+        setup_grace_s=600.0,  # the real bound when the pool view is unknown
+    )
+    assert not res.ok
+    assert res.failure == "stalled"  # NOT no_capacity
+    assert "setup" in res.detail
+
+
 def test_poll_job_confirmed_no_capacity_survives_later_probe_flake(monkeypatch):
     # Re-review guard: once a GOOD probe CONFIRMS an empty, non-initializing queue (a real
     # capacity-starved read), a LATER transient probe exception must NOT revive the "maybe a

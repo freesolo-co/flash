@@ -262,8 +262,10 @@ def make_checkpoint_upload_callback():
             # Multi-GPU (FSDP / accelerate) runs on_save on EVERY rank; only the single global
             # main process may upload, or ranks race on the same HF commit and one rank's
             # delete_patterns can wipe another rank's just-uploaded checkpoint. Single-GPU runs
-            # are always world-process-zero, so this is a no-op there.
-            if not state.is_world_process_zero:
+            # are always world-process-zero, so this is a no-op there. Guard the attribute
+            # access (defaulting to the single-process upload path) to match on_log below —
+            # some transformers versions / stubs omit is_world_process_zero on the state.
+            if not getattr(state, "is_world_process_zero", True):
                 return
             if not HF_REPO:
                 return

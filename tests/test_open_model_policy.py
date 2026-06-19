@@ -86,6 +86,24 @@ def test_allow_policy_disaggregated_raises_disk_floor(monkeypatch):
     assert small.min_disk_gb == int(1.2 * 2) + 64
 
 
+def test_allow_policy_disaggregated_fits_verdict_still_elevates_disk(monkeypatch):
+    # A disaggregated split (inference_gpus>0) materializes multiple model copies on the same node
+    # REGARDLESS of the per-card VRAM verdict: a model that comfortably "fits" each role's card still
+    # needs the elevated trainer+server+download disk floor. The floor must key off inference_gpus,
+    # not the (per-card) VRAM verdict — otherwise a `fits` split under-provisions disk and dies with
+    # "No space left on device" on a paid multi-GPU node.
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 9.0, raising=True)
+    monkeypatch.setattr(
+        "flash.providers.allocator._params_b_for_vram", lambda model_id: 9.0, raising=True
+    )
+    # 9B on an 80 GB A100 fits colocated (verdict == "fits"), but the split must still get 6*p + 96.
+    split = resolve_model(
+        "acme/mid-9b", "grpo", policy="allow", gpu="A100 PCIe", train={"inference_gpus": 2}
+    )
+    assert split.min_disk_gb == 9 * 6 + 96  # 150 GB, not the colocate 9*2 + 64
+    assert split.min_disk_gb > 9 * 2 + 64
+
+
 def test_allow_policy_unknown_size_warns_but_allows(monkeypatch, capsys):
     monkeypatch.setattr(
         "flash.engine.vram.fetch_hf_params_b", lambda model_id: None, raising=True

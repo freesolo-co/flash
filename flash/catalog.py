@@ -292,7 +292,11 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None, *, train=None
     # Xet-temp / per-step-checkpoint-save headroom (~96 GB). That reproduces the curated 35B
     # entry's validated 300 GB floor (6*35 + 96 ~= 306) and scales down for smaller splits.
     if est.params_b:
-        _split = _ig > 0 and est.verdict in ("tight", "unknown")
+        # A disaggregated split materializes multiple full model copies on the same node
+        # (trainer + `trl vllm-serve` + the HF download) regardless of the per-card VRAM
+        # verdict, so the elevated disk floor must key off inference_gpus alone — a model
+        # that comfortably "fits" the per-role card still needs the multi-copy headroom.
+        _split = _ig > 0
         per_param = 6 if _split else 2
         headroom = 96 if _split else 64
         min_disk = int(est.params_b * per_param) + headroom

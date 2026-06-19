@@ -368,6 +368,13 @@ def poll_job(
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
                 recovering = workers.get("initializing")
+                # A worker summary that carries NONE of the expected counter keys (an empty `{}` or a
+                # partial/malformed `/health` response) is UNKNOWN, not a confirmed-empty pool: every
+                # `.get(...)` returning None would otherwise make `not usable and not recovering` True
+                # and let the no_capacity fast-path delete a healthy endpoint on a bad read. Treat it
+                # like a probe flake — leave `capacity_confirmed` at its prior (latched) value rather
+                # than asserting an empty queue from data we never actually saw.
+                _counter_keys = ("running", "ready", "idle", "initializing", "throttled", "unhealthy")
                 # Latch a CONFIRMED capacity-starved read: an empty queue with NO usable worker
                 # (running/ready/idle) AND none initializing. Requiring `not usable` here is what
                 # keeps a backlog/scheduling delay (job IN_QUEUE while usable workers EXIST) from
@@ -376,7 +383,8 @@ def poll_job(
                 # can't revive false "maybe initializing" doubt and defer the fast-path by the full
                 # setup grace. A flake never *sets* it True (only a good probe can), so a stale-False
                 # read can't fire the fast-path either.
-                capacity_confirmed = not usable and not recovering
+                if any(k in workers for k in _counter_keys):
+                    capacity_confirmed = not usable and not recovering
                 if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
                     say(f"queued; workers: {workers}")
                 # Fail fast on a worker stuck UNHEALTHY: a dead worker / failed image pull won't
