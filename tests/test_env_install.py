@@ -22,7 +22,7 @@ class _FakeProc:
 
 def test_env_install_prime_hub_slug(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setenv("AUTOSLM_ENVS_MANIFEST", os.path.join(tmp, "envs.json"))
+        monkeypatch.setenv("FLASH_ENVS_MANIFEST", os.path.join(tmp, "envs.json"))
         import flash.envs.registry as registry
         from flash.cli import main as cli
 
@@ -54,7 +54,7 @@ def test_env_install_prime_hub_slug(monkeypatch):
         assert entry["package"] == "hendrycks-math"
         assert "hub.primeintellect.ai" in entry["extra_index_url"]
 
-        monkeypatch.delenv("AUTOSLM_ENVS_MANIFEST", raising=False)
+        monkeypatch.delenv("FLASH_ENVS_MANIFEST", raising=False)
         importlib.reload(registry)
 
 
