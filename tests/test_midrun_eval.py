@@ -527,6 +527,21 @@ def test_eval_config_env_overrides_toml_num_examples(monkeypatch):
     assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 20
 
 
+def test_eval_config_env_zero_matches_toml_zero(monkeypatch):
+    """env-0 and TOML-0 must AGREE: both mean "not set" -> the default (never a 0/1-row eval)."""
+    # TOML 0 -> default 64 (no env override)
+    monkeypatch.delenv("FLASH_EVAL_NUM", raising=False)
+    assert eval_config(256, spec_every=3, spec_eval_examples=0)["num_examples"] == 64
+    # env 0 must resolve the SAME way: fall back to the default, not max(1, 0) == 1
+    monkeypatch.setenv("FLASH_EVAL_NUM", "0")
+    assert eval_config(256, spec_every=3)["num_examples"] == 64
+    # env 0 falls back to the TOML value when one is set
+    assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 20
+    # negative env values are treated as "not set" too
+    monkeypatch.setenv("FLASH_EVAL_NUM", "-5")
+    assert eval_config(256, spec_every=3)["num_examples"] == 64
+
+
 # --------------------------------------------------------------------------- #
 # sample_eval_rows: fixed seeded random subset of the held-out split
 # --------------------------------------------------------------------------- #

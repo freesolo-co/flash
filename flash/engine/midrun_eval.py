@@ -405,10 +405,13 @@ def eval_config(
         every = spec_every
 
     # num_examples: FLASH_EVAL_NUM env override > [train] eval_examples TOML > default 64.
+    # 0/negative means "not set" for BOTH knobs (so env-0 and TOML-0 agree -> the default), never a
+    # 0/1-row eval; a malformed env var falls back to the TOML value (or the default).
     env_num = os.environ.get("FLASH_EVAL_NUM")
     spec_num = spec_eval_examples if (spec_eval_examples and spec_eval_examples > 0) else None
     if env_num is not None and env_num.strip() != "":
-        num_examples = _safe_int(env_num, spec_num or DEFAULT_EVAL_NUM)
+        env_resolved = _safe_int(env_num, spec_num or DEFAULT_EVAL_NUM)
+        num_examples = env_resolved if env_resolved > 0 else (spec_num or DEFAULT_EVAL_NUM)
     else:
         num_examples = spec_num if spec_num is not None else DEFAULT_EVAL_NUM
 
