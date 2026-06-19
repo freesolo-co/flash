@@ -39,18 +39,11 @@ class CostEstimate:
     wall_clock_seconds: float  # setup + train
     wall_capped: bool  # True if train_seconds was clamped to the run's wall-clock cap
 
-    # --- money ---
-    total_usd: float  # the headline figure (calibrated, if a factor was applied)
+    # --- money: wall-clock hours x market $/hr, first-principles, no output adjustment ---
+    total_usd: float
 
     # --- free-form notes (assumptions, GRPO rollout split, MoE active params, …) ---
     notes: tuple[str, ...] = ()
-
-    # --- break-even calibration multiplier applied to ``total_usd`` ---
-    # 1.0 = the raw first-principles analytical reference (what ``estimate_cost`` emits).
-    # < 1.0 = a quote scaled to break even against MEASURED real-run cost (the analytical
-    # model runs ~1.4x high vs billed cost); see ``calibration.breakeven_estimate``. The
-    # un-calibrated figure is always recoverable as ``total_usd / calibration_factor``.
-    calibration_factor: float = 1.0
 
     @property
     def wall_clock_hours(self) -> float:
@@ -62,28 +55,12 @@ class CostEstimate:
         return d
 
     def describe(self) -> str:
-        """One-line human summary.
-
-        The ``$/hr x h`` term is the raw analytical cost. When a break-even
-        ``calibration_factor`` has scaled ``total_usd``, that product no longer equals
-        the headline figure, so the suffix is annotated as the raw reference (``raw``)
-        rather than implying a contradictory total.
-        """
+        """One-line human summary. The figure is exactly ``$/hr x h`` -- no adjustment."""
         cap = " (wall-capped)" if self.wall_capped else ""
-        if self.calibration_factor != 1.0:
-            raw = self.total_usd / self.calibration_factor
-            money = (
-                f"${self.total_usd:.2f} (break-even x{self.calibration_factor:.3f}; "
-                f"raw ${raw:.2f} = ${self.gpu_hourly_usd:.2f}/hr x {self.wall_clock_hours:.2f}h{cap})"
-            )
-        else:
-            money = (
-                f"${self.total_usd:.2f} "
-                f"(${self.gpu_hourly_usd:.2f}/hr x {self.wall_clock_hours:.2f}h{cap})"
-            )
         return (
             f"{self.model_id} {self.method.upper()} x{self.steps} steps -> "
-            f"{money} on {self.gpu}@{self.provider}"
+            f"${self.total_usd:.2f} (${self.gpu_hourly_usd:.2f}/hr x {self.wall_clock_hours:.2f}h{cap}) "
+            f"on {self.gpu}@{self.provider}"
         )
 
     def breakdown(self) -> str:
@@ -98,15 +75,8 @@ class CostEstimate:
             f"Train      : {self.train_seconds / 60:.1f} min"
             + ("  [CAPPED at the wall-clock limit]" if self.wall_capped else ""),
             f"Wall clock : {self.wall_clock_hours:.2f} h",
+            f"TOTAL      : ${self.total_usd:.2f}",
         ]
-        if self.calibration_factor != 1.0:
-            raw = self.total_usd / self.calibration_factor
-            lines.append(f"Raw model  : ${raw:.2f}  (first-principles analytical reference)")
-            lines.append(
-                f"Break-even : x{self.calibration_factor:.3f}  "
-                "(calibrated to measured real-run cost)"
-            )
-        lines.append(f"TOTAL      : ${self.total_usd:.2f}")
         if self.notes:
             lines.append("Notes      :")
             lines.extend(f"  - {n}" for n in self.notes)

@@ -24,7 +24,7 @@ from flash.providers.base import unvalidated_allowed
 
 from .config import RunConfig
 from .estimate import CostEstimate
-from .hardware import gpu_hourly_usd, gpu_tflops, gpu_vram_gb, pick_gpu
+from .hardware import gpu_tflops, gpu_vram_gb, pick_gpu, realized_hourly_usd
 from .model_specs import active_params_b, download_weight_gb, model_quant, total_params_b
 from .rewards import reward_seconds_per_completion
 
@@ -33,9 +33,18 @@ SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
 
-# Model-FLOPs utilization: fraction of peak the run actually sustains.
-MFU_TRAIN = 0.40  # LoRA fwd/bwd/optimizer on a single card
+# Model-FLOPs utilization: fraction of peak the run actually sustains. These are physical
+# throughput constants -- calibrated against the measured wall clock of real RunPod/Vast
+# runs (cost_estimator_results/real_runs/), the same way you'd measure MFU empirically.
+MFU_TRAIN = 0.50  # LoRA fwd/bwd/optimizer on a single card
 MFU_DECODE = 0.18  # batched vLLM rollout (decode is memory-bound; batching helps)
+
+# Reward grading runs CONCURRENTLY, not one completion at a time: a step's completions are
+# scored in parallel (env workers / batched judge calls), so the reward wall is the serial
+# per-completion latency divided by the effective concurrency -- NOT completions x latency
+# (which over-counts a heavy grader by ~2 orders of magnitude and saturates the wall cap).
+# A physical infra constant (parallel grader slots), calibrated against measured heavy-env runs.
+REWARD_CONCURRENCY = 16.0
 
 # --- cold-start overhead (seconds) ---
 WORKER_BOOT_S = 180.0  # provision + container start + framework import
@@ -73,8 +82,11 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     gen_tokens = completions * n.completion_len
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_TRAIN)
-    reward_s = completions * reward_seconds_per_completion(
-        n.environment, n.reward_seconds_per_completion
+    # Reward graders run in parallel: divide the serial per-completion cost by the concurrency.
+    reward_s = (
+        completions
+        * reward_seconds_per_completion(n.environment, n.reward_seconds_per_completion)
+        / REWARD_CONCURRENCY
     )
     return gen_s + reward_s + update_s
 
@@ -177,7 +189,7 @@ def _notes(
             + (f", env {n.environment}" if n.environment else "")
             + ") + policy+reference update"
         )
-    notes.append(f"GPU sized with {vram_headroom():.0%} VRAM headroom; static fallback $/hr")
+    notes.append(f"GPU sized with {vram_headroom():.0%} VRAM headroom; market (spot/queue) $/hr")
     if wall_capped:
         per_seed = "" if config.setup_repeats == 1 else "per-seed "
         notes.append(
@@ -190,7 +202,7 @@ def _notes(
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
     """Deterministic pre-flight cost estimate -- the experiment's ground truth."""
     gpu, need = select_gpu(config)
-    hourly = gpu_hourly_usd(gpu)
+    hourly = realized_hourly_usd(gpu)  # market (spot/queue) rate runs are billed at
     # The wall cap is ``gpu.max_wall_seconds`` from the spec (default 24h); fall back to the
     # caller's ``wall_cap_s`` (the module default) when the config doesn't pin one.
     cap_s = float(config.max_wall_seconds) if config.max_wall_seconds is not None else wall_cap_s

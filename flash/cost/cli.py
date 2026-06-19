@@ -1,13 +1,11 @@
 """CLI for the Flash training-cost estimator.
 
     python -m flash.cost estimate --model Qwen/Qwen3.5-4B --method grpo --steps 150
-    python -m flash.cost estimate --model Qwen/Qwen3.5-4B --method grpo --steps 150 --raw
-    python -m flash.cost breakeven
+    python -m flash.cost verify
 
-``estimate`` prints the cost breakdown for one run -- the break-even quote (calibrated
-to measured real-run cost) by default, or the raw first-principles analytical reference
-with ``--raw``. ``breakeven`` proves the calibration centers on measured cost and sweeps
-the per-environment cost.
+``estimate`` prints the first-principles cost breakdown for one run (wall-clock hours x
+market $/hr; no output adjustment). ``verify`` grades the raw equation against measured
+RunPod/Vast cost and sweeps the per-environment cost.
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ import argparse
 import sys
 
 from .analytical import estimate_cost
-from .calibration import breakeven_estimate, environment_cost_sweep, verify_centering
+from .calibration import environment_cost_sweep, verify_accuracy
 from .config import RunConfig
 
 
@@ -30,32 +28,29 @@ def _cmd_estimate(args: argparse.Namespace) -> int:
         gpu=args.gpu,
         environment=args.environment,
     )
-    # Default to the break-even quote (calibrated to measured cost); --raw shows the
-    # un-calibrated first-principles analytical reference.
-    est = estimate_cost(cfg) if args.raw else breakeven_estimate(cfg)
-    print(est.breakdown())
+    print(estimate_cost(cfg).breakdown())
     return 0
 
 
-def _cmd_breakeven(args: argparse.Namespace) -> int:
-    cen = verify_centering()
-    print("Break-even centering  (sum calibrated quote vs sum measured cost over real runs):")
-    print(f"  {'group':5s} {'n':>3s} {'sum meas':>11s} {'sum quote':>10s} {'ratio':>7s}")
+def _cmd_verify(args: argparse.Namespace) -> int:
+    acc = verify_accuracy()
+    print("Equation vs MEASURED cost  (raw first-principles, no output factor):")
+    print(f"  {'group':5s} {'n':>3s} {'meanMAPE':>9s} {'medAPE':>8s} {'aggBias':>8s} {'<=33%':>6s}")
     for g in ("sft", "grpo", "all"):
-        c = cen[g]
+        if g not in acc:
+            continue
+        a = acc[g]
         print(
-            f"  {g:5s} {int(c['n']):3d} {c['sum_measured']:11.4f} "
-            f"{c['sum_calibrated']:10.4f} {c['ratio']:7.3f}"
+            f"  {g:5s} {a['n']:3d} {a['mean_mape_pct']:8.0f}% {a['median_ape_pct']:7.0f}% "
+            f"{a['agg_bias']:8.3f} {a['within_33pct'] * 100:5.0f}%"
         )
-    print("\nEnvironment cost sweep  (GRPO; break-even quote varies with reward grader):")
-    print(f"  {'model':18s} {'environment':30s} {'rwd_s':>6s} {'raw$':>8s} {'quote$':>8s}")
+    print("  (aggBias 1.0 = unbiased in aggregate; NOT forced -- whatever the inputs give)")
+    print("\nEnvironment cost sweep  (GRPO; cost varies with reward grader):")
+    print(f"  {'model':18s} {'environment':30s} {'rwd_s':>6s} {'usd$':>8s}")
     for r in environment_cost_sweep(steps=args.steps):
         rwd = "" if r["reward_s_per_completion"] is None else f"{r['reward_s_per_completion']:.2f}"
-        raw = "" if r["raw_usd"] is None else f"{r['raw_usd']:.2f}"
-        print(
-            f"  {r['model']:18s} {r['environment']:30s} {rwd:>6s} {raw:>8s} "
-            f"{r['breakeven_usd']:8.2f}"
-        )
+        cap = " cap" if r["capped"] else ""
+        print(f"  {r['model']:18s} {r['environment']:30s} {rwd:>6s} {r['usd']:8.2f}{cap}")
     return 0
 
 
@@ -63,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="flash.cost", description="Flash training-cost estimator")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    e = sub.add_parser("estimate", help="cost breakdown for one run (break-even quote)")
+    e = sub.add_parser("estimate", help="first-principles cost breakdown for one run")
     e.add_argument("--model", required=True)
     e.add_argument("--method", choices=("sft", "grpo"), required=True)
     e.add_argument("--steps", type=int, required=True)
@@ -71,20 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--gpu", default=None, help="pin a GPU class (else cheapest fit)")
     e.add_argument("--environment", default=None, help="verifiers env slug (GRPO reward tier)")
     e.add_argument("--thinking", action="store_true")
-    e.add_argument(
-        "--raw",
-        action="store_true",
-        help="show the un-calibrated first-principles analytical reference",
-    )
     e.set_defaults(func=_cmd_estimate)
 
-    b = sub.add_parser(
-        "breakeven", help="prove break-even centering + sweep cost across environments"
-    )
-    # Default matches environment_cost_sweep()'s own default so `flash.cost breakeven`
-    # reproduces the committed breakeven_report.md rather than diverging from it.
-    b.add_argument("--steps", type=int, default=100, help="steps for the environment sweep")
-    b.set_defaults(func=_cmd_breakeven)
+    v = sub.add_parser("verify", help="grade the equation vs measured cost + env sweep")
+    v.add_argument("--steps", type=int, default=100, help="steps for the environment sweep")
+    v.set_defaults(func=_cmd_verify)
     return p
 
 

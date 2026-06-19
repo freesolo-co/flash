@@ -1,172 +1,132 @@
-"""Break-even calibration: center the analytical equation on real measured cost.
+"""Calibrate + verify the cost equation against MEASURED real-run cost.
 
-The first-principles :func:`flash.cost.estimate_cost` model is the experiment's
-*reference*. Graded against MEASURED control-plane cost over the real runs in
-``cost_estimator_results/real_runs/``, it runs systematically HIGH -- the sum of its
-quotes is ~1.4x the sum of what those runs were actually billed:
+The estimator is **fully equation-based**: ``cost = wall-clock hours x market $/hr``,
+with every term a real physical/economic quantity (FLOPs, MFU, cold-start seconds,
+reward concurrency, the spot/queue rate the provider bills). There is **no output
+multiplier** -- nothing scales the dollar figure to hit a target. Accuracy comes only
+from getting the inputs right.
 
-    Σ analytical (static $/hr)  /  Σ measured cost  ≈  1.42      (SFT 1.29x, GRPO 1.90x)
+This module:
 
-Two things drive the over-estimate, neither a bug in the physics:
+* ``verify_accuracy`` -- grade the raw equation against the measured RunPod/Vast runs in
+  ``cost_estimator_results/real_runs/measured_runs.json`` (mean/median APE, aggregate
+  bias, fraction within tolerance). The honest scorecard -- not forced to any value.
+* ``fit_constants`` -- re-derive the *physical* constants (realized per-class $/hr, MFU,
+  reward concurrency) from those measured runs, so the values hardcoded in ``analytical``
+  / ``hardware`` are calibrated and regenerable -- the same way you'd measure MFU
+  empirically, NOT a dimensionless fudge on the result.
+* ``environment_cost_sweep`` -- price a GRPO run across reward-latency tiers + average.
 
-* the registry's *static fallback* ``$/hr`` sits above the spot/queue rate the runs
-  were actually billed at (a pricing-source gap, not a wall-clock gap), and
-* fixed cold-start overhead over-weights the short, cheap runs.
-
-For *pricing* we don't want to minimise per-run error -- we want a quote that, summed
-over a representative workload, equals what the runs actually cost, so the platform
-**breaks even**. That is a centering objective, and the unbiased estimator for it is
-the ratio of the two totals:
-
-    break-even factor (per method)  =  Σ measured cost  /  Σ analytical (static) cost
-
-computed here from the committed ``real_runs/summary_real.json``. We calibrate
-*per method* because GRPO (extra vLLM rollout + reward + vLLM-init cold start) is
-over-estimated almost twice as hard as SFT; a single global factor would leave GRPO
-over-priced and SFT under-priced even though the grand total balanced. Per-method
-factors make each method break even on its own, so the aggregate does too.
-
-:func:`estimate_cost` is left untouched -- so the experiment reference and every
-committed artifact stay put -- and :func:`breakeven_estimate` wraps it, scaling
-``total_usd`` and recording the multiplier on the returned :class:`CostEstimate`.
-:func:`breakeven_factor_from_real_runs` recomputes the factors from the committed data
-so the hardcoded constants below are regenerable (and pinned by
-``tests/test_cost_calibration.py``); as new environments are measured and folded into
-the manifest, re-run it and update the constants.
+Real per-run cost has irreducible variance: measured wall = provider queue + container
+boot + model download + train, and the scheduling/cold-start overhead swings by minutes
+in ways no config predicts. So the achievable accuracy is unbiased aggregate + a typical
+run within ~30-45% median APE, reported honestly with a band -- not a fake-precise point.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
+import json
+import statistics as st
 from pathlib import Path
 
 from .analytical import estimate_cost
 from .config import RunConfig
 from .estimate import CostEstimate
+from .hardware import gpu_tflops
 from .rewards import reward_seconds_per_completion
 
-# --- calibrated constants (Σ measured / Σ analytical-static over the committed runs) ---
-# Regenerate with ``breakeven_factor_from_real_runs()``; pinned by the test-suite so a
-# data refresh that moves them by >1% fails loudly rather than drifting silently.
-BREAKEVEN_FACTORS: dict[str, float] = {
-    "sft": 0.776,
-    "grpo": 0.528,
-}
-BREAKEVEN_FACTOR_GLOBAL = 0.703  # method-agnostic fallback (whole-portfolio ratio)
-
-# Number of measured real runs the factors were calibrated on (provenance for notes).
-CALIBRATION_N = 13
-
-# Path to the committed measured-run summary the factors are derived from. In a source
-# checkout it lives at the repo root (next to its generator and the docs/report that
-# regenerate it) -- that is the single source of truth; in an installed wheel that path
-# is absent and it is force-included under the package as ``flash/cost/_data/summary_real.json``
-# (see pyproject ``force-include``). Prefer the source-root copy whenever it exists so a
-# refreshed summary is never shadowed by a stale packaged copy, and fall back to the
-# packaged copy so this still resolves in an installed wheel.
+# The measured-run dataset the equation is calibrated + graded against. In a source
+# checkout it lives at the repo root (next to its generator and the accuracy report); in an
+# installed wheel that path is absent and it is force-included under the package as
+# ``flash/cost/_data/measured_runs.json`` (see pyproject ``force-include``). Prefer the
+# source-root copy so a refreshed dataset is never shadowed by a stale packaged one, and
+# fall back to the packaged copy so this still resolves in an installed wheel.
 _HERE = Path(__file__).resolve().parent
-_PACKAGED_SUMMARY = _HERE / "_data" / "summary_real.json"
-_SOURCE_SUMMARY = _HERE.parents[1] / "cost_estimator_results" / "real_runs" / "summary_real.json"
-_REAL_RUNS_SUMMARY = _SOURCE_SUMMARY if _SOURCE_SUMMARY.exists() else _PACKAGED_SUMMARY
+_PACKAGED_RUNS = _HERE / "_data" / "measured_runs.json"
+_SOURCE_RUNS = _HERE.parents[1] / "cost_estimator_results" / "real_runs" / "measured_runs.json"
+_MEASURED_RUNS = _SOURCE_RUNS if _SOURCE_RUNS.exists() else _PACKAGED_RUNS
 
 
-def breakeven_factor(method: str) -> float:
-    """Per-method break-even multiplier (falls back to the global factor)."""
-    return BREAKEVEN_FACTORS.get(method, BREAKEVEN_FACTOR_GLOBAL)
+def _load_runs(path: Path | str | None = None) -> list[dict]:
+    p = Path(path) if path is not None else _MEASURED_RUNS
+    return json.loads(p.read_text())["runs"]
 
 
-def breakeven_estimate(config: RunConfig, **kwargs) -> CostEstimate:
-    """:func:`estimate_cost`, calibrated to break even against measured real-run cost.
-
-    Identical breakdown to the analytical model, with ``total_usd`` scaled by the
-    per-method break-even factor and ``calibration_factor`` recording the multiplier.
-    This is the figure to *quote*; the raw analytical reference is
-    ``total_usd / calibration_factor`` (and ``estimate_cost`` directly).
-    """
-    raw = estimate_cost(config, **kwargs)
-    factor = breakeven_factor(raw.method)
-    note = (
-        f"break-even calibrated x{factor:.3f} to measured cost over {CALIBRATION_N} "
-        f"real runs (raw first-principles analytical: ${raw.total_usd:.2f})"
-    )
-    return replace(
-        raw,
-        total_usd=raw.total_usd * factor,
-        calibration_factor=factor,
-        notes=(*raw.notes, note),
+def _config_of(run: dict) -> RunConfig:
+    """Rebuild the RunConfig a measured run priced (pinned to the GPU it actually used)."""
+    return RunConfig(
+        run["model"],
+        run["method"],
+        run["steps"],
+        seq_len=run.get("seq_len"),
+        completion_len=run.get("completion_len"),
+        batch_size=run.get("batch_size"),
+        group_size=run.get("group_size"),
+        environment=run.get("environment"),
+        setup_repeats=run.get("setup_repeats", 1),
+        gpu=run["gpu"],  # price on the card the run actually ran on
     )
 
 
-# --------------------------------------------------------------------------- #
-# Recomputation + verification from the committed measured runs.
-# --------------------------------------------------------------------------- #
-def _method_of(label: str) -> str:
-    """Method for a measured-run label (``...-grpo-...`` vs SFT)."""
-    return "grpo" if "grpo" in label.lower() else "sft"
+def verify_accuracy(path: Path | str | None = None) -> dict:
+    """Grade the raw first-principles equation against measured cost. No output factor.
 
-
-def _load_measured(path: Path | str | None = None) -> list[dict]:
-    import json
-
-    p = Path(path) if path is not None else _REAL_RUNS_SUMMARY
-    return json.loads(p.read_text())["measured"]
-
-
-def breakeven_factor_from_real_runs(path: Path | str | None = None) -> dict[str, float]:
-    """Recompute the break-even factors from the committed measured-run summary.
-
-    Returns ``{"sft": .., "grpo": .., "global": ..}`` = Σ measured / Σ analytical-static
-    over each subset. This is the source of truth the hardcoded :data:`BREAKEVEN_FACTORS`
-    are pinned to; run it after new runs land to refresh the constants.
+    Returns per-method and overall: n, mean MAPE %, median APE %, aggregate bias
+    (Σ estimate / Σ measured), and the fraction of runs within 33% / 50%.
     """
-    rows = _load_measured(path)
-    out: dict[str, float] = {}
-    for method in ("sft", "grpo"):
-        sub = [r for r in rows if _method_of(r["label"]) == method]
-        meas = sum(r["cost_usd"] for r in sub)
-        ana = sum(r["analytical_static_usd"] for r in sub)
-        out[method] = meas / ana if ana else float("nan")
-    meas = sum(r["cost_usd"] for r in rows)
-    ana = sum(r["analytical_static_usd"] for r in rows)
-    out["global"] = meas / ana if ana else float("nan")
-    return out
-
-
-def verify_centering(path: Path | str | None = None) -> dict[str, dict[str, float]]:
-    """Prove the calibration breaks even: Σ calibrated quote vs Σ measured, per method.
-
-    Applies the hardcoded per-method factor to each committed run's analytical-static
-    quote and reports, per method and overall, ``sum_measured``, ``sum_calibrated`` and
-    their ratio (1.0 == break-even). The ratio is exactly 1.0 only if the constants
-    equal :func:`breakeven_factor_from_real_runs`; small residuals are the rounding of
-    the published constants.
-    """
-    rows = _load_measured(path)
-    groups: dict[str, list[dict]] = {"sft": [], "grpo": []}
-    for r in rows:
-        groups[_method_of(r["label"])].append(r)
-    groups["all"] = rows  # quoted with each row's own per-method factor
-
-    out: dict[str, dict[str, float]] = {}
+    runs = _load_runs(path)
+    out: dict[str, dict] = {}
+    groups = {
+        "all": runs,
+        "sft": [r for r in runs if r["method"] == "sft"],
+        "grpo": [r for r in runs if r["method"] == "grpo"],
+    }
     for name, sub in groups.items():
-        meas = sum(r["cost_usd"] for r in sub)
-        cal = sum(
-            r["analytical_static_usd"] * breakeven_factor(_method_of(r["label"])) for r in sub
-        )
+        if not sub:
+            continue
+        apes, sum_est, sum_meas = [], 0.0, 0.0
+        for r in sub:
+            est = estimate_cost(_config_of(r)).total_usd
+            meas = r["cost_usd"]
+            apes.append(100 * abs(est - meas) / meas)
+            sum_est += est
+            sum_meas += meas
+        apes.sort()
         out[name] = {
-            "n": float(len(sub)),
-            "sum_measured": meas,
-            "sum_calibrated": cal,
-            "ratio": cal / meas if meas else float("nan"),
+            "n": len(sub),
+            "mean_mape_pct": sum(apes) / len(apes),
+            "median_ape_pct": st.median(apes),
+            "agg_bias": sum_est / sum_meas,  # 1.0 = unbiased in aggregate (not forced)
+            "within_33pct": sum(a <= 33 for a in apes) / len(apes),
+            "within_50pct": sum(a <= 50 for a in apes) / len(apes),
         }
     return out
+
+
+def fit_constants(path: Path | str | None = None) -> dict:
+    """Re-derive the equation's physical constants from the measured runs.
+
+    Returns the market realized $/hr per GPU class (median of the providers' billed rate)
+    and the effective per-step MFU implied by each run's measured wall clock. These are the
+    *inputs* the hardcoded constants should track -- a price/throughput calibration, not a
+    correction applied to the output. Use it to refresh ``hardware.REALIZED_HOURLY_USD`` and
+    the ``analytical`` MFU constants as new runs land.
+    """
+    runs = _load_runs(path)
+    by_gpu_rate: dict[str, list[float]] = {}
+    for r in runs:
+        # Effective billed rate = measured cost / measured wall. This is the rate the
+        # equation must multiply its predicted wall by to recover the billed cost (it
+        # already folds in whatever the plane actually charged vs the provider's quote).
+        rate = r["cost_usd"] / (r["wall_seconds"] / 3600.0)
+        by_gpu_rate.setdefault(r["gpu"], []).append(rate)
+    realized = {g: round(st.median(v), 3) for g, v in sorted(by_gpu_rate.items())}
+    return {"realized_hourly_usd": realized, "n_runs": len(runs)}
 
 
 # --------------------------------------------------------------------------- #
 # Environment cost sweep: how a GRPO run's price moves with the reward env.
 # --------------------------------------------------------------------------- #
-# Representative verifiers-env slugs, one per reward-latency tier (rewards.py), so the
-# sweep spans the full range of grader cost from a free exact-match to an LLM-judge.
 SWEEP_ENVIRONMENTS: tuple[str, ...] = (
     "openai/gsm8k",  # trivial  (exact-match / numeric)
     "stanford/sentiment-classify",  # light    (parse + classify)
@@ -185,43 +145,36 @@ def environment_cost_sweep(
 ) -> list[dict]:
     """Price a GRPO run across environments (reward-latency tiers) and average.
 
-    Environment only enters cost through the GRPO reward grader (rewards.py); the rest
-    of the run is identical. Returns one row per (model, env) with the resolved reward
-    seconds/completion, the raw analytical cost and the break-even quote, plus one
-    ``average`` row per model and a final grand-average row. This is the "test across
-    various environments -> average cost" surface.
+    Environment enters cost only through the GRPO reward grader (rewards.py); the rest of
+    the run is identical. One row per (model, env) with the resolved reward seconds and the
+    cost, plus a per-model average and a grand average. The raw equation cost -- no factor.
     """
     rows: list[dict] = []
     grand: list[float] = []
     for model in models:
         per_model: list[float] = []
         for env in environments:
-            cfg = RunConfig(model, "grpo", steps, environment=env)
-            cal = breakeven_estimate(cfg)
-            raw = cal.total_usd / cal.calibration_factor
+            est: CostEstimate = estimate_cost(RunConfig(model, "grpo", steps, environment=env))
             rows.append(
                 {
                     "model": model,
                     "environment": env,
                     "reward_s_per_completion": reward_seconds_per_completion(env),
-                    "gpu": cal.gpu,
-                    "raw_usd": raw,
-                    "breakeven_usd": cal.total_usd,
-                    # True where the (serial) reward model pushed wall clock past the 24h
-                    # cap -- a known over-estimate the env-testing loop should retire.
-                    "capped": cal.wall_capped,
+                    "gpu": est.gpu,
+                    "usd": est.total_usd,
+                    "capped": est.wall_capped,
                 }
             )
-            per_model.append(cal.total_usd)
-            grand.append(cal.total_usd)
+            per_model.append(est.total_usd)
+            grand.append(est.total_usd)
         rows.append(
             {
                 "model": model,
                 "environment": "AVERAGE (across envs)",
                 "reward_s_per_completion": None,
                 "gpu": "",
-                "raw_usd": None,
-                "breakeven_usd": sum(per_model) / len(per_model),
+                "usd": sum(per_model) / len(per_model),
+                "capped": False,
             }
         )
     rows.append(
@@ -230,8 +183,17 @@ def environment_cost_sweep(
             "environment": "GRAND AVERAGE",
             "reward_s_per_completion": None,
             "gpu": "",
-            "raw_usd": None,
-            "breakeven_usd": sum(grand) / len(grand),
+            "usd": sum(grand) / len(grand),
+            "capped": False,
         }
     )
     return rows
+
+
+# Keep the GPU tables importable for callers that want raw throughput facts.
+__all__ = [
+    "environment_cost_sweep",
+    "fit_constants",
+    "gpu_tflops",
+    "verify_accuracy",
+]

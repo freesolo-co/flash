@@ -26,13 +26,16 @@ def test_unknown_env_uses_default():
     assert reward_seconds_per_completion(None) == reward_seconds_per_completion("totally/novel")
 
 
-def test_reward_dominates_with_a_heavy_env():
+def test_heavier_env_costs_more_but_concurrency_bounds_it():
+    # A heavier reward grader adds per-step time and cost -- but graders run CONCURRENTLY,
+    # so the heavy env is a few x the trivial one, NOT the ~100x a fully-serial model gives
+    # (which would saturate the wall cap). Concurrency is the physical fix to that blowup.
     base = RunConfig("openbmb/MiniCPM5-1B", "grpo", 20, batch_size=16, group_size=4)
     trivial = estimate_cost(
         RunConfig(**{**base.__dict__, "environment": "primeintellect/hendrycks-math"})
     )
     heavy = estimate_cost(RunConfig(**{**base.__dict__, "environment": "acme/code-judge"}))
-    assert heavy.seconds_per_step > 10 * trivial.seconds_per_step
+    assert heavy.seconds_per_step > trivial.seconds_per_step  # heavier reward => slower step
     assert heavy.total_usd > trivial.total_usd
     assert any("reward" in n.lower() for n in heavy.notes)
 

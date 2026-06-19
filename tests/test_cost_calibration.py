@@ -1,85 +1,85 @@
-"""Cost estimator: break-even calibration.
+"""Cost estimator: the equation is fully first-principles -- NO output multiplier.
 
-The analytical model runs ~1.4x high vs measured cost; ``calibration`` scales it so the
-summed quote breaks even. These tests pin the published factors to the committed real-run
-data, prove the portfolio centers, and check the wrapper/sweep wiring. No network.
+These tests pin the anti-reward-hacking invariant (the dollar figure is wall x rate, with
+no factor scaling the result), verify the equation prices at the realized market rate +
+concurrent reward, and exercise the accuracy grader against measured runs. No network.
 """
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from flash.cost import (
-    BREAKEVEN_FACTORS,
     RunConfig,
-    breakeven_estimate,
-    breakeven_factor_from_real_runs,
     environment_cost_sweep,
     estimate_cost,
-    verify_centering,
+    fit_constants,
+    verify_accuracy,
 )
-from flash.cost.calibration import BREAKEVEN_FACTOR_GLOBAL, breakeven_factor
+from flash.cost.estimate import CostEstimate
+from flash.cost.hardware import gpu_hourly_usd, realized_hourly_usd
 
 
-def test_published_factors_match_committed_data():
-    """The hardcoded factors must equal Σmeasured/Σanalytical over the committed runs."""
-    recomputed = breakeven_factor_from_real_runs()
-    assert recomputed["sft"] == pytest.approx(BREAKEVEN_FACTORS["sft"], abs=1e-3)
-    assert recomputed["grpo"] == pytest.approx(BREAKEVEN_FACTORS["grpo"], abs=1e-3)
-    assert recomputed["global"] == pytest.approx(BREAKEVEN_FACTOR_GLOBAL, abs=1e-3)
+def test_no_output_multiplier_field():
+    """CostEstimate must not carry any calibration/scaling factor -- the hack is gone."""
+    names = {f.name for f in dataclasses.fields(CostEstimate)}
+    assert not (names & {"calibration_factor", "breakeven_factor", "scale"})
 
 
-def test_grpo_is_overestimated_more_than_sft():
-    """GRPO's extra rollout/reward/vLLM-init is over-estimated harder -> smaller factor."""
-    assert BREAKEVEN_FACTORS["grpo"] < BREAKEVEN_FACTORS["sft"] < 1.0
+def test_total_is_exactly_wall_hours_times_rate():
+    """The dollar figure is wall-clock hours x market $/hr -- nothing else, no factor."""
+    cfg = RunConfig("Qwen/Qwen3.5-9B", "grpo", 50, environment="gsm8k", gpu="RTX 5090")
+    e = estimate_cost(cfg)
+    assert e.total_usd == pytest.approx(e.wall_clock_hours * realized_hourly_usd("RTX 5090"))
+    assert e.gpu_hourly_usd == pytest.approx(realized_hourly_usd("RTX 5090"))
 
 
-def test_portfolio_centers_to_break_even():
-    """Per-method calibration makes Σ quote == Σ measured (ratio ~1.0), per method + total."""
-    cen = verify_centering()
-    for group in ("sft", "grpo", "all"):
-        assert cen[group]["ratio"] == pytest.approx(1.0, abs=0.01), group
+def test_prices_at_realized_rate_below_list():
+    """Observed classes are priced at the spot/queue rate, which is below on-demand list."""
+    for cls in ("RTX 5090", "A100 PCIe", "RTX 3090"):
+        assert realized_hourly_usd(cls) < gpu_hourly_usd(cls)
+    # an unobserved class falls back to the list price (no spot discount invented)
+    assert realized_hourly_usd("H100") == gpu_hourly_usd("H100")
 
 
-def test_breakeven_estimate_applies_factor():
-    cfg = RunConfig("Qwen/Qwen3.5-9B", "grpo", 150, environment="gsm8k")
-    raw = estimate_cost(cfg)
-    cal = breakeven_estimate(cfg)
-    factor = breakeven_factor("grpo")
-    assert cal.calibration_factor == pytest.approx(factor)
-    assert cal.total_usd == pytest.approx(raw.total_usd * factor)
-    # the raw reference is recoverable, and the un-calibrated model is unchanged.
-    assert cal.total_usd / cal.calibration_factor == pytest.approx(raw.total_usd)
-    assert raw.calibration_factor == 1.0
+def test_concurrent_reward_keeps_heavy_grpo_off_the_floor():
+    """A heavy-reward env must cost more than a trivial one but not explode (serial model
+    would put 512 completions x 3s/step past the cap)."""
+    trivial = estimate_cost(RunConfig("openbmb/MiniCPM5-1B", "grpo", 100, environment="gsm8k"))
+    heavy = estimate_cost(RunConfig("openbmb/MiniCPM5-1B", "grpo", 100, environment="swe/code-exec"))
+    assert heavy.total_usd > trivial.total_usd
+    assert not heavy.wall_capped  # concurrent grading keeps a small run under the wall cap
 
 
-def test_breakeven_quote_is_cheaper_than_raw():
-    cfg = RunConfig("Qwen/Qwen3.5-4B", "sft", 200)
-    assert breakeven_estimate(cfg).total_usd < estimate_cost(cfg).total_usd
+def test_verify_accuracy_reports_unforced_bias():
+    acc = verify_accuracy()
+    assert acc["all"]["n"] >= 20
+    # honest scorecard: bias is a real number near (not pinned to) 1.0, error is positive
+    assert 0.5 < acc["all"]["agg_bias"] < 1.5
+    assert acc["all"]["median_ape_pct"] > 0
+    assert 0.0 <= acc["all"]["within_33pct"] <= 1.0
 
 
-def test_breakdown_shows_calibration_only_when_applied():
-    cfg = RunConfig("Qwen/Qwen3.5-4B", "grpo", 150)
-    assert "Break-even" in breakeven_estimate(cfg).breakdown()
-    assert "Break-even" not in estimate_cost(cfg).breakdown()
+def test_fit_constants_realized_rates_match_hardcoded():
+    """The realized $/hr the equation prices at must track the measured billing data."""
+    from flash.cost.hardware import REALIZED_HOURLY_USD
 
-
-def test_unknown_method_falls_back_to_global():
-    # method is normalized to sft|grpo, so an unmapped key uses the global fallback.
-    assert breakeven_factor("nope") == BREAKEVEN_FACTOR_GLOBAL
+    fit = fit_constants()["realized_hourly_usd"]
+    for cls, rate in REALIZED_HOURLY_USD.items():
+        if cls in fit:
+            assert rate == pytest.approx(fit[cls], abs=0.05), cls
 
 
 def test_environment_sweep_reward_tier_orders_cost():
-    """A heavier reward grader costs more (until the wall cap binds)."""
-    rows = [r for r in environment_cost_sweep() if r["raw_usd"] is not None]
-    by_env = {(r["model"], r["environment"]): r for r in rows}
-    model = "openbmb/MiniCPM5-1B"
-    trivial = by_env[(model, "openai/gsm8k")]["raw_usd"]
-    medium = by_env[(model, "primeintellect/web-search")]["raw_usd"]
-    assert trivial < medium  # trivial (0.01s) cheaper than medium (0.6s) reward
+    rows = [r for r in environment_cost_sweep() if r["gpu"]]
+    by = {(r["model"], r["environment"]): r for r in rows}
+    m = "openbmb/MiniCPM5-1B"
+    assert by[(m, "openai/gsm8k")]["usd"] < by[(m, "primeintellect/web-search")]["usd"]
 
 
-def test_environment_sweep_has_averages():
+def test_environment_sweep_has_grand_average():
     rows = environment_cost_sweep()
     assert rows[-1]["environment"] == "GRAND AVERAGE"
-    assert rows[-1]["breakeven_usd"] > 0
+    assert rows[-1]["usd"] > 0

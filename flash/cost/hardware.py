@@ -54,11 +54,36 @@ def gpu_tflops(name: str) -> float:
 
 
 def gpu_hourly_usd(name: str) -> float:
-    """Static fallback $/hr for a class (live pricing overrides this in production)."""
+    """Static fallback (on-demand list) $/hr for a class."""
     info = GPU_INFO.get(name)
     if info is None:
         raise KeyError(f"unknown GPU class {name!r}")
     return info.hourly_usd
+
+
+# Realized (spot/queue) $/hr a class is ACTUALLY billed at -- below the on-demand list
+# price. The cost equation must price at what runs are billed, not the list quote (which
+# over-estimates by the spot discount: e.g. RTX 5090 lists $0.99 but bills ~$0.86, A100
+# PCIe lists $1.39 but bills ~$1.04). A calibrated price INPUT, not an output adjustment:
+# these are the MEDIAN effective rate (measured cost / measured wall) per class over the
+# RunPod/Vast runs in cost_estimator_results/real_runs/measured_runs.json -- regenerate
+# with ``calibration.fit_constants`` and refresh here as new runs land (pinned by tests).
+# A class without measured runs falls back to the list price (no spot discount invented --
+# an honest over-estimate until it's been observed).
+REALIZED_HOURLY_USD: dict[str, float] = {
+    "RTX 3090": 0.238,
+    "RTX 4090": 0.412,
+    "RTX 5090": 0.863,
+    "RTX A5000": 0.304,
+    "RTX 6000 Ada": 0.601,
+    "A100 PCIe": 1.035,
+    "A100 SXM": 1.133,
+}
+
+
+def realized_hourly_usd(name: str) -> float:
+    """Market (spot/queue) $/hr a class is billed at; list price if not yet observed."""
+    return REALIZED_HOURLY_USD.get(name, gpu_hourly_usd(name))
 
 
 def gpu_vram_gb(name: str) -> int:

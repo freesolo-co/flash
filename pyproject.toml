@@ -73,12 +73,12 @@ packages = ["flash"]
 # Ship the PEP 561 marker so downstream type checkers pick up Flash's type hints.
 artifacts = ["flash/py.typed"]
 
-# The measured-run summary that the break-even calibration reads at runtime lives outside
+# The measured-run dataset the cost equation is calibrated + graded against lives outside
 # the `flash` package (next to its generator under cost_estimator_results/), so it would be
 # dropped from the wheel. force-include ships a copy inside the package so `flash.cost
-# breakeven` / verify_centering() work in an installed wheel, not just a source checkout.
+# verify` / verify_accuracy() work in an installed wheel, not just a source checkout.
 [tool.hatch.build.targets.wheel.force-include]
-"cost_estimator_results/real_runs/summary_real.json" = "flash/cost/_data/summary_real.json"
+"cost_estimator_results/real_runs/measured_runs.json" = "flash/cost/_data/measured_runs.json"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
