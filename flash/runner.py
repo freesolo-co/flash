@@ -132,6 +132,17 @@ def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -
     info = resolve_model(
         spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type, train=spec.train
     )
+    # Re-run the GENERIC multi-GPU topology guards here too. `spec_from_dict` runs them at parse, but
+    # a JobSpec built directly or rehydrated via `JobSpec.from_dict()` (a programmatic submission)
+    # reaches submit_job WITHOUT going through the schema, so an invalid topology — gpu.count>1 with
+    # inference_gpus==0 (colocated path strands paid cards), inference_gpus>=gpu.count (no trainer
+    # GPU), or an indivisible TP split — would otherwise pass straight to allocation/provisioning and
+    # only fail on the paid worker. Cheap, spec-only, idempotent for specs that did go through parse.
+    # ConfigError is a ValueError subclass, so it propagates uniformly with the disaggregated guard
+    # below (programmatic callers catch ValueError; the server catches the precise ConfigError).
+    from .schema import validate_topology
+
+    validate_topology(spec)
     # Fail fast: a disaggregated-only model (e.g. Qwen3.6-35B-A3B) can't run colocated GRPO, and a
     # single-trainer-only model (the 35B) can't use a multi-trainer (>1 trainer card) DDP split.
     from .engine.rollout_bench import validate_disaggregated_requirement

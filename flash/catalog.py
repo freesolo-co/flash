@@ -173,6 +173,13 @@ MODELS: dict[str, ModelInfo] = {
         # and the vLLM rollout are colocated on one card. With a dedicated inference GPU (35B served
         # 4-bit) + a sharded trainer on the rest, it fits. GRPO colocate for it is rejected.
         requires_disaggregated=True,
+        # 16 attention heads (text_config). The disaggregated rollout defaults to TENSOR parallelism
+        # (FLASH_DISAGG_PARALLEL=tp), where vLLM requires heads % inference_gpus == 0 — so a 1:3 split
+        # (inference_gpus=3) is invalid (16 % 3 != 0) and is rejected at submit. Declaring this lets
+        # the schema's TP-divisibility guard catch it before a paid 4-GPU rent (the guard skips the
+        # check when FLASH_DISAGG_PARALLEL=dp, the MoE-only data-parallel mode, where TP=1 makes head
+        # count irrelevant — this entry is the only model that supports dp).
+        num_attention_heads=16,
         # The disaggregated trainer is plain DDP (replicated per trainer rank — TRL's per-step LoRA
         # merge breaks under FSDP sharding), and the 35B is too large to load once PER trainer card
         # (host-RAM / OOM). So only SINGLE-trainer ratios (1:N) are valid; a 2:2 / 2:1 multi-trainer

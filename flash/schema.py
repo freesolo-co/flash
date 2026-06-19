@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import tomllib
 from typing import Any
 
@@ -353,6 +354,75 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     return spec
 
 
+def validate_topology(spec: JobSpec) -> None:
+    """Generic multi-GPU / disaggregated-rollout topology checks ([gpu] count, [train] inference_gpus).
+
+    These cross-field guards depend only on the spec (plus the catalog head count, when the model is
+    a catalog entry) — NOT on resolving/renting a GPU — so they catch an unfittable topology at submit
+    before a paid node is provisioned. Factored out of ``_validate_spec`` so ``runner.submit_job`` can
+    re-run them on a ``JobSpec`` that reached it WITHOUT going through ``spec_from_dict`` (a directly
+    constructed or ``JobSpec.from_dict``-rehydrated spec, e.g. a programmatic submission), which would
+    otherwise bypass the schema guard and only fail on the paid worker.
+    """
+    if spec.gpu.count < 1:
+        raise ConfigError("gpu.count must be >= 1")
+    if spec.train.inference_gpus < 0:
+        raise ConfigError("train.inference_gpus must be >= 0")
+    # A multi-GPU node is ONLY used by the disaggregated GRPO path (gpu.count = trainer GPUs +
+    # inference_gpus). With inference_gpus == 0 the worker takes the colocated/single-process path
+    # and never touches the extra cards, so gpu.count > 1 would silently bill for GPUs that cannot
+    # affect the run. Reject it up front (it also catches SFT, where inference_gpus is rejected
+    # above, so SFT is always single-GPU here).
+    if spec.gpu.count > 1 and spec.train.inference_gpus == 0:
+        raise ConfigError(
+            f"gpu.count ({spec.gpu.count}) > 1 requires train.inference_gpus > 0 (the "
+            "disaggregated GRPO rollout is the only multi-GPU path; gpu.count = trainer GPUs + "
+            "inference_gpus). Set inference_gpus, or use gpu.count = 1."
+        )
+    if spec.train.inference_gpus > 0:
+        # The disaggregated async rollout (vLLM server on dedicated GPUs) is a GRPO-only path —
+        # SFT has no rollout engine, so inference_gpus would just strand paid GPUs.
+        if spec.algorithm != "grpo":
+            raise ConfigError(
+                "train.inference_gpus is only valid for grpo (the disaggregated rollout server); "
+                "SFT has no rollout engine"
+            )
+        # Need at least one trainer GPU left after carving off the inference GPUs.
+        if spec.gpu.count <= spec.train.inference_gpus:
+            raise ConfigError(
+                f"gpu.count ({spec.gpu.count}) must be greater than train.inference_gpus "
+                f"({spec.train.inference_gpus}) — at least one GPU must train "
+                "(gpu.count = trainer GPUs + inference_gpus)"
+            )
+        # train_gpus>1 (2:1, 3:1, 2:2) runs the trainer as a DDP group via `accelerate launch`
+        # (run_rl's disaggregated launcher re-execs the worker across the train devices). Supported.
+        # Reject a tensor-parallel split the model's head count can't satisfy BEFORE renting: vLLM
+        # requires num_attention_heads % inference_gpus == 0 for TP (inference_gpus>1). For a catalog
+        # model with a declared head count this is known at submit time — e.g. MiniCPM5-1B (16 heads)
+        # with inference_gpus=3 is impossible (16 % 3 != 0). Catching it here avoids charging the user
+        # for a multi-GPU node that only fails at the worker's pre-server-boot guard. Open-model runs
+        # declare no head count and rely on the worker guard.
+        #
+        # Gate on the EFFECTIVE parallel mode, not on whether the model is MoE: the divisibility law
+        # only constrains TENSOR parallelism (the default). The dp opt-in (FLASH_DISAGG_PARALLEL=dp,
+        # MoE-only) replicates the whole server per card (tp=1) so head count is irrelevant — skip it
+        # there. Without this the 35B-A3B MoE (16 heads, num_attention_heads declared) would default
+        # to TP and a 1:3 split would pass schema yet crash the worker's TP guard after a paid 4-GPU
+        # rent. Must mirror the worker (engine.worker.run_rl) and allocator default exactly: tp unless
+        # FLASH_DISAGG_PARALLEL is the literal "dp".
+        _disagg_is_dp = (os.environ.get("FLASH_DISAGG_PARALLEL") or "").strip().lower() == "dp"
+        if spec.train.inference_gpus > 1 and spec.model in MODELS and not _disagg_is_dp:
+            _heads = int(getattr(MODELS[spec.model], "num_attention_heads", 0) or 0)
+            if _heads and _heads % spec.train.inference_gpus != 0:
+                _valid = [d for d in range(1, _heads + 1) if _heads % d == 0 and d < spec.gpu.count]
+                raise ConfigError(
+                    f"train.inference_gpus ({spec.train.inference_gpus}) is an invalid tensor-parallel "
+                    f"split for {spec.model}: it has {_heads} attention heads and vLLM requires "
+                    f"heads % inference_gpus == 0. Valid inference_gpus for this model (and gpu.count "
+                    f"= {spec.gpu.count}): {_valid}"
+                )
+
+
 def _validate_spec(spec: JobSpec) -> None:
     if not spec.train.seeds:
         raise ConfigError("train.seeds must contain at least one seed")
@@ -421,55 +491,7 @@ def _validate_spec(spec: JobSpec) -> None:
     if spec.train.lora_alpha <= 0:
         raise ConfigError("train.lora_alpha must be positive")
     # Multi-GPU / disaggregated-rollout topology ([gpu] count, [train] inference_gpus).
-    if spec.gpu.count < 1:
-        raise ConfigError("gpu.count must be >= 1")
-    if spec.train.inference_gpus < 0:
-        raise ConfigError("train.inference_gpus must be >= 0")
-    # A multi-GPU node is ONLY used by the disaggregated GRPO path (gpu.count = trainer GPUs +
-    # inference_gpus). With inference_gpus == 0 the worker takes the colocated/single-process path
-    # and never touches the extra cards, so gpu.count > 1 would silently bill for GPUs that cannot
-    # affect the run. Reject it up front (it also catches SFT, where inference_gpus is rejected
-    # above, so SFT is always single-GPU here).
-    if spec.gpu.count > 1 and spec.train.inference_gpus == 0:
-        raise ConfigError(
-            f"gpu.count ({spec.gpu.count}) > 1 requires train.inference_gpus > 0 (the "
-            "disaggregated GRPO rollout is the only multi-GPU path; gpu.count = trainer GPUs + "
-            "inference_gpus). Set inference_gpus, or use gpu.count = 1."
-        )
-    if spec.train.inference_gpus > 0:
-        # The disaggregated async rollout (vLLM server on dedicated GPUs) is a GRPO-only path —
-        # SFT has no rollout engine, so inference_gpus would just strand paid GPUs.
-        if spec.algorithm != "grpo":
-            raise ConfigError(
-                "train.inference_gpus is only valid for grpo (the disaggregated rollout server); "
-                "SFT has no rollout engine"
-            )
-        # Need at least one trainer GPU left after carving off the inference GPUs.
-        if spec.gpu.count <= spec.train.inference_gpus:
-            raise ConfigError(
-                f"gpu.count ({spec.gpu.count}) must be greater than train.inference_gpus "
-                f"({spec.train.inference_gpus}) — at least one GPU must train "
-                "(gpu.count = trainer GPUs + inference_gpus)"
-            )
-        # train_gpus>1 (2:1, 3:1, 2:2) runs the trainer as a DDP group via `accelerate launch`
-        # (run_rl's disaggregated launcher re-execs the worker across the train devices). Supported.
-        # Reject a tensor-parallel split the model's head count can't satisfy BEFORE renting: vLLM
-        # requires num_attention_heads % inference_gpus == 0 for TP (inference_gpus>1). For a catalog
-        # model with a declared head count this is known at submit time — e.g. MiniCPM5-1B (16 heads)
-        # with inference_gpus=3 is impossible (16 % 3 != 0). Catching it here avoids charging the user
-        # for a multi-GPU node that only fails at the worker's pre-server-boot guard. (The default
-        # parallelism is TP; the dp opt-in is MoE-only and those entries declare no head count, so
-        # they skip this. Open-model runs declare none too and rely on the worker guard.)
-        if spec.train.inference_gpus > 1 and spec.model in MODELS:
-            _heads = int(getattr(MODELS[spec.model], "num_attention_heads", 0) or 0)
-            if _heads and _heads % spec.train.inference_gpus != 0:
-                _valid = [d for d in range(1, _heads + 1) if _heads % d == 0 and d < spec.gpu.count]
-                raise ConfigError(
-                    f"train.inference_gpus ({spec.train.inference_gpus}) is an invalid tensor-parallel "
-                    f"split for {spec.model}: it has {_heads} attention heads and vLLM requires "
-                    f"heads % inference_gpus == 0. Valid inference_gpus for this model (and gpu.count "
-                    f"= {spec.gpu.count}): {_valid}"
-                )
+    validate_topology(spec)
     # Catalog-level disaggregation requirements (requires_disaggregated / single_trainer_only).
     # These live on the catalog entry, so they apply only to catalog models and are known here
     # WITHOUT resolving/renting. submit_job re-runs this on the resolved ModelInfo, but doing it at

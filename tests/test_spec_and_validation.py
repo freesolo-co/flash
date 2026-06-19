@@ -113,6 +113,39 @@ def test_disaggregated_topology_accepted() -> None:
     assert s22.gpu.count - s22.train.inference_gpus == 2
 
 
+def test_moe_invalid_tensor_parallel_split_rejected_at_submit() -> None:
+    """The 35B-A3B MoE declares 16 heads and defaults to TENSOR parallelism, so a 1:3 split
+    (inference_gpus=3, 16 % 3 != 0) must be rejected at submit — not skipped just because it's MoE."""
+    raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
+    raw["train"]["inference_gpus"] = 3
+    raw["gpu"]["count"] = 4
+    raw["gpu"]["type"] = "A100 PCIe"
+    with pytest.raises(ConfigError, match="invalid tensor-parallel split"):
+        spec_from_dict(raw)
+
+
+def test_moe_tp_split_skipped_under_data_parallel(monkeypatch) -> None:
+    """With FLASH_DISAGG_PARALLEL=dp (MoE-only data parallelism, tp=1) the head-divisibility law
+    doesn't apply, so the same indivisible 1:3 split is accepted (each card is a full replica)."""
+    monkeypatch.setenv("FLASH_DISAGG_PARALLEL", "dp")
+    raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
+    raw["train"]["inference_gpus"] = 3
+    raw["gpu"]["count"] = 4
+    raw["gpu"]["type"] = "A100 PCIe"
+    spec = spec_from_dict(raw)
+    assert spec.train.inference_gpus == 3
+
+
+def test_moe_valid_tensor_parallel_split_accepted() -> None:
+    """A divisible TP split passes for the MoE too: 16 heads with inference_gpus=2 (16 % 2 == 0)."""
+    raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
+    raw["train"]["inference_gpus"] = 2
+    raw["gpu"]["count"] = 3
+    raw["gpu"]["type"] = "A100 PCIe"
+    spec = spec_from_dict(raw)
+    assert spec.train.inference_gpus == 2
+
+
 def test_sft_epochs_must_be_positive() -> None:
     raw = _raw(algorithm="sft")
     raw["train"] = {"epochs": 0, "lora_rank": 8, "seeds": [0]}
@@ -267,6 +300,26 @@ def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(FileNotFoundError, match="unknown run_id"):
         orch.get_status("flash-000-nope")
+
+
+def test_submit_job_revalidates_topology_for_direct_jobspec(tmp_path, monkeypatch) -> None:
+    """A JobSpec built directly (bypassing spec_from_dict) with an invalid topology must be rejected
+    by submit_job BEFORE allocation — not reach a paid worker. gpu.count>1 + inference_gpus==0 takes
+    the colocated path and strands the extra paid card, so it must fail at submit."""
+    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    raw = _raw()
+    raw["gpu"]["count"] = 2  # multi-GPU node...
+    raw["train"]["inference_gpus"] = 0  # ...but colocated -> the extra card can never train
+    spec = JobSpec.from_dict(raw)  # bypasses schema._validate_spec
+    with pytest.raises(ValueError, match="requires train"):
+        orch.submit_job(spec, dry_run=True)
+
+    # And an indivisible TP split on a direct catalog spec is likewise caught at submit.
+    raw2 = _raw(model="openbmb/MiniCPM5-1B")
+    raw2["gpu"]["count"] = 4
+    raw2["train"]["inference_gpus"] = 3  # 16 % 3 != 0
+    with pytest.raises(ValueError, match="invalid tensor-parallel split"):
+        orch.submit_job(JobSpec.from_dict(raw2), dry_run=True)
 
 
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:
