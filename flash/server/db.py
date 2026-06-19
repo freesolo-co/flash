@@ -62,7 +62,7 @@ def hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
-def ensure_internal_key(api_key: str, email: str = "freesolo-internal") -> dict:
+def ensure_internal_key(api_key: str) -> dict:
     """Provision a row for the shared freesolo internal/service key (idempotent).
 
     The freesolo platform/SDK authenticate to the control plane with the same
@@ -76,7 +76,7 @@ def ensure_internal_key(api_key: str, email: str = "freesolo-internal") -> dict:
         conn.execute(
             "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (hash_key(api_key), "internal", email, now),
+            (hash_key(api_key), "internal", "freesolo-internal", now),
         )
     row = lookup_key(api_key)
     if row is None:  # pragma: no cover - the row was just inserted
@@ -84,7 +84,7 @@ def ensure_internal_key(api_key: str, email: str = "freesolo-internal") -> dict:
     return row
 
 
-def ensure_external_key(api_key: str, email: str = "freesolo-user") -> dict | None:
+def ensure_external_key(api_key: str) -> dict | None:
     """Provision a per-token row for a verified external (freesolo USER) key (idempotent).
 
     Unlike :func:`ensure_internal_key` (one shared service identity), this keys a distinct
@@ -100,7 +100,7 @@ def ensure_external_key(api_key: str, email: str = "freesolo-user") -> dict | No
         conn.execute(
             "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (hash_key(api_key), "freesolo", email, now),
+            (hash_key(api_key), "freesolo", "freesolo-user", now),
         )
     return lookup_key(api_key)
 
@@ -118,11 +118,11 @@ def lookup_key(api_key: str) -> dict | None:
         return dict(row)
 
 
-def record_run(run_id: str, key_id: int, kind: str = "train") -> None:
+def record_run(run_id: str, key_id: int) -> None:
     with _connect() as conn:
         conn.execute(
             "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, ?, ?)",
-            (run_id, key_id, kind, time.time()),
+            (run_id, key_id, "train", time.time()),
         )
 
 

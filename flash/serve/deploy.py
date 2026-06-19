@@ -34,13 +34,8 @@ logger = get_logger(__name__)
 # Default freesolo serving base URL (the Modal multi-LoRA app). Overridable per-env.
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
 
-# These remain so callers/tests that imported them keep resolving; they are cosmetic now
-# that serving is delegated to freesolo (no flash-owned endpoint to size or warm).
 MODES = ("dev", "always-on")
 DEFAULT_IDLE_TIMEOUT_S = 300
-_ENDPOINT_CACHE: dict[str, object] = {}
-# The serving deps used to live on the flash worker image; serving is now external.
-SERVE_DEPS: list[str] = []
 
 
 def serving_base_url() -> str:
@@ -51,11 +46,6 @@ def serving_base_url() -> str:
 def _internal_key_header() -> dict[str, str]:
     key = os.environ.get("FREESOLO_INTERNAL_KEY") or ""
     return {"X-Freesolo-Internal-Key": key} if key else {}
-
-
-def resolve_serve_deps() -> list[str]:
-    """Kept for back-compat; serving deps are external (freesolo), so this is empty."""
-    return SERVE_DEPS
 
 
 @dataclass
@@ -77,14 +67,6 @@ class Deployment:
         return asdict(self)
 
 
-def _language_model_only(model: str) -> bool:
-    """Cosmetic: the family-name guard the old flash worker used for text-only serving.
-
-    The freesolo serving app makes its own multimodal decisions; kept so any importer
-    keeps resolving."""
-    return "Qwen3.5" in model or "Qwen3.6" in model
-
-
 def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
     """Cosmetic endpoint label (the freesolo app serves all adapters on one endpoint)."""
     tail = (run_id or "").split("-")[-1][:24]
@@ -92,7 +74,7 @@ def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
     return f"{base}-{tail}" if tail else base
 
 
-def servable_gpu(gpu_name: str, model: str) -> str:
+def servable_gpu(gpu_name: str) -> str:
     """Resolve a friendly GPU class for the deployment record.
 
     Serving is delegated to freesolo (one GPU per base model, chosen there), so this is
@@ -120,7 +102,6 @@ def deploy_adapter(
     mode: str = "dev",
     idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S,
     dry_run: bool = False,
-    lora_rank: int = 64,
     thinking: bool = False,
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app.
@@ -132,7 +113,7 @@ def deploy_adapter(
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
-    friendly = servable_gpu(gpu_name, model)
+    friendly = servable_gpu(gpu_name)
     subfolder = f"{adapter_prefix}/adapter"
     dep = Deployment(
         run_id=run_id,
@@ -167,7 +148,7 @@ def deploy_adapter(
     return dep
 
 
-def undeploy_adapter(run_id: str, gpu_name: str = "RTX 5090") -> list[str]:
+def undeploy_adapter(run_id: str) -> list[str]:
     """Deregister the run's adapter from the freesolo serving app.
 
     Returns ``[run_id]`` when the adapter was removed (200), ``[]`` when it was already
@@ -189,15 +170,8 @@ def undeploy_adapter(run_id: str, gpu_name: str = "RTX 5090") -> list[str]:
 def chat(
     run_id: str,
     messages: list[dict],
-    model: str,
-    hf_repo: str,
-    adapter_prefix: str,
-    gpu_name: str = "RTX 5090",
     temperature: float = 0.0,
     max_tokens: int = 512,
-    mode: str = "dev",
-    idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S,
-    lora_rank: int = 64,
     thinking: bool = False,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
