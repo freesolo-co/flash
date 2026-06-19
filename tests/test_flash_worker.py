@@ -95,10 +95,10 @@ def test_build_worker_env_forwards_upload_console(monkeypatch):
 
 
 def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
-    """The opt-in chalk-kernel install hook (engine.chalk_kernels) runs inside the worker
-    subprocess and selects which install-on-call chalk installers to run from FLASH_* flags read
-    from its OWN process env, so an operator-set FLASH_* selection (and FLASH_CHALK_SPEC) MUST be
-    forwarded by the allowlist or every chalk kernel silently no-ops on every remote run."""
+    """The chalk-kernel install hook (engine.chalk_kernels) runs inside the worker subprocess and
+    resolves which chalk kernels to apply from FLASH_* flags read from its OWN process env (gap-
+    fillers default-on; FLASH_* are overrides). So an operator-set FLASH_* override (and
+    FLASH_CHALK_SPEC) MUST be forwarded by the allowlist or it silently no-ops on every remote run."""
     from flash.providers.runpod.train import build_worker_env
 
     # Exactly the per-kernel boolean flags in chalk_kernels._KERNELS (one per
@@ -154,12 +154,14 @@ def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
 
 def test_chalk_extra_pip_defaults_to_pypi_without_spec(monkeypatch):
     """chalk is published on PyPI, so a SELECTED run with FLASH_CHALK_SPEC unset auto-installs the
-    PyPI package by default (just like Liger) — no operator spec required."""
-    from flash.providers.runpod.train import chalk_extra_pip
+    VERSION-PINNED PyPI package by default (just like Liger) — no operator spec required, and a
+    breaking release can't silently land (the pin is bounded)."""
+    from flash.providers.runpod.train import DEFAULT_CHALK_SPEC, chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
     monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
-    assert chalk_extra_pip() == ["freesolo-chalk"]
+    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
+    assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk") and "<" in DEFAULT_CHALK_SPEC  # bounded
 
 
 def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):
@@ -202,12 +204,12 @@ def test_chalk_extra_pip_per_run_worker_env_spec_override(monkeypatch):
     """A per-run [worker_env] FLASH_CHALK_SPEC overrides the PyPI default for THAT run — resolved
     against the effective worker env (worker_env merged over os.environ), not bare os.environ, so a
     per-run source pin actually reaches the worker's extra_pip."""
-    from flash.providers.runpod.train import chalk_extra_pip
+    from flash.providers.runpod.train import DEFAULT_CHALK_SPEC, chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)  # nothing in os.environ
     spec = _spec_worker_env({"FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main"})
-    # bare env: chalk's gap-fillers are default-on -> the PyPI default installs
-    assert chalk_extra_pip() == ["freesolo-chalk"]
+    # bare env: chalk's gap-fillers are default-on -> the version-pinned PyPI default installs
+    assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
     # the per-run [worker_env] spec overrides the source for that run
     assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
 

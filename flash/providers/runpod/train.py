@@ -81,10 +81,11 @@ WORKER_DEPS = [
     # dense Qwen3.5 GDN models route to consumer cards by default, where fla works.
     # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
     # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
-    # (chalk_extra_pip) appends ``freesolo-chalk`` from PyPI to the worker's `extra_pip` for EVERY
-    # job by default — installed + applied automatically, like Liger. Override the source with
-    # FLASH_CHALK_SPEC (a pinned version / git URL / wheel), or disable every kernel (FLASH_<K>=0) to
-    # skip the install. The worker pip-installs extra_pip for EVERY job (baked-image RunPod
+    # (chalk_extra_pip) appends the version-pinned ``freesolo-chalk`` (DEFAULT_CHALK_SPEC) from PyPI
+    # to the worker's `extra_pip` for EVERY job by default — installed + applied automatically, like
+    # Liger. Override the source with FLASH_CHALK_SPEC (an exact version / git URL / wheel), or
+    # disable every kernel (FLASH_<K>=0) to skip the install. The worker pip-installs extra_pip for
+    # EVERY job (baked-image RunPod
     # _train_body + Vast bootstrap). Do NOT rely on
     # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS for this: the durable baked-image submit path
     # (jobs.build_function_input) returns the raw payload and never consults resolve_worker_deps, so
@@ -190,6 +191,13 @@ def _chalk_selected(spec=None) -> bool:
     return is_chalk_enabled(_effective_worker_env(spec))
 
 
+# Default chalk install spec when FLASH_CHALK_SPEC is unset. VERSION-PINNED (bounded range, like the
+# rest of WORKER_DEPS) so a default run is reproducible and a breaking freesolo-chalk release can't
+# silently land on production jobs — 0.1.x patches are allowed, 0.2 is not. Bump intentionally after
+# validating a new line; an operator can pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z.
+DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.1.0,<0.2.0"
+
+
 def chalk_extra_pip(spec=None) -> list[str]:
     """Chalk pip spec(s) to ADD to the worker's ``extra_pip`` when a chalk kernel is selected.
 
@@ -204,14 +212,15 @@ def chalk_extra_pip(spec=None) -> list[str]:
 
     Chalk's gap-fillers are default-on, so chalk is selected for a normal run even with no FLASH_*
     flags set. freesolo-chalk is published on PyPI, so it auto-installs by DEFAULT (just like Liger):
-    when chalk is selected and ``FLASH_CHALK_SPEC`` is unset we add ``freesolo-chalk``. Set
-    ``FLASH_CHALK_SPEC`` to override the source (a pinned version, a git URL, or a wheel/path), or
-    disable every kernel (``FLASH_<K>=0``) to skip the install.
+    when chalk is selected and ``FLASH_CHALK_SPEC`` is unset we add the version-pinned
+    :data:`DEFAULT_CHALK_SPEC`. Set ``FLASH_CHALK_SPEC`` to override the source (an exact version, a
+    git URL, or a wheel/path), or disable every kernel (``FLASH_<K>=0``) to skip the install.
     """
     if not _chalk_selected(spec):
         return []
-    # PyPI default — chalk is published, so a normal run installs + applies it automatically.
-    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or "freesolo-chalk"
+    # PyPI default (version-pinned for reproducibility) — chalk is published, so a normal run
+    # installs + applies it automatically. An explicit FLASH_CHALK_SPEC overrides the source.
+    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
     import shlex
 
     return [d for d in shlex.split(spec_str) if d.strip()]
