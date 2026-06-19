@@ -310,7 +310,7 @@ cat > /root/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
 # huggingface_hub never installed). Hold the box first so the control plane can
 # pull the log tail (mirrors the bootstrap-failure path below and the extra-pip
 # check=True path). The no-deps branch (":") always succeeds, so this is a no-op there.
-{pip_line} || {{ echo "AUTOSLM: base worker dependency install failed" >&2; sleep 600; exit 1; }}
+{pip_line} || {{ echo "FLASH: base worker dependency install failed" >&2; sleep 600; exit 1; }}
 "$PYBIN" /root/flash/bootstrap.py
 FLASH_RC=$?
 # On failure, hold the box for 10 min so the control plane can pull the container
