@@ -170,6 +170,16 @@ class GpuSpec:
 
 
 @dataclass(frozen=True)
+class WandbSpec:
+    # Optional W&B naming, defined in the [wandb] config table (first-class spec config, NOT
+    # env vars). project/run_name are non-secret labels; the actual WANDB_API_KEY stays an
+    # env-var secret. None -> the worker's defaults ("flash" project, "flash-<phase>-<run_id>-
+    # seedN" run name).
+    project: str | None = None
+    run_name: str | None = None
+
+
+@dataclass(frozen=True)
 class JobSpec:
     model: str = DEFAULT_MODEL
     algorithm: str = "grpo"
@@ -189,6 +199,9 @@ class JobSpec:
     # identically by SFT rendering, RL rollouts, and serving (decoding parity). OFF by default
     # (operator preference: training defaults to no-reasoning; set thinking = true to enable).
     thinking: bool = False
+    # Optional W&B run naming from the [wandb] config table. Carried as typed spec config
+    # (round-tripped in the job-spec JSON the worker reads), not as environment variables.
+    wandb: WandbSpec = field(default_factory=WandbSpec)
 
     @property
     def phase(self) -> str:
@@ -260,6 +273,10 @@ class JobSpec:
             worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
             thinking=_coerce_bool(data.get("thinking", False)),
+            wandb=WandbSpec(
+                project=(data.get("wandb") or {}).get("project"),
+                run_name=(data.get("wandb") or {}).get("run_name"),
+            ),
         )
 
     @classmethod

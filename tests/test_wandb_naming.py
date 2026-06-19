@@ -1,8 +1,9 @@
-"""[wandb] project / run_name config -> W&B env the worker honors. No network.
+"""[wandb] project / run_name config -> typed JobSpec.wandb the worker honors. No network.
 
-`slm train cfg.toml --set wandb.project=… --set wandb.run_name=…` (or a `[wandb]`
-table) lets a run land in its own W&B project / run name instead of the hardcoded
-`flash` / `flash-<phase>-<run_id>-seed<N>` defaults.
+`slm train cfg.toml --set wandb.project=… --set wandb.run_name=…` (or a `[wandb]` table) lets a
+run land in its own W&B project / run name instead of the hardcoded `flash` /
+`flash-<phase>-<run_id>-seed<N>` defaults. The naming is first-class spec config (round-tripped in
+the job-spec JSON the worker reads), NOT environment variables; the WANDB_API_KEY secret stays env.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from flash.schema import ConfigError, spec_from_dict, spec_from_file
+from flash.spec import JobSpec, WandbSpec
 
 
 def _base(**extra: object) -> dict:
@@ -23,36 +25,43 @@ def _base(**extra: object) -> dict:
     return cfg
 
 
-def test_wandb_section_folds_into_worker_env():
+def test_wandb_section_parses_into_spec():
     spec = spec_from_dict(_base(wandb={"project": "my-proj", "run_name": "my-run"}))
-    assert spec.worker_env["WANDB_PROJECT"] == "my-proj"
-    assert spec.worker_env["WANDB_NAME"] == "my-run"
+    assert spec.wandb.project == "my-proj"
+    assert spec.wandb.run_name == "my-run"
 
 
-def test_no_wandb_section_leaves_worker_env_clean():
+def test_no_wandb_section_is_empty():
     spec = spec_from_dict(_base())
-    assert "WANDB_PROJECT" not in spec.worker_env
-    assert "WANDB_NAME" not in spec.worker_env
+    assert spec.wandb.project is None
+    assert spec.wandb.run_name is None
 
 
 def test_partial_wandb_section():
     spec = spec_from_dict(_base(wandb={"project": "only-proj"}))
-    assert spec.worker_env["WANDB_PROJECT"] == "only-proj"
+    assert spec.wandb.project == "only-proj"
+    assert spec.wandb.run_name is None
+
+
+def test_wandb_config_does_not_touch_worker_env():
+    # [wandb] is its own typed field now, NOT folded into the worker_env env-var bag.
+    spec = spec_from_dict(_base(wandb={"project": "p", "run_name": "r"}))
+    assert "WANDB_PROJECT" not in spec.worker_env
     assert "WANDB_NAME" not in spec.worker_env
-
-
-def test_explicit_worker_env_wins_over_wandb_section():
-    # [worker_env] is the lower-level escape hatch; [wandb] must not clobber it.
-    spec = spec_from_dict(
-        _base(worker_env={"WANDB_PROJECT": "explicit"}, wandb={"project": "from-wandb"})
-    )
-    assert spec.worker_env["WANDB_PROJECT"] == "explicit"
 
 
 def test_wandb_values_are_trimmed():
     spec = spec_from_dict(_base(wandb={"project": "  p  ", "run_name": "  r  "}))
-    assert spec.worker_env["WANDB_PROJECT"] == "p"
-    assert spec.worker_env["WANDB_NAME"] == "r"
+    assert spec.wandb.project == "p"
+    assert spec.wandb.run_name == "r"
+
+
+def test_wandb_round_trips_through_json():
+    # The worker reads JOB_SPEC via JSON, so [wandb] must survive to_dict/from_dict.
+    spec = spec_from_dict(_base(wandb={"project": "rt-proj", "run_name": "rt-run"}))
+    rt = JobSpec.from_dict(spec.to_dict())
+    assert rt.wandb.project == "rt-proj"
+    assert rt.wandb.run_name == "rt-run"
 
 
 @pytest.mark.parametrize(
@@ -74,8 +83,7 @@ def test_wandb_section_must_be_a_table():
         spec_from_dict(_base(wandb="my-project"))
 
 
-def test_set_override_reaches_wandb(tmp_path):
-    # The CLI surface: `--set wandb.project=… --set wandb.run_name=…`.
+def _toml(tmp_path) -> str:
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "openbmb/MiniCPM5-1B"\n'
@@ -86,36 +94,44 @@ def test_set_override_reaches_wandb(tmp_path):
         "seeds = [0]\n"
         'hf_repo = "me/repo"\n'
     )
-    spec = spec_from_file(str(cfg), overrides=["wandb.project=cli-proj", "wandb.run_name=cli-run"])
-    assert spec.worker_env["WANDB_PROJECT"] == "cli-proj"
-    assert spec.worker_env["WANDB_NAME"] == "cli-run"
+    return str(cfg)
+
+
+def test_set_override_reaches_wandb(tmp_path):
+    # The CLI surface: `--set wandb.project=… --set wandb.run_name=…`.
+    spec = spec_from_file(
+        _toml(tmp_path), overrides=["wandb.project=cli-proj", "wandb.run_name=cli-run"]
+    )
+    assert spec.wandb.project == "cli-proj"
+    assert spec.wandb.run_name == "cli-run"
 
 
 @pytest.mark.parametrize("label", ["123", "1e-4", "true", "false"])
 def test_set_override_preserves_numeric_looking_wandb_label(tmp_path, label):
-    # A numeric- or bool-looking --set wandb.* value is the string label the user
-    # intends; it must not be coerced to int/float/bool (which the [wandb] validator
-    # rejects). The same value works through [worker_env].
-    cfg = tmp_path / "run.toml"
-    cfg.write_text(
-        'model = "openbmb/MiniCPM5-1B"\n'
-        'algorithm = "sft"\n'
-        "[environment]\n"
-        'id = "owner/some-env"\n'
-        "[train]\n"
-        "seeds = [0]\n"
-        'hf_repo = "me/repo"\n'
-    )
-    spec = spec_from_file(str(cfg), overrides=[f"wandb.run_name={label}"])
-    assert spec.worker_env["WANDB_NAME"] == label
+    # A numeric- or bool-looking --set wandb.* value is the string label the user intends; it must
+    # not be coerced to int/float/bool (which the [wandb] validator rejects).
+    spec = spec_from_file(_toml(tmp_path), overrides=[f"wandb.run_name={label}"])
+    assert spec.wandb.run_name == label
 
 
-def test_worker_run_name_honors_override(monkeypatch):
+def test_worker_run_name_uses_spec_wandb(monkeypatch):
+    # Primary path: the worker reads the run name from the typed spec (no env var).
     from flash.engine import worker
 
+    monkeypatch.delenv("WANDB_NAME", raising=False)
+    monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(run_name="from-spec")))
+    assert worker.wandb_run_name() == "from-spec"
+
+
+def test_worker_run_name_env_escape_hatch(monkeypatch):
+    # A [worker_env]-forwarded WANDB_NAME is honored only as a fallback when [wandb] run_name is
+    # unset — the typed config is the primary surface.
+    from flash.engine import worker
+
+    monkeypatch.setattr(worker, "JOB_SPEC", None)
     monkeypatch.setenv("WANDB_NAME", "custom-name")
     assert worker.wandb_run_name() == "custom-name"
-    monkeypatch.setenv("WANDB_NAME", "   ")  # blank -> fall back
+    monkeypatch.setenv("WANDB_NAME", "   ")  # blank -> fall back to default
     assert worker.wandb_run_name().startswith("flash-")
     monkeypatch.delenv("WANDB_NAME", raising=False)
     assert worker.wandb_run_name().startswith("flash-")

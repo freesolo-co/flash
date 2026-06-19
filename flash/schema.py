@@ -18,7 +18,7 @@ from .providers.base import (
     resolve_gpu_policy,
     unvalidated_allowed,
 )
-from .spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from .spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec, WandbSpec
 
 
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
@@ -158,8 +158,8 @@ def _apply_override(raw: dict, item: str) -> None:
     val = value.strip()
     # [wandb] leaves are string-valued labels (project / run name); a numeric- or
     # bool-looking value like `--set wandb.run_name=123` is still the string label the
-    # user intends, and the same value works through [worker_env]. Preserve it as a
-    # string instead of coercing it to int/float/bool (which _apply_wandb_naming rejects).
+    # user intends. Preserve it as a string instead of coercing it to int/float/bool
+    # (which _wandb_spec's string validation would otherwise reject).
     if parts[0] == "wandb":
         node[leaf] = val
     elif val.startswith("[") and val.endswith("]"):
@@ -265,11 +265,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         )
 
     # worker_env is the lower-level per-run escape hatch ([worker_env] table, string-valued,
-    # secret-guarded). The optional [wandb] naming table is folded ON TOP as the standard
-    # WANDB_PROJECT / WANDB_NAME env vars the worker honors — an explicit [worker_env] value wins
-    # (setdefault), so [wandb] never clobbers one a user set directly.
+    # secret-guarded). The optional [wandb] naming table is a separate, typed spec field
+    # (JobSpec.wandb) — NOT folded into worker_env env vars.
     worker_env = _worker_env(raw.get("worker_env"))
-    _apply_wandb_naming(raw.get("wandb"), worker_env)
+    wandb_spec = _wandb_spec(raw.get("wandb"))
 
     spec = JobSpec(
         model=model,
@@ -330,6 +329,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         worker_env=worker_env,
         model_policy=model_policy,
         thinking=thinking,
+        wandb=wandb_spec,
     )
     _validate_spec(spec)
     return spec
@@ -384,21 +384,22 @@ def _worker_env(raw: Any) -> dict[str, str]:
     return env
 
 
-# [wandb] config keys -> the standard W&B env vars the worker reads.
-_WANDB_KEYS = {"project": "WANDB_PROJECT", "run_name": "WANDB_NAME"}
+# Allowed [wandb] config keys -> typed JobSpec.wandb fields (first-class spec config, NOT env vars).
+_WANDB_KEYS = ("project", "run_name")
 
 
-def _apply_wandb_naming(raw: Any, worker_env: dict[str, str]) -> None:
-    """Fold the optional ``[wandb]`` table into ``worker_env`` as the standard W&B env vars.
+def _wandb_spec(raw: Any) -> WandbSpec:
+    """Parse the optional ``[wandb]`` table into a typed ``WandbSpec`` (project / run_name).
 
-    ``[wandb] project`` / ``run_name`` -> ``WANDB_PROJECT`` / ``WANDB_NAME`` (the env vars
-    ``engine.worker.wandb_report_to`` / ``wandb_run_name`` honor), so a run can land in its own
-    W&B project under its own run name instead of the hardcoded ``flash`` / ``flash-…``
-    defaults. Settable in TOML or via ``slm train cfg.toml --set wandb.project=… --set
-    wandb.run_name=…``. An explicit ``[worker_env]`` value wins (it's the lower-level escape
-    hatch) via ``setdefault``, so this never clobbers one a user set directly."""
+    These are non-secret W&B naming labels carried as first-class spec config (round-tripped in
+    the job-spec JSON the worker reads), NOT environment variables. The worker honors them in
+    ``engine.worker.wandb_report_to`` / ``wandb_run_name``, so a run can land in its own W&B
+    project under its own run name instead of the hardcoded ``flash`` / ``flash-…`` defaults.
+    Settable in TOML (``[wandb] project = …``) or via ``slm train cfg.toml --set
+    wandb.project=… --set wandb.run_name=…``. The actual W&B credential (WANDB_API_KEY) stays an
+    env-var secret — only the naming config lives here."""
     if raw is None:
-        return
+        return WandbSpec()
     if not isinstance(raw, dict):
         raise ConfigError('[wandb] must be a table (e.g. project = "my-project")')
     unknown = sorted(set(raw) - set(_WANDB_KEYS))
@@ -406,13 +407,15 @@ def _apply_wandb_naming(raw: Any, worker_env: dict[str, str]) -> None:
         raise ConfigError(
             f"[wandb] unknown key(s): {', '.join(unknown)} (allowed: {', '.join(_WANDB_KEYS)})"
         )
-    for key, env_key in _WANDB_KEYS.items():
+    values: dict[str, str] = {}
+    for key in _WANDB_KEYS:
         if key not in raw:
             continue
         val = raw[key]
         if not isinstance(val, str) or not val.strip():
             raise ConfigError(f"[wandb] {key} must be a non-empty string")
-        worker_env.setdefault(env_key, val.strip())
+        values[key] = val.strip()
+    return WandbSpec(**values)
 
 
 def _validate_spec(spec: JobSpec) -> None:

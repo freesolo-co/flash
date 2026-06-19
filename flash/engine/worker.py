@@ -849,9 +849,10 @@ def loraplus_optimizer_cls(optim_name: str):
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
-    (silent, the metrics.json artifact is still the source of truth). Sets a default project so runs
-    land in one place — a run's ``[wandb] project`` (forwarded as WANDB_PROJECT) overrides it via
-    setdefault, so runs aren't all forced into the "flash" project."""
+    (silent, the metrics.json artifact is still the source of truth). The project comes from the
+    ``[wandb] project`` config (``JOB_SPEC.wandb.project``), defaulting to "flash". The W&B SDK
+    only reads it from WANDB_PROJECT, so we set that from the spec here at the point of use (the
+    config itself is the typed spec field, not an externally-set env var)."""
     if not os.environ.get("WANDB_API_KEY"):
         return []
     import importlib.util
@@ -859,20 +860,27 @@ def wandb_report_to() -> list[str]:
     if importlib.util.find_spec("wandb") is None:
         print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
         return []
-    # Default project only — a run's [wandb] project (forwarded as WANDB_PROJECT via worker_env)
-    # wins, so runs aren't all forced into the hardcoded "flash" project.
-    os.environ.setdefault("WANDB_PROJECT", "flash")
+    project = JOB_SPEC.wandb.project if JOB_SPEC else None
+    if project:
+        os.environ["WANDB_PROJECT"] = project  # explicit [wandb] project wins
+    else:
+        # no [wandb] project: keep an explicit WANDB_PROJECT (the [worker_env] escape hatch) if
+        # one was forwarded, else default to "flash" — don't clobber it.
+        os.environ.setdefault("WANDB_PROJECT", "flash")
     return ["wandb"]
 
 
 def wandb_run_name() -> str:
-    """W&B run name. Defaults to a stable id tying the dashboard run to the Flash run
-    (``flash-<phase>-<run_id>-seed<N>``); a run's ``[wandb] run_name`` (forwarded as the
-    standard ``WANDB_NAME`` env var) overrides it so dashboards aren't all named "flash-…".
-    An explicit name is used verbatim — the user owns the naming."""
-    override = os.environ.get("WANDB_NAME")
-    if override and override.strip():
-        return override.strip()
+    """W&B run name. A run's ``[wandb] run_name`` config (``JOB_SPEC.wandb.run_name``) is used
+    verbatim — the user owns the naming; otherwise a stable id tying the dashboard run to the Flash
+    run (``flash-<phase>-<run_id>-seed<N>``). The [wandb] config is the primary surface; a
+    ``WANDB_NAME`` env (the [worker_env] escape hatch) is honored only as a fallback."""
+    configured = JOB_SPEC.wandb.run_name if JOB_SPEC else None
+    if configured and configured.strip():
+        return configured.strip()
+    env_override = os.environ.get("WANDB_NAME")  # [worker_env] escape hatch, not the primary config
+    if env_override and env_override.strip():
+        return env_override.strip()
     return f"flash-{PHASE}-{RUN_ID}-seed{SEED}"
 
 
