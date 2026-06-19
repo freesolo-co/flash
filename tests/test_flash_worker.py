@@ -230,7 +230,7 @@ def test_chalk_extra_pip_worker_env_overrides_os_env_flag(monkeypatch):
     assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
     # a per-run [worker_env] disabling every gap-filler turns chalk off for that run
     spec = _spec_worker_env(
-        {k: "0" for k in ("FLASH_ROPE_KERNEL", "FLASH_QKV_KERNEL", "FLASH_TRITON_LORA", "FLASH_EMBED_KERNEL")}
+        dict.fromkeys(("FLASH_ROPE_KERNEL", "FLASH_QKV_KERNEL", "FLASH_TRITON_LORA", "FLASH_EMBED_KERNEL"), "0")
     )
     assert chalk_extra_pip(spec) == []
 

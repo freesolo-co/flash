@@ -298,11 +298,13 @@ def test_make_lora_skips_pissa_on_4bit_qlora(monkeypatch):
     worker = _import_worker(monkeypatch)
     monkeypatch.setattr(worker, "lora_exclude_modules", lambda m: None)
 
-    # 4-bit QLoRA tier -> NO PiSSA (it would crash); rsLoRA still on
+    # 4-bit QLoRA tier -> NO PiSSA of ANY variant (any pissa_* init crashes on a 4-bit base);
+    # rsLoRA still on.
     monkeypatch.setattr(worker, "model_quant", lambda m: "4bit-qlora")
     captured.clear()
     worker.make_lora("Qwen/Qwen3.5-9B")
-    assert captured.get("init_lora_weights") != "pissa_niter_16"
+    _init = str(captured.get("init_lora_weights", "")).lower()
+    assert not _init.startswith("pissa"), f"PiSSA must be skipped on 4-bit, got {_init!r}"
     assert captured.get("use_rslora") is True
 
     # bf16/LoRA tier -> PiSSA on

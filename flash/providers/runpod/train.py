@@ -364,10 +364,11 @@ def _train_body(input_data: dict) -> dict:
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
 
     def run_mode(mode: str, check: bool) -> int:
-        """Run one worker process, tee its console to a file, and on failure upload the
-        tail to HF as console_<mode>.txt — the engine-core root cause of crashes like
-        vLLM EngineDeadError only ever appears on the subprocess console, never in the
-        Python traceback."""
+        """Run one worker process, tee its console to a file, and upload the tail to HF as
+        console_<mode>.txt on failure — the engine-core root cause of crashes like vLLM
+        EngineDeadError only ever appears on the subprocess console, never in the Python
+        traceback. With FLASH_UPLOAD_CONSOLE=1 (forwarded via build_worker_env) the console
+        is also uploaded on SUCCESS, so an operator can verify which optimizations engaged."""
         console = f"/tmp/console_{mode}.txt"
         with open(console, "w") as cf:
             proc = subprocess.Popen(
@@ -851,6 +852,11 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # Periodic mid-run GRPO eval cadence override (engine.worker reads it; >0 enables). The
         # held-out sample size comes from the run's [train] eval_examples, not an env var.
         "FLASH_EVAL_EVERY_STEPS",
+        # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
+        # run_mode() in _train_body reads this from its OWN process env, which is THIS forwarded
+        # allowlist + the worker image's os.environ — so a control-plane `FLASH_UPLOAD_CONSOLE=1`
+        # only reaches the worker if it's forwarded here. Without this it silently no-ops on success.
+        "FLASH_UPLOAD_CONSOLE",
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
         # the WORKER decides which installers to run from these flags. install_chalk_kernels runs
         # INSIDE the worker subprocess and reads them from its own process env, so a control-plane
