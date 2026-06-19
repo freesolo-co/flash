@@ -81,5 +81,5 @@ def test_logs_offset_in_query(stub):
 
 def test_unreachable_server_is_actionable():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    with pytest.raises(ClientError, match="AUTOSLM_API_URL"):
+    with pytest.raises(ClientError, match="FLASH_API_URL"):
         client.health()
