@@ -258,6 +258,12 @@ def make_checkpoint_upload_callback():
 
     class _CheckpointUpload(TrainerCallback):
         def on_save(self, args, state, control, **kwargs):
+            # Multi-GPU (FSDP / accelerate) runs on_save on EVERY rank; only the single global
+            # main process may upload, or ranks race on the same HF commit and one rank's
+            # delete_patterns can wipe another rank's just-uploaded checkpoint. Single-GPU runs
+            # are always world-process-zero, so this is a no-op there.
+            if not state.is_world_process_zero:
+                return
             if not HF_REPO:
                 return
             step = int(state.global_step)
@@ -880,10 +886,33 @@ def make_lora(model_id: str | None = None):
     # so LoRA converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
     # NOTE: PiSSA mutates the effective base, so the saved adapter is a PiSSA-residual unless
     # converted — fine for our train+eval+serve-same-stack flow.
-    kwargs["init_lora_weights"] = "pissa_niter_16"
+    # PiSSA's SVD-based init fails inside the DISAGGREGATED trainer (which is CVD-pinned to a
+    # non-zero device so the vLLM server can own device 0): peft's pissa_init hits
+    # "set_data ... incompatible tensor type" there. AUTOSLM_LORA_INIT=default falls back to the
+    # standard LoRA init (Kaiming-A / zero-B) — the disaggregated worker sets this. The init METHOD
+    # does not affect rollout/step THROUGHPUT, which is the whole point of the disaggregated path.
+    # `or` (not a get-default): a present-but-blank AUTOSLM_LORA_INIT must fall back too, else
+    # init_lora_weights="" reaches PEFT as an invalid value instead of a real init method.
+    _lora_init = os.environ.get("AUTOSLM_LORA_INIT") or "pissa_niter_16"
+    # PiSSA's SVD init requires an UNQUANTIZED base ("Please initialize PiSSA under
+    # float32/float16/bfloat16"); it raises on a 4-bit (qlora) base at adapter creation. Force
+    # standard init for qlora models regardless of the configured default, so the 4-bit trainers
+    # (Qwen3.5-9B, Qwen3.6-35B-A3B) don't crash — this hit 9B colocate (asb-esc-q9b-coloB).
+    if (
+        model_id
+        and model_quant(model_id) == "4bit-qlora"
+        and _lora_init.lower() not in ("default", "standard", "plain", "true")
+    ):
+        print(f"[lora] {model_id} is 4-bit qlora; PiSSA needs an unquantized base -> forcing standard init")
+        _lora_init = "default"
+    if _lora_init.lower() in ("default", "standard", "plain", "true"):
+        kwargs["init_lora_weights"] = True
+        print("[lora] init_lora_weights=default (standard LoRA init; pissa disabled)")
+    else:
+        kwargs["init_lora_weights"] = _lora_init
+        print(f"[lora] init_lora_weights={_lora_init}, rsLoRA scaling enabled")
     # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
     kwargs["use_rslora"] = True
-    print("[lora] init_lora_weights=pissa_niter_16, rsLoRA scaling enabled")
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
         if exclude:
@@ -1235,7 +1264,9 @@ def run_sft():
 # ---------------------------------------------------------------------------
 # RL (GRPO) with TRL + colocated vLLM
 # ---------------------------------------------------------------------------
-def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_comps: int) -> dict:
+def compute_grpo_batching(
+    prompts_per_step: int, group_size: int, per_device_comps: int, num_processes: int = 1
+) -> dict:
     """Translate an intended ``prompts_per_step`` into a TRL GRPO batch configuration.
 
     TRL's GRPO batch sizing is denominated in **completions (prompt-completion pairs), not
@@ -1259,11 +1290,20 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     prompts_per_step = max(1, int(prompts_per_step))
     per_device = max(1, int(per_device_comps))
     target_comps = prompts_per_step * group_size  # total completions / optimizer step
-    # Never let the per-device completion micro-batch exceed the target completion batch:
-    # a small prompts_per_step would otherwise overshoot it (mirrors run_sft's
-    # `min(per_device_bs, effective_batch)`). No-op at the default (prompts_per_step=64).
-    per_device = max(1, min(per_device, target_comps))
-    grad_accum = max(1, target_comps // per_device)
+    nproc = max(1, int(num_processes))
+    # Never let the per-device completion micro-batch exceed the PER-RANK share of the target
+    # completion batch. The smallest GLOBAL micro-batch is per_device * num_processes, so capping at
+    # the full target_comps (ignoring rank count) would let an num_processes>1 FSDP run overshoot
+    # prompts_per_step*group_size and inflate unique_prompts/step. Cap at target_comps // nproc
+    # (mirrors run_sft's `min(per_device_bs, effective_batch)`; no-op at the default nproc=1).
+    per_device = max(1, min(per_device, max(1, target_comps // nproc)))
+    # The GLOBAL completion batch TRL optimizes is per_device * grad_accum * num_processes —
+    # accelerate/TRL multiply by the data-parallel world size (FSDP trainer ranks). To still optimize
+    # `prompts_per_step` prompts/step under an `num_processes`-rank FSDP trainer, grad_accum must be
+    # divided by num_processes; otherwise the effective batch (and unique_prompts/step) scales with
+    # the rank count, and a small dataset can't fill even one step (the FSDP 0-real-steps bug seen on
+    # 2:2). num_processes=1 (colocate / single-trainer 1:1/1:2) is unchanged.
+    grad_accum = max(1, target_comps // (per_device * nproc))
     # TRL rejects a global completion batch (per_device * grad_accum) that is not
     # divisible by num_generations (= group_size), failing only AFTER the paid worker
     # is provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the
@@ -1272,7 +1312,9 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     # batch slightly; the common per_device|group_size cases are unchanged.
     accum_step = group_size // math.gcd(per_device, group_size)
     grad_accum = ((grad_accum + accum_step - 1) // accum_step) * accum_step
-    generations_per_step = per_device * grad_accum
+    # generations_per_step / unique_prompts_per_step are reported GLOBALLY (across all ranks) so the
+    # metric matches the intended prompts_per_step regardless of the trainer world size.
+    generations_per_step = per_device * grad_accum * nproc
     unique_prompts_per_step = generations_per_step // group_size
     return {
         "per_device_train_batch_size": per_device,
@@ -1571,6 +1613,44 @@ def _init_adapter_model(model_id: str):
     return model, None
 
 
+def _pin_trainer_devices_for_disaggregated() -> None:
+    """Pin CUDA_VISIBLE_DEVICES to the TRAINER's devices before any CUDA context is created.
+
+    Disaggregated GRPO only (``[train].inference_gpus>0``). Must run at the very top of main(),
+    before _drop_fla_on_hopper / finalize_alloc_conf_for_sleep / any model import touches CUDA —
+    CUDA_VISIBLE_DEVICES is honored only before the first context. The vLLM server (a separate
+    subprocess) gets the inference devices via its own env (server_subprocess_env); the trainer
+    must NOT also land on device 0 or TRL aborts the weight-sync init with "same CUDA device ...
+    for multiple distinct roles/ranks". detect_total_gpus reads AUTOSLM_GPU_COUNT / nvidia-smi (no
+    torch context), so this stays CUDA-free. run_rl recomputes the same split (deterministic)."""
+    if RUN_MODE != "rl":
+        return
+    from flash.engine import disaggregated as _disagg
+    from flash.engine.rollout_bench import select_rollout_split
+
+    # In the accelerate-launched trainer child (train_gpus>1), `accelerate launch --gpu_ids` already
+    # pinned this rank to its single train GPU; overriding CUDA_VISIBLE_DEVICES here would make every
+    # rank see all train GPUs and collide. Leave the env exactly as accelerate set it.
+    if _disagg.trainer_only_mode():
+        print("[rl][disagg] trainer-only child: accelerate manages CUDA_VISIBLE_DEVICES; skip pin")
+        return
+    inference_gpus = int(JOB_SPEC.train.inference_gpus) if (JOB_SPEC and JOB_SPEC.train) else 0
+    inference_gpus = int(os.environ.get("AUTOSLM_INFERENCE_GPUS", inference_gpus))
+    if inference_gpus <= 0:
+        return
+
+    total = _disagg.detect_total_gpus()
+    if inference_gpus >= total:
+        return  # run_rl's select_rollout_split will raise with a clear message
+    split = select_rollout_split(total, inference_gpus)
+    os.environ["CUDA_VISIBLE_DEVICES"] = _disagg.trainer_cuda_visible_devices(split)
+    print(
+        f"[rl][disagg] (early) pinned trainer CUDA_VISIBLE_DEVICES="
+        f"{os.environ['CUDA_VISIBLE_DEVICES']} (node {total} GPUs, {inference_gpus} for inference; "
+        f"server gets device(s) {','.join(map(str, split.infer_devices))})"
+    )
+
+
 def run_rl():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -1591,6 +1671,79 @@ def run_rl():
     is_tool_env = getattr(ACTIVE_ENV, "is_tool_env", False)
     is_multi_turn = getattr(ACTIVE_ENV, "multi_turn", False)
     conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
+    # ---- Disaggregated (multi-GPU async) rollout: device split (BEFORE any CUDA context) ----
+    # [train].inference_gpus>0 dedicates GPUs to a separate vLLM rollout server so generation
+    # overlaps the optimizer step instead of time-sharing one card (verl async rollout). The
+    # trainer process MUST pin CUDA_VISIBLE_DEVICES to its train devices before wait_for_gpu() (or
+    # any torch.cuda call) binds the context to all visible cards. The server is launched later (it
+    # needs the engine length); here we only compute the split + pin the trainer + snapshot a clean
+    # env for the server subprocess (which gets the GLOBAL inference device indices).
+    from flash.engine import disaggregated as _disagg
+    from flash.engine.rollout_bench import (
+        select_rollout_split,
+        validate_disaggregated_requirement,
+    )
+
+    _inference_gpus = int(JOB_SPEC.train.inference_gpus) if (JOB_SPEC and JOB_SPEC.train) else 0
+    _inference_gpus = int(os.environ.get("AUTOSLM_INFERENCE_GPUS", _inference_gpus))
+    # Re-validate against the EFFECTIVE inference_gpus: submit-time validation only saw the spec
+    # value, but AUTOSLM_INFERENCE_GPUS (via [worker_env]) can change it here — e.g. =0 would force
+    # colocated GRPO for a requires_disaggregated model that OOMs colocated. Fail fast on the worker.
+    from flash.catalog import MODELS as _CATALOG_RL
+
+    _info_rl = _CATALOG_RL.get(JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id)
+    validate_disaggregated_requirement(
+        requires_disaggregated=bool(getattr(_info_rl, "requires_disaggregated", False)),
+        algorithm="grpo",
+        inference_gpus=_inference_gpus,
+    )
+    _rollout_split = None
+    _disagg_base_env: dict | None = None
+    # Defaults for the colocate (inference_gpus==0) and train_gpus==1 paths — these MUST be defined
+    # before the disaggregated branch so the trainer-build block's `if _is_fsdp_launcher:` never hits
+    # an UnboundLocalError on the colocate path (only the train_gpus>1 launcher sets it True).
+    _trainer_only = False
+    _is_fsdp_launcher = False
+    if _inference_gpus > 0:
+        _total_gpus = _disagg.detect_total_gpus()
+        _rollout_split = select_rollout_split(_total_gpus, _inference_gpus)
+        print(
+            f"[rl][disagg] node has {_total_gpus} GPU(s); split {_rollout_split.label}: "
+            f"train devices {_rollout_split.train_devices}, infer devices "
+            f"{_rollout_split.infer_devices}"
+        )
+        # train_gpus>1 (2:1, 3:1, 2:2) needs the trainer as a DISTRIBUTED group, not one process
+        # spanning many GPUs (that silently becomes nn.DataParallel, which TRL's weight-sync gather
+        # can't handle). Two roles, same code path:
+        #   LAUNCHER (this run, train_gpus>1, RANK unset): launches the vLLM server below, then at the
+        #     trainer-build point re-execs the worker under `accelerate launch` (FSDP) across the
+        #     train devices and waits — it does NOT build a trainer itself.
+        #   TRAINER child (AUTOSLM_RL_TRAINER_ONLY=1, RANK set by accelerate): skips the server launch
+        #     (connects to the launcher's server via env port) and runs the FSDP GRPOTrainer; only
+        #     rank 0 writes artifacts. train_gpus==1 keeps the simple single-process path untouched.
+        _trainer_only = _disagg.trainer_only_mode()
+        _is_fsdp_launcher = _rollout_split.train_gpus > 1 and not _trainer_only
+        _disagg_base_env = dict(os.environ)  # clean snapshot for the server subprocess
+        if not _trainer_only:
+            # The launcher (and the train_gpus==1 path) pin the trainer away from the inference card.
+            # The accelerate child must NOT — accelerate's --gpu_ids already pinned each rank.
+            os.environ["CUDA_VISIBLE_DEVICES"] = _disagg.trainer_cuda_visible_devices(_rollout_split)
+            print(f"[rl][disagg] trainer CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+        else:
+            print(
+                f"[rl][disagg] trainer-only child rank={os.environ.get('RANK','0')} "
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} (accelerate-pinned)"
+            )
+        # PiSSA's SVD init crashes in the CVD-pinned (non-zero device) disaggregated trainer
+        # (peft set_data incompatible-tensor-type); fall back to standard LoRA init. setdefault so
+        # an explicit operator [worker_env] AUTOSLM_LORA_INIT still wins. Init method is irrelevant
+        # to the throughput this path measures.
+        # setdefault would NOT override an operator-set BLANK value, leaving make_lora with an
+        # invalid empty init (and PiSSA would still be attempted in this CVD-pinned trainer);
+        # treat blank/unset as "use standard init" so the fallback actually engages.
+        if not os.environ.get("AUTOSLM_LORA_INIT"):
+            os.environ["AUTOSLM_LORA_INIT"] = "default"
+    disaggregated = _rollout_split is not None and _rollout_split.mode == "disaggregated"
     wait_for_gpu()
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
@@ -1630,10 +1783,15 @@ def run_rl():
         # liger-loss gate below.
         _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
         sleep_mode = _memory_mode(model_id, _grpo_ctx)
-    # Rollout backend: always colocated vLLM (fast). The whole supported catalog runs GRPO with
-    # colocated vLLM; there is no transformers-generation fallback.
+    if disaggregated:
+        # The disaggregated rollout server runs continuously on its own GPU(s); there is no
+        # trainer/rollout time-share to free memory for, so sleep mode (offload weights each step)
+        # is both unnecessary and unsupported across the process boundary.
+        sleep_mode = False
+    # Rollout backend: vLLM. Colocate (default) shares the trainer GPU; disaggregated runs a
+    # separate vLLM server on dedicated GPU(s). There is no transformers-generation fallback.
     use_vllm = True
-    print("[rl] rollout backend: colocated vLLM")
+    print(f"[rl] rollout backend: {'disaggregated vLLM server' if disaggregated else 'colocated vLLM'}")
     from flash.catalog import MODELS as _CATALOG
 
     _info = _CATALOG.get(model_id)
@@ -1765,7 +1923,14 @@ def run_rl():
     if _params_b is None:
         _params_b = fetch_hf_params_b(model_id)
     per_device_comps = rl_per_device_comps(_max_completion, use_vllm=use_vllm, params_b=_params_b)
-    batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
+    # In the FSDP trainer child the optimizer runs across train_gpus ranks, so the per-rank grad_accum
+    # must be divided by that count (else the global batch over-scales and a small dataset yields 0
+    # real steps). The single-process paths (colocate, 1:1/1:2 with one trainer GPU, and the launcher
+    # which builds no trainer) pass num_processes=1 — unchanged.
+    _grpo_nproc = _rollout_split.train_gpus if (_trainer_only and _rollout_split) else 1
+    batching = compute_grpo_batching(
+        prompts_per_step, group_size, per_device_comps, num_processes=_grpo_nproc
+    )
     if not batching["divisible_by_group"]:
         print("WARN: generation batch not divisible by group size; check RL_PER_DEVICE_PROMPTS")
     print(
@@ -1833,7 +1998,158 @@ def run_rl():
     if liger_on(True):
         grpo_kwargs["use_liger_kernel"] = True
         print("[rl] liger fused GRPO loss enabled")
-    if use_vllm:
+    vllm_proc = None
+    if use_vllm and disaggregated:
+        # Disaggregated: a separate `trl vllm-serve` process owns the inference GPU(s); the trainer
+        # connects over loopback (vllm_mode="server") and TRL syncs the (PEFT-merged) policy weights
+        # to it via NCCL each generation batch (sync_weights), so generation for the next batch
+        # overlaps this step's optimizer instead of time-sharing one card (verl async rollout).
+        # The server gets the whole inference card (no colocate util cap), stays resident (no sleep),
+        # and its KV cache is bounded by --max_model_len = the GRPO engine length.
+        _port = _disagg.server_port()
+        _server_util = float(
+            os.environ.get("RL_VLLM_SERVER_UTIL", str(_disagg.DEFAULT_SERVER_GPU_UTIL))
+        )
+        # verl rollout lever (mirror colocate): fp8 KV cache on fp8-native silicon (compute
+        # capability >= 8.9: Ada/Hopper/Blackwell) ~halves the server's KV pool. The trainer GPU is
+        # the same class as the inference GPU (whole-machine node), so its capability is a valid
+        # proxy. Ampere (A100/3090, sm80) lacks fp8 -> stay fp16.
+        try:
+            import torch as _torch
+
+            _server_kv = "fp8" if _torch.cuda.get_device_capability() >= (8, 9) else None
+        except Exception:
+            _server_kv = None
+        # Inference parallelism across the rollout GPUs. DEFAULT = tensor-parallel: shard the model
+        # across infer_gpus so the decode (memory-bandwidth bound) gets their aggregate HBM
+        # bandwidth -> faster, larger-batch generation, which is how 1:2 / 1:3 ratios clear the
+        # rollout bottleneck on a generation-bound step. Works for dense AND MoE. Data-parallel
+        # (replicas) is REJECTED by vLLM for dense models ("Offline data parallel ... not supported
+        # ... for dense models"), so reserve AUTOSLM_DISAGG_PARALLEL=dp for the MoE 35B-A3B only.
+        _parallel = (os.environ.get("AUTOSLM_DISAGG_PARALLEL") or "tp").strip().lower()
+        if _parallel not in ("dp", "tp"):
+            _parallel = "tp"
+        if _parallel == "dp":
+            # vLLM rejects data-parallel for DENSE models ("Offline data parallel ... not supported
+            # ... for dense models"); only MoE supports it. Validate up front and fall back to tp
+            # (valid for dense AND MoE) with a warning, rather than booting the server for ~20 min
+            # and only then crashing on the incompatible config. tp is always a safe fallback, so an
+            # uncertain probe (offline / config unreadable) also degrades to tp.
+            _is_moe = False
+            try:
+                from transformers import AutoConfig
+
+                _cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+                _is_moe = bool(
+                    getattr(_cfg, "num_experts", 0) or getattr(_cfg, "n_routed_experts", 0)
+                ) or "moe" in (getattr(_cfg, "model_type", "") or "").lower()
+            except Exception as _e:
+                print(f"[rl][disagg] MoE probe failed ({_e}); assuming dense", flush=True)
+            if not _is_moe:
+                print(
+                    f"[rl][disagg] WARNING: AUTOSLM_DISAGG_PARALLEL=dp is MoE-only (vLLM rejects "
+                    f"data-parallel for dense models); {model_id} is dense -> using tp.",
+                    flush=True,
+                )
+                _parallel = "tp"
+        print(
+            f"[rl][disagg] inference parallelism={_parallel} across {_rollout_split.infer_gpus} "
+            f"rollout GPU(s) (tp=shard-one-model/throughput, dp=replicas-MoE-only)",
+            flush=True,
+        )
+        # FAST-FAIL the invalid-TP ratio: vLLM requires the model's attention-head count to be
+        # divisible by tensor_parallel_size (= infer_gpus). E.g. MiniCPM5-1B has 16 heads, so TP=3
+        # (a 1:3 split) is REJECTED ("Total number of attention heads (16) must be divisible by
+        # tensor parallel size (3)") — valid infer ratios for a 16-head model are 1, 2, 4, 8. Without
+        # this check the worker rents the GPU and boots the server for ~20 min only to crash on the
+        # pydantic VllmConfig validation. Catch it here (config read is cheap) with an actionable
+        # message naming the valid inference-GPU counts. Only relevant for TP with >1 inference GPU.
+        if _parallel == "tp" and _rollout_split.infer_gpus > 1:
+            try:
+                from transformers import AutoConfig
+
+                _hc = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+                # VL / multimodal configs nest the LM dims under text_config (the top-level
+                # num_attention_heads may be the vision encoder's). Pick the LM config the same way
+                # _estimate_params does: top-level only when it carries hidden_size, else text_config.
+                _tc = getattr(_hc, "text_config", None)
+                _src = _hc if getattr(_hc, "hidden_size", 0) else (_tc or _hc)
+                _heads = getattr(_src, "num_attention_heads", None)
+            except Exception as _e:
+                _heads = None
+                print(f"[rl][disagg] head-count probe failed ({_e}); skipping TP divisibility check", flush=True)
+            if _heads and _heads % _rollout_split.infer_gpus != 0:
+                # Disaggregated rollout reserves >=1 GPU for training, so inference_gpus < _total_gpus
+                # (never the full node) — cap the suggested divisors accordingly.
+                _valid = [d for d in range(1, _heads + 1) if _heads % d == 0 and d < _total_gpus]
+                raise RuntimeError(
+                    f"[rl][disagg] invalid tensor-parallel split: {model_id} has {_heads} attention "
+                    f"heads, not divisible by inference_gpus={_rollout_split.infer_gpus} (vLLM "
+                    f"requires heads % TP == 0). Valid inference_gpus for this model: {_valid}. "
+                    f"Pick a [train] inference_gpus from that set (e.g. a 1:2 or 1:4 split)."
+                )
+        _cmd = _disagg.build_vllm_serve_cmd(
+            model_id,
+            _rollout_split,
+            max_model_len=vllm_max_len,
+            port=_port,
+            gpu_memory_util=_server_util,
+            quant=quant,
+            kv_cache_dtype=_server_kv,
+            parallel=_parallel,
+        )
+        _server_timeout = float(os.environ.get("RL_VLLM_SERVER_TIMEOUT", "1200"))
+        if _trainer_only:
+            # The FSDP launcher already started the server on the inference card(s); this accelerate
+            # rank just connects to it (vllm_proc stays None so the finally never terminates the
+            # launcher's server). No health wait — the launcher only re-execs us once it is healthy.
+            print(f"[rl][disagg] trainer-only rank: connecting to existing rollout server at port {_port}")
+        else:
+            _server_log = "/tmp/vllm_serve.log"
+            vllm_proc = _disagg.launch_vllm_server(
+                _cmd, _disagg.server_subprocess_env(_disagg_base_env, _rollout_split), log_path=_server_log
+            )
+            # vLLM server boot under spawn is slow: re-import torch/vLLM in the spawned worker + model
+            # download + load + CUDA-graph capture. A 1B model measured ~450s end-to-end; bigger models
+            # take longer, so default generously (uvicorn binds the HTTP port only AFTER the worker
+            # finishes loading, so the health check sees connection-refused until then).
+            try:
+                # Emit a heartbeat every 60s during the boot so the control plane's no-heartbeat
+                # STALL detector (~25 min) doesn't kill a big model mid-boot: the 35B server
+                # (70 GB bf16 + tilelang/CUDA-graph JIT) can take >20 min to bind its port, and that
+                # whole stretch is silent otherwise. (This was why the 35B run got killed at 1503s.)
+                _boot_t0 = time.time()
+                _disagg.wait_for_server_health(
+                    _port,
+                    timeout=_server_timeout,
+                    proc=vllm_proc,
+                    log_path=_server_log,
+                    on_wait=lambda: heartbeat("rl_server_boot", boot_seconds=round(time.time() - _boot_t0)),
+                )
+            except BaseException:
+                # A server boot failure / health-check error here must NOT leak the vllm-serve
+                # subprocess + its inference GPU; the trainer try/finally below only covers train().
+                _disagg.terminate_server(vllm_proc)
+                raise
+            print(f"[rl][disagg] rollout server healthy at {_disagg.server_base_url(_port)}")
+        grpo_kwargs.update(
+            vllm_mode="server",
+            vllm_server_base_url=_disagg.server_base_url(_port),
+            vllm_server_timeout=_server_timeout,
+        )
+        # Keep the trainer's NCCL weight-sync group port in lockstep with the server's. Both default
+        # to TRL's 51216, but AUTOSLM_VLLM_GROUP_PORT overrides the SERVER (server_subprocess_env);
+        # the trainer's VLLMClient must use the same port or sync_weights can't rendezvous. Set the
+        # field only if this TRL exposes it (older TRL rejects unknown GRPOConfig kwargs).
+        _group_port = _disagg.group_port()
+        if "vllm_group_port" in getattr(GRPOConfig, "__dataclass_fields__", {}):
+            grpo_kwargs["vllm_group_port"] = _group_port
+        elif _group_port != _disagg.DEFAULT_GROUP_PORT:
+            print(
+                f"[rl][disagg][warn] this TRL has no GRPOConfig.vllm_group_port; cannot honor "
+                f"AUTOSLM_VLLM_GROUP_PORT={_group_port} on the trainer side (stays TRL default 51216)"
+            )
+    elif use_vllm:
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
         # the model's FULL context and won't start on a consumer GPU). RL_VLLM_GPU_UTIL
@@ -1941,9 +2257,13 @@ def run_rl():
 
     # VL checkpoints (Qwen3.5/3.6) train text-only: make TRL's colocated rollout
     # engine skip the vision tower (VRAM + 5090 PTX-compat; see the patch docstring).
-    # Only relevant when vLLM drives rollouts; transformers generation uses the trainer
-    # model (already text-only via the LoRA target/exclude config).
-    if use_vllm:
+    # Only reachable for the IN-PROCESS (colocate) engine. The disaggregated `trl vllm-serve`
+    # server is a separate process this monkeypatch can't reach, AND TRL's vllm-serve exposes no
+    # language-model-only flag, so that server loads the full model incl. the vision tower. That is
+    # acceptable in practice: the only requires_disaggregated model (Qwen3.6-35B-A3B) runs on H200,
+    # where the vision tower fits and the 5090-class PTX issue doesn't apply. Revisit (a TRL patch /
+    # --hf-overrides shim) only if a disaggregated VL model is ever served on a smaller GPU.
+    if use_vllm and not disaggregated:
         patch_vllm_language_model_only(model_id)
     hb_cb = make_reward_heartbeat_callback()
     # Multi-turn / tool wiring (trl 1.6): tool envs hand TRL the tool callables so it runs the
@@ -1957,6 +2277,15 @@ def run_rl():
         print("[rl][warn] tool env exposes no tools — using the multi-turn rollout_func path")
     use_rollout_func = is_multi_turn and not (is_tool_env and tools)
     require_vllm_for_rollout_func(use_rollout_func, use_vllm, model_id)
+    if use_rollout_func and disaggregated:
+        # The multi-turn rollout_func drives generation through TRL's IN-PROCESS vLLM engine; in
+        # disaggregated mode vLLM is a separate server (vllm_mode="server") with no in-process
+        # engine, so the rollout would fail at the first custom turn. Fail fast at setup.
+        raise RuntimeError(
+            "multi-turn GRPO (custom rollout_func) is not supported with disaggregated rollout "
+            "(inference_gpus>0): it needs an in-process vLLM engine, but disaggregated runs vLLM as "
+            "a separate server. Use colocated GRPO (inference_gpus=0) for multi-turn / tool envs."
+        )
     if is_tool_env and tools:
         extra_trainer_kwargs["tools"] = tools
         print(f"[rl] tool env: handing {len(tools)} tool(s) to TRL's native tool loop")
@@ -1987,32 +2316,102 @@ def run_rl():
             engine_max_len=vllm_max_len,
         )
         print("[rl] multi-turn env: driving the turn loop via rollout_func")
-    trainer = GRPOTrainer(
-        model=init_model,
-        args=cfg,
-        train_dataset=ds,
-        reward_funcs=reward_fn,
-        peft_config=init_peft,
-        processing_class=tok,
-        callbacks=[hb_cb, make_checkpoint_upload_callback()],
-        **extra_trainer_kwargs,
-    )
-    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or AUTOSLM_EVAL_EVERY_STEPS,
-    # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
-    # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.
-    periodic_eval = _maybe_attach_periodic_eval(
-        trainer,
-        tok,
-        is_multi_turn=is_multi_turn,
-        is_tool_env=is_tool_env,
-        max_new_default=_max_completion,
-        stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
-        engine_max_len=vllm_max_len,
-        max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
-    )
-    t_train = time.time()
-    with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
-        trainer.train(resume_from_checkpoint=resume_ckpt)
+    trainer = None
+    try:
+        if _is_fsdp_launcher:
+            # train_gpus>1: the server is up (above); re-exec THIS worker under `accelerate launch`
+            # so the GRPO trainer runs as an FSDP group across the train devices and connects to the
+            # server. We build no trainer in this process; the child (rank 0) writes all artifacts to
+            # the SAME /tmp + uploads to HF, so after it returns the run is complete here too.
+            import subprocess as _sp
+
+            t_train = time.time()
+            # Use DDP (replicate the model on each trainer rank), NOT FSDP sharding. TRL's per-step
+            # weight sync calls peft merge_adapter()->get_delta_weight (weight_B @ weight_A); FSDP
+            # (FULL_SHARD and even SHARD_GRAD_OP) flattens/shards the LoRA params so the merge fails
+            # ("inconsistent tensor size [32768] vs [24576]"). DDP keeps each param whole on every
+            # rank, so the merge works. Every model that runs a multi-trainer ratio here (1-9B)
+            # fits replicated on one trainer card; the only model that wouldn't (35B) uses the
+            # single-trainer 1:1 path, so DDP covers all the 2:1/2:2/3:1 ratios.
+            _acc_cmd = _disagg.build_accelerate_launch_cmd(_rollout_split, use_fsdp=False)
+            _child_env = dict(os.environ)
+            _child_env["AUTOSLM_RL_TRAINER_ONLY"] = "1"
+            _child_env["AUTOSLM_VLLM_SERVER_PORT"] = str(_port)
+            _child_env["AUTOSLM_VLLM_GROUP_PORT"] = str(_disagg.group_port())
+            # The launcher pinned CUDA_VISIBLE_DEVICES to all train devices; the child must NOT inherit
+            # that (accelerate's --gpu_ids assigns one GPU per rank). Drop it so accelerate controls
+            # device placement across the train GPUs.
+            _child_env.pop("CUDA_VISIBLE_DEVICES", None)
+            print(f"[rl][disagg][fsdp] launching FSDP trainer group ({_rollout_split.label}): {' '.join(_acc_cmd)}")
+            # Capture the child group's stdout+stderr to a file and ALWAYS upload it: the launcher's
+            # own console is not reliably captured once the child writes DONE, so this is the only way
+            # to see the FSDP trainer's behavior (real steps vs 0-step empty run) for debugging.
+            _child_log = "/tmp/fsdp_child.log"
+            with open(_child_log, "w") as _clf:
+                _rc = _sp.run(_acc_cmd, env=_child_env, stdout=_clf, stderr=_sp.STDOUT).returncode
+            print("[rl][disagg][fsdp] --- accelerate child log tail (last 160) ---")
+            print(_disagg._server_log_tail(_child_log, n=160))
+            print("[rl][disagg][fsdp] --- end child log ---", flush=True)
+            try:
+                hf_upload_file(_child_log, "console_fsdp_child.txt")
+            except Exception as _e:
+                print(f"[rl][disagg][fsdp] could not upload child log: {_e}")
+            if _rc != 0:
+                raise RuntimeError(
+                    f"accelerate FSDP trainer group exited {_rc} (split {_rollout_split.label}); "
+                    "see console_fsdp_child.txt"
+                )
+            print("[rl][disagg][fsdp] trainer group finished; artifacts written by rank 0")
+        else:
+            trainer = GRPOTrainer(
+                model=init_model,
+                args=cfg,
+                train_dataset=ds,
+                reward_funcs=reward_fn,
+                peft_config=init_peft,
+                processing_class=tok,
+                callbacks=[hb_cb, make_checkpoint_upload_callback()],
+                **extra_trainer_kwargs,
+            )
+            # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or
+            # AUTOSLM_EVAL_EVERY_STEPS, > 0): greedy eval on a held-out split, streamed via
+            # heartbeat("rl_eval", ...) AND accumulated into metrics.json so the agent reads
+            # the eval curve (not just the noisy reward) when judging a run.
+            periodic_eval = _maybe_attach_periodic_eval(
+                trainer,
+                tok,
+                is_multi_turn=is_multi_turn,
+                is_tool_env=is_tool_env,
+                max_new_default=_max_completion,
+                stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
+                engine_max_len=vllm_max_len,
+                max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
+            )
+            t_train = time.time()
+            with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+                trainer.train(resume_from_checkpoint=resume_ckpt)
+    finally:
+        # Free the inference card + port whether training finished or raised — INCLUDING a failure
+        # while CONSTRUCTING the trainer, before train() starts (generation is done once train()
+        # returns; on error the node is torn down anyway, but be tidy).
+        if vllm_proc is not None:
+            # Dump the rollout server's log tail to stdout (captured in console_rl.txt) so a
+            # post-health failure — e.g. the weight-sync NCCL/TCPStore rendezvous on init_communicator
+            # — is diagnosable from the server side, which the health-check tail can't reach.
+            try:
+                print("[rl][disagg] --- vllm-serve log tail (last 120 lines) ---")
+                print(_disagg._server_log_tail("/tmp/vllm_serve.log", n=120))
+                print("[rl][disagg] --- end vllm-serve log tail ---")
+            except Exception as _e:
+                print(f"[rl][disagg] could not read server log: {_e}")
+            _disagg.terminate_server(vllm_proc)
+            print("[rl][disagg] rollout server terminated")
+    if _is_fsdp_launcher:
+        # The accelerate child (rank 0) already saved the adapter, wrote /tmp/metrics.json, and
+        # uploaded every artifact to HF; /tmp is shared on this node so the run is complete here.
+        # This launcher built no trainer, so skip the in-process artifact writes and return.
+        print("[rl][disagg][fsdp] launcher done (artifacts written by the FSDP trainer group)")
+        return
     train_wall = time.time() - t_train
     reward_history = list(getattr(hb_cb, "reward_history", []))
     # Final eval on the actually-saved policy: the cadence only fires on multiples of
@@ -2024,7 +2423,17 @@ def run_rl():
     eval_history = periodic_eval.history_records() if periodic_eval is not None else []
 
     adapter_dir = f"{out_dir}/adapter"
-    trainer.model.save_pretrained(adapter_dir)
+    if _disagg.trainer_only_mode():
+        # FSDP trainer group: trainer.save_model gathers the sharded (LoRA) state across ALL ranks
+        # and writes on rank 0 — it must be called by every rank or the gather deadlocks.
+        # model.save_pretrained is NOT FSDP-aware (would save an empty/partial shard).
+        trainer.save_model(adapter_dir)
+    else:
+        trainer.model.save_pretrained(adapter_dir)
+    if not _disagg.is_main_rank():
+        # Non-rank-0 FSDP workers finished their part of the state gather above; only rank 0 does the
+        # HF upload + metrics + DONE. Return so the other ranks don't double-write/upload.
+        return
     tok.save_pretrained(adapter_dir)
     hf_upload_folder(adapter_dir, "adapter", required=True)
     heartbeat("rl_trained", train_wall=train_wall)
@@ -2047,6 +2456,11 @@ def run_rl():
             "download_seconds": download_seconds,
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,
+            # Rollout topology for the ratio benchmark: "colocate" (1 GPU) or the disaggregated
+            # train:infer split (e.g. "1:1", "2:1"). The benchmark reads these to label each row.
+            "rollout_mode": _rollout_split.mode if _rollout_split else "colocate",
+            "rollout_split": _rollout_split.label if _rollout_split else "colocate",
+            "inference_gpus": _inference_gpus,
             "loss_curve": _metric_curve(trainer, "loss"),
             **wandb_run_info(),
             # The mid-run eval curve (per [train] eval_every_steps): each entry has step,
@@ -2322,6 +2736,13 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
+        # Pin the trainer to its devices for the disaggregated GRPO path BEFORE anything below
+        # touches CUDA (_drop_fla_on_hopper / finalize_alloc_conf_for_sleep / model imports all can
+        # create a CUDA context). If we wait until run_rl, the context is already bound to device 0
+        # and the trainer collides with the vLLM server's device-0 rollout (TRL aborts with
+        # "same CUDA device ... for multiple distinct roles"). CUDA_VISIBLE_DEVICES only takes
+        # effect before the first context, so this is the earliest safe point.
+        _pin_trainer_devices_for_disaggregated()
         _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
         heartbeat("boot")
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)

@@ -77,15 +77,21 @@ class VastOffer:
     reliability: float
     inet_down: float
     geolocation: str
+    num_gpus: int = 1  # GPUs on this instance (for multi-GPU disaggregated runs + cost reporting)
 
 
 def usable_offers(
     min_vram_gb: int,
     disk_gb: float,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
+    num_gpus: int = 1,
 ) -> list[VastOffer]:
     """Verified datacenter offers able to run the job, cheapest first (community hosts only
     when ``AUTOSLM_VAST_ALLOW_COMMUNITY=1`` opts in — secrets ship to the box).
+
+    ``num_gpus`` (default 1) rents an instance with exactly that many GPUs — the disaggregated
+    async GRPO path needs a multi-GPU node ([gpu] count). ``min_vram_gb`` is the PER-GPU floor
+    (each card holds a trainer or rollout shard), unchanged by the count.
 
     Server-side filters do the heavy lifting; everything load-bearing is re-checked
     client-side (belt and suspenders — the result rows carry the proof fields).
@@ -94,6 +100,7 @@ def usable_offers(
         int(min_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
+        num_gpus=num_gpus,
     )
     # Host tier: DEFAULT datacenter-only (hosting_type==1). The onstart payload ships run secrets
     # (HF_TOKEN, PRIME_API_KEY, OpenRouter/OpenAI/W&B creds) to the box, so verified-but-lower-trust
@@ -116,8 +123,23 @@ def usable_offers(
         _bad_host = r.get("hosting_type") != 1 and not (
             allow_community and r.get("hosting_type") == 0
         )
+        # MULTI-GPU: require a WHOLE-machine offer with an EXPLICIT gpu_frac ~= 1.0. A fractional
+        # multi-GPU offer (e.g. 2 of an 8-GPU box, gpu_frac=0.25/0.5) rents 2 GPUs to the INSTANCE
+        # but the CONTAINER gets only 1 (Vast sets NVIDIA_VISIBLE_DEVICES=void and mounts the
+        # fraction's devices — verified: nvidia-smi -L=1, env void). A MISSING gpu_frac is treated
+        # as NOT-whole-machine here (a $0.54 missing-frac offer also yielded a 1-GPU container), so
+        # require the field present and >=0.99 — whole-machine offers carry gpu_frac=1.0 explicitly.
+        # float() guarded: a present-but-non-numeric gpu_frac (e.g. "" / null-ish string) would
+        # raise ValueError and abort the WHOLE offer search; treat unparseable as not-whole-machine
+        # (rejected), consistent with requiring an explicit numeric >=0.99.
+        try:
+            _gf_val = float(r.get("gpu_frac"))
+        except (TypeError, ValueError):
+            _gf_val = 0.0
+        _frac_ok = num_gpus <= 1 or _gf_val >= 0.99
         if (
             _bad_host
+            or not _frac_ok
             or r.get("verification") != "verified"
             # Exact class gate: guard against a board whose canonical class nominal VRAM
             # is below the request (e.g. asking for 48 GB but the mapping landed on a
@@ -143,6 +165,7 @@ def usable_offers(
                 reliability=float(r.get("reliability2") or 0),
                 inet_down=float(r.get("inet_down") or 0),
                 geolocation=str(r.get("geolocation") or ""),
+                num_gpus=int(r.get("num_gpus") or num_gpus),
             )
         )
     return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
@@ -357,7 +380,13 @@ def deploy_and_submit(
                 offer.offer_id,
                 image=vast_image(),
                 disk_gb=_effective_disk_gb(spec),
-                env={},
+                # Expose ALL rented GPUs to the container. The worker image is pytorch/pytorch
+                # (not nvidia/cuda) and the NVIDIA container runtime only surfaces the GPUs named
+                # in NVIDIA_VISIBLE_DEVICES — without this a multi-GPU offer's container can come up
+                # with just 1 GPU (observed: a num_gpus=2 5090 offer exposed 1 GPU, breaking the
+                # disaggregated split). "all" = all GPUs in the container's cgroup, i.e. exactly the
+                # rented ones (not other tenants'); harmless for single-GPU runs.
+                env={"NVIDIA_VISIBLE_DEVICES": "all"},
                 onstart=onstart,
                 label=label,
                 runtype="args",
@@ -383,6 +412,7 @@ def deploy_and_submit(
                         min(o.vram_gb for o in offers),
                         _effective_disk_gb(spec),
                         exclude_machine_ids=taken,
+                        num_gpus=int(getattr(spec.gpu, "count", 1)),
                     )
                     if o.gpu in allowed
                 ][:5]
@@ -626,6 +656,7 @@ def submit_run_vast(
                 info.vram_gb,
                 _effective_disk_gb(spec),
                 exclude_machine_ids=exclude_machine_ids,
+                num_gpus=int(getattr(spec.gpu, "count", 1)),
             )
             if o.gpu == spec.gpu.type
         ]

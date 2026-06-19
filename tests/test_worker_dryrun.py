@@ -197,3 +197,32 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
     assert len(seen_steps) == 6 * 20
     # the captured-snapshot temp files are cleaned up
     assert not glob.glob(os.path.join(hb_dir, "*.upload.tmp"))
+
+
+def test_grpo_batching_num_processes_fsdp():
+    """FSDP fix: grad_accum is divided by num_processes so the GLOBAL batch (and unique prompts/step)
+    stays at the intended target instead of scaling with the trainer-rank count — which was causing
+    a small dataset to yield 0 real steps on the 2:2 multi-trainer run."""
+    from flash.engine.worker import compute_grpo_batching
+
+    b1 = compute_grpo_batching(64, 8, 2, num_processes=1)
+    b2 = compute_grpo_batching(64, 8, 2, num_processes=2)
+    # single-process path unchanged
+    assert b1["unique_prompts_per_step"] == 64
+    # FSDP path: global unique prompts/step still 64 (not 128); per-rank grad_accum halved
+    assert b2["unique_prompts_per_step"] == 64
+    assert b2["gradient_accumulation_steps"] == b1["gradient_accumulation_steps"] // 2
+    assert b2["divisible_by_group"]
+
+
+def test_grpo_batching_per_device_cap_respects_rank_count():
+    """FSDP cap fix: a small prompts_per_step with an oversized per_device on a >1-rank trainer must
+    cap per_device at the per-rank share (target_comps // num_processes), so the global micro-batch
+    can't overshoot prompts_per_step*group_size and inflate unique_prompts/step."""
+    from flash.engine.worker import compute_grpo_batching
+
+    # target_comps = 4*8 = 32; before the fix, per_device capped at 32 gave 32*2 = 64 completions ->
+    # 8 unique prompts/step instead of the intended 4 on a 2-rank FSDP run.
+    b = compute_grpo_batching(prompts_per_step=4, group_size=8, per_device_comps=32, num_processes=2)
+    assert b["unique_prompts_per_step"] == 4
+    assert b["divisible_by_group"]

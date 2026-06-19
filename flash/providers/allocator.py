@@ -62,13 +62,51 @@ def required_vram_gb(
     when unreadable (handled inside model_required_vram_gb)."""
     from flash.engine.vram import model_required_vram_gb
 
-    return model_required_vram_gb(
+    colocate = model_required_vram_gb(
         model_id,
         algorithm,
         train=train,
         thinking=thinking,
         headroom=vram_headroom(),
     )
+    # Disaggregated GRPO ([train].inference_gpus>0) splits memory across the node's GPUs: the
+    # inference server (full bf16 weights + KV) and the trainer (quant weights + LoRA optimizer +
+    # activations) live on SEPARATE cards, so no single GPU needs the colocate total. The binding
+    # per-GPU need is max(server bf16 weights + KV/overhead, the trainer's share ~= colocate minus
+    # the vLLM engine/KV). Sizing to that lets a big model fit a per-role card (e.g. Qwen3.6-35B-A3B
+    # served bf16 on a 94GB H100 NVL, 4-bit trainer on the other) instead of demanding the colocate
+    # floor (~96GB) — which no available 2-GPU node meets — while staying FLOORED by the bf16 weights
+    # so the server can never be under-provisioned into an OOM. Also unblocks 4B 1:2 on a 5090 (the
+    # disaggregated server/trainer each fit 32GB though colocate 4B needs ~35GB).
+    if train is not None and int(getattr(train, "inference_gpus", 0) or 0) > 0:
+        pb = _params_b_for_vram(model_id)
+        if pb:
+            server_need = int(pb * 2.0 * 1.2)  # full bf16 weights + ~20% for KV / CUDA overhead
+            disagg_need = max(server_need, int(colocate * 0.7))
+            # Cap at the colocate estimate (disaggregation never needs more per GPU than the whole
+            # colocated total) but NEVER below server_need: for an MoE whose colocate is sized by
+            # ACTIVE params (e.g. Qwen3.6-35B-A3B), colocate can be < the full-bf16-weight server,
+            # and a bare min(colocate, ...) would under-provision the inference GPU into an OOM.
+            return max(server_need, min(colocate, disagg_need))
+    return colocate
+
+
+def _params_b_for_vram(model_id: str) -> float | None:
+    """Param count (billions) for disaggregated VRAM sizing: catalog first, then HF metadata."""
+    from flash.engine.vram import fetch_hf_params_b, params_b_from_str
+
+    try:
+        from flash.catalog import get_model
+
+        pb = params_b_from_str(getattr(get_model(model_id), "params", None))
+        if pb:
+            return pb
+    except Exception:
+        pass
+    try:
+        return fetch_hf_params_b(model_id)
+    except Exception:
+        return None
 
 
 def _runpod_candidates(need: int, pinned_gpu: str | None, allow_unval: bool) -> list[Candidate]:
@@ -102,6 +140,7 @@ def _vast_candidates(
     exclude_machine_ids,
     *,
     required: bool,
+    num_gpus: int = 1,
 ) -> tuple[list[Candidate], tuple]:
     """Vast's fitting classes from the live offer book (cheapest per class).
 
@@ -123,7 +162,8 @@ def _vast_candidates(
         # provisioned with (``create_instance``/``_effective_disk_gb``); searching at a
         # smaller requested ``disk_gb`` would surface offers that then fail to rent.
         book = usable_offers(
-            search_vram, max(float(disk_gb), MIN_DISK_GB), exclude_machine_ids=exclude_machine_ids
+            search_vram, max(float(disk_gb), MIN_DISK_GB),
+            exclude_machine_ids=exclude_machine_ids, num_gpus=num_gpus,
         )
     except Exception as exc:
         if required:
@@ -157,6 +197,8 @@ def allocate(
     disk_gb: int = 60,
     allow_unvalidated: bool | None = None,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
+    exclude_gpu_classes: set[str] | frozenset[str] = frozenset(),
+    gpu_count: int = 1,
     train=None,
     thinking: bool = False,
 ) -> Allocation:
@@ -166,7 +208,12 @@ def allocate(
     pins the substrate ("auto"/"runpod"/"vast"). Both default to fully automatic.
     ``train``/``thinking`` size the requirement to the run's actual knobs (context, group,
     rank, batch) via the matrix — long context / large group route up, small runs down.
+    ``exclude_gpu_classes`` drops whole GPU classes (any provider) from the candidate pool —
+    the orchestrator adds a class here after it failed ``no_capacity`` (capacity-starved /
+    throttled) so re-allocation walks to the next-cheapest AVAILABLE class instead of retrying
+    the same starved one on another provider.
     """
+    _excluded_classes = {canonical_gpu(c) for c in exclude_gpu_classes}
     if provider not in ("auto", *PROVIDER_NAMES):
         raise UnsupportedGpuError(
             f"unknown provider {provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
@@ -192,9 +239,12 @@ def allocate(
             cands += _runpod_candidates(need, pin, allow_unval)
         if provider in ("auto", "vast") and "vast" in live:
             vcands, book = _vast_candidates(
-                need, pin, allow_unval, disk_gb, exclude_machine_ids, required=(provider == "vast")
+                need, pin, allow_unval, disk_gb, exclude_machine_ids,
+                required=(provider == "vast"), num_gpus=gpu_count,
             )
             cands += vcands
+        if _excluded_classes:
+            cands = [c for c in cands if c.gpu not in _excluded_classes]
         return cands, book
 
     candidates, offer_book = _gather(pinned_gpu)

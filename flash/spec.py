@@ -134,11 +134,20 @@ class TrainSpec:
     # environment, and the completion budget matches the run's normal ``max_tokens``.
     # (``AUTOSLM_EVAL_EVERY_STEPS`` env var overrides it — operator/bench escape hatch.)
     eval_every_steps: int | None = None
+    # Disaggregated (async) GRPO rollout: number of GPUs in the node dedicated to the vLLM rollout
+    # server, the rest train (see engine.rollout_bench.select_rollout_split). 0 = colocate (the
+    # current single-GPU TRL path). >0 requires a multi-GPU node ([gpu] count = train + inference).
+    inference_gpus: int = 0
 
 
 @dataclass(frozen=True)
 class GpuSpec:
     type: str = DEFAULT_GPU
+    # Number of GPUs in the node (= trainer GPUs + [train].inference_gpus). 1 = single-GPU
+    # (colocate, the default). >1 provisions a multi-GPU node (Vast: an offer with num_gpus==count;
+    # RunPod Flash: gpu_count on the endpoint) for the disaggregated async GRPO path
+    # (see engine.rollout_bench / engine.disaggregated). All GPUs are the same `type`.
+    count: int = 1
     # GPU substrate: "auto" (cheapest across providers at submit time), "runpod", or
     # "vast" (verified datacenters only).
     provider: str = "auto"
@@ -238,9 +247,11 @@ class JobSpec:
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 eval_every_steps=_opt_int(train.get("eval_every_steps")),
+                inference_gpus=_opt_int(train.get("inference_gpus")) or 0,
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),
+                count=int(gpu.get("count", 1)),
                 provider=gpu.get("provider", "auto"),
                 requested=gpu.get("requested", ""),
                 allow_unvalidated=gpu.get("allow_unvalidated"),

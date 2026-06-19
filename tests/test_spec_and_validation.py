@@ -56,11 +56,41 @@ def _raw(**overrides) -> dict:
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         ({"model_policy": "yolo"}, "model_policy"),
         ({"gpu.allow_unvalidated": "yes"}, "must be a boolean"),
+        # Multi-GPU / disaggregated topology cross-field checks.
+        # inference_gpus>0 but only 1 GPU in the node -> no GPU left to train.
+        ({"train.inference_gpus": 1, "gpu.count": 1}, "must be greater than train.inference_gpus"),
+        ({"train.inference_gpus": 2, "gpu.count": 2}, "must be greater than train.inference_gpus"),
+        # the disaggregated rollout server is GRPO-only (SFT has no rollout engine).
+        (
+            {"algorithm": "sft", "train.inference_gpus": 1, "gpu.count": 2},
+            "only valid for grpo",
+        ),
+        ({"gpu.count": 0}, "gpu.count must be >= 1"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
     with pytest.raises(ConfigError, match=match):
         spec_from_dict(_raw(**overrides))
+
+
+def test_disaggregated_topology_accepted() -> None:
+    # A valid multi-GPU disaggregated GRPO config (2 GPUs: 1 train + 1 infer) parses.
+    s = spec_from_dict(_raw(**{"train.inference_gpus": 1, "gpu.count": 2}))
+    assert s.gpu.count == 2
+    assert s.train.inference_gpus == 1
+    # An explicit inference_gpus = 0 (colocate) is accepted, not rejected as below-minimum.
+    s0 = spec_from_dict(_raw(**{"train.inference_gpus": 0, "gpu.count": 1}))
+    assert s0.train.inference_gpus == 0
+    assert s0.gpu.count == 1
+    # Default (omitted) is single-GPU colocate.
+    sd = spec_from_dict(_raw())
+    assert sd.gpu.count == 1
+    assert sd.train.inference_gpus == 0
+    # train_gpus>1 ratios (2:1, 2:2) now validate — the FSDP multi-trainer launch is wired.
+    s21 = spec_from_dict(_raw(**{"train.inference_gpus": 1, "gpu.count": 3}))  # 2 train : 1 infer
+    assert s21.gpu.count - s21.train.inference_gpus == 2
+    s22 = spec_from_dict(_raw(**{"train.inference_gpus": 2, "gpu.count": 4}))  # 2 train : 2 infer
+    assert s22.gpu.count - s22.train.inference_gpus == 2
 
 
 def test_sft_epochs_must_be_positive() -> None:

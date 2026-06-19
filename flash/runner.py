@@ -130,6 +130,14 @@ def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     across the configured providers (RunPod Flash or Vast); dry-run only records state."""
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
+    # Fail fast: a disaggregated-only model (e.g. Qwen3.6-35B-A3B) can't run colocated GRPO.
+    from .engine.rollout_bench import validate_disaggregated_requirement
+
+    validate_disaggregated_requirement(
+        requires_disaggregated=info.requires_disaggregated,
+        algorithm=spec.algorithm,
+        inference_gpus=spec.train.inference_gpus,
+    )
     spec = JobSpec.from_dict(
         {**_with_model_disk(spec, info), "run_id": spec.run_id or new_run_id()}
     )
@@ -587,7 +595,17 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
     gpu_walk_offset = 0
-    for attempt in range(max_retries + 1):
+    # Two independent budgets. ``crash_retries`` (bounded by max_retries) covers genuine
+    # infra flakes (host died, network timeout) where we re-provision the SAME-or-next class.
+    # ``capacity walks`` are different: a ``no_capacity`` (throttled / stuck IN_QUEUE) result
+    # just means "this class has no free workers right now" — so we WALK to the next-cheapest
+    # candidate WITHOUT spending the crash budget and WITHOUT blacklisting the class (it may
+    # free up; we simply prefer one that's available now). Bounded by the candidate count so a
+    # fully-throttled market terminates instead of looping forever.
+    crash_retries = 0
+    attempt = -1
+    while True:
+        attempt += 1
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
@@ -649,6 +667,11 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 disk_gb=spec.gpu.disk_gb,
                 allow_unvalidated=spec.gpu.allow_unvalidated,
                 exclude_machine_ids=frozenset(bad_machines),
+                # Multi-GPU: the allocator must search for offers with this many GPUs (Vast) — else
+                # it builds the offer book at num_gpus=1 and a disaggregated run rents a 1-GPU
+                # instance (the real cause of "container has 1 GPU"). RunPod gets gpu_count on the
+                # endpoint separately (deploy_train_endpoint).
+                gpu_count=int(getattr(spec.gpu, "count", 1)),
                 # Pass the run's train knobs + thinking so the VRAM estimate reflects THIS job's
                 # max_length / group_size / batch_size / lora_rank (and the seq escalation) instead
                 # of the generic defaults — else a long-context / big-group run is sized at seq=1024
@@ -713,8 +736,8 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 # pool emptying between search and rent). That must consume a retry, not
                 # kill the run — the budget exists precisely for flakes.
                 res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
-                if attempt < max_retries:
-                    time.sleep(10 * (attempt + 1))  # let the transient clear
+                if crash_retries < max_retries:
+                    time.sleep(10 * (crash_retries + 1))  # let the transient clear
         if res.ok:
             # A best-effort cancel may fail to stop the worker, which then completes
             # successfully after cancel_run() persisted `cancelled`. Don't let a late
@@ -752,7 +775,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             # on a fresh one. Without this, a single ~1-in-200 host death killed the whole run.
             "terminated without a DONE sentinel",
         )
-        infra_shaped = res.failure in ("stalled", "poll_error") or any(
+        infra_shaped = res.failure in ("stalled", "poll_error", "no_capacity") or any(
             m in (res.detail or "") for m in _infra_markers
         )
         # A cancel deletes the endpoint, which the poller sees as an
@@ -764,20 +787,40 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         except FileNotFoundError:
             # Status file not yet written (early race): treat as not-cancelled and proceed.
             pass
+        # A capacity walk (no_capacity: the class is throttled / has no free workers right now)
+        # hops to the next-cheapest candidate WITHOUT spending the crash-retry budget and WITHOUT
+        # blacklisting the class — we just prefer one that's available now. It stops only once
+        # every candidate class has been tried (a fully-throttled market). A genuine infra crash
+        # (host died / network) instead spends the bounded crash budget.
+        is_capacity = res.failure == "no_capacity"
+        ncand = len(alloc.candidates) if alloc is not None else 0
+        if is_capacity:
+            can_retry = infra_shaped and chosen is not None and gpu_walk_offset < ncand - 1
+        else:
+            can_retry = infra_shaped and crash_retries < max_retries
         print(
             f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and attempt < max_retries else 'not retrying'}"
+            f"{'retrying (resume from last checkpoint)' if can_retry else 'not retrying'}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,
         )
-        if not infra_shaped or attempt >= max_retries:
+        if not can_retry:
             break
-        # Step to the next-cheapest class only when THIS attempt actually provisioned one
-        # and it failed infra-shaped. An allocation/pricing failure (chosen is None) never
-        # tried a card, so the next attempt must retry from the cheapest, not walk past it.
+        # Advance to the next-cheapest candidate when THIS attempt actually provisioned one.
+        # An allocation/pricing failure (chosen is None) never tried a card, so the next attempt
+        # must retry from the cheapest, not walk past it.
         if chosen is not None:
             gpu_walk_offset += 1
+            if is_capacity:
+                print(
+                    f"retry: {chosen.gpu} had no free workers (throttled / capacity-starved); "
+                    "walking to the next-cheapest available class (not blacklisting it)",
+                    file=log,
+                    flush=True,
+                )
+        if not is_capacity:
+            crash_retries += 1
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones
     # are only known here).

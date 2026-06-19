@@ -52,6 +52,10 @@ class ModelInfo:
     #             so `thinking = true` is required
     #   "unknown" open-model-policy entries (capability not verified)
     thinking: str = "none"
+    # Requires the DISAGGREGATED (multi-GPU async) GRPO path: too large to colocate the trainer +
+    # vLLM rollout on one GPU. A GRPO request for such a model must set ``[train].inference_gpus>0``
+    # on a multi-GPU node (see engine.rollout_bench); colocate GRPO is rejected. SFT is unaffected.
+    requires_disaggregated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -127,6 +131,23 @@ MODELS: dict[str, ModelInfo] = {
         notes="QLoRA (4-bit NF4 base + bf16 LoRA). GRPO's colocated vLLM rollout loads the "
         "base 4-bit via bitsandbytes too, so both copies are 4-bit -> fits ~24-32 GB "
         "instead of 80 GB bf16. ~near-lossless vs bf16 LoRA.",
+    ),
+    "Qwen/Qwen3.6-35B-A3B": ModelInfo(
+        id="Qwen/Qwen3.6-35B-A3B",
+        display_name="Qwen3.6 35B-A3B (MoE)",
+        params="35B total / ~3B active (MoE)",
+        algos=("sft", "grpo"),
+        min_vram_gb=48,
+        grpo_min_vram_gb=80,
+        quant="4bit-qlora",
+        recommended_gpu="A100 PCIe",
+        thinking="hybrid",
+        # Re-added for the DISAGGREGATED (multi-GPU async) GRPO path only: it OOMs when the trainer
+        # and the vLLM rollout are colocated on one card. With a dedicated inference GPU (35B served
+        # 4-bit) + a sharded trainer on the rest, it fits. GRPO colocate for it is rejected.
+        requires_disaggregated=True,
+        notes="MoE; GRPO requires the disaggregated multi-GPU node ([train].inference_gpus>0). "
+        "The 35B is served 4-bit on the inference GPU while a sharded trainer runs on the rest.",
     ),
 }
 

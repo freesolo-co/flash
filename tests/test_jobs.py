@@ -137,6 +137,35 @@ def test_poll_job_stall_detection(monkeypatch):
     assert res.failure == "stalled"
 
 
+def test_poll_job_no_capacity_when_stuck_in_queue(monkeypatch):
+    # A job that can't LEAVE the queue (worker stays throttled / never assigned) is on a
+    # capacity-starved class -> fail FAST with no_capacity (well before setup_grace_s) so the
+    # orchestrator walks to the next-cheapest available class instead of burning the full grace.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api, "endpoint_health", lambda eid: {"workers": {"throttled": 1}}
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    h = jobs.JobHandle("ep", "name", "job")
+    res = jobs.poll_job(
+        h,
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        queue_grace_s=600.0,
+        setup_grace_s=5000.0,  # MUCH larger: the queue grace must fire first
+    )
+    assert not res.ok
+    assert res.failure == "no_capacity"
+    assert "IN_QUEUE" in res.detail
+
+
 def test_poll_job_setup_grace_before_first_heartbeat(monkeypatch):
     # No heartbeat ever (cold start that never finishes): must NOT trip the tight
     # stall_after_s window — it waits for the larger setup_grace_s instead.
@@ -199,6 +228,42 @@ def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
     monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
 
     hbs = iter([{"stage": "boot", "step": None, "ts": 1}])  # then None
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: next(hbs, None),
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert res.failure == "stalled"
+    assert "during setup" in res.detail
+    assert "limit 5000s" in res.detail
+
+
+def test_rl_server_boot_is_a_setup_stage():
+    # The disaggregated rollout server's boot heartbeat must be classified as SETUP, otherwise the
+    # first rl_server_boot upload flips to the tight training window while the server is still
+    # booting (vLLM model load can take >20 min on a big model).
+    from flash.providers.runpod.jobs import _SETUP_HEARTBEAT_STAGES
+
+    assert "rl_server_boot" in _SETUP_HEARTBEAT_STAGES
+
+
+def test_poll_job_rl_server_boot_does_not_tighten(monkeypatch):
+    # An rl_server_boot heartbeat (emitted during the disaggregated vLLM server boot) proves
+    # liveness but must keep the larger setup_grace_s — the boot is still pre-training.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    hbs = iter([{"stage": "rl_server_boot", "step": None, "ts": 1}])  # then None
 
     res = jobs.poll_job(
         jobs.JobHandle("ep", "name", "job"),

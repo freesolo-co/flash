@@ -89,9 +89,14 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
 # The prebuilt worker image (full training stack baked in; built by Dockerfile.worker /
 # .github/workflows/worker-image.yml). PUBLIC under the org namespace, so no registry login is
-# ever needed. Always used on both Vast and RunPod — there is no operator override and no generic
-# fallback image. Must be published to GHCR + made public before runs can pull it.
-WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
+# ever needed. Used on both Vast and RunPod. AUTOSLM_TRAIN_WORKER_IMAGE overrides the tag (e.g. to
+# validate a candidate image like :cu128-mgpu without overwriting the production :cu128) — read at
+# import, so set it in the control-plane env. Must be published to GHCR + public before runs pull it.
+# .strip() so a whitespace-only AUTOSLM_TRAIN_WORKER_IMAGE falls back to the default tag instead of
+# becoming an invalid Docker ref that RunPod Flash / Vast would try (and fail) to provision with.
+WORKER_IMAGE = (
+    os.environ.get("AUTOSLM_TRAIN_WORKER_IMAGE") or ""
+).strip() or "ghcr.io/freesolo-co/flash-worker:cu128"
 
 
 def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
@@ -497,7 +502,8 @@ def get_train_endpoint(
     kwargs = dict(
         name=name,
         gpu=flash_gpu(friendly),
-        gpu_count=1,
+        # GPUs per worker (= trainer + inference_gpus); >1 for disaggregated async GRPO, else 1.
+        gpu_count=max(1, int(getattr(getattr(spec, "gpu", None), "count", 1))),
         min_cuda_version=min_cuda_for(friendly),
         execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
         workers=(0, 1),  # one dedicated worker per run; scale to zero when idle
@@ -705,6 +711,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # Compute substrate, read back by engine.worker for the RunMetrics record. Vast's
         # on-instance bootstrap overrides this to "vast" (it reuses this same env builder).
         "AUTOSLM_ARM": "runpod",
+        # GPUs provisioned on the node (= trainer + inference_gpus). The worker reads this
+        # (engine.disaggregated.detect_total_gpus) to compute the disaggregated rollout split
+        # WITHOUT initializing a torch CUDA context first. 1 = single-GPU (colocate).
+        "AUTOSLM_GPU_COUNT": str(max(1, int(getattr(spec.gpu, "count", 1)))),
         "BENCH_HF_MODEL": spec.model,
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,

@@ -90,6 +90,17 @@ def test_search_offers_query_shape(monkeypatch):
     assert q["order"] == [["dph_total", "asc"]]
 
 
+def test_search_offers_multi_gpu_query_shape(monkeypatch):
+    """A disaggregated (multi-GPU) request asks Vast for an instance with EXACTLY that many GPUs."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    calls = _capture_urlopen(monkeypatch, [{"offers": []}])
+    vast_api.search_offers(24576, num_gpus=2)
+    q = calls[0][2]["q"]
+    assert q["num_gpus"] == {"eq": 2}  # exact-match: pay for a 2-GPU machine, not an 8-GPU one
+
+
 def test_request_retries_5xx_and_429_then_succeeds(monkeypatch):
     from flash.providers.vast import api as vast_api
 

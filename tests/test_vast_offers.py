@@ -48,9 +48,12 @@ def test_usable_offers_filters_and_order(monkeypatch):
 
     captured = {}
 
-    def fake_search(min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, limit=64, extra_q=None):
+    def fake_search(
+        min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, num_gpus=1, limit=64, extra_q=None
+    ):
         captured["min_vram_mb"] = min_vram_mb
         captured["min_disk_gb"] = min_disk_gb
+        captured["num_gpus"] = num_gpus
         return list(FIXTURE)
 
     monkeypatch.setattr(vast_api, "search_offers", fake_search)

@@ -149,7 +149,7 @@ def test_vast_live_pricing_from_offers_mock(monkeypatch):
     monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
     monkeypatch.setenv("VAST_API_KEY", "vk")
 
-    def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):
+    def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset(), num_gpus=1):
         from flash.providers.vast.jobs import VastOffer
 
         return [
@@ -258,7 +258,7 @@ def test_allocator_pinned_larger_gpu_searches_at_pin_size(monkeypatch):
     _mock_both_available(monkeypatch)
     captured = {}
 
-    def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):
+    def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset(), num_gpus=1):
         captured["min_vram_gb"] = min_vram_gb
         return [_offer(gpu="A40", dph=0.40)]  # A40 = 48 GB, the pinned class
 

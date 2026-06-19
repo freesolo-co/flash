@@ -296,9 +296,15 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # TrainSpec "None/0 -> no cap" contract); the worker reads these from [train].
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
+            # GPUs in the node dedicated to the disaggregated vLLM rollout server (0 = colocate,
+            # the default). >0 needs a multi-GPU node ([gpu] count = trainer + inference); the
+            # count>inference_gpus cross-check is in _validate_spec. minimum=0 so an explicit
+            # `inference_gpus = 0` (colocate) is accepted, not rejected as below-minimum.
+            inference_gpus=_train_int(train_raw, "inference_gpus", minimum=0) or 0,
         ),
         gpu=GpuSpec(
             type=gpu_type,
+            count=int(gpu_raw.get("count", 1)),
             provider=provider,
             requested=requested_gpu,
             allow_unvalidated=allow_unval,
@@ -416,3 +422,25 @@ def _validate_spec(spec: JobSpec) -> None:
     # that produces a no-op adapter (zero scaling at serve). Reject up front.
     if spec.train.lora_alpha <= 0:
         raise ConfigError("train.lora_alpha must be positive")
+    # Multi-GPU / disaggregated-rollout topology ([gpu] count, [train] inference_gpus).
+    if spec.gpu.count < 1:
+        raise ConfigError("gpu.count must be >= 1")
+    if spec.train.inference_gpus < 0:
+        raise ConfigError("train.inference_gpus must be >= 0")
+    if spec.train.inference_gpus > 0:
+        # The disaggregated async rollout (vLLM server on dedicated GPUs) is a GRPO-only path —
+        # SFT has no rollout engine, so inference_gpus would just strand paid GPUs.
+        if spec.algorithm != "grpo":
+            raise ConfigError(
+                "train.inference_gpus is only valid for grpo (the disaggregated rollout server); "
+                "SFT has no rollout engine"
+            )
+        # Need at least one trainer GPU left after carving off the inference GPUs.
+        if spec.gpu.count <= spec.train.inference_gpus:
+            raise ConfigError(
+                f"gpu.count ({spec.gpu.count}) must be greater than train.inference_gpus "
+                f"({spec.train.inference_gpus}) — at least one GPU must train "
+                "(gpu.count = trainer GPUs + inference_gpus)"
+            )
+        # train_gpus>1 (2:1, 3:1, 2:2) runs the trainer as an FSDP group via `accelerate launch`
+        # (run_rl's disaggregated launcher re-execs the worker across the train devices). Supported.

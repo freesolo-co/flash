@@ -1,0 +1,227 @@
+"""Pure command/env builders for the disaggregated (multi-GPU async) GRPO rollout server."""
+
+from __future__ import annotations
+
+import pytest
+
+from flash.engine.disaggregated import (
+    TRL_VLLM_SERVE_FLAGS,
+    build_accelerate_launch_cmd,
+    build_vllm_serve_cmd,
+    detect_total_gpus,
+    is_main_rank,
+    server_subprocess_env,
+    trainer_cuda_visible_devices,
+    trainer_only_mode,
+)
+from flash.engine.rollout_bench import select_rollout_split
+
+
+def test_build_cmd_defaults_to_tensor_parallel():
+    # DEFAULT parallel="tp": shard the model across the inference GPUs so decode gets their
+    # aggregate HBM bandwidth (the lever that makes 1:2 / 1:3 clear the rollout bottleneck). Works
+    # for dense AND MoE. tensor_parallel_size == infer_gpus, no data_parallel_size emitted.
+    split = select_rollout_split(3, 2)  # 1 train : 2 infer
+    cmd = build_vllm_serve_cmd("some/model", split, max_model_len=1024, port=8000)
+    assert cmd[cmd.index("--tensor_parallel_size") + 1] == "2"
+    assert "--data_parallel_size" not in cmd
+    assert cmd[cmd.index("--model") + 1] == "some/model"
+    assert cmd[cmd.index("--port") + 1] == "8000"
+    assert cmd[cmd.index("--max_model_len") + 1] == "1024"
+    assert cmd[0:2] == ["trl", "vllm-serve"]
+
+
+def test_build_cmd_data_parallel_replicas_for_moe():
+    # parallel="dp": replicas (data_parallel_size == infer_gpus, tensor_parallel_size == 1). vLLM
+    # only accepts offline DP for MoE models, so this is reserved for the 35B-A3B.
+    split = select_rollout_split(3, 2)  # 1 train : 2 infer
+    cmd = build_vllm_serve_cmd("moe/model", split, max_model_len=1024, port=8000, parallel="dp")
+    assert cmd[cmd.index("--data_parallel_size") + 1] == "2"
+    assert cmd[cmd.index("--tensor_parallel_size") + 1] == "1"
+
+
+def test_build_cmd_never_emits_unsupported_quant_flags():
+    # `trl vllm-serve` (TRL 1.6) has NO --quantization/--load_format option; emitting them makes
+    # HfArgumentParser reject the args and the server launch fail. A QLoRA model is served bf16 on
+    # its own inference card in disaggregated mode (the trainer keeps the 4-bit base separately).
+    for q in ("4bit-qlora", "bf16"):
+        cmd = build_vllm_serve_cmd("m/x", select_rollout_split(2, 1), max_model_len=2048, port=8000, quant=q)
+        assert "--quantization" not in cmd
+        assert "--load_format" not in cmd
+
+
+def test_build_cmd_only_emits_trl_supported_flags():
+    # Guard against the exact blocker the verify pass caught: every --flag must be a real TRL
+    # ScriptArguments field, or `trl vllm-serve` rejects the launch. Covers bf16 + qlora + extras.
+    for q in ("bf16", "4bit-qlora"):
+        cmd = build_vllm_serve_cmd("m/x", select_rollout_split(3, 2), max_model_len=1024, port=9000, quant=q)
+        flags = [tok for tok in cmd[2:] if tok.startswith("--")]  # skip the 'trl vllm-serve' prefix
+        unknown = [f for f in flags if f not in TRL_VLLM_SERVE_FLAGS]
+        assert not unknown, f"unsupported trl vllm-serve flags emitted: {unknown}"
+
+
+def test_build_cmd_respects_trl_bin_and_extra():
+    split = select_rollout_split(2, 1)
+    cmd = build_vllm_serve_cmd(
+        "m", split, max_model_len=512, port=9001, trl_bin="/opt/trl", extra=["--enforce_eager", "true"]
+    )
+    assert cmd[0] == "/opt/trl"
+    assert cmd[-2:] == ["--enforce_eager", "true"]
+
+
+def test_server_env_pins_inference_to_device_zero():
+    # 4-GPU node, 1 infer : 3 train -> server pinned to device 0 (valid NVML index), trainer 1,2,3
+    split = select_rollout_split(4, 1)
+    env = server_subprocess_env({"PATH": "/usr/bin", "FOO": "bar"}, split)
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert env["FOO"] == "bar"  # base env preserved
+    assert trainer_cuda_visible_devices(split) == "1,2,3"
+
+
+def test_server_env_is_a_copy():
+    split = select_rollout_split(2, 1)
+    base = {"CUDA_VISIBLE_DEVICES": "7"}
+    env = server_subprocess_env(base, split)
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"  # server gets device 0
+    assert base["CUDA_VISIBLE_DEVICES"] == "7"  # caller's base dict untouched
+    assert trainer_cuda_visible_devices(split) == "1"  # trainer gets the rest
+
+
+def test_server_env_forces_spawn():
+    # vLLM nested-multiprocessing fork after CUDA/NVML init -> NVMLError_InvalidArgument on model
+    # inspection; the server env must force spawn so each child gets a clean NVML state.
+    env = server_subprocess_env({}, select_rollout_split(2, 1))
+    assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+
+def test_server_env_multi_infer():
+    split = select_rollout_split(3, 2)  # infer (0,1), train (2,)
+    env = server_subprocess_env({}, split)
+    assert env["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert trainer_cuda_visible_devices(split) == "2"
+
+
+def test_detect_total_gpus_prefers_explicit_env():
+    assert detect_total_gpus({"AUTOSLM_GPU_COUNT": "4"}) == 4
+    assert detect_total_gpus({"AUTOSLM_GPU_COUNT": "1"}) == 1
+    # a garbage value falls through (does not crash); without nvidia-smi/torch it returns >=1
+    assert detect_total_gpus({"AUTOSLM_GPU_COUNT": "not-a-number"}) >= 1
+
+
+def test_accelerate_launch_cmd_2to1():
+    # 2:1 split (2 trainer GPUs : 1 infer). accelerate launches one rank per TRAIN GPU, pinned to
+    # the global train device ids, FSDP-sharded, running the worker module.
+    split = select_rollout_split(3, 1)  # total 3, infer 1 -> train_gpus=2
+    cmd = build_accelerate_launch_cmd(split, python_bin="python")
+    assert cmd[0:2] == ["accelerate", "launch"]
+    # FSDP implies multi-GPU; accelerate REJECTS --multi_gpu alongside --use_fsdp, so it must be absent
+    assert "--multi_gpu" not in cmd
+    assert "--use_fsdp" in cmd
+    assert cmd[cmd.index("--num_processes") + 1] == "2"  # == train_gpus
+    # train devices are the GLOBAL ids after the infer device(s); select_rollout_split puts infer
+    # first, so train devices are 1,2 for a 3-GPU node with 1 infer GPU.
+    assert cmd[cmd.index("--gpu_ids") + 1] == "1,2"
+    assert cmd[-2:] == ["-m", "flash.engine.worker"]
+
+
+def test_accelerate_launch_cmd_no_fsdp():
+    # DDP path: --multi_gpu present, no FSDP flags.
+    split = select_rollout_split(3, 1)
+    cmd = build_accelerate_launch_cmd(split, use_fsdp=False)
+    assert "--multi_gpu" in cmd
+    assert "--use_fsdp" not in cmd
+    assert "--fsdp_sharding_strategy" not in cmd
+
+
+def test_is_main_rank_defaults_true_without_rank():
+    assert is_main_rank({}) is True  # colocate / single-GPU: no RANK -> main
+    assert is_main_rank({"RANK": "0"}) is True
+    assert is_main_rank({"RANK": "1"}) is False
+
+
+def test_trainer_only_mode_flag():
+    assert trainer_only_mode({}) is False
+    assert trainer_only_mode({"AUTOSLM_RL_TRAINER_ONLY": "1"}) is True
+    assert trainer_only_mode({"AUTOSLM_RL_TRAINER_ONLY": "0"}) is False
+
+
+# ---------------------------------------------------------------------------
+# wait_for_server_health boot-heartbeat timing
+# ---------------------------------------------------------------------------
+
+
+def _scripted_clock(monkeypatch, values):
+    """Patch disaggregated's time.time to return successive ``values`` (last one repeats), and
+    no-op its sleep. Lets a test place the deadline crossing at an exact point in the loop."""
+    from flash.engine import disaggregated as d
+
+    seq = list(values)
+    idx = {"i": 0}
+
+    def _time():
+        i = idx["i"]
+        v = seq[i] if i < len(seq) else seq[-1]
+        idx["i"] = i + 1
+        return v
+
+    monkeypatch.setattr(d.time, "time", _time)
+    monkeypatch.setattr(d.time, "sleep", lambda s: None)
+    return _time
+
+
+def _ok_urlopen(url, timeout=None):
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        class _R:
+            status = 200
+
+        yield _R()
+
+    return _cm()
+
+
+def test_wait_for_server_health_fires_first_ping_promptly(monkeypatch):
+    # The first on_wait (boot heartbeat) must fire at loop ENTRY, not one full on_wait_every later,
+    # so a poller whose stall clock is already near its limit still sees an rl_server_boot quickly.
+    from flash.engine import disaggregated as d
+
+    # Reads: deadline-base(0), _next_ping(0), while-cond(1), ping-gate(1), ... server healthy 1st probe.
+    _scripted_clock(monkeypatch, [0.0, 0.0, 1.0, 1.0, 2.0, 2.0])
+    pings = []
+    monkeypatch.setattr(d.urllib.request, "urlopen", _ok_urlopen)
+
+    d.wait_for_server_health(
+        8000,
+        timeout=600.0,
+        on_wait=lambda: pings.append(True),
+        on_wait_every=60.0,
+    )
+    # The server is healthy on the first probe; the ping must already have fired before it because
+    # _next_ping is seeded to loop-entry time (not entry + on_wait_every).
+    assert pings, "first boot heartbeat did not fire promptly at loop entry"
+
+
+def test_wait_for_server_health_deadline_checked_after_on_wait(monkeypatch):
+    # A blocking on_wait (slow HF upload) must not let the loop overrun the deadline: after on_wait
+    # returns, the deadline is re-checked, so a timeout is raised rather than an extra HTTP probe.
+    from flash.engine import disaggregated as d
+
+    # Reads in order: deadline-base(0)->deadline=10; _next_ping(0); while-cond(5)<10 enter loop;
+    # ping-gate(5)>=0 fire on_wait; post-on_wait poll has no proc; deadline re-check(20)>=10 -> break
+    # -> raise TimeoutError WITHOUT ever probing HTTP. If the re-check were missing, urlopen would run.
+    _scripted_clock(monkeypatch, [0.0, 0.0, 5.0, 5.0, 20.0])
+
+    def _boom_urlopen(url, timeout=None):
+        raise AssertionError("HTTP probe ran; deadline was not re-checked after on_wait")
+
+    monkeypatch.setattr(d.urllib.request, "urlopen", _boom_urlopen)
+
+    with pytest.raises(TimeoutError):
+        d.wait_for_server_health(
+            8000,
+            timeout=10.0,
+            on_wait=lambda: None,
+            on_wait_every=60.0,
+        )

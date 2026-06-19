@@ -62,19 +62,25 @@ TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
 
 # Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
 # training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
+# ``rl_server_boot`` is the disaggregated (multi-GPU) rollout server's boot heartbeat, emitted
+# every ~60s while vLLM loads the model and binds its port — still pre-training, so it likewise
+# stays under setup_grace_s (otherwise the FIRST boot ping would prematurely flip to the tight
+# training window while the server is still booting).
 # Receiving one proves the worker is alive but NOT that the slow setup (model download +
 # vLLM init) finished, so they must not flip stall detection to the tight training window.
 _SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
+    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start", "rl_server_boot"}
 )
 
 
 def stall_kwargs() -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
     run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
-    window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat.
+    window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat;
+    ``queue_grace_s`` = how long a job may sit IN_QUEUE (no worker assigned) before it's judged
+    capacity-starved and fails ``no_capacity`` so the orchestrator advances to the next class.
     """
-    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0}
+    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 720.0}
 
 
 def volume_endpoint_kwargs(spec) -> dict:
@@ -178,7 +184,9 @@ def deploy_train_endpoint(
         kwargs = dict(
             name=name,
             gpu=flash_gpu(friendly),
-            gpu_count=1,
+            # GPUs per worker on the endpoint (= trainer + inference_gpus). >1 for the
+            # disaggregated async GRPO path; default 1 (single-GPU colocate).
+            gpu_count=max(1, int(getattr(getattr(spec, "gpu", None), "count", 1))),
             min_cuda_version=min_cuda_for(friendly),
             execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
             workers=(0, 1),
@@ -284,6 +292,7 @@ def poll_job(
     heartbeat_reader=None,
     stall_after_s: float = 1200.0,
     setup_grace_s: float = 3000.0,
+    queue_grace_s: float = 720.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
@@ -351,6 +360,23 @@ def poll_job(
             except Exception:
                 # Health surfacing is diagnostic only; a probe failure must not stop polling.
                 pass
+        # CAPACITY FAST-PATH: a job that can't even LEAVE the queue (no worker ever assigned)
+        # is on a capacity-starved GPU class — RunPod keeps the worker `throttled` and the job
+        # IN_QUEUE indefinitely. Fail FAST with ``no_capacity`` (well before the multi-minute
+        # setup grace) so the orchestrator advances to the next-cheapest AVAILABLE class instead
+        # of burning the whole retry budget on a class with zero free workers. Only fires while
+        # still IN_QUEUE: once a worker picks the job up (status RUNNING) the slow-but-legit
+        # cold start (image pull / dep install / model download) gets the full setup grace below.
+        if status == "IN_QUEUE" and time.time() - last_progress > queue_grace_s:
+            return PollResult(
+                False,
+                failure="no_capacity",
+                detail=(
+                    f"no worker assigned for {int(time.time() - last_progress)}s while IN_QUEUE "
+                    f"(GPU class capacity-starved / throttled; limit {int(queue_grace_s)}s) — "
+                    "advancing to the next-cheapest available class"
+                ),
+            )
         # heartbeat progress surfacing + stall detection
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:

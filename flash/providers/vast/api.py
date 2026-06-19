@@ -63,6 +63,7 @@ def search_offers(
     *,
     min_disk_gb: float = 0,
     min_reliability: float = 0.95,
+    num_gpus: int = 1,
     limit: int = 64,
     extra_q: dict | None = None,
 ) -> list[dict]:
@@ -78,10 +79,12 @@ def search_offers(
     # We intentionally do NOT apply Vast's server-side datacenter-only filter: verified
     # COMMUNITY/marketplace hosts are included too (scarce classes often have no verified-datacenter
     # supply), and usable_offers re-checks hosting_type + verification + the reliability floor.
+    # Rent an instance with EXACTLY ``num_gpus`` GPUs (default 1). Exact-match (not >=) so a
+    # 2-GPU disaggregated run pays for a 2-GPU machine, not an 8-GPU one (dph_total is per-instance).
     q: dict[str, Any] = {
         "verified": {"eq": True},
         "rentable": {"eq": True},
-        "num_gpus": {"eq": 1},
+        "num_gpus": {"eq": int(num_gpus)},
         "gpu_ram": {"gte": int(min_vram_mb)},
         "reliability2": {"gte": float(min_reliability)},
         "type": "ask",

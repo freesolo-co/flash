@@ -285,7 +285,7 @@ def test_deploy_refresh_excludes_blacklisted_machines(monkeypatch):
     def fake_create(offer_id, **kw):
         raise vast_api.VastApiError("taken")
 
-    def fake_usable(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):
+    def fake_usable(min_vram_gb, disk_gb, exclude_machine_ids=frozenset(), num_gpus=1):
         captured["exclude"] = set(exclude_machine_ids)
         return []  # force the pool-exhausted raise after the (captured) refresh
 
@@ -320,7 +320,7 @@ def test_deploy_refresh_uses_disk_floor(monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(vast_api.VastApiError("taken")),
     )
 
-    def fake_usable(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):
+    def fake_usable(min_vram_gb, disk_gb, exclude_machine_ids=frozenset(), num_gpus=1):
         captured["disk_gb"] = disk_gb
         return []
 

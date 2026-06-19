@@ -105,6 +105,23 @@ def test_skip_net_matches_static_cheapest(monkeypatch):
     assert a.gpu == cheapest_gpu(24)
 
 
+def test_exclude_gpu_classes_walks_to_next_cheapest(monkeypatch):
+    # The capacity-walk uses exclude_gpu_classes to skip a throttled class WITHOUT lowering the
+    # VRAM floor: re-allocation then returns the NEXT-cheapest fitting class, never raises just
+    # because the cheapest was excluded (as long as something else still fits).
+    from flash.providers import allocator
+
+    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    base = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    nxt = allocator.allocate(
+        "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({base.gpu})
+    )
+    assert nxt.gpu != base.gpu  # walked past the excluded (throttled) class
+    assert nxt.min_vram_gb == base.min_vram_gb  # same VRAM floor — never sized below need
+    # the excluded class is gone from the candidate pool entirely
+    assert all(c.gpu != base.gpu for c in nxt.candidates)
+
+
 def test_nothing_fits_names_constraint(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError
