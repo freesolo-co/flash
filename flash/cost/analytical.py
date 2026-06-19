@@ -139,9 +139,9 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
             config.model_id, config.method, train=config.train_knobs(), thinking=config.thinking
         )
     # ``allow_unvalidated`` is tri-state. ``None`` means "unspecified", which the submit-time
-    # allocator resolves via ``unvalidated_allowed`` (the FLASH_GPU_ALLOW_UNVALIDATED env
-    # default) -- so resolve it the SAME way here instead of treating None as validated-only,
-    # or a run the env widened would be priced against the narrower validated pool.
+    # allocator resolves via ``unvalidated_allowed`` (the managed per-run policy) -- so resolve
+    # it the SAME way here instead of treating None as validated-only, keeping the estimate's
+    # pool in lockstep with whatever the allocator would actually allocate.
     gpu = pick_gpu(
         need,
         pin=config.gpu,

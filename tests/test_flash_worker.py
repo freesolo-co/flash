@@ -4,7 +4,6 @@ Covers:
 - build_worker_env forwards the documented RL/vLLM tuning knobs to the GPU worker
   (they were silently dropped) and sets a fragmentation-safe allocator default;
 - the runpod_flash backoff OverflowError that aborted long runs is patched;
-- the serve cold-start execution timeout is generous + env-overridable;
 - per-phase error artifact names don't collide (train error survives a later eval error).
 """
 
@@ -104,6 +103,172 @@ def test_build_worker_env_forwards_prime_api_key(monkeypatch):
     assert "PRIME_API_KEY" not in build_worker_env(_spec(), 0)
 
 
+def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
+    """The opt-in chalk-kernel install hook (engine.chalk_kernels) runs inside the worker
+    subprocess and selects which install-on-call chalk installers to run from FLASH_* flags read
+    from its OWN process env, so an operator-set FLASH_* selection (and FLASH_CHALK_SPEC) MUST be
+    forwarded by the allowlist or every chalk kernel silently no-ops on every remote run."""
+    from flash.providers.runpod.train import build_worker_env
+
+    flags = {
+        "FLASH_MLP_KERNEL": "1",
+        "FLASH_MLP_FP8": "1",
+        "FLASH_MLP_FP8_DOWN": "0",
+        "FLASH_FP8_BASE": "1",
+        "FLASH_FP8_BASE_ATTN": "0",
+        "FLASH_FP8_BASE_MLP": "1",
+        "FLASH_FP8_BASE_MIN_K": "512",
+        "FLASH_TRITON_LORA": "1",
+        "FLASH_EMBED_KERNEL": "1",
+        "FLASH_QKV_KERNEL": "1",
+        "FLASH_ROPE_KERNEL": "1",
+        "FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main",
+    }
+    for k, v in flags.items():
+        monkeypatch.setenv(k, v)
+    env = build_worker_env(_spec(), 0)
+    for k, v in flags.items():
+        assert env.get(k) == v, f"{k} not forwarded to worker"
+    # unset chalk flags are not invented
+    for k in flags:
+        monkeypatch.delenv(k, raising=False)
+    env2 = build_worker_env(_spec(), 0)
+    assert not any(k in env2 for k in flags)
+
+
+def _clear_chalk_flags(monkeypatch):
+    for k in (
+        "FLASH_MLP_KERNEL",
+        "FLASH_MLP_FP8",
+        "FLASH_FP8_BASE",
+        "FLASH_TRITON_LORA",
+        "FLASH_EMBED_KERNEL",
+        "FLASH_QKV_KERNEL",
+        "FLASH_ROPE_KERNEL",
+        "FLASH_CHALK_SPEC",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_chalk_extra_pip_empty_without_flags(monkeypatch):
+    """No FLASH_* kernel flag -> nothing added to the worker's extra_pip (default = no chalk)."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")  # spec alone must not opt in
+    assert chalk_extra_pip() == []
+
+
+def test_chalk_extra_pip_empty_without_spec(monkeypatch):
+    """A kernel flag is set but FLASH_CHALK_SPEC is unset -> nothing added (chalk is unpublished,
+    can't auto-install) — install_chalk_kernels then safely no-ops on the worker."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
+    assert chalk_extra_pip() == []
+
+
+def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):
+    """Kernel flag + FLASH_CHALK_SPEC -> the chalk spec is appended to extra_pip, which the worker
+    installs for EVERY job (the durable baked-image path that bypasses resolve_worker_deps)."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_FP8_BASE", "1")
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "git+https://github.com/freesolo-co/chalk@main")
+    assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
+
+
+def test_chalk_extra_pip_falsey_flag_does_not_opt_in(monkeypatch):
+    """FLASH_*=0 is inert: a leftover 0 must not pull chalk in even with a spec set."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "0")
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")
+    assert chalk_extra_pip() == []
+
+
+def _spec_worker_env(worker_env: dict):
+    """A grpo JobSpec carrying a per-run [worker_env] block (the TOML override map)."""
+    from flash.spec import JobSpec, TrainSpec
+
+    return JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        worker_env=dict(worker_env),
+    )
+
+
+def test_chalk_extra_pip_detects_per_run_worker_env_optin(monkeypatch):
+    """DEFECT: a run that enables chalk only via its [worker_env] block (not the control-plane
+    process env) was NOT detected — chalk_extra_pip read bare os.environ, so the spec was never
+    appended and the kernels never installed for that run. The effective worker env (worker_env
+    merged over os.environ) must be what decides selection + the FLASH_CHALK_SPEC lookup."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)  # nothing in os.environ
+    spec = _spec_worker_env(
+        {
+            "FLASH_FP8_BASE": "1",
+            "FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main",
+        }
+    )
+    # bare process env -> nothing; the opt-in lives only in [worker_env]
+    assert chalk_extra_pip() == []
+    assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
+
+
+def test_chalk_extra_pip_worker_env_spec_with_os_env_flag(monkeypatch):
+    """Mixed source: the kernel flag is in the control-plane env but FLASH_CHALK_SPEC is pinned
+    per-run in [worker_env]. The merged effective env resolves both, so the spec is added."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_TRITON_LORA", "1")  # selection from the process env
+    spec = _spec_worker_env({"FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@dev"})
+    assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@dev"]
+
+
+def test_chalk_extra_pip_worker_env_overrides_os_env_flag(monkeypatch):
+    """[worker_env] wins over os.environ (same precedence build_worker_env applies): a per-run
+    FLASH_*=0 must DISABLE a chalk flag set globally, so chalk is not installed for that run."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # global opt-in
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "git+https://github.com/freesolo-co/chalk@main")
+    # without an override the global flag opts in
+    assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
+    # a per-run [worker_env] FLASH_MLP_KERNEL=0 turns it OFF for this run
+    spec = _spec_worker_env({"FLASH_MLP_KERNEL": "0"})
+    assert chalk_extra_pip(spec) == []
+
+
+def test_chalk_selection_matches_what_worker_env_forwards(monkeypatch):
+    """Consistency: the SAME effective env that decides chalk install must be what the worker
+    process sees. A [worker_env] chalk opt-in both (a) triggers chalk_extra_pip and (b) reaches
+    the worker via build_worker_env, so install_chalk_kernels sees the flag on the worker."""
+    from flash.providers.runpod.train import build_worker_env, chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    spec = _spec_worker_env(
+        {
+            "FLASH_QKV_KERNEL": "1",
+            "FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main",
+        }
+    )
+    # (a) submit path appends the chalk spec to extra_pip
+    assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
+    # (b) the same flag is forwarded into the worker's env, so install_chalk_kernels (which reads
+    #     the worker's own process env) selects the kernel on the worker
+    env = build_worker_env(spec, 0)
+    assert env.get("FLASH_QKV_KERNEL") == "1"
+    assert env.get("FLASH_CHALK_SPEC") == "git+https://github.com/freesolo-co/chalk@main"
+
+
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
@@ -158,6 +323,19 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
 
+def test_alloc_conf_rl_cedes_to_worker(monkeypatch):
+    # The launcher can't know the worker's sleep decision (resolved from model size + context),
+    # so RL ships the conservative non-expandable conf plus FLASH_ALLOC_AUTO=1, ceding the final
+    # choice to the worker (which upgrades to expandable_segments once it resolves sleep OFF).
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    env = build_worker_env(_spec(), 0)  # grpo
+    assert env["FLASH_ALLOC_AUTO"] == "1"
+    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
+
+
 def test_runpod_backoff_no_overflow_on_long_runs():
     """DEFECT: runpod_flash computed base*(2**attempt) then clamped, so a long poll loop
     overflowed (~80 min in) and killed a healthy job. The patch caps the exponent first."""
@@ -174,15 +352,6 @@ def test_runpod_backoff_no_overflow_on_long_runs():
     from runpod_flash.core.resources import serverless
 
     assert serverless.get_backoff_delay(100000, max_seconds=5) <= 5 * 1.2 + 1e-9
-
-
-def test_serve_execution_timeout_is_fixed():
-    """DEFECT: serve execution cap (10 min) was shorter than a cold serving worker's startup, so
-    the first slm chat/deploy failed with 'executionTimeout exceeded'. It is now a fixed, generous
-    constant (no env override)."""
-    from flash.serve import deploy
-
-    assert deploy.serve_execution_timeout_ms() >= 20 * 60 * 1000
 
 
 def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():

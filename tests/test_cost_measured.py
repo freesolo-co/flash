@@ -183,8 +183,8 @@ def test_spec_wall_cap_and_unvalidated_flow_into_runconfig():
     # the reconstructed estimate prices the same run the measured dollars covered (the cap
     # clamps per-seed wall; the policy widens GPU selection). A MISSING allow_unvalidated is
     # tri-state UNSPECIFIED (None), NOT validated-only -- so selection resolves it via the same
-    # FLASH_GPU_ALLOW_UNVALIDATED default the submit-time allocator uses (see the analytical
-    # test); coercing it to False here would diverge from a run the env var widened.
+    # managed default the submit-time allocator uses (see the analytical test); coercing it to
+    # False here would diverge from the pool the allocator would actually pick.
     base = runconfig_from_status(GRPO_STATUS)
     assert base.max_wall_seconds is None
     assert base.allow_unvalidated is None

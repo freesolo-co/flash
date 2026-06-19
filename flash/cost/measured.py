@@ -83,11 +83,11 @@ def runconfig_from_status(
     # run with a short explicit cap is priced against the 24h default and overstated).
     max_wall = gpu_spec.get("max_wall_seconds")
     # ``gpu.allow_unvalidated`` is TRI-STATE in the spec/allocator: a MISSING key is not
-    # "validated-only" -- it's "unspecified", which submit-time resolves via the
-    # FLASH_GPU_ALLOW_UNVALIDATED env default (providers.base.unvalidated_allowed). Coercing
-    # a missing value to ``False`` here would price against a validated-only pool even when the
-    # env widened the real run's GPU selection. So keep ``None`` when absent and only coerce to
-    # bool when a value is actually present; selection resolves ``None`` the same way the runner does.
+    # "validated-only" -- it's "unspecified", which submit-time resolves via the managed
+    # default (providers.base.unvalidated_allowed). Coercing a missing value to ``False`` here
+    # would diverge from how the allocator resolves an absent flag. So keep ``None`` when absent
+    # and only coerce to bool when a value is actually present; selection resolves ``None`` the
+    # same way the runner does.
     allow_unvalidated = gpu_spec.get("allow_unvalidated")
     if allow_unvalidated is not None:
         allow_unvalidated = bool(allow_unvalidated)

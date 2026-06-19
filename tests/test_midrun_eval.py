@@ -24,6 +24,7 @@ from flash.engine.midrun_eval import (
     evaluate_policy,
     make_periodic_eval_callback,
     multi_turn_scorer,
+    sample_eval_rows,
     single_turn_scorer,
     summarize,
 )
@@ -496,19 +497,56 @@ def test_eval_config_cadence_from_toml(monkeypatch):
     assert cfg["max_new_tokens"] == 256  # always the completion budget, never a separate knob
 
 
-def test_eval_config_env_overrides_toml_cadence(monkeypatch):
-    """FLASH_EVAL_EVERY_STEPS (operator/bench escape hatch) wins over the TOML value."""
+def test_eval_config_ignores_env_cadence_override(monkeypatch):
+    """The cadence comes ONLY from the run spec ([train] eval_every_steps); the old
+    FLASH_EVAL_EVERY_STEPS env override no longer exists."""
     monkeypatch.setenv("FLASH_EVAL_EVERY_STEPS", "25")
-    assert eval_config(256, spec_every=10)["every_steps"] == 25
+    assert eval_config(256, spec_every=10)["every_steps"] == 10  # spec wins, env ignored
 
 
-def test_eval_config_num_examples_is_operator_safety_cap(monkeypatch):
-    """num_examples is NOT a config knob — it's an operator safety cap (default 64) so a huge env
-    eval split can't dominate training; the agent sizes the eval set via the environment."""
-    monkeypatch.delenv("FLASH_EVAL_NUM", raising=False)
+def test_eval_config_num_examples_default():
+    """No knob set -> the built-in default sample size (64)."""
     assert eval_config(256, spec_every=3)["num_examples"] == 64
+
+
+def test_eval_config_num_examples_from_toml():
+    """[train] eval_examples sets how many held-out rows each pass samples."""
+    assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 20
+    # 0/None falls back to the default, never 0 examples
+    assert eval_config(256, spec_every=3, spec_eval_examples=0)["num_examples"] == 64
+    assert eval_config(256, spec_every=3, spec_eval_examples=None)["num_examples"] == 64
+
+
+def test_eval_config_ignores_env_num_override(monkeypatch):
+    """num_examples comes ONLY from [train] eval_examples (or the default); the old FLASH_EVAL_NUM
+    env override no longer applies."""
     monkeypatch.setenv("FLASH_EVAL_NUM", "8")
-    assert eval_config(256, spec_every=3)["num_examples"] == 8
+    assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 20  # TOML wins
+    assert eval_config(256, spec_every=3)["num_examples"] == 64  # default, env ignored
+
+
+def test_sample_eval_rows_takes_n_random_rows():
+    pool = [{"i": i} for i in range(100)]
+    out = sample_eval_rows(pool, 10)
+    assert len(out) == 10
+    assert all(r in pool for r in out)
+    # NOT just the first 10 (that's the bias this feature removes)
+    assert [r["i"] for r in out] != list(range(10))
+
+
+def test_sample_eval_rows_is_deterministic_across_passes():
+    pool = [{"i": i} for i in range(100)]
+    # same seed -> identical subset every pass (a comparable eval curve)
+    assert sample_eval_rows(pool, 10) == sample_eval_rows(pool, 10)
+    # preserved in original order
+    idxs = [r["i"] for r in sample_eval_rows(pool, 10)]
+    assert idxs == sorted(idxs)
+
+
+def test_sample_eval_rows_returns_all_when_pool_small():
+    pool = [{"i": i} for i in range(5)]
+    assert sample_eval_rows(pool, 10) == pool  # n >= len -> eval them all
+    assert sample_eval_rows(pool, 0) == pool  # 0 -> all (never empty)
 
 
 # --------------------------------------------------------------------------- #

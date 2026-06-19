@@ -10,10 +10,10 @@ so the GPU worker can install it too.
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 import tempfile
+from pathlib import Path
 
 
 class _FakeProc:
@@ -22,11 +22,10 @@ class _FakeProc:
 
 def test_env_install_prime_hub_slug(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setenv("FLASH_ENVS_MANIFEST", os.path.join(tmp, "envs.json"))
         import flash.envs.registry as registry
         from flash.cli import main as cli
 
-        importlib.reload(registry)
+        monkeypatch.setattr(registry, "INSTALLED_MANIFEST", Path(tmp) / "envs.json")
 
         recorded = {}
         monkeypatch.setattr(
@@ -53,9 +52,6 @@ def test_env_install_prime_hub_slug(monkeypatch):
         entry = manifest["primeintellect/hendrycks-math"]
         assert entry["package"] == "hendrycks-math"
         assert "hub.primeintellect.ai" in entry["extra_index_url"]
-
-        monkeypatch.delenv("FLASH_ENVS_MANIFEST", raising=False)
-        importlib.reload(registry)
 
 
 def test_env_install_rejects_bare_id(monkeypatch, capsys):

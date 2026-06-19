@@ -35,6 +35,7 @@ import traceback
 from flash.engine.accounting import RunMetrics
 
 # Shared, substrate-neutral fine-tuning internals (live in this same package).
+from flash.engine.chalk_kernels import install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
@@ -292,24 +293,16 @@ def make_checkpoint_upload_callback():
 # repo; committing every training step (the reward callback fires per step) blows HuggingFace's
 # per-repo commit rate limit (128/hour), especially when several runs share one HF_REPO. Only
 # the per-step "rl_step" stage is high-frequency, so throttle JUST that one to once per
-# FLASH_HEARTBEAT_MIN_S (default 60s); every other stage — including milestones and the
-# terminal done/already_done — always commits so the control plane never misses a transition.
+# 60s; every other stage — including milestones and the terminal done/already_done — always
+# commits so the control plane never misses a transition.
 # The local file + stdout line are always written regardless.
 _HB_LAST_UPLOAD = 0.0
 
 
 def _hb_min_interval_s() -> float:
-    """The rl_step heartbeat-upload throttle, in seconds. Operators raise FLASH_HEARTBEAT_MIN_S
-    to stay under HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO runs
-    share one HF_REPO; default 60s. A non-positive or unparseable value falls back to 60s."""
-    raw = os.environ.get("FLASH_HEARTBEAT_MIN_S")
-    if raw is None:
-        return 60.0
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return 60.0
-    return value if value > 0 else 60.0
+    """The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
+    128 commits/hour-per-repo limit when concurrent runs share one HF_REPO."""
+    return 60.0
 
 
 _HB_MIN_INTERVAL_S = _hb_min_interval_s()
@@ -654,18 +647,17 @@ def finalize_alloc_conf_for_sleep() -> None:
     """Sync the CUDA allocator conf with the worker's RESOLVED vLLM sleep default.
 
     The launcher (providers/*/train.py build_worker_env) must pick PYTORCH_ALLOC_CONF before this
-    process starts, but it can't always know the GRPO sleep decision: for a small model with
-    RL_VLLM_SLEEP unset the worker resolves sleep OFF (the speed default), yet the launcher
-    conservatively assumes sleep ON and picks the non-expandable conf (safe, but fragments a long
-    colocate run). When the launcher cedes the decision (it sets FLASH_ALLOC_AUTO=1 — only when
-    it applied a DEFAULT, never an operator override), we resolve the same sleep default here (we
+    process starts, but it can't always know the GRPO sleep decision: for a small model the worker
+    resolves sleep OFF (the speed default), yet the launcher conservatively assumes sleep ON and
+    picks the non-expandable conf (safe, but fragments a long colocate run). When the launcher cedes
+    the decision (it sets FLASH_ALLOC_AUTO=1 for RL runs), we resolve the same sleep default here (we
     have the model config + GPU) and, if sleep is OFF, switch to expandable_segments — which only
     crashes WITH sleep on, a case we've just ruled out. PYTORCH_ALLOC_CONF is read lazily at the
     first CUDA allocation, so this must run before any allocation (it does — called at boot)."""
     if os.environ.get("FLASH_ALLOC_AUTO") != "1":
         return
     try:
-        model_id = os.environ.get("BENCH_HF_MODEL", "")
+        model_id = JOB_SPEC.model if JOB_SPEC else ""
         # Resolve the GRPO context the SAME way the sleep gate does (run_rl): the run's
         # [train].max_length, so a long-context run gets the right sleep default + alloc conf.
         _spec_len = 0
@@ -752,11 +744,113 @@ def fused_optim_name() -> str:
     return "paged_adamw_8bit"
 
 
+def _reset_peak_gpu() -> None:
+    """Reset the CUDA peak-memory counter so a subsequent ``_peak_gpu_gb`` measures only the work
+    that follows (e.g. the train loop, isolating the optimizer-state A/B from setup/model load)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def _peak_gpu_gb() -> float:
+    """Peak torch-allocated CUDA memory (GB) since the last reset; 0.0 if no CUDA. Note: bnb paged
+    8-bit optimizer state lives in unified/managed memory outside torch's caching allocator and is
+    NOT counted here — so this OVERSTATES the 8-bit saving. _GpuPeakSampler measures the true
+    device footprint (incl. bnb managed pages) for the honest A/B number."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return round(torch.cuda.max_memory_allocated() / 1e9, 3)
+    except Exception:
+        pass
+    return 0.0
+
+
+class _GpuPeakSampler:
+    """Background sampler of true device memory (GB) = (total - free) from cuda.mem_get_info, which
+    DOES include bitsandbytes managed/paged optimizer pages while they're GPU-resident (torch's
+    max_memory_allocated does not). This is the honest peak for the fp32-vs-8-bit optimizer A/B."""
+
+    def __init__(self, interval: float = 0.25):
+        self.interval = interval
+        self.peak_used = 0
+        self._stop = False
+        self._thread = None
+
+    def _run(self):
+        import torch
+
+        while not self._stop:
+            try:
+                free, total = torch.cuda.mem_get_info()
+                self.peak_used = max(self.peak_used, total - free)
+            except Exception:
+                pass
+            time.sleep(self.interval)
+
+    def start(self):
+        try:
+            import threading
+
+            import torch
+
+            if not torch.cuda.is_available():
+                return self
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        except Exception:
+            pass
+        return self
+
+    def stop_gb(self) -> float:
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        return round(self.peak_used / 1e9, 3)
+
+
+def loraplus_optimizer_cls(optim_name: str):
+    """Optimizer class for the LoRA+ ``create_optimizer`` override (returns ``(cls, extra_kwargs)``).
+
+    The LoRA+ override has to *build* the optimizer itself (PEFT splits the LoRA A/B matrices into
+    separate param groups with different LRs), so it cannot inherit TRL's ``optim=`` string — it has
+    to choose a concrete class. Historically it always built a full-precision ``torch.optim.AdamW``,
+    which silently discarded the catalog's ``paged_adamw_8bit`` setting whenever LoRA+ was on.
+
+    PEFT's ``create_loraplus_optimizer`` accepts ANY ``optimizer_cls`` — including bitsandbytes 8-bit
+    optimizers (it registers embedding overrides with bnb's ``GlobalOptimManager`` to keep them
+    32-bit) — so LoRA+ and the 8-bit paged optimizer state coexist. An ``8bit`` ``optim`` value
+    (the fleet default; ``fused_optim_name`` -> ``paged_adamw_8bit``) selects
+    ``bnb.optim.PagedAdamW8bit``; a non-8-bit ``optim`` keeps fp32 AdamW. This simply mirrors the
+    configured ``optim`` — there is no separate toggle: an on-GPU A/B (Qwen3.5-4B SFT, rank-128
+    LoRA, same seed/data/init) measured the 8-bit paged state at -75% optimizer memory
+    (1359 -> 346 MB) and -0.72 GB peak with NO convergence penalty (final loss 10.64 vs 11.16 from
+    an identical start), so it's unconditionally the default wherever ``optim`` is 8-bit. Falls
+    back to fp32 AdamW only if bitsandbytes is missing."""
+    import torch as _torch
+
+    # case-insensitive + str-safe: TRL normalizes optim to an OptimizerNames enum whose str() is
+    # "OptimizerNames.PAGED_ADAMW_8BIT" (uppercase), so a bare `"8bit" in optim_name` would miss it.
+    if "8bit" in str(optim_name or "").lower():
+        try:
+            import bitsandbytes as bnb
+
+            return bnb.optim.PagedAdamW8bit, {}
+        except Exception as e:  # bnb missing / no CUDA build -> safe fp32 fallback
+            print(f"[lora+] bitsandbytes 8-bit optimizer unavailable ({e}); using fp32 AdamW")
+    return _torch.optim.AdamW, {}
+
+
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
-    (silent, the metrics.json artifact is still the source of truth). Sets a default project so runs
-    land in one place."""
+    (silent, the metrics.json artifact is still the source of truth). Pins the project so every run
+    lands in one place."""
     if not os.environ.get("WANDB_API_KEY"):
         return []
     import importlib.util
@@ -764,7 +858,7 @@ def wandb_report_to() -> list[str]:
     if importlib.util.find_spec("wandb") is None:
         print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
         return []
-    os.environ.setdefault("WANDB_PROJECT", "flash")
+    os.environ["WANDB_PROJECT"] = "flash"
     return ["wandb"]
 
 
@@ -855,17 +949,9 @@ def make_lora(model_id: str | None = None):
     ``lora_exclude_modules``)."""
     from peft import LoraConfig
 
-    # PEFT target_modules accepts the special string "all-linear" OR a LIST of module-name
-    # suffixes. A comma-separated env (e.g. "q_proj,k_proj,v_proj,o_proj" to adapt attention only
-    # and leave the MoE experts frozen) MUST be split into a list — else PEFT treats the whole
-    # string as ONE module name and raises "Target modules ... not found in the base model".
-    _parts = [
-        t.strip() for t in os.environ.get("LORA_TARGETS", "all-linear").split(",") if t.strip()
-    ]
-    # "all-linear" is a PEFT SPECIAL string, not a module name — keep it as a string (incl. when a
-    # stray trailing comma made it the sole element, e.g. "all-linear," -> ["all-linear"]). Any
-    # real multi-module value becomes a list of suffixes.
-    targets = "all-linear" if (not _parts or _parts == ["all-linear"]) else _parts
+    # Adapt every linear projection. "all-linear" is a PEFT SPECIAL string (not a module name)
+    # that PEFT expands to all linear layers — the right managed default across the catalog.
+    targets = "all-linear"
     rank = JOB_SPEC.train.lora_rank if JOB_SPEC else RECIPE.lora.rank
     alpha = JOB_SPEC.train.lora_alpha if JOB_SPEC else RECIPE.lora.alpha
     kwargs = {
@@ -893,10 +979,7 @@ def make_lora(model_id: str | None = None):
 
 
 def model_quant(model_id: str) -> str:
-    """Quantization tier for this model: catalog entry > FLASH_QUANT env > bf16."""
-    env_q = os.environ.get("FLASH_QUANT")
-    if env_q:
-        return env_q
+    """Quantization tier for this model: catalog entry > bf16 (managed; no override)."""
     try:
         from flash.catalog import MODELS
 
@@ -1004,15 +1087,15 @@ def run_sft():
     setup_seconds = time.time() - t_start
     heartbeat("sft_model_load", setup_seconds=setup_seconds)
 
-    default_epochs = (
+    # Epochs come from the run's [train] epochs (already in JOB_SPEC), else the recipe default.
+    epochs = int(
         JOB_SPEC.train.epochs
         if JOB_SPEC and JOB_SPEC.train.epochs is not None
         else RECIPE.sft.num_epochs
     )
-    epochs = int(os.environ.get("SFT_EPOCHS", str(default_epochs)))
-    # SDK [train] knobs override the recipe default; an operator env var still wins last.
+    # SDK [train] knobs override the recipe default.
     _t = JOB_SPEC.train if JOB_SPEC else None
-    per_device_bs = int(os.environ.get("SFT_PER_DEVICE_BS", "4"))
+    per_device_bs = 4
     # batch_size is the GLOBAL/effective batch: grad-accum is sized to reach it. Cap the
     # per-device micro-batch at the target (so a target < per_device doesn't overshoot) and
     # use CEIL division so the realized global batch is never BELOW the requested one (floor
@@ -1080,22 +1163,13 @@ def run_sft():
     # sdist-only; Dao-AILab wheels stop at torch 2.9) so it would build from source on every cold
     # start (~20 min, fragile) — it is NOT in the worker image. So _fa_ok is False on the current
     # stack and packing is effectively unavailable until flash-attn is baked into a prebuilt image.
-    # Default: packing ON when FA2 is importable; else SKIP (don't silently cross-contaminate).
-    # SFT_PACKING=0 disables; SFT_PACKING=1 forces (bfd under SDPA, with the contamination warning).
-    _packing_env = os.environ.get("SFT_PACKING")
-    _want_packing = (_packing_env or "1") not in ("0", "false", "False")
-    _packing_forced = _packing_env not in (None, "")
+    # Packing is ON when FA2 is importable (varlen keeps 'bfd' example boundaries correct); else
+    # SKIP — without a boundary-correct attn backend examples would cross-contaminate under SDPA.
     _fa_ok = _flash_attn_available()
-    if _want_packing and _fa_ok:
+    if _fa_ok:
         cfg_kwargs["packing"] = True
-        print("[sft] example packing enabled (FA2 varlen; SFT_PACKING=0 to disable)")
-    elif _want_packing and _packing_forced:
-        cfg_kwargs["packing"] = True
-        print(
-            "[sft] WARNING: packing forced without FA2 — 'bfd' boundaries need varlen; "
-            "examples may cross-contaminate under SDPA. Set SFT_PACKING=0 to disable."
-        )
-    elif _want_packing:
+        print("[sft] example packing enabled (FA2 varlen)")
+    else:
         print(
             "[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
             "2.10). Bake flash-attn into the worker image to enable FA2 varlen packing."
@@ -1139,47 +1213,80 @@ def run_sft():
     if _lp_ratio > 1:
 
         class _SFT(SFTTrainer):  # local LoRA+ subclass
+            _loraplus_applied = False  # True only once the LoRA+ grouping actually installs
+
             def create_optimizer(self):
                 if self.optimizer is None:
                     try:
                         from peft.optimizers import create_loraplus_optimizer
-                        from transformers import Trainer as _HFTrainer
 
-                        # Respect the configured `optim` (the QLoRA tier sets paged_adamw_8bit so
-                        # bitsandbytes pages int8 optimizer state to host RAM — hardcoding plain
-                        # torch AdamW here would OOM 4-bit runs). Resolve the optimizer class +
-                        # kwargs from self.args exactly as the HF Trainer would, then build it via
-                        # LoRA+ so the B-matrix LR ratio still applies on top of the right optimizer.
-                        optimizer_cls, optimizer_kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(
-                            self.args, self.model
+                        # Mirror the configured `optim` so LoRA+ and the 8-bit paged optimizer state
+                        # coexist (instead of silently forcing fp32 AdamW); see loraplus_optimizer_cls.
+                        # .value (not str()): self.args.optim is a TRL OptimizerNames enum whose
+                        # str() is "OptimizerNames.PAGED_ADAMW_8BIT"; pass the raw value
+                        # ("paged_adamw_8bit") so the 8-bit match works.
+                        opt_cls, extra = loraplus_optimizer_cls(
+                            getattr(self.args.optim, "value", self.args.optim)
                         )
-                        # LoRA+ assigns the lr per param-group, so drop any class-level lr; pass it
-                        # explicitly. The lr keyword name has shifted across PEFT versions, so pass
-                        # it via optimizer_kwargs (the stable form) and fall back to a top-level lr=.
-                        optimizer_kwargs.pop("lr", None)
+                        # Forward the TrainingArguments optimizer config that the default HF
+                        # create_optimizer path would have applied. Building the optimizer
+                        # ourselves means we must replicate it explicitly, or LoRA+ runs would
+                        # silently use the optimizer class's own defaults instead of the
+                        # configured betas/eps/weight_decay. betas/eps go straight to the optimizer
+                        # constructor (alongside any `extra` from loraplus_optimizer_cls);
+                        # weight_decay is handled separately below.
+                        fwd = dict(extra)
+                        _betas = (
+                            getattr(self.args, "adam_beta1", None),
+                            getattr(self.args, "adam_beta2", None),
+                        )
+                        if None not in _betas:
+                            fwd.setdefault("betas", _betas)
+                        _eps = getattr(self.args, "adam_epsilon", None)
+                        if _eps is not None:
+                            fwd.setdefault("eps", _eps)
+                        # PEFT does NOT read args.weight_decay; it applies decay via its own LoRA+
+                        # param groups, keyed off the loraplus_weight_decay kwarg (which it pops
+                        # before constructing the optimizer). Pass it as a top-level kwarg so it
+                        # isn't forwarded into the optimizer constructor.
+                        lp_extra: dict[str, object] = {}
+                        _wd = getattr(self.args, "weight_decay", None)
+                        if _wd is not None:
+                            lp_extra["loraplus_weight_decay"] = _wd
+                        # PEFT's create_loraplus_optimizer forwards extra kwargs to the optimizer;
+                        # the lr keyword name has shifted across PEFT versions, so pass it via
+                        # optimizer_kwargs (the stable form) and fall back to a top-level lr=.
                         try:
                             self.optimizer = create_loraplus_optimizer(
                                 model=self.model,
-                                optimizer_cls=optimizer_cls,
-                                optimizer_kwargs={**optimizer_kwargs, "lr": self.args.learning_rate},
+                                optimizer_cls=opt_cls,
+                                optimizer_kwargs={"lr": self.args.learning_rate, **fwd},
                                 loraplus_lr_ratio=_lp_ratio,
+                                **lp_extra,
                             )
                         except TypeError:
                             self.optimizer = create_loraplus_optimizer(
                                 model=self.model,
-                                optimizer_cls=optimizer_cls,
+                                optimizer_cls=opt_cls,
                                 lr=self.args.learning_rate,
                                 loraplus_lr_ratio=_lp_ratio,
-                                **optimizer_kwargs,
+                                **fwd,
+                                **lp_extra,
                             )
+                        self._loraplus_applied = True
                         print(
                             f"[lora+] optimizer enabled (B-matrix LR ratio={_lp_ratio}, "
-                            f"optim={self.args.optim})"
+                            f"cls={opt_cls.__name__})"
                         )
                         return self.optimizer
                     except Exception as e:  # never block training on the LoRA+ wiring
                         print("[lora+] setup failed, falling back to default optimizer:", e)
                 return super().create_optimizer()
+
+    # Install any opt-in chalk kernels (selected via FLASH_* flags) before TRL builds the model, so the
+    # class/function-level patches (LoRA delta, fused MLP/QKV, RoPE) apply to it. No-op unless
+    # a FLASH_* kernel flag is set and freesolo-chalk is installed.
+    install_chalk_kernels()
 
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
@@ -1191,11 +1298,19 @@ def run_sft():
         processing_class=tok,
         callbacks=[make_checkpoint_upload_callback()],
     )
+    # The class/function-level chalk kernels installed above patch the layers TRL just built; the
+    # INSTANCE-level ones (FP8 base, embedding, FP8 MLP) need the materialized module, so install
+    # them now against the SFT trainer.model. No-op unless a FLASH_* kernel flag is set and chalk present.
+    install_chalk_kernels(getattr(trainer, "model", None))
 
+    _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
+    _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. bnb managed optimizer pages
     t_train = time.time()
     with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
+    sft_peak_gpu_gb = _peak_gpu_gb()
+    sft_device_peak_gpu_gb = _gpu_sampler.stop_gb()
 
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
@@ -1226,6 +1341,24 @@ def run_sft():
             # console is only uploaded on failure, so a short successful run otherwise drops its
             # loss history entirely.
             "loss_curve": _metric_curve(trainer, "loss"),
+            # Peak torch-allocated GPU memory during the train loop (excludes bnb managed pages, so
+            # it overstates the 8-bit saving — use device_peak_gpu_gb for the true footprint).
+            "peak_gpu_gb": sft_peak_gpu_gb,
+            # True peak device memory (total-free, incl. bnb managed optimizer pages): the honest
+            # headline for the fp32-vs-8-bit LoRA+ optimizer A/B.
+            "device_peak_gpu_gb": sft_device_peak_gpu_gb,
+            # Report the optimizer ACTUALLY built on the trainer, not the planned class: if the
+            # LoRA+ create_optimizer override failed, training falls back to TRL's configured
+            # optimizer without LoRA+ grouping. loraplus_applied records which path actually ran.
+            # Accelerate wraps the optimizer (AcceleratedOptimizer) under transformers 5.x, so unwrap
+            # via `.optimizer` to record the underlying PagedAdamW8bit/AdamW the A/B cares about, not
+            # the wrapper name.
+            "loraplus_optim": (
+                type(getattr(trainer.optimizer, "optimizer", trainer.optimizer)).__name__
+                if getattr(trainer, "optimizer", None) is not None
+                else loraplus_optimizer_cls(fused_optim_name())[0].__name__
+            ),
+            "loraplus_applied": getattr(trainer, "_loraplus_applied", False),
             **wandb_run_info(),
         },
     )
@@ -1296,10 +1429,10 @@ def rl_per_device_comps(
     This, not grad-accum, sets peak trainer VRAM: the logprob pass materializes fp32 logits
     of shape [per_device, completion_len, vocab]. At Qwen's ~152k vocab a long completion is
     enormous (measured: per_device 8 x 4096 tok x 152k x 4 B = ~20 GiB single alloc -> OOMs
-    a small card). So we MEMORY-CAP per_device to a logits budget (RL_LOGITS_BUDGET_GB,
-    default 6) for the given completion length, then push the difference into grad-accum
+    a small card). So we MEMORY-CAP per_device to a logits budget (6 GB) for the
+    given completion length, then push the difference into grad-accum
     (compute_grpo_batching) so the effective batch is unchanged. This keeps long-completion
-    GRPO on a cheaper GPU. RL_PER_DEVICE_PROMPTS forces an explicit value.
+    GRPO on a cheaper GPU.
 
     The logits budget is NOT the whole story: the per-device forward also holds the model's
     attention/activation memory (the Qwen3.5 GDN/FLA kernels peak per micro-batch even with
@@ -1310,12 +1443,10 @@ def rl_per_device_comps(
     TRAINS at 4. So for colocate, additionally cap per_device to the live card's VRAM scaled
     by model width (~sqrt(params)): ~vram_gb/8 at 2B-width, tightened for wider models (4B/9B).
     """
-    base = int(os.environ.get("RL_PER_DEVICE_PROMPTS", "2" if THINKING else "8"))
-    if "RL_PER_DEVICE_PROMPTS" in os.environ:
-        # Explicit operator force (A/B knob): bypass BOTH auto-caps -- they own the OOM risk.
-        return max(1, base)
+    # Default prompts/step; the auto-caps below (logits budget + colocate VRAM/width) handle OOM.
+    base = 2 if THINKING else 8
     if completion_len > 0:
-        budget = float(os.environ.get("RL_LOGITS_BUDGET_GB", "6")) * 1e9
+        budget = 6.0 * 1e9
         cap = max(1, int(budget / (max(1, completion_len) * vocab * 4)))
         base = min(base, cap)
     if use_vllm:
@@ -1371,7 +1502,7 @@ def _maybe_attach_periodic_eval(
     max_turns: int,
 ):
     """Attach periodic mid-run eval to the GRPO trainer when enabled — the run's
-    ``[train] eval_every_steps`` (or the ``FLASH_EVAL_EVERY_STEPS`` operator override) > 0.
+    ``[train] eval_every_steps`` > 0.
 
     Returns the ``PeriodicEval`` (so the caller can persist its ``history`` into metrics.json),
     or ``None`` when eval is disabled/unsupported for this run.
@@ -1393,7 +1524,11 @@ def _maybe_attach_periodic_eval(
     # eval queries + grading logic + completion budget all come from the environment / the run's
     # normal settings, not config.
     _train = JOB_SPEC.train if JOB_SPEC else None
-    cfg = _me.eval_config(max_new_default, spec_every=getattr(_train, "eval_every_steps", None))
+    cfg = _me.eval_config(
+        max_new_default,
+        spec_every=getattr(_train, "eval_every_steps", None),
+        spec_eval_examples=getattr(_train, "eval_examples", None),
+    )
     if cfg["every_steps"] <= 0:
         return None
     if is_tool_env:
@@ -1421,11 +1556,15 @@ def _maybe_attach_periodic_eval(
     # fails) — this runs at training start, so a raise here would abort the whole paid run. Guard
     # it: a broken eval split disables mid-run eval, never the training.
     try:
-        # Pass the cap as `limit` so the env getter materializes at most num_examples rows (a huge
-        # Hub eval/train split isn't fully built just to be sliced); the slice is a backstop for
-        # envs whose getter ignores `n`.
-        _cap = cfg["num_examples"] or None
-        examples = env.dataset("eval", limit=_cap)[: cfg["num_examples"]]
+        # Evaluate a RANDOM SAMPLE of num_examples held-out rows, not the whole split (generation
+        # is the cost; scoring the entire eval set every pass would dominate training) and not the
+        # first N (order-biased). Materialize a bounded pool (data load is cheap vs generation),
+        # then take a FIXED seeded subset so the same rows are scored every pass -> a comparable
+        # eval curve. `limit` bounds the pool; a verifiers getter that honors (n, seed) already
+        # returns a seeded slice, and the sample is the backstop for getters that ignore `n`.
+        n = cfg["num_examples"]
+        pool = env.dataset("eval", limit=max(n, _me.EVAL_POOL_CAP))
+        examples = _me.sample_eval_rows(pool, n)
     except Exception as exc:  # never let an eval-split failure abort training
         print(f"[rl][eval] could not materialize the eval split ({exc}); skipping mid-run eval")
         return None
@@ -1598,12 +1737,14 @@ def run_rl():
     quant = model_quant(model_id)
     download_seconds = prefetch_model(model_id)
     rl = RECIPE.rl
-    steps = int(os.environ.get("RL_STEPS", str(rl.num_steps)))
-    # Throughput/quality knobs (env-overridable): the number of prompts optimized per step,
-    # completions per prompt, and whether vLLM offloads weights between steps. Sleep mode
-    # frees memory for the optimizer but reloads ~weights each step (a large per-step cost);
-    # disable it (RL_VLLM_SLEEP=0) with a higher RL_VLLM_GPU_UTIL when both fit resident.
-    # SDK-supplied GRPO knobs (datums parity) override the recipe; env vars still win.
+    # Steps come from the run's [train] steps (already in JOB_SPEC), else the recipe default.
+    steps = int(
+        JOB_SPEC.train.steps if JOB_SPEC and JOB_SPEC.train.steps is not None else rl.num_steps
+    )
+    # Throughput/quality knobs: the number of prompts optimized per step, completions per
+    # prompt, and whether vLLM offloads weights between steps. Sleep mode frees memory for the
+    # optimizer but reloads ~weights each step (a large per-step cost); it's gated OFF by model
+    # size when both the policy and rollout engine fit resident.
     gcfg = grpo_overrides()
     _t = JOB_SPEC.train if JOB_SPEC else None
     # batch_size = prompts per optimizer step for GRPO.
@@ -1619,17 +1760,12 @@ def run_rl():
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     # vLLM sleep mode offloads the rollout engine's weights between steps to free memory for the
     # optimizer, but reloading each step is a large per-step cost — PR #174 measured ~2-2.6x faster
-    # GRPO with it OFF on models that fit. Default it by model size (same small=speed / large=memory
-    # gate as gradient checkpointing): OFF for small/fitting models, ON for large. RL_VLLM_SLEEP wins.
-    _sleep_env = os.environ.get("RL_VLLM_SLEEP")
-    if _sleep_env is not None:
-        sleep_mode = _sleep_env not in ("0", "false", "False")
-    else:
-        # Gate on the GRPO rollout context (the run's [train].max_length sizes the engine + KV
-        # cache): a long-context GRPO run is memory-tight and needs sleep mode. Matches the
-        # liger-loss gate below.
-        _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
-        sleep_mode = _memory_mode(model_id, _grpo_ctx)
+    # GRPO with it OFF on models that fit. Gate it by model size (same small=speed / large=memory
+    # gate as gradient checkpointing): OFF for small/fitting models, ON for large.
+    # Gate on the GRPO rollout context (the run's [train].max_length sizes the engine + KV cache):
+    # a long-context GRPO run is memory-tight and needs sleep mode. Matches the liger-loss gate below.
+    _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
+    sleep_mode = _memory_mode(model_id, _grpo_ctx)
     # Rollout backend: always colocated vLLM (fast). The whole supported catalog runs GRPO with
     # colocated vLLM; there is no transformers-generation fallback.
     use_vllm = True
@@ -1767,7 +1903,7 @@ def run_rl():
     per_device_comps = rl_per_device_comps(_max_completion, use_vllm=use_vllm, params_b=_params_b)
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
-        print("WARN: generation batch not divisible by group size; check RL_PER_DEVICE_PROMPTS")
+        print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
     print(
         f"[rl] GRPO batching: per_device={batching['per_device_train_batch_size']} "
         f"grad_accum={batching['gradient_accumulation_steps']} "
@@ -1836,12 +1972,12 @@ def run_rl():
     if use_vllm:
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
-        # the model's FULL context and won't start on a consumer GPU). RL_VLLM_GPU_UTIL
-        # sizes vLLM's pool; RL_VLLM_SLEEP offloads its weights between steps.
+        # the model's FULL context and won't start on a consumer GPU). vllm_gpu_memory_utilization
+        # sizes vLLM's pool; sleep mode offloads its weights between steps.
         grpo_kwargs.update(
             vllm_mode="colocate",
             vllm_max_model_length=vllm_max_len,
-            vllm_gpu_memory_utilization=float(os.environ.get("RL_VLLM_GPU_UTIL", "0.45")),
+            vllm_gpu_memory_utilization=0.45,
             vllm_enable_sleep_mode=sleep_mode,
         )
         # Rollout-memory + throughput knobs, applied ONLY if this TRL exposes the field (so an
@@ -1891,6 +2027,14 @@ def run_rl():
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
     # to fp32 and double VRAM).
     init_model, init_peft = _init_adapter_model(model_id)
+    # Install the CLASS/FUNCTION-level opt-in chalk kernels (LoRA delta, fused MLP/QKV, RoPE)
+    # BEFORE GRPOTrainer builds the model so the patches apply to its freshly-built layers. The
+    # INSTANCE-level kernels (FP8 base, embedding, FP8 MLP) need the actual nn.Module and are
+    # installed AFTER construction (below) against trainer.model — on the fresh-LoRA path
+    # init_model is just the model-id string (TRL builds the module), and even on the
+    # continue-adapter path TRL may rebuild/wrap the PeftModel, so trainer.model is the
+    # authoritative target. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
+    install_chalk_kernels()
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
         # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
@@ -1997,6 +2141,11 @@ def run_rl():
         callbacks=[hb_cb, make_checkpoint_upload_callback()],
         **extra_trainer_kwargs,
     )
+    # Now that TRL has materialized the model, install the INSTANCE-level chalk kernels (FP8 base,
+    # embedding, FP8 MLP) against the actual module GRPOTrainer optimizes (trainer.model). Doing it
+    # here (not on init_model) is what makes them reach the fresh-LoRA path, where init_model was
+    # only the model-id string. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
+    install_chalk_kernels(getattr(trainer, "model", None))
     # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or FLASH_EVAL_EVERY_STEPS,
     # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
     # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.

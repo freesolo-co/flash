@@ -77,11 +77,12 @@ def test_search_offers_query_shape(monkeypatch):
     assert url.endswith("/search/asks/")
     assert auth == "Bearer vk-test"
     q = body["q"]
-    # The non-negotiable filters: verified hosts, rentable, 1 GPU. Community/marketplace hosts are
-    # allowed (no server-side datacenter-only filter); hosting_type is re-checked downstream with
-    # the reliability floor, so quality stays gated.
+    # The non-negotiable filters: verified DATACENTER hosts, rentable, 1 GPU. Community/marketplace
+    # hosts are filtered out server-side (datacenter==True) — they're rejected downstream anyway
+    # (run secrets ship to the box), so filtering server-side keeps the price-sorted page full of
+    # usable datacenter offers; hosting_type + the reliability floor are still re-checked downstream.
     assert q["verified"] == {"eq": True}
-    assert "datacenter" not in q
+    assert q["datacenter"] == {"eq": True}
     assert q["rentable"] == {"eq": True}
     assert q["num_gpus"] == {"eq": 1}
     assert q["gpu_ram"] == {"gte": 24576}

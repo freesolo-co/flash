@@ -173,24 +173,28 @@ def test_allow_unvalidated_widens_gpu_selection():
 
 def test_unspecified_allow_unvalidated_resolves_like_submit_time(monkeypatch):
     # ``allow_unvalidated`` is tri-state: an UNSPECIFIED value (None, the default and what a
-    # spec with no gpu.allow_unvalidated key reconstructs to) must NOT be treated as a hard
-    # False. select_gpu resolves it via the SAME FLASH_GPU_ALLOW_UNVALIDATED default the
-    # submit-time allocator uses (providers.base.unvalidated_allowed), so the estimate matches
-    # the GPU a run the env var widened actually allocates -- the bug this guards against is a
-    # missing flag silently pricing against the narrower validated-only pool.
+    # spec with no gpu.allow_unvalidated key reconstructs to) is resolved by select_gpu via the
+    # SAME helper the submit-time allocator uses (providers.base.unvalidated_allowed), so the
+    # estimate prices against exactly the pool a run actually allocates. Flash is fully managed
+    # now -- ``unvalidated_allowed`` honors the per-run flag only, with NO global env override --
+    # so an unspecified (None) flag resolves to the validated-only pool regardless of any
+    # FLASH_GPU_ALLOW_UNVALIDATED in the environment.
     from flash.cost.hardware import pick_gpu
+    from flash.providers.base import unvalidated_allowed
 
     cfg_unspecified = RunConfig(MID, "sft", 100)  # allow_unvalidated defaults to None
     assert cfg_unspecified.allow_unvalidated is None
     need = select_gpu(RunConfig(MID, "sft", 100, allow_unvalidated=False))[1]
 
-    # Env off -> None resolves to validated-only (matches submit-time default).
+    # None resolves through unvalidated_allowed -> validated-only (managed default), and an
+    # ambient FLASH_GPU_ALLOW_UNVALIDATED does NOT widen it (no global env override anymore).
+    assert unvalidated_allowed(None) is False
     monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
     assert select_gpu(cfg_unspecified)[0] == pick_gpu(need, allow_unvalidated=False)
 
-    # Env on -> None widens to the unvalidated pool, exactly as the allocator would.
     monkeypatch.setenv("FLASH_GPU_ALLOW_UNVALIDATED", "1")
-    assert select_gpu(cfg_unspecified)[0] == pick_gpu(need, allow_unvalidated=True)
+    assert unvalidated_allowed(None) is False
+    assert select_gpu(cfg_unspecified)[0] == pick_gpu(need, allow_unvalidated=False)
 
 
 def test_qlora_model_fits_a_smaller_card_than_bf16_would():
