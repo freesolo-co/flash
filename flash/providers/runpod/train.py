@@ -660,14 +660,13 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # GRPO vLLM sleep mode, whose CuMemAllocator memory pool is incompatible with
     # expandable_segments (vLLM asserts and the run crashes at engine init). So for RL with
     # sleep mode ON (the default), default to a non-expandable conf instead; SFT and
-    # sleep-off RL keep expandable_segments. An explicit operator override always wins.
+    # sleep-off RL keep expandable_segments. A per-run [worker_env] pin always wins.
     _is_rl = str(getattr(spec, "algorithm", "")).lower() not in ("sft",)
-    # RL_VLLM_SLEEP may be pinned per-run via [worker_env] (highest precedence, merged into the
-    # worker env later) OR via the control-plane process env. Resolve it from BOTH here — with
-    # worker_env winning — so a per-run explicit pin counts as explicit: otherwise _sleep_set stays
-    # false, FLASH_ALLOC_AUTO=1 is sent, and the worker can upgrade to expandable_segments while
-    # run_rl still enables vLLM sleep, hitting the CuMemAllocator incompatibility after provisioning.
-    _sleep_raw = (spec.worker_env or {}).get("RL_VLLM_SLEEP", os.environ.get("RL_VLLM_SLEEP"))
+    # RL_VLLM_SLEEP may be pinned per-run via the [worker_env] TOML table (merged into the worker
+    # env later). When pinned it counts as explicit: otherwise _sleep_set stays false,
+    # FLASH_ALLOC_AUTO=1 is sent, and the worker can upgrade to expandable_segments while run_rl
+    # still enables vLLM sleep, hitting the CuMemAllocator incompatibility after provisioning.
+    _sleep_raw = (spec.worker_env or {}).get("RL_VLLM_SLEEP")
     _sleep_set = _sleep_raw is not None
     _sleep_on = (_sleep_raw if _sleep_raw is not None else "1") not in ("0", "false", "False")
     _alloc_default = (
@@ -676,18 +675,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         else "expandable_segments:True"
     )
     # torch >= 2.10 renamed the env to PYTORCH_ALLOC_CONF — set BOTH names for either stack.
-    # Resolve the override from [worker_env] AND the control-plane process env (worker_env wins,
-    # mirroring RL_VLLM_SLEEP above): a per-run [worker_env] PYTORCH_ALLOC_CONF is merged into the
-    # worker env later (and would win), but if it isn't counted as an explicit override HERE,
-    # _alloc_override stays falsy, FLASH_ALLOC_AUTO=1 is sent, and finalize_alloc_conf_for_sleep
-    # overwrites the operator's per-run pin.
+    # A per-run [worker_env] alloc conf counts as an explicit pin HERE (else _alloc_override stays
+    # falsy, FLASH_ALLOC_AUTO=1 is sent, and finalize_alloc_conf_for_sleep overwrites the run's pin).
     _we = spec.worker_env or {}
-    _alloc_override = (
-        _we.get("PYTORCH_ALLOC_CONF")
-        or _we.get("PYTORCH_CUDA_ALLOC_CONF")
-        or os.environ.get("PYTORCH_ALLOC_CONF")
-        or os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-    )
+    _alloc_override = _we.get("PYTORCH_ALLOC_CONF") or _we.get("PYTORCH_CUDA_ALLOC_CONF")
     _alloc_conf = _alloc_override or _alloc_default
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
@@ -707,13 +698,9 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
             if (_is_rl and not _sleep_set and not _alloc_override)
             else {}
         ),
-        # Escape hatch for torch.compile/inductor spikes (Qwen3.5 DeltaNet kernels
-        # compile at first forward and can OOM a tight colocate budget).
-        **(
-            {"TORCHDYNAMO_DISABLE": os.environ["TORCHDYNAMO_DISABLE"]}
-            if os.environ.get("TORCHDYNAMO_DISABLE")
-            else {}
-        ),
+        # Escape hatch for torch.compile/inductor spikes (Qwen3.5 DeltaNet kernels compile at first
+        # forward and can OOM a tight colocate budget); pinnable per-run via [worker_env].
+        **({"TORCHDYNAMO_DISABLE": _we["TORCHDYNAMO_DISABLE"]} if _we.get("TORCHDYNAMO_DISABLE") else {}),
     }
     # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub
     # env(s), public + private) + optional reward-judge creds: a verifiers env whose rubric
@@ -741,28 +728,11 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # volume instead of per run).
     if getattr(spec.gpu, "network_volume", None):
         env["HF_HOME"] = "/runpod-volume/hf-cache"
-    # Forward operator/runtime tuning knobs to the GPU worker.
-    for k in (
-        "SFT_PER_DEVICE_BS",
-        "SFT_PACKING",
-        # Colocate-memory knobs the docs tell users to set to fix vLLM OOM / KV-cache errors.
-        "RL_VLLM_GPU_UTIL",
-        "RL_VLLM_SLEEP",
-        "VLLM_USE_V1",
-        # Attention-backend escape hatch: vllm's bundled flash-attn PTX can be newer
-        # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
-        # sidestep it without restricting the host pool to CUDA-13 drivers.
-        "VLLM_ATTENTION_BACKEND",
-        "FLASH_QUANT",
-        "WANDB_API_KEY",
-        "WANDB_ENTITY",
-        "LORA_TARGETS",
-        # rl_step heartbeat-upload throttle (engine.worker._hb_min_interval_s). Operators raise this
-        # to stay under HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO
-        # runs share one HF_REPO; the worker no-op's a non-positive/unparseable value back to 60s.
-        "FLASH_HEARTBEAT_MIN_S",
-    ):
-        # Forward when SET, even if empty: an explicit "" is a meaningful override.
+    # Forward W&B credentials/routing to the worker. Run TUNING is NOT an operator env knob: flash
+    # is fully managed — the worker uses the optimal default for every setting, and the only per-run
+    # configuration is the run spec (the structured [train] fields + the [worker_env] TOML table
+    # merged in below). No control-plane process-env override reaches the worker.
+    for k in ("WANDB_API_KEY", "WANDB_ENTITY"):
         if os.environ.get(k) is not None:
             env[k] = os.environ[k]
     # Per-run worker_env overrides win over the global os.environ allowlist: this is what lets
