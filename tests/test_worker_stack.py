@@ -108,10 +108,8 @@ def _fake_bitsandbytes(monkeypatch):
 
 
 def test_loraplus_optimizer_mirrors_8bit_optim(monkeypatch):
-    """Default-on: an `8bit` optim string -> bnb PagedAdamW8bit (LoRA+ and 8-bit state coexist)."""
+    """An `8bit` optim string -> bnb PagedAdamW8bit (LoRA+ and 8-bit state coexist), always-on."""
     worker = _import_worker(monkeypatch)
-    monkeypatch.setattr(worker, "_LORAPLUS_8BIT_DEFAULT", True)
-    monkeypatch.delenv("FLASH_LORAPLUS_8BIT", raising=False)
     _fake_torch(monkeypatch)
     paged = _fake_bitsandbytes(monkeypatch)
     cls, extra = worker.loraplus_optimizer_cls("paged_adamw_8bit")
@@ -119,34 +117,12 @@ def test_loraplus_optimizer_mirrors_8bit_optim(monkeypatch):
     assert extra == {}
 
 
-def test_loraplus_optimizer_default_off_keeps_fp(monkeypatch):
-    """Default-off: even an `8bit` optim string keeps fp32 AdamW unless explicitly opted in."""
-    worker = _import_worker(monkeypatch)
-    monkeypatch.setattr(worker, "_LORAPLUS_8BIT_DEFAULT", False)
-    monkeypatch.delenv("FLASH_LORAPLUS_8BIT", raising=False)
-    adamw = _fake_torch(monkeypatch)
-    _fake_bitsandbytes(monkeypatch)
-    assert worker.loraplus_optimizer_cls("paged_adamw_8bit")[0] is adamw
-
-
 def test_loraplus_optimizer_fp_optim_uses_adamw(monkeypatch):
-    """A non-8-bit optim string keeps full-precision torch AdamW."""
+    """A non-8-bit optim string keeps full-precision torch AdamW (mirrors the configured optim)."""
     worker = _import_worker(monkeypatch)
-    monkeypatch.delenv("FLASH_LORAPLUS_8BIT", raising=False)
     adamw = _fake_torch(monkeypatch)
     cls, _extra = worker.loraplus_optimizer_cls("adamw_torch")
     assert cls is adamw
-
-
-def test_loraplus_optimizer_env_override(monkeypatch):
-    """FLASH_LORAPLUS_8BIT forces the choice regardless of the optim string (A/B knob)."""
-    worker = _import_worker(monkeypatch)
-    adamw = _fake_torch(monkeypatch)
-    paged = _fake_bitsandbytes(monkeypatch)
-    monkeypatch.setenv("FLASH_LORAPLUS_8BIT", "1")
-    assert worker.loraplus_optimizer_cls("adamw_torch")[0] is paged  # forced on
-    monkeypatch.setenv("FLASH_LORAPLUS_8BIT", "0")
-    assert worker.loraplus_optimizer_cls("paged_adamw_8bit")[0] is adamw  # forced off
 
 
 def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
@@ -155,7 +131,6 @@ def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
 
     worker = _import_worker(monkeypatch)
     adamw = _fake_torch(monkeypatch)
-    monkeypatch.setenv("FLASH_LORAPLUS_8BIT", "1")
     real_import = builtins.__import__
 
     def _no_bnb(name, *a, **k):
