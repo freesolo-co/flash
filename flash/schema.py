@@ -342,12 +342,23 @@ def _worker_env(raw: Any) -> dict[str, str]:
     if not isinstance(raw, dict):
         raise ConfigError("[worker_env] must be a table of string key/values")
     env = {str(k): str(v) for k, v in raw.items()}
+    # Env var NAMES must be usable by subprocess.Popen(env=...) on the worker, which raises
+    # ValueError for an empty name or one containing '=' or a NUL byte (and whitespace breaks most
+    # shells). Reject these at parse time so a malformed [worker_env] (e.g. a TOML quoted key like
+    # "BAD=KEY", or an empty key) fails on config load — not after a worker has been provisioned.
+    bad_names = sorted(repr(k) for k in env if (not k) or any(c in k for c in "=\0 \t\n\r"))
+    if bad_names:
+        raise ConfigError(
+            f"[worker_env] has invalid environment variable name(s): {', '.join(bad_names)}; an "
+            "env var name must be non-empty and contain no '=', whitespace, or NUL byte"
+        )
     # [worker_env] is serialized into job_spec_json (persisted + logged), so it must NOT carry
     # secrets — they would leak into run artifacts. Reject secret-looking keys; operators set
     # those as real process environment variables (forwarded to the worker out-of-band) instead.
     # Detect by `_`-delimited WORD components (not substring): flag a secret WORD, or `KEY`
-    # qualified by API/SECRET/PRIVATE/ACCESS/INTERNAL/AUTH. This catches HF_TOKEN, *_API_KEY,
-    # SECRET_KEY, INTERNAL_KEY, CREDENTIAL, AWS_SECRET_ACCESS_KEY while allowing legit knobs whose
+    # qualified by a credential context. This catches HF_TOKEN, *_API_KEY, SECRET_KEY, INTERNAL_KEY,
+    # CREDENTIAL, AWS_SECRET_ACCESS_KEY, GITHUB_PAT (PAT word), and credential keys like SSH_KEY /
+    # DEPLOY_KEY / GPG_KEY (KEY qualified by a credential context) — while allowing legit knobs whose
     # names merely contain a marker (RL_VLLM_MAX_BATCHED_TOKENS -> word TOKENS, not TOKEN; a bare
     # SORT_KEY -> KEY without a secret qualifier).
     _secret_words = {
@@ -355,10 +366,12 @@ def _worker_env(raw: Any) -> dict[str, str]:
         "SECRET",
         "PASSWORD",
         "PASSWD",
+        "PASSPHRASE",
         "CREDENTIAL",
         "CREDENTIALS",
         "APIKEY",
         "PRIVATEKEY",
+        "PAT",  # personal access token (e.g. GITHUB_PAT, GH_PAT)
     }
     _key_qualifiers = {
         "API",
@@ -369,6 +382,15 @@ def _worker_env(raw: Any) -> dict[str, str]:
         "AUTH",
         "SIGNING",
         "ENCRYPTION",
+        # credential-key contexts: SSH_KEY, DEPLOY_KEY, GPG_KEY, RSA_KEY, TLS/SSL/PEM keys, etc.
+        "SSH",
+        "DEPLOY",
+        "GPG",
+        "PGP",
+        "RSA",
+        "PEM",
+        "SSL",
+        "TLS",
     }
 
     def _is_secret_key(name: str) -> bool:

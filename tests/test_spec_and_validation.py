@@ -311,6 +311,9 @@ def test_configure_logging_verbosity() -> None:
         "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
         "MY_CREDENTIAL",
         "AUTH_KEY",  # KEY qualified by AUTH
+        "SSH_KEY",  # KEY qualified by SSH
+        "DEPLOY_KEY",  # KEY qualified by DEPLOY
+        "GITHUB_PAT",  # PAT word (personal access token)
     ],
 )
 def test_worker_env_rejects_secret_keys(key: str) -> None:
@@ -333,3 +336,11 @@ def test_worker_env_rejects_secret_keys(key: str) -> None:
 def test_worker_env_allows_non_secret_keys(key: str) -> None:
     spec = spec_from_dict(_raw(worker_env={key: "v"}))
     assert spec.worker_env[key] == "v"
+
+
+@pytest.mark.parametrize("name", ["BAD=KEY", "", "BAD KEY", "X\tY"])
+def test_worker_env_rejects_invalid_env_names(name: str) -> None:
+    # Names subprocess.Popen(env=...) would reject on the worker (empty / '=' / whitespace) must
+    # fail at parse time, not after a worker has been provisioned.
+    with pytest.raises(ConfigError, match="invalid environment variable name"):
+        spec_from_dict(_raw(worker_env={name: "v"}))
