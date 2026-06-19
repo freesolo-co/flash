@@ -49,20 +49,14 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
 
 
-def test_build_worker_env_forwards_midrun_eval_knobs(monkeypatch):
-    """The mid-run eval cadence (FLASH_EVAL_EVERY_STEPS) is read via os.environ on the worker, so
-    it MUST be on the forward allowlist or the feature silently no-ops on every remote run (RunPod
-    + Vast, which reuses this same build_worker_env)."""
+def test_build_worker_env_does_not_forward_eval_cadence(monkeypatch):
+    """Mid-run eval cadence is NOT an env var: the worker resolves it from the run's
+    [train] eval_every_steps and ignores FLASH_EVAL_EVERY_STEPS (see
+    test_eval_config_ignores_env_cadence_override), so build_worker_env must NOT forward it."""
     from flash.providers.runpod.train import build_worker_env
 
-    knobs = {
-        "FLASH_EVAL_EVERY_STEPS": "20",
-    }
-    for k, v in knobs.items():
-        monkeypatch.setenv(k, v)
-    env = build_worker_env(_spec(), 0)
-    for k, v in knobs.items():
-        assert env.get(k) == v, f"{k} not forwarded to worker"
+    monkeypatch.setenv("FLASH_EVAL_EVERY_STEPS", "20")
+    assert "FLASH_EVAL_EVERY_STEPS" not in build_worker_env(_spec(), 0)
 
 
 def test_build_worker_env_forwards_judge_model(monkeypatch):

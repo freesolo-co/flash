@@ -844,12 +844,14 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
-        # W&B credential that enables logging. The project + run name come from the spec's typed
-        # [wandb] config, NOT env vars (see engine.worker.wandb_report_to / wandb_run_name).
+        # W&B credential that enables logging. Project + run name come from the spec's typed
+        # [wandb] config (NOT env vars); the run's entity is the API key's default account/team
+        # (wandb_report_to does not pass entity=).
         "WANDB_API_KEY",
-        # Periodic mid-run GRPO eval cadence override (engine.worker reads it; >0 enables). The
-        # held-out sample size comes from the run's [train] eval_examples, not an env var.
-        "FLASH_EVAL_EVERY_STEPS",
+        # NB: mid-run GRPO eval cadence is NOT an env var — it comes solely from the run's
+        # [train] eval_every_steps (with eval_examples for the sample size); the worker resolves it
+        # via midrun_eval.eval_config(spec_every=...) and ignores any FLASH_EVAL_EVERY_STEPS env
+        # (see test_eval_config_ignores_env_cadence_override). So there is nothing to forward here.
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
         # the WORKER decides which installers to run from these flags. install_chalk_kernels runs
         # INSIDE the worker subprocess and reads them from its own process env, so a control-plane
