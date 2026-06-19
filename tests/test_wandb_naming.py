@@ -8,6 +8,8 @@ the job-spec JSON the worker reads), NOT environment variables; the WANDB_API_KE
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from flash.schema import ConfigError, spec_from_dict, spec_from_file
@@ -123,15 +125,48 @@ def test_worker_run_name_uses_spec_wandb(monkeypatch):
     assert worker.wandb_run_name() == "from-spec"
 
 
-def test_worker_run_name_env_escape_hatch(monkeypatch):
-    # A [worker_env]-forwarded WANDB_NAME is honored only as a fallback when [wandb] run_name is
-    # unset — the typed config is the primary surface.
+def test_worker_run_name_is_toml_only_ignores_env(monkeypatch):
+    # WANDB_NAME is fully gone: even if the env var is set, the run name comes only from the
+    # [wandb] config (here unset -> the stable default). No env-var override path.
     from flash.engine import worker
 
     monkeypatch.setattr(worker, "JOB_SPEC", None)
-    monkeypatch.setenv("WANDB_NAME", "custom-name")
-    assert worker.wandb_run_name() == "custom-name"
-    monkeypatch.setenv("WANDB_NAME", "   ")  # blank -> fall back to default
+    monkeypatch.setenv("WANDB_NAME", "should-be-ignored")
     assert worker.wandb_run_name().startswith("flash-")
-    monkeypatch.delenv("WANDB_NAME", raising=False)
-    assert worker.wandb_run_name().startswith("flash-")
+
+
+def test_report_to_inits_wandb_from_spec_without_env(monkeypatch):
+    # wandb_report_to initializes the run from the typed [wandb] config via the SDK and sets NO
+    # WANDB_PROJECT env var — the env var is fully gone.
+    import importlib.util
+    import sys
+    import types
+
+    from flash.engine import worker
+
+    calls: dict = {}
+    fake = types.ModuleType("wandb")
+    fake.run = None
+
+    def _init(**kw):
+        calls.update(kw)
+        fake.run = object()
+
+    fake.init = _init
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    _orig_find = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a, **k: (object() if name == "wandb" else _orig_find(name, *a, **k)),
+    )
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    monkeypatch.delenv("WANDB_PROJECT", raising=False)
+    monkeypatch.setattr(
+        worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(project="my-proj", run_name="my-run"))
+    )
+
+    assert worker.wandb_report_to() == ["wandb"]
+    assert calls["project"] == "my-proj"  # project from the spec, via wandb.init
+    assert calls["name"] == "my-run"  # run name from the spec
+    assert "WANDB_PROJECT" not in os.environ  # the env var is fully gone
