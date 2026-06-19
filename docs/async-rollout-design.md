@@ -1,10 +1,13 @@
 # Multi-GPU async (disaggregated) GRPO rollouts — design + benchmark plan
 
-Status: **Feature BUILT and the disaggregated path runs end-to-end through training start; the
-remaining blocker to the ratio NUMBERS is multi-GPU CONTAINER PROVISIONING — neither substrate
-reliably hands one worker two usable GPUs.** Numbers tables are filled ONLY from measured runs —
-never estimated. (Real GPU-money spend authorized by the user; many real runs executed on Vast +
-RunPod to drive this down.)
+Status: **Feature BUILT and MEASURED end-to-end.** Multi-GPU CONTAINER PROVISIONING is SOLVED on
+Vast by filtering to **whole-machine** offers (`num_gpus={"eq":k}` + `gpu_frac >= 0.99`), which hands
+one worker all `k` usable GPUs (earlier fractional-offer containers exposed only 1 GPU — see "How
+provisioning was solved" below). The colocate / 1:1 / 1:2 / 2:2 ratios are MEASURED on real 5090
+nodes (table below). The only configs still open are higher train-heavy ratios (3:1) that need a
+larger bench dataset, and a RunPod **Pods** path for >32 GB multi-GPU classes. Numbers tables are
+filled ONLY from measured runs — never estimated. (Real GPU-money spend authorized by the user; many
+real runs executed on Vast + RunPod to drive this down.)
 
 What landed + is verified working on real hardware:
 - **Multi-GPU provisioning plumbing**: `[gpu] count` ([spec.py](../flash/spec.py)/[schema.py](../flash/schema.py)
@@ -15,8 +18,8 @@ What landed + is verified working on real hardware:
   `vllm_mode="server"`, TRL's automatic per-step `sync_weights()` (LoRA-merge → NCCL broadcast),
   server torn down in a `finally`. **On a node with 2 real GPUs this reaches `rl_train_start` and
   the weight-sync handshake** (verified on real runs).
-- **Capacity-aware allocation** ([providers/runpod/jobs.py](../flash/flash/providers/runpod/jobs.py)
-  poll `no_capacity` fast-fail at `queue_grace_s`=720s + [runner](../flash/flash/runner.py)
+- **Capacity-aware allocation** ([providers/runpod/jobs.py](../flash/providers/runpod/jobs.py)
+  poll `no_capacity` fast-fail at `queue_grace_s`=720s + [runner](../flash/runner.py)
   class-walk): a throttled/capacity-starved class is detected in ~12 min (not the 50-min stall
   grace) and the run walks to the next-cheapest AVAILABLE class — **validated live** (a RunPod
   A100×2 throttle fast-failed at 724s and advanced). No blacklisting (a class may free up).
@@ -27,34 +30,33 @@ init on the pinned trainer (PiSSA SVD crash) → 1200s server-health timeout (sp
 **early trainer device-pin in `main()` before any CUDA context** (was binding device 0, colliding
 with the server) → `detect_total_gpus` uses the REAL `nvidia-smi -L` count, not the requested hint.
 
-### THE blocker: providers don't hand one worker two usable GPUs
+### How provisioning was solved (and the failure mode the filter avoids)
 
-The benchmark NUMBERS require a worker container with ≥2 CUDA-usable GPUs. Measured on real runs:
-- **Vast**: a `num_gpus==2` offer is rented and the **instance really has 2 GPUs** (verified via a
-  rent→`get_instance`→destroy probe: `INSTANCE num_gpus=2, running`), but the worker **container**
-  exposes only **1** GPU (clean `nvidia-smi -L` = 1). Every earlier "device collision"/NVML/UUID
-  symptom was two roles contending for that one container-visible GPU. Setting
-  `NVIDIA_VISIBLE_DEVICES=all` in the create-time `env` did NOT fix it — the NVIDIA container
-  runtime fixes GPU visibility at container-launch from the **image's** ENV, not a runtime env var.
-  Baked `ENV NVIDIA_VISIBLE_DEVICES=all` into the image and TESTED it (built `:cu128-mgpu` via
-  `crane mutate` of `:cu128` — added the env, reused all layers, no rebuild; ran with
-  `FLASH_TRAIN_WORKER_IMAGE=:cu128-mgpu`): the container **STILL exposed only 1 GPU**.
-  **CONCLUSION: Vast multi-GPU is NOT achievable from the client.** The instance has 2 GPUs but the
-  container's device cgroup is limited to 1 — neither the create-time `env` nor the image `ENV`
-  changes it. This is a Vast `runtype=args` / fractional-machine container behavior that needs a
-  Vast-side fix (or their support). The remaining route to multi-GPU is a **RunPod Pods**
-  provisioner (real multi-GPU nodes; flash only uses RunPod Flash serverless today, which
-  throttles for multi-GPU). `FLASH_TRAIN_WORKER_IMAGE` (override) + the baked image ENV are kept —
-  both are correct and will help the moment a substrate actually hands the container ≥2 GPUs.
-- **RunPod Flash (serverless)**: A100×2 (and the classes the fallback walked to) **throttle** — no
-  free multi-GPU serverless worker; the run fast-fails `no_capacity`. RunPod's true multi-GPU is
-  **Pods**, a different substrate flash does not use.
+The benchmark NUMBERS require a worker container with ≥2 CUDA-usable GPUs. The fix is to filter to
+**whole-machine** Vast offers; the historical failure mode below is exactly what that filter avoids.
 
-So the disaggregated CODE is complete + correct (it trains end-to-end when 2 GPUs are present), but
-the ratio sweep can't be measured until provisioning delivers 2 usable GPUs. **Fix paths (not yet
-done):** (a) Vast — make `create_instance` expose ALL rented GPUs to the container (investigate
-NVIDIA_VISIBLE_DEVICES / the offer rental); (b) add a RunPod **Pods** provisioner (real multi-GPU
-nodes) instead of Flash serverless; (c) retry RunPod Flash A100 multi-GPU when capacity frees.
+- **Vast — SOLVED via whole-machine offers.** The original failure: a **fractional** `num_gpus==2`
+  offer (e.g. 2 of an 8-GPU box, `gpu_frac` 0.25/0.5) rents 2 GPUs to the **instance** (verified via
+  a rent→`get_instance`→destroy probe: `INSTANCE num_gpus=2, running`) but the **container's** device
+  cgroup is limited to its fraction, so the worker saw only **1** GPU (clean `nvidia-smi -L` = 1).
+  Setting `NVIDIA_VISIBLE_DEVICES=all` alone could not widen a cgroup that only contained 1 device.
+  **The fix is twofold and is in the code now:** (1) `usable_offers` requires an EXPLICIT
+  `gpu_frac >= 0.99` (whole-machine; a missing/fractional `gpu_frac` is rejected — `flash/providers/
+  vast/jobs.py`), so the rented machine isn't a sliver of a bigger box; and (2) `NVIDIA_VISIBLE_DEVICES
+  =all` is set both in the create-time `env` (`flash/providers/vast/jobs.py`) and baked into the image
+  (`ENV NVIDIA_VISIBLE_DEVICES=all` in `Dockerfile.worker`). On a whole-machine offer the cgroup
+  already contains all `k` GPUs and `=all` surfaces them — `nvidia-smi -L` then shows all `k` and the
+  disaggregated split works (the 1:1 / 1:2 / 2:2 rows below are measured on these nodes). The earlier
+  "device collision"/NVML/UUID symptoms were two roles contending for the single container-visible GPU
+  of a fractional offer — gone once whole-machine offers are enforced.
+- **RunPod Flash (serverless) — still capacity-limited.** A100×2 (and the classes the fallback walked
+  to) **throttle** — no free multi-GPU serverless worker; the run fast-fails `no_capacity`. RunPod's
+  true multi-GPU is **Pods**, a different substrate flash does not use yet.
+
+So the disaggregated CODE is complete + correct and trains end-to-end on the whole-machine Vast nodes;
+the measured ratios are below. **Still open:** (a) a RunPod **Pods** provisioner for >32 GB multi-GPU
+classes (5090 whole-machine offers are plentiful but only 32 GB, too small for a 4B replica); (b)
+larger-dataset 3:1 train-heavy bench; (c) retry RunPod Flash A100 multi-GPU when capacity frees.
 
 Run matrix (the ratios):
 - **colocate (1 GPU)** — MEASURED baseline (107.4 s/step, MiniCPM5-1B heavy).
@@ -71,10 +73,15 @@ the optimizer step serialize on one device, so the GPU is idle for inference dur
 and idle for training during generation. For larger models / long completions this is the dominant
 cost.
 
-**Disaggregated (async) rollout** puts the inference engine (vLLM server) on its own GPU(s) and the
-FSDP/accelerate trainer on the rest, so generation for step _N+1_ overlaps the optimizer of step
-_N_ ("one-step-off" async). This is exactly verl's model (3D-HybridEngine / flexible device
-mapping: FSDP|Megatron trainer × vLLM|SGLang rollout, with NCCL weight resharding between them).
+**Disaggregated rollout** puts the inference engine (vLLM server) on its own GPU(s) and the
+DDP/accelerate trainer on the rest. Note the realized win here is **NOT** one-step-off async overlap:
+TRL `vllm_mode="server"` is **synchronous** (generate → train → sync, no overlap flag), so step _N+1_
+generation does NOT overlap the optimizer of step _N_ (measured: 1:1 ≈ colocate at 1.02×). The
+speedup instead comes from (a) **tensor-parallel inference throughput** on the dedicated card(s) and
+(b) the trainer no longer time-sharing its GPU with vLLM. This is a partial slice of verl's model
+(3D-HybridEngine / flexible device mapping: FSDP|Megatron trainer × vLLM|SGLang rollout, with NCCL
+weight resharding); the true one-step-off overlap verl provides would need a custom trainer loop (see
+the verl-lever table and the "what the numbers say" corrections below).
 Ref: https://github.com/verl-project/verl
 
 ## Current state (blockers this design removed — now DONE)
@@ -91,8 +98,11 @@ Ref: https://github.com/verl-project/verl
 
 ### 1. Provisioning multi-GPU
 - **Vast** (primary; has live multi-GPU supply — verified: 2–8 GPU verified offers exist for
-  4090/5090/A100/H100 classes): `search_offers(..., num_gpus=k)` → `num_gpus={"gte":k}` and select
-  an offer whose `num_gpus >= k`. New `[gpu] count` spec field (default 1).
+  4090/5090/A100/H100 classes): `search_offers(..., num_gpus=k)` → `num_gpus={"eq":k}` (EXACT-match,
+  not `>=`) so we rent exactly `k` GPUs and never pay for a larger machine than requested, plus a
+  whole-machine `gpu_frac >= 0.99` filter so the container actually sees all `k` GPUs (a fractional
+  multi-GPU offer rents `k` GPUs to the instance but exposes only its fraction to the container).
+  New `[gpu] count` spec field (default 1).
 - **RunPod**: Flash is 1-GPU serverless; multi-GPU needs **Pods**. Out of scope for v1 (Vast covers
   the multi-GPU benchmark); document the Pods path as follow-up.
 

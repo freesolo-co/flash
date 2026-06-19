@@ -37,12 +37,29 @@ DEFAULT_GROUP_PORT = 51216
 DEFAULT_SERVER_GPU_UTIL = 0.90
 
 
+def _port_env(name: str, default: int) -> int:
+    """Operator port override, tolerant of the ``[worker_env]`` stringification quirk.
+
+    A blank / whitespace / non-numeric value (common when env is populated via TOML
+    ``[worker_env]``) falls back to ``default`` with a warning rather than raising a
+    ``ValueError`` that would crash the worker at setup time.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        print(f"[rl][disagg] WARNING: {name}={raw!r} is not an int — using default {default}")
+        return default
+
+
 def server_port() -> int:
-    return int(os.environ.get("FLASH_VLLM_SERVER_PORT", DEFAULT_SERVER_PORT))
+    return _port_env("FLASH_VLLM_SERVER_PORT", DEFAULT_SERVER_PORT)
 
 
 def group_port() -> int:
-    return int(os.environ.get("FLASH_VLLM_GROUP_PORT", DEFAULT_GROUP_PORT))
+    return _port_env("FLASH_VLLM_GROUP_PORT", DEFAULT_GROUP_PORT)
 
 
 def server_base_url(port: int | None = None) -> str:
