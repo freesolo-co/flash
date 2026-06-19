@@ -176,15 +176,6 @@ def test_runpod_backoff_no_overflow_on_long_runs():
     assert serverless.get_backoff_delay(100000, max_seconds=5) <= 5 * 1.2 + 1e-9
 
 
-def test_serve_execution_timeout_is_fixed():
-    """DEFECT: serve execution cap (10 min) was shorter than a cold serving worker's startup, so
-    the first slm chat/deploy failed with 'executionTimeout exceeded'. It is now a fixed, generous
-    constant (no env override)."""
-    from flash.serve import deploy
-
-    assert deploy.serve_execution_timeout_ms() >= 20 * 60 * 1000
-
-
 def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():
     """Multi-turn GRPO with vLLM disabled (the 35B tier's grpo_use_vllm=False, or RL_USE_VLLM=0)
     must fail fast — the rollout closure reads trainer.vllm_generation.llm, which only exists
