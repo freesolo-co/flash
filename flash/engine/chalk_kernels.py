@@ -87,6 +87,19 @@ def _enabled_kwargs() -> dict[str, bool]:
     return {kw: _kernel_on(flag, default_on) for flag, kw, default_on in _KERNELS}
 
 
+def active_kernels(report: Mapping) -> list[str]:
+    """The chalk kernels that actually ENGAGED (truthy, non-error result) in an apply report.
+
+    For a metrics note recording which kernels ran (so chalk engagement is verifiable without the
+    console). Excludes ``liger`` (TRL applies Liger; chalk's report carries it as False here).
+    """
+    return sorted(
+        k
+        for k, v in (report or {}).items()
+        if k != "liger" and v not in (False, None) and not (isinstance(v, dict) and "error" in v)
+    )
+
+
 def install_chalk_kernels(model=None) -> dict:
     """Apply chalk's gap-filling kernels to ``model`` — ON by default (like Liger), flags override.
 
@@ -138,11 +151,7 @@ def install_chalk_kernels(model=None) -> dict:
         log.warning("chalk apply failed (ignored, kernels disabled): %s", e)
         return {}
 
-    active = [
-        k
-        for k, v in (report or {}).items()
-        if v not in (False, None) and not (isinstance(v, dict) and "error" in v)
-    ]
+    active = active_kernels(report)
     if active:
-        log.info("chalk kernels active: %s", ", ".join(sorted(active)))
+        log.info("chalk kernels active: %s", ", ".join(active))
     return report or {}

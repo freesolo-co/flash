@@ -10,7 +10,7 @@ is absent or every kernel is disabled; and that a chalk apply error never aborts
 import sys
 import types
 
-from flash.engine.chalk_kernels import install_chalk_kernels, is_chalk_enabled
+from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels, is_chalk_enabled
 
 # Every FLASH_* kernel flag (so a test can clear leftovers from the environment).
 _ALL_FLAGS = (
@@ -154,3 +154,17 @@ def test_is_chalk_enabled(monkeypatch):
     assert is_chalk_enabled(disabled) is False
     # a single opt-in flag is enough to need chalk installed
     assert is_chalk_enabled({**disabled, "FLASH_MLP_KERNEL": "1"}) is True
+
+
+def test_active_kernels_filters_report():
+    """active_kernels keeps only the kernels that ENGAGED (truthy, non-error) and drops liger."""
+    rep = {
+        "liger": False,  # TRL owns Liger — excluded
+        "rope": True,
+        "fused_lora_delta": 12,  # a count is "engaged"
+        "fused_embedding": False,  # fell back
+        "fused_mlp": {"error": "boom"},  # errored
+    }
+    assert active_kernels(rep) == ["fused_lora_delta", "rope"]
+    assert active_kernels({}) == []
+    assert active_kernels(None) == []

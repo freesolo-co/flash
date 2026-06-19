@@ -35,7 +35,7 @@ import traceback
 from flash.engine.accounting import RunMetrics
 
 # Shared, substrate-neutral fine-tuning internals (live in this same package).
-from flash.engine.chalk_kernels import install_chalk_kernels
+from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
@@ -1330,9 +1330,9 @@ def run_sft():
         callbacks=[make_checkpoint_upload_callback()],
     )
     # The class/function-level chalk kernels installed above patch the layers TRL just built; the
-    # INSTANCE-level ones (FP8 base, embedding, FP8 MLP) need the materialized module, so install
-    # them now against the SFT trainer.model. No-op unless a FLASH_* kernel flag is set and chalk present.
-    install_chalk_kernels(getattr(trainer, "model", None))
+    # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
+    # SFT trainer.model — chalk composes on top of TRL's Liger. No-op unless chalk is installed.
+    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
 
     _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. bnb managed optimizer pages
@@ -1390,6 +1390,9 @@ def run_sft():
                 else loraplus_optimizer_cls(fused_optim_name())[0].__name__
             ),
             "loraplus_applied": getattr(trainer, "_loraplus_applied", False),
+            # Which chalk gap-filling kernels actually ENGAGED (empty/None = chalk not installed or
+            # every kernel fell back) — verifies the chalk stack without the console.
+            "chalk_kernels": active_kernels(_chalk_report) or None,
             **wandb_run_info(),
         },
     )
@@ -2172,11 +2175,10 @@ def run_rl():
         callbacks=[hb_cb, make_checkpoint_upload_callback()],
         **extra_trainer_kwargs,
     )
-    # Now that TRL has materialized the model, install the INSTANCE-level chalk kernels (FP8 base,
-    # embedding, FP8 MLP) against the actual module GRPOTrainer optimizes (trainer.model). Doing it
-    # here (not on init_model) is what makes them reach the fresh-LoRA path, where init_model was
-    # only the model-id string. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
-    install_chalk_kernels(getattr(trainer, "model", None))
+    # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
+    # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
+    # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
+    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
     # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or FLASH_EVAL_EVERY_STEPS,
     # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
     # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.
@@ -2254,6 +2256,9 @@ def run_rl():
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,
             "loss_curve": _metric_curve(trainer, "loss"),
+            # Which chalk gap-filling kernels actually ENGAGED (None = chalk not installed or every
+            # kernel fell back) — verifies the chalk stack on a GRPO run without the console.
+            "chalk_kernels": active_kernels(_chalk_report) or None,
             **wandb_run_info(),
             # The mid-run eval curve (per [train] eval_every_steps): each entry has step,
             # eval_reward, eval_pass_rate, and eval_metrics{}. Empty when eval is off. The agent
