@@ -262,10 +262,17 @@ def make_checkpoint_upload_callback():
             # Multi-GPU (FSDP / accelerate) runs on_save on EVERY rank; only the single global
             # main process may upload, or ranks race on the same HF commit and one rank's
             # delete_patterns can wipe another rank's just-uploaded checkpoint. Single-GPU runs
-            # are always world-process-zero, so this is a no-op there. Guard the attribute
-            # access (defaulting to the single-process upload path) to match on_log below —
-            # some transformers versions / stubs omit is_world_process_zero on the state.
+            # are always world-process-zero, so this is a no-op there. Two layered guards: the
+            # transformers state flag, AND the RANK-env check the worker uses for every other
+            # artifact write (adapter/metrics/DONE). The RANK check is authoritative so that if a
+            # transformers version / stub omits is_world_process_zero (the getattr default would
+            # otherwise let EVERY non-zero rank upload), the disaggregated DDP group still only
+            # uploads from rank 0. Single-process paths set no RANK -> "0" -> main, unchanged.
+            from flash.engine import disaggregated as _disagg
+
             if not getattr(state, "is_world_process_zero", True):
+                return
+            if not _disagg.is_main_rank():
                 return
             if not HF_REPO:
                 return
