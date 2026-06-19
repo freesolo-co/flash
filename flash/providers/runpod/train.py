@@ -776,6 +776,16 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "RL_VLLM_GPU_UTIL",
         "RL_VLLM_SLEEP",
         "RL_PER_DEVICE_PROMPTS",
+        # Disaggregated (multi-GPU async) rollout knobs (engine/worker.py + disaggregated.py):
+        # SERVER_TIMEOUT raises the vllm-serve health-wait for a slow big-model boot (the 35B can
+        # take >20 min); SERVER_UTIL sizes the dedicated rollout card's vLLM pool; DISAGG_PARALLEL
+        # picks tp (default) vs dp (MoE-only); ENFORCE_EAGER skips CUDA-graph capture so a huge
+        # model boots inside the timeout. Operators set these via the submitter env (mirroring
+        # RL_VLLM_GPU_UTIL), so forward them or the worker silently falls back to defaults.
+        "RL_VLLM_SERVER_TIMEOUT",
+        "RL_VLLM_SERVER_UTIL",
+        "AUTOSLM_DISAGG_PARALLEL",
+        "AUTOSLM_RL_VLLM_ENFORCE_EAGER",
         "VLLM_USE_V1",
         # Attention-backend escape hatch: vllm's bundled flash-attn PTX can be newer
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER

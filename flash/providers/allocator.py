@@ -21,6 +21,8 @@ Vast classes come from a live offer book (collected through the provider's
 
 from __future__ import annotations
 
+import os
+
 from flash._logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
@@ -90,13 +92,17 @@ def required_vram_gb(
         pb = _params_b_for_vram(model_id)
         if pb:
             infer = max(1, _ig)
-            # The rollout server is TENSOR-PARALLEL across the inference GPUs (build_vllm_serve_cmd
-            # parallel="tp" -> --tensor_parallel_size=infer): vLLM shards BOTH the bf16 weights and
-            # the KV cache across the TP ranks, so each inference card holds ~1/infer of the full
-            # server, not the whole model. infer==1 keeps the full-weight need (a single-card server).
-            # Without this, a 35B served TP=2 wrongly demanded a 94GB card per GPU and could not find a
-            # 3-/4-GPU whole-machine offer; sized per-shard it fits 2x A100-80G / H100-80G (abundant).
-            server_need = int(pb * 2.0 * 1.2 / infer)  # per-card bf16 shard + ~20% for KV / overhead
+            # Inference parallelism (must match build_vllm_serve_cmd's default + AUTOSLM_DISAGG_PARALLEL):
+            #   TP (DEFAULT): the rollout server shards BOTH the bf16 weights and the KV cache across the
+            #     inference GPUs (--tensor_parallel_size=infer), so each card holds ~1/infer of the
+            #     server -> divide by infer (a 35B TP=2 fits 2x A100-80G instead of demanding 94GB/card).
+            #   DP (MoE-only, opt-in): each inference GPU is a FULL replica
+            #     (--data_parallel_size=infer, tp=1), so each card needs the WHOLE server -> do NOT
+            #     divide (dividing would under-provision into an OOM, esp. for the 35B MoE).
+            # infer==1 collapses both to the full-weight single-card need.
+            _dp = (os.environ.get("AUTOSLM_DISAGG_PARALLEL") or "").strip().lower() == "dp"
+            _shards = 1 if _dp else infer
+            server_need = int(pb * 2.0 * 1.2 / _shards)  # per-card bf16 (full for dp, shard for tp) + ~20% KV/overhead
             disagg_need = max(server_need, int(colocate * 0.7))
             # Cap at the colocate estimate (disaggregation never needs more per GPU than the whole
             # colocated total) but NEVER below server_need: for an MoE whose colocate is sized by

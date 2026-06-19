@@ -1304,13 +1304,16 @@ def compute_grpo_batching(
     # the rank count, and a small dataset can't fill even one step (the FSDP 0-real-steps bug seen on
     # 2:2). num_processes=1 (colocate / single-trainer 1:1/1:2) is unchanged.
     grad_accum = max(1, target_comps // (per_device * nproc))
-    # TRL rejects a global completion batch (per_device * grad_accum) that is not
-    # divisible by num_generations (= group_size), failing only AFTER the paid worker
-    # is provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the
-    # next multiple that makes the batch divisible (grad_accum must be a multiple of
-    # group_size // gcd(per_device, group_size)). This only ever raises the effective
-    # batch slightly; the common per_device|group_size cases are unchanged.
-    accum_step = group_size // math.gcd(per_device, group_size)
+    # TRL rejects a GLOBAL completion batch (per_device * grad_accum * num_processes) that is not
+    # divisible by num_generations (= group_size), failing only AFTER the paid worker is
+    # provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the next multiple
+    # that makes the GLOBAL batch divisible. The divisibility multiple must use per_device * nproc
+    # (the global micro-batch), not per_device alone — otherwise a multi-trainer (nproc>1) run whose
+    # global micro-batch already divides group_size still gets grad_accum inflated, training MORE
+    # prompts/step than configured (e.g. group_size=8, nproc=2, per_device=4: global micro-batch 8
+    # is already one full group, but gcd(per_device, group_size) would force grad_accum=2 -> 2
+    # prompts/step instead of 1). nproc=1 (colocate / single-trainer) is unchanged.
+    accum_step = group_size // math.gcd(per_device * nproc, group_size)
     grad_accum = ((grad_accum + accum_step - 1) // accum_step) * accum_step
     # generations_per_step / unique_prompts_per_step are reported GLOBALLY (across all ranks) so the
     # metric matches the intended prompts_per_step regardless of the trainer world size.
@@ -1783,6 +1786,22 @@ def run_rl():
                 f"[rl][disagg] trainer-only child rank={os.environ.get('RANK','0')} "
                 f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} (accelerate-pinned)"
             )
+            # accelerate launch sets ONE comma-separated CUDA_VISIBLE_DEVICES for the whole child
+            # group and selects each rank's GPU via LOCAL_RANK — it does NOT slice CVD per rank. So
+            # without an explicit set_device, the CUDA probes below (wait_for_gpu's `device="cuda"`,
+            # setup_perf_backends) all land on the group's cuda:0, stacking every rank's startup
+            # context on the FIRST train GPU and starving/OOMing rank 0 on tight DDP ratios. Bind
+            # this rank to its LOCAL_RANK device up front so all subsequent CUDA work is rank-local
+            # (the Trainer/Accelerator later selects the same device).
+            _local_rank = os.environ.get("LOCAL_RANK")
+            if _local_rank is not None and _local_rank.isdigit():
+                try:
+                    import torch as _torch_rank
+
+                    _torch_rank.cuda.set_device(int(_local_rank))
+                    print(f"[rl][disagg] trainer-only child bound to cuda:{_local_rank} (LOCAL_RANK)")
+                except Exception as _e:
+                    print(f"[rl][disagg][warn] could not set_device(LOCAL_RANK={_local_rank}): {_e}")
         # PiSSA's SVD init crashes in the CVD-pinned (non-zero device) disaggregated trainer
         # (peft set_data incompatible-tensor-type); fall back to standard LoRA init. setdefault so
         # an explicit operator [worker_env] AUTOSLM_LORA_INIT still wins. Init method is irrelevant
