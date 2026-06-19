@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import pytest
 
-from flash.cost.experiment import decaying_stub_factory, run_experiment
 from flash.cost.measured import (
     measured_as_estimate,
     measured_from_status,
@@ -236,21 +235,3 @@ def test_measured_as_estimate_is_the_ground_truth():
     assert e.total_usd == pytest.approx(m.cost_usd)
     assert e.gpu == m.gpu
     assert any("MEASURED" in n for n in e.notes)
-
-
-def test_measured_ground_truth_grades_through_the_harness():
-    runs = [measured_from_status(GRPO_STATUS), measured_from_status(SFT_STATUS)]
-    grid = [r.config for r in runs]
-    gt = measured_ground_truth_fn(runs)
-    result = run_experiment(
-        grid=grid,
-        versions=(1, 6),
-        estimator_factory=decaying_stub_factory(ground_truth_fn=gt),
-        ground_truth_fn=gt,
-        max_workers=2,
-    )
-    # The stub matches its (measured) ground truth at the top version.
-    assert result.summary(6).mape == pytest.approx(0.0)
-    # Truth dollars came from the measured runs.
-    truths = sorted(c.truth_usd for c in result.cells if c.version == 6)
-    assert truths == pytest.approx([0.02, 0.0473])

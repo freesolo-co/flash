@@ -40,10 +40,17 @@ class CostEstimate:
     wall_capped: bool  # True if train_seconds was clamped to the run's wall-clock cap
 
     # --- money ---
-    total_usd: float
+    total_usd: float  # the headline figure (calibrated, if a factor was applied)
 
     # --- free-form notes (assumptions, GRPO rollout split, MoE active params, …) ---
     notes: tuple[str, ...] = ()
+
+    # --- break-even calibration multiplier applied to ``total_usd`` ---
+    # 1.0 = the raw first-principles analytical reference (what ``estimate_cost`` emits).
+    # < 1.0 = a quote scaled to break even against MEASURED real-run cost (the analytical
+    # model runs ~1.4x high vs billed cost); see ``calibration.breakeven_estimate``. The
+    # un-calibrated figure is always recoverable as ``total_usd / calibration_factor``.
+    calibration_factor: float = 1.0
 
     @property
     def wall_clock_hours(self) -> float:
@@ -75,8 +82,15 @@ class CostEstimate:
             f"Train      : {self.train_seconds / 60:.1f} min"
             + ("  [CAPPED at the wall-clock limit]" if self.wall_capped else ""),
             f"Wall clock : {self.wall_clock_hours:.2f} h",
-            f"TOTAL      : ${self.total_usd:.2f}",
         ]
+        if self.calibration_factor != 1.0:
+            raw = self.total_usd / self.calibration_factor
+            lines.append(f"Raw model  : ${raw:.2f}  (first-principles analytical reference)")
+            lines.append(
+                f"Break-even : x{self.calibration_factor:.3f}  "
+                "(calibrated to measured real-run cost)"
+            )
+        lines.append(f"TOTAL      : ${self.total_usd:.2f}")
         if self.notes:
             lines.append("Notes      :")
             lines.extend(f"  - {n}" for n in self.notes)

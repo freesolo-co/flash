@@ -50,15 +50,9 @@ gpu = [
 # access, or a wheel); the submit path appends that spec to the worker's extra_pip, which is
 # installed for every job (works on the default baked-image path, unlike FLASH_WORKER_EXTRA_DEPS).
 server = ["fastapi", "uvicorn"]
-# The LLM cost estimator + its prompt-convergence experiment (flash.cost): the
-# Claude-backed estimator (anthropic) and the report's PNG graph (matplotlib). The
-# analytical model and unit tests need neither -- both are imported lazily.
-# The floor is >=0.69: cost/llm.py's `_complete` calls `output_config={"effort": ...}`
-# + adaptive `thinking={"type": "adaptive"}` + top-level `cache_control`, all of which
-# the older 0.40 SDK predates (it would resolve an anthropic that 400s on those kwargs).
-cost = ["anthropic>=0.69", "matplotlib>=3.7"]
-# Convenience aggregate of all optional runtime extras.
-all = ["flash[gpu,server,cost]"]
+# Convenience aggregate of all optional runtime extras. The cost estimator
+# (flash.cost) is pure-Python -- no extra required.
+all = ["flash[gpu,server]"]
 
 [project.urls]
 Homepage = "https://github.com/freesolo-co/flash"

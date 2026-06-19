@@ -2,16 +2,18 @@
 
 The honest test of an estimator is a real GPU run, not another equation. This module
 maps a control-plane run-status payload (`slm status <id>`) to the `RunConfig` that run
-priced and to its measured cost/wall-time, and exposes a `ground_truth_fn` so the
-prompt-convergence harness can grade the LLM against *measured* dollars.
+priced and to its measured cost/wall-time. It is the status->measured-cost bridge the
+break-even calibration is derived and refreshed from: launch real runs (RunPod/Vast),
+parse their status here, and compare measured dollars against the analytical quote.
 
-Pure parsing -- no network. The analysis script fetches the status dicts (via the
-`slm` CLI) and feeds them here, so this stays unit-testable offline.
+Pure parsing -- no network. A collector fetches the status dicts (via the `slm` CLI)
+and feeds them here, so this stays unit-testable offline.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +21,11 @@ from flash.engine.recipe import RECIPE
 
 from .config import RunConfig
 from .estimate import CostEstimate
-from .experiment import GroundTruthFn
+
+# A function returning the ground-truth cost for a run (``measured_ground_truth_fn``
+# builds one). Inlined here so the calculation/calibration path carries no dependency on
+# the (pruned) LLM prompt-convergence experiment that previously defined it.
+GroundTruthFn = Callable[[RunConfig], CostEstimate]
 
 
 def _steps_from_train(algorithm: str, train: dict[str, Any]) -> int:
