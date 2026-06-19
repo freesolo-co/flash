@@ -166,6 +166,128 @@ def test_poll_job_no_capacity_when_stuck_in_queue(monkeypatch):
     assert "IN_QUEUE" in res.detail
 
 
+def test_poll_job_initializing_worker_suppresses_no_capacity(monkeypatch):
+    # A worker that is `initializing` (large baked image / slow pull) keeps the job IN_QUEUE past
+    # queue_grace_s while ACTIVELY coming up — that's a cold start, not capacity starvation. The
+    # no_capacity fast-path must NOT fire (it would delete the endpoint mid cold-start); the worker
+    # then runs and the job completes. setup_grace_s + the unhealthy fast-path still bound the wait.
+    import base64
+    import itertools
+
+    import cloudpickle
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    statuses = iter(
+        [{"status": "IN_QUEUE"}] * 4
+        + [
+            {
+                "status": "COMPLETED",
+                "output": {
+                    "success": True,
+                    "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
+                },
+            }
+        ]
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(statuses))
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"initializing": 1, "running": 0, "ready": 0, "idle": 0}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        queue_grace_s=200.0,  # small: would fire fast WERE it capacity-starved
+        setup_grace_s=100000.0,
+    )
+    assert res.ok
+    assert res.metrics == {"acc": 1.0}
+
+
+def test_poll_job_probe_error_does_not_premature_no_capacity(monkeypatch):
+    # If every endpoint_health probe ERRORS while IN_QUEUE we have no trustworthy view of the
+    # worker pool, so the no_capacity fast-path must NOT fire on a stale/unverified
+    # `worker_initializing=False` (deleting an endpoint whose worker may be initializing is the
+    # expensive failure direction). Instead the job is bounded by setup_grace_s -> a stall, never a
+    # no_capacity that would walk GPU classes blind.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
+
+    def _boom(eid):
+        raise RuntimeError("health endpoint flaking")
+
+    monkeypatch.setattr(runpod_api, "endpoint_health", _boom)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        queue_grace_s=200.0,  # small: WOULD trip no_capacity if the fast-path fired on stale False
+        setup_grace_s=600.0,  # the real bound when probes are blind
+    )
+    assert not res.ok
+    assert res.failure == "stalled"  # NOT no_capacity
+    assert "setup" in res.detail
+
+
+def test_poll_job_clears_init_flags_when_not_in_queue(monkeypatch):
+    # Unit-level guard for the cross-episode reset (the "stale init flag after queue exit" thread):
+    # `worker_initializing` / `init_probe_fresh` are meaningful only WHILE IN_QUEUE and are set
+    # solely by the IN_QUEUE health probe. poll_job must zero them on any non-IN_QUEUE status so a
+    # later re-queue (IN_QUEUE -> RUNNING -> worker dies -> IN_QUEUE) can't inherit a prior episode's
+    # initializing/fresh view. We assert by spying on the locals the loop carries forward: after a
+    # RUNNING tick following an initializing IN_QUEUE tick, no_capacity in the *next* IN_QUEUE
+    # episode must depend on a NEW probe, never the stale one.
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    # Episode 1 sets initializing=True + fresh=True; RUNNING clears; episode 2 is genuinely throttled
+    # and, once its OWN probe confirms an empty pool, must fire no_capacity (not stay suppressed by
+    # the stale initializing=True). Generous spacing so a fresh episode-2 probe always runs first.
+    statuses = iter(
+        [{"status": "IN_QUEUE"}]
+        + [{"status": "RUNNING"}]
+        + [{"status": "IN_QUEUE"}] * 10
+    )
+    healths = iter(
+        [{"workers": {"initializing": 1, "running": 0, "ready": 0, "idle": 0}}]
+        + [{"workers": {"throttled": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}}] * 6
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(statuses))
+    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: next(healths, {"workers": {}}))
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # 100s/iter: every IN_QUEUE iteration re-probes (>90s gate), so episode 2 always has a fresh,
+    # episode-local throttled probe -> no_capacity fires on THAT, proving the stale initializing=True
+    # from episode 1 did not permanently suppress the walk.
+    import itertools
+
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        queue_grace_s=200.0,
+        setup_grace_s=100000.0,
+    )
+    assert not res.ok
+    assert res.failure == "no_capacity"  # episode 2 walked; stale init flag did not strand the run
+    assert "IN_QUEUE" in res.detail
+
+
 def test_poll_job_setup_grace_before_first_heartbeat(monkeypatch):
     # No heartbeat ever (cold start that never finishes): must NOT trip the tight
     # stall_after_s window — it waits for the larger setup_grace_s instead.

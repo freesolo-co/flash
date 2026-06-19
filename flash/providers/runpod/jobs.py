@@ -317,6 +317,7 @@ def poll_job(
     last_health_probe = 0.0
     unhealthy_since: float | None = None  # first time the worker was seen stuck UNHEALTHY
     worker_initializing = False  # last probe saw a worker cold-starting the image (initializing)
+    init_probe_fresh = False  # a health probe in THIS IN_QUEUE episode succeeded since last fired
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
@@ -332,6 +333,14 @@ def poll_job(
             say(f"job {handle.job_id}: {status}")
             last_status = status
             last_progress = time.time()
+        # The initializing flag (and its freshness) is meaningful only WHILE queued and is set
+        # solely by the IN_QUEUE health probe. Clear it whenever the job is not IN_QUEUE so a
+        # later re-queue (e.g. RUNNING -> the worker dies -> back to IN_QUEUE) starts from a clean
+        # slate instead of inheriting a stale `initializing=True` that would suppress the
+        # no_capacity fast-path for a now-genuinely-throttled queue until the next probe.
+        if status != "IN_QUEUE":
+            worker_initializing = False
+            init_probe_fresh = False
         if status in TERMINAL_OK:
             try:
                 return PollResult(True, metrics=decode_output(st.get("output")))
@@ -359,6 +368,7 @@ def poll_job(
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
                 recovering = workers.get("initializing")
                 worker_initializing = bool(recovering)
+                init_probe_fresh = True  # this episode has a successful probe to trust
                 if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
                     say(f"queued; workers: {workers}")
                 # Fail fast on a worker stuck UNHEALTHY: a dead worker / failed image pull won't
@@ -382,7 +392,12 @@ def poll_job(
                     unhealthy_since = None  # recovered / usable worker appeared
             except Exception:
                 # Health surfacing is diagnostic only; a probe failure must not stop polling.
-                pass
+                # But it also leaves `worker_initializing` at its (possibly stale) prior value, so
+                # mark the episode as having no fresh probe: the no_capacity fast-path below only
+                # fires on a CONFIRMED-empty queue, never on an unverified stale `False`. This keeps
+                # the safe failure direction — a probe-blind window won't delete an endpoint whose
+                # worker may be actively initializing (setup_grace_s still bounds the wait).
+                init_probe_fresh = False
         # CAPACITY FAST-PATH: a job that can't even LEAVE the queue (no worker ever assigned)
         # is on a capacity-starved GPU class — RunPod keeps the worker `throttled` and the job
         # IN_QUEUE indefinitely. Fail FAST with ``no_capacity`` (well before the multi-minute
@@ -396,8 +411,14 @@ def poll_job(
         # cold start, not capacity starvation, so deleting the endpoint here would throw away a
         # worker about to run. The setup_grace_s stall window (and the unhealthy fast-path) still
         # bound this, so a worker that never finishes initializing is not waited on forever.
+        #
+        # Require ``init_probe_fresh``: only fire on a CONFIRMED-empty queue (a successful probe in
+        # THIS IN_QUEUE episode that saw no initializing worker). If every probe in the window
+        # errored we have no trustworthy view, so we don't delete the endpoint on a stale/unverified
+        # `worker_initializing=False`; setup_grace_s still bounds the wait either way.
         if (
             status == "IN_QUEUE"
+            and init_probe_fresh
             and not worker_initializing
             and time.time() - last_progress > queue_grace_s
         ):
