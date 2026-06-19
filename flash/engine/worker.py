@@ -2681,10 +2681,13 @@ def run_rl():
         # engine skip the vision tower (VRAM + 5090 PTX-compat; see the patch docstring).
         # Only reachable for the IN-PROCESS (colocate) engine. The disaggregated `trl vllm-serve`
         # server is a separate process this monkeypatch can't reach, AND TRL's vllm-serve exposes no
-        # language-model-only flag, so that server loads the full model incl. the vision tower. That is
-        # acceptable in practice: the only requires_disaggregated model (Qwen3.6-35B-A3B) runs on H200,
-        # where the vision tower fits and the 5090-class PTX issue doesn't apply. Revisit (a TRL patch /
-        # --hf-overrides shim) only if a disaggregated VL model is ever served on a smaller GPU.
+        # language-model-only flag, so that server loads the full model incl. the vision tower. So a
+        # CATALOG VL model may run disaggregated ONLY when it is requires_disaggregated (the 35B-A3B,
+        # served on H200-class GPUs where the tower fits and the 5090 PTX issue doesn't apply); an
+        # OPTIONAL disaggregated split of the dense Qwen3.5 VL line is rejected at submit (schema.
+        # validate_topology) before a paid rent, since those colocate fine on one card. (Open-model VL
+        # checkpoints aren't catalog entries; their disaggregated split still loads the tower — revisit
+        # with a TRL patch / --hf-overrides shim only if one must run disaggregated on a smaller GPU.)
         if use_vllm and not disaggregated:
             patch_vllm_language_model_only(model_id)
         hb_cb = make_reward_heartbeat_callback()

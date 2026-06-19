@@ -94,8 +94,10 @@ def test_valid_tensor_parallel_split_accepted_at_submit() -> None:
 
 
 def test_disaggregated_topology_accepted() -> None:
-    # A valid multi-GPU disaggregated GRPO config (2 GPUs: 1 train + 1 infer) parses.
-    s = spec_from_dict(_raw(**{"train.inference_gpus": 1, "gpu.count": 2}))
+    # A valid multi-GPU disaggregated GRPO config (2 GPUs: 1 train + 1 infer) parses. Use a
+    # NON-VL dense model (MiniCPM5-1B): the dense Qwen3.5 line is a text-only fine-tune of a VL
+    # checkpoint and is now rejected from OPTIONAL disaggregation (see the dedicated VL test).
+    s = spec_from_dict(_raw(model="openbmb/MiniCPM5-1B", **{"train.inference_gpus": 1, "gpu.count": 2}))
     assert s.gpu.count == 2
     assert s.train.inference_gpus == 1
     # An explicit inference_gpus = 0 (colocate) is accepted, not rejected as below-minimum.
@@ -107,9 +109,13 @@ def test_disaggregated_topology_accepted() -> None:
     assert sd.gpu.count == 1
     assert sd.train.inference_gpus == 0
     # train_gpus>1 ratios (2:1, 2:2) now validate — the FSDP multi-trainer launch is wired.
-    s21 = spec_from_dict(_raw(**{"train.inference_gpus": 1, "gpu.count": 3}))  # 2 train : 1 infer
+    s21 = spec_from_dict(
+        _raw(model="openbmb/MiniCPM5-1B", **{"train.inference_gpus": 1, "gpu.count": 3})
+    )  # 2 train : 1 infer
     assert s21.gpu.count - s21.train.inference_gpus == 2
-    s22 = spec_from_dict(_raw(**{"train.inference_gpus": 2, "gpu.count": 4}))  # 2 train : 2 infer
+    s22 = spec_from_dict(
+        _raw(model="openbmb/MiniCPM5-1B", **{"train.inference_gpus": 2, "gpu.count": 4})
+    )  # 2 train : 2 infer
     assert s22.gpu.count - s22.train.inference_gpus == 2
 
 
@@ -154,6 +160,43 @@ def test_moe_valid_tensor_parallel_split_accepted() -> None:
     """A divisible TP split passes for the MoE too: 16 heads with inference_gpus=2 (16 % 2 == 0)."""
     raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
     raw["train"]["inference_gpus"] = 2
+    raw["gpu"]["count"] = 3
+    raw["gpu"]["type"] = "A100 PCIe"
+    spec = spec_from_dict(raw)
+    assert spec.train.inference_gpus == 2
+
+
+def test_qwen35_dense_indivisible_tp_split_rejected_at_submit() -> None:
+    """Regression: the Qwen3.5 dense catalog entries now declare their head counts, so an
+    indivisible TP split is rejected at SUBMIT (before renting), not only at the worker's guard.
+    Qwen3.5-0.8B has 8 heads, so inference_gpus=3 (8 % 3 != 0) is invalid."""
+    raw = _raw(model="Qwen/Qwen3.5-0.8B")
+    raw["train"]["inference_gpus"] = 3
+    raw["gpu"]["count"] = 4
+    with pytest.raises(ConfigError, match="invalid tensor-parallel split"):
+        spec_from_dict(raw)
+
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B"])
+def test_vl_optional_disaggregated_split_rejected_at_submit(model) -> None:
+    """A vision-language catalog model trained text-only must NOT run an OPTIONAL disaggregated
+    split: the `trl vllm-serve` server can't skip the vision tower (no language-model-only flag), so
+    a split would load the full model (extra VRAM + the RTX 5090 PTX issue). These colocate on one
+    card, so the split is rejected at submit. (A DIVISIBLE head count is used so this fails on the VL
+    guard, not the head-divisibility guard — 0.8B has 8 heads, 4B/9B have 16, all % 2 == 0.)"""
+    raw = _raw(model=model)
+    raw["train"]["inference_gpus"] = 2
+    raw["gpu"]["count"] = 3
+    raw["gpu"]["type"] = "RTX 5090"
+    with pytest.raises(ConfigError, match="vision-language checkpoint"):
+        spec_from_dict(raw)
+
+
+def test_requires_disaggregated_vl_split_still_accepted() -> None:
+    """The 35B-A3B is VL but requires_disaggregated (the one validated VL split, on H200-class GPUs),
+    so the VL guard must NOT reject its disaggregated split — only the OPTIONAL dense-VL splits."""
+    raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
+    raw["train"]["inference_gpus"] = 2  # 16 heads % 2 == 0, and is_moe so dp/tp both fine
     raw["gpu"]["count"] = 3
     raw["gpu"]["type"] = "A100 PCIe"
     spec = spec_from_dict(raw)

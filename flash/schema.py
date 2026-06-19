@@ -425,6 +425,30 @@ def validate_topology(spec: JobSpec) -> None:
                     f"heads % inference_gpus == 0. Valid inference_gpus for this model (and gpu.count "
                     f"= {spec.gpu.count}): {_valid}"
                 )
+        # Reject an OPTIONAL disaggregated split of a vision-language catalog model. VL checkpoints
+        # (Qwen3.5/3.6) train/serve TEXT-ONLY: the colocate rollout engine skips the vision tower via
+        # patch_vllm_language_model_only, but the disaggregated `trl vllm-serve` server has NO
+        # language-model-only flag (see disaggregated.TRL_VLLM_SERVE_FLAGS), so it would load the full
+        # model incl. the vision tower — extra VRAM and, on RTX 5090-class cards, the vision-attention
+        # PTX failure the colocate patch dodges. The dense Qwen3.5 line colocates fine on one card, so
+        # a disaggregated split buys nothing and only strands the tower; reject it at submit before a
+        # paid multi-GPU rent. The ONE exception is a requires_disaggregated VL model (the 35B-A3B):
+        # it MUST run disaggregated and does so on H200-class GPUs where the tower fits and the PTX
+        # issue doesn't apply — that path stays allowed. (Open-model VL checkpoints aren't catalog
+        # entries, so the worker remains their catch-all.)
+        _info = MODELS.get(spec.model)
+        if (
+            _info is not None
+            and getattr(_info, "is_vl", False)
+            and not getattr(_info, "requires_disaggregated", False)
+        ):
+            raise ConfigError(
+                f"{spec.model} is a vision-language checkpoint trained text-only; the disaggregated "
+                "rollout server (trl vllm-serve) cannot skip its vision tower, so a disaggregated "
+                "split (train.inference_gpus>0) would load the full model — extra VRAM and an RTX "
+                "5090 vision-attention PTX failure. This model colocates on a single GPU: use gpu.count "
+                "= 1 with train.inference_gpus = 0 (colocated GRPO)."
+            )
 
 
 def _validate_spec(spec: JobSpec) -> None:

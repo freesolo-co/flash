@@ -80,6 +80,17 @@ class ModelInfo:
     # MoE (where the worker honors dp); for a dense model the law still applies. Declared per
     # entry so the schema knows, at submit, whether `dp` will really be honored.
     is_moe: bool = False
+    # Natively-multimodal (vision-language) checkpoint that Flash trains/serves TEXT-ONLY. The
+    # COLOCATE rollout engine skips the vision tower via patch_vllm_language_model_only (saves VRAM
+    # and dodges the RTX 5090 vision-attention PTX issue), but the DISAGGREGATED `trl vllm-serve`
+    # server exposes NO language-model-only flag, so it would load the full model incl. the vision
+    # tower. The only VL model validated for the disaggregated path is the 35B-A3B (requires_
+    # disaggregated, served on H200-class GPUs where the tower fits and the consumer PTX issue
+    # doesn't apply); for every OTHER VL model the submit-time guard (schema.validate_topology)
+    # rejects an OPTIONAL disaggregated split, since it colocates fine on one card and a split would
+    # only strand the vision tower on a consumer card. Declared statically so the guard needs no
+    # network/config probe at submit (is_vl_checkpoint reads the HF config; this mirrors it).
+    is_vl: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -117,6 +128,14 @@ MODELS: dict[str, ModelInfo] = {
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
         thinking="hybrid",
+        # 8 attention heads (text_config) -> valid TP / inference_gpus are {1, 2, 4, 8}; a 1:3
+        # (TP=3) split is invalid (8 % 3 != 0) and is rejected at submit (validate_topology),
+        # not only at the worker's pre-server-boot guard.
+        num_attention_heads=8,
+        # Natively-multimodal, trained/served text-only -> the disaggregated rollout server can't
+        # skip the vision tower (no language-model-only flag), so an optional disaggregated split is
+        # rejected at submit (it colocates fine on one card).
+        is_vl=True,
         notes="Smallest Qwen3.5; cheap smoke/dev runs with the modern arch.",
     ),
     "Qwen/Qwen3.5-2B": ModelInfo(
@@ -127,6 +146,9 @@ MODELS: dict[str, ModelInfo] = {
         min_vram_gb=16,
         recommended_gpu="RTX 4090",
         thinking="hybrid",
+        # 8 attention heads (text_config): same valid-TP set as the 0.8B (8 % inference_gpus == 0).
+        num_attention_heads=8,
+        is_vl=True,  # text-only fine-tune of a VL checkpoint; see Qwen3.5-0.8B note.
     ),
     "Qwen/Qwen3.5-4B": ModelInfo(
         id="Qwen/Qwen3.5-4B",
@@ -136,6 +158,9 @@ MODELS: dict[str, ModelInfo] = {
         min_vram_gb=32,
         recommended_gpu="RTX 5090",
         thinking="hybrid",
+        # 16 attention heads (text_config) -> valid TP / inference_gpus are {1, 2, 4, 8, 16}.
+        num_attention_heads=16,
+        is_vl=True,  # text-only fine-tune of a VL checkpoint; see Qwen3.5-0.8B note.
         notes="Current-gen 4B. GRPO uses the sleep-mode memory recipe (hybrid arch needs "
         "extra engine state-cache); fused DeltaNet kernels ship in the default stack.",
     ),
@@ -155,6 +180,9 @@ MODELS: dict[str, ModelInfo] = {
         quant="4bit-qlora",
         recommended_gpu="RTX 5090",
         thinking="hybrid",
+        # 16 attention heads (text_config) -> valid TP / inference_gpus are {1, 2, 4, 8, 16}.
+        num_attention_heads=16,
+        is_vl=True,  # text-only fine-tune of a VL checkpoint; see Qwen3.5-0.8B note.
         notes="QLoRA (4-bit NF4 base + bf16 LoRA). GRPO's colocated vLLM rollout loads the "
         "base 4-bit via bitsandbytes too, so both copies are 4-bit -> fits ~24-32 GB "
         "instead of 80 GB bf16. ~near-lossless vs bf16 LoRA.",
@@ -193,6 +221,13 @@ MODELS: dict[str, ModelInfo] = {
         # check when FLASH_DISAGG_PARALLEL=dp, the MoE-only data-parallel mode, where TP=1 makes head
         # count irrelevant — this entry is the only model that supports dp).
         num_attention_heads=16,
+        # VL (qwen3_5_moe) but the ONLY VL model VALIDATED for the disaggregated rollout: it is
+        # requires_disaggregated and runs on H200-class GPUs where the full model (incl. the vision
+        # tower the `trl vllm-serve` server can't skip) fits and the consumer-card PTX issue doesn't
+        # apply. The submit-time VL-disaggregated guard (schema.validate_topology) allows a VL split
+        # only for a requires_disaggregated model, so this one passes while the dense Qwen3.5 line is
+        # rejected from OPTIONAL disaggregation.
+        is_vl=True,
         # The disaggregated trainer is plain DDP (replicated per trainer rank — TRL's per-step LoRA
         # merge breaks under FSDP sharding), and the 35B is too large to load once PER trainer card
         # (host-RAM / OOM). So only SINGLE-trainer ratios (1:N) are valid; a 2:2 / 2:1 multi-trainer
