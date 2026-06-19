@@ -555,6 +555,43 @@ def test_poll_job_rl_server_boot_does_not_tighten(monkeypatch):
     assert "limit 5000s" in res.detail
 
 
+def test_model_prefetched_is_a_setup_stage():
+    # PR #4 review (thread 3): prefetch_model() emits `model_prefetched` the instant the weight
+    # download finishes — BEFORE the standalone vLLM server is launched in a disaggregated run. It
+    # must be classified SETUP, else the prefetch ping flips to the tight training window and the
+    # subsequent ~20-min 35B server boot is killed despite its rl_server_boot heartbeats.
+    from flash.providers.runpod.jobs import _SETUP_HEARTBEAT_STAGES
+
+    assert "model_prefetched" in _SETUP_HEARTBEAT_STAGES
+
+
+def test_poll_job_model_prefetched_does_not_tighten(monkeypatch):
+    # A model_prefetched heartbeat (download done, training/server-boot not started) proves
+    # liveness but must keep the larger setup_grace_s — it is still pre-training.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+
+    hbs = iter([{"stage": "model_prefetched", "step": None, "ts": 1}])  # then None
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: next(hbs, None),
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert res.failure == "stalled"
+    assert "during setup" in res.detail
+    assert "limit 5000s" in res.detail
+
+
 def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
     # A worker stuck UNHEALTHY while IN_QUEUE (e.g. a mutable image tag republished mid-pull) won't
     # self-recover, so poll_job must fail fast on unhealthy_grace_s and NOT burn the full
@@ -864,9 +901,11 @@ def test_supervisor_no_capacity_excludes_starved_class(monkeypatch):
         # Two attempts on two DIFFERENT classes (the first starved, the second served the run).
         assert len(gpus_seen) == 2
         assert gpus_seen[0] != gpus_seen[1]
-        # The first allocation excluded nothing; the retry allocation excluded the starved class.
+        # The first allocation excluded nothing; the retry allocation excluded the starved class
+        # PROVIDER-SCOPED — (provider, class) — so a RunPod queue-starvation can't drop the same
+        # class on Vast (PR #4 thread 2). The run pinned provider="runpod", so the pair is tagged.
         assert excluded_seen[0] == frozenset()
-        assert gpus_seen[0] in excluded_seen[1]
+        assert ("runpod", gpus_seen[0]) in excluded_seen[1]
 
 
 def test_supervisor_capacity_walk_resets_offset_after_infra_crash(monkeypatch):

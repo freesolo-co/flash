@@ -125,16 +125,38 @@ def required_vram_gb(
 
 
 def _is_moe_model(model_id: str) -> bool:
-    """Whether the catalog marks ``model_id`` as MoE (mirrors schema.py / engine.worker.run_rl).
+    """Whether ``model_id`` is MoE, mirroring engine.worker.run_rl's `dp` gate.
 
     Drives the disaggregated `dp` sizing gate: vLLM only honors offline data parallelism for MoE
-    models, so the worker downgrades a dense `dp` request to TP and the allocator must size to TP
-    for dense models. An unknown model (not in the catalog) is treated as dense — the conservative
-    side, since TP sizing shards the server and never under-provisions a dense card."""
+    models, so the worker downgrades a dense `dp` request to TP. Sizing must match that downgrade —
+    if we size a `dp` MoE as TP (divide by infer) the worker keeps full replicas and OOMs.
+
+    The catalog is consulted first, but an open model (``model_policy="allow"``, not listed) the
+    worker would still detect as MoE via ``AutoConfig`` is invisible to a catalog-only test — so we
+    fall back to the SAME HF probe the worker uses (``num_experts`` / ``n_routed_experts`` /
+    ``model_type`` contains "moe"). An unknown model whose probe is uncertain (offline /
+    FLASH_SKIP_NET / config unreadable) is treated as dense — the conservative side, matching the
+    worker's own uncertain-path downgrade to TP, since TP sizing shards the server and never
+    under-provisions a dense card."""
     try:
         from flash.catalog import get_model
 
-        return bool(getattr(get_model(model_id), "is_moe", False))
+        if bool(getattr(get_model(model_id), "is_moe", False)):
+            return True
+    except Exception:
+        pass
+    # Open/unlisted model: mirror engine.worker.run_rl's AutoConfig probe so submit sizes a `dp`
+    # rollout as full per-card replicas (no divide) exactly as the worker will run it. Offline
+    # (FLASH_SKIP_NET) we can't probe, so stay on the dense/TP side — consistent with the worker.
+    if os.environ.get("FLASH_SKIP_NET"):
+        return False
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        return bool(
+            getattr(cfg, "num_experts", 0) or getattr(cfg, "n_routed_experts", 0)
+        ) or "moe" in (getattr(cfg, "model_type", "") or "").lower()
     except Exception:
         return False
 
@@ -254,7 +276,7 @@ def allocate(
     disk_gb: int = 60,
     allow_unvalidated: bool | None = None,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
-    exclude_gpu_classes: set[str] | frozenset[str] = frozenset(),
+    exclude_gpu_classes: set = frozenset(),
     gpu_count: int = 1,
     train=None,
     thinking: bool = False,
@@ -265,12 +287,22 @@ def allocate(
     pins the substrate ("auto"/"runpod"/"vast"). Both default to fully automatic.
     ``train``/``thinking`` size the requirement to the run's actual knobs (context, group,
     rank, batch) via the matrix — long context / large group route up, small runs down.
-    ``exclude_gpu_classes`` drops whole GPU classes (any provider) from the candidate pool —
-    the orchestrator adds a class here after it failed ``no_capacity`` (capacity-starved /
-    throttled) so re-allocation walks to the next-cheapest AVAILABLE class instead of retrying
-    the same starved one on another provider.
+    ``exclude_gpu_classes`` drops capacity-starved classes from the candidate pool — the
+    orchestrator adds an entry here after a ``no_capacity`` failure so re-allocation walks to the
+    next-cheapest AVAILABLE class. Each entry is either a bare class string (excluded on EVERY
+    provider) or a ``(provider, class)`` tuple (excluded only on that provider). The orchestrator
+    uses the scoped form: ``no_capacity`` is a RunPod-only queue result (Vast has no queue), so a
+    RunPod A100 queue-starvation must NOT drop an available Vast A100 offer that could still serve
+    the run.
     """
-    _excluded_classes = {canonical_gpu(c) for c in exclude_gpu_classes}
+    _excluded_all: set[str] = set()
+    _excluded_scoped: set[tuple[str, str]] = set()
+    for _c in exclude_gpu_classes:
+        if isinstance(_c, tuple):
+            _prov, _cls = _c
+            _excluded_scoped.add((_prov, canonical_gpu(_cls)))
+        else:
+            _excluded_all.add(canonical_gpu(_c))
     if provider not in ("auto", *PROVIDER_NAMES):
         raise UnsupportedGpuError(
             f"unknown provider {provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
@@ -300,8 +332,13 @@ def allocate(
                 required=(provider == "vast"), num_gpus=gpu_count,
             )
             cands += vcands
-        if _excluded_classes:
-            cands = [c for c in cands if c.gpu not in _excluded_classes]
+        if _excluded_all or _excluded_scoped:
+            cands = [
+                c
+                for c in cands
+                if c.gpu not in _excluded_all
+                and (c.provider, c.gpu) not in _excluded_scoped
+            ]
         return cands, book
 
     candidates, offer_book = _gather(pinned_gpu)

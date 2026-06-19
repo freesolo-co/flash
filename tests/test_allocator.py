@@ -122,6 +122,43 @@ def test_exclude_gpu_classes_walks_to_next_cheapest(monkeypatch):
     assert all(c.gpu != base.gpu for c in nxt.candidates)
 
 
+def test_exclude_gpu_classes_provider_scoped(monkeypatch):
+    # PR #4 review (thread 2): a no_capacity failure is RunPod-only (Vast has no IN_QUEUE), so the
+    # exclusion is passed as a (provider, class) pair and must drop ONLY that provider's offer of
+    # the class — the same class on the other provider must survive so an available Vast A100 isn't
+    # skipped because RunPod's A100 queue was starved.
+    from flash.providers import allocator
+    from flash.providers.base import Candidate
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ["runpod", "vast"])
+    monkeypatch.setattr(
+        allocator,
+        "_runpod_candidates",
+        lambda *a, **k: [Candidate("runpod", "A100 SXM", 1.50, 80, True)],
+    )
+    monkeypatch.setattr(
+        allocator,
+        "_vast_candidates",
+        lambda *a, **k: ([Candidate("vast", "A100 SXM", 1.00, 80, True)], ()),
+    )
+
+    # Scoped exclusion of the RunPod A100 leaves the (cheaper) Vast A100 selectable.
+    a = allocator.allocate(
+        "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({("runpod", "A100 SXM")})
+    )
+    assert (a.provider, a.gpu) == ("vast", "A100 SXM")
+    assert all(c.provider != "runpod" for c in a.candidates)
+
+    # A bare class string still excludes the class on EVERY provider (legacy market-wide form).
+    from flash.providers.base import UnsupportedGpuError
+
+    with pytest.raises(UnsupportedGpuError):
+        allocator.allocate(
+            "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({"A100 SXM"})
+        )
+
+
 def test_nothing_fits_names_constraint(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError

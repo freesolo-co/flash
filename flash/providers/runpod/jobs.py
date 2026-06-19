@@ -61,7 +61,13 @@ TERMINAL_OK = {"COMPLETED"}
 TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
 
 # Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
-# training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
+# training loop begins (boot -> model_prefetched -> sft_start/rl_start, then later
+# sft_model_load/rl_train_start).
+# ``model_prefetched`` is emitted by prefetch_model() the instant the weight download finishes —
+# which in a DISAGGREGATED run lands BEFORE the standalone vLLM server is even launched. It must
+# stay a setup stage: otherwise the prefetch ping flips to the tight training window and the
+# subsequent ~20-min 35B server boot (only ``rl_server_boot`` pings, themselves setup) gets killed
+# by stall_after_s despite making real progress.
 # ``rl_server_boot`` is the disaggregated (multi-GPU) rollout server's boot heartbeat, emitted
 # every ~60s while vLLM loads the model and binds its port — still pre-training, so it likewise
 # stays under setup_grace_s (otherwise the FIRST boot ping would prematurely flip to the tight
@@ -69,7 +75,15 @@ TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
 # Receiving one proves the worker is alive but NOT that the slow setup (model download +
 # vLLM init) finished, so they must not flip stall detection to the tight training window.
 _SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start", "rl_server_boot"}
+    {
+        "boot",
+        "model_prefetched",
+        "sft_start",
+        "rl_start",
+        "sft_model_load",
+        "rl_train_start",
+        "rl_server_boot",
+    }
 )
 
 

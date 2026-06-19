@@ -643,15 +643,16 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
     gpu_walk_offset = 0
-    # GPU classes that failed ``no_capacity`` (throttled / stuck IN_QUEUE with no free worker).
-    # ``allocate()`` re-runs a LIVE-market price walk every retry, so a bare index walk
-    # (gpu_walk_offset) can re-select the same starved class if the ranking shifts between
-    # attempts. Excluding the class identity from the next allocation makes the walk robust to
-    # re-ranking — the capacity-starved class is dropped from the candidate pool entirely, so the
-    # offset can't land on it again. We exclude by class only (not provider): a class throttled on
-    # one provider is usually throttled market-wide for this run, and re-trying it elsewhere just
-    # burns another queue_grace_s.
-    starved_classes: set[str] = set()
+    # (provider, GPU class) pairs that failed ``no_capacity`` (throttled / stuck IN_QUEUE with no
+    # free worker). ``allocate()`` re-runs a LIVE-market price walk every retry, so a bare index
+    # walk (gpu_walk_offset) can re-select the same starved class if the ranking shifts between
+    # attempts. Excluding the starved (provider, class) from the next allocation makes the walk
+    # robust to re-ranking — the dropped pair can't be the offset's landing spot again. We scope
+    # the exclusion to the FAILING provider, not the class market-wide: ``no_capacity`` is a
+    # RunPod-only queue result (Vast has no IN_QUEUE), so a RunPod A100 queue-starvation must not
+    # drop an available Vast A100 offer — under provider="auto" that could needlessly skip, or
+    # even fail, a run whose only remaining capacity is the same class on the other provider.
+    starved_classes: set[tuple[str, str]] = set()
     # Two independent budgets. ``crash_retries`` (bounded by max_retries) covers genuine
     # infra flakes (host died, network timeout) where we re-provision the SAME-or-next class.
     # ``capacity walks`` are different: a ``no_capacity`` (throttled / stuck IN_QUEUE) result
@@ -724,8 +725,9 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 disk_gb=spec.gpu.disk_gb,
                 allow_unvalidated=spec.gpu.allow_unvalidated,
                 exclude_machine_ids=frozenset(bad_machines),
-                # Drop classes that already failed no_capacity this run so the live re-ranking can't
-                # re-select a starved class at the new gpu_walk_offset (see starved_classes above).
+                # Drop (provider, class) pairs that already failed no_capacity this run so the live
+                # re-ranking can't re-select a starved pair at the new gpu_walk_offset (provider-
+                # scoped — see starved_classes above; a RunPod-starved class stays open on Vast).
                 exclude_gpu_classes=frozenset(starved_classes),
                 # Multi-GPU: the allocator must search for offers with this many GPUs (Vast) — else
                 # it builds the offer book at num_gpus=1 and a disaggregated run rents a 1-GPU
@@ -884,7 +886,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 # into the shorter post-exclusion list would skip past the cheapest remaining classes
                 # (candidates[gpu_walk_offset] on a shorter list). Exclusion already prevents the
                 # starved class from being re-selected, so starting back at the cheapest is safe.
-                starved_classes.add(chosen.gpu)
+                starved_classes.add((chosen.provider, chosen.gpu))
                 gpu_walk_offset = 0
                 print(
                     f"retry: {chosen.gpu} had no free workers (throttled / capacity-starved); "
