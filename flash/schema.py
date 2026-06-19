@@ -291,6 +291,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # minimum=0 so `eval_every_steps = 0` explicitly disables (matches "0/None disables");
             # negatives are rejected.
             eval_every_steps=_train_int(train_raw, "eval_every_steps", minimum=0),
+            # How many held-out rows each mid-run eval pass scores (a fixed seeded random sample);
+            # minimum=1 (must score at least one), None -> built-in default (64).
+            eval_examples=_train_int(train_raw, "eval_examples", minimum=1),
             # SFT caps: max_steps caps optimizer steps (cheap pre-flight smoke); max_examples
             # truncates the SFT dataset. minimum=0 so an explicit 0 means "no cap" (matches the
             # TrainSpec "None/0 -> no cap" contract); the worker reads these from [train].

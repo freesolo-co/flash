@@ -24,6 +24,7 @@ from flash.engine.midrun_eval import (
     evaluate_policy,
     make_periodic_eval_callback,
     multi_turn_scorer,
+    sample_eval_rows,
     single_turn_scorer,
     summarize,
 )
@@ -502,13 +503,57 @@ def test_eval_config_env_overrides_toml_cadence(monkeypatch):
     assert eval_config(256, spec_every=10)["every_steps"] == 25
 
 
-def test_eval_config_num_examples_is_operator_safety_cap(monkeypatch):
-    """num_examples is NOT a config knob — it's an operator safety cap (default 64) so a huge env
-    eval split can't dominate training; the agent sizes the eval set via the environment."""
+def test_eval_config_num_examples_default(monkeypatch):
+    """No knob set -> the built-in default sample size (64)."""
     monkeypatch.delenv("AUTOSLM_EVAL_NUM", raising=False)
     assert eval_config(256, spec_every=3)["num_examples"] == 64
+
+
+def test_eval_config_num_examples_from_toml(monkeypatch):
+    """[train] eval_examples sets how many held-out rows each pass samples."""
+    monkeypatch.delenv("AUTOSLM_EVAL_NUM", raising=False)
+    assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 20
+    # 0/None falls back to the default, never 0 examples
+    assert eval_config(256, spec_every=3, spec_eval_examples=0)["num_examples"] == 64
+    assert eval_config(256, spec_every=3, spec_eval_examples=None)["num_examples"] == 64
+
+
+def test_eval_config_env_overrides_toml_num_examples(monkeypatch):
+    """AUTOSLM_EVAL_NUM (operator/bench escape hatch) wins over [train] eval_examples."""
     monkeypatch.setenv("AUTOSLM_EVAL_NUM", "8")
-    assert eval_config(256, spec_every=3)["num_examples"] == 8
+    assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 8
+    # a malformed override falls back to the TOML value, not a crash
+    monkeypatch.setenv("AUTOSLM_EVAL_NUM", "not-an-int")
+    assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 20
+
+
+# --------------------------------------------------------------------------- #
+# sample_eval_rows: fixed seeded random subset of the held-out split
+# --------------------------------------------------------------------------- #
+
+
+def test_sample_eval_rows_takes_n_random_rows():
+    pool = [{"i": i} for i in range(100)]
+    out = sample_eval_rows(pool, 10)
+    assert len(out) == 10
+    assert all(r in pool for r in out)
+    # NOT just the first 10 (that's the bias this feature removes)
+    assert [r["i"] for r in out] != list(range(10))
+
+
+def test_sample_eval_rows_is_deterministic_across_passes():
+    pool = [{"i": i} for i in range(100)]
+    # same seed -> identical subset every pass (a comparable eval curve)
+    assert sample_eval_rows(pool, 10) == sample_eval_rows(pool, 10)
+    # preserved in original order
+    idxs = [r["i"] for r in sample_eval_rows(pool, 10)]
+    assert idxs == sorted(idxs)
+
+
+def test_sample_eval_rows_returns_all_when_pool_small():
+    pool = [{"i": i} for i in range(5)]
+    assert sample_eval_rows(pool, 10) == pool  # n >= len -> eval them all
+    assert sample_eval_rows(pool, 0) == pool  # 0 -> all (never empty)
 
 
 # --------------------------------------------------------------------------- #
