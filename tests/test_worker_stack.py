@@ -82,6 +82,66 @@ def test_lora_exclude_modules_text_model(monkeypatch):
     assert worker.lora_exclude_modules("openbmb/MiniCPM5-1B") is None
 
 
+def _fake_torch(monkeypatch):
+    """Inject a stub ``torch`` (the CPU/server venv has no torch) exposing optim.AdamW."""
+
+    class _AdamW:  # marker class; identity is all the tests check
+        pass
+
+    fake = types.ModuleType("torch")
+    fake.optim = types.SimpleNamespace(AdamW=_AdamW)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    return _AdamW
+
+
+def _fake_bitsandbytes(monkeypatch):
+    """Inject a stub ``bitsandbytes`` so loraplus_optimizer_cls can resolve the 8-bit class
+    without a CUDA build of bnb installed."""
+
+    class _PagedAdamW8bit:  # marker class; identity is all the test checks
+        pass
+
+    fake = types.ModuleType("bitsandbytes")
+    fake.optim = types.SimpleNamespace(PagedAdamW8bit=_PagedAdamW8bit)
+    monkeypatch.setitem(sys.modules, "bitsandbytes", fake)
+    return _PagedAdamW8bit
+
+
+def test_loraplus_optimizer_mirrors_8bit_optim(monkeypatch):
+    """An `8bit` optim string -> bnb PagedAdamW8bit (LoRA+ and 8-bit state coexist), always-on."""
+    worker = _import_worker(monkeypatch)
+    _fake_torch(monkeypatch)
+    paged = _fake_bitsandbytes(monkeypatch)
+    cls, extra = worker.loraplus_optimizer_cls("paged_adamw_8bit")
+    assert cls is paged
+    assert extra == {}
+
+
+def test_loraplus_optimizer_fp_optim_uses_adamw(monkeypatch):
+    """A non-8-bit optim string keeps full-precision torch AdamW (mirrors the configured optim)."""
+    worker = _import_worker(monkeypatch)
+    adamw = _fake_torch(monkeypatch)
+    cls, _extra = worker.loraplus_optimizer_cls("adamw_torch")
+    assert cls is adamw
+
+
+def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
+    """If bitsandbytes can't be imported, fall back to fp32 AdamW (never block training)."""
+    import builtins
+
+    worker = _import_worker(monkeypatch)
+    adamw = _fake_torch(monkeypatch)
+    real_import = builtins.__import__
+
+    def _no_bnb(name, *a, **k):
+        if name == "bitsandbytes" or name.startswith("bitsandbytes."):
+            raise ImportError("no bitsandbytes")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_bnb)
+    assert worker.loraplus_optimizer_cls("paged_adamw_8bit")[0] is adamw
+
+
 def test_heartbeat_commit_is_throttled(monkeypatch):
     """heartbeat() must rate-limit HF commits (per-step commits blow HF's 128/hour repo cap),
     while always committing milestone stages."""

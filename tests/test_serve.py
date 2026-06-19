@@ -192,10 +192,14 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
         adapter_prefix="sft/flash-7-abcd/seed0",
         temperature=0.0,
         max_tokens=8,
+        thinking=True,
     )
     assert seen["url"] == "https://serve.example/v1/chat/completions"
     assert seen["json"]["model"] == "flash-7-abcd"
     assert seen["json"]["max_tokens"] == 8
     assert seen["json"]["messages"] == [{"role": "user", "content": "2+2?"}]
+    # Per-run thinking parity: the thinking flag is forwarded to the chat template so a
+    # thinking-trained adapter serves with thinking (not silently dropped).
+    assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
     # The OpenAI shape is preserved so resp["choices"][0]["message"]["content"] works.
     assert out["choices"][0]["message"]["content"] == "hi there"
