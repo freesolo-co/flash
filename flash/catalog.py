@@ -72,6 +72,14 @@ class ModelInfo:
     # ratio fails before renting the paid node instead of crashing the DDP launch mid-run. A future
     # sharded (FSDP) trainer would lift this; until then it is a hard submit-time floor.
     single_trainer_only: bool = False
+    # Mixture-of-experts checkpoint. Only MoE models can use the disaggregated rollout's
+    # DATA-parallel mode (FLASH_DISAGG_PARALLEL=dp, tp=1 replicas): vLLM rejects offline data
+    # parallelism for DENSE models, so the worker (engine.worker.run_rl) downgrades a dense
+    # `dp` request back to TENSOR parallelism. The submit-time TP head-divisibility guard must
+    # mirror that downgrade — it may only be skipped under `dp` for a model that is actually
+    # MoE (where the worker honors dp); for a dense model the law still applies. Declared per
+    # entry so the schema knows, at submit, whether `dp` will really be honored.
+    is_moe: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -173,6 +181,11 @@ MODELS: dict[str, ModelInfo] = {
         # and the vLLM rollout are colocated on one card. With a dedicated inference GPU (35B served
         # 4-bit) + a sharded trainer on the rest, it fits. GRPO colocate for it is rejected.
         requires_disaggregated=True,
+        # MoE: the ONLY catalog model that supports FLASH_DISAGG_PARALLEL=dp (vLLM rejects offline
+        # data parallelism for dense models). Lets the schema skip the TP head-divisibility guard
+        # under `dp` for THIS model only — dense models still get the guard even under `dp` because
+        # the worker downgrades their `dp` request back to tp.
+        is_moe=True,
         # 16 attention heads (text_config). The disaggregated rollout defaults to TENSOR parallelism
         # (FLASH_DISAGG_PARALLEL=tp), where vLLM requires heads % inference_gpus == 0 — so a 1:3 split
         # (inference_gpus=3) is invalid (16 % 3 != 0) and is rejected at submit. Declaring this lets

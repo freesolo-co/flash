@@ -403,15 +403,19 @@ def validate_topology(spec: JobSpec) -> None:
         # for a multi-GPU node that only fails at the worker's pre-server-boot guard. Open-model runs
         # declare no head count and rely on the worker guard.
         #
-        # Gate on the EFFECTIVE parallel mode, not on whether the model is MoE: the divisibility law
-        # only constrains TENSOR parallelism (the default). The dp opt-in (FLASH_DISAGG_PARALLEL=dp,
-        # MoE-only) replicates the whole server per card (tp=1) so head count is irrelevant — skip it
-        # there. Without this the 35B-A3B MoE (16 heads, num_attention_heads declared) would default
-        # to TP and a 1:3 split would pass schema yet crash the worker's TP guard after a paid 4-GPU
-        # rent. Must mirror the worker (engine.worker.run_rl) and allocator default exactly: tp unless
-        # FLASH_DISAGG_PARALLEL is the literal "dp".
+        # The divisibility law only constrains TENSOR parallelism (the default). The dp opt-in
+        # (FLASH_DISAGG_PARALLEL=dp) replicates the whole server per card (tp=1) so head count is
+        # irrelevant — but ONLY for a model the worker actually serves data-parallel, i.e. a MoE.
+        # vLLM rejects offline data parallelism for DENSE models, so the worker (engine.worker.run_rl)
+        # downgrades a dense `dp` request back to TP and then enforces head divisibility; a dense
+        # catalog model with an indivisible split under `dp` would otherwise pass schema yet crash the
+        # worker's TP guard after a paid multi-GPU rent. So skip the check only when dp is requested
+        # AND the catalog model is MoE (the worker will honor dp). For the MoE 35B-A3B (16 heads) under
+        # the default tp, a 1:3 split is still correctly rejected here. Must mirror the worker exactly:
+        # tp unless FLASH_DISAGG_PARALLEL=="dp" AND the model is MoE.
         _disagg_is_dp = (os.environ.get("FLASH_DISAGG_PARALLEL") or "").strip().lower() == "dp"
-        if spec.train.inference_gpus > 1 and spec.model in MODELS and not _disagg_is_dp:
+        _skip_for_dp = _disagg_is_dp and bool(getattr(MODELS.get(spec.model), "is_moe", False))
+        if spec.train.inference_gpus > 1 and spec.model in MODELS and not _skip_for_dp:
             _heads = int(getattr(MODELS[spec.model], "num_attention_heads", 0) or 0)
             if _heads and _heads % spec.train.inference_gpus != 0:
                 _valid = [d for d in range(1, _heads + 1) if _heads % d == 0 and d < spec.gpu.count]

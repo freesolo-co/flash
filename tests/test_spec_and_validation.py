@@ -136,6 +136,20 @@ def test_moe_tp_split_skipped_under_data_parallel(monkeypatch) -> None:
     assert spec.train.inference_gpus == 3
 
 
+def test_dense_tp_split_rejected_even_under_data_parallel(monkeypatch) -> None:
+    """FLASH_DISAGG_PARALLEL=dp must NOT skip the head-divisibility guard for a DENSE model: vLLM
+    rejects offline data parallelism for dense models, so the worker downgrades a dense `dp` request
+    back to TP. A dense catalog model (MiniCPM5-1B, 16 heads) with an indivisible 1:3 split must
+    still be rejected at submit even with dp set — else it passes schema only to crash on a paid
+    node after the worker's dp->tp downgrade."""
+    monkeypatch.setenv("FLASH_DISAGG_PARALLEL", "dp")
+    raw = _raw(model="openbmb/MiniCPM5-1B")
+    raw["train"]["inference_gpus"] = 3
+    raw["gpu"]["count"] = 4
+    with pytest.raises(ConfigError, match="invalid tensor-parallel split"):
+        spec_from_dict(raw)
+
+
 def test_moe_valid_tensor_parallel_split_accepted() -> None:
     """A divisible TP split passes for the MoE too: 16 heads with inference_gpus=2 (16 % 2 == 0)."""
     raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
