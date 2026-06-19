@@ -1197,6 +1197,10 @@ def run_sft():
         processing_class=tok,
         callbacks=[make_checkpoint_upload_callback()],
     )
+    # The class/function-level chalk kernels installed above patch the layers TRL just built; the
+    # INSTANCE-level ones (FP8 base, embedding, FP8 MLP) need the materialized module, so install
+    # them now against the SFT trainer.model. No-op unless a CHALK_* flag is set and chalk present.
+    install_chalk_kernels(getattr(trainer, "model", None))
 
     t_train = time.time()
     with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
@@ -1897,10 +1901,14 @@ def run_rl():
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
     # to fp32 and double VRAM).
     init_model, init_peft = _init_adapter_model(model_id)
-    # Install any opt-in chalk kernels (CHALK_* flags). init_model is the built base, so the
-    # instance-level kernels (FP8 base, embedding, FP8 MLP) can patch its frozen Linears too.
-    # No-op unless a CHALK_* flag is set and freesolo-chalk is installed.
-    install_chalk_kernels(init_model)
+    # Install the CLASS/FUNCTION-level opt-in chalk kernels (LoRA delta, fused MLP/QKV, RoPE)
+    # BEFORE GRPOTrainer builds the model so the patches apply to its freshly-built layers. The
+    # INSTANCE-level kernels (FP8 base, embedding, FP8 MLP) need the actual nn.Module and are
+    # installed AFTER construction (below) against trainer.model — on the fresh-LoRA path
+    # init_model is just the model-id string (TRL builds the module), and even on the
+    # continue-adapter path TRL may rebuild/wrap the PeftModel, so trainer.model is the
+    # authoritative target. No-op unless a CHALK_* flag is set and freesolo-chalk is installed.
+    install_chalk_kernels()
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
         # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
@@ -2007,6 +2015,11 @@ def run_rl():
         callbacks=[hb_cb, make_checkpoint_upload_callback()],
         **extra_trainer_kwargs,
     )
+    # Now that TRL has materialized the model, install the INSTANCE-level chalk kernels (FP8 base,
+    # embedding, FP8 MLP) against the actual module GRPOTrainer optimizes (trainer.model). Doing it
+    # here (not on init_model) is what makes them reach the fresh-LoRA path, where init_model was
+    # only the model-id string. No-op unless a CHALK_* flag is set and freesolo-chalk is installed.
+    install_chalk_kernels(getattr(trainer, "model", None))
     # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or AUTOSLM_EVAL_EVERY_STEPS,
     # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
     # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.
