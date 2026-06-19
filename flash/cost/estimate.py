@@ -70,7 +70,9 @@ class CostEstimate:
             f"GPU        : {self.gpu} on {self.provider} "
             f"({self.gpu_vram_gb} GB; run needs >= {self.required_vram_gb} GB) "
             f"@ ${self.gpu_hourly_usd:.2f}/hr",
-            f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + download)",
+            f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + download"
+            + (" + vLLM init" if self.method == "grpo" else "")
+            + ")",
             f"Per step   : {self.seconds_per_step:.2f} s",
             f"Train      : {self.train_seconds / 60:.1f} min"
             + ("  [CAPPED at the wall-clock limit]" if self.wall_capped else ""),

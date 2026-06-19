@@ -180,7 +180,7 @@ def measured_as_estimate(m: MeasuredRun) -> CostEstimate:
 
 
 def measured_ground_truth_fn(runs: list[MeasuredRun]) -> GroundTruthFn:
-    """A `ground_truth_fn` for `run_experiment` that returns measured cost per config.
+    """A ``GroundTruthFn`` that returns the measured cost for a given config.
 
     Keyed by ``config.display()``. Two runs that share a label can't both be the ground
     truth for the same grid cell, so reject duplicates loudly instead of silently keeping

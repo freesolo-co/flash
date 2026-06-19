@@ -173,11 +173,15 @@ def pick_gpu(
         pinned = [g for g in candidates if g.name == canonical]
         if pinned:
             candidates = pinned
-        elif not pin_must_fit:
+        elif not pin_must_fit and _selectable(GPU_INFO[canonical]):
             # Grading a measured run: the pin is the card the run demonstrably ran on, so the
             # offline VRAM heuristic over-estimated the requirement and dropped a card that
             # actually fit. Force the recorded class back in rather than re-pricing the bill on
-            # a different GPU. canonical_gpu already validated it's a real managed class.
+            # a different GPU. ``pin_must_fit=False`` bypasses ONLY the VRAM-fit gate -- the
+            # provider/validation gates in ``_selectable`` still apply, so a pin the pinned
+            # provider can't provision (or that policy forbids) is NOT silently force-honored;
+            # such a row falls through to cheapest-fit (or the no-candidate error) instead.
+            # canonical_gpu already validated it's a real managed class.
             return GPU_INFO[canonical].name
     if not candidates:
         raise ValueError(

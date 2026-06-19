@@ -67,6 +67,16 @@ class RunConfig:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
         if self.setup_repeats < 1:
             raise ValueError(f"setup_repeats must be >= 1, got {self.setup_repeats}")
+        # ``setup_repeats`` is the seed count, and ``estimate_cost`` divides ``steps`` evenly
+        # across seeds (each seed is a separate job running its OWN share of the steps -- the
+        # reconstruction in ``runconfig_from_status`` always builds steps = per_seed x seeds).
+        # A non-divisible (steps, setup_repeats) would price fractional steps per seed, which
+        # can't happen in a real run and skews per-seed wall-cap behavior, so reject it.
+        if self.steps % self.setup_repeats != 0:
+            raise ValueError(
+                f"steps ({self.steps}) must be a multiple of setup_repeats "
+                f"({self.setup_repeats}): each seed runs an equal share of the steps"
+            )
         # Explicit run knobs (None -> recipe default) must be positive; a <= 0 value
         # produces a bogus quote (zero/negative tokens or completions per step). lora_rank
         # is included to mirror the real parser's ``train.lora_rank < 1`` rejection.
