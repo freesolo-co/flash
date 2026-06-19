@@ -356,7 +356,14 @@ def server_subprocess_env(base_env: dict, split: RolloutSplit) -> dict:
     """
     env = dict(base_env)
     env["CUDA_VISIBLE_DEVICES"] = _cvd(split.infer_devices)
-    env.setdefault("FLASH_VLLM_GROUP_PORT", str(group_port()))
+    # Assign (NOT setdefault): the canonical group port is whatever group_port() resolves to, which
+    # already reads + SANITIZES FLASH_VLLM_GROUP_PORT (blank / whitespace / non-numeric -> default).
+    # setdefault would leave an existing INVALID value untouched (the [worker_env] stringification
+    # quirk this whole module guards against), so the server would parse a blank port while the
+    # trainer side uses the sanitized default -> NCCL weight-sync rendezvous mismatch. Overwriting
+    # with the sanitized value keeps both sides in lockstep AND still honours a valid operator
+    # override (group_port() returns it unchanged).
+    env["FLASH_VLLM_GROUP_PORT"] = str(group_port())
     # Force vLLM's worker/inspection subprocesses to SPAWN (not fork). `trl vllm-serve` runs its
     # llm_worker as a multiprocessing.Process and vLLM forks a further subprocess to inspect the
     # model architecture; a fork after the parent has touched CUDA/NVML corrupts the NVML handle in

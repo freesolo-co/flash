@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from flash.engine.disaggregated import (
+    DEFAULT_GROUP_PORT,
     TRL_VLLM_SERVE_FLAGS,
     build_accelerate_launch_cmd,
     build_vllm_serve_cmd,
@@ -99,6 +100,25 @@ def test_server_env_multi_infer():
     env = server_subprocess_env({}, split)
     assert env["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert trainer_cuda_visible_devices(split) == "2"
+
+
+def test_server_env_overwrites_blank_group_port(monkeypatch):
+    # The [worker_env] TOML stringification can leave FLASH_VLLM_GROUP_PORT as a blank/whitespace
+    # string. The trainer side resolves it via group_port() -> sanitized default, so the server env
+    # MUST be forced to the same sanitized value (NOT setdefault, which would keep the blank value
+    # and break the NCCL weight-sync rendezvous between trainer and server).
+    monkeypatch.delenv("FLASH_VLLM_GROUP_PORT", raising=False)
+    split = select_rollout_split(2, 1)
+    for blank in ("", "   ", "not-a-port"):
+        env = server_subprocess_env({"FLASH_VLLM_GROUP_PORT": blank}, split)
+        assert env["FLASH_VLLM_GROUP_PORT"] == str(DEFAULT_GROUP_PORT)
+
+
+def test_server_env_honours_valid_group_port_override(monkeypatch):
+    # A VALID operator override must reach the server unchanged (and matches the trainer's group_port).
+    monkeypatch.setenv("FLASH_VLLM_GROUP_PORT", "51999")
+    env = server_subprocess_env({"FLASH_VLLM_GROUP_PORT": "51999"}, select_rollout_split(2, 1))
+    assert env["FLASH_VLLM_GROUP_PORT"] == "51999"
 
 
 def test_detect_total_gpus_prefers_explicit_env():
