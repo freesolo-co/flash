@@ -83,8 +83,17 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 
 # The prebuilt worker image (full training stack baked in; built by Dockerfile.worker /
 # .github/workflows/worker-image.yml). PUBLIC under the org namespace, so no registry login is
-# ever needed. Always used on both Vast and RunPod — there is no operator override and no generic
-# fallback image. Must be published to GHCR + made public before runs can pull it.
+# ever needed. Must be published to GHCR + made public before the paths that use it can pull it.
+#   * Vast: ALWAYS used (jobs.builders pins the container to WORKER_IMAGE).
+#   * RunPod baked-image submit (jobs.deploy_train_endpoint / build_function_input): the default —
+#     a self-contained serverless worker whose rp_handler runs _train_body. FLASH_WORKER_IMAGE
+#     overrides the tag (e.g. a hotfix); the boot-install fallback is only reachable if BOTH are
+#     cleared (not a normal configuration).
+#   * RunPod Flash live-endpoint (train.endpoints.get_train_endpoint): does NOT use this baked image
+#     by default — RunPod Flash needs its serverless runtime baked in, which WORKER_IMAGE lacks, so
+#     it boot-installs resolve_worker_deps() on Flash's default template instead. It uses an image
+#     only when the operator sets FLASH_WORKER_IMAGE to a RunPod-serverless-compatible one.
+# So FLASH_WORKER_IMAGE IS an operator override (consulted by every RunPod path).
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 
 
