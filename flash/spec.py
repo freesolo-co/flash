@@ -132,7 +132,7 @@ class TrainSpec:
     # so the agent judges the run on held-out eval, not just the training reward. 0/None disables.
     # This cadence is the ONLY mid-run-eval knob: the eval queries and grading logic live in the
     # environment, and the completion budget matches the run's normal ``max_tokens``.
-    # (``AUTOSLM_EVAL_EVERY_STEPS`` env var overrides it — operator/bench escape hatch.)
+    # (``FLASH_EVAL_EVERY_STEPS`` env var overrides it — operator/bench escape hatch.)
     eval_every_steps: int | None = None
 
 
@@ -147,7 +147,7 @@ class GpuSpec:
     # this is a policy word — ``type`` is then just the parse-time provisional; a
     # concrete ``requested`` pins the class and the allocator only picks the provider.
     requested: str = ""
-    # Carried into the submit-time allocator (None -> AUTOSLM_GPU_ALLOW_UNVALIDATED).
+    # Carried into the submit-time allocator (None -> FLASH_GPU_ALLOW_UNVALIDATED).
     allow_unvalidated: bool | None = None
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
@@ -263,11 +263,11 @@ class JobSpec:
 
 
 def load_job_spec_from_env() -> JobSpec | None:
-    """Load AUTOSLM_JOB_SPEC_JSON or AUTOSLM_JOB_SPEC_PATH if present on a worker node."""
-    raw = os.environ.get("AUTOSLM_JOB_SPEC_JSON")
+    """Load FLASH_JOB_SPEC_JSON or FLASH_JOB_SPEC_PATH if present on a worker node."""
+    raw = os.environ.get("FLASH_JOB_SPEC_JSON")
     if raw:
         return JobSpec.from_json(raw)
-    path = os.environ.get("AUTOSLM_JOB_SPEC_PATH")
+    path = os.environ.get("FLASH_JOB_SPEC_PATH")
     if path and os.path.exists(path):
         with open(path) as f:
             return JobSpec.from_json(f.read())

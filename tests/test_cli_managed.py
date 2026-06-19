@@ -79,9 +79,9 @@ def stub_server():
 def _run(args, home: str, api_url: str):
     env = os.environ.copy()
     env.pop("FREESOLO_API_KEY", None)
-    env.pop("AUTOSLM_API_KEY", None)
+    env.pop("FLASH_API_KEY", None)
     # The stub serves both the freesolo verify endpoint and the flash control plane.
-    env.update({"HOME": home, "AUTOSLM_API_URL": api_url, "FREESOLO_BASE_URL": api_url})
+    env.update({"HOME": home, "FLASH_API_URL": api_url, "FREESOLO_BASE_URL": api_url})
     return subprocess.run(
         [sys.executable, "-m", "flash.cli.main", *args],
         cwd=ROOT,
