@@ -428,7 +428,7 @@ def _validate_spec(spec: JobSpec) -> None:
                 f"({spec.train.inference_gpus}) — at least one GPU must train "
                 "(gpu.count = trainer GPUs + inference_gpus)"
             )
-        # train_gpus>1 (2:1, 3:1, 2:2) runs the trainer as an FSDP group via `accelerate launch`
+        # train_gpus>1 (2:1, 3:1, 2:2) runs the trainer as a DDP group via `accelerate launch`
         # (run_rl's disaggregated launcher re-execs the worker across the train devices). Supported.
         # Reject a tensor-parallel split the model's head count can't satisfy BEFORE renting: vLLM
         # requires num_attention_heads % inference_gpus == 0 for TP (inference_gpus>1). For a catalog

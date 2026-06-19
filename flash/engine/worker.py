@@ -977,9 +977,9 @@ def make_lora(model_id: str | None = None):
     # "set_data ... incompatible tensor type" there. FLASH_LORA_INIT=default falls back to the
     # standard LoRA init (Kaiming-A / zero-B) — the disaggregated worker sets this. The init METHOD
     # does not affect rollout/step THROUGHPUT, which is the whole point of the disaggregated path.
-    # `or` (not a get-default): a present-but-blank FLASH_LORA_INIT must fall back too, else
-    # init_lora_weights="" reaches PEFT as an invalid value instead of a real init method.
-    _lora_init = os.environ.get("FLASH_LORA_INIT") or "pissa_niter_16"
+    # `.strip() or` (not a get-default): a present-but-blank/whitespace-only FLASH_LORA_INIT must fall
+    # back too, else init_lora_weights="" (or "   ") reaches PEFT as an invalid value, not a real init.
+    _lora_init = (os.environ.get("FLASH_LORA_INIT") or "").strip() or "pissa_niter_16"
     # PiSSA's SVD init requires an UNQUANTIZED base ("Please initialize PiSSA under
     # float32/float16/bfloat16"); it raises on a 4-bit (qlora) base at adapter creation. Force
     # standard init for qlora models regardless of the configured default, so the 4-bit trainers
@@ -2069,8 +2069,8 @@ def run_rl():
         # to the throughput this path measures.
         # setdefault would NOT override an operator-set BLANK value, leaving make_lora with an
         # invalid empty init (and PiSSA would still be attempted in this CVD-pinned trainer);
-        # treat blank/unset as "use standard init" so the fallback actually engages.
-        if not os.environ.get("FLASH_LORA_INIT"):
+        # treat blank/whitespace-only/unset as "use standard init" so the fallback actually engages.
+        if not (os.environ.get("FLASH_LORA_INIT") or "").strip():
             os.environ["FLASH_LORA_INIT"] = "default"
     disaggregated = _rollout_split is not None and _rollout_split.mode == "disaggregated"
     # The FSDP/DDP LAUNCHER builds NO trainer (it re-execs the worker under `accelerate launch` and
@@ -2716,9 +2716,12 @@ def run_rl():
             print("[rl] multi-turn env: driving the turn loop via rollout_func")
         if _is_fsdp_launcher:
             # train_gpus>1: the server is up (above); re-exec THIS worker under `accelerate launch`
-            # so the GRPO trainer runs as an FSDP group across the train devices and connects to the
-            # server. We build no trainer in this process; the child (rank 0) writes all artifacts to
-            # the SAME /tmp + uploads to HF, so after it returns the run is complete here too.
+            # so the GRPO trainer runs as a DDP group across the train devices and connects to the
+            # server. (NOTE: this is DDP, not FSDP — `use_fsdp=False` below — because TRL's LoRA-merge
+            # weight sync is incompatible with FSDP sharding; see the next comment. The launcher var
+            # is named `_is_fsdp_launcher` for historical reasons.) We build no trainer in this
+            # process; the child (rank 0) writes all artifacts to the SAME /tmp + uploads to HF, so
+            # after it returns the run is complete here too.
             import subprocess as _sp
 
             t_train = time.time()
@@ -2738,26 +2741,26 @@ def run_rl():
             # that (accelerate's --gpu_ids assigns one GPU per rank). Drop it so accelerate controls
             # device placement across the train GPUs.
             _child_env.pop("CUDA_VISIBLE_DEVICES", None)
-            print(f"[rl][disagg][fsdp] launching FSDP trainer group ({_rollout_split.label}): {' '.join(_acc_cmd)}")
+            print(f"[rl][disagg][ddp] launching DDP trainer group ({_rollout_split.label}): {' '.join(_acc_cmd)}")
             # Capture the child group's stdout+stderr to a file and ALWAYS upload it: the launcher's
             # own console is not reliably captured once the child writes DONE, so this is the only way
-            # to see the FSDP trainer's behavior (real steps vs 0-step empty run) for debugging.
-            _child_log = "/tmp/fsdp_child.log"
+            # to see the DDP trainer's behavior (real steps vs 0-step empty run) for debugging.
+            _child_log = "/tmp/ddp_child.log"
             with open(_child_log, "w") as _clf:
                 _rc = _sp.run(_acc_cmd, env=_child_env, stdout=_clf, stderr=_sp.STDOUT).returncode
-            print("[rl][disagg][fsdp] --- accelerate child log tail (last 160) ---")
+            print("[rl][disagg][ddp] --- accelerate child log tail (last 160) ---")
             print(_disagg._server_log_tail(_child_log, n=160))
-            print("[rl][disagg][fsdp] --- end child log ---", flush=True)
+            print("[rl][disagg][ddp] --- end child log ---", flush=True)
             try:
-                hf_upload_file(_child_log, "console_fsdp_child.txt")
+                hf_upload_file(_child_log, "console_ddp_child.txt")
             except Exception as _e:
-                print(f"[rl][disagg][fsdp] could not upload child log: {_e}")
+                print(f"[rl][disagg][ddp] could not upload child log: {_e}")
             if _rc != 0:
                 raise RuntimeError(
-                    f"accelerate FSDP trainer group exited {_rc} (split {_rollout_split.label}); "
-                    "see console_fsdp_child.txt"
+                    f"accelerate DDP trainer group exited {_rc} (split {_rollout_split.label}); "
+                    "see console_ddp_child.txt"
                 )
-            print("[rl][disagg][fsdp] trainer group finished; artifacts written by rank 0")
+            print("[rl][disagg][ddp] trainer group finished; artifacts written by rank 0")
         else:
             trainer = GRPOTrainer(
                 model=init_model,
@@ -2831,7 +2834,7 @@ def run_rl():
         # The accelerate child (rank 0) already saved the adapter, wrote /tmp/metrics.json, and
         # uploaded every artifact to HF; /tmp is shared on this node so the run is complete here.
         # This launcher built no trainer, so skip the in-process artifact writes and return.
-        print("[rl][disagg][fsdp] launcher done (artifacts written by the FSDP trainer group)")
+        print("[rl][disagg][ddp] launcher done (artifacts written by the DDP trainer group)")
         return
     train_wall = time.time() - t_train
     reward_history = list(getattr(hb_cb, "reward_history", []))
@@ -2845,14 +2848,15 @@ def run_rl():
 
     adapter_dir = f"{out_dir}/adapter"
     if _disagg.trainer_only_mode():
-        # FSDP trainer group: trainer.save_model gathers the sharded (LoRA) state across ALL ranks
-        # and writes on rank 0 — it must be called by every rank or the gather deadlocks.
-        # model.save_pretrained is NOT FSDP-aware (would save an empty/partial shard).
+        # DDP trainer group: trainer.save_model runs the accelerate state sync across ALL ranks and
+        # writes on rank 0 — it must be called by every rank or the collective deadlocks. The model
+        # is DDP-replicated (not FSDP-sharded), but go through the accelerator's save_model rather
+        # than model.save_pretrained so the multi-rank barrier/sync is honored.
         trainer.save_model(adapter_dir)
     else:
         trainer.model.save_pretrained(adapter_dir)
     if not _disagg.is_main_rank():
-        # Non-rank-0 FSDP workers finished their part of the state gather above; only rank 0 does the
+        # Non-rank-0 DDP workers finished their part of the state sync above; only rank 0 does the
         # HF upload + metrics + DONE. Return so the other ranks don't double-write/upload.
         return
     tok.save_pretrained(adapter_dir)

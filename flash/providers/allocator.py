@@ -21,6 +21,7 @@ Vast classes come from a live offer book (collected through the provider's
 
 from __future__ import annotations
 
+import math
 import os
 
 from flash._logging import get_logger
@@ -102,8 +103,10 @@ def required_vram_gb(
             # infer==1 collapses both to the full-weight single-card need.
             _dp = (os.environ.get("FLASH_DISAGG_PARALLEL") or "").strip().lower() == "dp"
             _shards = 1 if _dp else infer
-            server_need = int(pb * 2.0 * 1.2 / _shards)  # per-card bf16 (full for dp, shard for tp) + ~20% KV/overhead
-            disagg_need = max(server_need, int(colocate * 0.7))
+            # math.ceil (not int(): flooring under-provisions by up to ~1GB into an avoidable OOM on a
+            # tight fit) — matches vram.py's conservative `math.ceil(est * headroom)` sizing.
+            server_need = math.ceil(pb * 2.0 * 1.2 / _shards)  # per-card bf16 (full for dp, shard for tp) + ~20% KV/overhead
+            disagg_need = max(server_need, math.ceil(colocate * 0.7))
             # Cap at the colocate estimate (disaggregation never needs more per GPU than the whole
             # colocated total) but NEVER below server_need: for an MoE whose colocate is sized by
             # ACTIVE params (e.g. Qwen3.6-35B-A3B), colocate can be < the full-bf16-weight server,
