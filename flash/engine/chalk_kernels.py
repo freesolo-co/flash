@@ -29,10 +29,6 @@ from flash._logging import get_logger
 
 log = get_logger(__name__)
 
-# Set once we've logged the "freesolo-chalk not installed" notice — install_chalk_kernels runs
-# twice per training run (pre-/post-build), and this keeps the notice to a single line per process.
-_MISSING_CHALK_LOGGED = False
-
 # Chalk kernel table: (FLASH_* flag, apply_chalk_kernel_to_qwen35 keyword, default_on).
 # The GAP-FILLERS that complement Liger are ON BY DEFAULT — applied automatically like
 # apply_liger_kernel — because each chalk installer self-tests on install and falls back to the
@@ -124,16 +120,14 @@ def install_chalk_kernels(model=None) -> dict:
     try:
         from chalk.transformers import apply_chalk_kernel_to_qwen35
     except ImportError:
-        # chalk's gap-fillers are default-on, but freesolo-chalk isn't installed on this worker
-        # (no FLASH_CHALK_SPEC, or running on the control plane). Documented as always safe: the
-        # kernels degrade to the eager/Liger path. Gate the notice to ONCE per process.
-        global _MISSING_CHALK_LOGGED
-        if not _MISSING_CHALK_LOGGED:
-            _MISSING_CHALK_LOGGED = True
-            log.info(
-                "chalk gap-filling kernels are default-on but freesolo-chalk is not installed "
-                "(set FLASH_CHALK_SPEC to an installable spec on the worker); using eager/Liger."
-            )
+        # chalk is installed by default (PyPI; chalk_extra_pip), so this only fires if an install
+        # was disabled/failed. Always safe: the kernels degrade to the eager/Liger path. Only the
+        # post-build call reaches this import (the pre-build pass returns early), so it logs at most
+        # once per run — no per-process dedup needed.
+        log.info(
+            "freesolo-chalk is not installed on this worker (set FLASH_CHALK_SPEC to an installable "
+            "spec, or check the default PyPI install); chalk kernels off, using eager/Liger."
+        )
         return {}
     except Exception as e:
         # A partially-installed / version-incompatible chalk can raise non-ImportError errors at
