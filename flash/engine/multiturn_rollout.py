@@ -209,7 +209,6 @@ def build_rollout_func(
     stop: list[str] | None,
     thinking: bool,
     engine_max_len: int | None = None,
-    num_generations_attr: str = "num_generations",
 ):
     """Return a TRL ``rollout_func`` closure that drives ``active_env`` on the colocate engine.
 
@@ -224,7 +223,7 @@ def build_rollout_func(
 
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
-        num_gen = int(getattr(trainer, num_generations_attr, 1) or 1)
+        num_gen = int(getattr(trainer, "num_generations", 1) or 1)
 
         def generate(prefix_ids: list[int], max_tokens: int):
             sp = SamplingParams(

@@ -173,7 +173,7 @@ def list_instances() -> list[dict]:
     return inst if isinstance(inst, list) else []
 
 
-def instance_logs(instance_id: int, tail: int = 400, wait_s: float = 20.0) -> str | None:
+def instance_logs(instance_id: int) -> str | None:
     """Container log tail via the logs API (request -> poll the result URL).
 
     The only place early-bootstrap failures (pip/env errors before the worker can
@@ -184,13 +184,13 @@ def instance_logs(instance_id: int, tail: int = 400, wait_s: float = 20.0) -> st
         out = request_with_retries(
             f"/v0/instances/request_logs/{int(instance_id)}/",
             method="PUT",
-            body={"tail": str(int(tail))},
+            body={"tail": "400"},
             retries=1,
         )
         url = out.get("result_url") if isinstance(out, dict) else None
         if not url:
             return None
-        deadline = time.time() + wait_s
+        deadline = time.time() + 20.0
         while time.time() < deadline:
             try:
                 with urllib.request.urlopen(url, timeout=15) as resp:

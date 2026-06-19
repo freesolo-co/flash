@@ -509,7 +509,7 @@ def vllm_language_model_only_kwargs(model_id: str) -> dict:
     return {"language_model_only": True} if is_vl_checkpoint(model_id) else {}
 
 
-def _attn_impl_for_capability(major: int, minor: int) -> str | None:
+def _attn_impl_for_capability(major: int) -> str | None:
     """Map a CUDA compute capability to the trainer ``attn_implementation``.
 
     Attention uses PyTorch SDPA (its flash/efficient backend is already selected automatically
@@ -553,7 +553,7 @@ def optimal_attn_impl() -> str | None:
     except Exception as e:
         print("optimal_attn_impl probe failed:", e)
         return None
-    impl = _attn_impl_for_capability(major, minor)
+    impl = _attn_impl_for_capability(major)
     if impl:
         print(f"[attn] sm{major}{minor} -> attn_implementation={impl}")
     return impl
@@ -2273,13 +2273,13 @@ def gpu_diagnostics() -> dict:
     return diag
 
 
-def wait_for_gpu(max_tries=12, sleep_s=10):
+def wait_for_gpu():
     """Rented nodes sometimes report 'CUDA device not ready' transiently at startup.
     Poll a trivial CUDA op until it succeeds before doing real work; raise if never ready."""
     import time as _t
 
     last = None
-    for i in range(max_tries):
+    for i in range(12):
         try:
             import torch
 
@@ -2292,9 +2292,9 @@ def wait_for_gpu(max_tries=12, sleep_s=10):
             last = "cuda not available"
         except Exception as e:
             last = str(e)[:160]
-        print(f"GPU not ready (try {i + 1}/{max_tries}): {last}; sleeping {sleep_s}s")
-        _t.sleep(sleep_s)
-    raise RuntimeError(f"GPU never became ready after {max_tries} tries: {last}")
+        print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
+        _t.sleep(10)
+    raise RuntimeError(f"GPU never became ready after 12 tries: {last}")
 
 
 def free_gpu(trainer=None):
@@ -2316,14 +2316,14 @@ def free_gpu(trainer=None):
         print("free_gpu warn:", e)
 
 
-def _metric_curve(trainer, key: str, cap: int = 400) -> list:
+def _metric_curve(trainer, key: str) -> list:
     """The logged values of `key` (e.g. 'loss' or 'reward') from the trainer's log history,
     rounded + capped. Lets metrics.json carry the convergence/reward curve for an A/B without
     relying on a checkpoint's trainer_state.json (only written on save_steps) or the console
     (only uploaded on failure). Never raises."""
     try:
         vals = [round(float(h[key]), 4) for h in trainer.state.log_history if key in h]
-        return vals[:cap]
+        return vals[:400]
     except Exception:
         return []
 
@@ -2376,7 +2376,7 @@ def write_train_meta(
             "job_spec": JOB_SPEC.to_dict() if JOB_SPEC else None,
         },
     )
-    _finalize(m, adapter_dir)
+    _finalize(m)
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
@@ -2395,7 +2395,7 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
     return adir if os.path.isdir(adir) else None
 
 
-def _finalize(metrics: RunMetrics, adapter_dir: str):
+def _finalize(metrics: RunMetrics):
     metrics.save("/tmp/metrics.json")
     # Required: a swallowed upload would make the control plane fail/retry a finished run.
     hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)

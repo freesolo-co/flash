@@ -84,7 +84,7 @@ def _deploy_lock(run_id: str) -> _RunLock:
         return lk
 
 
-def recover_runs(log=None) -> None:
+def recover_runs() -> None:
     """Re-attach to in-flight runs after a server restart (per-run daemon threads)."""
     from flash.runner import _gc_run_endpoints, _update, attach_run, resume_run
 
@@ -203,7 +203,7 @@ def create_app():
     def create_run(payload: dict, key: dict = Depends(require_key)):
         spec = _parse_spec(payload, run_id=new_run_id())
         dry_run = bool(payload.get("dry_run", False))
-        db.record_run(spec.run_id, key["id"], kind="train")
+        db.record_run(spec.run_id, key["id"])
         try:
             status = submit_job(spec, dry_run=dry_run, background=True)
         except Exception as exc:

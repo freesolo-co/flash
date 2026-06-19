@@ -31,8 +31,8 @@ CODE_ROOT = "/runcode"
 CODE_DIR = "/runcode/code"
 
 
-def load_payload(path: str = PAYLOAD_PATH) -> dict:
-    with open(path) as f:
+def load_payload() -> dict:
+    with open(PAYLOAD_PATH) as f:
         return json.load(f)
 
 

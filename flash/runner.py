@@ -81,8 +81,8 @@ class _RunCancelled(RuntimeError):
     """User cancellation observed mid-run; terminal, never retried/overwritten."""
 
 
-def new_run_id(prefix: str = "flash") -> str:
-    return f"{prefix}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+def new_run_id() -> str:
+    return f"flash-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
