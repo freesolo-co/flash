@@ -18,7 +18,7 @@ from .base import Environment
 
 # Manifest of installed verifiers / Prime Hub environments (written by `slm env install`).
 INSTALLED_MANIFEST = Path(
-    os.environ.get("AUTOSLM_ENVS_MANIFEST", str(Path.home() / ".flash" / "envs.json"))
+    os.environ.get("FLASH_ENVS_MANIFEST", str(Path.home() / ".flash" / "envs.json"))
 )
 
 

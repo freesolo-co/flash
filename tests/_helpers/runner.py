@@ -1,6 +1,6 @@
 """Shared ``fresh_runner`` helper.
 
-Reloads ``flash.runner`` with AUTOSLM_SKIP_NET unset and RUNS_DIR/RESULTS_DIR
+Reloads ``flash.runner`` with FLASH_SKIP_NET unset and RUNS_DIR/RESULTS_DIR
 redirected under a tmp dir — the reload+monkeypatch dance the audit found duplicated
 across the orchestrator/jobs tests.
 """
@@ -14,11 +14,11 @@ import os
 def fresh_runner(tmp, monkeypatch):
     """Reload ``flash.runner`` for the network-shaped submit/poll path with mocks.
 
-    Unsets AUTOSLM_SKIP_NET (monkeypatch auto-restores it) and redirects the fixed
+    Unsets FLASH_SKIP_NET (monkeypatch auto-restores it) and redirects the fixed
     RUNS_DIR/RESULTS_DIR module constants under ``tmp`` via monkeypatch so they're
     restored after the test (the module object is shared, so a bare assignment leaks).
     """
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     import flash.runner as runner
 
     importlib.reload(runner)
