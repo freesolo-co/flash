@@ -24,23 +24,23 @@ def _spec():
 
 
 def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
-    """DEFECT: RL_VLLM_GPU_UTIL / RL_PER_DEVICE_PROMPTS (and the others) were never added to
-    the forward list, so the docs' OOM-fix advice couldn't reach the worker."""
+    """Genuine runtime tuning knobs (not in the spec) reach the worker via the allowlist."""
     from flash.providers.runpod.train import build_worker_env
 
     knobs = {
         "RL_VLLM_GPU_UTIL": "0.40",
         "RL_VLLM_SLEEP": "1",
-        "RL_PER_DEVICE_PROMPTS": "2",
         "VLLM_USE_V1": "0",
         "SFT_PER_DEVICE_BS": "4",
     }
     for k, v in knobs.items():
         monkeypatch.setenv(k, v)
+    monkeypatch.setenv("RL_PER_DEVICE_PROMPTS", "2")
 
     env = build_worker_env(_spec(), 0)
     for k, v in knobs.items():
         assert env.get(k) == v, f"{k} not forwarded to worker"
+    assert "RL_PER_DEVICE_PROMPTS" not in env  # default + auto-caps only
     # fragmentation-safe allocator default is always set
     assert "PYTORCH_CUDA_ALLOC_CONF" in env
 
@@ -53,21 +53,16 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
 
 
-def test_build_worker_env_forwards_midrun_eval_knobs(monkeypatch):
-    """The periodic mid-run eval knobs are read via os.environ on the worker, so they MUST be
-    on the forward allowlist or the feature silently no-ops on every remote run (RunPod + Vast,
-    which reuses this same build_worker_env)."""
+def test_build_worker_env_does_not_forward_midrun_eval_knobs(monkeypatch):
+    """The mid-run eval cadence comes from the run spec ([train] eval_every_steps), not env, so the
+    old FLASH_EVAL_* operator overrides are NOT forwarded to the worker."""
     from flash.providers.runpod.train import build_worker_env
 
-    knobs = {
-        "FLASH_EVAL_EVERY_STEPS": "20",
-        "FLASH_EVAL_NUM": "16",
-    }
-    for k, v in knobs.items():
-        monkeypatch.setenv(k, v)
+    for k in ("FLASH_EVAL_EVERY_STEPS", "FLASH_EVAL_NUM"):
+        monkeypatch.setenv(k, "20")
     env = build_worker_env(_spec(), 0)
-    for k, v in knobs.items():
-        assert env.get(k) == v, f"{k} not forwarded to worker"
+    for k in ("FLASH_EVAL_EVERY_STEPS", "FLASH_EVAL_NUM"):
+        assert k not in env, f"{k} should no longer be forwarded (cadence comes from the spec)"
 
 
 def test_build_worker_env_forwards_heartbeat_throttle(monkeypatch):

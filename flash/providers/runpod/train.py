@@ -174,19 +174,8 @@ def upload_code(repo: str | None = None) -> str:
     token = os.environ.get("HF_TOKEN")
     pkg_dir = os.path.dirname(os.path.abspath(flash.__file__))
     api = HfApi(token=token)
-    # Worker pulls code/** by HTTP; HF FREE-TIER accounts cannot serve PRIVATE dataset
-    # downloads (worker gets 403), so operators on a free tier must publish artifact repos
-    # public. Default private (paid-tier safe); set FLASH_HF_REPO_PRIVATE=0 to create public.
-    private = os.environ.get("FLASH_HF_REPO_PRIVATE", "1") not in ("0", "false", "False")
-    api.create_repo(repo, repo_type="dataset", exist_ok=True, private=private)
-    # create_repo(exist_ok=True) is a no-op on an EXISTING repo, so it never flips a repo that
-    # already exists private back to public. When the operator wants public (free-tier: workers
-    # 403 on private downloads), force visibility explicitly so a reused private repo is fixed.
-    if not private:
-        try:
-            api.update_repo_settings(repo_id=repo, repo_type="dataset", private=False)
-        except Exception as e:
-            logger.warning("could not ensure %s is public (free-tier worker may 403): %s", repo, e)
+    # Run artifact repos are always private (they carry run code, adapters, and metrics).
+    api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True)
     api.upload_folder(
         folder_path=pkg_dir,
         path_in_repo="code/flash",
@@ -272,19 +261,14 @@ def _train_body(input_data: dict) -> dict:
 
     env = dict(os.environ)
     env.update(overrides)
-    # A large job_spec_json (e.g. many inline params/dataset refs) can blow past the
-    # ~128 KiB per-env-string exec limit ("Argument list too long"). Pass a large spec
-    # via a file (FLASH_JOB_SPEC_PATH); keep the inline env var for small specs.
-    # load_job_spec_from_env reads either.
-    spec_json = input_data["job_spec_json"]
-    if len(spec_json) > 96_000:
-        spec_path = "/tmp/job_spec.json"
-        with open(spec_path, "w") as sf:
-            sf.write(spec_json)
-        env["FLASH_JOB_SPEC_PATH"] = spec_path
-        env.pop("FLASH_JOB_SPEC_JSON", None)
-    else:
-        env["FLASH_JOB_SPEC_JSON"] = spec_json
+    # Always pass the spec via a file (FLASH_JOB_SPEC_PATH): a large inline spec can blow past the
+    # ~128 KiB per-env-string exec limit ("Argument list too long"), and a file is ONE code path for
+    # every size (cheap write). load_job_spec_from_env reads it.
+    spec_path = "/tmp/job_spec.json"
+    with open(spec_path, "w") as sf:
+        sf.write(input_data["job_spec_json"])
+    env["FLASH_JOB_SPEC_PATH"] = spec_path
+    env.pop("FLASH_JOB_SPEC_JSON", None)
     env["PHASE"] = input_data["phase"]
     env["SEED"] = str(input_data["seed"])
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -752,20 +736,13 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # volume instead of per run).
     if getattr(spec.gpu, "network_volume", None):
         env["HF_HOME"] = "/runpod-volume/hf-cache"
-    if spec.train.steps is not None:
-        env["RL_STEPS"] = str(spec.train.steps)
-    if spec.train.epochs is not None:
-        env["SFT_EPOCHS"] = str(spec.train.epochs)
-    # Forward the documented worker-tuning knobs so they actually reach the GPU worker.
-    # RL_VLLM_GPU_UTIL / RL_PER_DEVICE_PROMPTS are the colocate-memory knobs the docs tell
-    # users to set to fix vLLM OOM/KV-cache errors; they were previously dropped here.
+    # Forward operator/runtime tuning knobs to the GPU worker.
     for k in (
         "SFT_PER_DEVICE_BS",
         "SFT_PACKING",
         # Colocate-memory knobs the docs tell users to set to fix vLLM OOM / KV-cache errors.
         "RL_VLLM_GPU_UTIL",
         "RL_VLLM_SLEEP",
-        "RL_PER_DEVICE_PROMPTS",
         "VLLM_USE_V1",
         # Attention-backend escape hatch: vllm's bundled flash-attn PTX can be newer
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
@@ -775,12 +752,6 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "WANDB_API_KEY",
         "WANDB_ENTITY",
         "LORA_TARGETS",
-        # Periodic mid-run GRPO eval (engine/midrun_eval.eval_config): the cadence normally comes
-        # from the run's [train] eval_every_steps; FLASH_EVAL_EVERY_STEPS is an operator override
-        # (>0 enables), and FLASH_EVAL_NUM is a safety cap on held-out rows per eval. Everything
-        # else (eval set, grading, completion budget, threshold) comes from the environment/run.
-        "FLASH_EVAL_EVERY_STEPS",
-        "FLASH_EVAL_NUM",
         # rl_step heartbeat-upload throttle (engine.worker._hb_min_interval_s). Operators raise this
         # to stay under HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO
         # runs share one HF_REPO; the worker no-op's a non-positive/unparseable value back to 60s.

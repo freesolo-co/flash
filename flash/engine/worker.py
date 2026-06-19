@@ -1004,13 +1004,13 @@ def run_sft():
     setup_seconds = time.time() - t_start
     heartbeat("sft_model_load", setup_seconds=setup_seconds)
 
-    default_epochs = (
+    # Epochs come from the run's [train] epochs (already in JOB_SPEC), else the recipe default.
+    epochs = int(
         JOB_SPEC.train.epochs
         if JOB_SPEC and JOB_SPEC.train.epochs is not None
         else RECIPE.sft.num_epochs
     )
-    epochs = int(os.environ.get("SFT_EPOCHS", str(default_epochs)))
-    # SDK [train] knobs override the recipe default; an operator env var still wins last.
+    # SDK [train] knobs override the recipe default.
     _t = JOB_SPEC.train if JOB_SPEC else None
     per_device_bs = int(os.environ.get("SFT_PER_DEVICE_BS", "4"))
     # batch_size is the GLOBAL/effective batch: grad-accum is sized to reach it. Cap the
@@ -1299,7 +1299,7 @@ def rl_per_device_comps(
     a small card). So we MEMORY-CAP per_device to a logits budget (RL_LOGITS_BUDGET_GB,
     default 6) for the given completion length, then push the difference into grad-accum
     (compute_grpo_batching) so the effective batch is unchanged. This keeps long-completion
-    GRPO on a cheaper GPU. RL_PER_DEVICE_PROMPTS forces an explicit value.
+    GRPO on a cheaper GPU.
 
     The logits budget is NOT the whole story: the per-device forward also holds the model's
     attention/activation memory (the Qwen3.5 GDN/FLA kernels peak per micro-batch even with
@@ -1310,10 +1310,8 @@ def rl_per_device_comps(
     TRAINS at 4. So for colocate, additionally cap per_device to the live card's VRAM scaled
     by model width (~sqrt(params)): ~vram_gb/8 at 2B-width, tightened for wider models (4B/9B).
     """
-    base = int(os.environ.get("RL_PER_DEVICE_PROMPTS", "2" if THINKING else "8"))
-    if "RL_PER_DEVICE_PROMPTS" in os.environ:
-        # Explicit operator force (A/B knob): bypass BOTH auto-caps -- they own the OOM risk.
-        return max(1, base)
+    # Default prompts/step; the auto-caps below (logits budget + colocate VRAM/width) handle OOM.
+    base = 2 if THINKING else 8
     if completion_len > 0:
         budget = float(os.environ.get("RL_LOGITS_BUDGET_GB", "6")) * 1e9
         cap = max(1, int(budget / (max(1, completion_len) * vocab * 4)))
@@ -1371,7 +1369,7 @@ def _maybe_attach_periodic_eval(
     max_turns: int,
 ):
     """Attach periodic mid-run eval to the GRPO trainer when enabled — the run's
-    ``[train] eval_every_steps`` (or the ``FLASH_EVAL_EVERY_STEPS`` operator override) > 0.
+    ``[train] eval_every_steps`` > 0.
 
     Returns the ``PeriodicEval`` (so the caller can persist its ``history`` into metrics.json),
     or ``None`` when eval is disabled/unsupported for this run.
@@ -1598,7 +1596,10 @@ def run_rl():
     quant = model_quant(model_id)
     download_seconds = prefetch_model(model_id)
     rl = RECIPE.rl
-    steps = int(os.environ.get("RL_STEPS", str(rl.num_steps)))
+    # Steps come from the run's [train] steps (already in JOB_SPEC), else the recipe default.
+    steps = int(
+        JOB_SPEC.train.steps if JOB_SPEC and JOB_SPEC.train.steps is not None else rl.num_steps
+    )
     # Throughput/quality knobs (env-overridable): the number of prompts optimized per step,
     # completions per prompt, and whether vLLM offloads weights between steps. Sleep mode
     # frees memory for the optimizer but reloads ~weights each step (a large per-step cost);
@@ -1767,7 +1768,7 @@ def run_rl():
     per_device_comps = rl_per_device_comps(_max_completion, use_vllm=use_vllm, params_b=_params_b)
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
-        print("WARN: generation batch not divisible by group size; check RL_PER_DEVICE_PROMPTS")
+        print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
     print(
         f"[rl] GRPO batching: per_device={batching['per_device_train_batch_size']} "
         f"grad_accum={batching['gradient_accumulation_steps']} "
@@ -1997,8 +1998,8 @@ def run_rl():
         callbacks=[hb_cb, make_checkpoint_upload_callback()],
         **extra_trainer_kwargs,
     )
-    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or FLASH_EVAL_EVERY_STEPS,
-    # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
+    # Opt-in periodic mid-run eval (the run's [train] eval_every_steps > 0): greedy eval on a
+    # held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
     # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.
     periodic_eval = _maybe_attach_periodic_eval(
         trainer,
