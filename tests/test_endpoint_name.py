@@ -1,6 +1,6 @@
 """Regression test: Flash train endpoints must be uniquely named per run.
 
-Bug: every run created a Flash endpoint with the fixed name ``autoslm-train-<gpu>``. When a
+Bug: every run created a Flash endpoint with the fixed name ``flash-<gpu>``. When a
 prior run's endpoint was still registered, runpod_flash's ``get_or_deploy_resource`` tried
 to *update* it and RunPod rejected it with ``GraphQL errors: Template name must be unique``,
 so back-to-back runs (e.g. a sequential benchmark) failed to launch. There is no endpoint
@@ -9,21 +9,21 @@ GC/reuse, so the fix is a per-run unique endpoint name.
 
 from __future__ import annotations
 
-from autoslm.providers.runpod.train import _run_suffix, endpoint_name
+from flash.providers.runpod.train import _run_suffix, endpoint_name
 
 
 def test_endpoint_name_default():
-    assert endpoint_name("RTX 5090") == "autoslm-train-5090"
-    assert endpoint_name("RTX 4090") == "autoslm-train-4090"
+    assert endpoint_name("RTX 5090") == "flash-5090"
+    assert endpoint_name("RTX 4090") == "flash-4090"
 
 
 def test_endpoint_name_unique_per_run():
-    a = endpoint_name("RTX 5090", _run_suffix("autoslm-1780837378-c220526e"))
-    b = endpoint_name("RTX 5090", _run_suffix("autoslm-1780840000-deadbeef"))
-    assert a.startswith("autoslm-train-5090-")
+    a = endpoint_name("RTX 5090", _run_suffix("flash-1780837378-c220526e"))
+    b = endpoint_name("RTX 5090", _run_suffix("flash-1780840000-deadbeef"))
+    assert a.startswith("flash-5090-")
     assert a != b, "different runs must get different endpoint names (no template collision)"
     # deterministic: same run_id -> same name (a retry reuses its own endpoint)
-    assert a == endpoint_name("RTX 5090", _run_suffix("autoslm-1780837378-c220526e"))
+    assert a == endpoint_name("RTX 5090", _run_suffix("flash-1780837378-c220526e"))
     # COLLISION FIX: run_ids sharing a trailing segment (e.g. both end in the card name) must
     # NOT collide onto one endpoint -- the old split("-")[-1] bug caused stale-config reuse.
     c = endpoint_name("RTX 5090", _run_suffix("val-9b-grpo-s4096-a100"))
@@ -34,7 +34,7 @@ def test_endpoint_name_unique_per_run():
 def test_endpoint_name_sanitizes_suffix():
     # only alnum/hyphen survive; bounded length
     name = endpoint_name("RTX 5090", "weird/sufx with spaces!!")
-    assert name.startswith("autoslm-train-5090-")
+    assert name.startswith("flash-5090-")
     tail = name.rsplit("-", 1)[-1]
     assert tail.isalnum()
     assert len(tail) <= 24
@@ -42,4 +42,4 @@ def test_endpoint_name_sanitizes_suffix():
 
 def test_run_suffix_none_safe():
     assert _run_suffix(None) is None
-    assert endpoint_name("RTX 5090", _run_suffix(None)) == "autoslm-train-5090"
+    assert endpoint_name("RTX 5090", _run_suffix(None)) == "flash-5090"

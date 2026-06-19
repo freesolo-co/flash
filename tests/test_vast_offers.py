@@ -43,8 +43,8 @@ FIXTURE = [
 
 
 def test_usable_offers_filters_and_order(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     captured = {}
 
@@ -72,8 +72,8 @@ def test_usable_offers_filters_and_order(monkeypatch):
 
 def test_usable_offers_community_opt_in(monkeypatch):
     """AUTOSLM_VAST_ALLOW_COMMUNITY=1 widens the gate to verified community hosts."""
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
     monkeypatch.setenv("AUTOSLM_VAST_ALLOW_COMMUNITY", "1")
@@ -83,8 +83,8 @@ def test_usable_offers_community_opt_in(monkeypatch):
 
 
 def test_usable_offers_vram_gate(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
     out = vast.usable_offers(32, disk_gb=60)
@@ -93,8 +93,8 @@ def test_usable_offers_vram_gate(monkeypatch):
 
 
 def test_usable_offers_exclude_machines(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     rows = [_offer(id=1, machine_id=7, dph_total=0.25), _offer(id=2, machine_id=8, dph_total=0.30)]
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: rows)

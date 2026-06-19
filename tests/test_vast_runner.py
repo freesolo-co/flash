@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from autoslm.spec import JobSpec
+from flash.spec import JobSpec
 
 
 def test_reliability_and_inet_floors_are_fixed_defaults(monkeypatch):
@@ -17,7 +17,7 @@ def test_reliability_and_inet_floors_are_fixed_defaults(monkeypatch):
     Mbps) — NOT operator-tunable. Setting the old AUTOSLM_VAST_MIN_* env vars has no effect."""
     import importlib
 
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import jobs as vast
 
     monkeypatch.setenv("AUTOSLM_VAST_MIN_RELIABILITY", "0.999")
     monkeypatch.setenv("AUTOSLM_VAST_MIN_INET_MBPS", "1000")
@@ -36,7 +36,7 @@ def _spec(**gpu_kw) -> JobSpec:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
-            "run_id": "autoslm-1700000000-abcd1234",
+            "run_id": "flash-1700000000-abcd1234",
             "train": {"epochs": 1, "seeds": [0], "hf_repo": "org/repo"},
             "gpu": gpu,
         }
@@ -53,7 +53,7 @@ def _offer_obj(offer_id=1, machine_id=10, gpu="RTX 3090", dph=0.25):
 # onstart + bootstrap
 # ---------------------------------------------------------------------------
 def test_onstart_ships_payload_and_bootstrap(monkeypatch):
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import jobs as vast
 
     monkeypatch.setenv("VAST_API_KEY", "vk-supersecret")
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-supersecret")
@@ -61,7 +61,7 @@ def test_onstart_ships_payload_and_bootstrap(monkeypatch):
     payload = vast.build_payload(_spec(), seed=0, attempt=1)
     assert payload["phase"] == "sft"
     assert payload["attempt"] == 1
-    assert payload["hf_prefix"] == "sft/autoslm-1700000000-abcd1234/seed0"
+    assert payload["hf_prefix"] == "sft/flash-1700000000-abcd1234/seed0"
     assert payload["max_wall_s"] == 3600
 
     script = vast.build_onstart(payload, install_deps=True)
@@ -78,7 +78,7 @@ def test_onstart_ships_payload_and_bootstrap(monkeypatch):
     # crash), holding the box for log retrieval — mirrors the bootstrap-failure path.
     assert "base worker dependency install failed" in script
     pip_idx = script.index("pip install")
-    boot_idx = script.index("/root/autoslm/bootstrap.py\n")  # the run, not the heredoc write
+    boot_idx = script.index("/root/flash/bootstrap.py\n")  # the run, not the heredoc write
     guard_idx = script.index("base worker dependency install failed")
     assert pip_idx < guard_idx < boot_idx, "guard must sit between base pip and bootstrap run"
     assert "pip install" not in vast.build_onstart(payload, install_deps=False).replace(
@@ -99,7 +99,7 @@ def test_build_payload_carries_per_run_hf_repo(monkeypatch):
     """The submit payload's hf_repo is the run's [train] hf_repo (there is no operator HF_REPO
     fallback). The worker fetches code + writes artifacts to this repo, its env's HF_REPO must
     match the payload's, and an operator HF_REPO in the env must NOT leak in."""
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import jobs as vast
 
     # an operator HF_REPO in the control-plane env must be ignored
     monkeypatch.setenv("HF_REPO", "operator/default")
@@ -107,7 +107,7 @@ def test_build_payload_carries_per_run_hf_repo(monkeypatch):
         {
             "model": "Qwen/Qwen3-0.6B",
             "algorithm": "sft",
-            "run_id": "autoslm-1700000000-abcd1234",
+            "run_id": "flash-1700000000-abcd1234",
             "train": {"epochs": 1, "seeds": [0], "hf_repo": "myorg/runs"},
             "gpu": {"type": "RTX 3090", "provider": "vast", "max_wall_seconds": 3600},
         }
@@ -118,7 +118,7 @@ def test_build_payload_carries_per_run_hf_repo(monkeypatch):
 
 
 def _bootstrap_env(monkeypatch, phase="sft", rcs=(0,), metrics=True):
-    from autoslm.providers.vast import _bootstrap as vb
+    from flash.providers.vast import _bootstrap as vb
 
     calls: list[str] = []
     markers: list[tuple[bool, str]] = []
@@ -167,7 +167,7 @@ def test_bootstrap_fails_without_metrics(monkeypatch):
 
 def _bootstrap_with_hub_env(monkeypatch, prime_present):
     """Drive _bootstrap.main() with one Prime Hub env to install, recording subprocess cmds."""
-    from autoslm.providers.vast import _bootstrap as vb
+    from flash.providers.vast import _bootstrap as vb
 
     cmds: list[list[str]] = []
     monkeypatch.setattr(
@@ -228,8 +228,8 @@ def test_bootstrap_installs_prime_when_missing(monkeypatch):
 # deploy_and_submit: live-market offer walk
 # ---------------------------------------------------------------------------
 def test_deploy_walks_taken_offers(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     attempts = []
@@ -247,12 +247,12 @@ def test_deploy_walks_taken_offers(monkeypatch):
     assert h.instance_id == 9999
     assert h.offer_id == 3
     assert h.gpu == "RTX 3090"
-    assert h.label == "autoslm-1700000000-abcd1234-s0-a2"
+    assert h.label == "flash-1700000000-abcd1234-s0-a2"
 
 
 def test_deploy_refreshes_once_when_all_taken(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     created = []
@@ -276,8 +276,8 @@ def test_deploy_refresh_excludes_blacklisted_machines(monkeypatch):
     """Fix #3: the in-provider offer REFRESH must keep the run's blacklisted machines
     excluded — otherwise a sick machine the orchestrator just blacklisted can be
     re-selected from the fresh market."""
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     captured = {}
@@ -308,8 +308,8 @@ def test_deploy_refresh_uses_disk_floor(monkeypatch):
     """Fix #2: both the initial and refresh offer searches use the same effective disk
     floor create_instance enforces (max(disk_gb, 60)); a spec asking <60 GB must NOT
     surface offers that then fail to rent."""
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     captured = {}
@@ -331,8 +331,8 @@ def test_deploy_refresh_uses_disk_floor(monkeypatch):
 
 
 def test_deploy_raises_when_pool_exhausted(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     monkeypatch.setenv("HF_REPO", "org/repo")
     monkeypatch.setattr(
@@ -352,8 +352,8 @@ def test_deploy_raises_when_pool_exhausted(monkeypatch):
 # ---------------------------------------------------------------------------
 def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, step=10.0):
     """Mock the instance status sequence + the HF artifact readers + the clock."""
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     seq = iter(instances)
     last = {"inst": None}
@@ -385,13 +385,13 @@ def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, ste
 
 
 def _handle(started_ts=10_000.0, rate=0.25):
-    from autoslm.providers.vast.jobs import VastJobHandle
+    from flash.providers.vast.jobs import VastJobHandle
 
     return VastJobHandle(
         instance_id=9999,
         offer_id=1,
         machine_id=10,
-        label="autoslm-x-s0-a0",
+        label="flash-x-s0-a0",
         gpu="RTX 3090",
         hourly_usd=rate,
         attempt=0,
@@ -507,9 +507,9 @@ def test_poll_client_deadline(monkeypatch):
 # the cost-safety invariant: every exit path destroys the instance
 # ---------------------------------------------------------------------------
 def _wire_runner(monkeypatch, poll_outcome):
-    from autoslm.providers.base import PollResult
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.base import PollResult
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
@@ -525,7 +525,7 @@ def _wire_runner(monkeypatch, poll_outcome):
 
 
 def test_runner_destroys_on_success(monkeypatch):
-    from autoslm.providers.base import PollResult
+    from flash.providers.base import PollResult
 
     vast, destroyed, _ = _wire_runner(monkeypatch, PollResult(True, metrics={"a": 1}))
     handles = []
@@ -538,7 +538,7 @@ def test_runner_destroys_on_success(monkeypatch):
 
 
 def test_runner_destroys_on_failure_and_exception(monkeypatch):
-    from autoslm.providers.base import PollResult
+    from flash.providers.base import PollResult
 
     vast, destroyed, _ = _wire_runner(monkeypatch, PollResult(False, failure="stalled"))
     res = vast.submit_run_vast(_spec(), seed=0, offers=[_offer_obj()])
@@ -566,22 +566,22 @@ def test_runner_destroys_when_handle_persist_fails(monkeypatch):
 
 
 def test_instance_label_always_sweepable():
-    from autoslm.providers.vast.jobs import instance_label
+    from flash.providers.vast.jobs import instance_label
 
     # platform run ids pass through; anything else gets the prefix FORCED so the
     # orphan sweep can never miss an instance we rented (live incident: a unit
     # test's "fail-fast" run id produced unsweepable labels)
-    assert instance_label("autoslm-1700-abcd", 0, 1) == "autoslm-1700-abcd-s0-a1"
-    assert instance_label("fail-fast", 0, 0) == "autoslm-fail-fast-s0-a0"
+    assert instance_label("flash-1700-abcd", 0, 1) == "flash-1700-abcd-s0-a1"
+    assert instance_label("fail-fast", 0, 0) == "flash-fail-fast-s0-a0"
 
 
 def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     instances = [
-        {"id": 1, "label": "autoslm-fail-fast-s0-a0"},  # forced-prefix label
-        {"id": 2, "label": "autoslm-other-run-s0-a0"},  # different run -> keep
+        {"id": 1, "label": "flash-fail-fast-s0-a0"},  # forced-prefix label
+        {"id": 2, "label": "flash-other-run-s0-a0"},  # different run -> keep
     ]
     destroyed = []
     monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
@@ -591,7 +591,7 @@ def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
 
 
 def test_handle_roundtrip():
-    from autoslm.providers.vast.jobs import VastJobHandle
+    from flash.providers.vast.jobs import VastJobHandle
 
     h = _handle()
     d = h.to_dict()
@@ -600,26 +600,26 @@ def test_handle_roundtrip():
 
 
 def test_run_label_prefix_matches_instance_label():
-    """Fix #8: run_label_prefix applies the SAME forced-`autoslm-` transform the labels
+    """Fix #8: run_label_prefix applies the SAME forced-`flash-` transform the labels
     carry, so the orphan-sweep allowlist (built from raw run ids) actually matches."""
-    from autoslm.providers.vast.jobs import instance_label, run_label_prefix
+    from flash.providers.vast.jobs import instance_label, run_label_prefix
 
     # a raw run id (no prefix) -> the prefix its labels start with IS prefixed
-    assert run_label_prefix("fail-fast") == "autoslm-fail-fast"
+    assert run_label_prefix("fail-fast") == "flash-fail-fast"
     assert instance_label("fail-fast", 0, 0).startswith(run_label_prefix("fail-fast"))
     # an already-prefixed run id is idempotent
-    assert run_label_prefix("autoslm-1700-abcd") == "autoslm-1700-abcd"
-    assert instance_label("autoslm-1700-abcd", 1, 2).startswith(
-        run_label_prefix("autoslm-1700-abcd")
+    assert run_label_prefix("flash-1700-abcd") == "flash-1700-abcd"
+    assert instance_label("flash-1700-abcd", 1, 2).startswith(
+        run_label_prefix("flash-1700-abcd")
     )
 
 
 def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
-    """Fix #8: a live run whose RAW id lacks the `autoslm-` prefix is still protected —
+    """Fix #8: a live run whose RAW id lacks the `flash-` prefix is still protected —
     sweep_orphans transforms active ids through run_label_prefix before matching, so its
     forced-prefix instance label is not swept."""
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     instances = [
         {"id": 1, "label": vast.instance_label("fail-fast", 0, 0)},  # live run -> KEEP
@@ -635,49 +635,49 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
 
 
 def test_sweep_orphans_label_safety(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     instances = [
-        {"id": 1, "label": "autoslm-1700-aaaa-s0-a0"},  # orphan -> destroy
-        {"id": 2, "label": "autoslm-1700-bbbb-s0-a1"},  # active run -> keep
+        {"id": 1, "label": "flash-1700-aaaa-s0-a0"},  # orphan -> destroy
+        {"id": 2, "label": "flash-1700-bbbb-s0-a1"},  # active run -> keep
         {"id": 3, "label": "someone-elses-workload"},  # not ours -> NEVER touch
         {"id": 4, "label": ""},  # unlabeled -> NEVER touch
     ]
     destroyed = []
     monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
-    out = vast.sweep_orphans(active_labels={"autoslm-1700-bbbb"})
+    out = vast.sweep_orphans(active_labels={"flash-1700-bbbb"})
     assert out == [1]
     assert destroyed == [1]
 
 
 def test_sweep_orphans_prefix_is_not_shielded_by_a_longer_run_id(monkeypatch):
     """A live run id that is a STRING prefix of another run id must not shield the other
-    run's orphan. ``autoslm-100`` is a prefix of ``autoslm-1000-...`` but they are
+    run's orphan. ``flash-100`` is a prefix of ``flash-1000-...`` but they are
     distinct runs; the match has to land on the ``-s`` seed boundary, not raw startswith."""
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     instances = [
-        {"id": 1, "label": vast.instance_label("autoslm-100", 0, 0)},  # live run -> KEEP
-        {"id": 2, "label": vast.instance_label("autoslm-1000", 0, 0)},  # orphan -> destroy
+        {"id": 1, "label": vast.instance_label("flash-100", 0, 0)},  # live run -> KEEP
+        {"id": 2, "label": vast.instance_label("flash-1000", 0, 0)},  # orphan -> destroy
     ]
     # Sanity: the orphan's label really does start with the live run's prefix as a raw
     # string, so the old ``startswith`` would have wrongly shielded it.
-    assert instances[1]["label"].startswith(vast.run_label_prefix("autoslm-100"))
+    assert instances[1]["label"].startswith(vast.run_label_prefix("flash-100"))
     destroyed = []
     monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
-    out = vast.sweep_orphans(active_labels={"autoslm-100"})
+    out = vast.sweep_orphans(active_labels={"flash-100"})
     assert out == [2]  # only the genuine orphan; the prefix-collision run is left alone
 
 
 def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
     """The offers=None fallback indexes GPU_INFO by concrete class; a policy word
     ("cheapest"/"auto") must fail with a clear error, not an opaque KeyError."""
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
 
     spec = _spec(type="cheapest")
     with pytest.raises(vast_api.VastApiError, match="concrete gpu class"):

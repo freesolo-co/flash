@@ -1,13 +1,13 @@
 """Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the
 `slm` CLI and consumes its run-id / run-state / metrics outputs. This asserts that
-the autoslm side of that seam still provides what the agent depends on.
+the flash side of that seam still provides what the agent depends on.
 
 The agent package lives in a sibling folder (../agent/src) that is NOT installed in
-the autoslm venv, so we add it to sys.path here (mirroring how the existing
+the flash venv, so we add it to sys.path here (mirroring how the existing
 end-to-end tests import across packages). When that import can't resolve, the
-agent-side assertions are skipped rather than failing the autoslm suite.
+agent-side assertions are skipped rather than failing the flash suite.
 
-Run: cd autoslm && AUTOSLM_SKIP_NET=1 .venv/bin/python -m pytest \
+Run: cd flash && AUTOSLM_SKIP_NET=1 .venv/bin/python -m pytest \
         tests/test_agent_slm_cli_contract.py -q
 """
 
@@ -33,9 +33,9 @@ def _import_agent(modpath: str):
     return mod
 
 
-# --- autoslm side (always importable in the autoslm venv) ---------------------
-from autoslm.cli.main import main
-from autoslm.runner import (
+# --- flash side (always importable in the flash venv) ---------------------
+from flash.cli.main import main
+from flash.runner import (
     TERMINAL_STATES,
     get_status,
     new_run_id,
@@ -98,7 +98,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
     prints (see codex/outputs.py run_id field), so this asserts those keys exist with
     a real run id and a `dry_run` state — fully offline.
     """
-    config = tmp_path / "autoslm_grpo.toml"
+    config = tmp_path / "flash_grpo.toml"
     config.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "grpo"\n'
@@ -125,21 +125,21 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
 # --- new_run_id format vs the agent's run-id expectations ---------------------
 
 def test_new_run_id_format_is_filesystem_safe_and_stable() -> None:
-    """autoslm.runner.new_run_id() must stay within the safe run-id alphabet (it flows
+    """flash.runner.new_run_id() must stay within the safe run-id alphabet (it flows
     into filesystem paths AND into the agent's tracker as best_run_id/run_id). The
-    agent resolves the autoslm run id from the tracker (workflows.common
+    agent resolves the flash run id from the tracker (workflows.common
     .training_run_id_from_tracker) and threads it back into its output schema, so the
     id has to survive a string round-trip and the path-containment check.
     """
     rid = new_run_id()
     # default prefix + epoch + 8 hex chars
-    assert re.fullmatch(r"autoslm-\d+-[0-9a-f]{8}", rid), rid
+    assert re.fullmatch(r"flash-\d+-[0-9a-f]{8}", rid), rid
     # The runner's own path-safety gate must accept it (no traversal characters).
     assert require_safe_run_id(rid) == rid
 
 
 def test_agent_tracker_run_id_round_trips_through_resolver(tmp_path: Path) -> None:
-    """End-to-end of the run-id seam: an autoslm run id written into the agent's
+    """End-to-end of the run-id seam: an flash run id written into the agent's
     progress.json tracker (as best_run_id) must be read back unchanged by the agent's
     resolve_training_run_id, and reflected into the summary JSON. This is exactly the
     flow `slm train` -> tracker -> agent output uses, so a change to either the id
@@ -165,14 +165,14 @@ def test_agent_tracker_run_id_round_trips_through_resolver(tmp_path: Path) -> No
     assert json.loads(summary_out)["run_id"] == rid
 
 
-def test_agent_terminal_states_subset_of_autoslm_terminal_states() -> None:
+def test_agent_terminal_states_subset_of_flash_terminal_states() -> None:
     """The agent waits for a run to reach a terminal state before reading final
-    metrics. autoslm.runner.TERMINAL_STATES is the source of truth; the CLI's
+    metrics. flash.runner.TERMINAL_STATES is the source of truth; the CLI's
     _CLI_DONE_STATES (what `slm`/the agent polls until) must be a superset and must
-    include every autoslm terminal state, or the agent could poll forever on a state
+    include every flash terminal state, or the agent could poll forever on a state
     the CLI never treats as done.
     """
-    from autoslm.cli import main as cli_main
+    from flash.cli import main as cli_main
 
     assert TERMINAL_STATES <= cli_main._CLI_DONE_STATES
     # "done" is the success terminal the agent's verifier gates run_completed on.
@@ -186,7 +186,7 @@ def test_get_status_returns_fields_the_agent_reads(tmp_path, monkeypatch) -> Non
     persisted RunStatus exposes those keys so a field rename in RunStatus can't
     silently strip what the agent/CLI consume.
     """
-    from autoslm import runner
+    from flash import runner
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     rid = new_run_id()

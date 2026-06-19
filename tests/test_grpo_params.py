@@ -15,8 +15,8 @@ import sys
 
 import pytest
 
-from autoslm.schema import spec_from_dict
-from autoslm.spec import JobSpec
+from flash.schema import spec_from_dict
+from flash.spec import JobSpec
 
 
 class _Tok:
@@ -27,7 +27,7 @@ class _Tok:
 
 
 def test_think_token_count_counts_the_think_span() -> None:
-    import autoslm.engine.worker as w
+    import flash.engine.worker as w
 
     tok = _Tok()
     assert w.think_token_count("<think>a b c</think>the answer", tok) == 3
@@ -39,7 +39,7 @@ def test_think_token_count_counts_the_think_span() -> None:
 
 
 def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
-    import autoslm.engine.worker as w
+    import flash.engine.worker as w
 
     knobs = {
         "group_size": 4,
@@ -97,7 +97,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
 
 
 def test_train_grpo_knobs_parse_and_roundtrip() -> None:
-    from autoslm.schema import spec_from_dict
+    from flash.schema import spec_from_dict
 
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
@@ -141,7 +141,7 @@ def test_opt_int_float_reject_bools() -> None:
     _opt_int/_opt_float) rejects it, matching schema._opt_num."""
     import pytest
 
-    from autoslm.spec import _opt_float, _opt_int
+    from flash.spec import _opt_float, _opt_int
 
     for bad in (True, False):
         with pytest.raises(TypeError):
@@ -168,7 +168,7 @@ def test_opt_int_float_reject_bools() -> None:
 
 
 def test_verifiers_adapter_forwards_only_env_kwargs(monkeypatch) -> None:
-    # environment.params is forwarded to vf.load_environment WITHOUT autoslm-reserved
+    # environment.params is forwarded to vf.load_environment WITHOUT flash-reserved
     # keys (a stray grpo_config/mode/records/eval_* must be dropped, not passed through).
     import types
 
@@ -188,7 +188,7 @@ def test_verifiers_adapter_forwards_only_env_kwargs(monkeypatch) -> None:
     )
     monkeypatch.setitem(sys.modules, "verifiers", fake_vf)
 
-    from autoslm.envs import registry
+    from flash.envs import registry
 
     registry.load_environment(
         "owner/env",
@@ -233,7 +233,7 @@ def test_hf_repo_per_run_parses_and_validates() -> None:
     # [train] hf_repo is the REQUIRED per-run HF artifact repo (no operator HF_REPO default);
     # it must parse through schema (server) AND JobSpec.from_dict (worker), an absent value
     # must be rejected as required, and a malformed value must 400 at parse time.
-    from autoslm.schema import ConfigError
+    from flash.schema import ConfigError
 
     raw = {
         "model": "Qwen/Qwen3-0.6B",
@@ -319,7 +319,7 @@ def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
     """The per-device completion micro-batch caps to the fp32-logits budget: a short completion
     keeps the base (8), a long one (4096 tok x ~152k vocab x 4 B ~ 2.5 GB/unit) caps to fit the
     6 GB budget, pushing the rest into grad-accum. (CPU: the colocate VRAM cap is GPU-only.)"""
-    from autoslm.engine.worker import rl_per_device_comps
+    from flash.engine.worker import rl_per_device_comps
 
     monkeypatch.delenv("RL_PER_DEVICE_PROMPTS", raising=False)
     monkeypatch.delenv("THINKING", raising=False)
@@ -339,7 +339,7 @@ def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
 def test_optimizer_knob_validation_rejects_bad_values() -> None:
     # schema is the server's 400 layer: nonsensical/malformed knobs must raise
     # ConfigError at parse time, not TypeError (500) or a silently-misbehaving worker.
-    from autoslm.schema import ConfigError
+    from flash.schema import ConfigError
 
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
@@ -378,7 +378,7 @@ def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
     # steps/epochs must run through _train_int like every other integer knob: a
     # non-integer (e.g. steps=1.5) must 400 at parse time, not slip through to the
     # worker and crash int("1.5") AFTER a paid GPU is provisioned.
-    from autoslm.schema import ConfigError
+    from flash.schema import ConfigError
 
     base = {
         "model": "Qwen/Qwen3.5-0.8B",

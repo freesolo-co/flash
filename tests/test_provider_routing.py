@@ -12,10 +12,10 @@ import io
 
 import pytest
 
-from autoslm.spec import JobSpec
+from flash.spec import JobSpec
 
 
-def _spec(run_id="autoslm-1700000001-rt01", **gpu_kw) -> JobSpec:
+def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
     gpu = {"type": "RTX A5000", "provider": "auto", "requested": "auto", "max_retries": 2}
     gpu.update(gpu_kw)
     return JobSpec.from_dict(
@@ -36,7 +36,7 @@ def _offer_obj(offer_id=5, machine_id=2, gpu="RTX 3090", dph=0.25):
 
 
 def _alloc(provider="vast", gpu="RTX 3090", rate=0.25, offer=None, provider_offers=()):
-    from autoslm.providers.base import Allocation, Candidate
+    from flash.providers.base import Allocation, Candidate
 
     cand = Candidate(provider, gpu, rate, 24, True, offer=offer)
     return Allocation(
@@ -56,7 +56,7 @@ def _vast_handle_dict(instance_id=1, machine_id=2):
         "instance_id": instance_id,
         "offer_id": 5,
         "machine_id": machine_id,
-        "label": "autoslm-x-s0-a0",
+        "label": "flash-x-s0-a0",
         "gpu": "RTX 3090",
         "hourly_usd": 0.25,
         "attempt": 0,
@@ -66,7 +66,7 @@ def _vast_handle_dict(instance_id=1, machine_id=2):
 
 @pytest.fixture
 def orch(monkeypatch, tmp_path):
-    from autoslm import runner
+    from flash import runner
 
     monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -81,9 +81,9 @@ def _seed_status(orch, spec):
 
 
 def test_vast_allocation_routes_to_vast_runner(orch, monkeypatch):
-    from autoslm.providers import allocator
-    from autoslm.providers.base import PollResult
-    from autoslm.providers.vast import jobs as vast_jobs
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast_jobs
 
     offer = _offer_obj()
     monkeypatch.setattr(
@@ -130,11 +130,11 @@ def test_vast_cost_flows_into_run_status(orch, monkeypatch):
 
 
 def test_failover_crosses_providers_and_blacklists_machine(orch, monkeypatch):
-    from autoslm.providers import allocator
-    from autoslm.providers.base import PollResult
-    from autoslm.providers.runpod import jobs as rp_jobs
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast_jobs
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast_jobs
 
     offer = _offer_obj(machine_id=42)
     allocate_calls = []
@@ -188,9 +188,9 @@ def test_failover_crosses_providers_and_blacklists_machine(orch, monkeypatch):
 
 
 def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
-    from autoslm.providers import allocator
-    from autoslm.providers.base import PollResult
-    from autoslm.providers.vast import jobs as vast_jobs
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast_jobs
 
     offer = _offer_obj()
     monkeypatch.setattr(
@@ -219,9 +219,9 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
 
 
 def test_concrete_requested_pins_class(orch, monkeypatch):
-    from autoslm.providers import allocator
-    from autoslm.providers.base import PollResult
-    from autoslm.providers.vast import jobs as vast_jobs
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast_jobs
 
     pins = []
 
@@ -251,9 +251,9 @@ def test_empty_requested_pins_concrete_type(orch, monkeypatch):
     """An empty gpu.requested (a direct-API spec that skipped config parsing) is treated
     as a concrete pin of gpu.type: the allocator runs (so failover/pricing still apply)
     but only to pick the provider for that one class — it never re-picks the class."""
-    from autoslm.providers import allocator
-    from autoslm.providers.base import PollResult
-    from autoslm.providers.vast import jobs as vast_jobs
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.vast import jobs as vast_jobs
 
     pins = []
 
@@ -279,10 +279,10 @@ def test_empty_requested_pins_concrete_type(orch, monkeypatch):
 # cancel / attach routing
 # ---------------------------------------------------------------------------
 def test_cancel_routes_vast(orch, monkeypatch):
-    from autoslm.providers.runpod import api as runpod_api
-    from autoslm.providers.runpod import train as rp_train
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast_jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import train as rp_train
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast_jobs
 
     cancelled, destroyed, swept, runpod_calls, terminated = [], [], [], [], []
     monkeypatch.setattr(vast_jobs, "cancel", lambda remote: cancelled.append(remote))
@@ -312,8 +312,8 @@ def test_cancel_routes_vast(orch, monkeypatch):
 
 
 def test_cancel_legacy_handle_defaults_to_runpod(orch, monkeypatch):
-    from autoslm.providers.runpod import api as runpod_api
-    from autoslm.providers.runpod import train as rp_train
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import train as rp_train
 
     cancelled_jobs, deleted_eps = [], []
     monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled_jobs.append((e, j)))
@@ -331,10 +331,10 @@ def test_cancel_legacy_handle_defaults_to_runpod(orch, monkeypatch):
 
 
 def test_attach_routes_vast_and_destroys(orch, monkeypatch):
-    from autoslm.providers.base import PollResult
-    from autoslm.providers.runpod import train as rp_train
-    from autoslm.providers.vast import api as vast_api
-    from autoslm.providers.vast import jobs as vast_jobs
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import train as rp_train
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast_jobs
 
     seen_kwargs: dict = {}
 
@@ -366,7 +366,7 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
 # config: provider fields
 # ---------------------------------------------------------------------------
 def test_config_provider_fields(monkeypatch):
-    from autoslm.schema import ConfigError, spec_from_dict
+    from flash.schema import ConfigError, spec_from_dict
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)

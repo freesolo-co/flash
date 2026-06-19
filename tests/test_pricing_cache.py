@@ -8,7 +8,7 @@ import json
 
 def _fresh_pricing(monkeypatch, tmp_path):
     monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
-    import autoslm.providers.runpod.pricing as pricing
+    import flash.providers.runpod.pricing as pricing
 
     pricing = importlib.reload(pricing)
     monkeypatch.setattr(pricing, "_CACHE_PATH", tmp_path / "rates.json")

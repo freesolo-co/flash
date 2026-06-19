@@ -1,7 +1,7 @@
 [project]
-name = "autoslm-train"
+name = "flash"
 version = "0.2.0"
-description = "AutoSLM — managed LoRA post-training (SFT/GRPO) for verifiers environments, driven by the `slm` CLI"
+description = "Flash — managed LoRA post-training (SFT/GRPO) for verifiers environments, driven by the `slm` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.10-3.12 (not 3.13 yet).
 requires-python = ">=3.11,<3.13"
@@ -26,7 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Heavy deps for running the fine-tuning worker locally (on the GPU worker these are
-# installed by RunPod Flash via WORKER_DEPS in autoslm/flash/train.py).
+# installed by RunPod Flash via WORKER_DEPS in flash/flash/train.py).
 gpu = [
     "torch==2.10.0",
     "transformers>=5.6,<5.11",
@@ -38,26 +38,26 @@ gpu = [
 ]
 server = ["fastapi", "uvicorn"]
 # Convenience aggregate of all optional runtime extras.
-all = ["autoslm-train[gpu,server]"]
+all = ["flash[gpu,server]"]
 
 [project.urls]
 Homepage = "https://github.com/freesolo-co/freesolo"
 Repository = "https://github.com/freesolo-co/freesolo"
 
 [project.scripts]
-slm = "autoslm.cli.main:main"
+slm = "flash.cli.main:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `slm`
-# subcommand. Requires the `server` extra (`pip install 'autoslm-train[server]'`).
-autoslm-server = "autoslm.server.__main__:main"
+# subcommand. Requires the `server` extra (`pip install 'flash[server]'`).
+flash-server = "flash.server.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["autoslm"]
-# Ship the PEP 561 marker so downstream type checkers pick up AutoSLM's type hints.
-artifacts = ["autoslm/py.typed"]
+packages = ["flash"]
+# Ship the PEP 561 marker so downstream type checkers pick up Flash's type hints.
+artifacts = ["flash/py.typed"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -103,4 +103,4 @@ ignore = ["E501", "B008"]
 # Routes live inside the create_app() closure; with PEP 563 lazy annotations,
 # Annotated[..., Depends(closure_local)] cannot be resolved by get_type_hints,
 # so the definition-time `= Depends(...)` form is required here.
-"autoslm/server/app.py" = ["FAST002"]
+"flash/server/app.py" = ["FAST002"]

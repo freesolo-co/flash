@@ -15,7 +15,7 @@ import types
 
 import pytest
 
-from autoslm.engine.midrun_eval import (
+from flash.engine.midrun_eval import (
     EvalRecord,
     EvalSummary,
     PeriodicEval,

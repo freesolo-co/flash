@@ -21,7 +21,7 @@ def _require_key():
 def test_runpod_auth_and_list_endpoints():
     """Auth + reachability: listing endpoints is a read-only account call."""
     _require_key()
-    from autoslm.providers.runpod import api as runpod_api
+    from flash.providers.runpod import api as runpod_api
 
     endpoints = runpod_api.list_endpoints()
     assert isinstance(endpoints, list)  # 200 + a (possibly empty) list == authed & reachable
@@ -30,7 +30,7 @@ def test_runpod_auth_and_list_endpoints():
 def test_runpod_live_gpu_pricing():
     """The GPU-types pricing route returns $/hr for at least one managed class."""
     _require_key()
-    from autoslm.providers.runpod.pricing import _fetch_live_rates
+    from flash.providers.runpod.pricing import _fetch_live_rates
 
     rates = _fetch_live_rates()
     assert isinstance(rates, dict)
@@ -41,7 +41,7 @@ def test_runpod_live_gpu_pricing():
 def test_runpod_provider_hourly_rate():
     """The provider interface returns a positive $/hr (live or static fallback)."""
     _require_key()
-    from autoslm.providers import get_provider
+    from flash.providers import get_provider
 
     rate = get_provider("runpod").hourly_rate("RTX 5090")
     assert rate > 0

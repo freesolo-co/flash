@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from autoslm.client import ApiClient, ApiError, ClientError
+from flash.client import ApiClient, ApiError, ClientError
 
 
 @pytest.fixture

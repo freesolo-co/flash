@@ -36,7 +36,7 @@ class _FakeVfEnv:
 
 
 def test_verifiers_adapter_mapping():
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
     assert env.id == "fake/env"
@@ -61,7 +61,7 @@ def test_evaluate_surfaces_eval_metric_metrics_distinct_from_reward():
     """``evaluate()`` returns the weighted training reward AND each eval-metric rubric func's RAW
     score by name — so an env expresses an evaluation metric (e.g. accuracy) that differs from a
     shaped GRPO reward, entirely in the environment's rubric. ``reward()`` stays metric-free."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     def shaped_reward(completion, answer):  # weight 1.0 -> drives training; partial credit
         return 0.3 if answer in completion[-1]["content"] else 0.0
@@ -89,7 +89,7 @@ def test_evaluate_surfaces_eval_metric_metrics_distinct_from_reward():
 
 def test_eval_split_uses_eval_dataset_not_train():
     """A populated eval_dataset is returned for the eval split (not the train split)."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
     eval_rows = env.dataset("eval")
@@ -100,7 +100,7 @@ def test_empty_eval_dataset_does_not_fall_back_to_train():
     """An empty-but-configured eval split ([]) is honored as an empty eval set; it must NOT
     fall back to the TRAIN split (the `or` -> `is None` fix). Falling back would evaluate on
     training data."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     class _Env(_FakeVfEnv):
         def __init__(self):
@@ -115,7 +115,7 @@ def test_empty_eval_dataset_does_not_fall_back_to_train():
 def test_eval_get_eval_dataset_empty_does_not_fall_back():
     """An empty list from get_eval_dataset() (not the attr) is likewise honored as empty and
     must not fall through to get_dataset/train."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     class _Env:
         rubric = None
@@ -134,7 +134,7 @@ def test_eval_get_eval_dataset_empty_does_not_fall_back():
 def test_missing_eval_dataset_falls_back_to_train():
     """When NO eval split is configured at all (genuinely absent / None), the eval split falls
     back to the env's train split — the only legitimate fallback case."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     class _Env:
         rubric = None
@@ -151,7 +151,7 @@ def test_missing_eval_dataset_falls_back_to_train():
 def test_install_manifest_and_worker_deps():
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["AUTOSLM_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
-        import autoslm.envs.registry as registry
+        import flash.envs.registry as registry
 
         importlib.reload(registry)
         # The worker only pip-installs `verifiers`; the env itself is installed via the
@@ -176,7 +176,7 @@ def test_install_manifest_and_worker_deps():
 def test_vf_load_id_strips_owner_slug():
     """DEFECT: the adapter passed the full ``owner/name`` slug to verifiers, which only
     resolves the bare env id."""
-    from autoslm.envs.adapter import vf_load_id
+    from flash.envs.adapter import vf_load_id
 
     assert vf_load_id("primeintellect/hendrycks-math") == "hendrycks-math"
     assert vf_load_id("math500") == "math500"  # already bare -> unchanged
@@ -186,7 +186,7 @@ def test_load_verifiers_environment_uses_bare_ids(monkeypatch):
     """DEFECT: load must hand verifiers the BARE id (owner stripped)."""
     import types as _types
 
-    from autoslm.envs import adapter as va
+    from flash.envs import adapter as va
 
     seen = []
 
@@ -205,7 +205,7 @@ def test_load_verifiers_environment_uses_bare_ids(monkeypatch):
 def test_rubric_group_is_flattened_and_eval_metric_skipped():
     """DEFECT: a RubricGroup's top-level funcs is empty, so reward was always 0; and a
     eval-metric monitor func (e.g. num_turns) crashed on missing state."""
-    from autoslm.envs.adapter import VerifiersEnvironment, _flatten_rubric
+    from flash.envs.adapter import VerifiersEnvironment, _flatten_rubric
 
     def correct(completion, answer):
         return 1.0 if str(answer) in completion[-1]["content"] else 0.0
@@ -238,7 +238,7 @@ def test_reward_from_weighted_func_propagates_exception():
     0.0 — a raise in a weighted func is a real reward failure (e.g. judge API error) that would
     otherwise train/score on an all-zero signal. (Eval-metric funcs run with guarded exceptions
     instead — see test_reward_eval_metric_crashing_func_runs_with_guarded_exception.)"""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     def boom(**kwargs):
         raise RuntimeError("kaboom")
@@ -260,7 +260,7 @@ def test_reward_eval_metric_crashing_func_runs_with_guarded_exception():
     """Per verifiers semantics a eval-metric monitor func RUNS (it may mutate shared state /
     be logged), but its exceptions are GUARDED (swallowed) — a thrown monitor must not fail the
     run — and it contributes 0 to the reward."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     calls = []
 
@@ -288,7 +288,7 @@ def test_reward_eval_metric_crashing_func_runs_with_guarded_exception():
 def test_eval_metric_func_runs_and_can_mutate_shared_state():
     """A eval-metric func runs BEFORE a later weighted func and may set shared ``state`` the
     weighted func then reads. It still contributes 0 itself and is absent from the breakdown."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     def monitor(state, **kwargs):  # eval-metric: seeds shared state, returns nothing useful
         state["seen"] = True
@@ -323,7 +323,7 @@ def test_scores_breakdown_collision_does_not_clobber_existing_distinct_key():
     BOTH (both start with ``score``) and forms ``score_2`` for the third — fine here, but
     a distinct-but-prefixed name in the wrong order makes it recompute an occupied key and
     silently drop a scorer. Exact-key probing keeps every scorer."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     def make(name):
         def f(**kwargs):
@@ -357,7 +357,7 @@ def test_reward_available_uses_state_transcript_in_multi_turn():
     """In multi-turn mode, `completion`/`prompt` passed to reward funcs come from the
     accumulated `state` transcript (full message list), not the scalar completion wrapped as a
     lone assistant message. Single-turn keeps the scalar-wrapping behavior."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     class _Env:
         rubric = None
@@ -394,7 +394,7 @@ def test_reward_available_uses_state_transcript_in_multi_turn():
 def test_group_reward_func_is_rejected_at_construction():
     """A weighted group/batch reward func (plural required arg the single-turn worker
     can't supply) must fail fast, not silently score 0.0 on a paid run."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     def group_reward(completions, answers):  # plural batch args — unsupported
         return [1.0 for _ in completions]
@@ -425,7 +425,7 @@ def test_group_reward_func_is_rejected_at_construction():
 def test_reward_parses_json_string_info():
     """A Hub row may store `info` as a JSON string; reward funcs that index it must
     receive a dict, not raise TypeError (swallowed as 0.0)."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     def uses_info(completion, info):
         return 1.0 if info.get("want") == "yes" else 0.0
@@ -450,7 +450,7 @@ def test_reward_parses_json_string_info():
 def test_dataset_getter_requiring_args_is_called_correctly():
     """A Hub env exposing get_dataset(n, seed) without defaults must be called with
     those args, not no-arg (which raised TypeError -> swallowed -> empty train set)."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     rows = [{"prompt": [{"role": "user", "content": "q"}], "answer": "a"}]
 
@@ -471,7 +471,7 @@ def test_dataset_getter_requiring_args_is_called_correctly():
 
 def test_worker_installs_env_via_prime():
     """The Flash worker pip-installs only verifiers; the Hub env installs via `prime`."""
-    import autoslm.envs.registry as registry
+    import flash.envs.registry as registry
 
     assert registry.worker_pip_for_env("primeintellect/hendrycks-math") == ["verifiers"]
     # The env id is handed to the worker to `prime env install` (authenticated, public+private).
@@ -482,7 +482,7 @@ def test_worker_installs_env_via_prime():
 
 def _multi_turn_env(vf_env):
     """A VerifiersEnvironment forced into multi-turn mode (so env_reply/rollout_done run)."""
-    from autoslm.envs.adapter import VerifiersEnvironment
+    from flash.envs.adapter import VerifiersEnvironment
 
     env = VerifiersEnvironment(vf_env, "owner/x")
     env.multi_turn = True

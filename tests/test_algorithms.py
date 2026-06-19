@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from autoslm.catalog import ALGORITHMS
-from autoslm.schema import ConfigError, spec_from_dict
+from flash.catalog import ALGORITHMS
+from flash.schema import ConfigError, spec_from_dict
 
 
 def test_algorithms_registry():
@@ -20,8 +20,8 @@ def test_unknown_algorithm_rejected():
 def test_grpo_capability_still_enforced():
     # The guardrail: an SFT-only model rejects GRPO through the config path. No catalog
     # entry is SFT-only anymore, so inject a temporary one.
-    from autoslm import catalog
-    from autoslm.catalog import ModelInfo
+    from flash import catalog
+    from flash.catalog import ModelInfo
 
     catalog.MODELS["test/sft-only"] = ModelInfo(
         id="test/sft-only",

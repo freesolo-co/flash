@@ -10,15 +10,15 @@ import tempfile
 
 def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import autoslm.providers.runpod.train as flash_train
-        import autoslm.runner as runner
+        import flash.providers.runpod.train as flash_train
+        import flash.runner as runner
 
         importlib.reload(flash_train)
         importlib.reload(runner)
         # Storage roots are fixed constants now; redirect via monkeypatch (auto-restored).
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
-        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}
 
@@ -36,7 +36,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
                 "notes": {},
             }
 
-        # _run_job does `from autoslm.providers.runpod.train import submit_train, upload_code` at call time.
+        # _run_job does `from flash.providers.runpod.train import submit_train, upload_code` at call time.
         monkeypatch.setattr(flash_train, "submit_train", fake_submit)
         monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "mock/repo")
 
@@ -51,7 +51,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         assert status.state == "done", status.error
         # 1h on a 4090 at the projected rate (static fallback under AUTOSLM_SKIP_NET)
-        from autoslm.providers.runpod.pricing import hourly_rate
+        from flash.providers.runpod.pricing import hourly_rate
 
         assert abs(status.cost_usd - hourly_rate("RTX 4090")) < 1e-6, status.cost_usd
         assert captured["gpu"] == "RTX 4090"

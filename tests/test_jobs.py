@@ -15,16 +15,16 @@ import pytest
 
 
 def test_job_handle_roundtrip():
-    from autoslm.providers.runpod.jobs import JobHandle
+    from flash.providers.runpod.jobs import JobHandle
 
-    h = JobHandle("ep123", "autoslm-train-5090-abc", "job456")
+    h = JobHandle("ep123", "flash-5090-abc", "job456")
     assert JobHandle.from_dict(h.to_dict()) == h
 
 
 def test_decode_output_success():
     import cloudpickle
 
-    from autoslm.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.jobs import decode_output
 
     metrics = {"trained_eval_acc": 0.9, "cost_usd": 0.5}
     out = {"success": True, "result": base64.b64encode(cloudpickle.dumps(metrics)).decode()}
@@ -32,7 +32,7 @@ def test_decode_output_success():
 
 
 def test_decode_output_error_includes_stdout_tail():
-    from autoslm.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.jobs import decode_output
 
     with pytest.raises(RuntimeError) as ei:
         decode_output({"success": False, "error": "boom", "stdout": "x" * 5000})
@@ -42,7 +42,7 @@ def test_decode_output_error_includes_stdout_tail():
 def test_decode_output_client_mode_serverless_handler():
     """Baked-image path: the serverless rp_handler returns the metrics dict directly (RunPod
     surfaces it as job["output"]), with no Flash success/result envelope — return it as-is."""
-    from autoslm.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.jobs import decode_output
 
     metrics = {"trained_eval_acc": 0.87, "train_wall": 12.3, "cost_usd": 0.04}
     assert decode_output(metrics) == metrics
@@ -54,7 +54,7 @@ def test_decode_output_client_mode_serverless_handler():
 def test_decode_output_client_mode_error_includes_stdout_tail():
     """Client-mode failures must also carry the worker stdout tail (poll_job root-causes
     crashes from it) — same as the Flash envelope path."""
-    from autoslm.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.jobs import decode_output
 
     with pytest.raises(RuntimeError) as ei:
         decode_output({"error": "vllm crashed", "stdout": "trace-line\n" + "z" * 5000})
@@ -69,8 +69,8 @@ def test_decode_output_client_mode_error_includes_stdout_tail():
 def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
     import cloudpickle
 
-    from autoslm.providers.runpod import api as runpod_api
-    from autoslm.providers.runpod import jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
 
     seq = iter(statuses)
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(seq))
@@ -124,8 +124,8 @@ def test_poll_job_stall_detection(monkeypatch):
     # job stays IN_PROGRESS forever, heartbeat never advances -> stall
     import itertools
 
-    from autoslm.providers.runpod import api as runpod_api
-    from autoslm.providers.runpod import jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -142,8 +142,8 @@ def test_poll_job_setup_grace_before_first_heartbeat(monkeypatch):
     # stall_after_s window — it waits for the larger setup_grace_s instead.
     import itertools
 
-    from autoslm.providers.runpod import api as runpod_api
-    from autoslm.providers.runpod import jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -164,8 +164,8 @@ def test_poll_job_tight_stall_after_first_heartbeat(monkeypatch):
     # stall_after_s window applies, not the big setup grace.
     import itertools
 
-    from autoslm.providers.runpod import api as runpod_api
-    from autoslm.providers.runpod import jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -190,8 +190,8 @@ def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
     # tight training window — the slow model-load/vLLM-init still has to fit setup_grace_s.
     import itertools
 
-    from autoslm.providers.runpod import api as runpod_api
-    from autoslm.providers.runpod import jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -217,8 +217,8 @@ def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
     # setup_grace must NOT silently slow stall detection — stay on stall_after_s.
     import itertools
 
-    from autoslm.providers.runpod import api as runpod_api
-    from autoslm.providers.runpod import jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -238,8 +238,8 @@ def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
 def test_poll_job_tolerates_transient_api_errors(monkeypatch):
     import cloudpickle
 
-    from autoslm.providers.runpod import api as runpod_api
-    from autoslm.providers.runpod import jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
 
     ok = {
         "success": True,
@@ -270,7 +270,7 @@ def _fresh_orchestrator(tmp, monkeypatch):
 
 
 def _spec(run_id):
-    from autoslm.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
 
     return JobSpec(
         run_id=run_id,
@@ -284,8 +284,8 @@ def _spec(run_id):
 def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import autoslm.providers.runpod.jobs as jobs
-        import autoslm.providers.runpod.train as flash_train
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
 
         calls = {"n": 0}
 
@@ -310,8 +310,8 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
 def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import autoslm.providers.runpod.jobs as jobs
-        import autoslm.providers.runpod.train as flash_train
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
 
         calls = {"n": 0}
 
@@ -337,10 +337,10 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
     # A5000 < RTX 4090 < RTX 5090 by $/hr, so successive attempts step through them.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import autoslm.providers.runpod.jobs as jobs
-        import autoslm.providers.runpod.pricing as pricing
-        import autoslm.providers.runpod.train as flash_train
-        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         # Force the deterministic static ranking (no live pricing fetch) and the
         # validated-only pool, so a stray AUTOSLM_GPU_ALLOW_UNVALIDATED in the dev's
@@ -375,7 +375,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         # Three attempts, three distinct classes, each at least as expensive as the last.
         assert len(gpus_seen) == 3
         assert len(set(gpus_seen)) == 3
-        from autoslm.providers.runpod.pricing import hourly_rate
+        from flash.providers.runpod.pricing import hourly_rate
 
         rates = [hourly_rate(g) for g in gpus_seen]
         assert rates == sorted(rates)
@@ -387,10 +387,10 @@ def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
     # (offset clamps) — the walk must not silently move a pinned run to another card.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import autoslm.providers.runpod.jobs as jobs
-        import autoslm.providers.runpod.pricing as pricing
-        import autoslm.providers.runpod.train as flash_train
-        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
@@ -427,11 +427,11 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
     # one. (Regression guard for the walk-offset-vs-attempt-counter bug.)
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import autoslm.providers.allocator as allocator
-        import autoslm.providers.runpod.jobs as jobs
-        import autoslm.providers.runpod.pricing as pricing
-        import autoslm.providers.runpod.train as flash_train
-        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
@@ -478,9 +478,9 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
     # recovery via attach_run costs the card it actually ran on, not the provisional one.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import autoslm.providers.runpod.jobs as jobs
-        import autoslm.providers.runpod.pricing as pricing
-        import autoslm.providers.runpod.train as flash_train
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
 
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         status = orch.RunStatus(
@@ -506,7 +506,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         st = orch.attach_run("walked", log_stream=sys.stderr)
 
         assert st.state == "done"
-        from autoslm.providers.runpod.pricing import hourly_rate
+        from flash.providers.runpod.pricing import hourly_rate
 
         # ~1 GPU-hour on the walked 5090, not the cheaper provisional 4090.
         assert abs(st.cost_usd - hourly_rate("RTX 5090")) < 1e-6
@@ -519,7 +519,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
 def test_cancel_uses_rest_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        from autoslm.providers.runpod import api as runpod_api
+        from flash.providers.runpod import api as runpod_api
 
         status = orch.RunStatus(
             run_id="c1",
@@ -531,7 +531,7 @@ def test_cancel_uses_rest_handle(monkeypatch):
         cancelled, deleted = [], []
         monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: cancelled.append((e, j)))
         monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: deleted.append(e))
-        import autoslm.providers.runpod.train as flash_train
+        import flash.providers.runpod.train as flash_train
 
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         st = orch.cancel_run("c1")
@@ -547,8 +547,8 @@ def test_cancel_uses_rest_handle(monkeypatch):
 def test_attach_completes_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import autoslm.providers.runpod.jobs as jobs
-        import autoslm.providers.runpod.train as flash_train
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
 
         status = orch.RunStatus(
             run_id="a1",
@@ -574,9 +574,9 @@ def test_attach_clears_stale_handle_before_resuming_seeds(monkeypatch):
     # provisioning gap must not reattach recovery to the finished job.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import autoslm.providers.runpod.jobs as jobs
-        import autoslm.providers.runpod.train as flash_train
-        from autoslm.spec import GpuSpec, JobSpec, TrainSpec
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         spec = JobSpec(
             run_id="m1",

@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-import autoslm.providers.preflight as pf
+import flash.providers.preflight as pf
 
 
 @pytest.fixture
@@ -61,8 +61,8 @@ def test_preflight_require_hf_false_still_needs_provider_keys(clean_env, monkeyp
 
 
 def test_runpod_key_is_env_only(clean_env):
-    # ~/.autoslm/config.json holds the AutoSLM key; it must never be read as a RunPod key.
-    from autoslm.providers.runpod.auth import load_api_key
+    # ~/.flash/config.json holds the Flash key; it must never be read as a RunPod key.
+    from flash.providers.runpod.auth import load_api_key
 
     assert load_api_key() is None
 
@@ -108,12 +108,12 @@ def test_client_requires_login(monkeypatch, tmp_path):
     monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
     import importlib
 
-    import autoslm.client.config as client_config
+    import flash.client.config as client_config
 
     importlib.reload(client_config)
     try:
-        from autoslm.client import ClientError
-        from autoslm.client.http import client_from_config
+        from flash.client import ClientError
+        from flash.client.http import client_from_config
 
         with pytest.raises(ClientError, match="slm login"):
             client_from_config()

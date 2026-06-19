@@ -51,7 +51,7 @@ def _restore_env(saved):
 
 
 def test_strip_think_unit():
-    import autoslm.engine.worker as ne
+    import flash.engine.worker as ne
 
     assert ne.strip_think(None) is None
     assert ne.strip_think("no tags, answer 42") == "no tags, answer 42"
@@ -69,9 +69,9 @@ def test_strip_think_unit():
 def test_thinking_budget_selection(monkeypatch):
     # A JobSpec with an env id makes the worker resolve ACTIVE_ENV at import; stub the loader so
     # this CPU dry-run doesn't reach the Prime Hub. We only exercise THINKING / micro-batch here.
-    monkeypatch.setattr("autoslm.envs.registry.load_environment", lambda *a, **k: object())
+    monkeypatch.setattr("flash.envs.registry.load_environment", lambda *a, **k: object())
     saved = _set_thinking_worker_env()
-    import autoslm.engine.worker as ne
+    import flash.engine.worker as ne
 
     try:
         importlib.reload(ne)
@@ -110,7 +110,7 @@ def test_grpo_batching_rounds_up_to_divisible():
     # the global completion batch (8) indivisible by num_generations (3); TRL rejects
     # that only AFTER the paid worker is provisioned. compute_grpo_batching now rounds
     # grad_accum up so the batch is always divisible by group_size.
-    import autoslm.engine.worker as ne
+    import flash.engine.worker as ne
 
     importlib.reload(ne)
     for prompts, group, per_device in [(5, 3, 8), (64, 8, 2), (64, 8, 8), (7, 5, 4), (1, 6, 8)]:
@@ -128,7 +128,7 @@ def test_grpo_batching_caps_per_device_at_target():
     # A small prompts_per_step must not be overshot by an oversized per-device completion
     # micro-batch: the global completion batch is capped at prompts_per_step * group_size,
     # so the per-device micro-batch is clamped down to the target (mirrors run_sft).
-    import autoslm.engine.worker as ne
+    import flash.engine.worker as ne
 
     importlib.reload(ne)
     # per_device (8) far exceeds target completions (1 * 2 = 2): must clamp, not overshoot.
