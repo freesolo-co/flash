@@ -104,6 +104,33 @@ def test_build_worker_env_forwards_prime_api_key(monkeypatch):
     assert "PRIME_API_KEY" not in build_worker_env(_spec(), 0)
 
 
+def test_build_worker_env_forwards_chalk_flags(monkeypatch):
+    """The opt-in chalk-kernel install hook (engine.chalk_kernels) runs inside the worker
+    subprocess and reads CHALK_* flags from its own process env, so an operator-set CHALK_*
+    MUST be forwarded by the allowlist or the kernel silently no-ops on every remote run.
+    Forwarding is prefix-based, so arbitrary/future CHALK_* names pass through unchanged."""
+    from flash.providers.runpod.train import build_worker_env
+
+    flags = {
+        "CHALK_MLP_KERNEL": "1",
+        "CHALK_FP8_BASE": "1",
+        "CHALK_TRITON_LORA": "1",
+        "CHALK_EMBED_KERNEL": "1",
+        # a flag this repo doesn't enumerate must still pass through (prefix, not explicit list)
+        "CHALK_SOME_FUTURE_FLAG": "e4m3",
+    }
+    for k, v in flags.items():
+        monkeypatch.setenv(k, v)
+    env = build_worker_env(_spec(), 0)
+    for k, v in flags.items():
+        assert env.get(k) == v, f"{k} not forwarded to worker"
+    # unset CHALK_* flags are not invented
+    for k in flags:
+        monkeypatch.delenv(k, raising=False)
+    env2 = build_worker_env(_spec(), 0)
+    assert not any(k.startswith("CHALK_") for k in env2)
+
+
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
