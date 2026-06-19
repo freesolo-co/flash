@@ -150,7 +150,7 @@ def test_missing_eval_dataset_falls_back_to_train():
 
 def test_install_manifest_and_worker_deps():
     with tempfile.TemporaryDirectory() as tmp:
-        os.environ["AUTOSLM_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
+        os.environ["FLASH_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
         import flash.envs.registry as registry
 
         importlib.reload(registry)
@@ -166,7 +166,7 @@ def test_install_manifest_and_worker_deps():
         # The train env doubling as the eval env is installed once.
         assert registry.worker_hub_env_ids("owner/x", {"eval_env_id": "owner/x"}) == ["owner/x"]
 
-        os.environ.pop("AUTOSLM_ENVS_MANIFEST", None)
+        os.environ.pop("FLASH_ENVS_MANIFEST", None)
         importlib.reload(registry)
 
 
