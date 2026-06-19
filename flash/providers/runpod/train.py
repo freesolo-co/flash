@@ -176,6 +176,11 @@ def upload_code(repo: str | None = None) -> str:
     api = HfApi(token=token)
     # Run artifact repos are always private (they carry run code, adapters, and metrics).
     api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True)
+    # create_repo(exist_ok=True) is a no-op on an EXISTING repo, so `private=True` above does NOT
+    # change the visibility of a repo that was created earlier as public. Force private explicitly
+    # so a reused/public artifact repo can't leak run code/adapters/metrics under the always-private
+    # invariant. (Idempotent: a no-op on a repo that is already private.)
+    api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True)
     api.upload_folder(
         folder_path=pkg_dir,
         path_in_repo="code/flash",
