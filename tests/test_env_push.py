@@ -145,7 +145,7 @@ def test_push_single_py_uses_sibling_config_id_name(monkeypatch, tmp_path):
 
 
 def test_push_single_py_no_sibling_config_uses_file_stem(monkeypatch, tmp_path):
-    # Without a sibling autoslm.toml/id, the published name falls back to the file stem.
+    # Without a sibling flash.toml/id, the published name falls back to the file stem.
     env_file = tmp_path / "my_task.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/prime")

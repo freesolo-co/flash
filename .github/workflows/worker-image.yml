@@ -3,7 +3,7 @@ name: flash worker image
 # Builds the prebuilt flash worker image (full training stack + flash-attn baked in) and
 # pushes it to GHCR, so Vast/RunPod cold-start skips the per-host dep install (the dominant
 # cold-start cost). Training and serving both default to the pinned WORKER_IMAGE constant
-# (flash/providers/runpod/train.py) — bump that to the new tag. AUTOSLM_WORKER_IMAGE is an
+# (flash/providers/runpod/train.py) — bump that to the new tag. FLASH_WORKER_IMAGE is an
 # operator env override honored by BOTH training (providers/runpod/{jobs,train}.py) and serving
 # (flash/serve/deploy.py).
 #

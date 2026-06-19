@@ -47,18 +47,18 @@ def test_deploy_rejects_unknown_mode():
 
 
 def test_resolve_serve_deps(monkeypatch):
-    monkeypatch.delenv("AUTOSLM_SERVE_DEPS", raising=False)
+    monkeypatch.delenv("FLASH_SERVE_DEPS", raising=False)
     assert any("vllm==0.19" in d for d in resolve_serve_deps())  # the single pinned stack
-    monkeypatch.setenv("AUTOSLM_SERVE_DEPS", "vllm==9.9")  # explicit override wins
+    monkeypatch.setenv("FLASH_SERVE_DEPS", "vllm==9.9")  # explicit override wins
     assert resolve_serve_deps() == ["vllm==9.9"]
 
 
 def test_resolve_serve_deps_preserves_comma_ranges(monkeypatch):
     # A PEP 440 range like transformers>=5.6,<5.11 must NOT be comma-split into two
     # pip args. Whitespace-separated string and JSON list both keep it intact.
-    monkeypatch.setenv("AUTOSLM_SERVE_DEPS", "torch==2.10.0 transformers>=5.6,<5.11 vllm==0.19.1")
+    monkeypatch.setenv("FLASH_SERVE_DEPS", "torch==2.10.0 transformers>=5.6,<5.11 vllm==0.19.1")
     assert resolve_serve_deps() == ["torch==2.10.0", "transformers>=5.6,<5.11", "vllm==0.19.1"]
-    monkeypatch.setenv("AUTOSLM_SERVE_DEPS", '["transformers>=5.6,<5.11", "vllm==0.19.1"]')
+    monkeypatch.setenv("FLASH_SERVE_DEPS", '["transformers>=5.6,<5.11", "vllm==0.19.1"]')
     assert resolve_serve_deps() == ["transformers>=5.6,<5.11", "vllm==0.19.1"]
 
 

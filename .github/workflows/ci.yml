@@ -26,5 +26,5 @@ jobs:
 
       - name: Tests (CPU, offline)
         env:
-          AUTOSLM_SKIP_NET: "1"
+          FLASH_SKIP_NET: "1"
         run: uv run pytest -q
