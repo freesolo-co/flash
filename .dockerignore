@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 .ruff_cache/
 .cache/
-.autoslm/
+.flash/
 results/
 hf_cache/
 uv-cache/

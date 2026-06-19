@@ -1,8 +1,8 @@
-"""Cross-component integration: the *real* AutoSLM ``ApiClient`` driving the
+"""Cross-component integration: the *real* Flash ``ApiClient`` driving the
 *real* control-plane FastAPI app in-process.
 
-The freesolo SDK / training worker talks to the managed AutoSLM service through
-``autoslm.client.http.ApiClient`` (stdlib ``urllib``). Its unit tests
+The freesolo SDK / training worker talks to the managed Flash service through
+``flash.client.http.ApiClient`` (stdlib ``urllib``). Its unit tests
 (``test_client.py``) assert request shaping against a hand-rolled fake server,
 and ``test_server_api.py`` drives the app with a ``TestClient`` and raw JSON --
 but nothing exercises the *pair* together, so the client's spec serialisation
@@ -34,7 +34,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
-from autoslm.client.http import ApiClient, ApiError
+from flash.client.http import ApiClient, ApiError
 
 # A representative managed-run spec -- the shape the freesolo bridge / SDK
 # submits: catalog model, Prime Hub environment slug, an HF repo for artifacts.
@@ -81,9 +81,9 @@ def make_client(tmp_path, monkeypatch):
     monkeypatch.setenv("PRIME_API_KEY", "pit-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
 
-    import autoslm.runner as runner
-    import autoslm.server.auth as auth_mod
-    import autoslm.server.db as db_mod
+    import flash.runner as runner
+    import flash.server.auth as auth_mod
+    import flash.server.db as db_mod
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -94,7 +94,7 @@ def make_client(tmp_path, monkeypatch):
     # work). The client request/response contract is unaffected.
     monkeypatch.setattr(runner, "_run_job", lambda *a, **k: None)
 
-    import autoslm.server.app as app_mod
+    import flash.server.app as app_mod
 
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
@@ -134,7 +134,7 @@ def test_health_and_identity_roundtrip(make_client) -> None:
 
     health = client.health()
     assert health["ok"] is True
-    assert health["service"] == "autoslm"
+    assert health["service"] == "flash"
 
     me = client.me()
     # The server resolves the bearer to a per-key identity and the client parses
@@ -167,7 +167,7 @@ def test_create_status_list_cancel_lifecycle(make_client) -> None:
 
 
 def test_logs_offset_paging_roundtrip(make_client) -> None:
-    import autoslm.runner as runner
+    import flash.runner as runner
 
     client = make_client()
     run_id = client.create_run(SPEC)["run_id"]

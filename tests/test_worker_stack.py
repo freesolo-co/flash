@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import types
 
-from autoslm.providers.runpod.train import (
+from flash.providers.runpod.train import (
     WORKER_DEPS,
     resolve_worker_deps,
 )
@@ -44,8 +44,8 @@ def test_worker_stack_pins_qwen35_capable_versions():
 def _import_worker(monkeypatch):
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("autoslm.engine.worker", None)
-    import autoslm.engine.worker as worker
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as worker
 
     return worker
 
@@ -87,8 +87,8 @@ def test_heartbeat_commit_is_throttled(monkeypatch):
     while always committing milestone stages."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("autoslm.engine.worker", None)
-    import autoslm.engine.worker as w
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
 
     calls = []
     monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: calls.append(a[1]))
@@ -116,8 +116,8 @@ def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
     callback behind the checkpoint daemon's HF commit during GRPO."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("autoslm.engine.worker", None)
-    import autoslm.engine.worker as w
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
 
     # When hf_upload_file is invoked, the lock must be acquirable (i.e. not held).
     lock_free_during_upload = []
@@ -141,8 +141,8 @@ def test_heartbeat_terminal_only_mode(monkeypatch):
     always commit so the control plane never misses a transition."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("autoslm.engine.worker", None)
-    import autoslm.engine.worker as w
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
 
     calls = []
     def _fake_upload(*a, **k):
@@ -171,8 +171,8 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
     leaves transformers' default (None). There is no env override."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("autoslm.engine.worker", None)
-    import autoslm.engine.worker as w
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
 
     assert w.optimal_attn_impl() is None
 
@@ -182,8 +182,8 @@ def test_liger_on_requires_default_and_gpu(monkeypatch):
     liger_kernel (both absent in CI), so it's off here too."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("autoslm.engine.worker", None)
-    import autoslm.engine.worker as w
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
 
     assert w.liger_on(False) is False
     assert w.liger_on(True) is False  # no CUDA / liger_kernel in CI
@@ -194,8 +194,8 @@ def test_liger_default_model_size_gate(monkeypatch):
     for models ≥ ~3B where fused-CE's memory win pays off."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("AUTOSLM_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("autoslm.engine.worker", None)
-    import autoslm.engine.worker as w
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
 
     # _estimate_params: ~1B vs ~4B configs
     small = types.SimpleNamespace(

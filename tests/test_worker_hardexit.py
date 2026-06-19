@@ -13,7 +13,7 @@ already persisted to HF inside the handler), bypassing the hanging teardown.
 
 from __future__ import annotations
 
-import autoslm.engine.worker as worker
+import flash.engine.worker as worker
 
 
 class _HardExit(BaseException):

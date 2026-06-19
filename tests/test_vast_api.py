@@ -31,7 +31,7 @@ class _FakeResponse:
 
 def _capture_urlopen(monkeypatch, responses):
     """Mock urlopen; returns the list of (method, url, body_dict, auth_header) captured."""
-    from autoslm.providers.vast import api as vast_api
+    from flash.providers.vast import api as vast_api
 
     calls = []
     seq = iter(responses)
@@ -56,7 +56,7 @@ def _capture_urlopen(monkeypatch, responses):
 
 
 def test_api_key_env_only(monkeypatch):
-    from autoslm.providers.vast.api import VastApiError, _api_key
+    from flash.providers.vast.api import VastApiError, _api_key
 
     monkeypatch.delenv("VAST_API_KEY", raising=False)
     with pytest.raises(VastApiError, match="VAST_API_KEY"):
@@ -66,7 +66,7 @@ def test_api_key_env_only(monkeypatch):
 
 
 def test_search_offers_query_shape(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
+    from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [{"offers": [{"id": 1}]}])
@@ -91,7 +91,7 @@ def test_search_offers_query_shape(monkeypatch):
 
 
 def test_request_retries_5xx_and_429_then_succeeds(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
+    from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [_http_error(503), _http_error(429), {"ok": True}])
@@ -100,7 +100,7 @@ def test_request_retries_5xx_and_429_then_succeeds(monkeypatch):
 
 
 def test_request_4xx_raises_immediately_with_body(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
+    from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [_http_error(400, b'{"msg": "no such ask"}')])
@@ -110,7 +110,7 @@ def test_request_4xx_raises_immediately_with_body(monkeypatch):
 
 
 def test_create_instance_success_and_rejection(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
+    from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(
@@ -121,13 +121,13 @@ def test_create_instance_success_and_rejection(monkeypatch):
         "disk_gb": 60,
         "env": {"A": "1"},
         "onstart": "#!/bin/bash",
-        "label": "autoslm-x",
+        "label": "flash-x",
     }
     assert vast_api.create_instance(123, **kwargs) == 777
     method, url, body, _ = calls[0]
     assert method == "PUT"
     assert url.endswith("/asks/123/")
-    assert body["label"] == "autoslm-x"
+    assert body["label"] == "flash-x"
     assert body["env"] == {"A": "1"}
     with pytest.raises(vast_api.VastApiError, match="rejected"):
         vast_api.create_instance(123, **kwargs)
@@ -137,7 +137,7 @@ def test_create_instance_is_not_retried(monkeypatch):
     """Fix #4: ``PUT /asks/{id}`` is non-idempotent (each success rents a NEW instance),
     so a transient failure must NOT be blindly retried — a retry on a timeout where Vast
     already accepted the first request would double-provision (a billing leak)."""
-    from autoslm.providers.vast import api as vast_api
+    from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     # First call raises a transient 503; if create were retried it would hit the second
@@ -151,7 +151,7 @@ def test_create_instance_is_not_retried(monkeypatch):
         "disk_gb": 60,
         "env": {},
         "onstart": "#!/bin/bash",
-        "label": "autoslm-x",
+        "label": "flash-x",
     }
     with pytest.raises(vast_api.VastApiError):
         vast_api.create_instance(123, **kwargs)
@@ -159,7 +159,7 @@ def test_create_instance_is_not_retried(monkeypatch):
 
 
 def test_get_instance_none_on_404(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
+    from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [_http_error(404)])
@@ -167,7 +167,7 @@ def test_get_instance_none_on_404(monkeypatch):
 
 
 def test_destroy_instance_never_raises(monkeypatch):
-    from autoslm.providers.vast import api as vast_api
+    from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [{}])

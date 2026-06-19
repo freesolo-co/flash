@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from autoslm.catalog import ModelInfo
-from autoslm.schema import ConfigError, spec_from_dict, spec_from_file
-from autoslm.spec import JobSpec
+from flash.catalog import ModelInfo
+from flash.schema import ConfigError, spec_from_dict, spec_from_file
+from flash.spec import JobSpec
 
 
 def _raw(model="Qwen/Qwen3.5-0.8B", **kw):
@@ -42,8 +42,8 @@ def test_thinking_true_on_hybrid_model():
 def test_thinking_rejected_for_non_thinking_model():
     # No catalog entry is thinking="none" anymore, so inject a temporary one to exercise
     # the "this model can't think" rejection path.
-    from autoslm import catalog
-    from autoslm.catalog import ModelInfo
+    from flash import catalog
+    from flash.catalog import ModelInfo
 
     catalog.MODELS["test/none-think"] = ModelInfo(
         id="test/none-think",
@@ -72,8 +72,8 @@ def test_always_thinking_model_requires_flag(monkeypatch):
         min_vram_gb=12,
         thinking="always",
     )
-    monkeypatch.setattr("autoslm.schema.resolve_model", lambda *a, **k: info)
-    monkeypatch.setattr("autoslm.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
+    monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
+    monkeypatch.setattr("flash.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
     # An always-thinker can't run with thinking OFF (the default); the rejection triggers on the
     # default-off as well as an explicit thinking=false.
     with pytest.raises(ConfigError) as ei:
@@ -94,8 +94,8 @@ def test_thinking_unknown_capability_warns_but_allows(monkeypatch, capsys):
         min_vram_gb=12,
         thinking="unknown",
     )
-    monkeypatch.setattr("autoslm.schema.resolve_model", lambda *a, **k: info)
-    monkeypatch.setattr("autoslm.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
+    monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
+    monkeypatch.setattr("flash.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
     spec = spec_from_dict(_raw(model="acme/tiny-1b", model_policy="allow", thinking=True))
     assert spec.thinking is True
     assert "warning" in capsys.readouterr().out

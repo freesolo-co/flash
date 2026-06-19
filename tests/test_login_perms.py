@@ -17,7 +17,7 @@ def test_login_writes_private_config():
     finally:
         if saved_home is not None:
             os.environ["HOME"] = saved_home
-        import autoslm.client.config as client_config
+        import flash.client.config as client_config
 
         importlib.reload(client_config)
 
@@ -25,10 +25,10 @@ def test_login_writes_private_config():
 def _check_login():
     with tempfile.TemporaryDirectory() as home:
         os.environ["HOME"] = home
-        import autoslm.client.config as client_config
+        import flash.client.config as client_config
 
         importlib.reload(client_config)
-        import autoslm.cli.main as cli
+        import flash.cli.main as cli
 
         # Login verifies the freesolo key against the freesolo backend, then stores it. Stub
         # the network verify so the test stays offline; an invalid key would raise instead.

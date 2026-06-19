@@ -35,7 +35,7 @@ def stub_server():
                     return
                 self._send(
                     200,
-                    {"run_id": "autoslm-1-stub", "state": "queued", "spec": body.get("spec")},
+                    {"run_id": "flash-1-stub", "state": "queued", "spec": body.get("spec")},
                 )
             else:
                 self._send(404, {"detail": f"unknown path {self.path}"})
@@ -52,7 +52,7 @@ def stub_server():
                     {
                         "runs": [
                             {
-                                "run_id": "autoslm-1-stub",
+                                "run_id": "flash-1-stub",
                                 "state": "done",
                                 "cost_usd": 0.25,
                                 "updated_at": 1.0,
@@ -80,10 +80,10 @@ def _run(args, home: str, api_url: str):
     env = os.environ.copy()
     env.pop("FREESOLO_API_KEY", None)
     env.pop("AUTOSLM_API_KEY", None)
-    # The stub serves both the freesolo verify endpoint and the autoslm control plane.
+    # The stub serves both the freesolo verify endpoint and the flash control plane.
     env.update({"HOME": home, "AUTOSLM_API_URL": api_url, "FREESOLO_BASE_URL": api_url})
     return subprocess.run(
-        [sys.executable, "-m", "autoslm.cli.main", *args],
+        [sys.executable, "-m", "flash.cli.main", *args],
         cwd=ROOT,
         text=True,
         env=env,
@@ -102,7 +102,7 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     assert "fs-stub-key" not in proc.stdout
     assert "saved to" in proc.stdout
 
-    cfg = os.path.join(home, ".autoslm", "config.json")
+    cfg = os.path.join(home, ".flash", "config.json")
     with open(cfg) as f:
         cfg_data = json.load(f)
     assert cfg_data["api_key"] == "fs-stub-key"
@@ -117,11 +117,11 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     proc = _run(["train", str(toml), "--background"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = json.loads(proc.stdout)
-    assert out["run_id"] == "autoslm-1-stub"
+    assert out["run_id"] == "flash-1-stub"
     assert out["spec"]["model"] == "Qwen/Qwen3.5-4B"
 
     # `slm ps` renders the server's run list.
     proc = _run(["ps"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "autoslm-1-stub" in proc.stdout
+    assert "flash-1-stub" in proc.stdout
     assert "0.2500" in proc.stdout

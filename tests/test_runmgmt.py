@@ -8,12 +8,12 @@ import tempfile
 
 def test_list_and_cancel(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import autoslm.runner as runner
+        import flash.runner as runner
 
         importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
         monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from autoslm.spec import JobSpec
+        from flash.spec import JobSpec
 
         # two dry-run records
         for rid in ("a", "b"):
@@ -43,11 +43,11 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
     import os
 
     with tempfile.TemporaryDirectory() as tmp:
-        import autoslm.runner as runner
+        import flash.runner as runner
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        from autoslm.spec import JobSpec
+        from flash.spec import JobSpec
 
         spec = JobSpec(run_id="v1", model="Qwen/Qwen3.5-4B", algorithm="grpo")
         # A near-zero-duration Vast run stamps cost_usd=0.0 + notes.provider="vast".
@@ -73,12 +73,12 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
     import os
 
     with tempfile.TemporaryDirectory() as tmp:
-        import autoslm.runner as runner
+        import flash.runner as runner
 
         importlib.reload(runner)
         monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
         monkeypatch.setattr(runner, "_gpu_rate", lambda gpu: 3600.0)
-        from autoslm.spec import JobSpec
+        from flash.spec import JobSpec
 
         spec = JobSpec(run_id="r1", model="Qwen/Qwen3.5-4B", algorithm="grpo")
         # No cost_usd stamped (RunPod path): fall back to wall * rate and attribute runpod.

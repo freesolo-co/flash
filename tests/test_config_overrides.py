@@ -24,7 +24,7 @@ def _write(tmp, name, text):
 
 
 def test_set_overrides_scalar_and_list():
-    from autoslm.schema import spec_from_file
+    from flash.schema import spec_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         cfg = _write(tmp, "c.toml", BASE)
@@ -37,7 +37,7 @@ def test_set_overrides_scalar_and_list():
 
 
 def test_composed_config_deep_merge():
-    from autoslm.schema import spec_from_file
+    from flash.schema import spec_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         base = _write(tmp, "base.toml", BASE)
@@ -49,7 +49,7 @@ def test_composed_config_deep_merge():
 
 
 def test_set_requires_key_value():
-    from autoslm.schema import ConfigError, spec_from_file
+    from flash.schema import ConfigError, spec_from_file
 
     with tempfile.TemporaryDirectory() as tmp:
         cfg = _write(tmp, "c.toml", BASE)

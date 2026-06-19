@@ -1,4 +1,4 @@
-# AutoSLM
+# Flash
 
 Managed LoRA post-training service: SFT and GRPO on managed GPUs across multiple
 providers — RunPod Flash (serverless queue; RTX 4090/5090 classes) and Vast.ai
@@ -15,44 +15,44 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - **Verifiers-only environments.** Every run names a Prime Intellect `verifiers`
   environment by its published Hub slug (`[environment] id = "owner/name"`).
   Scaffold a local env, publish it with `slm env push`, then reference it by id.
-  The worker wraps it via `autoslm/envs/adapter.py`. There are no
+  The worker wraps it via `flash/envs/adapter.py`. There are no
   built-in task environments and no freesolo bridge. Single-turn environments
   are fully supported (SFT/GRPO/eval).
 
 ## Layout
 
-- `autoslm/catalog.py` — curated model catalog (Qwen3 dense supported tier;
+- `flash/catalog.py` — curated model catalog (Qwen3 dense supported tier;
   Qwen3.5/3.6 experimental tier) + `model_policy = "allow"` VRAM-fit check + each
   model's `thinking` capability (opt-in reasoning mode `thinking = true`)
-- `autoslm/schema.py`, `autoslm/spec.py` — TOML → `JobSpec`
-- `autoslm/runner.py` — server-side run supervisor (durable job handle,
+- `flash/schema.py`, `flash/spec.py` — TOML → `JobSpec`
+- `flash/runner.py` — server-side run supervisor (durable job handle,
   retries, cost guard, endpoint GC)
-- `autoslm/providers/` — RunPod Flash + Vast.ai provider subtrees (pricing,
+- `flash/providers/` — RunPod Flash + Vast.ai provider subtrees (pricing,
   gpus, durable submit/poll, preflight) behind one `base.Provider` protocol,
   with a cross-provider `allocator.py` that picks the cheapest fitting class
-- `autoslm/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
+- `flash/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
   shared recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
-- `autoslm/envs/` — environment machinery: registry and the
+- `flash/envs/` — environment machinery: registry and the
   `adapter` that wraps Prime Intellect / Hub `verifiers`
   environments onto the worker's interface
 - `slm lab setup` / `slm env init` — scaffold a starter local verifiers env and a
   ready-to-run config to start from
-- `autoslm/serve/`, `autoslm/server/` — adapter serving and the FastAPI control
-  plane (run operator-side via the separate `autoslm-server` command)
-- `autoslm/mcp/` — stdio MCP bridge for coding agents
+- `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
+  plane (run operator-side via the separate `flash-server` command)
+- `flash/mcp/` — stdio MCP bridge for coding agents
 - `Dockerfile` — the control-plane image (used by the repo docker-compose)
 - `tests/` — pytest suite (CPU-only with `AUTOSLM_SKIP_NET=1`)
 
 ## Local commands
 
 ```bash
-cd autoslm
+cd flash
 uv sync --extra server
 AUTOSLM_SKIP_NET=1 uv run pytest          # CPU tests (no GPU/network)
 uv run ruff check . && uv run ruff format .
 uv run slm --help
-uv run autoslm-server                      # control plane (operator-side, run once)
+uv run flash-server                      # control plane (operator-side, run once)
 ```
 
 The control plane owns provider credentials: `RUNPOD_API_KEY` is always required

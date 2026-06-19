@@ -22,7 +22,7 @@ def make_vast_offer(
     geolocation: str = "CZ",
 ):
     """A fully-vetted ``VastOffer`` with sensible defaults (override any field)."""
-    from autoslm.providers.vast.jobs import VastOffer
+    from flash.providers.vast.jobs import VastOffer
 
     return VastOffer(
         offer_id=offer_id,

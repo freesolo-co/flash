@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from autoslm.engine.multiturn_rollout import (
+from flash.engine.multiturn_rollout import (
     build_examples_index,
     index_collisions,
     rollout_one,
@@ -192,6 +192,6 @@ def test_examples_index_and_collisions():
     assert len(idx) == 2  # collision collapsed
     assert index_collisions(rows, lambda r: r["prompt"]) == 1
     # last write wins on collision
-    from autoslm.engine.multiturn_rollout import _prompt_key
+    from flash.engine.multiturn_rollout import _prompt_key
 
     assert idx[_prompt_key([{"role": "user", "content": "a"}])]["answer"] == "3"

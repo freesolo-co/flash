@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import types
 
-import autoslm.providers.runpod.train as ftrain
-from autoslm.providers.runpod.train import _run_suffix, _select_endpoint_resources, endpoint_name
+import flash.providers.runpod.train as ftrain
+from flash.providers.runpod.train import _run_suffix, _select_endpoint_resources, endpoint_name
 
 
 def _res(name):
@@ -21,43 +21,43 @@ def _res(name):
 
 def test_select_matches_live_prefixed_endpoint():
     target = endpoint_name(
-        "RTX 5090", _run_suffix("autoslm-123-c220526e")
-    )  # autoslm-train-5090-c220526e
+        "RTX 5090", _run_suffix("flash-123-c220526e")
+    )  # flash-5090-c220526e
     resources = {
         "u1": _res(f"live-{target}"),  # the live-provisioned resource for this run
-        "u2": _res("autoslm-train-5090-deadbeef"),  # a different run
-        "u3": _res("live-autoslm-train-4090-c220526e"),  # different GPU class
+        "u2": _res("flash-5090-deadbeef"),  # a different run
+        "u3": _res("live-flash-4090-c220526e"),  # different GPU class
     }
     assert _select_endpoint_resources(resources, target) == ["u1"]
 
 
 def test_select_empty_target_matches_nothing():
-    assert _select_endpoint_resources({"u1": _res("live-autoslm-train-5090-x")}, "") == []
+    assert _select_endpoint_resources({"u1": _res("live-flash-5090-x")}, "") == []
 
 
 def test_terminate_endpoint_never_raises_when_sdk_missing(monkeypatch):
     # ensure_auth raises (no key) -> terminate_endpoint must swallow and return a result list
-    import autoslm.providers.runpod.auth as auth
+    import flash.providers.runpod.auth as auth
 
     monkeypatch.setattr(auth, "ensure_auth", lambda: (_ for _ in ()).throw(RuntimeError("no key")))
-    out = ftrain.terminate_endpoint("RTX 5090", "autoslm-1-abcd1234")
+    out = ftrain.terminate_endpoint("RTX 5090", "flash-1-abcd1234")
     assert isinstance(out, list)
     assert out
     assert out[0]["success"] is False
 
 
 def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
-    import autoslm.runner as orch
+    import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.spec import JobSpec
+    from flash.spec import JobSpec
 
     spec = JobSpec.from_dict(
         {
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
             "gpu": {"type": "RTX 5090"},
-            "run_id": "autoslm-9-feedface",
+            "run_id": "flash-9-feedface",
         }
     )
     st = orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
@@ -73,7 +73,7 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
     monkeypatch.setattr(ftrain, "terminate_endpoint", fake_terminate)
 
     out = orch.cancel_run(spec.run_id)
-    assert calls == {"gpu": "RTX 5090", "run_id": "autoslm-9-feedface"}, (
+    assert calls == {"gpu": "RTX 5090", "run_id": "flash-9-feedface"}, (
         "must terminate the remote endpoint"
     )
     assert out.state == "cancelled"
@@ -83,13 +83,13 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     # Cancelling a deployed run tears down its serve endpoint; the deployment record
     # must flip to "undeployed" so /v1/deployments and /chat stop treating the
     # cancelled run as active (and can't recreate the endpoint).
-    import autoslm.runner as orch
-    import autoslm.serve.deploy as deploy
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.spec import JobSpec
+    from flash.spec import JobSpec
 
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-dep-1"})
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-1"})
     st = orch.RunStatus(
         run_id=spec.run_id,
         state="deployed",
@@ -98,7 +98,7 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["autoslm-serve-5090-x"])
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
     out = orch.cancel_run(spec.run_id)
@@ -113,13 +113,13 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     # helper, and that write must happen while _STATUS_LOCK is held.
     import inspect
 
-    import autoslm.runner as orch
-    import autoslm.serve.deploy as deploy
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.spec import JobSpec
+    from flash.spec import JobSpec
 
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-dep-lock"})
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-lock"})
     st = orch.RunStatus(
         run_id=spec.run_id,
         state="deployed",
@@ -128,7 +128,7 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["autoslm-serve-5090-x"])
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
     # The undeploy write must route through the lock-guarded helper (not a bare _save_status
@@ -156,13 +156,13 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
     # non-terminal state (the old _update(run_id, "deployed", deployment=...) path no-ops
     # against the terminal `done` CAS, leaving the deployment advertised as `ready`). It must
     # mark the deployment undeployed regardless of the terminal race.
-    import autoslm.runner as orch
-    import autoslm.serve.deploy as deploy
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.spec import JobSpec
+    from flash.spec import JobSpec
 
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-dep-race"})
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-race"})
     st = orch.RunStatus(
         run_id=spec.run_id,
         state="deployed",
@@ -171,7 +171,7 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["autoslm-serve-5090-x"])
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
     monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
 
     # Inject the race: a concurrent mark_undeployed flips the run to terminal `done` AFTER
@@ -179,7 +179,7 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
     def racing_undeploy(*a, **k):
         # mark_undeployed moves a live `deployed` run to terminal `done`.
         orch.mark_undeployed(spec.run_id)
-        return ["autoslm-serve-5090-x"]
+        return ["flash-serve-5090-x"]
 
     monkeypatch.setattr(deploy, "undeploy_adapter", racing_undeploy)
 
@@ -199,13 +199,13 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
     # so the final transition must OVERRIDE the racing `done` — the run must end `cancelled`,
     # not `done`. (Mirrors test_cancel_deployed_run_undeployed_even_when_raced_to_terminal but
     # asserts the state verdict specifically.)
-    import autoslm.runner as orch
-    import autoslm.serve.deploy as deploy
+    import flash.runner as orch
+    import flash.serve.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.spec import JobSpec
+    from flash.spec import JobSpec
 
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-cancel-wins"})
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-wins"})
     st = orch.RunStatus(
         run_id=spec.run_id,
         state="deployed",
@@ -221,7 +221,7 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
     def racing_undeploy(*a, **k):
         orch.mark_undeployed(spec.run_id)
         assert orch.get_status(spec.run_id).state == "done"  # the race landed
-        return ["autoslm-serve-5090-x"]
+        return ["flash-serve-5090-x"]
 
     monkeypatch.setattr(deploy, "undeploy_adapter", racing_undeploy)
 
@@ -238,12 +238,12 @@ def test_cancel_loses_to_racing_genuine_completion_done(tmp_path, monkeypatch):
     # The run actually finished, so its result MUST be preserved — cancel must NOT clobber it to
     # `cancelled`. (A blunt allow_from_terminal=True would discard the real result here; the
     # override is scoped to runs that were `deployed` at entry, which a `running` run is not.)
-    import autoslm.runner as orch
+    import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.spec import JobSpec
+    from flash.spec import JobSpec
 
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-finish-race"})
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-finish-race"})
     # A `running` run (NOT deployed): no deployment, an in-flight training thread.
     st = orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
     orch._save_status(st)
@@ -270,7 +270,7 @@ def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
     UNDER FLASH_SDK_LOCK, not just the undeploy. isolate_flash_state swaps runpod_flash's
     process-wide registry globals, so a concurrent deploy could swap the scope mid-teardown.
     Asserts the lock is held when isolate_flash_state runs (and released afterward)."""
-    import autoslm.providers.runpod.auth as auth
+    import flash.providers.runpod.auth as auth
 
     monkeypatch.setattr(auth, "ensure_auth", lambda: None)
     held = {}
@@ -280,7 +280,7 @@ def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
         raise RuntimeError("short-circuit before the real SDK lookup")
 
     monkeypatch.setattr(ftrain, "isolate_flash_state", rec_isolate)
-    out = ftrain.terminate_endpoint("RTX 5090", "autoslm-1-abcd1234")
+    out = ftrain.terminate_endpoint("RTX 5090", "flash-1-abcd1234")
     assert held.get("locked") is True, "isolate_flash_state must run while holding FLASH_SDK_LOCK"
     assert ftrain.FLASH_SDK_LOCK.locked() is False, "lock must be released after terminate"
     assert isinstance(out, list)  # still never raises
@@ -289,12 +289,12 @@ def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
 
 
 def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
-    import autoslm.runner as orch
+    import flash.runner as orch
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from autoslm.spec import JobSpec
+    from flash.spec import JobSpec
 
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "autoslm-done-1"})
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-done-1"})
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="done", spec=spec.to_dict()))
 
     called = {"v": False}

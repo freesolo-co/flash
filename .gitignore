@@ -13,7 +13,7 @@ hf_cache/
 
 # Run artifacts: adapters (large binaries) live on the HF dataset repo, not in git
 results/
-.autoslm/
+.flash/
 uv-cache/
 .flash/
 

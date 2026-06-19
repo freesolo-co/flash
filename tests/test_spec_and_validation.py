@@ -11,8 +11,8 @@ import os
 
 import pytest
 
-from autoslm.schema import ConfigError, spec_from_dict
-from autoslm.spec import JobSpec, load_job_spec_from_env
+from flash.schema import ConfigError, spec_from_dict
+from flash.spec import JobSpec, load_job_spec_from_env
 
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
@@ -184,7 +184,7 @@ def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
 
 
 def _fresh_orchestrator(tmp_path, monkeypatch):
-    import autoslm.runner as runner
+    import flash.runner as runner
 
     importlib.reload(runner)
     # Storage roots are fixed constants now; redirect to tmp for isolation.
@@ -198,8 +198,8 @@ def test_runs_file_path_rejects_traversal(tmp_path, monkeypatch) -> None:
     for bad in ("../escape", "a/b", "", "x" * 200, ".hidden"):
         with pytest.raises(ValueError, match="invalid run_id"):
             orch.runs_file_path(bad, ".json")
-    good = orch.runs_file_path("autoslm-123-abc", ".log")
-    assert good.endswith("autoslm-123-abc.log")
+    good = orch.runs_file_path("flash-123-abc", ".log")
+    assert good.endswith("flash-123-abc.log")
 
 
 def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
@@ -216,15 +216,15 @@ def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
     assert orch.cancel_run(status.run_id).state == "dry_run"
 
     with pytest.raises(FileNotFoundError, match="unknown run_id"):
-        orch.get_status("autoslm-000-nope")
+        orch.get_status("flash-000-nope")
 
 
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
-    spec = spec_from_dict(_raw(), run_id="autoslm-1-x")
-    assert orch.artifacts_dir(spec).endswith(os.path.join("results", "runpod", "rl", "autoslm-1-x"))
-    assert orch.adapter_prefix(spec) == "rl/autoslm-1-x/seed0"
-    assert orch.adapter_prefix(spec, seed=3) == "rl/autoslm-1-x/seed3"
+    spec = spec_from_dict(_raw(), run_id="flash-1-x")
+    assert orch.artifacts_dir(spec).endswith(os.path.join("results", "runpod", "rl", "flash-1-x"))
+    assert orch.adapter_prefix(spec) == "rl/flash-1-x/seed0"
+    assert orch.adapter_prefix(spec, seed=3) == "rl/flash-1-x/seed3"
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +233,7 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
 
 
 def test_vram_estimate_scales_with_params_and_algorithm() -> None:
-    from autoslm.engine import vram
+    from flash.engine import vram
 
     sft_small = vram.estimate_vram_gb(0.6, "sft")
     sft_big = vram.estimate_vram_gb(8.0, "sft")
@@ -244,7 +244,7 @@ def test_vram_estimate_scales_with_params_and_algorithm() -> None:
 def test_vram_sft_honors_per_device_bs_env(monkeypatch) -> None:
     # The SFT activation term must track the worker's SFT_PER_DEVICE_BS (the operator env that
     # build_worker_env forwards): raising it must size the estimate UP, not stay capped at 4.
-    from autoslm.engine import vram
+    from flash.engine import vram
 
     monkeypatch.delenv("SFT_PER_DEVICE_BS", raising=False)
     base = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
@@ -257,7 +257,7 @@ def test_vram_sft_honors_per_device_bs_env(monkeypatch) -> None:
 
 
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
-    from autoslm.engine import vram
+    from flash.engine import vram
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     assert vram.fetch_hf_params_b("any/model") is None
@@ -269,16 +269,16 @@ def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
 
 
 def test_get_logger_namespacing() -> None:
-    from autoslm._logging import get_logger
+    from flash._logging import get_logger
 
-    assert get_logger().name == "autoslm"
-    assert get_logger("autoslm").name == "autoslm"
-    assert get_logger("autoslm.providers").name == "autoslm.providers"
-    assert get_logger("mymodule").name == "autoslm.mymodule"
+    assert get_logger().name == "flash"
+    assert get_logger("flash").name == "flash"
+    assert get_logger("flash.providers").name == "flash.providers"
+    assert get_logger("mymodule").name == "flash.mymodule"
 
 
 def test_log_level_from_env(monkeypatch) -> None:
-    from autoslm import _logging
+    from flash import _logging
 
     monkeypatch.setenv("AUTOSLM_LOG_LEVEL", "debug")
     assert _logging._level_from_env() == logging.DEBUG

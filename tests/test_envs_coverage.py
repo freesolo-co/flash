@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from autoslm.envs.base import BaseEnvironment
+from flash.envs.base import BaseEnvironment
 
 # ---------------------------------------------------------------------------
 # base
@@ -28,7 +28,7 @@ def test_base_environment_defaults() -> None:
 
 def test_load_environment_requires_env_id() -> None:
     """Verifiers-only: an empty env id is a hard error (no default env, no local path)."""
-    from autoslm.envs.registry import load_environment
+    from flash.envs.registry import load_environment
 
     with pytest.raises(ValueError, match="no environment specified"):
         load_environment("")
@@ -39,7 +39,7 @@ def test_env_init_scaffolds_a_loadable_verifiers_env(tmp_path, monkeypatch) -> N
     BaseEnvironment subclass — so a publish to the Hub actually loads."""
     from argparse import Namespace
 
-    from autoslm.cli.main import cmd_env_init
+    from flash.cli.main import cmd_env_init
 
     monkeypatch.chdir(tmp_path)
     assert cmd_env_init(Namespace(name="my-task")) == 0

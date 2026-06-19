@@ -6,9 +6,9 @@ import pytest
 
 
 def test_required_vram_catalog_and_open(monkeypatch):
-    from autoslm.engine import vram
-    from autoslm.providers import allocator
-    from autoslm.providers.allocator import required_vram_gb
+    from flash.engine import vram
+    from flash.providers import allocator
+    from flash.providers.allocator import required_vram_gb
 
     # MEASURED: tiny-model GRPO OOMs a 20 GB card (vLLM-colocate engine overhead the param
     # estimate missed); floored to the 24 GB vLLM-colocate minimum (_VLLM_COLOCATE_FLOOR_GB).
@@ -32,8 +32,8 @@ def test_pinned_undersized_gpu_escalates_never_below_need(monkeypatch):
     class across providers (the pin is a preference, not a hard cap). The matrix ``need`` stays the
     absolute floor (escalation never drops below it -> no OOM). Only a need that exceeds EVERY GPU
     across EVERY provider raises (all options exhausted)."""
-    from autoslm.providers import allocator
-    from autoslm.providers.base import UnsupportedGpuError
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     # Qwen3-4B GRPO at the default engine length (2368 tokens, mirroring run_rl) needs ~35 GB;
@@ -53,7 +53,7 @@ def test_pinned_undersized_gpu_escalates_never_below_need(monkeypatch):
 
 
 def test_validation_gate_and_opt_in(monkeypatch):
-    from autoslm.providers import allocator
+    from flash.providers import allocator
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
@@ -67,7 +67,7 @@ def test_validation_gate_and_opt_in(monkeypatch):
 
 
 def test_provider_pin_runpod(monkeypatch):
-    from autoslm.providers import allocator
+    from flash.providers import allocator
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="runpod")
@@ -76,8 +76,8 @@ def test_provider_pin_runpod(monkeypatch):
 
 
 def test_unknown_provider_rejected(monkeypatch):
-    from autoslm.providers import allocator
-    from autoslm.providers.base import UnsupportedGpuError
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     # A name not in PROVIDER_NAMES is an "unknown provider".
@@ -86,8 +86,8 @@ def test_unknown_provider_rejected(monkeypatch):
 
 
 def test_known_provider_unavailable_offline(monkeypatch):
-    from autoslm.providers import allocator
-    from autoslm.providers.base import UnsupportedGpuError
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
 
     # vast is a known provider but offline (AUTOSLM_SKIP_NET) it is not available.
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
@@ -96,8 +96,8 @@ def test_known_provider_unavailable_offline(monkeypatch):
 
 
 def test_skip_net_matches_static_cheapest(monkeypatch):
-    from autoslm.providers import allocator
-    from autoslm.providers.base import cheapest_gpu
+    from flash.providers import allocator
+    from flash.providers.base import cheapest_gpu
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")  # real available_providers: runpod only
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
@@ -106,8 +106,8 @@ def test_skip_net_matches_static_cheapest(monkeypatch):
 
 
 def test_nothing_fits_names_constraint(monkeypatch):
-    from autoslm.providers import allocator
-    from autoslm.providers.base import UnsupportedGpuError
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
 
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 4096)
@@ -119,7 +119,7 @@ def test_estimator_matches_measured_seq_boundaries():
     """The raw VRAM physics reproduces the MEASURED RunPod capacity sweep: each anchor
     is a real train/OOM boundary observed on a pinned card (the calibration ground truth).
     estimate_vram_gb is the accurate estimate; model_required adds the safety headroom."""
-    from autoslm.engine.vram import estimate_vram_gb as e
+    from flash.engine.vram import estimate_vram_gb as e
 
     # 0.8B (0.9B): seq up to 32k fits the cheapest 24 GB card, both algos (measured: A5000)
     assert e(0.9, "grpo", seq_len=4096) <= 24
@@ -140,7 +140,7 @@ def test_estimator_matches_measured_seq_boundaries():
 def test_required_vram_policy_floors_and_downrouting():
     """model_required_vram_gb: hard floors never under-provision; small runs down-route to
     a cheaper card; bigger context/group/thinking only ever size UP (never down)."""
-    from autoslm.engine.vram import model_required_vram_gb as need
+    from flash.engine.vram import model_required_vram_gb as need
 
     m4 = "Qwen/Qwen3.5-4B"
     # context length lifts GRPO need monotonically
@@ -170,8 +170,8 @@ def test_required_vram_policy_floors_and_downrouting():
 def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
     """The GRPO estimate must include the fp32-logits term (it scales with max_tokens, NOT
     seq_len) and cap it at the per-device logits budget so it never over-reserves."""
-    from autoslm.engine import vram
-    from autoslm.engine.vram import estimate_vram_gb as e
+    from flash.engine import vram
+    from flash.engine.vram import estimate_vram_gb as e
 
     # Holding seq fixed, a longer completion (max_tokens) raises the GRPO train-phase estimate.
     # Use the non-colocate path (use_vllm=False) so the rollout term doesn't mask the train peak
@@ -188,12 +188,12 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
 def test_vram_headroom_consistent_across_sizing_paths():
     """resolve_gpu_policy (parse-time) and required_vram_gb (submit-time) must size with the SAME
     headroom (a validated constant), so they never disagree (PR #176 review)."""
-    from autoslm.providers import allocator
+    from flash.providers import allocator
 
     assert allocator.vram_headroom() == 1.1
     # both paths feed model_required_vram_gb the same headroom -> identical sizing
     a_need = allocator.required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_length": 4096})
-    from autoslm.engine.vram import model_required_vram_gb
+    from flash.engine.vram import model_required_vram_gb
 
     direct = model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"max_length": 4096}, headroom=1.1)
     assert a_need == direct
@@ -204,8 +204,8 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
     required VRAM, across a sweep of model x algo x seq x group x batch. If this ever fails,
     auto-allocation could provision a too-small card and OOM a paid worker."""
     monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
-    from autoslm.providers.allocator import allocate, required_vram_gb
-    from autoslm.providers.base import get_gpu_info
+    from flash.providers.allocator import allocate, required_vram_gb
+    from flash.providers.base import get_gpu_info
 
     grid = [
         ("Qwen/Qwen3.5-0.8B", "grpo", {"max_length": 1024, "group_size": 4}),
