@@ -156,7 +156,13 @@ def _apply_override(raw: dict, item: str) -> None:
     leaf = parts[-1]
     # support list values like seeds=[0,1]
     val = value.strip()
-    if val.startswith("[") and val.endswith("]"):
+    # [wandb] leaves are string-valued labels (project / run name); a numeric- or
+    # bool-looking value like `--set wandb.run_name=123` is still the string label the
+    # user intends, and the same value works through [worker_env]. Preserve it as a
+    # string instead of coercing it to int/float/bool (which _apply_wandb_naming rejects).
+    if parts[0] == "wandb":
+        node[leaf] = val
+    elif val.startswith("[") and val.endswith("]"):
         inner = val[1:-1].strip()
         node[leaf] = [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
     else:

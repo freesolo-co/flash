@@ -91,6 +91,25 @@ def test_set_override_reaches_wandb(tmp_path):
     assert spec.worker_env["WANDB_NAME"] == "cli-run"
 
 
+@pytest.mark.parametrize("label", ["123", "1e-4", "true", "false"])
+def test_set_override_preserves_numeric_looking_wandb_label(tmp_path, label):
+    # A numeric- or bool-looking --set wandb.* value is the string label the user
+    # intends; it must not be coerced to int/float/bool (which the [wandb] validator
+    # rejects). The same value works through [worker_env].
+    cfg = tmp_path / "run.toml"
+    cfg.write_text(
+        'model = "openbmb/MiniCPM5-1B"\n'
+        'algorithm = "sft"\n'
+        "[environment]\n"
+        'id = "owner/some-env"\n'
+        "[train]\n"
+        "seeds = [0]\n"
+        'hf_repo = "me/repo"\n'
+    )
+    spec = spec_from_file(str(cfg), overrides=[f"wandb.run_name={label}"])
+    assert spec.worker_env["WANDB_NAME"] == label
+
+
 def test_worker_run_name_honors_override(monkeypatch):
     from flash.engine import worker
 
