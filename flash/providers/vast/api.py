@@ -2,9 +2,9 @@
 
 Mirrors ``providers/runpod/api.py``: stdlib urllib only, hardened retries, and nothing
 persisted locally — a fresh process can list/destroy any instance using only the
-persisted ids + VAST_API_KEY. Only ``verified`` offers are searched (the datacenter-only
-filter is NOT applied, so verified community/marketplace hosts are included too); callers
-re-check hosting_type + verification + the reliability floor client-side.
+persisted ids + VAST_API_KEY. Only ``verified`` DATACENTER offers are searched (the
+server-side ``datacenter`` hosting-type filter is applied, since run secrets ship to the
+box); callers re-check hosting_type + verification + the reliability floor client-side.
 """
 
 from __future__ import annotations
@@ -66,20 +66,21 @@ def search_offers(
     limit: int = 64,
     extra_q: dict | None = None,
 ) -> list[dict]:
-    """Rentable single-GPU offers from verified hosts, cheapest first. We drop the server-side
-    datacenter-only filter so verified COMMUNITY/marketplace hosts are returned alongside
-    datacenter ones (usable_offers still re-checks hosting_type + verification + the reliability
-    floor, so quality is enforced downstream).
+    """Rentable single-GPU offers from verified DATACENTER hosts, cheapest first.
 
     ``datacenter`` here is Vast's hosting-type filter (professional datacenters vs
     consumer/hobbyist machines); results additionally carry ``hosting_type`` which
-    callers must re-check (``usable_offers``) — never trust one filter layer alone.
+    callers re-check (``usable_offers``) — never trust one filter layer alone.
     """
-    # We intentionally do NOT apply Vast's server-side datacenter-only filter: verified
-    # COMMUNITY/marketplace hosts are included too (scarce classes often have no verified-datacenter
-    # supply), and usable_offers re-checks hosting_type + verification + the reliability floor.
+    # Apply Vast's server-side datacenter-only filter (hosting_type==1). usable_offers now rejects
+    # community/marketplace hosts unconditionally (run secrets ship to the box), so a mixed search
+    # would risk filling the price-sorted limit=64 page with community offers and reporting "no
+    # usable offers" even when verified-datacenter capacity exists just past the page. Filtering
+    # server-side keeps the page full of datacenter offers; usable_offers still re-checks
+    # hosting_type + verification + the reliability floor (belt and suspenders).
     q: dict[str, Any] = {
         "verified": {"eq": True},
+        "datacenter": {"eq": True},
         "rentable": {"eq": True},
         "num_gpus": {"eq": 1},
         "gpu_ram": {"gte": int(min_vram_mb)},
