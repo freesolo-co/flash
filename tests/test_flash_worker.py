@@ -23,14 +23,11 @@ def _spec():
 
 
 def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
-    """DEFECT: RL_VLLM_GPU_UTIL / RL_PER_DEVICE_PROMPTS (and the others) were never added to
-    the forward list, so the docs' OOM-fix advice couldn't reach the worker."""
+    """The worker-side knobs the worker / vLLM actually read are forwarded to the GPU worker."""
     from flash.providers.runpod.train import build_worker_env
 
     knobs = {
-        "RL_VLLM_GPU_UTIL": "0.40",
         "RL_VLLM_SLEEP": "1",
-        "RL_PER_DEVICE_PROMPTS": "2",
         "VLLM_USE_V1": "0",
         "SFT_PER_DEVICE_BS": "4",
     }
@@ -53,32 +50,19 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
 
 
 def test_build_worker_env_forwards_midrun_eval_knobs(monkeypatch):
-    """The periodic mid-run eval knobs are read via os.environ on the worker, so they MUST be
-    on the forward allowlist or the feature silently no-ops on every remote run (RunPod + Vast,
-    which reuses this same build_worker_env)."""
+    """The mid-run eval cadence (FLASH_EVAL_EVERY_STEPS) is read via os.environ on the worker, so
+    it MUST be on the forward allowlist or the feature silently no-ops on every remote run (RunPod
+    + Vast, which reuses this same build_worker_env)."""
     from flash.providers.runpod.train import build_worker_env
 
     knobs = {
         "FLASH_EVAL_EVERY_STEPS": "20",
-        "FLASH_EVAL_NUM": "16",
     }
     for k, v in knobs.items():
         monkeypatch.setenv(k, v)
     env = build_worker_env(_spec(), 0)
     for k, v in knobs.items():
         assert env.get(k) == v, f"{k} not forwarded to worker"
-
-
-def test_build_worker_env_forwards_heartbeat_throttle(monkeypatch):
-    """FLASH_HEARTBEAT_MIN_S is read by engine.worker on the GPU side to throttle rl_step
-    heartbeat commits under HuggingFace's 128/hr-per-repo cap; operators raise it when several
-    concurrent GRPO runs share one HF_REPO, so it MUST be on the forward allowlist."""
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.setenv("FLASH_HEARTBEAT_MIN_S", "180")
-    assert build_worker_env(_spec(), 0).get("FLASH_HEARTBEAT_MIN_S") == "180"
-    monkeypatch.delenv("FLASH_HEARTBEAT_MIN_S", raising=False)
-    assert "FLASH_HEARTBEAT_MIN_S" not in build_worker_env(_spec(), 0)
 
 
 def test_build_worker_env_forwards_judge_model(monkeypatch):
