@@ -97,6 +97,16 @@ def runconfig_from_status(
     allow_unvalidated = gpu_spec.get("allow_unvalidated")
     if allow_unvalidated is not None:
         allow_unvalidated = bool(allow_unvalidated)
+    # Pin the card the run ACTUALLY ran on. A policy GPU (``gpu.type`` = "auto"/"cheapest")
+    # is re-allocated to a concrete class at submit time, recorded in ``remote.allocated_gpu``
+    # (with ``remote.provider``); falling back to ``gpu.type`` would leave the reconstructed
+    # config pinned to a policy sentinel and re-derive the GPU from the offline heuristic at
+    # grading time -- pricing the measured bill against a DIFFERENT card. Mirror
+    # ``measured_from_status``/``calibration._config_of``: prefer the allocated GPU/provider
+    # and only fall back to the requested type/default when the run never recorded one.
+    remote = status.get("remote") or {}
+    allocated_gpu = remote.get("allocated_gpu") or gpu_spec.get("type")
+    allocated_provider = remote.get("provider")
     return RunConfig(
         model_id=spec["model"],
         method=method,
@@ -108,7 +118,8 @@ def runconfig_from_status(
         group_size=train.get("group_size") if is_grpo else None,
         lora_rank=train.get("lora_rank"),
         thinking=bool(spec.get("thinking", False)),
-        gpu=gpu_spec.get("type"),
+        gpu=allocated_gpu,
+        provider=allocated_provider if allocated_provider is not None else "auto",
         allow_unvalidated=allow_unvalidated,
         max_wall_seconds=int(max_wall) if max_wall is not None else None,
         environment=(spec.get("environment") or {}).get("id"),
@@ -131,6 +142,20 @@ class MeasuredRun:
     @property
     def ok(self) -> bool:
         return self.state == "done" and self.cost_usd > 0
+
+    @property
+    def effective_hourly_usd(self) -> float:
+        """The billed rate, falling back to cost/wall when the provider omits ``hourly_usd``.
+
+        Some providers don't report ``remote.hourly_usd``, but the measured ``cost_usd`` and
+        ``wall_seconds`` are the ground truth -- so the implied rate (cost / hours) is a
+        meaningful per-run rate for reports/notes instead of a misleading ``$0.00/hr``.
+        """
+        if self.hourly_usd is not None:
+            return self.hourly_usd
+        if self.wall_seconds > 0:
+            return self.cost_usd / (self.wall_seconds / 3600.0)
+        return 0.0
 
 
 def measured_from_status(
@@ -158,6 +183,7 @@ def measured_from_status(
 
 def measured_as_estimate(m: MeasuredRun) -> CostEstimate:
     """Wrap a measured run as a `CostEstimate` (total_usd + gpu are the ground truth)."""
+    rate = m.effective_hourly_usd  # billed rate, or cost/wall when the provider omits it
     return CostEstimate(
         model_id=m.config.model_id,
         method=m.config.method,
@@ -166,7 +192,7 @@ def measured_as_estimate(m: MeasuredRun) -> CostEstimate:
         provider=m.provider,
         gpu_vram_gb=0,
         required_vram_gb=0,
-        gpu_hourly_usd=m.hourly_usd or 0.0,
+        gpu_hourly_usd=rate,
         setup_seconds=0.0,
         seconds_per_step=(m.wall_seconds / m.config.steps) if m.config.steps else 0.0,
         train_seconds=m.wall_seconds,
@@ -174,7 +200,7 @@ def measured_as_estimate(m: MeasuredRun) -> CostEstimate:
         wall_capped=False,
         total_usd=m.cost_usd,
         notes=(
-            f"MEASURED on {m.gpu}@{m.provider} (${m.hourly_usd or 0:.2f}/hr, {m.wall_seconds:.0f}s)",
+            f"MEASURED on {m.gpu}@{m.provider} (${rate:.2f}/hr, {m.wall_seconds:.0f}s)",
         ),
     )
 

@@ -212,7 +212,9 @@ def _notes(
             + (f", env {n.environment}" if n.environment else "")
             + ") + policy+reference update"
         )
-    notes.append(f"GPU sized with {vram_headroom():.0%} VRAM headroom; market (spot/queue) $/hr")
+    # ``vram_headroom()`` is a sizing MULTIPLIER (e.g. 1.1), so the headroom fraction is it
+    # minus one -- report 10%, not the multiplier itself as 110%.
+    notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; market (spot/queue) $/hr")
     if wall_capped:
         per_seed = "" if config.setup_repeats == 1 else "per-seed "
         notes.append(
