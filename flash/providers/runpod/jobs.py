@@ -284,6 +284,7 @@ def poll_job(
     heartbeat_reader=None,
     stall_after_s: float = 1200.0,
     setup_grace_s: float = 3000.0,
+    unhealthy_grace_s: float = 240.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
@@ -305,6 +306,7 @@ def poll_job(
     last_progress = time.time()
     seen_heartbeat = False
     last_health_probe = 0.0
+    unhealthy_since: float | None = None  # first time the worker was seen stuck UNHEALTHY
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
@@ -344,10 +346,29 @@ def poll_job(
             try:
                 h = runpod_api.endpoint_health(handle.endpoint_id)
                 workers = h.get("workers") or {}
-                if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not (
-                    workers.get("running") or workers.get("ready") or workers.get("idle")
-                ):
+                usable = workers.get("running") or workers.get("ready") or workers.get("idle")
+                recovering = workers.get("initializing")
+                if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
                     say(f"queued; workers: {workers}")
+                # Fail fast on a worker stuck UNHEALTHY: a dead worker / failed image pull won't
+                # self-recover, so don't burn the full setup_grace_s (~50 min) waiting on it — once
+                # it has stayed unhealthy with nothing usable or (re)initializing for
+                # unhealthy_grace_s, return a (retryable) stall so the runner re-provisions a FRESH
+                # endpoint (fresh image pull, likely a different host). Observed: a mutable image
+                # tag republished mid-pull corrupts the worker -> unhealthy, and a fresh pull fixes it.
+                if workers.get("unhealthy") and not usable and not recovering:
+                    if unhealthy_since is None:
+                        unhealthy_since = time.time()
+                    elif time.time() - unhealthy_since > unhealthy_grace_s:
+                        return PollResult(
+                            False,
+                            failure="stalled",
+                            detail=f"worker stuck unhealthy for "
+                            f"{int(time.time() - unhealthy_since)}s while IN_QUEUE (likely a failed "
+                            f"image pull); retrying on a fresh endpoint",
+                        )
+                else:
+                    unhealthy_since = None  # recovered / usable worker appeared
             except Exception:
                 # Health surfacing is diagnostic only; a probe failure must not stop polling.
                 pass
@@ -383,7 +404,7 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     runner can persist {endpoint_id, job_id} for cross-process reattach.
     """
     from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
-    from flash.providers.runpod.train import _run_suffix, build_worker_env
+    from flash.providers.runpod.train import _run_suffix, build_worker_env, chalk_extra_pip
 
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
     # Per-attempt endpoint name: a retry must land on a genuinely fresh endpoint —
@@ -396,7 +417,12 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     # doing it after deploy_train_endpoint() would leak the just-created endpoint (its
     # rN-suffixed name can't be reconstructed from the run id later) against the account
     # quota — the runner would also treat the raise as a retryable poll_error.
-    extra_pip = list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
+    # extra_pip runs for EVERY job here (the durable baked-image path skips resolve_worker_deps /
+    # FLASH_WORKER_EXTRA_DEPS in build_function_input, but _train_body always pip-installs
+    # extra_pip), so the opt-in chalk spec is appended here to reach default runs.
+    extra_pip = (
+        list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
+    ) + chalk_extra_pip(spec)
     worker_env = build_worker_env(spec, seed)
     endpoint_id, name = deploy_train_endpoint(
         spec.gpu.type,
