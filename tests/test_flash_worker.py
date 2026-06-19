@@ -161,7 +161,8 @@ def test_chalk_extra_pip_defaults_to_pypi_without_spec(monkeypatch):
     _clear_chalk_flags(monkeypatch)
     monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
     assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
-    assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk") and "<" in DEFAULT_CHALK_SPEC  # bounded
+    assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk")
+    assert "<" in DEFAULT_CHALK_SPEC  # bounded range, not an unpinned floating install
 
 
 def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):
