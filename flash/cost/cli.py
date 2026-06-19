@@ -35,15 +35,16 @@ def _cmd_estimate(args: argparse.Namespace) -> int:
 def _cmd_verify(args: argparse.Namespace) -> int:
     acc = verify_accuracy()
     print("Equation vs MEASURED cost  (raw first-principles, no output factor):")
-    print(f"  {'group':5s} {'n':>3s} {'meanMAPE':>9s} {'medAPE':>8s} {'aggBias':>8s} {'<=33%':>6s}")
-    for g in ("sft", "grpo", "all"):
+    print(f"  {'group':10s} {'n':>3s} {'meanMAPE':>9s} {'medAPE':>8s} {'aggBias':>8s} {'<=33%':>6s}")
+    for g in ("all", "sft", "grpo", "real", "real_sft", "real_grpo"):
         if g not in acc:
             continue
         a = acc[g]
         print(
-            f"  {g:5s} {a['n']:3d} {a['mean_mape_pct']:8.0f}% {a['median_ape_pct']:7.0f}% "
+            f"  {g:10s} {a['n']:3d} {a['mean_mape_pct']:8.0f}% {a['median_ape_pct']:7.0f}% "
             f"{a['agg_bias']:8.3f} {a['within_33pct'] * 100:5.0f}%"
         )
+    print("  real_* = runs >=500s (ran their configured work); the meaningful pricing accuracy.")
     print("  (aggBias 1.0 = unbiased in aggregate; NOT forced -- whatever the inputs give)")
     print("\nEnvironment cost sweep  (GRPO; cost varies with reward grader):")
     print(f"  {'model':18s} {'environment':30s} {'rwd_s':>6s} {'usd$':>8s}")

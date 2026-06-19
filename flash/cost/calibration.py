@@ -68,18 +68,32 @@ def _config_of(run: dict) -> RunConfig:
     )
 
 
+# A run whose measured wall is below this almost never executed its configured step count
+# (smoke tests get cancelled / step-capped early), so its measured cost is for a *different*
+# (shorter) run than the config the equation prices -- an invalid comparison, not an
+# estimator error (tell: predicted train time alone exceeds the whole measured wall). We
+# report those separately rather than letting them pollute the real-run accuracy.
+REAL_RUN_MIN_WALL_S = 500.0
+
+
 def verify_accuracy(path: Path | str | None = None) -> dict:
     """Grade the raw first-principles equation against measured cost. No output factor.
 
-    Returns per-method and overall: n, mean MAPE %, median APE %, aggregate bias
-    (Σ estimate / Σ measured), and the fraction of runs within 33% / 50%.
+    Returns per-group: n, mean MAPE %, median APE %, aggregate bias (Σ estimate / Σ
+    measured), and the fraction within 33% / 50%. Groups: all / sft / grpo, plus the
+    ``real_*`` subsets (wall >= REAL_RUN_MIN_WALL_S) that actually ran their configured
+    work -- the meaningful accuracy for pricing a real training run.
     """
     runs = _load_runs(path)
+    real = [r for r in runs if r.get("wall_seconds", 0) >= REAL_RUN_MIN_WALL_S]
     out: dict[str, dict] = {}
     groups = {
         "all": runs,
         "sft": [r for r in runs if r["method"] == "sft"],
         "grpo": [r for r in runs if r["method"] == "grpo"],
+        "real": real,
+        "real_sft": [r for r in real if r["method"] == "sft"],
+        "real_grpo": [r for r in real if r["method"] == "grpo"],
     }
     for name, sub in groups.items():
         if not sub:

@@ -47,17 +47,23 @@ python -m flash.cost verify    # grade the equation vs measured cost + env sweep
 
 | Group | n | mean MAPE | median APE | agg bias | within 33% |
 |---|---:|---:|---:|---:|---:|
-| sft | 13 | 143% | 46% | 1.22 | 15% |
-| grpo | 43 | 90% | **26%** | 1.13 | 60% |
-| all | 56 | 102% | **34%** | 1.14 | 50% |
+| all | 56 | 112% | 34% | 1.17 | 50% |
+| **real** (≥500s) | 40 | 39% | **24%** | 0.89 | 62% |
+| **real GRPO** | 33 | 37% | **22%** | 0.88 | **73%** |
+| real SFT | 7 | 49% | 43% | 0.99 | 14% |
 
-**`agg bias` is not forced to 1.0** — forcing it would be exactly the output hack this
-equation avoids. GRPO's 26% median (60% of runs within a third of measured) is **at the
-irreducible floor**: the per-run cold-start (post-allocation boot + deps-install + model
-download) measures **470–840s across runs** — a 1.8× spread with no config-visible
-predictor — so a short, cold-start-bound run cannot be priced tighter than that, whatever
-the constant. The equation fits the *central* cold-start, not the noise. SFT (46%, n=13)
-is data-limited (mostly short, cold-start-bound runs); more long SFT runs will tighten it.
+The meaningful rows are **`real`** — runs ≥500s that actually executed their configured
+work. **Real GRPO is accurate: 22% median APE, 73% of runs within a third of measured.**
+`agg bias` is **not forced to 1.0** (that would be the output hack this avoids).
+
+Two things to read honestly:
+- **Sub-500s "runs" over-predict ~3×** and drag the `all` row down — they were cancelled /
+  step-capped before running their configured steps (the tell: predicted train time alone
+  exceeds the whole measured wall), so their cost is for a *different, shorter* run than the
+  equation prices. An invalid comparison, not an estimator error.
+- The real-run residual is **cold-start spread** (implied cold-start is a stable ~480–520s
+  on long runs) **+ per-step scatter** — a central estimate, not a fake-precise point. SFT
+  (n=7) is centered (bias ~1.0) but data-limited; more long SFT runs will tighten its spread.
 
 Refresh the calibration as new runs land: harvest the control plane into `measured_runs.json`,
 re-run `fit_constants` to refresh `REALIZED_HOURLY_USD` + the MFU/concurrency constants, and

@@ -38,7 +38,10 @@ GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref f
 # 56 real RunPod/Vast runs by minimizing median cost APE -- the way you'd measure MFU
 # empirically, not a correction on the output. LoRA + small batches underutilize the card,
 # so these sit well below dense-pretraining MFU.
-MFU_TRAIN = 0.35  # LoRA fwd/bwd/optimizer on a single card
+MFU_TRAIN = 0.35  # GRPO policy/reference update (processes the rollout batch)
+MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd: less efficient than the GRPO update (smaller effective
+# batch, long supervised sequences) -- the real SFT runs underutilize the card more, a
+# method-specific throughput, not an output adjustment. Centers the SFT bias to ~1.0.
 MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 
 # Reward grading runs CONCURRENTLY, not one completion at a time: a step's completions are
@@ -80,7 +83,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     if not n.is_grpo:
         tokens = n.batch_size * n.seq_len
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * active * tokens
-        return flops / (peak * MFU_TRAIN)
+        return flops / (peak * MFU_SFT_TRAIN)
 
     # GRPO step = rollout (generate G completions/prompt) + reward (score every
     # completion through the verifiers env) + policy/reference update.

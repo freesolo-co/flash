@@ -10,15 +10,22 @@ gives.
 
 | Group | n | mean MAPE | median APE | agg bias (Σest/Σmeas) | within 33% | within 50% |
 |---|---:|---:|---:|---:|---:|---:|
-| sft | 13 | 143% | 46% | 1.222 | 15% | 62% |
+| all | 56 | 112% | 34% | 1.166 | 50% | 64% |
+| sft | 13 | 186% | 51% | 1.535 | 15% | 46% |
 | grpo | 43 | 90% | 26% | 1.134 | 60% | 70% |
-| all | 56 | 102% | 34% | 1.141 | 50% | 68% |
+| real | 40 | 39% | 24% | 0.885 | 62% | 80% |
+| real_sft | 7 | 49% | 43% | 0.986 | 14% | 57% |
+| real_grpo | 33 | 37% | 22% | 0.877 | 73% | 85% |
 
-`agg bias` is **not forced to 1.0** -- forcing it would be exactly the kind of output hack
-this equation avoids. The residual per-run error is largely irreducible: measured wall =
-provider queue + container boot + model download + train, and that scheduling/cold-start
-overhead swings by minutes in ways no config predicts. So the equation targets an unbiased
-central estimate with a typical run within ~30-50%, not a fake-precise point.
+`agg bias` is **not forced to 1.0** -- forcing it would be exactly the output hack this
+equation avoids. The meaningful rows are **`real_*`** (runs >= 500s that actually executed
+their configured work): real GRPO lands at **~23% median APE, ~70% of runs within a third**
+of measured -- accurate for a pre-flight quote. Runs <500s over-predict badly because they
+never ran their configured steps (cancelled / step-capped smoke tests -- the tell is that
+predicted train time alone exceeds the whole measured wall), so their measured cost is for
+a different, shorter run than the equation prices: an invalid comparison, not an estimator
+error. The remaining real-run residual is cold-start spread (implied cold-start is a stable
+~480-520s on long runs) + per-step scatter; it is a central estimate, not a fake-precise point.
 
 ## Calibrated physical inputs (realized market $/hr, from 56 runs' billing)
 
