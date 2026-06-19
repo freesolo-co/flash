@@ -202,8 +202,7 @@ def cancel_run(run_id: str) -> RunStatus:
         try:
             from flash.serve.deploy import undeploy_adapter
 
-            deployed_gpu = (status.deployment or {}).get("gpu") or spec.gpu.type
-            deleted = undeploy_adapter(run_id, gpu_name=deployed_gpu)
+            deleted = undeploy_adapter(run_id)
             # Mark the deployment inactive so /v1/deployments and /chat (which gate only
             # on the deployment record's state) stop treating the cancelled run as
             # active. dev mode is scale-to-zero: a never-chatted dev deployment has no

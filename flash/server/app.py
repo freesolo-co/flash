@@ -32,7 +32,7 @@ from flash.runner import (
 )
 from flash.schema import ConfigError, spec_from_dict
 from flash.serve.deploy import chat as serve_chat
-from flash.serve.deploy import deploy_adapter, servable_gpu, undeploy_adapter
+from flash.serve.deploy import deploy_adapter, undeploy_adapter
 from flash.spec import JobSpec
 
 from . import auth, db
@@ -287,7 +287,6 @@ def create_app():
                     mode=mode,
                     idle_timeout_s=int(payload.get("idle_timeout_s", 300)),
                     dry_run=dry_run,
-                    lora_rank=spec.train.lora_rank,
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                 )
@@ -302,7 +301,7 @@ def create_app():
                 marked = mark_deployed(run_id, dep.to_dict(), expect_state=prev_state)
                 if marked.state != "deployed":
                     with contextlib.suppress(Exception):
-                        undeploy_adapter(run_id, gpu_name=servable_gpu(spec.gpu.type, spec.model))
+                        undeploy_adapter(run_id)
                     raise HTTPException(
                         status_code=409,
                         detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
@@ -315,11 +314,7 @@ def create_app():
         # deploy's provisioning/finalization.
         with _deploy_lock(run_id):
             status = owned_run(run_id, key)
-            spec = JobSpec.from_dict(status.spec)
-            # The deployment record carries the class actually served (an unvalidated
-            # training class falls back to a RunPod-validated class at deploy time).
-            deployed_gpu = (status.deployment or {}).get("gpu") or spec.gpu.type
-            deleted = undeploy_adapter(run_id, gpu_name=deployed_gpu)
+            deleted = undeploy_adapter(run_id)
             # dev mode is scale-to-zero: the serve endpoint is created only on the first
             # chat, so an empty deletion just means it was never warmed — still a clean
             # undeploy. always-on provisions the endpoint at deploy time, so an empty
@@ -381,19 +376,8 @@ def create_app():
             return serve_chat(
                 run_id=run_id,
                 messages=payload.get("messages") or [],
-                model=spec.model,
-                hf_repo=spec.train.hf_repo,
-                adapter_prefix=adapter_prefix(spec),
-                # Use the class actually deployed (an unvalidated training class falls
-                # back to a RunPod-validated class at deploy time). Recomputing from
-                # spec.gpu.type could pick a different serve endpoint that undeploy and
-                # cancel — which target the recorded deployment GPU — would not delete.
-                gpu_name=deployment.get("gpu") or spec.gpu.type,
                 temperature=float(payload.get("temperature") or 0.0),
                 max_tokens=int(payload.get("max_tokens") or 512),
-                mode=deployment.get("mode", "dev"),
-                idle_timeout_s=int(deployment.get("idle_timeout_s", 300)),
-                lora_rank=spec.train.lora_rank,
                 # a run trained with thinking serves with thinking (per-run parity)
                 thinking=spec.thinking,
             )

@@ -74,7 +74,7 @@ def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
     return f"{base}-{tail}" if tail else base
 
 
-def servable_gpu(gpu_name: str, model: str) -> str:
+def servable_gpu(gpu_name: str) -> str:
     """Resolve a friendly GPU class for the deployment record.
 
     Serving is delegated to freesolo (one GPU per base model, chosen there), so this is
@@ -102,7 +102,6 @@ def deploy_adapter(
     mode: str = "dev",
     idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S,
     dry_run: bool = False,
-    lora_rank: int = 64,
     thinking: bool = False,
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app.
@@ -114,7 +113,7 @@ def deploy_adapter(
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
-    friendly = servable_gpu(gpu_name, model)
+    friendly = servable_gpu(gpu_name)
     subfolder = f"{adapter_prefix}/adapter"
     dep = Deployment(
         run_id=run_id,
@@ -149,7 +148,7 @@ def deploy_adapter(
     return dep
 
 
-def undeploy_adapter(run_id: str, gpu_name: str = "RTX 5090") -> list[str]:
+def undeploy_adapter(run_id: str) -> list[str]:
     """Deregister the run's adapter from the freesolo serving app.
 
     Returns ``[run_id]`` when the adapter was removed (200), ``[]`` when it was already
@@ -171,15 +170,8 @@ def undeploy_adapter(run_id: str, gpu_name: str = "RTX 5090") -> list[str]:
 def chat(
     run_id: str,
     messages: list[dict],
-    model: str,
-    hf_repo: str,
-    adapter_prefix: str,
-    gpu_name: str = "RTX 5090",
     temperature: float = 0.0,
     max_tokens: int = 512,
-    mode: str = "dev",
-    idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S,
-    lora_rank: int = 64,
     thinking: bool = False,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
