@@ -854,8 +854,8 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # under the key's default (personal) entity, so team runs vanish from the configured
         # workspace and service-account setups that require an explicit entity can fail. (Run TUNING
         # is still NOT an operator env knob: flash is fully managed — every training setting uses the
-        # optimal default and the only per-run config is the spec's structured [train] fields. The
-        # worker also pins WANDB_PROJECT itself.)
+        # optimal default and the only per-run config is the spec's structured fields. The W&B
+        # project + run name come from the spec's typed [wandb] config — not env vars.)
         "WANDB_API_KEY",
         "WANDB_ENTITY",
         "LORA_TARGETS",
