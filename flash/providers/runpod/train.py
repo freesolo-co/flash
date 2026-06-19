@@ -848,9 +848,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # held-out sample size comes from the run's [train] eval_examples, not an env var.
         "FLASH_EVAL_EVERY_STEPS",
         # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
-        # run_mode() in _train_body reads this from its OWN process env, which is THIS forwarded
-        # allowlist + the worker image's os.environ — so a control-plane `FLASH_UPLOAD_CONSOLE=1`
-        # only reaches the worker if it's forwarded here. Without this it silently no-ops on success.
+        # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
+        # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a
+        # control-plane `FLASH_UPLOAD_CONSOLE=1` only reaches run_mode if it's forwarded here.
+        # Without this it silently no-ops on success.
         "FLASH_UPLOAD_CONSOLE",
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
         # the WORKER decides which installers to run from these flags. install_chalk_kernels runs

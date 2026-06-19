@@ -87,6 +87,19 @@ def test_build_worker_env_forwards_prime_api_key(monkeypatch):
     assert "PRIME_API_KEY" not in build_worker_env(_spec(), 0)
 
 
+def test_build_worker_env_forwards_upload_console(monkeypatch):
+    """FLASH_UPLOAD_CONSOLE (upload the worker console on SUCCESS, not just on crash) is read on the
+    worker by run_mode() from the forwarded env dict — RunPod _train_body AND the Vast bootstrap,
+    both of which reuse this build_worker_env. It MUST be on the allowlist or the success-console
+    upload silently no-ops on every remote run."""
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.setenv("FLASH_UPLOAD_CONSOLE", "1")
+    assert build_worker_env(_spec(), 0).get("FLASH_UPLOAD_CONSOLE") == "1"
+    monkeypatch.delenv("FLASH_UPLOAD_CONSOLE", raising=False)
+    assert "FLASH_UPLOAD_CONSOLE" not in build_worker_env(_spec(), 0)
+
+
 def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
     """The opt-in chalk-kernel install hook (engine.chalk_kernels) runs inside the worker
     subprocess and selects which install-on-call chalk installers to run from FLASH_* flags read

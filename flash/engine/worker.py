@@ -2203,11 +2203,23 @@ def run_rl():
     # trust it. (An env returning all-zero rewards still appends 0.0s, so an EMPTY history uniquely
     # means the reward path never ran.)
     _steps_run = int(getattr(trainer.state, "global_step", 0) or 0)
-    if not reward_history:
+    # A resume that already reached the target steps legitimately performs ZERO new optimizer
+    # steps: the previous worker uploaded the final checkpoint (and scored its rewards) but died
+    # before writing metrics/DONE, so this worker's fresh hb_cb has an empty reward_history even
+    # though the policy IS fully trained. Don't fail those — finalize from the resumed state. The
+    # no-op guard below is only for a run that genuinely trained nothing (no resume, or the resume
+    # didn't reach the target steps).
+    _resumed_complete = bool(resume_ckpt) and steps > 0 and _steps_run >= steps
+    if not reward_history and not _resumed_complete:
         raise RuntimeError(
             f"GRPO scored no reward in {train_wall:.1f}s over {_steps_run} step(s) — the rollout "
             "produced no completions, so the policy was never actually trained. Failing loudly "
             "instead of reporting a no-op run as done (seen on RTX 5090/sm120 vLLM rollout)."
+        )
+    if not reward_history and _resumed_complete:
+        print(
+            f"[resume] no new reward in this worker but resumed checkpoint already reached "
+            f"{_steps_run}/{steps} step(s) — finalizing the completed policy instead of failing."
         )
     # Final eval on the actually-saved policy: the cadence only fires on multiples of
     # eval_every_steps, so when the run length isn't a multiple the last cadence eval predates the
