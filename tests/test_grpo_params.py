@@ -138,6 +138,33 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     assert spec.environment.params == {}
 
 
+def test_eval_examples_zero_is_accepted_as_default() -> None:
+    """`[train] eval_examples = 0` is the documented "use the built-in default (64)" no-op, so the
+    server-side TOML validator must ACCEPT it (it parses to 0; eval_config maps 0 -> 64), matching
+    the worker JSON path — a negative is still rejected."""
+    import pytest
+
+    from flash.engine.midrun_eval import eval_config
+    from flash.schema import ConfigError, spec_from_dict
+
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "model_policy": "allow",
+        "environment": {"id": "owner/env"},
+        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "train": {"seeds": [0], "steps": 10, "hf_repo": "owner/runs", "eval_examples": 0},
+    }
+    spec = spec_from_dict(raw, run_id="eval0")
+    assert spec.train.eval_examples == 0  # accepted (not a ConfigError), not coerced
+    # and downstream it resolves to the built-in default sample size (64), not 0
+    assert eval_config(256, spec_eval_examples=spec.train.eval_examples)["num_examples"] == 64
+    # a negative eval_examples is still rejected at parse time
+    raw["train"]["eval_examples"] = -1
+    with pytest.raises(ConfigError, match="eval_examples must be >= 0"):
+        spec_from_dict(raw, run_id="evalneg")
+
+
 def test_opt_int_float_reject_bools() -> None:
     """A JSON boolean must NOT silently coerce to a numeric train knob: bool is an int
     subclass in Python, so ``int(True)`` would become 1. JobSpec.from_dict (via
