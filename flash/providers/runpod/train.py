@@ -772,6 +772,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
         "AUTOSLM_QUANT",
+        # LoRA+ optimizer A/B knob: 1 -> run the LoRA+ override with bnb PagedAdamW8bit (8-bit
+        # paged state coexists with LoRA+), 0 -> full-precision torch AdamW. Unset -> mirror the
+        # configured `optim`. (Per-run [worker_env] override also works for concurrent A/B runs.)
+        "AUTOSLM_LORAPLUS_8BIT",
         "WANDB_API_KEY",
         "WANDB_ENTITY",
         "LORA_TARGETS",
