@@ -38,14 +38,15 @@ logger = get_logger(__name__)
 
 # "Comfortably" = the open-model VRAM estimate plus headroom, so a full SFT+GRPO run
 # never lands in check_fit's "tight" band by construction. Curated catalog entries
-# already carry measured minimums and are used as-is. The headroom (default 1.1 ==
-# model_required_vram_gb's own default) is read at call time via vram_headroom() so allocate()
-# and resolve_gpu_policy size identically and pick up a value exported after import.
+# already carry measured minimums and are used as-is. The headroom (1.1 ==
+# model_required_vram_gb's own default) is read through vram_headroom() at call time so
+# allocate() and resolve_gpu_policy share one source of truth and size identically.
 
 
 def vram_headroom() -> float:
     """The sizing headroom multiplier, honored by both the submit-time allocator and the
-    parse-time resolve_gpu_policy so they never disagree (PR #176 review). A validated constant."""
+    parse-time resolve_gpu_policy so they never disagree (PR #176 review). A validated
+    constant (1.1) — not currently env-tunable."""
     return 1.1
 
 

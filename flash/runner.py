@@ -878,9 +878,14 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             if is_capacity:
                 # Exclude this class from the next allocation so a live re-ranking can't put the
                 # starved class back. Exclusion (not the index walk) drives the capacity hop: the
-                # re-allocation drops the starved class entirely, so the SAME gpu_walk_offset now
-                # selects the cheapest REMAINING class. Bumping the offset here would skip past it.
+                # re-allocation drops the starved class entirely, so candidate[0] of the shrunk,
+                # re-ranked list is the cheapest REMAINING class. Reset the walk offset to point at
+                # it: a prior INFRA crash may have advanced gpu_walk_offset, and carrying that offset
+                # into the shorter post-exclusion list would skip past the cheapest remaining classes
+                # (candidates[gpu_walk_offset] on a shorter list). Exclusion already prevents the
+                # starved class from being re-selected, so starting back at the cheapest is safe.
                 starved_classes.add(chosen.gpu)
+                gpu_walk_offset = 0
                 print(
                     f"retry: {chosen.gpu} had no free workers (throttled / capacity-starved); "
                     "walking to the next-cheapest available class (excluding the starved class)",

@@ -869,6 +869,85 @@ def test_supervisor_no_capacity_excludes_starved_class(monkeypatch):
         assert gpus_seen[0] in excluded_seen[1]
 
 
+def test_supervisor_capacity_walk_resets_offset_after_infra_crash(monkeypatch):
+    # PR #4 review (thread): an infra crash advances gpu_walk_offset, then a no_capacity
+    # excludes the starved class and re-allocates a SHORTER, re-ranked candidate list. The
+    # capacity hop is driven by exclusion (not the index), so the stale offset from the earlier
+    # crash must be RESET to 0 — otherwise candidates[offset] on the shorter list skips past the
+    # cheapest remaining class and a viable GPU is wrongly walked over. We assert the post-capacity
+    # attempt lands on the CHEAPEST remaining class, not an offset-skipped pricier one.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+
+        real_allocate = allocator.allocate
+        # Capture the cheapest class of the FULL pool and the cheapest of the pool once the
+        # crashed-then-starved class is excluded, so the assertion is independent of the catalog.
+        cheapest_full = {"gpu": None}
+        cheapest_after_exclude = {"gpu": None}
+
+        def spy_allocate(*a, **k):
+            res = real_allocate(*a, **k)
+            excluded = frozenset(k.get("exclude_gpu_classes", frozenset()))
+            if not excluded and cheapest_full["gpu"] is None:
+                cheapest_full["gpu"] = res.candidates[0].gpu
+            if excluded:
+                cheapest_after_exclude["gpu"] = res.candidates[0].gpu
+            return res
+
+        monkeypatch.setattr(allocator, "allocate", spy_allocate)
+
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            if attempt == 0:
+                # Infra crash on the cheapest class -> keeps the class in the pool, bumps the offset.
+                return jobs.PollResult(False, failure="stalled", detail="frozen host")
+            if attempt == 1:
+                # The offset now points at the 2nd-cheapest class; it is capacity-starved.
+                # Exclusion drives the hop and the offset must RESET to the cheapest remaining.
+                return jobs.PollResult(
+                    False, failure="no_capacity", detail="no worker assigned; throttled"
+                )
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="crash-then-starve",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", requested="cheapest", provider="runpod", max_retries=3),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("crash-then-starve").state == "done"
+        assert len(gpus_seen) == 3
+        # Attempt 0 takes the cheapest; attempt 1 (offset=1 after the crash) takes the 2nd-cheapest.
+        assert gpus_seen[0] == cheapest_full["gpu"]
+        assert gpus_seen[1] != gpus_seen[0]
+        # Attempt 2: the starved 2nd class is excluded and the offset reset, so we land on the
+        # cheapest of the REMAINING pool — NOT skipped past it by the stale offset.
+        assert cheapest_after_exclude["gpu"] is not None
+        assert gpus_seen[2] == cheapest_after_exclude["gpu"]
+        # The cheapest remaining (which the run took) is the original cheapest class, re-tried:
+        # the crash kept it in the pool, so the reset returns to it rather than walking over it.
+        assert gpus_seen[2] == cheapest_full["gpu"]
+
+
 def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
     # A concrete pin yields a single candidate, so infra retries stay on that class
     # (offset clamps) — the walk must not silently move a pinned run to another card.
