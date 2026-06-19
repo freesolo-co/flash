@@ -1,6 +1,6 @@
 # `flash.cost` — training-cost estimator
 
-Pre-flight **USD cost estimates** for an Flash SFT/GRPO run, plus an experiment that
+Pre-flight **USD cost estimates** for a Flash SFT/GRPO run, plus an experiment that
 measures how well an LLM can reproduce those estimates as it is fed more of the Flash
 framework. Built on top of the GPU cost/sizing matrix from PR #185 — it consumes the
 same pricing (`providers/base.py`), VRAM matrix (`engine/vram.py`), recipe

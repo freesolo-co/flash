@@ -88,11 +88,22 @@ def pick_gpu(
     ``resolve_gpu_policy`` only canonicalizes a non-policy value).
 
     When ``provider`` pins a substrate ("runpod"/"vast"), candidates are restricted to
-    classes validated on that provider, mirroring the allocator's per-provider filter
-    (so e.g. a RunPod-only class isn't priced as a Vast pick).
+    classes the provider can serve (``validated_on``), mirroring the allocator's
+    per-provider filter -- so e.g. a RunPod-only class isn't priced as a Vast pick. This
+    provider filter holds even with ``allow_unvalidated=True``: that flag only relaxes the
+    validation-status gate (it lets unvalidated-but-provisionable classes through), it
+    does NOT let a class be quoted on a substrate that can't provision it.
     """
 
-    def _validated_for(g: GpuClass) -> bool:
+    def _selectable(g: GpuClass) -> bool:
+        # Two independent gates, mirroring ``allocator.allocate``: a per-provider
+        # provisionability filter AND a validation-status filter. ``allow_unvalidated``
+        # only relaxes the latter -- it never lets a class be priced on a substrate that
+        # can't serve it. So a Vast-only class is never quoted under ``provider="runpod"``,
+        # even with ``allow_unvalidated=True`` (the allocator walks ``provider.gpu_classes()``
+        # per provider; ``validated_on`` is the static registry's proxy for that membership).
+        if provider not in (None, "auto") and provider not in g.validated_on:
+            return False
         if allow_unvalidated:
             return True
         if provider in (None, "auto"):
@@ -100,7 +111,7 @@ def pick_gpu(
         return provider in g.validated_on
 
     candidates = [
-        g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _validated_for(g)
+        g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)
     ]
     # A policy sentinel (auto/cheapest/empty/None) is not a GPU pin -- it means "auto-
     # select", so leave the candidate set as-is. Only a concrete GPU name is canonicalized

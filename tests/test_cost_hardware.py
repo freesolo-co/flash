@@ -114,3 +114,16 @@ def test_pick_gpu_provider_pin_restricts_to_validated_on():
     assert "vast" in GPU_INFO[chosen].validated_on
     # With provider auto (default), the runpod-only A5000 is back in the pool.
     assert pick_gpu(24, provider="auto") == "RTX A5000"
+
+
+def test_pick_gpu_provider_pin_holds_under_allow_unvalidated():
+    # allow_unvalidated relaxes the validation-status gate, NOT the per-provider filter:
+    # a class the pinned provider can't serve must never be quoted, even unvalidated.
+    # Mirrors allocator.allocate (it walks one provider's gpu_classes()), so a runpod pin
+    # never prices a Vast-only class and vice versa.
+    runpod_pick = pick_gpu(24, provider="runpod", allow_unvalidated=True)
+    assert "runpod" in GPU_INFO[runpod_pick].validated_on
+    vast_pick = pick_gpu(24, provider="vast", allow_unvalidated=True)
+    assert "vast" in GPU_INFO[vast_pick].validated_on
+    # Without a provider pin, allow_unvalidated still widens across the whole registry.
+    assert pick_gpu(12, allow_unvalidated=True) == "RTX 2000 Ada"

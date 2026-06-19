@@ -39,9 +39,15 @@ def markdown_report(
     improvement = ""
     if first.mape is not None and last.mape is not None and first.mape > 0:
         drop = (1 - last.mape / first.mape) * 100
+        # A sweep need not converge monotonically: if the last version is WORSE than the
+        # first, ``drop`` is negative -- report it honestly as an increase, not a reduction.
+        if drop >= 0:
+            change = f"a **{drop:.0f}% error reduction**"
+        else:
+            change = f"a **{-drop:.0f}% error increase**"
         improvement = (
             f"\nFrom **{first.label}** ({_fmt_pct(first.mape)} MAPE) to **{last.label}** "
-            f"({_fmt_pct(last.mape)} MAPE) — a **{drop:.0f}% error reduction** as the prompt "
+            f"({_fmt_pct(last.mape)} MAPE) — {change} as the prompt "
             f"gains Flash framework knowledge."
         )
 

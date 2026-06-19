@@ -117,7 +117,11 @@ def main(argv: list[str] | None = None) -> int:
 
     def median(values: list[float]) -> float:
         s = sorted(values)
-        return s[len(s) // 2]
+        n = len(s)
+        mid = n // 2
+        # True median: average the two middle values for an even-length list (matches
+        # ``statistics.median``); the bare upper-middle element skews an even-count sample.
+        return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
 
     raw_apes, adj_apes = [], []
     for m in done:
