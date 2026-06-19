@@ -270,6 +270,21 @@ def _substring_answer_score(completion: str, example: dict) -> float:
     return 1.0 if answer and answer in (completion or "") else 0.0
 
 
+def _unique_key(name: str, existing) -> str:
+    """``name``, or the first ``name_1``/``name_2``/… not already a key of ``existing``.
+
+    Probe for an unused exact key so two rubric funcs that share a name both survive — a
+    prefix/length heuristic can recompute a suffix that collides with an already-recorded
+    key (e.g. ``score`` vs ``score_detail``) and silently overwrite a scorer.
+    """
+    if name not in existing:
+        return name
+    i = 1
+    while f"{name}_{i}" in existing:
+        i += 1
+    return f"{name}_{i}"
+
+
 def _is_multi_turn(vf_env) -> bool:
     """True for a tool/multi-turn verifiers env (NOT a plain SingleTurnEnv)."""
     try:
@@ -513,17 +528,7 @@ class VerifiersEnvironment(BaseEnvironment):
                 continue
             name = getattr(func, "__name__", str(func))
             score = float(weight) * _invoke_reward(func, available)
-            # Collisions (two funcs share a name): keep them distinct so neither is lost.
-            # Probe for an unused exact key — a prefix/length heuristic can recompute a
-            # suffix that collides with an already-recorded key (e.g. ``score`` vs
-            # ``score_detail``) and silently overwrite a scorer.
-            if name in breakdown:
-                base = name
-                i = 1
-                while name in breakdown:
-                    name = f"{base}_{i}"
-                    i += 1
-            breakdown[name] = score
+            breakdown[_unique_key(name, breakdown)] = score
             total += score
         breakdown["total"] = total
         return breakdown
@@ -563,12 +568,7 @@ class VerifiersEnvironment(BaseEnvironment):
                     raw = _invoke_reward(func, available)
                 except Exception:
                     continue
-                key = name
-                i = 1
-                while key in metrics:  # keep colliding metric names distinct
-                    key = f"{name}_{i}"
-                    i += 1
-                metrics[key] = raw
+                metrics[_unique_key(name, metrics)] = raw
                 continue
             total += float(weight) * _invoke_reward(func, available)
         return {"reward": total, "metrics": metrics}
