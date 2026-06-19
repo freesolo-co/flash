@@ -82,7 +82,10 @@ WORKER_DEPS = [
     # NB: freesolo-chalk (custom Triton/CUDA kernels, opt-in via CHALK_* flags) is NOT baked in
     # by default — it isn't on PyPI yet, and a bad/inaccessible spec here would abort worker boot.
     # flash auto-detects chalk if present (flash/engine/chalk_kernels.py). Enable the kernels by
-    # adding an installable chalk spec via AUTOSLM_WORKER_DEPS for the run.
+    # ADDING an installable chalk spec via AUTOSLM_WORKER_EXTRA_DEPS for the run (the additive hook
+    # — it appends to this pinned stack). Do NOT use AUTOSLM_WORKER_DEPS for this: that variable
+    # REPLACES the whole list, so setting it to just a chalk spec would drop transformers/trl/vllm
+    # and the worker would fail before training.
 ]
 # NOTE on download speed: Flash's runtime already ships hf_transfer and exports
 # HF_HUB_ENABLE_HF_TRANSFER=1 on workers (measured: Qwen3-4B's ~8 GB pulled in 6.3 s,
