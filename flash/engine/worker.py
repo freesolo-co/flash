@@ -1915,8 +1915,23 @@ def _is_disaggregated_ddp_launcher() -> bool:
         if inference_gpus >= total:
             return False  # invalid split; run_rl raises with a clear message
         return select_rollout_split(total, inference_gpus).train_gpus > 1
-    except Exception:
-        return False
+    except Exception as e:
+        # We are already in the disaggregated configuration (rl mode, not the trainer-only child,
+        # inference_gpus>0), and the only non-launcher split — inference_gpus>=total — is returned
+        # above before this try. So an UNEXPECTED split-detection failure here is NOT evidence that
+        # this is a colocated/single-trainer run; swallowing it as `return False` would let the
+        # caller (_drop_fla_on_hopper) run get_device_capability() and bind a retained CUDA context
+        # on the pinned trainer card for the whole DDP launch — the exact rank-0 VRAM/OOM hazard this
+        # guard exists to prevent. Fail SAFE to True (the launcher trains nothing, so skipping its fla
+        # probe is free; each accelerate child still drops fla rank-local), and log loudly so the
+        # mis-detection is visible rather than silent.
+        print(
+            f"[rl][disagg] WARNING: _is_disaggregated_ddp_launcher split detection failed ({e!r}); "
+            "assuming multi-trainer launcher to avoid binding a CUDA context on the trainer card "
+            "(skips the fla probe; children still drop fla rank-local).",
+            flush=True,
+        )
+        return True
 
 
 def _pin_trainer_devices_for_disaggregated() -> None:

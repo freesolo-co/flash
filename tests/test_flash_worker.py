@@ -491,3 +491,20 @@ def test_is_disaggregated_ddp_launcher_only_for_multi_trainer(monkeypatch):
     # colocate (inference_gpus=0) -> not a launcher
     ne = _launcher_worker(monkeypatch, inference_gpus=0, total_gpus=1)
     assert ne._is_disaggregated_ddp_launcher() is False
+
+
+def test_is_disaggregated_ddp_launcher_fails_safe_on_split_error(monkeypatch):
+    """An UNEXPECTED split-detection failure inside the disaggregated configuration (rl mode, not
+    the trainer child, inference_gpus>0) must fail SAFE to True, not silently to False. Returning
+    False would let _drop_fla_on_hopper run get_device_capability() and bind a retained CUDA context
+    on the pinned trainer card for the whole DDP launch — the exact rank-0 OOM hazard this guard
+    prevents. (The only legitimate non-launcher split, inference_gpus>=total, is handled explicitly
+    before the try, so reaching the except means a genuine error, where skipping the probe is safe.)"""
+    ne = _launcher_worker(monkeypatch, inference_gpus=1, total_gpus=3)
+    import flash.engine.rollout_bench as _rb
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("split detection blew up")
+
+    monkeypatch.setattr(_rb, "select_rollout_split", _boom)
+    assert ne._is_disaggregated_ddp_launcher() is True
