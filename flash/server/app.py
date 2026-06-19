@@ -64,9 +64,12 @@ class _RunLock:
         self._lock.release()
 
 
-# Per-run lock serializing deploy vs undeploy: always-on provisioning is slow and runs
-# OUTSIDE the status lock, so without this the two could interleave — a racing undeploy
-# could leave a billable endpoint unrecorded, or a deploy's cleanup of a raced finalize could clobber another.
+# Per-run lock serializing deploy vs undeploy: registration with the freesolo serving app
+# is slow and runs OUTSIDE the status lock, so without this the two could interleave —
+# a racing undeploy could leave a stale deployment record (registered with freesolo but
+# unrecorded here, or vice-versa), or a deploy's cleanup of a raced finalize could clobber
+# another. Serving is delegated to freesolo (scales to zero per base model), so there is no
+# billable flash-side endpoint at stake — only the deployment record's consistency.
 # WeakValueDictionary so an entry is dropped once no request holds the lock — the map
 # can't grow unboundedly with one entry per distinct run_id over the server's lifetime.
 _DEPLOY_LOCKS: weakref.WeakValueDictionary[str, _RunLock] = weakref.WeakValueDictionary()
