@@ -843,8 +843,13 @@ def loraplus_optimizer_cls(optim_name: str):
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
-    (silent, the metrics.json artifact is still the source of truth). Pins the project so every run
-    lands in one place."""
+    (silent, the metrics.json artifact is still the source of truth).
+
+    Project + run name come ONLY from the typed ``[wandb]`` config (``JOB_SPEC.wandb``) — there is
+    NO WANDB_PROJECT / WANDB_NAME environment variable. HF's WandbCallback has no project argument
+    and would read WANDB_PROJECT from the env, so we initialize the run directly via the wandb SDK
+    here (``wandb.init(project=..., name=...)``); the Trainer's callback then reuses that run. The
+    only W&B env var is the WANDB_API_KEY credential."""
     if not os.environ.get("WANDB_API_KEY"):
         return []
     import importlib.util
@@ -852,12 +857,30 @@ def wandb_report_to() -> list[str]:
     if importlib.util.find_spec("wandb") is None:
         print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
         return []
-    os.environ["WANDB_PROJECT"] = "flash"
+    # Best-effort, like the bitsandbytes import above: a partial/broken wandb install or an
+    # init failure (auth, network, runtime import error) must NOT abort training — W&B logging is
+    # optional and metrics.json is the source of truth. Any failure -> no W&B logging ([]).
+    try:
+        import wandb
+
+        if wandb.run is None:  # init from the spec so the project needs no WANDB_PROJECT env
+            project = (JOB_SPEC.wandb.project if JOB_SPEC else None) or "flash"
+            wandb.init(project=project, name=wandb_run_name())
+    except Exception as e:
+        print(f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)")
+        return []
     return ["wandb"]
 
 
 def wandb_run_name() -> str:
-    """Stable, human-readable W&B run name tying the dashboard run to the Flash run id."""
+    """W&B run name, from the typed ``[wandb] run_name`` config (``JOB_SPEC.wandb.run_name``) only —
+    no WANDB_NAME environment variable. An explicit name is used verbatim (the user owns the
+    naming); otherwise a stable id tying the dashboard run to the Flash run
+    (``flash-<phase>-<run_id>-seed<N>``). Passed to the Trainer via ``TrainingArguments.run_name``
+    and to ``wandb.init`` above."""
+    configured = JOB_SPEC.wandb.run_name if JOB_SPEC else None
+    if configured and configured.strip():
+        return configured.strip()
     return f"flash-{PHASE}-{RUN_ID}-seed{SEED}"
 
 

@@ -832,44 +832,24 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         env["RL_STEPS"] = str(spec.train.steps)
     if spec.train.epochs is not None:
         env["SFT_EPOCHS"] = str(spec.train.epochs)
-    # Forward the documented worker-tuning knobs so they actually reach the GPU worker.
-    # RL_VLLM_GPU_UTIL / RL_PER_DEVICE_PROMPTS are the colocate-memory knobs the docs tell
-    # users to set to fix vLLM OOM/KV-cache errors; they were previously dropped here.
+    # Forward the worker-side knobs the worker / vLLM / mid-run eval actually read. flash is fully
+    # managed: there are no per-run env tuning knobs — the only per-run config is the spec's
+    # structured fields, and the worker hardcodes the vLLM-util / quant / heartbeat defaults.
     for k in (
         "SFT_PER_DEVICE_BS",
-        "SFT_PACKING",
-        # Colocate-memory knobs the docs tell users to set to fix vLLM OOM / KV-cache errors.
-        "RL_VLLM_GPU_UTIL",
+        # RL_VLLM_SLEEP drives the alloc-conf choice above (CuMemAllocator vs expandable_segments).
         "RL_VLLM_SLEEP",
-        "RL_PER_DEVICE_PROMPTS",
         "VLLM_USE_V1",
         # Attention-backend escape hatch: vllm's bundled flash-attn PTX can be newer
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
-        "FLASH_QUANT",
-        # W&B account routing: the API key AND the optional WANDB_ENTITY that routes runs into a
-        # team/service-account workspace. These are operator ACCOUNT config (where the dashboards
-        # land), not training tuning — without the entity, `wandb_report_to()` still enables W&B
-        # under the key's default (personal) entity, so team runs vanish from the configured
-        # workspace and service-account setups that require an explicit entity can fail. (Run TUNING
-        # is still NOT an operator env knob: flash is fully managed — every training setting uses the
-        # optimal default and the only per-run config is the spec's structured [train] fields. The
-        # worker also pins WANDB_PROJECT itself.)
+        # W&B credential that enables logging. The project + run name come from the spec's typed
+        # [wandb] config, NOT env vars (see engine.worker.wandb_report_to / wandb_run_name).
         "WANDB_API_KEY",
-        "WANDB_ENTITY",
-        "LORA_TARGETS",
-        # Periodic mid-run GRPO eval cadence (engine/midrun_eval.eval_config) comes from the run's
-        # [train] eval_every_steps / eval_examples. NB: the worker no longer reads these
-        # FLASH_EVAL_* env vars (the eval knobs are taken from the structured [train] spec only);
-        # forwarding them is presently a no-op kept for backward/operator compatibility.
+        # Periodic mid-run GRPO eval cadence override (engine.worker reads it; >0 enables). The
+        # held-out sample size comes from the run's [train] eval_examples, not an env var.
         "FLASH_EVAL_EVERY_STEPS",
-        "FLASH_EVAL_NUM",
-        # rl_step heartbeat-upload throttle. Forwarded for operators who want to stay under
-        # HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO runs share one
-        # HF_REPO. NB: the worker currently uses a FIXED 60s throttle (engine.worker._HB_MIN_INTERVAL_S)
-        # and does not read this var, so forwarding it is presently a no-op on the worker side.
-        "FLASH_HEARTBEAT_MIN_S",
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
         # the WORKER decides which installers to run from these flags. install_chalk_kernels runs
         # INSIDE the worker subprocess and reads them from its own process env, so a control-plane

@@ -18,7 +18,7 @@ from .providers.base import (
     resolve_gpu_policy,
     unvalidated_allowed,
 )
-from .spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from .spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec, WandbSpec
 
 
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
@@ -156,7 +156,13 @@ def _apply_override(raw: dict, item: str) -> None:
     leaf = parts[-1]
     # support list values like seeds=[0,1]
     val = value.strip()
-    if val.startswith("[") and val.endswith("]"):
+    # [wandb] leaves are string-valued labels (project / run name); a numeric- or
+    # bool-looking value like `--set wandb.run_name=123` is still the string label the
+    # user intends. Preserve it as a string instead of coercing it to int/float/bool
+    # (which _wandb_spec's string validation would otherwise reject).
+    if parts[0] == "wandb":
+        node[leaf] = val
+    elif val.startswith("[") and val.endswith("]"):
         inner = val[1:-1].strip()
         node[leaf] = [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
     else:
@@ -258,6 +264,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true"
         )
 
+    # worker_env is the lower-level per-run escape hatch ([worker_env] table, string-valued,
+    # secret-guarded). The optional [wandb] naming table is a separate, typed spec field
+    # (JobSpec.wandb) — NOT folded into worker_env env vars.
+    worker_env = _worker_env(raw.get("worker_env"))
+    wandb_spec = _wandb_spec(raw.get("wandb"))
+
     spec = JobSpec(
         model=model,
         algorithm=algorithm,
@@ -314,11 +326,118 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             datacenter=gpu_raw.get("datacenter"),
         ),
         run_id=run_id or raw.get("run_id", "local"),
+        worker_env=worker_env,
         model_policy=model_policy,
         thinking=thinking,
+        wandb=wandb_spec,
     )
     _validate_spec(spec)
     return spec
+
+
+def _worker_env(raw: Any) -> dict[str, str]:
+    """Parse the optional [worker_env] table: per-run worker env overrides (string-valued)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("[worker_env] must be a table of string key/values")
+    env = {str(k): str(v) for k, v in raw.items()}
+    # Env var NAMES must be usable by subprocess.Popen(env=...) on the worker, which raises
+    # ValueError for an empty name or one containing '=' or a NUL byte (and whitespace breaks most
+    # shells). Reject these at parse time so a malformed [worker_env] (e.g. a TOML quoted key like
+    # "BAD=KEY", or an empty key) fails on config load — not after a worker has been provisioned.
+    bad_names = sorted(repr(k) for k in env if (not k) or any(c in k for c in "=\0 \t\n\r"))
+    if bad_names:
+        raise ConfigError(
+            f"[worker_env] has invalid environment variable name(s): {', '.join(bad_names)}; an "
+            "env var name must be non-empty and contain no '=', whitespace, or NUL byte"
+        )
+    # [worker_env] is serialized into job_spec_json (persisted + logged), so it must NOT carry
+    # secrets — they would leak into run artifacts. Reject secret-looking keys; operators set
+    # those as real process environment variables (forwarded to the worker out-of-band) instead.
+    # Detect by `_`-delimited WORD components (not substring): flag a secret WORD, or `KEY`
+    # qualified by a credential context. This catches HF_TOKEN, *_API_KEY, SECRET_KEY, INTERNAL_KEY,
+    # CREDENTIAL, AWS_SECRET_ACCESS_KEY, GITHUB_PAT (PAT word), and credential keys like SSH_KEY /
+    # DEPLOY_KEY / GPG_KEY (KEY qualified by a credential context) — while allowing legit knobs whose
+    # names merely contain a marker (RL_VLLM_MAX_BATCHED_TOKENS -> word TOKENS, not TOKEN; a bare
+    # SORT_KEY -> KEY without a secret qualifier).
+    _secret_words = {
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PASSPHRASE",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "APIKEY",
+        "PRIVATEKEY",
+        "PAT",  # personal access token (e.g. GITHUB_PAT, GH_PAT)
+    }
+    _key_qualifiers = {
+        "API",
+        "SECRET",
+        "PRIVATE",
+        "ACCESS",
+        "INTERNAL",
+        "AUTH",
+        "SIGNING",
+        "ENCRYPTION",
+        # credential-key contexts: SSH_KEY, DEPLOY_KEY, GPG_KEY, RSA_KEY, TLS/SSL/PEM keys, etc.
+        "SSH",
+        "DEPLOY",
+        "GPG",
+        "PGP",
+        "RSA",
+        "PEM",
+        "SSL",
+        "TLS",
+    }
+
+    def _is_secret_key(name: str) -> bool:
+        words = set(name.upper().split("_"))
+        return bool(words & _secret_words) or ("KEY" in words and bool(words & _key_qualifiers))
+
+    secrets = sorted(k for k in env if _is_secret_key(k))
+    if secrets:
+        raise ConfigError(
+            f"[worker_env] must not contain secret-bearing keys ({', '.join(secrets)}); these are "
+            "serialized into run artifacts — set them as real environment variables instead"
+        )
+    return env
+
+
+# Allowed [wandb] config keys -> typed JobSpec.wandb fields (first-class spec config, NOT env vars).
+_WANDB_KEYS = ("project", "run_name")
+
+
+def _wandb_spec(raw: Any) -> WandbSpec:
+    """Parse the optional ``[wandb]`` table into a typed ``WandbSpec`` (project / run_name).
+
+    These are non-secret W&B naming labels carried as first-class spec config (round-tripped in
+    the job-spec JSON the worker reads), NOT environment variables. The worker honors them in
+    ``engine.worker.wandb_report_to`` / ``wandb_run_name``, so a run can land in its own W&B
+    project under its own run name instead of the hardcoded ``flash`` / ``flash-…`` defaults.
+    Settable in TOML (``[wandb] project = …``) or via ``slm train cfg.toml --set
+    wandb.project=… --set wandb.run_name=…``. The actual W&B credential (WANDB_API_KEY) stays an
+    env-var secret — only the naming config lives here."""
+    if raw is None:
+        return WandbSpec()
+    if not isinstance(raw, dict):
+        raise ConfigError('[wandb] must be a table (e.g. project = "my-project")')
+    unknown = sorted(set(raw) - set(_WANDB_KEYS))
+    if unknown:
+        raise ConfigError(
+            f"[wandb] unknown key(s): {', '.join(unknown)} (allowed: {', '.join(_WANDB_KEYS)})"
+        )
+    values: dict[str, str] = {}
+    for key in _WANDB_KEYS:
+        if key not in raw:
+            continue
+        val = raw[key]
+        if not isinstance(val, str) or not val.strip():
+            raise ConfigError(f"[wandb] {key} must be a non-empty string")
+        values[key] = val.strip()
+    return WandbSpec(**values)
 
 
 def _validate_spec(spec: JobSpec) -> None:
