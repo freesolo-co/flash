@@ -60,8 +60,8 @@ def test_build_worker_env_forwards_midrun_eval_knobs(monkeypatch):
     from flash.providers.runpod.train import build_worker_env
 
     knobs = {
-        "AUTOSLM_EVAL_EVERY_STEPS": "20",
-        "AUTOSLM_EVAL_NUM": "16",
+        "FLASH_EVAL_EVERY_STEPS": "20",
+        "FLASH_EVAL_NUM": "16",
     }
     for k, v in knobs.items():
         monkeypatch.setenv(k, v)
@@ -71,27 +71,27 @@ def test_build_worker_env_forwards_midrun_eval_knobs(monkeypatch):
 
 
 def test_build_worker_env_forwards_heartbeat_throttle(monkeypatch):
-    """AUTOSLM_HEARTBEAT_MIN_S is read by engine.worker on the GPU side to throttle rl_step
+    """FLASH_HEARTBEAT_MIN_S is read by engine.worker on the GPU side to throttle rl_step
     heartbeat commits under HuggingFace's 128/hr-per-repo cap; operators raise it when several
     concurrent GRPO runs share one HF_REPO, so it MUST be on the forward allowlist."""
     from flash.providers.runpod.train import build_worker_env
 
-    monkeypatch.setenv("AUTOSLM_HEARTBEAT_MIN_S", "180")
-    assert build_worker_env(_spec(), 0).get("AUTOSLM_HEARTBEAT_MIN_S") == "180"
-    monkeypatch.delenv("AUTOSLM_HEARTBEAT_MIN_S", raising=False)
-    assert "AUTOSLM_HEARTBEAT_MIN_S" not in build_worker_env(_spec(), 0)
+    monkeypatch.setenv("FLASH_HEARTBEAT_MIN_S", "180")
+    assert build_worker_env(_spec(), 0).get("FLASH_HEARTBEAT_MIN_S") == "180"
+    monkeypatch.delenv("FLASH_HEARTBEAT_MIN_S", raising=False)
+    assert "FLASH_HEARTBEAT_MIN_S" not in build_worker_env(_spec(), 0)
 
 
 def test_build_worker_env_forwards_judge_model(monkeypatch):
-    """The optimizer-authored verifiers env reads AUTOSLM_JUDGE_MODEL on the worker to pick its
+    """The optimizer-authored verifiers env reads FLASH_JUDGE_MODEL on the worker to pick its
     JudgeRubric client model (SFT-eval / GRPO-reward / rejection-sampling); the control-plane
     override must be forwarded, else the env silently falls back to its generated default."""
     from flash.providers.runpod.train import build_worker_env
 
-    monkeypatch.setenv("AUTOSLM_JUDGE_MODEL", "openai/gpt-oss-120b")
-    assert build_worker_env(_spec(), 0).get("AUTOSLM_JUDGE_MODEL") == "openai/gpt-oss-120b"
-    monkeypatch.delenv("AUTOSLM_JUDGE_MODEL", raising=False)
-    assert "AUTOSLM_JUDGE_MODEL" not in build_worker_env(_spec(), 0)
+    monkeypatch.setenv("FLASH_JUDGE_MODEL", "openai/gpt-oss-120b")
+    assert build_worker_env(_spec(), 0).get("FLASH_JUDGE_MODEL") == "openai/gpt-oss-120b"
+    monkeypatch.delenv("FLASH_JUDGE_MODEL", raising=False)
+    assert "FLASH_JUDGE_MODEL" not in build_worker_env(_spec(), 0)
 
 
 def test_build_worker_env_forwards_prime_api_key(monkeypatch):
