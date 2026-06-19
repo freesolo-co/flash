@@ -15,9 +15,12 @@ from __future__ import annotations
 from .analytical import estimate_cost, seconds_per_step, select_gpu, setup_seconds
 from .config import RunConfig
 from .estimate import CostEstimate
+from .llm import LLMCostEstimator, LLMEstimate
 
 __all__ = [
     "CostEstimate",
+    "LLMCostEstimator",
+    "LLMEstimate",
     "RunConfig",
     "estimate_cost",
     "seconds_per_step",

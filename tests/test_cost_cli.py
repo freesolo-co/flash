@@ -33,3 +33,20 @@ from flash.cost.cli import _parse_versions
 )
 def test_parse_versions(spec, expected):
     assert _parse_versions(spec) == expected
+
+
+@pytest.mark.parametrize("spec", ["x", "1,x", "6-1", "3-1", "", ",", " , "])
+def test_parse_versions_rejects_malformed(spec):
+    # Non-integer tokens, reversed ranges, and empty specs raise rather than silently
+    # yielding garbage that crashes mid-sweep.
+    with pytest.raises(ValueError, match="version"):
+        _parse_versions(spec)
+
+
+@pytest.mark.parametrize("spec", ["0", "99", "1,7", "0-2"])
+def test_cmd_experiment_rejects_out_of_range(spec):
+    # Out-of-range versions are caught before the sweep and reported as a clean CLI
+    # error (exit 2), not a downstream traceback from prompt_for_version.
+    from flash.cost.cli import main
+
+    assert main(["experiment", "--offline", "--versions", spec]) == 2

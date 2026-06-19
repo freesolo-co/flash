@@ -58,8 +58,13 @@ def _extract(text: str) -> tuple[float | None, str | None, str]:
     # Fallbacks: a "cost_usd": N pair, then the first dollar figure anywhere.
     kv = re.search(r"cost_usd\"?\s*[:=]\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", text)
     if kv:
-        gpu = re.search(r"gpu\"?\s*[:=]\s*\"?([A-Za-z0-9 ]+)", text)
-        return float(kv.group(1)), (gpu.group(1).strip() if gpu else None), ""
+        gpu_m = re.search(r"gpu\"?\s*[:=]\s*\"?([A-Za-z0-9 ]+)", text)
+        # Mirror the JSON path: a falsy / "no GPU" value (empty or a bare "0") is absent,
+        # not a present-but-falsy class that would later be graded against the truth.
+        gpu = gpu_m.group(1).strip() if gpu_m else None
+        if gpu in ("", "0"):
+            gpu = None
+        return float(kv.group(1)), gpu, ""
     dollar = re.search(r"\$\s*([0-9]+(?:\.[0-9]+)?)", text)
     if dollar:
         return float(dollar.group(1)), None, ""

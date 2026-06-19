@@ -48,22 +48,43 @@ def _parse_versions(spec: str) -> list[int]:
     range inside a list no longer swallows the whole string. Overlapping tokens are
     de-duplicated and the result is sorted (``"1,1-3"`` -> ``[1, 2, 3]``), so a repeated
     version doesn't grade the same prompt twice and skew the experiment.
+
+    Raises ``ValueError`` for malformed input -- a non-integer token (``"x"``), a
+    reversed range (``"6-1"``), or a spec that expands to nothing (``","``) -- so the
+    caller can surface a clean CLI error instead of a later traceback.
     """
     seen: set[int] = set()
     for token in spec.split(","):
         token = token.strip()
         if not token:
             continue
-        if "-" in token:
-            lo, hi = token.split("-", 1)
-            seen.update(range(int(lo), int(hi) + 1))
-        else:
-            seen.add(int(token))
+        try:
+            if "-" in token:
+                lo_s, hi_s = token.split("-", 1)
+                lo, hi = int(lo_s), int(hi_s)
+                if lo > hi:
+                    raise ValueError(f"reversed range {token!r} (low > high)")
+                seen.update(range(lo, hi + 1))
+            else:
+                seen.add(int(token))
+        except ValueError as exc:
+            raise ValueError(f"invalid version token {token!r}: {exc}") from exc
+    if not seen:
+        raise ValueError(f"no versions parsed from {spec!r}")
     return sorted(seen)
 
 
 def _cmd_experiment(args: argparse.Namespace) -> int:
-    versions = _parse_versions(args.versions)
+    try:
+        versions = _parse_versions(args.versions)
+        out_of_range = [v for v in versions if not 1 <= v <= NUM_VERSIONS]
+        if out_of_range:
+            raise ValueError(
+                f"version(s) {out_of_range} out of range 1..{NUM_VERSIONS}"
+            )
+    except ValueError as exc:
+        print(f"error: --versions {args.versions!r}: {exc}", file=sys.stderr)
+        return 2
     grid = diverse_grid() if args.grid == "diverse" else default_grid()
     if args.offline:
         factory = decaying_stub_factory()

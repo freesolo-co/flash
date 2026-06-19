@@ -45,3 +45,20 @@ def test_extract_returns_none_when_no_cost():
     cost, gpu, _reasoning = _extract("the model said nothing useful")
     assert cost is None
     assert gpu is None
+
+
+def test_extract_fallback_drops_zero_gpu_to_none():
+    # The non-JSON fallback path must normalize a bare "0" GPU the same way the JSON
+    # path does, so it isn't graded as a present GPU class downstream.
+    cost, gpu, _ = _extract('cost_usd: 1.5\ngpu: 0')
+    assert cost == 1.5
+    assert gpu is None
+
+
+def test_llm_cost_estimator_is_exported():
+    # The package docstring/public API references LLMCostEstimator -- it must import
+    # from the package root.
+    from flash.cost import LLMCostEstimator, LLMEstimate
+
+    assert LLMCostEstimator is not None
+    assert LLMEstimate is not None
