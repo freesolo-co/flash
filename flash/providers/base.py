@@ -400,14 +400,17 @@ def resolve_gpu_policy(
     key = (requested or "").strip().lower()
     if key not in POLICY_NAMES:
         return canonical_gpu(requested)
-    from flash.engine.vram import model_required_vram_gb
-    from flash.providers.allocator import vram_headroom
+    # Use the allocator's disaggregated-AWARE sizing (which itself honors AUTOSLM_VRAM_HEADROOM
+    # via vram_headroom, so parse-time matches submit-time exactly — PR #176). For a
+    # disaggregated GRPO run ([train].inference_gpus>0) the rollout server is tensor-parallel
+    # across the inference GPUs and the trainer is on separate cards, so the binding PER-GPU need
+    # is far below the colocate total. Sizing the parse-time provisional with the colocate total
+    # would raise here (e.g. "no validated GPU has >= 103 GB") and block the advertised
+    # disaggregated-only model BEFORE the submit-time allocator can apply the smaller per-GPU
+    # estimate. required_vram_gb falls back to the plain colocate figure when inference_gpus==0.
+    from flash.providers.allocator import required_vram_gb
 
-    # Honor AUTOSLM_VRAM_HEADROOM here too so parse-time sizing matches the submit-time
-    # allocator exactly (PR #176 review: they previously diverged on the headroom knob).
-    min_vram = model_required_vram_gb(
-        model_id, algorithm, train=train, thinking=thinking, headroom=vram_headroom()
-    )
+    min_vram = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
     return cheapest_gpu(min_vram, include_unvalidated=unvalidated_allowed(allow_unvalidated))
 
 

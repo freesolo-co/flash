@@ -427,6 +427,17 @@ def _validate_spec(spec: JobSpec) -> None:
         raise ConfigError("gpu.count must be >= 1")
     if spec.train.inference_gpus < 0:
         raise ConfigError("train.inference_gpus must be >= 0")
+    # A multi-GPU node is ONLY used by the disaggregated GRPO path (gpu.count = trainer GPUs +
+    # inference_gpus). With inference_gpus == 0 the worker takes the colocated/single-process path
+    # and never touches the extra cards, so gpu.count > 1 would silently bill for GPUs that cannot
+    # affect the run. Reject it up front (it also catches SFT, where inference_gpus is rejected
+    # above, so SFT is always single-GPU here).
+    if spec.gpu.count > 1 and spec.train.inference_gpus == 0:
+        raise ConfigError(
+            f"gpu.count ({spec.gpu.count}) > 1 requires train.inference_gpus > 0 (the "
+            "disaggregated GRPO rollout is the only multi-GPU path; gpu.count = trainer GPUs + "
+            "inference_gpus). Set inference_gpus, or use gpu.count = 1."
+        )
     if spec.train.inference_gpus > 0:
         # The disaggregated async rollout (vLLM server on dedicated GPUs) is a GRPO-only path —
         # SFT has no rollout engine, so inference_gpus would just strand paid GPUs.

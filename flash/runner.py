@@ -955,7 +955,10 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     # a policy GPU can be re-allocated to a different RunPod class at submit time, so
     # the worker stamps "allocated_gpu" into metrics for the cost fallback below.
     gpu_type = metrics.get("allocated_gpu") or spec.gpu.type
-    rate = _gpu_rate(gpu_type)
+    # _gpu_rate is the PER-CARD RunPod price; a disaggregated run rents [gpu] count cards
+    # (trainer + inference), so the wall-based projection below must rate the whole node, not
+    # one card. (Vast stamps its own total cost_usd from the offer and short-circuits this.)
+    rate = _gpu_rate(gpu_type) * max(1, int(getattr(spec.gpu, "count", 1)))
     # A non-runpod provider (e.g. Vast) stamps the real cost_usd from its offer's $/hr
     # AND tags notes["provider"] with its own name — and a near-zero-duration run can
     # legitimately stamp cost_usd == 0.0. The RunPod arm, by contrast, never stamps a real

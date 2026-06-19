@@ -78,10 +78,18 @@ def required_vram_gb(
     # floor (~96GB) — which no available 2-GPU node meets — while staying FLOORED by the bf16 weights
     # so the server can never be under-provisioned into an OOM. Also unblocks 4B 1:2 on a 5090 (the
     # disaggregated server/trainer each fit 32GB though colocate 4B needs ~35GB).
-    if train is not None and int(getattr(train, "inference_gpus", 0) or 0) > 0:
+    # ``train`` may be a TrainSpec (attribute) or a raw [train] dict (parse-time, before the
+    # TrainSpec is built) — read inference_gpus from whichever shape so the parse-time
+    # resolve_gpu_policy and the submit-time allocator size identically.
+    _ig = train.get("inference_gpus") if isinstance(train, dict) else getattr(train, "inference_gpus", 0)
+    try:
+        _ig = int(_ig or 0)
+    except (TypeError, ValueError):
+        _ig = 0
+    if train is not None and _ig > 0:
         pb = _params_b_for_vram(model_id)
         if pb:
-            infer = max(1, int(getattr(train, "inference_gpus", 1) or 1))
+            infer = max(1, _ig)
             # The rollout server is TENSOR-PARALLEL across the inference GPUs (build_vllm_serve_cmd
             # parallel="tp" -> --tensor_parallel_size=infer): vLLM shards BOTH the bf16 weights and
             # the KV cache across the TP ranks, so each inference card holds ~1/infer of the full
@@ -116,9 +124,18 @@ def _params_b_for_vram(model_id: str) -> float | None:
         return None
 
 
-def _runpod_candidates(need: int, pinned_gpu: str | None, allow_unval: bool) -> list[Candidate]:
-    """RunPod's fitting classes priced live (static fallback)."""
+def _runpod_candidates(
+    need: int, pinned_gpu: str | None, allow_unval: bool, gpu_count: int = 1
+) -> list[Candidate]:
+    """RunPod's fitting classes priced live (static fallback).
+
+    ``hourly_rate`` is the PER-CARD price; a multi-GPU node (``gpu_count`` > 1, the disaggregated
+    rollout topology) rents that many cards, so the candidate's $/hr must be the per-card rate x
+    gpu_count. Without this a multi-GPU RunPod node would be ranked (and later reported) as if it
+    cost a single card, underreporting spend and skewing selection against providers whose
+    multi-GPU offers are priced as the TOTAL instance (e.g. Vast's dph_total)."""
     provider = get_provider("runpod")
+    n = max(1, int(gpu_count))
     out: list[Candidate] = []
     for g in provider.gpu_classes():
         if g.vram_gb < need:
@@ -131,7 +148,7 @@ def _runpod_candidates(need: int, pinned_gpu: str | None, allow_unval: bool) -> 
             Candidate(
                 "runpod",
                 g.name,
-                provider.hourly_rate(g.name),
+                provider.hourly_rate(g.name) * n,
                 g.vram_gb,
                 "runpod" in g.validated_on,
             )
@@ -243,7 +260,7 @@ def allocate(
         cands: list[Candidate] = []
         book: tuple = ()
         if provider in ("auto", "runpod") and "runpod" in live:
-            cands += _runpod_candidates(need, pin, allow_unval)
+            cands += _runpod_candidates(need, pin, allow_unval, gpu_count=gpu_count)
         if provider in ("auto", "vast") and "vast" in live:
             vcands, book = _vast_candidates(
                 need, pin, allow_unval, disk_gb, exclude_machine_ids,

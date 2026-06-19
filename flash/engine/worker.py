@@ -1385,6 +1385,12 @@ def make_reward_heartbeat_callback():
             self.reward_history = []
 
         def on_log(self, args, state, control, logs=None, **kwargs):
+            # In a disaggregated multi-trainer (DDP) group EVERY rank runs this callback; the
+            # heartbeat commits heartbeat.json to the SAME HF path, so N ranks would race /
+            # duplicate-commit. Only rank 0 (world-process-zero) emits — single-process and
+            # train_gpus==1 paths are always rank 0, so their behavior is unchanged.
+            if not getattr(state, "is_world_process_zero", True):
+                return
             if not logs:
                 return
             r = logs.get("reward")
@@ -1613,6 +1619,45 @@ def _init_adapter_model(model_id: str):
     return model, None
 
 
+def _env_inference_gpus(default: int) -> int:
+    """``AUTOSLM_INFERENCE_GPUS`` as an int, tolerating a present-but-BLANK value.
+
+    A ``[worker_env]`` table serializes every value via ``str(v)``, so an empty/whitespace
+    ``AUTOSLM_INFERENCE_GPUS`` reaches the worker as ``""`` — a bare ``int("")`` would raise
+    ValueError and abort the worker before any clear config error. Treat blank/unparseable as
+    "no override" (keep the spec default) instead of crashing."""
+    raw = os.environ.get("AUTOSLM_INFERENCE_GPUS")
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        print(
+            f"[rl][disagg][warn] AUTOSLM_INFERENCE_GPUS={raw!r} is not an integer; "
+            f"using inference_gpus={default}"
+        )
+        return default
+
+
+def _require_full_node_for_disaggregated(total_gpus: int, inference_gpus: int) -> None:
+    """Fail fast when a disaggregated run's node exposes FEWER GPUs than [gpu] count requested.
+
+    A provider can under-provision (rent an N-GPU offer yet expose <N to the container — observed
+    on Vast). For COLOCATE that just means fewer cards than hoped, but for a DISAGGREGATED ratio it
+    silently rebuilds a DIFFERENT topology: a requested 2:2 (count=4, inference_gpus=2) on a node
+    that exposes only 3 GPUs collapses to 1:2 — one trainer instead of two, skipping the FSDP/DDP
+    multi-trainer path the user paid for, while the VRAM was sized for the full ratio. Refuse the
+    degraded split (the node is torn down on raise) instead of quietly mis-running the config."""
+    hint = os.environ.get("AUTOSLM_GPU_COUNT")
+    if hint and hint.isdigit() and int(hint) > total_gpus:
+        raise RuntimeError(
+            f"[rl][disagg] node under-provisioned: [gpu] count requested {hint} GPU(s) but the "
+            f"container exposes only {total_gpus} (nvidia-smi). A disaggregated rollout "
+            f"(inference_gpus={inference_gpus}) needs the full requested topology — refusing to "
+            f"silently run a smaller split. Re-provision a node with {hint} visible GPUs."
+        )
+
+
 def _pin_trainer_devices_for_disaggregated() -> None:
     """Pin CUDA_VISIBLE_DEVICES to the TRAINER's devices before any CUDA context is created.
 
@@ -1635,7 +1680,7 @@ def _pin_trainer_devices_for_disaggregated() -> None:
         print("[rl][disagg] trainer-only child: accelerate manages CUDA_VISIBLE_DEVICES; skip pin")
         return
     inference_gpus = int(JOB_SPEC.train.inference_gpus) if (JOB_SPEC and JOB_SPEC.train) else 0
-    inference_gpus = int(os.environ.get("AUTOSLM_INFERENCE_GPUS", inference_gpus))
+    inference_gpus = _env_inference_gpus(inference_gpus)
     if inference_gpus <= 0:
         return
 
@@ -1685,7 +1730,7 @@ def run_rl():
     )
 
     _inference_gpus = int(JOB_SPEC.train.inference_gpus) if (JOB_SPEC and JOB_SPEC.train) else 0
-    _inference_gpus = int(os.environ.get("AUTOSLM_INFERENCE_GPUS", _inference_gpus))
+    _inference_gpus = _env_inference_gpus(_inference_gpus)
     # Re-validate against the EFFECTIVE inference_gpus: submit-time validation only saw the spec
     # value, but AUTOSLM_INFERENCE_GPUS (via [worker_env]) can change it here — e.g. =0 would force
     # colocated GRPO for a requires_disaggregated model that OOMs colocated. Fail fast on the worker.
@@ -1706,6 +1751,10 @@ def run_rl():
     _is_fsdp_launcher = False
     if _inference_gpus > 0:
         _total_gpus = _disagg.detect_total_gpus()
+        # Refuse a degraded topology if the provider under-provisioned (fewer visible GPUs than the
+        # requested [gpu] count): a disaggregated ratio sized/intended for the full node must not
+        # silently collapse to a smaller split.
+        _require_full_node_for_disaggregated(_total_gpus, _inference_gpus)
         _rollout_split = select_rollout_split(_total_gpus, _inference_gpus)
         print(
             f"[rl][disagg] node has {_total_gpus} GPU(s); split {_rollout_split.label}: "
@@ -2211,122 +2260,132 @@ def run_rl():
             {"cudagraph_mode": "FULL_AND_PIECEWISE"},
             "vLLM cudagraph_mode (verl rollout default)",
         )
-    # Adapter init: continue training the SFT adapter (peft_config=None, model is the
-    # loaded PeftModel) when train.init_from_adapter is set, else a fresh LoRA on the
-    # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
-    # to fp32 and double VRAM).
-    init_model, init_peft = _init_adapter_model(model_id)
-    if init_peft is not None:
-        # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
-        # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
-        # bnb.Linear4bit modules and brings up its colocated vLLM rollout engine with
-        # quantization="bitsandbytes" (so a 36B MoE fits an 80 GB GPU in 4-bit on both the
-        # trainer and rollout sides). Otherwise force bf16 (TRL string-loading can fall
-        # back to fp32 and double VRAM).
-        _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
-        if quant == "4bit-qlora":
-            _patch_peft_weight_converter_compat()  # adapter (re)load compatibility
-            grpo_kwargs["model_init_kwargs"] = qlora_model_init_kwargs()
-            _vllm_note = "; vLLM rollout -> bitsandbytes" if use_vllm else ""
-            print(f"[rl] loading {model_id} in 4-bit (QLoRA tier){_vllm_note}")
-        else:
-            grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
-        if _attn:
-            grpo_kwargs["model_init_kwargs"]["attn_implementation"] = _attn
-    else:
-        _attn = optimal_attn_impl()
-    # stop_sequences: TRL forwards generation_kwargs to the (vLLM) sampler, whose
-    # SamplingParams.stop truncates each rollout at the requested delimiter — so the reward
-    # sees the same completion the config intends, instead of generating to max_completion.
-    if _t and _t.stop_sequences:
-        grpo_kwargs["generation_kwargs"] = {"stop": list(_t.stop_sequences)}
-    # advantage_clip>0 is the datums centered-advantage clamp; TRL has no advantage-value
-    # clip knob (it clips the importance ratio), so honor the default (clip off ==
-    # centered) and surface a note when a config asks for an explicit clamp.
-    if _adv_clip > 0:
-        print(f"[rl] advantage_clip={_adv_clip} recorded; TRL centers advantages (no value clip)")
-    # num_iterations (the one promoted GRPO speed lever, measured 1.38x faster) is feature-detected
-    # so an older TRL that lacks the field is simply skipped (GRPOConfig rejects unknown kwargs).
-    # Generation dominates GRPO wall-clock, so reusing each rollout batch for 2 optimizer steps is
-    # the cheapest large speedup; mu=2 is the standard GRPO config and TRL's importance-sampling
-    # correction (on by default) keeps the step stable. (The GSPO/DAPO A/B levers were dropped: the
-    # framework-scan in gpu-bench/RESEARCH_FINDINGS.md measured no robust win over baseline.)
-    import dataclasses as _dc
-
-    try:
-        _grpo_fields = {f.name for f in _dc.fields(GRPOConfig)}
-    except TypeError:
-        _grpo_fields = set()  # not a dataclass on this TRL -> skip the feature-detected knob
-    if "num_iterations" in _grpo_fields:
-        grpo_kwargs["num_iterations"] = 2
-        print("[rl] rollout amortization: num_iterations=2 (reuse each generation batch)")
-    cfg = GRPOConfig(**grpo_kwargs)
-    setup_seconds = time.time() - t_start
-    heartbeat("rl_train_start", setup_seconds=setup_seconds)
-
-    # VL checkpoints (Qwen3.5/3.6) train text-only: make TRL's colocated rollout
-    # engine skip the vision tower (VRAM + 5090 PTX-compat; see the patch docstring).
-    # Only reachable for the IN-PROCESS (colocate) engine. The disaggregated `trl vllm-serve`
-    # server is a separate process this monkeypatch can't reach, AND TRL's vllm-serve exposes no
-    # language-model-only flag, so that server loads the full model incl. the vision tower. That is
-    # acceptable in practice: the only requires_disaggregated model (Qwen3.6-35B-A3B) runs on H200,
-    # where the vision tower fits and the 5090-class PTX issue doesn't apply. Revisit (a TRL patch /
-    # --hf-overrides shim) only if a disaggregated VL model is ever served on a smaller GPU.
-    if use_vllm and not disaggregated:
-        patch_vllm_language_model_only(model_id)
-    hb_cb = make_reward_heartbeat_callback()
-    # Multi-turn / tool wiring (trl 1.6): tool envs hand TRL the tool callables so it runs the
-    # tool-call loop natively; pure multi-turn envs hand TRL a rollout_func that drives the
-    # env's own turn loop on the colocate engine (env_mask masks the non-model tokens).
-    extra_trainer_kwargs: dict = {}
-    tools = ACTIVE_ENV.tools() if is_tool_env else []
-    # A tool env exposing NO tools would silently degrade to single-shot under tools=[]; drive
-    # it through the rollout_func turn loop instead so it isn't mis-trained as single-turn.
-    if is_tool_env and not tools:
-        print("[rl][warn] tool env exposes no tools — using the multi-turn rollout_func path")
-    use_rollout_func = is_multi_turn and not (is_tool_env and tools)
-    require_vllm_for_rollout_func(use_rollout_func, use_vllm, model_id)
-    if use_rollout_func and disaggregated:
-        # The multi-turn rollout_func drives generation through TRL's IN-PROCESS vLLM engine; in
-        # disaggregated mode vLLM is a separate server (vllm_mode="server") with no in-process
-        # engine, so the rollout would fail at the first custom turn. Fail fast at setup.
-        raise RuntimeError(
-            "multi-turn GRPO (custom rollout_func) is not supported with disaggregated rollout "
-            "(inference_gpus>0): it needs an in-process vLLM engine, but disaggregated runs vLLM as "
-            "a separate server. Use colocated GRPO (inference_gpus=0) for multi-turn / tool envs."
-        )
-    if is_tool_env and tools:
-        extra_trainer_kwargs["tools"] = tools
-        print(f"[rl] tool env: handing {len(tools)} tool(s) to TRL's native tool loop")
-    if use_rollout_func:
-        from flash.engine.multiturn_rollout import (
-            build_examples_index,
-            build_rollout_func,
-            index_collisions,
-        )
-
-        examples_by_key = build_examples_index(train, ACTIVE_ENV.prompt_messages)
-        ncol = index_collisions(train, ACTIVE_ENV.prompt_messages)
-        if ncol:
-            print(
-                f"[rl][warn] {ncol} duplicate prompt(s) collide in the reward index; the shared "
-                "prompt scores against the last example's answer/info"
-            )
-        extra_trainer_kwargs["rollout_func"] = build_rollout_func(
-            active_env=ACTIVE_ENV,
-            tok=tok,
-            examples_by_key=examples_by_key,
-            max_completion=_max_completion,
-            max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
-            temperature=_temperature,
-            top_p=rl.sampling_top_p,
-            stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
-            thinking=THINKING,
-            engine_max_len=vllm_max_len,
-        )
-        print("[rl] multi-turn env: driving the turn loop via rollout_func")
     trainer = None
     try:
+        # Adapter init: continue training the SFT adapter (peft_config=None, model is the
+        # loaded PeftModel) when train.init_from_adapter is set, else a fresh LoRA on the
+        # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
+        # to fp32 and double VRAM).
+        #
+        # The FSDP/DDP LAUNCHER (train_gpus>1) builds NO trainer — it re-execs the worker under
+        # `accelerate launch` and the child ranks load their own copies. Loading the base+adapter
+        # here would pin a full extra PeftModel on the launcher's train devices that is never freed
+        # before the children spawn on the SAME cards -> OOM / lost memory for the ranks (esp. a
+        # common GRPO-after-SFT run via train.init_from_adapter). Skip the load entirely on the
+        # launcher; the children call _init_adapter_model in their own process.
+        if _is_fsdp_launcher:
+            init_model, init_peft = None, None
+        else:
+            init_model, init_peft = _init_adapter_model(model_id)
+        if init_peft is not None:
+            # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
+            # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
+            # bnb.Linear4bit modules and brings up its colocated vLLM rollout engine with
+            # quantization="bitsandbytes" (so a 36B MoE fits an 80 GB GPU in 4-bit on both the
+            # trainer and rollout sides). Otherwise force bf16 (TRL string-loading can fall
+            # back to fp32 and double VRAM).
+            _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
+            if quant == "4bit-qlora":
+                _patch_peft_weight_converter_compat()  # adapter (re)load compatibility
+                grpo_kwargs["model_init_kwargs"] = qlora_model_init_kwargs()
+                _vllm_note = "; vLLM rollout -> bitsandbytes" if use_vllm else ""
+                print(f"[rl] loading {model_id} in 4-bit (QLoRA tier){_vllm_note}")
+            else:
+                grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
+            if _attn:
+                grpo_kwargs["model_init_kwargs"]["attn_implementation"] = _attn
+        else:
+            _attn = optimal_attn_impl()
+        # stop_sequences: TRL forwards generation_kwargs to the (vLLM) sampler, whose
+        # SamplingParams.stop truncates each rollout at the requested delimiter — so the reward
+        # sees the same completion the config intends, instead of generating to max_completion.
+        if _t and _t.stop_sequences:
+            grpo_kwargs["generation_kwargs"] = {"stop": list(_t.stop_sequences)}
+        # advantage_clip>0 is the datums centered-advantage clamp; TRL has no advantage-value
+        # clip knob (it clips the importance ratio), so honor the default (clip off ==
+        # centered) and surface a note when a config asks for an explicit clamp.
+        if _adv_clip > 0:
+            print(f"[rl] advantage_clip={_adv_clip} recorded; TRL centers advantages (no value clip)")
+        # num_iterations (the one promoted GRPO speed lever, measured 1.38x faster) is feature-detected
+        # so an older TRL that lacks the field is simply skipped (GRPOConfig rejects unknown kwargs).
+        # Generation dominates GRPO wall-clock, so reusing each rollout batch for 2 optimizer steps is
+        # the cheapest large speedup; mu=2 is the standard GRPO config and TRL's importance-sampling
+        # correction (on by default) keeps the step stable. (The GSPO/DAPO A/B levers were dropped: the
+        # framework-scan in gpu-bench/RESEARCH_FINDINGS.md measured no robust win over baseline.)
+        import dataclasses as _dc
+
+        try:
+            _grpo_fields = {f.name for f in _dc.fields(GRPOConfig)}
+        except TypeError:
+            _grpo_fields = set()  # not a dataclass on this TRL -> skip the feature-detected knob
+        if "num_iterations" in _grpo_fields:
+            grpo_kwargs["num_iterations"] = 2
+            print("[rl] rollout amortization: num_iterations=2 (reuse each generation batch)")
+        cfg = GRPOConfig(**grpo_kwargs)
+        setup_seconds = time.time() - t_start
+        heartbeat("rl_train_start", setup_seconds=setup_seconds)
+
+        # VL checkpoints (Qwen3.5/3.6) train text-only: make TRL's colocated rollout
+        # engine skip the vision tower (VRAM + 5090 PTX-compat; see the patch docstring).
+        # Only reachable for the IN-PROCESS (colocate) engine. The disaggregated `trl vllm-serve`
+        # server is a separate process this monkeypatch can't reach, AND TRL's vllm-serve exposes no
+        # language-model-only flag, so that server loads the full model incl. the vision tower. That is
+        # acceptable in practice: the only requires_disaggregated model (Qwen3.6-35B-A3B) runs on H200,
+        # where the vision tower fits and the 5090-class PTX issue doesn't apply. Revisit (a TRL patch /
+        # --hf-overrides shim) only if a disaggregated VL model is ever served on a smaller GPU.
+        if use_vllm and not disaggregated:
+            patch_vllm_language_model_only(model_id)
+        hb_cb = make_reward_heartbeat_callback()
+        # Multi-turn / tool wiring (trl 1.6): tool envs hand TRL the tool callables so it runs the
+        # tool-call loop natively; pure multi-turn envs hand TRL a rollout_func that drives the
+        # env's own turn loop on the colocate engine (env_mask masks the non-model tokens).
+        extra_trainer_kwargs: dict = {}
+        tools = ACTIVE_ENV.tools() if is_tool_env else []
+        # A tool env exposing NO tools would silently degrade to single-shot under tools=[]; drive
+        # it through the rollout_func turn loop instead so it isn't mis-trained as single-turn.
+        if is_tool_env and not tools:
+            print("[rl][warn] tool env exposes no tools — using the multi-turn rollout_func path")
+        use_rollout_func = is_multi_turn and not (is_tool_env and tools)
+        require_vllm_for_rollout_func(use_rollout_func, use_vllm, model_id)
+        if use_rollout_func and disaggregated:
+            # The multi-turn rollout_func drives generation through TRL's IN-PROCESS vLLM engine; in
+            # disaggregated mode vLLM is a separate server (vllm_mode="server") with no in-process
+            # engine, so the rollout would fail at the first custom turn. Fail fast at setup.
+            raise RuntimeError(
+                "multi-turn GRPO (custom rollout_func) is not supported with disaggregated rollout "
+                "(inference_gpus>0): it needs an in-process vLLM engine, but disaggregated runs vLLM as "
+                "a separate server. Use colocated GRPO (inference_gpus=0) for multi-turn / tool envs."
+            )
+        if is_tool_env and tools:
+            extra_trainer_kwargs["tools"] = tools
+            print(f"[rl] tool env: handing {len(tools)} tool(s) to TRL's native tool loop")
+        if use_rollout_func:
+            from flash.engine.multiturn_rollout import (
+                build_examples_index,
+                build_rollout_func,
+                index_collisions,
+            )
+
+            examples_by_key = build_examples_index(train, ACTIVE_ENV.prompt_messages)
+            ncol = index_collisions(train, ACTIVE_ENV.prompt_messages)
+            if ncol:
+                print(
+                    f"[rl][warn] {ncol} duplicate prompt(s) collide in the reward index; the shared "
+                    "prompt scores against the last example's answer/info"
+                )
+            extra_trainer_kwargs["rollout_func"] = build_rollout_func(
+                active_env=ACTIVE_ENV,
+                tok=tok,
+                examples_by_key=examples_by_key,
+                max_completion=_max_completion,
+                max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
+                temperature=_temperature,
+                top_p=rl.sampling_top_p,
+                stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
+                thinking=THINKING,
+                engine_max_len=vllm_max_len,
+            )
+            print("[rl] multi-turn env: driving the turn loop via rollout_func")
         if _is_fsdp_launcher:
             # train_gpus>1: the server is up (above); re-exec THIS worker under `accelerate launch`
             # so the GRPO trainer runs as an FSDP group across the train devices and connects to the
@@ -2386,16 +2445,22 @@ def run_rl():
             # AUTOSLM_EVAL_EVERY_STEPS, > 0): greedy eval on a held-out split, streamed via
             # heartbeat("rl_eval", ...) AND accumulated into metrics.json so the agent reads
             # the eval curve (not just the noisy reward) when judging a run.
-            periodic_eval = _maybe_attach_periodic_eval(
-                trainer,
-                tok,
-                is_multi_turn=is_multi_turn,
-                is_tool_env=is_tool_env,
-                max_new_default=_max_completion,
-                stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
-                engine_max_len=vllm_max_len,
-                max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
-            )
+            # In a disaggregated multi-trainer (DDP) group EVERY rank builds this trainer; only
+            # rank 0 should run held-out eval + emit rl_eval heartbeats (the others would do
+            # redundant generation and duplicate-commit the same eval). is_main_rank is True for
+            # single-process / train_gpus==1, so their behavior is unchanged.
+            periodic_eval = None
+            if _disagg.is_main_rank():
+                periodic_eval = _maybe_attach_periodic_eval(
+                    trainer,
+                    tok,
+                    is_multi_turn=is_multi_turn,
+                    is_tool_env=is_tool_env,
+                    max_new_default=_max_completion,
+                    stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
+                    engine_max_len=vllm_max_len,
+                    max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
+                )
             t_train = time.time()
             with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
                 trainer.train(resume_from_checkpoint=resume_ckpt)
