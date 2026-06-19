@@ -104,31 +104,91 @@ def test_build_worker_env_forwards_prime_api_key(monkeypatch):
     assert "PRIME_API_KEY" not in build_worker_env(_spec(), 0)
 
 
-def test_build_worker_env_forwards_chalk_flags(monkeypatch):
+def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
     """The opt-in chalk-kernel install hook (engine.chalk_kernels) runs inside the worker
-    subprocess and reads CHALK_* flags from its own process env, so an operator-set CHALK_*
-    MUST be forwarded by the allowlist or the kernel silently no-ops on every remote run.
-    Forwarding is prefix-based, so arbitrary/future CHALK_* names pass through unchanged."""
+    subprocess and selects which install-on-call chalk installers to run from FLASH_* flags read
+    from its OWN process env, so an operator-set FLASH_* selection (and FLASH_CHALK_SPEC) MUST be
+    forwarded by the allowlist or every chalk kernel silently no-ops on every remote run."""
     from flash.providers.runpod.train import build_worker_env
 
     flags = {
-        "CHALK_MLP_KERNEL": "1",
-        "CHALK_FP8_BASE": "1",
-        "CHALK_TRITON_LORA": "1",
-        "CHALK_EMBED_KERNEL": "1",
-        # a flag this repo doesn't enumerate must still pass through (prefix, not explicit list)
-        "CHALK_SOME_FUTURE_FLAG": "e4m3",
+        "FLASH_MLP_KERNEL": "1",
+        "FLASH_MLP_FP8": "1",
+        "FLASH_MLP_FP8_DOWN": "0",
+        "FLASH_FP8_BASE": "1",
+        "FLASH_FP8_BASE_ATTN": "0",
+        "FLASH_FP8_BASE_MLP": "1",
+        "FLASH_FP8_BASE_MIN_K": "512",
+        "FLASH_TRITON_LORA": "1",
+        "FLASH_EMBED_KERNEL": "1",
+        "FLASH_QKV_KERNEL": "1",
+        "FLASH_ROPE_KERNEL": "1",
+        "FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main",
     }
     for k, v in flags.items():
         monkeypatch.setenv(k, v)
     env = build_worker_env(_spec(), 0)
     for k, v in flags.items():
         assert env.get(k) == v, f"{k} not forwarded to worker"
-    # unset CHALK_* flags are not invented
+    # unset chalk flags are not invented
     for k in flags:
         monkeypatch.delenv(k, raising=False)
     env2 = build_worker_env(_spec(), 0)
-    assert not any(k.startswith("CHALK_") for k in env2)
+    assert not any(k in env2 for k in flags)
+
+
+def _clear_chalk_flags(monkeypatch):
+    for k in (
+        "FLASH_MLP_KERNEL",
+        "FLASH_MLP_FP8",
+        "FLASH_FP8_BASE",
+        "FLASH_TRITON_LORA",
+        "FLASH_EMBED_KERNEL",
+        "FLASH_QKV_KERNEL",
+        "FLASH_ROPE_KERNEL",
+        "FLASH_CHALK_SPEC",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_chalk_extra_pip_empty_without_flags(monkeypatch):
+    """No FLASH_* kernel flag -> nothing added to the worker's extra_pip (default = no chalk)."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")  # spec alone must not opt in
+    assert chalk_extra_pip() == []
+
+
+def test_chalk_extra_pip_empty_without_spec(monkeypatch):
+    """A kernel flag is set but FLASH_CHALK_SPEC is unset -> nothing added (chalk is unpublished,
+    can't auto-install) — install_chalk_kernels then safely no-ops on the worker."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
+    assert chalk_extra_pip() == []
+
+
+def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):
+    """Kernel flag + FLASH_CHALK_SPEC -> the chalk spec is appended to extra_pip, which the worker
+    installs for EVERY job (the durable baked-image path that bypasses resolve_worker_deps)."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_FP8_BASE", "1")
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "git+https://github.com/freesolo-co/chalk@main")
+    assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
+
+
+def test_chalk_extra_pip_falsey_flag_does_not_opt_in(monkeypatch):
+    """FLASH_*=0 is inert: a leftover 0 must not pull chalk in even with a spec set."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "0")
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")
+    assert chalk_extra_pip() == []
 
 
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
