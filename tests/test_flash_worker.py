@@ -23,34 +23,42 @@ def _spec():
     )
 
 
-def test_build_worker_env_forwards_tuning_knobs(monkeypatch):
-    """Genuine runtime tuning knobs (not in the spec) reach the worker via the allowlist."""
+def test_build_worker_env_does_not_forward_tuning_knobs(monkeypatch):
+    """Run tuning is fully managed: operator process-env knobs are NOT forwarded to the worker —
+    the worker uses optimal defaults, and per-run config comes from the spec / [worker_env] TOML."""
     from flash.providers.runpod.train import build_worker_env
 
-    knobs = {
-        "RL_VLLM_GPU_UTIL": "0.40",
-        "RL_VLLM_SLEEP": "1",
-        "VLLM_USE_V1": "0",
-        "SFT_PER_DEVICE_BS": "4",
-    }
-    for k, v in knobs.items():
-        monkeypatch.setenv(k, v)
-    monkeypatch.setenv("RL_PER_DEVICE_PROMPTS", "2")
-
+    managed = (
+        "RL_VLLM_GPU_UTIL", "RL_VLLM_SLEEP", "VLLM_USE_V1", "VLLM_ATTENTION_BACKEND",
+        "SFT_PER_DEVICE_BS", "SFT_PACKING", "FLASH_QUANT", "LORA_TARGETS",
+        "FLASH_HEARTBEAT_MIN_S", "RL_PER_DEVICE_PROMPTS",
+    )
+    for k in managed:
+        monkeypatch.setenv(k, "1")
     env = build_worker_env(_spec(), 0)
-    for k, v in knobs.items():
-        assert env.get(k) == v, f"{k} not forwarded to worker"
-    assert "RL_PER_DEVICE_PROMPTS" not in env  # default + auto-caps only
-    # fragmentation-safe allocator default is always set
+    for k in managed:
+        assert k not in env, f"{k} should not be forwarded (tuning is managed)"
+    # W&B credential/routing is still forwarded; fragmentation-safe allocator default still set
+    monkeypatch.setenv("WANDB_API_KEY", "wb")
+    assert build_worker_env(_spec(), 0)["WANDB_API_KEY"] == "wb"
     assert "PYTORCH_CUDA_ALLOC_CONF" in env
 
 
-def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
+def test_build_worker_env_alloc_conf_pinned_via_worker_env(monkeypatch):
+    """A per-run [worker_env] alloc-conf pin wins over the computed default; an operator process-env
+    PYTORCH_*_ALLOC_CONF no longer does."""
     from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
 
-    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
-    env = build_worker_env(_spec(), 0)
-    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:999")  # process env: ignored
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        worker_env={"PYTORCH_ALLOC_CONF": "max_split_size_mb:256"},
+    )
+    env = build_worker_env(spec, 0)
+    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"  # [worker_env] wins, not the env
 
 
 def test_build_worker_env_does_not_forward_midrun_eval_knobs(monkeypatch):
@@ -65,16 +73,21 @@ def test_build_worker_env_does_not_forward_midrun_eval_knobs(monkeypatch):
         assert k not in env, f"{k} should no longer be forwarded (cadence comes from the spec)"
 
 
-def test_build_worker_env_forwards_heartbeat_throttle(monkeypatch):
-    """FLASH_HEARTBEAT_MIN_S is read by engine.worker on the GPU side to throttle rl_step
-    heartbeat commits under HuggingFace's 128/hr-per-repo cap; operators raise it when several
-    concurrent GRPO runs share one HF_REPO, so it MUST be on the forward allowlist."""
+def test_build_worker_env_heartbeat_throttle_via_worker_env(monkeypatch):
+    """The rl_step heartbeat throttle is not an operator process-env knob; a run pins it via the
+    [worker_env] TOML table (process env is ignored)."""
     from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
 
-    monkeypatch.setenv("FLASH_HEARTBEAT_MIN_S", "180")
-    assert build_worker_env(_spec(), 0).get("FLASH_HEARTBEAT_MIN_S") == "180"
-    monkeypatch.delenv("FLASH_HEARTBEAT_MIN_S", raising=False)
+    monkeypatch.setenv("FLASH_HEARTBEAT_MIN_S", "999")  # process env: ignored
     assert "FLASH_HEARTBEAT_MIN_S" not in build_worker_env(_spec(), 0)
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        worker_env={"FLASH_HEARTBEAT_MIN_S": "180"},
+    )
+    assert build_worker_env(spec, 0).get("FLASH_HEARTBEAT_MIN_S") == "180"
 
 
 def test_build_worker_env_forwards_judge_model(monkeypatch):
@@ -134,11 +147,18 @@ def test_alloc_conf_default_avoids_expandable_under_grpo_sleep(monkeypatch):
 
 def test_alloc_conf_default_expandable_when_sleep_off(monkeypatch):
     from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    monkeypatch.setenv("RL_VLLM_SLEEP", "0")  # sleep off -> expandable is safe + preferred
-    env = build_worker_env(_spec(), 0)
+    # sleep off -> expandable is safe + preferred; pinned via [worker_env] (not process env)
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        worker_env={"RL_VLLM_SLEEP": "0"},
+    )
+    env = build_worker_env(spec, 0)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
 
