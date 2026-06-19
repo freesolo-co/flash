@@ -90,15 +90,12 @@ def test_build_worker_env_heartbeat_throttle_via_worker_env(monkeypatch):
     assert build_worker_env(spec, 0).get("FLASH_HEARTBEAT_MIN_S") == "180"
 
 
-def test_build_worker_env_forwards_judge_model(monkeypatch):
-    """The optimizer-authored verifiers env reads FLASH_JUDGE_MODEL on the worker to pick its
-    JudgeRubric client model (SFT-eval / GRPO-reward / rejection-sampling); the control-plane
-    override must be forwarded, else the env silently falls back to its generated default."""
+def test_build_worker_env_does_not_set_judge_model(monkeypatch):
+    """The judge model is no longer an env knob in flash — it's fixed in the env-authoring side
+    (gpt-oss-120b). flash neither forwards an operator value nor sets one on the worker."""
     from flash.providers.runpod.train import build_worker_env
 
-    monkeypatch.setenv("FLASH_JUDGE_MODEL", "openai/gpt-oss-120b")
-    assert build_worker_env(_spec(), 0).get("FLASH_JUDGE_MODEL") == "openai/gpt-oss-120b"
-    monkeypatch.delenv("FLASH_JUDGE_MODEL", raising=False)
+    monkeypatch.setenv("FLASH_JUDGE_MODEL", "some/other-model")  # operator value: ignored
     assert "FLASH_JUDGE_MODEL" not in build_worker_env(_spec(), 0)
 
 

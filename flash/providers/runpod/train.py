@@ -702,21 +702,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # forward and can OOM a tight colocate budget); pinnable per-run via [worker_env].
         **({"TORCHDYNAMO_DISABLE": _we["TORCHDYNAMO_DISABLE"]} if _we.get("TORCHDYNAMO_DISABLE") else {}),
     }
-    # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub
-    # env(s), public + private) + optional reward-judge creds: a verifiers env whose rubric
-    # calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
-    # where the reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env
-    # reads (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's
-    # control-plane override so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
-    # back to the env's generated default. Forward any that the operator has set; absent ones are
-    # simply not passed (the env then uses its own default model).
-    for key in (
-        "HF_TOKEN",
-        "PRIME_API_KEY",
-        "OPENROUTER_API_KEY",
-        "OPENAI_API_KEY",
-        "FLASH_JUDGE_MODEL",
-    ):
+    # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub env(s),
+    # public + private) + reward-judge creds: a verifiers env whose rubric calls an LLM judge needs
+    # the API key ON THE WORKER, where the reward runs.
+    for key in ("HF_TOKEN", "PRIME_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"):
         if os.environ.get(key):
             env[key] = os.environ[key]
     # Seed the worker's own HF_REPO env from the run's [train] hf_repo (adapter/checkpoint/
