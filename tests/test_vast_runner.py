@@ -14,19 +14,19 @@ from flash.spec import JobSpec
 
 def test_reliability_and_inet_floors_are_fixed_defaults(monkeypatch):
     """The reliability floor and inet-speed minimum are fixed correctness defaults (0.995 / 200
-    Mbps) — NOT operator-tunable. Setting the old AUTOSLM_VAST_MIN_* env vars has no effect."""
+    Mbps) — NOT operator-tunable. Setting the old FLASH_VAST_MIN_* env vars has no effect."""
     import importlib
 
     from flash.providers.vast import jobs as vast
 
-    monkeypatch.setenv("AUTOSLM_VAST_MIN_RELIABILITY", "0.999")
-    monkeypatch.setenv("AUTOSLM_VAST_MIN_INET_MBPS", "1000")
+    monkeypatch.setenv("FLASH_VAST_MIN_RELIABILITY", "0.999")
+    monkeypatch.setenv("FLASH_VAST_MIN_INET_MBPS", "1000")
     importlib.reload(vast)
     # The env vars are no longer read: the floors stay at their fixed defaults.
     assert vast.RELIABILITY_FLOOR == 0.995
     assert vast.MIN_INET_MBPS == 200.0
-    monkeypatch.delenv("AUTOSLM_VAST_MIN_RELIABILITY", raising=False)
-    monkeypatch.delenv("AUTOSLM_VAST_MIN_INET_MBPS", raising=False)
+    monkeypatch.delenv("FLASH_VAST_MIN_RELIABILITY", raising=False)
+    monkeypatch.delenv("FLASH_VAST_MIN_INET_MBPS", raising=False)
     importlib.reload(vast)  # restore module defaults for other tests
 
 
@@ -66,10 +66,10 @@ def test_onstart_ships_payload_and_bootstrap(monkeypatch):
 
     script = vast.build_onstart(payload, install_deps=True)
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
-    b64 = script.split("AUTOSLM_PAYLOAD_EOF")[1].strip()
+    b64 = script.split("FLASH_PAYLOAD_EOF")[1].strip()
     assert json.loads(base64.b64decode(b64)) == payload
     # the self-contained bootstrap is embedded and keeps _train_body's semantics
-    assert "AUTOSLM_BOOTSTRAP_EOF" in script
+    assert "FLASH_BOOTSTRAP_EOF" in script
     assert "metrics.json" in script
     # worker deps install (skippable with a baked image)
     assert "pip install" in script

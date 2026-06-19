@@ -35,7 +35,7 @@ def test_pinned_undersized_gpu_escalates_never_below_need(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError
 
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     # Qwen3-4B GRPO at the default engine length (2368 tokens, mirroring run_rl) needs ~35 GB;
     # pinning a 24 GB RTX 4090 escalates UP to the cheapest fitting class (never provisions an
     # undersized OOM card, never raises).
@@ -55,8 +55,8 @@ def test_pinned_undersized_gpu_escalates_never_below_need(monkeypatch):
 def test_validation_gate_and_opt_in(monkeypatch):
     from flash.providers import allocator
 
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
-    monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
+    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
     # L4 is validated nowhere -> excluded by default...
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
@@ -69,7 +69,7 @@ def test_validation_gate_and_opt_in(monkeypatch):
 def test_provider_pin_runpod(monkeypatch):
     from flash.providers import allocator
 
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="runpod")
     assert a.provider == "runpod"
     assert all(c.provider == "runpod" for c in a.candidates)
@@ -79,7 +79,7 @@ def test_unknown_provider_rejected(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError
 
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     # A name not in PROVIDER_NAMES is an "unknown provider".
     with pytest.raises(UnsupportedGpuError, match="unknown provider"):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="lambda")
@@ -89,8 +89,8 @@ def test_known_provider_unavailable_offline(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError
 
-    # vast is a known provider but offline (AUTOSLM_SKIP_NET) it is not available.
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    # vast is a known provider but offline (FLASH_SKIP_NET) it is not available.
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     with pytest.raises(UnsupportedGpuError, match="not available"):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="vast")
 
@@ -99,7 +99,7 @@ def test_skip_net_matches_static_cheapest(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import cheapest_gpu
 
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")  # real available_providers: runpod only
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")  # real available_providers: runpod only
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert a.gpu == cheapest_gpu(24)
@@ -109,7 +109,7 @@ def test_nothing_fits_names_constraint(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError
 
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 4096)
     with pytest.raises(UnsupportedGpuError, match="4096 GB"):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
@@ -203,7 +203,7 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
     """The core anti-OOM invariant: the GPU the allocator picks ALWAYS has >= the matrix's
     required VRAM, across a sweep of model x algo x seq x group x batch. If this ever fails,
     auto-allocation could provision a too-small card and OOM a paid worker."""
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     from flash.providers.allocator import allocate, required_vram_gb
     from flash.providers.base import get_gpu_info
 

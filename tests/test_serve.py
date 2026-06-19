@@ -213,7 +213,7 @@ def test_serve_body_openai_shape():
     try:
         import flash.serve.deploy as d
 
-        for k in ("_AUTOSLM_KEY", "_AUTOSLM_PROC"):
+        for k in ("_FLASH_KEY", "_FLASH_PROC"):
             d.__dict__.pop(k, None)
         resp = d._serve_body(dict(payload))
         resp_thinking = d._serve_body({**payload, "thinking": True})
@@ -282,7 +282,7 @@ def test_serve_body_drops_template_kwargs_on_old_vllm():
     try:
         import flash.serve.deploy as d
 
-        for k in ("_AUTOSLM_KEY", "_AUTOSLM_PROC"):
+        for k in ("_FLASH_KEY", "_FLASH_PROC"):
             d.__dict__.pop(k, None)
         resp = d._serve_body(
             {

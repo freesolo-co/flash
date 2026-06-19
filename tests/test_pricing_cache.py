@@ -7,7 +7,7 @@ import json
 
 
 def _fresh_pricing(monkeypatch, tmp_path):
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     import flash.providers.runpod.pricing as pricing
 
     pricing = importlib.reload(pricing)
@@ -18,7 +18,7 @@ def _fresh_pricing(monkeypatch, tmp_path):
 
 def test_skip_net_returns_static_rates(monkeypatch, tmp_path) -> None:
     pricing = _fresh_pricing(monkeypatch, tmp_path)
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     rates = pricing.live_rates()
     assert rates["RTX 4090"] > 0
     assert pricing.hourly_rate("RTX 4090") == rates["RTX 4090"]
