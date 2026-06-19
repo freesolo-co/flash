@@ -81,7 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
     b = sub.add_parser(
         "breakeven", help="prove break-even centering + sweep cost across environments"
     )
-    b.add_argument("--steps", type=int, default=300, help="steps for the environment sweep")
+    # Default matches environment_cost_sweep()'s own default so `flash.cost breakeven`
+    # reproduces the committed breakeven_report.md rather than diverging from it.
+    b.add_argument("--steps", type=int, default=100, help="steps for the environment sweep")
     b.set_defaults(func=_cmd_breakeven)
     return p
 

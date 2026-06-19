@@ -62,12 +62,28 @@ class CostEstimate:
         return d
 
     def describe(self) -> str:
-        """One-line human summary."""
+        """One-line human summary.
+
+        The ``$/hr x h`` term is the raw analytical cost. When a break-even
+        ``calibration_factor`` has scaled ``total_usd``, that product no longer equals
+        the headline figure, so the suffix is annotated as the raw reference (``raw``)
+        rather than implying a contradictory total.
+        """
         cap = " (wall-capped)" if self.wall_capped else ""
+        if self.calibration_factor != 1.0:
+            raw = self.total_usd / self.calibration_factor
+            money = (
+                f"${self.total_usd:.2f} (break-even x{self.calibration_factor:.3f}; "
+                f"raw ${raw:.2f} = ${self.gpu_hourly_usd:.2f}/hr x {self.wall_clock_hours:.2f}h{cap})"
+            )
+        else:
+            money = (
+                f"${self.total_usd:.2f} "
+                f"(${self.gpu_hourly_usd:.2f}/hr x {self.wall_clock_hours:.2f}h{cap})"
+            )
         return (
             f"{self.model_id} {self.method.upper()} x{self.steps} steps -> "
-            f"${self.total_usd:.2f} on {self.gpu}@{self.provider} "
-            f"(${self.gpu_hourly_usd:.2f}/hr x {self.wall_clock_hours:.2f}h{cap})"
+            f"{money} on {self.gpu}@{self.provider}"
         )
 
     def breakdown(self) -> str:

@@ -57,14 +57,14 @@ BREAKEVEN_FACTOR_GLOBAL = 0.703  # method-agnostic fallback (whole-portfolio rat
 # Number of measured real runs the factors were calibrated on (provenance for notes).
 CALIBRATION_N = 13
 
-# Path to the committed measured-run summary the factors are derived from.
-# flash/cost/calibration.py -> parents[2] == repo root.
-_REAL_RUNS_SUMMARY = (
-    Path(__file__).resolve().parents[2]
-    / "cost_estimator_results"
-    / "real_runs"
-    / "summary_real.json"
-)
+# Path to the committed measured-run summary the factors are derived from. In a source
+# checkout it lives at the repo root (next to its generator); in an installed wheel it is
+# force-included under the package as ``flash/cost/_data/summary_real.json`` (see
+# pyproject ``force-include``). Prefer the packaged copy so this resolves in both contexts.
+_HERE = Path(__file__).resolve().parent
+_PACKAGED_SUMMARY = _HERE / "_data" / "summary_real.json"
+_SOURCE_SUMMARY = _HERE.parents[1] / "cost_estimator_results" / "real_runs" / "summary_real.json"
+_REAL_RUNS_SUMMARY = _PACKAGED_SUMMARY if _PACKAGED_SUMMARY.exists() else _SOURCE_SUMMARY
 
 
 def breakeven_factor(method: str) -> float:
