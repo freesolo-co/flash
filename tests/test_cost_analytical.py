@@ -161,7 +161,7 @@ def test_allow_unvalidated_widens_gpu_selection():
     # widened pool: an unvalidated class can be picked when it's the cheapest that fits.
     from flash.cost.hardware import pick_gpu
 
-    cfg_strict = RunConfig(MID, "sft", 100)
+    cfg_strict = RunConfig(MID, "sft", 100, allow_unvalidated=False)
     cfg_open = RunConfig(MID, "sft", 100, allow_unvalidated=True)
     strict_gpu, need = select_gpu(cfg_strict)
     open_gpu = select_gpu(cfg_open)[0]
@@ -169,6 +169,28 @@ def test_allow_unvalidated_widens_gpu_selection():
     # pick_gpu(need, allow_unvalidated=True) and the strict pick equals the validated-only pool.
     assert open_gpu == pick_gpu(need, allow_unvalidated=True)
     assert strict_gpu == pick_gpu(need, allow_unvalidated=False)
+
+
+def test_unspecified_allow_unvalidated_resolves_like_submit_time(monkeypatch):
+    # ``allow_unvalidated`` is tri-state: an UNSPECIFIED value (None, the default and what a
+    # spec with no gpu.allow_unvalidated key reconstructs to) must NOT be treated as a hard
+    # False. select_gpu resolves it via the SAME AUTOSLM_GPU_ALLOW_UNVALIDATED default the
+    # submit-time allocator uses (providers.base.unvalidated_allowed), so the estimate matches
+    # the GPU a run the env var widened actually allocates -- the bug this guards against is a
+    # missing flag silently pricing against the narrower validated-only pool.
+    from flash.cost.hardware import pick_gpu
+
+    cfg_unspecified = RunConfig(MID, "sft", 100)  # allow_unvalidated defaults to None
+    assert cfg_unspecified.allow_unvalidated is None
+    need = select_gpu(RunConfig(MID, "sft", 100, allow_unvalidated=False))[1]
+
+    # Env off -> None resolves to validated-only (matches submit-time default).
+    monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+    assert select_gpu(cfg_unspecified)[0] == pick_gpu(need, allow_unvalidated=False)
+
+    # Env on -> None widens to the unvalidated pool, exactly as the allocator would.
+    monkeypatch.setenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", "1")
+    assert select_gpu(cfg_unspecified)[0] == pick_gpu(need, allow_unvalidated=True)
 
 
 def test_qlora_model_fits_a_smaller_card_than_bf16_would():

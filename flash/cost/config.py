@@ -44,8 +44,13 @@ class RunConfig:
     # Whether the run permits unvalidated GPU classes (spec ``gpu.allow_unvalidated``).
     # The allocator widens its candidate pool when this is set, so the cheapest fitting
     # class -- and thus the priced $/hr -- can be an unvalidated one. Mirror it here so a
-    # preflight estimate matches the allocator's pick for such specs.
-    allow_unvalidated: bool = False
+    # preflight estimate matches the allocator's pick for such specs. TRI-STATE, exactly
+    # like the spec field and the submit-time allocator arg: ``None`` means "unspecified"
+    # and is resolved at selection time via ``providers.base.unvalidated_allowed`` (which
+    # consults AUTOSLM_GPU_ALLOW_UNVALIDATED) -- the SAME default the runner applies. A
+    # missing spec value must NOT be coerced to ``False`` here, or the estimate would
+    # silently disagree with a run the env var widened.
+    allow_unvalidated: bool | None = None
     # Per-run total wall-clock cap in seconds (spec ``gpu.max_wall_seconds``; default 24h).
     # The runner applies this PER SEED (each seed is its own job), so the estimator clamps
     # each seed's setup+train to it. ``None`` -> the estimator's default cap.

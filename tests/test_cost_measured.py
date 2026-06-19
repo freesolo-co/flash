@@ -181,10 +181,13 @@ def test_multi_seed_run_scales_setup_in_analytical_cost():
 def test_spec_wall_cap_and_unvalidated_flow_into_runconfig():
     # gpu.max_wall_seconds and gpu.allow_unvalidated from the spec must reach the RunConfig so
     # the reconstructed estimate prices the same run the measured dollars covered (the cap
-    # clamps per-seed wall; the policy widens GPU selection). Defaults: no cap, validated-only.
+    # clamps per-seed wall; the policy widens GPU selection). A MISSING allow_unvalidated is
+    # tri-state UNSPECIFIED (None), NOT validated-only -- so selection resolves it via the same
+    # AUTOSLM_GPU_ALLOW_UNVALIDATED default the submit-time allocator uses (see the analytical
+    # test); coercing it to False here would diverge from a run the env var widened.
     base = runconfig_from_status(GRPO_STATUS)
     assert base.max_wall_seconds is None
-    assert base.allow_unvalidated is False
+    assert base.allow_unvalidated is None
 
     status = {
         **GRPO_STATUS,
@@ -196,6 +199,16 @@ def test_spec_wall_cap_and_unvalidated_flow_into_runconfig():
     cfg = runconfig_from_status(status)
     assert cfg.max_wall_seconds == 2400
     assert cfg.allow_unvalidated is True
+
+    # An explicit false stays a hard False (validated-only), distinct from an absent key.
+    status_false = {
+        **GRPO_STATUS,
+        "spec": {
+            **GRPO_STATUS["spec"],
+            "gpu": {"type": "RTX 5090", "allow_unvalidated": False},
+        },
+    }
+    assert runconfig_from_status(status_false).allow_unvalidated is False
 
 
 def test_duplicate_measured_labels_are_rejected():

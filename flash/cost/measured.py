@@ -82,6 +82,15 @@ def runconfig_from_status(
     # reconstructed estimate prices the SAME run the measured dollars covered (otherwise a
     # run with a short explicit cap is priced against the 24h default and overstated).
     max_wall = gpu_spec.get("max_wall_seconds")
+    # ``gpu.allow_unvalidated`` is TRI-STATE in the spec/allocator: a MISSING key is not
+    # "validated-only" -- it's "unspecified", which submit-time resolves via the
+    # AUTOSLM_GPU_ALLOW_UNVALIDATED env default (providers.base.unvalidated_allowed). Coercing
+    # a missing value to ``False`` here would price against a validated-only pool even when the
+    # env widened the real run's GPU selection. So keep ``None`` when absent and only coerce to
+    # bool when a value is actually present; selection resolves ``None`` the same way the runner does.
+    allow_unvalidated = gpu_spec.get("allow_unvalidated")
+    if allow_unvalidated is not None:
+        allow_unvalidated = bool(allow_unvalidated)
     return RunConfig(
         model_id=spec["model"],
         method=method,
@@ -94,7 +103,7 @@ def runconfig_from_status(
         lora_rank=train.get("lora_rank"),
         thinking=bool(spec.get("thinking", False)),
         gpu=gpu_spec.get("type"),
-        allow_unvalidated=bool(gpu_spec.get("allow_unvalidated", False)),
+        allow_unvalidated=allow_unvalidated,
         max_wall_seconds=int(max_wall) if max_wall is not None else None,
         environment=(spec.get("environment") or {}).get("id"),
         reward_seconds_per_completion=reward_seconds_per_completion,

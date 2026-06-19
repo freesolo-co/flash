@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 
 from flash.providers.allocator import required_vram_gb, vram_headroom
+from flash.providers.base import unvalidated_allowed
 
 from .config import RunConfig
 from .estimate import CostEstimate
@@ -137,11 +138,15 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
         need = required_vram_gb(
             config.model_id, config.method, train=config.train_knobs(), thinking=config.thinking
         )
+    # ``allow_unvalidated`` is tri-state. ``None`` means "unspecified", which the submit-time
+    # allocator resolves via ``unvalidated_allowed`` (the AUTOSLM_GPU_ALLOW_UNVALIDATED env
+    # default) -- so resolve it the SAME way here instead of treating None as validated-only,
+    # or a run the env widened would be priced against the narrower validated pool.
     gpu = pick_gpu(
         need,
         pin=config.gpu,
         provider=config.provider,
-        allow_unvalidated=config.allow_unvalidated,
+        allow_unvalidated=unvalidated_allowed(config.allow_unvalidated),
     )
     return gpu, need
 
