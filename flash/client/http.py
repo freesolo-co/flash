@@ -110,7 +110,7 @@ class ApiClient:
         except urllib.error.URLError as exc:
             raise ClientError(
                 f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
-                "check your network connection and AUTOSLM_API_URL"
+                "check your network connection and FLASH_API_URL"
             ) from exc
 
     # -- identity ----------------------------------------------------------------------
