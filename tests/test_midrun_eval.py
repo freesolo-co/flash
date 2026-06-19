@@ -482,8 +482,8 @@ def test_bind_model_getter_overrides():
 
 
 def test_eval_config_disabled_by_default(monkeypatch):
-    monkeypatch.delenv("AUTOSLM_EVAL_EVERY_STEPS", raising=False)
-    monkeypatch.delenv("AUTOSLM_EVAL_NUM", raising=False)
+    monkeypatch.delenv("FLASH_EVAL_EVERY_STEPS", raising=False)
+    monkeypatch.delenv("FLASH_EVAL_NUM", raising=False)
     cfg = eval_config(default_max_new=256)
     # nothing set -> disabled; max_new == the run's normal completion budget; cap defaults to 64
     assert cfg == {"every_steps": 0, "num_examples": 64, "max_new_tokens": 256}
@@ -491,27 +491,27 @@ def test_eval_config_disabled_by_default(monkeypatch):
 
 def test_eval_config_cadence_from_toml(monkeypatch):
     """The cadence comes from the run's [train] eval_every_steps (no env var needed)."""
-    monkeypatch.delenv("AUTOSLM_EVAL_EVERY_STEPS", raising=False)
+    monkeypatch.delenv("FLASH_EVAL_EVERY_STEPS", raising=False)
     cfg = eval_config(default_max_new=256, spec_every=10)
     assert cfg["every_steps"] == 10
     assert cfg["max_new_tokens"] == 256  # always the completion budget, never a separate knob
 
 
 def test_eval_config_env_overrides_toml_cadence(monkeypatch):
-    """AUTOSLM_EVAL_EVERY_STEPS (operator/bench escape hatch) wins over the TOML value."""
-    monkeypatch.setenv("AUTOSLM_EVAL_EVERY_STEPS", "25")
+    """FLASH_EVAL_EVERY_STEPS (operator/bench escape hatch) wins over the TOML value."""
+    monkeypatch.setenv("FLASH_EVAL_EVERY_STEPS", "25")
     assert eval_config(256, spec_every=10)["every_steps"] == 25
 
 
 def test_eval_config_num_examples_default(monkeypatch):
     """No knob set -> the built-in default sample size (64)."""
-    monkeypatch.delenv("AUTOSLM_EVAL_NUM", raising=False)
+    monkeypatch.delenv("FLASH_EVAL_NUM", raising=False)
     assert eval_config(256, spec_every=3)["num_examples"] == 64
 
 
 def test_eval_config_num_examples_from_toml(monkeypatch):
     """[train] eval_examples sets how many held-out rows each pass samples."""
-    monkeypatch.delenv("AUTOSLM_EVAL_NUM", raising=False)
+    monkeypatch.delenv("FLASH_EVAL_NUM", raising=False)
     assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 20
     # 0/None falls back to the default, never 0 examples
     assert eval_config(256, spec_every=3, spec_eval_examples=0)["num_examples"] == 64
@@ -519,11 +519,11 @@ def test_eval_config_num_examples_from_toml(monkeypatch):
 
 
 def test_eval_config_env_overrides_toml_num_examples(monkeypatch):
-    """AUTOSLM_EVAL_NUM (operator/bench escape hatch) wins over [train] eval_examples."""
-    monkeypatch.setenv("AUTOSLM_EVAL_NUM", "8")
+    """FLASH_EVAL_NUM (operator/bench escape hatch) wins over [train] eval_examples."""
+    monkeypatch.setenv("FLASH_EVAL_NUM", "8")
     assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 8
     # a malformed override falls back to the TOML value, not a crash
-    monkeypatch.setenv("AUTOSLM_EVAL_NUM", "not-an-int")
+    monkeypatch.setenv("FLASH_EVAL_NUM", "not-an-int")
     assert eval_config(256, spec_every=3, spec_eval_examples=20)["num_examples"] == 20
 
 

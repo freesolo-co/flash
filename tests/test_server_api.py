@@ -1,7 +1,7 @@
 """Control-plane API: freesolo bearer auth, multi-tenant isolation (CPU-only).
 
 User auth is freesolo API keys only (no native key system). Tests run offline
-(AUTOSLM_SKIP_NET=1): the `api` fixture monkeypatches ``auth._freesolo_verify`` to accept
+(FLASH_SKIP_NET=1): the `api` fixture monkeypatches ``auth._freesolo_verify`` to accept
 any token shaped like a freesolo user key, so each distinct token resolves to its own
 run-ownership identity via ``db.ensure_external_key``. All runs are dry-run so nothing
 touches the network; operator env vars are dummies (the startup preflight only checks
@@ -66,7 +66,7 @@ def api(tmp_path, monkeypatch):
 
     importlib.reload(app_mod)
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. The real
-    # network verify never runs (AUTOSLM_SKIP_NET is set for the suite anyway).
+    # network verify never runs (FLASH_SKIP_NET is set for the suite anyway).
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     with TestClient(app_mod.create_app()) as client:
@@ -175,7 +175,7 @@ def test_freesolo_verify_does_not_cache_network_errors(monkeypatch):
     # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -209,7 +209,7 @@ def test_freesolo_verify_5xx_transient_but_4xx_cached(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -257,7 +257,7 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -314,7 +314,7 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     def boom(*a, **k):
         raise AssertionError("oversized token must not reach the network")
@@ -326,17 +326,17 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
 
 
 def test_freesolo_user_key_no_network_when_skip_net(api, monkeypatch):
-    # AUTOSLM_SKIP_NET set: _freesolo_verify short-circuits before any network call (urlopen is
+    # FLASH_SKIP_NET set: _freesolo_verify short-circuits before any network call (urlopen is
     # patched to blow up to prove it's never called) and authenticate returns None.
     import flash.server.auth as auth_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     # Drop the fixture's stub so the real _freesolo_verify (with its SKIP_NET guard) runs.
     importlib.reload(auth_mod)
 
     def boom(req, timeout=None):
-        raise AssertionError("no network call may happen under AUTOSLM_SKIP_NET")
+        raise AssertionError("no network call may happen under FLASH_SKIP_NET")
 
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", boom)
     assert auth_mod.authenticate("Bearer unknown-token") is None
@@ -350,7 +350,7 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
     # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     calls = {"n": 0}
 
     def fake_urlopen(req, timeout=None):
@@ -385,7 +385,7 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200

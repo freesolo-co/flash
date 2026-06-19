@@ -378,12 +378,12 @@ def eval_config(
     """Resolve the mid-run-eval knobs.
 
     Two knobs come from the run's ``[train]`` TOML:
-      * CADENCE — ``eval_every_steps`` (``spec_every``); ``AUTOSLM_EVAL_EVERY_STEPS`` overrides;
+      * CADENCE — ``eval_every_steps`` (``spec_every``); ``FLASH_EVAL_EVERY_STEPS`` overrides;
         0/unset disables.
       * SAMPLE SIZE — ``eval_examples`` (``spec_eval_examples``): how many held-out rows each pass
         scores. The eval takes a FIXED random sample of this many rows (seeded) instead of the
         whole split, so a huge eval set can't dominate training and the curve stays comparable
-        across passes. ``AUTOSLM_EVAL_NUM`` overrides it; default 64.
+        across passes. ``FLASH_EVAL_NUM`` overrides it; default 64.
 
     Everything else comes from the ENVIRONMENT: the eval queries are the env's held-out
     ``eval_dataset``, the grading is its rubric (reward + eval-metric metrics), the completion
@@ -392,20 +392,20 @@ def eval_config(
     """
 
     def _safe_int(value, fallback):
-        # A malformed AUTOSLM_EVAL_* env var must not abort training at setup — fall back.
+        # A malformed FLASH_EVAL_* env var must not abort training at setup — fall back.
         try:
             return int(value)
         except (TypeError, ValueError):
             return fallback
 
-    env_every = os.environ.get("AUTOSLM_EVAL_EVERY_STEPS")
+    env_every = os.environ.get("FLASH_EVAL_EVERY_STEPS")
     if env_every is not None and env_every.strip() != "":
         every = _safe_int(env_every, spec_every)  # bad env var -> fall back to the TOML value
     else:
         every = spec_every
 
-    # num_examples: AUTOSLM_EVAL_NUM env override > [train] eval_examples TOML > default 64.
-    env_num = os.environ.get("AUTOSLM_EVAL_NUM")
+    # num_examples: FLASH_EVAL_NUM env override > [train] eval_examples TOML > default 64.
+    env_num = os.environ.get("FLASH_EVAL_NUM")
     spec_num = spec_eval_examples if (spec_eval_examples and spec_eval_examples > 0) else None
     if env_num is not None and env_num.strip() != "":
         num_examples = _safe_int(env_num, spec_num or DEFAULT_EVAL_NUM)
