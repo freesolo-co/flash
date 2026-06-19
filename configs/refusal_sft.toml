@@ -1,0 +1,19 @@
+# Self-CTRL refusal — Phase 1: SFT warm-start.
+# Teaches the <predict>/<respond> format and consistent constitutional behavior
+# (refuse harmful, comply benign) via the env's gold `answer`.
+model = "Qwen/Qwen3.5-4B"
+algorithm = "sft"
+
+[environment]
+id = "your-org/selfctrl-refusal"   # set to the slug printed by `slm env push`
+
+[train]
+hf_repo = "your-org/selfctrl-runs"
+epochs = 3
+lora_rank = 32
+lora_alpha = 64
+max_length = 1024
+seeds = [0]
+
+[gpu]
+type = "RTX 5090"

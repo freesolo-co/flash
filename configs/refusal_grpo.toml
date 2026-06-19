@@ -1,0 +1,25 @@
+# Self-CTRL refusal — Phase 2: GRPO.
+# Reward = consistency (prediction matches actual behavior) + constitutional term
+# (refuse harmful, comply benign). Tracks refusal-prediction accuracy + HarmBench rate.
+model = "Qwen/Qwen3.5-4B"
+algorithm = "grpo"
+
+[environment]
+id = "your-org/selfctrl-refusal"
+
+[train]
+hf_repo = "your-org/selfctrl-runs"
+steps = 200
+group_size = 8
+learning_rate = 1e-5        # paper REINFORCE ~1e-6 — verify vs PDF
+kl_penalty_coef = 0.02      # paper beta ~0.01 — verify vs PDF
+temperature = 1.0
+max_tokens = 512
+eval_every_steps = 10
+lora_rank = 32
+lora_alpha = 64
+seeds = [0]
+# init_from_adapter = "sft/<sft-run-id>/seed0"
+
+[gpu]
+type = "RTX 5090"

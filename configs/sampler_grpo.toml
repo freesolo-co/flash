@@ -1,0 +1,26 @@
+# Self-CTRL biased-sampler — Phase 2: GRPO (the Self-CTRL consistency objective).
+# GRPO is group-normalized REINFORCE — the in-package analog of the paper's policy gradient.
+# Reward = 1 - TV(stated distribution, empirical distribution of the same completion's draws).
+model = "Qwen/Qwen3.5-4B"
+algorithm = "grpo"
+
+[environment]
+id = "your-org/selfctrl-sampler"
+
+[train]
+hf_repo = "your-org/selfctrl-runs"
+steps = 150                 # start small; paper reports ~1000 — scale up once it trends
+group_size = 8              # completions per prompt (G)
+learning_rate = 1e-5        # GRPO recipe default (paper REINFORCE ~1e-6 — verify vs PDF)
+kl_penalty_coef = 0.02      # KL to the reference model (paper beta ~0.01 — verify vs PDF)
+temperature = 1.0
+max_tokens = 512            # room for the <predict> JSON + 20 <samples> draws
+eval_every_steps = 10       # logs R^2 / imitation eval metrics mid-run
+lora_rank = 32
+lora_alpha = 64
+seeds = [0]
+# Warm-start from the SFT phase (fill in the SFT run id after Phase 1 finishes):
+# init_from_adapter = "sft/<sft-run-id>/seed0"
+
+[gpu]
+type = "RTX 5090"
