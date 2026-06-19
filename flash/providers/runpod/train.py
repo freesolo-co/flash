@@ -844,15 +844,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
-        # W&B credential that enables logging. The project + run name come from the spec's typed
-        # [wandb] config, NOT env vars (see engine.worker.wandb_report_to / wandb_run_name).
+        # W&B credential that enables logging. Project + run name come from the spec's typed
+        # [wandb] config (NOT env vars); the run's entity is the API key's default account/team
+        # (wandb_report_to does not pass entity=).
         "WANDB_API_KEY",
-        # W&B account routing: the optional entity that lands runs in a team / service-account
-        # workspace. Unlike the other pruned knobs this DOES have a reader — the wandb SDK reads
-        # WANDB_ENTITY from the worker's process env at wandb.init() (wandb_report_to does not pass
-        # entity=), so without it a configured team run silently falls back to the API key's default
-        # (personal) entity and service-account setups that require an explicit entity fail.
-        "WANDB_ENTITY",
         # NB: mid-run GRPO eval cadence is NOT an env var — it comes solely from the run's
         # [train] eval_every_steps (with eval_examples for the sample size); the worker resolves it
         # via midrun_eval.eval_config(spec_every=...) and ignores any FLASH_EVAL_EVERY_STEPS env

@@ -855,7 +855,8 @@ def wandb_report_to() -> list[str]:
     NO WANDB_PROJECT / WANDB_NAME environment variable. HF's WandbCallback has no project argument
     and would read WANDB_PROJECT from the env, so we initialize the run directly via the wandb SDK
     here (``wandb.init(project=..., name=...)``); the Trainer's callback then reuses that run. The
-    only W&B env var is the WANDB_API_KEY credential."""
+    run's entity is the API key's default account/team (we don't pass ``entity=``), so the only
+    W&B env var is the WANDB_API_KEY credential."""
     if not os.environ.get("WANDB_API_KEY"):
         return []
     import importlib.util

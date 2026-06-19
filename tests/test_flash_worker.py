@@ -59,19 +59,6 @@ def test_build_worker_env_does_not_forward_eval_cadence(monkeypatch):
     assert "FLASH_EVAL_EVERY_STEPS" not in build_worker_env(_spec(), 0)
 
 
-def test_build_worker_env_forwards_wandb_entity(monkeypatch):
-    """WANDB_ENTITY routes W&B runs into a team / service-account workspace. wandb_report_to()
-    does NOT pass entity= to wandb.init(), so the wandb SDK resolves it from the worker's process
-    env; it must therefore be on the forward allowlist, else a configured team run silently lands
-    in the API key's default (personal) entity (RunPod + Vast share this build_worker_env)."""
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.setenv("WANDB_ENTITY", "freesolo-team")
-    assert build_worker_env(_spec(), 0).get("WANDB_ENTITY") == "freesolo-team"
-    monkeypatch.delenv("WANDB_ENTITY", raising=False)
-    assert "WANDB_ENTITY" not in build_worker_env(_spec(), 0)
-
-
 def test_build_worker_env_forwards_judge_model(monkeypatch):
     """The optimizer-authored verifiers env reads FLASH_JUDGE_MODEL on the worker to pick its
     JudgeRubric client model (SFT-eval / GRPO-reward / rejection-sampling); the control-plane
