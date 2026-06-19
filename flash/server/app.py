@@ -247,9 +247,9 @@ def create_app():
     @app.post("/v1/runs/{run_id}/deploy")
     def deploy(run_id: str, payload: dict | None = None, key: dict = Depends(require_key)):
         payload = payload or {}
-        # Serialize deploy vs undeploy (and a second deploy) for this run: provisioning is
-        # slow and runs outside the status lock, so without this they could interleave and
-        # leave a billable endpoint unrecorded, or let rollback clobber a concurrent deploy.
+        # Serialize deploy vs undeploy (and a second deploy) for this run: registration
+        # with the freesolo serving app runs outside the status lock, so without this they
+        # could interleave and leave the serving record and the control plane inconsistent.
         with _deploy_lock(run_id):
             status = owned_run(run_id, key)
             spec = JobSpec.from_dict(status.spec)
@@ -262,9 +262,9 @@ def create_app():
                         "trained adapter artifacts can be deployed"
                     ),
                 )
-            # Legacy runs persisted before [train].hf_repo was mandatory rehydrate with an empty
-            # hf_repo; without this guard deploy_adapter -> snapshot_download fails deep as an
-            # opaque 5xx (and for always-on, only after starting paid provisioning). Reject early.
+            # Legacy runs persisted before [train].hf_repo was mandatory rehydrate with an
+            # empty hf_repo; without this guard freesolo serving cannot locate the adapter
+            # artifacts (the per-run HF dataset repo). Reject early with a clear 409.
             if not dry_run and not spec.train.hf_repo:
                 raise HTTPException(
                     status_code=409,
@@ -274,35 +274,10 @@ def create_app():
                     ),
                 )
             mode = payload.get("mode", "dev")
-            # always-on provisions AND warms a billable 1-worker endpoint inside
-            # deploy_adapter before returning. Persist a provisional deployment record
-            # FIRST (keyed to the class actually served) so a crash between warmup and the
-            # final mark_deployed can't orphan a billing endpoint with no record —
-            # /v1/deployments, undeploy, and cancel all key off the deployment record.
-            # (dev mode is scale-to-zero: nothing bills until the first chat, so no
-            # provisional record is needed.)
-            # The state the run must still be in for this deploy to proceed — a CAS guard so
-            # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't
-            # be silently overwritten.
+            # The state the run must still be in for this deploy to finalize — a CAS guard so
+            # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't be
+            # silently overwritten by the deployment record.
             prev_state = status.state
-            provisional = not dry_run and mode == "always-on"
-            if provisional:
-                marked = mark_deployed(
-                    run_id,
-                    {
-                        "state": "provisioning",
-                        "mode": mode,
-                        "gpu": servable_gpu(spec.gpu.type, spec.model),
-                    },
-                    expect_state=prev_state,
-                )
-                # The CAS no-ops if a /cancel raced in first; don't provision a paid
-                # endpoint for a run that's no longer deployable.
-                if marked.state != "deployed":
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"run {run_id} is {marked.state!r}; deploy aborted",
-                    )
             try:
                 dep = deploy_adapter(
                     run_id=run_id,
@@ -318,29 +293,14 @@ def create_app():
                     thinking=spec.thinking,
                 )
             except Exception as exc:
-                # The always-on provisional mark_deployed flipped the run to `deployed`
-                # before provisioning. If provisioning/warmup fails (QLoRA rejection,
-                # adapter download, vLLM boot), roll it back to the pre-deploy snapshot so
-                # /v1/deployments and /chat don't treat a non-existent endpoint as active.
-                # deploy_adapter already tears down any endpoint it actually provisioned;
-                # this only restores the control-plane record. `status` still holds the
-                # pre-deploy snapshot; rollback_deploy re-applies it under the status lock
-                # and skips if a concurrent cancel already wrote a terminal state.
-                if provisional:
-                    from flash.runner import rollback_deploy
-
-                    rollback_deploy(run_id, status)
                 if isinstance(exc, ValueError):
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 raise
             if not dry_run:
-                # always-on's provisional mark already flipped the run to `deployed`; dev
-                # never marked it, so it's still the pre-deploy state. The CAS no-ops only if
-                # a /cancel raced finalization — then the endpoint we just warmed is orphaned,
-                # so tear it down and report the conflict instead of a bogus 200.
-                marked = mark_deployed(
-                    run_id, dep.to_dict(), expect_state="deployed" if provisional else prev_state
-                )
+                # Record the deployment. The CAS no-ops only if a /cancel raced finalization
+                # — then the adapter we just registered is orphaned, so deregister it and
+                # report the conflict instead of a bogus 200.
+                marked = mark_deployed(run_id, dep.to_dict(), expect_state=prev_state)
                 if marked.state != "deployed":
                     with contextlib.suppress(Exception):
                         undeploy_adapter(run_id, gpu_name=servable_gpu(spec.gpu.type, spec.model))
