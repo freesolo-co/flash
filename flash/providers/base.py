@@ -340,7 +340,7 @@ def unvalidated_allowed(explicit: bool | None = None) -> bool:
         return explicit
     # Truthy allowlist (not a falsey denylist): only an explicit truthy value opts in, so
     # "false"/"False"/"no"/"off"/"0"/"" all correctly leave unvalidated GPUs disabled.
-    return os.environ.get("AUTOSLM_GPU_ALLOW_UNVALIDATED", "").strip().lower() in (
+    return os.environ.get("FLASH_GPU_ALLOW_UNVALIDATED", "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -403,7 +403,7 @@ def resolve_gpu_policy(
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
 
-    # Honor AUTOSLM_VRAM_HEADROOM here too so parse-time sizing matches the submit-time
+    # Honor FLASH_VRAM_HEADROOM here too so parse-time sizing matches the submit-time
     # allocator exactly (PR #176 review: they previously diverged on the headroom knob).
     min_vram = model_required_vram_gb(
         model_id, algorithm, train=train, thinking=thinking, headroom=vram_headroom()
