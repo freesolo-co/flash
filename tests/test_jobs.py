@@ -243,6 +243,45 @@ def test_poll_job_probe_error_does_not_premature_no_capacity(monkeypatch):
     assert "setup" in res.detail
 
 
+def test_poll_job_confirmed_no_capacity_survives_later_probe_flake(monkeypatch):
+    # Re-review guard: once a GOOD probe CONFIRMS an empty, non-initializing queue (a real
+    # capacity-starved read), a LATER transient probe exception must NOT revive the "maybe a
+    # worker is initializing" doubt and defer the no_capacity fast-path to the full setup grace.
+    # The confirmed verdict is latched and survives the flake, so no_capacity still fires once
+    # queue_grace_s elapses (the orchestrator walks GPU classes promptly instead of stalling ~50m).
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
+
+    # First probe: CONFIRMED capacity-starved (empty pool, nothing initializing). Every later
+    # probe flakes. The fast-path must still fire off the latched confirmation, not stall.
+    calls = {"n": 0}
+
+    def _health(eid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"workers": {"throttled": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}}
+        raise RuntimeError("health endpoint flaking")
+
+    monkeypatch.setattr(runpod_api, "endpoint_health", _health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        queue_grace_s=300.0,  # fires soon after the confirming probe; setup_grace would be ~50m
+        setup_grace_s=100000.0,  # MUCH larger: a stall here would prove the flake erased the verdict
+    )
+    assert not res.ok
+    assert res.failure == "no_capacity"  # latched confirmation survived the flake; walked promptly
+    assert "IN_QUEUE" in res.detail
+
+
 def test_poll_job_clears_init_flags_when_not_in_queue(monkeypatch):
     # Unit-level guard for the cross-episode reset (the "stale init flag after queue exit" thread):
     # `worker_initializing` / `init_probe_fresh` are meaningful only WHILE IN_QUEUE and are set
