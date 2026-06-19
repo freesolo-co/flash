@@ -116,6 +116,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
             "advantage_clip": 1.5,
             "thinking_length_penalty_coef": 0.001,
             "eval_every_steps": 5,
+            "eval_examples": 32,
         },
     }
     spec = spec_from_dict(raw, run_id="grpo-x")
@@ -126,13 +127,42 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     assert spec.train.advantage_clip == 1.5
     assert spec.train.thinking_length_penalty_coef == 0.001
     assert spec.train.eval_every_steps == 5  # mid-run eval cadence from [train]
+    assert spec.train.eval_examples == 32  # mid-run eval RANDOM-sample size from [train]
     # survives the JSON round-trip the worker reconstructs from
     rt = JobSpec.from_dict(spec.to_dict()).train
     assert rt.group_size == 4
     assert rt.thinking_length_penalty_coef == 0.001
     assert rt.eval_every_steps == 5
+    assert rt.eval_examples == 32
     # GRPO knobs are NOT in environment.params (that goes verbatim to load_environment)
     assert spec.environment.params == {}
+
+
+def test_eval_examples_zero_is_accepted_as_default() -> None:
+    """`[train] eval_examples = 0` is the documented "use the built-in default (64)" no-op, so the
+    server-side TOML validator must ACCEPT it (it parses to 0; eval_config maps 0 -> 64), matching
+    the worker JSON path — a negative is still rejected."""
+    import pytest
+
+    from flash.engine.midrun_eval import eval_config
+    from flash.schema import ConfigError, spec_from_dict
+
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "model_policy": "allow",
+        "environment": {"id": "owner/env"},
+        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "train": {"seeds": [0], "steps": 10, "hf_repo": "owner/runs", "eval_examples": 0},
+    }
+    spec = spec_from_dict(raw, run_id="eval0")
+    assert spec.train.eval_examples == 0  # accepted (not a ConfigError), not coerced
+    # and downstream it resolves to the built-in default sample size (64), not 0
+    assert eval_config(256, spec_eval_examples=spec.train.eval_examples)["num_examples"] == 64
+    # a negative eval_examples is still rejected at parse time
+    raw["train"]["eval_examples"] = -1
+    with pytest.raises(ConfigError, match="eval_examples must be >= 0"):
+        spec_from_dict(raw, run_id="evalneg")
 
 
 def test_opt_int_float_reject_bools() -> None:
@@ -321,19 +351,11 @@ def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
     6 GB budget, pushing the rest into grad-accum. (CPU: the colocate VRAM cap is GPU-only.)"""
     from flash.engine.worker import rl_per_device_comps
 
-    monkeypatch.delenv("RL_PER_DEVICE_PROMPTS", raising=False)
     monkeypatch.delenv("THINKING", raising=False)
     # short completion: budget non-binding -> base default 8
     assert rl_per_device_comps(512, vocab=152_000, use_vllm=True) == 8
-    # long completion: 6e9 / (4096*152000*4) ~ 2.4 -> capped to 2
+    # long completion: 6e9 / (4096*152000*4) ~ 2.4 -> capped to 2 (budget fixed at 6 GB, managed)
     assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 2
-    # explicit override always wins (and disables the auto-caps)
-    monkeypatch.setenv("RL_PER_DEVICE_PROMPTS", "5")
-    assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 5
-    # a tighter budget caps harder
-    monkeypatch.delenv("RL_PER_DEVICE_PROMPTS", raising=False)
-    monkeypatch.setenv("RL_LOGITS_BUDGET_GB", "2")
-    assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 1
 
 
 def test_optimizer_knob_validation_rejects_bad_values() -> None:
