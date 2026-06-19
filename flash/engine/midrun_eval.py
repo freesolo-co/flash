@@ -32,7 +32,7 @@ emission are unit-tested without a GPU, tokenizer, or vLLM. Only :func:`build_hf
 
 from __future__ import annotations
 
-import os
+import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -348,35 +348,53 @@ def make_periodic_eval_callback(periodic: PeriodicEval):
 # ---------------------------------------------------------------------------
 # GPU-side wiring (the only part that touches torch / the model). From worker.run_rl.
 # ---------------------------------------------------------------------------
-def eval_config(default_max_new: int, *, spec_every: int | None = None) -> dict:
-    """Resolve the mid-run-eval knobs. The CADENCE is the only real knob: it comes from the run's
-    ``[train] eval_every_steps`` TOML (``spec_every``), with ``FLASH_EVAL_EVERY_STEPS`` as an
-    operator override; 0/unset disables.
+DEFAULT_EVAL_NUM = 64
+# Fixed seed for the held-out random sample, so every eval pass scores the SAME subset and the
+# eval curve is comparable across steps.
+EVAL_SAMPLE_SEED = 12345
+# Default pool size to MATERIALIZE and sample from when `eval_examples` is small (data load is
+# cheap; only generation is the real cost), so a multi-million-row Hub split isn't fully built just
+# to pick a few-dozen-row sample. The pool must hold at least `n` rows to draw an n-row sample, so
+# the caller materializes max(n, EVAL_POOL_CAP): this cap is the FLOOR for the common small-n case,
+# not a ceiling — a run that explicitly sets eval_examples ABOVE the cap is asking to score that
+# many rows and gets exactly that (the bound is only a default for the few-dozen-row default n).
+EVAL_POOL_CAP = 2048
 
-    Everything else comes from the ENVIRONMENT, not config: the eval queries are the env's
-    held-out ``eval_dataset``, the grading is its rubric (reward + eval-metric metrics), the
-    completion budget equals the run's normal ``max_tokens`` (``default_max_new``), and the pass
-    threshold is the env's own. ``num_examples`` is ONLY a safety cap so a huge env eval split
-    can't dominate training (``FLASH_EVAL_NUM``, default 64) — the agent sizes the eval set via
-    the environment, not here.
+
+def sample_eval_rows(pool: list, n: int, seed: int = EVAL_SAMPLE_SEED) -> list:
+    """A FIXED seeded random sample of ``n`` rows from ``pool`` (kept in original order).
+
+    The whole pool is returned when ``n <= 0`` or ``n >= len(pool)`` (asking for at least as many
+    as exist means "eval them all"). Same ``seed`` -> same subset on every pass, so the held-out
+    eval curve is comparable across optimizer steps rather than jumping around on a fresh sample.
     """
+    if n <= 0 or n >= len(pool):
+        return pool
+    idx = sorted(random.Random(seed).sample(range(len(pool)), n))
+    return [pool[i] for i in idx]
 
-    def _safe_int(value, fallback):
-        # A malformed FLASH_EVAL_* env var must not abort training at setup — fall back.
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return fallback
 
-    env_every = os.environ.get("FLASH_EVAL_EVERY_STEPS")
-    if env_every is not None and env_every.strip() != "":
-        every = _safe_int(env_every, spec_every)  # bad env var -> fall back to the TOML value
-    else:
-        every = spec_every
+def eval_config(
+    default_max_new: int, *, spec_every: int | None = None, spec_eval_examples: int | None = None
+) -> dict:
+    """Resolve the mid-run-eval knobs, both from the run's ``[train]`` TOML:
+      * CADENCE — ``eval_every_steps`` (``spec_every``); 0/unset disables.
+      * SAMPLE SIZE — ``eval_examples`` (``spec_eval_examples``): how many held-out rows each pass
+        scores. The eval takes a FIXED seeded random sample of this many rows instead of the whole
+        split, so a huge eval set can't dominate training and the curve stays comparable across
+        passes. None/0 -> the built-in default (``DEFAULT_EVAL_NUM``).
+
+    Everything else comes from the ENVIRONMENT: the eval queries are the env's held-out
+    ``eval_dataset``, the grading is its rubric (reward + eval-metric metrics), the completion
+    budget equals the run's normal ``max_tokens`` (``default_max_new``), and the pass threshold
+    is the env's own.
+    """
+    every = max(0, int(spec_every)) if spec_every is not None else 0
+    spec_num = spec_eval_examples if (spec_eval_examples and spec_eval_examples > 0) else None
+    num_examples = spec_num if spec_num is not None else DEFAULT_EVAL_NUM
     return {
-        "every_steps": _safe_int(every, 0) if every is not None else 0,
-        # safety cap only (negative would hit Python negative-slicing semantics on the split)
-        "num_examples": max(0, _safe_int(os.environ.get("FLASH_EVAL_NUM"), 64)),
+        "every_steps": every,
+        "num_examples": max(1, num_examples),  # the held-out random-sample size (>=1)
         "max_new_tokens": max(1, int(default_max_new)),  # = the run's normal completion budget
     }
 

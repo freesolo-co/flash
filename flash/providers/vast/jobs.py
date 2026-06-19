@@ -1,7 +1,7 @@
 """Vast.ai run lifecycle: verified offers -> instance -> HF-artifact poll.
 
 The Vast equivalent of ``providers/runpod/jobs.py``. Vast has no serverless queue:
-we rent a single-GPU instance from a VERIFIED offer (datacenter or community), ship a self-contained
+we rent a single-GPU instance from a VERIFIED datacenter offer, ship a self-contained
 bootstrap (the private ``_bootstrap`` module) through the onstart script, and detect
 completion purely via the worker's HF artifacts (DONE/metrics.json/heartbeat.json) +
 the instance's status — no inbound network to the box is ever needed.
@@ -19,7 +19,6 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
-import os
 import shlex
 import time
 from dataclasses import dataclass
@@ -84,8 +83,7 @@ def usable_offers(
     disk_gb: float,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
 ) -> list[VastOffer]:
-    """Verified datacenter offers able to run the job, cheapest first (community hosts only
-    when ``FLASH_VAST_ALLOW_COMMUNITY=1`` opts in — secrets ship to the box).
+    """Verified datacenter offers able to run the job, cheapest first.
 
     Server-side filters do the heavy lifting; everything load-bearing is re-checked
     client-side (belt and suspenders — the result rows carry the proof fields).
@@ -95,13 +93,10 @@ def usable_offers(
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
     )
-    # Host tier: DEFAULT datacenter-only (hosting_type==1). The onstart payload ships run secrets
+    # Host tier: ALWAYS datacenter-only (hosting_type==1). The onstart payload ships run secrets
     # (HF_TOKEN, PRIME_API_KEY, OpenRouter/OpenAI/W&B creds) to the box, so verified-but-lower-trust
-    # community/marketplace hosts (hosting_type 0) are an explicit operator opt-in via
-    # FLASH_VAST_ALLOW_COMMUNITY=1 — needed for scarce classes whose verified-DATACENTER supply is
-    # empty (e.g. B200) while the RunPod equivalent is capacity-throttled. Community offers are still
-    # verified + reliability-floored (RELIABILITY_FLOOR above); datacenter-only is the safe default.
-    allow_community = os.environ.get("FLASH_VAST_ALLOW_COMMUNITY") in ("1", "true", "True")
+    # community/marketplace hosts (hosting_type 0) are never used — even verified + reliability-
+    # floored, they're a lower trust tier we don't ship secrets to.
     out: list[VastOffer] = []
     for r in rows:
         gpu = vast_gpu_for_offer(str(r.get("gpu_name") or ""), float(r.get("gpu_ram") or 0))
@@ -110,12 +105,9 @@ def usable_offers(
         info = GPU_INFO[gpu]
         dph = float(r.get("dph_total") or 0)
         cuda = float(r.get("cuda_max_good") or 0)
-        # Host tier: accept verified datacenter (hosting_type==1) AND verified community
-        # (hosting_type==0) hosts — community is always allowed, still gated by the reliability
-        # floor + verification below; any other hosting_type is rejected.
-        _bad_host = r.get("hosting_type") != 1 and not (
-            allow_community and r.get("hosting_type") == 0
-        )
+        # Host tier: accept ONLY verified datacenter hosts (hosting_type==1); community/marketplace
+        # (hosting_type==0) and anything else is rejected (we ship run secrets to the box).
+        _bad_host = r.get("hosting_type") != 1
         if (
             _bad_host
             or r.get("verification") != "verified"
