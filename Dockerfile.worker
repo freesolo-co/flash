@@ -92,7 +92,8 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 'hf-transfer','verifiers','prime','runpod']]"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
-# from the real _train_body source (single source of truth) and run it as the container CMD so the
+# from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;
+# _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
 # image is a self-contained RunPod Serverless worker. On Vast the image is launched in args-mode
 # (`bash -c <onstart>`), which OVERRIDES this CMD — so ONE image serves both providers (Vast bash
 # bootstrap vs RunPod serverless handler reading job["input"]). Build context is the repo root.
