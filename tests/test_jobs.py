@@ -277,6 +277,89 @@ def test_poll_job_rl_server_boot_does_not_tighten(monkeypatch):
     assert "limit 5000s" in res.detail
 
 
+def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
+    # A worker stuck UNHEALTHY while IN_QUEUE (e.g. a mutable image tag republished mid-pull) won't
+    # self-recover, so poll_job must fail fast on unhealthy_grace_s and NOT burn the full
+    # setup_grace_s (~50 min) — returning a retryable stall so the runner re-provisions a fresh
+    # endpoint. Regression guard for the multi-hour "waited on a dead worker" failure.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"unhealthy": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        stall_after_s=150.0,
+        setup_grace_s=100000.0,  # huge: only the unhealthy fast-fail can trip here
+        unhealthy_grace_s=240.0,
+    )
+    assert res.failure == "stalled"  # infra-shaped -> runner retries on a fresh endpoint
+    assert "unhealthy" in res.detail
+
+
+def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
+    # A brief unhealthy blip during cold start that then yields a usable worker must NOT trip the
+    # fast-fail (it resets once a usable/initializing worker appears) — only a STUCK unhealthy does.
+    import base64
+    import itertools
+
+    import cloudpickle
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    statuses = iter(
+        [
+            {"status": "IN_QUEUE"},  # probe 1: unhealthy -> arm unhealthy_since
+            {"status": "IN_QUEUE"},  # probe 2: usable worker -> reset (no fail)
+            {"status": "IN_PROGRESS"},
+            {
+                "status": "COMPLETED",
+                "output": {
+                    "success": True,
+                    "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
+                },
+            },
+        ]
+    )
+    healths = iter(
+        [
+            {"workers": {"unhealthy": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}},
+            {"workers": {"unhealthy": 0, "running": 1, "ready": 0, "idle": 0, "initializing": 0}},
+        ]
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(statuses))
+    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: next(healths, {"workers": {}}))
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        stall_after_s=150.0,
+        setup_grace_s=100000.0,
+        # Large queue grace too: this test exercises the unhealthy-recovery path, not the
+        # capacity fast-path (queue_grace_s), and the synthetic 100s/step clock would otherwise
+        # trip no_capacity before the worker leaves IN_QUEUE.
+        queue_grace_s=100000.0,
+        unhealthy_grace_s=240.0,
+    )
+    assert res.ok
+    assert res.metrics == {"acc": 1.0}
+
+
 def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
     # Without a heartbeat_reader we can't tell setup from training, so the larger
     # setup_grace must NOT silently slow stall detection — stay on stall_after_s.
