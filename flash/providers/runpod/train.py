@@ -387,7 +387,13 @@ def _train_body(input_data: dict) -> dict:
                 print(line, end="")  # keep streaming to the platform console
                 cf.write(line)
             proc.wait()
-        if proc.returncode != 0:
+        # Console is uploaded on FAILURE (crash root-cause). FLASH_UPLOAD_CONSOLE=1 also uploads it
+        # on SUCCESS so an operator can verify which optimizations engaged — LoRA+/8-bit-AdamW/
+        # Liger/PiSSA/rsLoRA/fla/chalk all log their engagement (or fallback) to the console.
+        _force_console = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
+            "", "0", "false", "no", "off",
+        )
+        if proc.returncode != 0 or _force_console:
             try:
                 from huggingface_hub import HfApi
 
@@ -406,11 +412,11 @@ def _train_body(input_data: dict) -> dict:
                 )
             except Exception as up_err:
                 print("console upload warn:", up_err)
-            if check:
-                raise RuntimeError(
-                    f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
-                    f"and error_{mode}.txt in the HF dataset repo"
-                )
+        if proc.returncode != 0 and check:
+            raise RuntimeError(
+                f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
+                f"and error_{mode}.txt in the HF dataset repo"
+            )
         return proc.returncode
 
     # A warm worker can carry a previous seed's metrics files; a stale metrics.json

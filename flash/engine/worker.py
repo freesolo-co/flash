@@ -961,15 +961,23 @@ def make_lora(model_id: str | None = None):
         "target_modules": targets,
         "task_type": "CAUSAL_LM",
     }
-    # Adapter initialization (convergence lever, always-on: measured -35% train loss in A/B
-    # (gpu-bench)). PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds)
-    # so LoRA converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
+    # Adapter initialization (convergence lever: measured -35% train loss in A/B (gpu-bench)).
+    # PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds) so LoRA
+    # converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
     # NOTE: PiSSA mutates the effective base, so the saved adapter is a PiSSA-residual unless
     # converted — fine for our train+eval+serve-same-stack flow.
-    kwargs["init_lora_weights"] = "pissa_niter_16"
+    # BUT PiSSA's SVD needs an UNQUANTIZED base: on the 4-bit QLoRA tier peft raises "Please
+    # initialize PiSSA under float32/float16/bfloat16" and the whole run crashes at adapter init.
+    # The catalog's 9B is 4bit-qlora by default, so every 9B run died here. Fall back to the
+    # default LoRA init on the QLoRA tier; PiSSA stays on for the bf16/LoRA tier.
+    if model_id and model_quant(model_id) == "4bit-qlora":
+        print("[lora] 4-bit QLoRA base -> default LoRA init (PiSSA needs an fp base)")
+    else:
+        kwargs["init_lora_weights"] = "pissa_niter_16"
+        print("[lora] init_lora_weights=pissa_niter_16")
     # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
+    # Quant-independent (just the alpha/sqrt(r) scale), so on for both tiers.
     kwargs["use_rslora"] = True
-    print("[lora] init_lora_weights=pissa_niter_16, rsLoRA scaling enabled")
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
         if exclude:
