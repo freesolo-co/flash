@@ -3,8 +3,9 @@
 chalk is install-on-call (it reads NO env vars), so flash's install_chalk_kernels must decide
 *which* chalk installers to call from per-kernel FLASH_* selection flags. These tests verify the
 FLASH_-flag -> installer mapping (incl. kwargs), the default no-op (no flags), the no-op when chalk
-is absent, the model=None skipping of instance-only installers, and that an installer error never
-aborts training.
+is absent, the two-pass split (PRE-build model=None -> class/fn-level only; POST-build model set ->
+instance-level only, so the worker's two calls install each kernel exactly once with no double
+global patch), and that an installer error never aborts training.
 """
 
 import sys
@@ -123,8 +124,9 @@ def test_falsey_flag_value_does_not_select(monkeypatch):
     assert calls == []
 
 
-def test_model_none_skips_instance_only_installers(monkeypatch):
-    """With every flag on but model=None, class/fn-level installers run; instance-only ones skip."""
+def test_model_none_runs_only_class_level_installers(monkeypatch):
+    """PRE-build pass (model=None): the class/fn-level global patches run; the instance-level
+    installers are skipped (no built module yet)."""
     _clear_flags(monkeypatch)
     for k, v in _ALL_FLAGS.items():
         monkeypatch.setenv(k, v)
@@ -132,16 +134,20 @@ def test_model_none_skips_instance_only_installers(monkeypatch):
     _install_fake_chalk(monkeypatch, calls)
     res = install_chalk_kernels(None)
     names = {n for n, _, _ in calls}
-    assert {"install_lora", "install_qwen35_mlp", "install_qwen35_qkv", "install_qwen35_rope"} <= names
-    # instance-only installers are skipped when there's no model
+    # class/fn-level installers all ran, each with no model
+    assert names == {"install_lora", "install_qwen35_mlp", "install_qwen35_qkv", "install_qwen35_rope"}
+    assert all(model is None for _, model, _ in calls)
+    # instance-level installers are skipped when there's no model
     assert "install_fp8_base" not in names
     assert "install_qwen35_embedding" not in names
     assert "install_qwen35_mlp_fp8" not in names
     assert res  # non-empty result map
 
 
-def test_model_present_runs_instance_installers_with_model(monkeypatch):
-    """With a model, instance-level installers receive it; class-level ones are called w/o it."""
+def test_model_present_runs_only_instance_installers_with_model(monkeypatch):
+    """POST-build pass (model present): ONLY the instance-level installers run, each receiving the
+    model. The class/fn-level global patches were applied on the pre-build pass and must NOT be
+    re-installed here (that would double-patch the already-patched global)."""
     _clear_flags(monkeypatch)
     for k, v in _ALL_FLAGS.items():
         monkeypatch.setenv(k, v)
@@ -150,11 +156,35 @@ def test_model_present_runs_instance_installers_with_model(monkeypatch):
     sentinel = object()
     install_chalk_kernels(sentinel)
     by_name = {n: model for n, model, _ in calls}
-    assert by_name["install_fp8_base"] is sentinel
-    assert by_name["install_qwen35_embedding"] is sentinel
-    assert by_name["install_qwen35_mlp_fp8"] is sentinel
-    assert by_name["install_lora"] is None  # class-level: called without the model
-    assert by_name["install_qwen35_mlp"] is None
+    # instance-level installers ran with the model
+    assert by_name == {
+        "install_fp8_base": sentinel,
+        "install_qwen35_embedding": sentinel,
+        "install_qwen35_mlp_fp8": sentinel,
+    }
+    # class/fn-level installers were NOT re-run on the post-build pass
+    assert "install_lora" not in by_name
+    assert "install_qwen35_mlp" not in by_name
+    assert "install_qwen35_qkv" not in by_name
+    assert "install_qwen35_rope" not in by_name
+
+
+def test_two_pass_install_runs_each_kernel_exactly_once(monkeypatch):
+    """The worker calls install_chalk_kernels() pre-build then install_chalk_kernels(model)
+    post-build. Across BOTH passes each selected kernel installs exactly once — the global
+    class/fn-level patches are not re-applied on the second pass."""
+    _clear_flags(monkeypatch)
+    for k, v in _ALL_FLAGS.items():
+        monkeypatch.setenv(k, v)
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    install_chalk_kernels()  # pre-build: class/fn-level only
+    install_chalk_kernels(object())  # post-build: instance-level only
+    counts: dict[str, int] = {}
+    for n, _, _ in calls:
+        counts[n] = counts.get(n, 0) + 1
+    # every selected installer was called exactly once across the two passes (no double-install)
+    assert counts == dict.fromkeys(_INSTALLERS, 1)
 
 
 def test_per_kernel_kwargs_are_forwarded(monkeypatch):
@@ -188,8 +218,8 @@ def test_fp8_base_uses_chalk_defaults_when_no_knobs(monkeypatch):
 def test_installer_error_is_swallowed(monkeypatch):
     """An installer raising must not abort training; the error is recorded, not propagated."""
     _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # class/fn-level -> runs on the model=None pass
     calls = []
     _install_fake_chalk(monkeypatch, calls, raise_in="install_qwen35_mlp")
-    res = install_chalk_kernels(object())  # must not raise
+    res = install_chalk_kernels()  # pre-build pass; must not raise
     assert str(res["install_qwen35_mlp"]).startswith("error:")

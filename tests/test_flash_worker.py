@@ -191,6 +191,85 @@ def test_chalk_extra_pip_falsey_flag_does_not_opt_in(monkeypatch):
     assert chalk_extra_pip() == []
 
 
+def _spec_worker_env(worker_env: dict):
+    """A grpo JobSpec carrying a per-run [worker_env] block (the TOML override map)."""
+    from flash.spec import JobSpec, TrainSpec
+
+    return JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        worker_env=dict(worker_env),
+    )
+
+
+def test_chalk_extra_pip_detects_per_run_worker_env_optin(monkeypatch):
+    """DEFECT: a run that enables chalk only via its [worker_env] block (not the control-plane
+    process env) was NOT detected — chalk_extra_pip read bare os.environ, so the spec was never
+    appended and the kernels never installed for that run. The effective worker env (worker_env
+    merged over os.environ) must be what decides selection + the FLASH_CHALK_SPEC lookup."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)  # nothing in os.environ
+    spec = _spec_worker_env(
+        {
+            "FLASH_FP8_BASE": "1",
+            "FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main",
+        }
+    )
+    # bare process env -> nothing; the opt-in lives only in [worker_env]
+    assert chalk_extra_pip() == []
+    assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
+
+
+def test_chalk_extra_pip_worker_env_spec_with_os_env_flag(monkeypatch):
+    """Mixed source: the kernel flag is in the control-plane env but FLASH_CHALK_SPEC is pinned
+    per-run in [worker_env]. The merged effective env resolves both, so the spec is added."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_TRITON_LORA", "1")  # selection from the process env
+    spec = _spec_worker_env({"FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@dev"})
+    assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@dev"]
+
+
+def test_chalk_extra_pip_worker_env_overrides_os_env_flag(monkeypatch):
+    """[worker_env] wins over os.environ (same precedence build_worker_env applies): a per-run
+    FLASH_*=0 must DISABLE a chalk flag set globally, so chalk is not installed for that run."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # global opt-in
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "git+https://github.com/freesolo-co/chalk@main")
+    # without an override the global flag opts in
+    assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
+    # a per-run [worker_env] FLASH_MLP_KERNEL=0 turns it OFF for this run
+    spec = _spec_worker_env({"FLASH_MLP_KERNEL": "0"})
+    assert chalk_extra_pip(spec) == []
+
+
+def test_chalk_selection_matches_what_worker_env_forwards(monkeypatch):
+    """Consistency: the SAME effective env that decides chalk install must be what the worker
+    process sees. A [worker_env] chalk opt-in both (a) triggers chalk_extra_pip and (b) reaches
+    the worker via build_worker_env, so install_chalk_kernels sees the flag on the worker."""
+    from flash.providers.runpod.train import build_worker_env, chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    spec = _spec_worker_env(
+        {
+            "FLASH_QKV_KERNEL": "1",
+            "FLASH_CHALK_SPEC": "git+https://github.com/freesolo-co/chalk@main",
+        }
+    )
+    # (a) submit path appends the chalk spec to extra_pip
+    assert chalk_extra_pip(spec) == ["git+https://github.com/freesolo-co/chalk@main"]
+    # (b) the same flag is forwarded into the worker's env, so install_chalk_kernels (which reads
+    #     the worker's own process env) selects the kernel on the worker
+    env = build_worker_env(spec, 0)
+    assert env.get("FLASH_QKV_KERNEL") == "1"
+    assert env.get("FLASH_CHALK_SPEC") == "git+https://github.com/freesolo-co/chalk@main"
+
+
 def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     """The worker env's HF_REPO is seeded from the run's [train] hf_repo, NOT the operator's
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is

@@ -98,13 +98,20 @@ def install_chalk_kernels(model=None) -> dict:
     each enabled ``FLASH_*`` flag maps to one chalk installer (see :func:`_selected_installers`).
     With no flags set this calls nothing and returns ``{}``.
 
-    Call once per training run. Pass ``model`` (the built ``nn.Module``) to enable the
-    instance-level kernels (FP8 base, embedding, FP8 MLP); the class/function-level kernels
-    (LoRA delta, fused MLP/QKV, RoPE) install with ``model=None`` too, so this can also be
-    called *before* the trainer builds the model.
+    Call this TWICE per training run — exactly the two passes the worker makes — and each kernel
+    installs on the ONE pass it belongs to (never twice):
 
-    Returns a ``{installer_name: result}`` map (``{}`` when no flag is set or chalk isn't
-    installed).
+    * ``install_chalk_kernels()`` (``model is None``, the PRE-build pass) installs only the
+      class/function-level kernels (LoRA delta, fused MLP/QKV, RoPE) — global monkeypatches that
+      must be in place before the trainer builds the model. Instance-level kernels are skipped (no
+      module yet).
+    * ``install_chalk_kernels(trainer.model)`` (``model is not None``, the POST-build pass) installs
+      only the instance-level kernels (FP8 base, embedding, FP8 MLP) against the materialized
+      module. The class/function-level monkeypatches were already applied on the pre-build pass, so
+      re-running them here would double-patch — they are deliberately NOT re-run.
+
+    Returns a ``{installer_name: result}`` map for the installers that ran ON THIS PASS (``{}`` when
+    no flag is set, chalk isn't installed, or no selected kernel belongs to this pass).
     """
     selected = _selected_installers()
     if not selected:
@@ -130,12 +137,19 @@ def install_chalk_kernels(model=None) -> dict:
 
     results: dict[str, object] = {}
     for name, needs_model, kwargs in selected:
+        # Each kernel installs on exactly ONE of the two passes, so the second call never
+        # re-applies what the first already installed:
+        #   * class/function-level (needs_model=False): global monkeypatches -> PRE-build pass only
+        #     (model is None). Skipping them when a model is present avoids re-installing the global
+        #     patch the pre-build call already applied (double-patch).
+        #   * instance-level (needs_model=True): patch the built nn.Module -> POST-build pass only
+        #     (model is not None); there is no module to patch on the pre-build pass.
+        if needs_model != (model is not None):
+            continue
         fn = getattr(ck, name, None)
         if fn is None:
             log.warning("chalk has no installer %s (skipping)", name)
             continue
-        if needs_model and model is None:
-            continue  # instance-level kernel; needs the built model (installed in the post-build call)
         try:
             results[name] = fn(model, **kwargs) if needs_model else fn(**kwargs)
         except Exception as e:  # never block training on an optional kernel

@@ -167,16 +167,41 @@ _CHALK_KERNEL_FLAGS = (
 )
 
 
-def _chalk_selected() -> bool:
-    """True if any FLASH_* chalk kernel-selection flag is set to a truthy value."""
+def _effective_worker_env(spec=None) -> dict[str, str]:
+    """The env the WORKER process will actually see, for chalk-selection decisions.
+
+    chalk install-on-call is selected by ``FLASH_*`` flags read on the worker from its own process
+    env, which ``build_worker_env`` builds as the control-plane ``os.environ`` allowlist with the
+    run's ``[worker_env]`` overrides merged ON TOP (per-run ``spec.worker_env`` wins). A run that
+    opts into chalk via its ``[worker_env]`` block therefore sets the flag the worker reads — so the
+    SAME merge must decide whether chalk is selected and whether its spec is added to ``extra_pip``;
+    reading bare ``os.environ`` here would miss a per-run ``[worker_env]`` opt-in and the kernels
+    would never install for that run.
+
+    Returns ``os.environ`` overlaid with ``spec.worker_env`` (string-coerced). ``spec=None`` (no
+    per-run env) collapses to plain ``os.environ``.
+    """
+    eff: dict[str, str] = dict(os.environ)
+    for k, v in (getattr(spec, "worker_env", None) or {}).items():
+        eff[str(k)] = str(v)
+    return eff
+
+
+def _chalk_selected(spec=None) -> bool:
+    """True if any FLASH_* chalk kernel-selection flag is truthy in the EFFECTIVE worker env.
+
+    Reads the per-run ``[worker_env]`` (``spec.worker_env``) merged over ``os.environ`` so a chalk
+    opt-in set only in the run's ``[worker_env]`` block is detected (see ``_effective_worker_env``).
+    """
+    env = _effective_worker_env(spec)
     for name in _CHALK_KERNEL_FLAGS:
-        v = os.environ.get(name)
+        v = env.get(name)
         if v is not None and v.strip().lower() not in ("", "0", "false", "no", "off"):
             return True
     return False
 
 
-def chalk_extra_pip() -> list[str]:
+def chalk_extra_pip(spec=None) -> list[str]:
     """Chalk pip spec(s) to ADD to the worker's ``extra_pip`` when a chalk kernel is selected.
 
     This is the install hook that runs for DEFAULT remote jobs: the baked-image RunPod path
@@ -184,15 +209,19 @@ def chalk_extra_pip() -> list[str]:
     payload's ``extra_pip`` regardless of ``WORKER_IMAGE`` — unlike ``FLASH_WORKER_EXTRA_DEPS``
     / ``resolve_worker_deps``, which the durable ``build_function_input`` baked-image path skips.
 
+    Selection (and the ``FLASH_CHALK_SPEC`` lookup) is resolved against the EFFECTIVE worker env —
+    the run's ``[worker_env]`` merged over ``os.environ`` — so it matches exactly what the worker
+    process will see (``build_worker_env``) and a per-run ``[worker_env]`` opt-in installs chalk.
+
     freesolo-chalk is unpublished, so there is no auto-installable default: the operator MUST set
     ``FLASH_CHALK_SPEC`` to an installable spec (a git URL with access, or a wheel/path). When a
     chalk kernel flag is set but ``FLASH_CHALK_SPEC`` is empty we log a warning and add nothing —
     ``install_chalk_kernels`` then finds no chalk on the worker and safely no-ops.
     """
-    if not _chalk_selected():
+    if not _chalk_selected(spec):
         return []
-    spec = os.environ.get("FLASH_CHALK_SPEC", "").strip()
-    if not spec:
+    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip()
+    if not spec_str:
         logger.warning(
             "a FLASH_* chalk kernel is selected but FLASH_CHALK_SPEC is unset; freesolo-chalk is "
             "unpublished so it can't be auto-installed — set FLASH_CHALK_SPEC to an installable "
@@ -201,7 +230,7 @@ def chalk_extra_pip() -> list[str]:
         return []
     import shlex
 
-    return [d for d in shlex.split(spec) if d.strip()]
+    return [d for d in shlex.split(spec_str) if d.strip()]
 
 
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
@@ -907,7 +936,7 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         # Vast bootstrap both pip-install it), so it's where the chalk spec must go to reach a
         # default run — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
-        + chalk_extra_pip(),
+        + chalk_extra_pip(spec),
         "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     if log is not None:
