@@ -1,0 +1,20 @@
+name: Main source guard
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  source-is-dev:
+    name: Source branch is dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require PRs into main to originate from dev
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "dev" ]; then
+            echo "::error::PRs into main must come from 'dev' (got '$HEAD_REF'). Merge into dev, then promote dev -> main."
+            exit 1
+          fi
+          echo "Source branch '$HEAD_REF' is allowed."
