@@ -756,7 +756,8 @@ def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
     (silent, the metrics.json artifact is still the source of truth). Sets a default project so runs
-    land in one place."""
+    land in one place — a run's ``[wandb] project`` (forwarded as WANDB_PROJECT) overrides it via
+    setdefault, so runs aren't all forced into the "flash" project."""
     if not os.environ.get("WANDB_API_KEY"):
         return []
     import importlib.util
@@ -769,7 +770,13 @@ def wandb_report_to() -> list[str]:
 
 
 def wandb_run_name() -> str:
-    """Stable, human-readable W&B run name tying the dashboard run to the Flash run id."""
+    """W&B run name. Defaults to a stable id tying the dashboard run to the Flash run
+    (``flash-<phase>-<run_id>-seed<N>``); a run's ``[wandb] run_name`` (forwarded as the
+    standard ``WANDB_NAME`` env var) overrides it so dashboards aren't all named "flash-…".
+    An explicit name is used verbatim — the user owns the naming."""
+    override = os.environ.get("WANDB_NAME")
+    if override and override.strip():
+        return override.strip()
     return f"flash-{PHASE}-{RUN_ID}-seed{SEED}"
 
 

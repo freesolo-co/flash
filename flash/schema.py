@@ -259,6 +259,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true"
         )
 
+    worker_env = _worker_env(raw.get("worker_env"))
+    _apply_wandb_naming(raw.get("wandb"), worker_env)
+
     spec = JobSpec(
         model=model,
         algorithm=algorithm,
@@ -310,7 +313,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             datacenter=gpu_raw.get("datacenter"),
         ),
         run_id=run_id or raw.get("run_id", "local"),
-        worker_env=_worker_env(raw.get("worker_env")),
+        worker_env=worker_env,
         model_policy=model_policy,
         thinking=thinking,
     )
@@ -333,8 +336,26 @@ def _worker_env(raw: Any) -> dict[str, str]:
     # SECRET_KEY, INTERNAL_KEY, CREDENTIAL, AWS_SECRET_ACCESS_KEY while allowing legit knobs whose
     # names merely contain a marker (RL_VLLM_MAX_BATCHED_TOKENS -> word TOKENS, not TOKEN; a bare
     # SORT_KEY -> KEY without a secret qualifier).
-    _secret_words = {"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS", "APIKEY", "PRIVATEKEY"}
-    _key_qualifiers = {"API", "SECRET", "PRIVATE", "ACCESS", "INTERNAL", "AUTH", "SIGNING", "ENCRYPTION"}
+    _secret_words = {
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "APIKEY",
+        "PRIVATEKEY",
+    }
+    _key_qualifiers = {
+        "API",
+        "SECRET",
+        "PRIVATE",
+        "ACCESS",
+        "INTERNAL",
+        "AUTH",
+        "SIGNING",
+        "ENCRYPTION",
+    }
 
     def _is_secret_key(name: str) -> bool:
         words = set(name.upper().split("_"))
@@ -347,6 +368,37 @@ def _worker_env(raw: Any) -> dict[str, str]:
             "serialized into run artifacts — set them as real environment variables instead"
         )
     return env
+
+
+# [wandb] config keys -> the standard W&B env vars the worker reads.
+_WANDB_KEYS = {"project": "WANDB_PROJECT", "run_name": "WANDB_NAME"}
+
+
+def _apply_wandb_naming(raw: Any, worker_env: dict[str, str]) -> None:
+    """Fold the optional ``[wandb]`` table into ``worker_env`` as the standard W&B env vars.
+
+    ``[wandb] project`` / ``run_name`` -> ``WANDB_PROJECT`` / ``WANDB_NAME`` (the env vars
+    ``engine.worker.wandb_report_to`` / ``wandb_run_name`` honor), so a run can land in its own
+    W&B project under its own run name instead of the hardcoded ``flash`` / ``flash-…``
+    defaults. Settable in TOML or via ``slm train cfg.toml --set wandb.project=… --set
+    wandb.run_name=…``. An explicit ``[worker_env]`` value wins (it's the lower-level escape
+    hatch), so this never clobbers one a user set directly."""
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise ConfigError('[wandb] must be a table (e.g. project = "my-project")')
+    unknown = sorted(set(raw) - set(_WANDB_KEYS))
+    if unknown:
+        raise ConfigError(
+            f"[wandb] unknown key(s): {', '.join(unknown)} (allowed: {', '.join(_WANDB_KEYS)})"
+        )
+    for key, env_key in _WANDB_KEYS.items():
+        if key not in raw:
+            continue
+        val = raw[key]
+        if not isinstance(val, str) or not val.strip():
+            raise ConfigError(f"[wandb] {key} must be a non-empty string")
+        worker_env.setdefault(env_key, val.strip())
 
 
 def _validate_spec(spec: JobSpec) -> None:
