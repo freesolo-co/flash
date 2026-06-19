@@ -325,9 +325,7 @@ def deploy_and_submit(
     machine the orchestrator just blacklisted gets re-selected from the fresh market.
     """
 
-    def say(msg: str):
-        if log is not None:
-            print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=log, flush=True)
+    say = make_say(log)
 
     if not offers:
         raise vast_api.VastApiError("no usable vast offers (verified datacenter pool empty)")

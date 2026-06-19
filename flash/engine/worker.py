@@ -250,8 +250,6 @@ def make_checkpoint_upload_callback():
     older checkpoints are deleted in the same commit. If an upload is still in flight
     when the next save fires, the new save is skipped (the following one catches up).
     """
-    import threading
-
     from transformers import TrainerCallback
 
     lock = threading.Lock()
@@ -298,13 +296,9 @@ def make_checkpoint_upload_callback():
 _HB_LAST_UPLOAD = 0.0
 
 
-def _hb_min_interval_s() -> float:
-    """The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
-    128 commits/hour-per-repo limit when concurrent runs share one HF_REPO."""
-    return 60.0
-
-
-_HB_MIN_INTERVAL_S = _hb_min_interval_s()
+# The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
+# 128 commits/hour-per-repo limit when concurrent runs share one HF_REPO.
+_HB_MIN_INTERVAL_S = 60.0
 _HB_THROTTLED_STAGES = frozenset({"rl_step"})
 # Terminal transitions the control plane must never miss — always committed.
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})

@@ -38,10 +38,6 @@ def _api_key() -> str:
     return _CLIENT.api_key()
 
 
-def _request(path: str, method: str = "GET", body: dict | None = None, timeout: float = 30.0):
-    return _CLIENT.request(path, method=method, body=body, timeout=timeout)
-
-
 def request_with_retries(
     path: str,
     method: str = "GET",

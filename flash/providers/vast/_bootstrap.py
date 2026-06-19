@@ -208,7 +208,6 @@ def main() -> int:
             # / verifiers extras) must stop NOW with an actionable error, not proceed to
             # a later import crash while the paid instance runs (matches the RunPod path).
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
-        _wenv = payload.get("env") or {}
         # NB: fla is dropped on Hopper (sm90) automatically by engine.worker._drop_fla_on_hopper at
         # worker startup (fla's GDN backward is miscomputed on sm90, #640) — no bootstrap uninstall
         # or env toggle. fla only ever runs on the consumer archs where its Triton kernel is correct.

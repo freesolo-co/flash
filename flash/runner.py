@@ -469,23 +469,6 @@ def mark_deployment_undeployed(run_id: str) -> RunStatus:
         return status
 
 
-def rollback_deploy(run_id: str, snapshot: RunStatus) -> None:
-    """Restore the pre-deploy state/deployment after always-on provisioning fails.
-
-    Lock-guarded + terminal-respecting (same guard as _update/mark_deployed): a /cancel
-    that landed during provisioning/warmup already persisted `cancelled`; restoring the
-    pre-deploy snapshot must NOT overwrite it and resurrect the run as `done`/`deployed`.
-    """
-    with _STATUS_LOCK:
-        status = get_status(run_id)
-        if status.state in TERMINAL_STATES:
-            return
-        status.state = snapshot.state
-        status.deployment = snapshot.deployment
-        status.updated_at = time.time()
-        _save_status(status)
-
-
 def _run_job(spec: JobSpec) -> None:
     # Lazy import so dry-run / unit tests never construct a Flash endpoint.
     from flash.providers.runpod.train import upload_code

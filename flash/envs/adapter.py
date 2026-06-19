@@ -263,6 +263,13 @@ def _run_eval_metric(func, available: dict) -> None:
         _invoke_reward(func, available)
 
 
+def _substring_answer_score(completion: str, example: dict) -> float:
+    """Fallback reward for an env with no rubric: 1.0 iff the example ``answer`` is a
+    non-empty substring of the completion, else 0.0."""
+    answer = str(example.get("answer") or "")
+    return 1.0 if answer and answer in (completion or "") else 0.0
+
+
 def _is_multi_turn(vf_env) -> bool:
     """True for a tool/multi-turn verifiers env (NOT a plain SingleTurnEnv)."""
     try:
@@ -493,8 +500,7 @@ class VerifiersEnvironment(BaseEnvironment):
         """
         breakdown: dict[str, float] = {}
         if not self._reward_pairs:
-            answer = str(example.get("answer") or "")
-            score = 1.0 if answer and answer in (completion or "") else 0.0
+            score = _substring_answer_score(completion, example)
             return {"answer_match": score, "total": score}
         available = self._reward_available(completion, example, state)
         total = 0.0
@@ -543,8 +549,7 @@ class VerifiersEnvironment(BaseEnvironment):
         no rubric falls back to the substring ``answer_match`` as both reward and (empty) metrics.
         """
         if not self._reward_pairs:
-            answer = str(example.get("answer") or "")
-            score = 1.0 if answer and answer in (completion or "") else 0.0
+            score = _substring_answer_score(completion, example)
             return {"reward": score, "metrics": {}}
         available = self._reward_available(completion, example, state)
         total = 0.0
@@ -706,8 +711,7 @@ def load_verifiers_environment(
     """
     vf = _import_vf()
     vf_env = vf.load_environment(vf_load_id(env_id), **_drop_reserved_kwargs(kwargs))
-    eval_ref = eval_env_id
-    eval_vf_env = vf.load_environment(vf_load_id(eval_ref)) if eval_ref else None
+    eval_vf_env = vf.load_environment(vf_load_id(eval_env_id)) if eval_env_id else None
     return VerifiersEnvironment(
         vf_env,
         env_id,

@@ -40,6 +40,7 @@ from . import auth, db
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
+_SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 
 class _RunLock:
@@ -135,9 +136,7 @@ def create_app():
     try:
         from fastapi import Depends, FastAPI, Header, HTTPException
     except ImportError as exc:
-        raise RuntimeError(
-            "the control plane needs the server extras: pip install 'flash[server]'"
-        ) from exc
+        raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
@@ -408,7 +407,5 @@ def run_server(host: str = "127.0.0.1", port: int = 8080) -> None:
     try:
         import uvicorn
     except ImportError as exc:
-        raise RuntimeError(
-            "the control plane needs the server extras: pip install 'flash[server]'"
-        ) from exc
+        raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     uvicorn.run(create_app(), host=host, port=port)

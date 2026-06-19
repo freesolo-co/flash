@@ -27,14 +27,6 @@ class RunpodApiError(RuntimeError):
 _CLIENT = RestClient(env_var="RUNPOD_API_KEY", error_cls=RunpodApiError)
 
 
-def _api_key() -> str:
-    return _CLIENT.api_key()
-
-
-def _request(url: str, method: str = "GET", body: dict | None = None, timeout: float = 30.0):
-    return _CLIENT.request(url, method=method, body=body, timeout=timeout)
-
-
 def request_with_retries(
     url: str,
     method: str = "GET",

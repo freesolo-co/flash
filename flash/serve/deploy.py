@@ -34,13 +34,8 @@ logger = get_logger(__name__)
 # Default freesolo serving base URL (the Modal multi-LoRA app). Overridable per-env.
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
 
-# These remain so callers/tests that imported them keep resolving; they are cosmetic now
-# that serving is delegated to freesolo (no flash-owned endpoint to size or warm).
 MODES = ("dev", "always-on")
 DEFAULT_IDLE_TIMEOUT_S = 300
-_ENDPOINT_CACHE: dict[str, object] = {}
-# The serving deps used to live on the flash worker image; serving is now external.
-SERVE_DEPS: list[str] = []
 
 
 def serving_base_url() -> str:
@@ -51,11 +46,6 @@ def serving_base_url() -> str:
 def _internal_key_header() -> dict[str, str]:
     key = os.environ.get("FREESOLO_INTERNAL_KEY") or ""
     return {"X-Freesolo-Internal-Key": key} if key else {}
-
-
-def resolve_serve_deps() -> list[str]:
-    """Kept for back-compat; serving deps are external (freesolo), so this is empty."""
-    return SERVE_DEPS
 
 
 @dataclass
@@ -75,14 +65,6 @@ class Deployment:
 
     def to_dict(self) -> dict:
         return asdict(self)
-
-
-def _language_model_only(model: str) -> bool:
-    """Cosmetic: the family-name guard the old flash worker used for text-only serving.
-
-    The freesolo serving app makes its own multimodal decisions; kept so any importer
-    keeps resolving."""
-    return "Qwen3.5" in model or "Qwen3.6" in model
 
 
 def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
