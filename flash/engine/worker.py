@@ -1803,6 +1803,24 @@ def _env_inference_gpus(default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read env var ``name`` as a float, tolerating a present-but-BLANK value.
+
+    ``os.environ.get(name, default)`` only falls back when the key is ABSENT — a present
+    empty/whitespace value (e.g. forwarded from the control-plane env or a serialized
+    ``[worker_env]`` table that emits ``""``) reaches ``float()`` and raises ValueError,
+    aborting the worker before any clear config error. Treat blank/unparseable as
+    "no override" (keep the default) instead of crashing."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        print(f"[rl][disagg][warn] {name}={raw!r} is not a float; using {default}")
+        return default
+
+
 def _require_full_node_for_disaggregated(total_gpus: int, inference_gpus: int) -> None:
     """Fail fast when a disaggregated run's node exposes FEWER GPUs than [gpu] count requested.
 
@@ -2373,9 +2391,7 @@ def run_rl():
         # The server gets the whole inference card (no colocate util cap), stays resident (no sleep),
         # and its KV cache is bounded by --max_model_len = the GRPO engine length.
         _port = _disagg.server_port()
-        _server_util = float(
-            os.environ.get("RL_VLLM_SERVER_UTIL", str(_disagg.DEFAULT_SERVER_GPU_UTIL))
-        )
+        _server_util = _env_float("RL_VLLM_SERVER_UTIL", _disagg.DEFAULT_SERVER_GPU_UTIL)
         # verl rollout lever (mirror colocate): fp8 KV cache on fp8-native silicon (compute
         # capability >= 8.9: Ada/Hopper/Blackwell) ~halves the server's KV pool. The trainer GPU is
         # the same class as the inference GPU (whole-machine node), so its capability is a valid
@@ -2483,7 +2499,7 @@ def run_rl():
             parallel=_parallel,
             extra=(_vllm_extra or None),
         )
-        _server_timeout = float(os.environ.get("RL_VLLM_SERVER_TIMEOUT", "1200"))
+        _server_timeout = _env_float("RL_VLLM_SERVER_TIMEOUT", 1200.0)
         if _trainer_only:
             # The FSDP launcher already started the server on the inference card(s); this accelerate
             # rank just connects to it (vllm_proc stays None so the finally never terminates the
