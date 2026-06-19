@@ -36,6 +36,18 @@ def _coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _coerce_str_map(value: Any) -> dict[str, str]:
+    """Coerce a loosely-typed spec field into a ``dict[str, str]``.
+
+    A malformed persisted spec (or programmatic caller) can set a mapping field to a non-dict;
+    `.items()` on that would crash `from_dict` with AttributeError. Treat a non-dict as empty,
+    mirroring how the other nested fields tolerate missing/garbage input.
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): str(v) for k, v in value.items()}
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
@@ -165,6 +177,12 @@ class JobSpec:
     train: TrainSpec = field(default_factory=TrainSpec)
     gpu: GpuSpec = field(default_factory=GpuSpec)
     run_id: str = "local"
+    # Per-run worker-environment overrides merged into the GPU worker's env (highest precedence
+    # over the control-plane os.environ allowlist). The escape hatch for A/B kernel experiments
+    # that must differ PER RUN, not globally: e.g. an optimizer or LoRA-init override on just the
+    # experiment run while others keep the global default. Forwarded verbatim (string values);
+    # never set secrets here.
+    worker_env: dict[str, str] = field(default_factory=dict)
     # "catalog" (curated models only) or "allow" (any HF model that fits the GPU).
     model_policy: str = "catalog"
     # Thinking/reasoning mode (thinking-capable models only). One flag per run, consumed
@@ -239,6 +257,7 @@ class JobSpec:
                 datacenter=gpu.get("datacenter"),
             ),
             run_id=data.get("run_id", "local"),
+            worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
             thinking=_coerce_bool(data.get("thinking", False)),
         )
