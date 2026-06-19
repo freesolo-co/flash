@@ -75,6 +75,13 @@ def runconfig_from_status(
     # analytical estimate and the LLM prompt then price the SAME total work (N x train
     # + N x setup) the measured dollars paid for.
     n_seeds = max(1, len(train.get("seeds") or (0,)))
+    gpu_spec = spec.get("gpu") or {}
+    # The spec's per-run wall cap (``gpu.max_wall_seconds``) and unvalidated-GPU policy
+    # (``gpu.allow_unvalidated``) drive what the runner actually billed: the cap clamps each
+    # seed's wall clock and the policy widens the allocator's GPU pool. Carry both so the
+    # reconstructed estimate prices the SAME run the measured dollars covered (otherwise a
+    # run with a short explicit cap is priced against the 24h default and overstated).
+    max_wall = gpu_spec.get("max_wall_seconds")
     return RunConfig(
         model_id=spec["model"],
         method=method,
@@ -86,7 +93,9 @@ def runconfig_from_status(
         group_size=train.get("group_size") if is_grpo else None,
         lora_rank=train.get("lora_rank"),
         thinking=bool(spec.get("thinking", False)),
-        gpu=(spec.get("gpu") or {}).get("type"),
+        gpu=gpu_spec.get("type"),
+        allow_unvalidated=bool(gpu_spec.get("allow_unvalidated", False)),
+        max_wall_seconds=int(max_wall) if max_wall is not None else None,
         environment=(spec.get("environment") or {}).get("id"),
         reward_seconds_per_completion=reward_seconds_per_completion,
         label=label or status.get("run_id"),

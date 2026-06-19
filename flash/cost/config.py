@@ -41,6 +41,15 @@ class RunConfig:
     reward_seconds_per_completion: float | None = None
 
     gpu: str | None = None  # pin a class; else cheapest fitting
+    # Whether the run permits unvalidated GPU classes (spec ``gpu.allow_unvalidated``).
+    # The allocator widens its candidate pool when this is set, so the cheapest fitting
+    # class -- and thus the priced $/hr -- can be an unvalidated one. Mirror it here so a
+    # preflight estimate matches the allocator's pick for such specs.
+    allow_unvalidated: bool = False
+    # Per-run total wall-clock cap in seconds (spec ``gpu.max_wall_seconds``; default 24h).
+    # The runner applies this PER SEED (each seed is its own job), so the estimator clamps
+    # each seed's setup+train to it. ``None`` -> the estimator's default cap.
+    max_wall_seconds: int | None = None
     provider: str = "auto"
     # Verifiers environment slug (owner/name). Descriptive only -- the dataset/reward
     # source doesn't drive GPU-time cost -- but carried so a run is fully specified.

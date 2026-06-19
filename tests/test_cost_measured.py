@@ -178,6 +178,26 @@ def test_multi_seed_run_scales_setup_in_analytical_cost():
     assert three_seed.total_usd == pytest.approx(one_seed.total_usd * 3)
 
 
+def test_spec_wall_cap_and_unvalidated_flow_into_runconfig():
+    # gpu.max_wall_seconds and gpu.allow_unvalidated from the spec must reach the RunConfig so
+    # the reconstructed estimate prices the same run the measured dollars covered (the cap
+    # clamps per-seed wall; the policy widens GPU selection). Defaults: no cap, validated-only.
+    base = runconfig_from_status(GRPO_STATUS)
+    assert base.max_wall_seconds is None
+    assert base.allow_unvalidated is False
+
+    status = {
+        **GRPO_STATUS,
+        "spec": {
+            **GRPO_STATUS["spec"],
+            "gpu": {"type": "RTX 5090", "max_wall_seconds": 2400, "allow_unvalidated": True},
+        },
+    }
+    cfg = runconfig_from_status(status)
+    assert cfg.max_wall_seconds == 2400
+    assert cfg.allow_unvalidated is True
+
+
 def test_duplicate_measured_labels_are_rejected():
     # Two runs with the same display label can't both be the ground truth for one cell;
     # reject the collision instead of silently keeping the last and mis-grading the rest.

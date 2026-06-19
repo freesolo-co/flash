@@ -131,6 +131,46 @@ def test_wall_clock_cap_bounds_runaway_runs():
     assert uncapped_like.total_usd > e.total_usd
 
 
+def test_config_max_wall_seconds_overrides_default_cap():
+    # A spec-pinned per-run wall cap (gpu.max_wall_seconds) is honored instead of the 24h
+    # default, so a run with a short explicit cap isn't priced against the 24h ceiling.
+    uncapped = estimate_cost(RunConfig(BIG, "grpo", 100_000))
+    assert uncapped.wall_capped is True  # binds the 24h default
+    short = estimate_cost(RunConfig(BIG, "grpo", 100_000, max_wall_seconds=3600))
+    assert short.wall_capped is True
+    assert short.wall_clock_seconds == pytest.approx(3600.0)
+    assert short.total_usd < uncapped.total_usd
+
+
+def test_wall_cap_is_applied_per_seed_not_to_the_aggregate():
+    # The runner provisions each seed as its own job and applies max_wall_seconds PER SEED.
+    # So a 3-seed run that wall-caps at a per-seed limit bills 3x the per-seed capped wall,
+    # NOT a single aggregate cap. With a 1h per-seed cap on a runaway 3-seed run, total wall
+    # is ~3h (3 capped seeds), not 1h.
+    cfg = RunConfig(BIG, "grpo", 300_000, setup_repeats=3, max_wall_seconds=3600)
+    e = estimate_cost(cfg)
+    assert e.wall_capped is True
+    assert e.wall_clock_seconds == pytest.approx(3 * 3600.0)
+    # One seed of the same shape caps at exactly one per-seed window.
+    one = RunConfig(BIG, "grpo", 100_000, setup_repeats=1, max_wall_seconds=3600)
+    assert estimate_cost(one).wall_clock_seconds == pytest.approx(3600.0)
+
+
+def test_allow_unvalidated_widens_gpu_selection():
+    # When the spec permits unvalidated classes, GPU selection mirrors the allocator's
+    # widened pool: an unvalidated class can be picked when it's the cheapest that fits.
+    from flash.cost.hardware import pick_gpu
+
+    cfg_strict = RunConfig(MID, "sft", 100)
+    cfg_open = RunConfig(MID, "sft", 100, allow_unvalidated=True)
+    strict_gpu, need = select_gpu(cfg_strict)
+    open_gpu = select_gpu(cfg_open)[0]
+    # Selection routes the allow_unvalidated flag through to pick_gpu: the open pick equals
+    # pick_gpu(need, allow_unvalidated=True) and the strict pick equals the validated-only pool.
+    assert open_gpu == pick_gpu(need, allow_unvalidated=True)
+    assert strict_gpu == pick_gpu(need, allow_unvalidated=False)
+
+
 def test_qlora_model_fits_a_smaller_card_than_bf16_would():
     # Qwen3.5-9B is 4-bit QLoRA; its GRPO still fits a 32 GB 5090, not an 80 GB A100.
     e = estimate_cost(RunConfig(BIG, "grpo", 100))

@@ -84,10 +84,20 @@ def main(argv: list[str] | None = None) -> int:
         print("No completed runs yet -- re-run once they finish.")
         return 1
 
+    # Describe the actual reward env(s) the runs used (don't hardcode one) -- a mixed or
+    # non-flash-bench manifest would otherwise be misdescribed.
+    envs = sorted({m.config.environment for m in done if m.config.environment})
+    if not envs:
+        env_phrase = "their configured reward env"
+    elif len(envs) == 1:
+        env_phrase = f"the `{envs[0]}` reward env"
+    else:
+        env_phrase = "reward envs " + ", ".join(f"`{e}`" for e in envs)
+
     out = [
         "# Cost estimator vs MEASURED real-run cost",
         "",
-        f"{len(done)} real training runs on the `freesolo-co/flash-bench` reward env "
+        f"{len(done)} real training runs on {env_phrase} "
         "(SFT + GRPO, RTX 5090 / A100 PCIe, varied group/steps/model). Ground truth is "
         "the actual control-plane `cost_usd`, not the analytical equation.",
         "",

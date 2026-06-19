@@ -137,11 +137,23 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
         need = required_vram_gb(
             config.model_id, config.method, train=config.train_knobs(), thinking=config.thinking
         )
-    gpu = pick_gpu(need, pin=config.gpu, provider=config.provider)
+    gpu = pick_gpu(
+        need,
+        pin=config.gpu,
+        provider=config.provider,
+        allow_unvalidated=config.allow_unvalidated,
+    )
     return gpu, need
 
 
-def _notes(config: RunConfig, gpu: str, raw_train_s: float, wall_capped: bool) -> tuple[str, ...]:
+def _notes(
+    config: RunConfig,
+    gpu: str,
+    raw_train_s: float,
+    wall_capped: bool,
+    *,
+    cap_s: float = DEFAULT_WALL_CAP_S,
+) -> tuple[str, ...]:
     n = config.normalized()
     notes: list[str] = []
     total = total_params_b(n.model_id)
@@ -162,8 +174,9 @@ def _notes(config: RunConfig, gpu: str, raw_train_s: float, wall_capped: bool) -
         )
     notes.append(f"GPU sized with {vram_headroom():.0%} VRAM headroom; static fallback $/hr")
     if wall_capped:
+        per_seed = "" if config.setup_repeats == 1 else "per-seed "
         notes.append(
-            f"train clamped to the {DEFAULT_WALL_CAP_S / 3600:.0f}h wall cap "
+            f"train clamped to the {cap_s / 3600:.0f}h {per_seed}wall cap "
             f"(uncapped: {raw_train_s / 3600:.1f}h)"
         )
     return tuple(notes)
@@ -173,16 +186,26 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     """Deterministic pre-flight cost estimate -- the experiment's ground truth."""
     gpu, need = select_gpu(config)
     hourly = gpu_hourly_usd(gpu)
-    # A multi-seed run cold-starts (and is billed for) setup once PER SEED, so charge
-    # ``setup_repeats`` cold starts -- mirroring how the reconstructed step count is
-    # scaled by the seed count, so analytical setup tracks the measured per-seed bill.
-    setup = setup_seconds(config) * config.setup_repeats
-    sps = seconds_per_step(config, gpu)
-    raw_train = config.steps * sps
+    # The wall cap is ``gpu.max_wall_seconds`` from the spec (default 24h); fall back to the
+    # caller's ``wall_cap_s`` (the module default) when the config doesn't pin one.
+    cap_s = float(config.max_wall_seconds) if config.max_wall_seconds is not None else wall_cap_s
 
-    # The cap is on TOTAL wall clock; setup is billed too, so clamp training to fit.
-    wall_capped = (setup + raw_train) > wall_cap_s
-    train = max(0.0, wall_cap_s - setup) if wall_capped else raw_train
+    # A multi-seed run is N independent jobs (runner.py: "one allocation per seed"), each of
+    # which cold-starts, runs its own steps, and has ``max_wall_seconds`` applied to ITS OWN
+    # wall clock. So price one seed (setup + its share of the steps), clamp THAT to the cap,
+    # then multiply by the seed count -- summing per-seed capped wall, not capping the
+    # aggregate once (which under-/over-prices a multi-seed run whose per-seed cap binds).
+    seeds = config.setup_repeats
+    setup_per_seed = setup_seconds(config)
+    sps = seconds_per_step(config, gpu)
+    raw_train_per_seed = (config.steps / seeds) * sps
+
+    # The cap is on TOTAL per-seed wall clock; setup is billed too, so clamp training to fit.
+    wall_capped = (setup_per_seed + raw_train_per_seed) > cap_s
+    train_per_seed = max(0.0, cap_s - setup_per_seed) if wall_capped else raw_train_per_seed
+
+    setup = setup_per_seed * seeds
+    train = train_per_seed * seeds
     wall = setup + train
     total_usd = wall / 3600.0 * hourly
 
@@ -201,5 +224,5 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
         total_usd=total_usd,
-        notes=_notes(config, gpu, raw_train, wall_capped),
+        notes=_notes(config, gpu, raw_train_per_seed, wall_capped, cap_s=cap_s),
     )
