@@ -91,11 +91,17 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     gen_tokens = completions * n.completion_len
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_TRAIN)
-    # Reward graders run in parallel: divide the serial per-completion cost by the concurrency.
+    # Reward graders run in parallel, but only as many slots as there are completions to
+    # grade: the effective concurrency is min(completions, REWARD_CONCURRENCY). With fewer
+    # completions than slots (e.g. a batch_size=1, group_size=4 GRPO step = 4 completions),
+    # dividing by the full 16 would model a fraction of a wave and undercount the reward wall
+    # -- at least one completion's full latency must elapse. For completions >= the slot count
+    # this is identical to dividing by REWARD_CONCURRENCY, so larger steps are unaffected.
+    reward_concurrency = min(completions, REWARD_CONCURRENCY)
     reward_s = (
         completions
         * reward_seconds_per_completion(n.environment, n.reward_seconds_per_completion)
-        / REWARD_CONCURRENCY
+        / reward_concurrency
     )
     return gen_s + reward_s + update_s
 

@@ -53,7 +53,18 @@ def _load_runs(path: Path | str | None = None) -> list[dict]:
 
 
 def _config_of(run: dict) -> RunConfig:
-    """Rebuild the RunConfig a measured run priced (pinned to the GPU it actually used)."""
+    """Rebuild the RunConfig a measured run priced (pinned to the GPU it actually used).
+
+    The measured ``gpu`` is a record of fact -- the card the run *did* run on -- so it must
+    be honored even when that class isn't in the default validated pool (e.g. a Vast
+    ``A100 SXM`` / ``RTX 6000 Ada`` run). ``pick_gpu`` only keeps a pin that survives both
+    its provisionability gate (per ``provider``) and its validation gate, so pass the run's
+    own ``provider`` and ``allow_unvalidated=True`` -- otherwise an unvalidated pinned class
+    is dropped and the run is re-priced on a *different* GPU, corrupting its accuracy/bias.
+    Forward ``max_wall_seconds`` when the dataset carries it so a capped run is graded
+    against the same wall cap the runner applied (the current dataset records none, so this
+    is a no-op until a measured row includes one -- a cap is never invented here).
+    """
     return RunConfig(
         run["model"],
         run["method"],
@@ -64,7 +75,10 @@ def _config_of(run: dict) -> RunConfig:
         group_size=run.get("group_size"),
         environment=run.get("environment"),
         setup_repeats=run.get("setup_repeats", 1),
-        gpu=run["gpu"],  # price on the card the run actually ran on
+        gpu=run["gpu"],  # price on the card the run actually ran on (a record of fact)
+        provider=run.get("provider", "auto"),  # restrict the pool to the substrate it ran on
+        allow_unvalidated=True,  # honor the recorded class even if it's outside the validated pool
+        max_wall_seconds=run.get("max_wall_seconds"),  # grade against the run's own cap if recorded
     )
 
 
@@ -75,17 +89,41 @@ def _config_of(run: dict) -> RunConfig:
 # report those separately rather than letting them pollute the real-run accuracy.
 REAL_RUN_MIN_WALL_S = 500.0
 
+# Effective billed rate (cost / wall) below which a row's billing is implausible: no managed
+# class bills anywhere near this. Such a row is a degenerate run -- the job hung/idled and was
+# force-killed with near-zero billed GPU-seconds, so its huge wall is not training time and
+# its tiny cost is not the price of the configured work (e.g. a 49.5h / $0.04 SFT row bills
+# $0.0008/hr -- 300x below the cheapest class's ~$0.24/hr floor). It clears the wall-length
+# filter above (its wall is absurdly LONG, not short) but is just as invalid a comparison, so
+# exclude it from the real-run accuracy the same way.
+REAL_RUN_MIN_RATE_USD_PER_HR = 0.10
+
+
+def _ran_its_work(run: dict) -> bool:
+    """Whether a measured row actually executed its configured run (valid to grade against).
+
+    Excludes both the short smoke tests (wall below the floor) and the degenerate
+    hung/idle rows whose billed rate is implausibly low (cost/wall far under any class's
+    real $/hr) -- in both cases the measured cost prices a *different* run than the config.
+    """
+    wall = run.get("wall_seconds", 0.0)
+    if wall < REAL_RUN_MIN_WALL_S:
+        return False
+    rate = run.get("cost_usd", 0.0) / (wall / 3600.0) if wall else 0.0
+    return rate >= REAL_RUN_MIN_RATE_USD_PER_HR
+
 
 def verify_accuracy(path: Path | str | None = None) -> dict:
     """Grade the raw first-principles equation against measured cost. No output factor.
 
     Returns per-group: n, mean MAPE %, median APE %, aggregate bias (Σ estimate / Σ
     measured), and the fraction within 33% / 50%. Groups: all / sft / grpo, plus the
-    ``real_*`` subsets (wall >= REAL_RUN_MIN_WALL_S) that actually ran their configured
-    work -- the meaningful accuracy for pricing a real training run.
+    ``real_*`` subsets (rows that actually ran their configured work, per ``_ran_its_work``:
+    wall above the floor AND a plausible billed rate) -- the meaningful accuracy for pricing
+    a real training run.
     """
     runs = _load_runs(path)
-    real = [r for r in runs if r.get("wall_seconds", 0) >= REAL_RUN_MIN_WALL_S]
+    real = [r for r in runs if _ran_its_work(r)]
     out: dict[str, dict] = {}
     groups = {
         "all": runs,
@@ -128,14 +166,26 @@ def fit_constants(path: Path | str | None = None) -> dict:
     """
     runs = _load_runs(path)
     by_gpu_rate: dict[str, list[float]] = {}
+    n_used = 0
     for r in runs:
         # Effective billed rate = measured cost / measured wall. This is the rate the
         # equation must multiply its predicted wall by to recover the billed cost (it
         # already folds in whatever the plane actually charged vs the provider's quote).
-        rate = r["cost_usd"] / (r["wall_seconds"] / 3600.0)
+        wall = r.get("wall_seconds", 0.0)
+        if wall <= 0:
+            continue
+        rate = r["cost_usd"] / (wall / 3600.0)
+        # The billed RATE is a property of the GPU class, independent of whether the run
+        # finished its configured steps -- so short smoke tests still measure it and are kept.
+        # Only the degenerate hung/idle rows (rate below any class's real floor) are dropped:
+        # their tiny cost over a huge idle wall isn't a real per-hour rate and would drag the
+        # class median toward zero.
+        if rate < REAL_RUN_MIN_RATE_USD_PER_HR:
+            continue
         by_gpu_rate.setdefault(r["gpu"], []).append(rate)
+        n_used += 1
     realized = {g: round(st.median(v), 3) for g, v in sorted(by_gpu_rate.items())}
-    return {"realized_hourly_usd": realized, "n_runs": len(runs)}
+    return {"realized_hourly_usd": realized, "n_runs": n_used}
 
 
 # --------------------------------------------------------------------------- #
