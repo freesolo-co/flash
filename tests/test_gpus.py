@@ -187,8 +187,5 @@ def test_build_worker_env():
     )
     env = build_worker_env(spec, 0)
     assert env["RUN_ID"] == "r1"
-    # The model is carried by the full JobSpec (JOB_SPEC.model), NOT a BENCH_HF_MODEL env var.
-    assert "BENCH_HF_MODEL" not in env
-    # [train] steps/epochs are NOT forwarded as env vars — the worker reads them from JOB_SPEC.
-    assert "RL_STEPS" not in env
-    assert "SFT_EPOCHS" not in env
+    assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3.5-4B"
+    assert env["RL_STEPS"] == "20"
