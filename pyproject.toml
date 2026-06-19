@@ -19,9 +19,14 @@ classifiers = [
 ]
 dependencies = [
     "runpod-flash",
-    "huggingface-hub>=0.25",
+    # >=0.34: upload_code()'s update_repo_settings(private=True) needs the visibility-via-settings
+    # API (older 0.25.x update_repo_settings only accepts `gated` and raises TypeError on `private`;
+    # visibility there lived on the now-removed update_repo_visibility).
+    "huggingface-hub>=0.34",
     "datasets>=2.19",
     "verifiers>=0.1.10",
+    # Thin HTTP client for the freesolo serving app (adapter deploy/undeploy/chat).
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -36,13 +41,21 @@ gpu = [
     "bitsandbytes>=0.49",
     "accelerate>=1.4",
 ]
+# freesolo-chalk (Freesolo's custom Triton/CUDA kernels, complements Liger) is an OPTIONAL,
+# separately-installed package — it is not on PyPI yet, so it is deliberately NOT a hard
+# dependency here (that would break resolution). flash auto-detects it at runtime and no-ops
+# when it's absent (see flash/engine/chalk_kernels.py). chalk is install-on-call (it reads NO env
+# vars), so the worker selects kernels via per-kernel FLASH_* flags. Enable on a remote run by
+# setting the FLASH_* kernel flag(s) AND FLASH_CHALK_SPEC=<installable chalk spec> (git URL with
+# access, or a wheel); the submit path appends that spec to the worker's extra_pip, which is
+# installed for every job (works on the default baked-image path, unlike FLASH_WORKER_EXTRA_DEPS).
 server = ["fastapi", "uvicorn"]
 # Convenience aggregate of all optional runtime extras.
 all = ["flash[gpu,server]"]
 
 [project.urls]
-Homepage = "https://github.com/freesolo-co/freesolo"
-Repository = "https://github.com/freesolo-co/freesolo"
+Homepage = "https://github.com/freesolo-co/flash"
+Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
 slm = "flash.cli.main:main"

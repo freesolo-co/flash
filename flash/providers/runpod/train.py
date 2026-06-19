@@ -79,6 +79,17 @@ WORKER_DEPS = [
     # NB: fla's gated chunk_bwd is broken on HOPPER (H100) with Triton >= 3.4 (fla #640), so
     # resolve_worker_deps DROPS fla on sm90 (the correct pure-PyTorch delta rule runs instead). The
     # dense Qwen3.5 GDN models route to consumer cards by default, where fla works.
+    # NB: freesolo-chalk (custom Triton/CUDA kernels, install-on-call — calling an installer IS
+    # the opt-in; chalk reads NO env vars) is NOT baked in by default — it isn't on PyPI yet, and a
+    # bad/inaccessible spec here would abort worker boot. flash auto-detects chalk if present
+    # (flash/engine/chalk_kernels.py). To enable kernels on a DEFAULT remote run: set the per-kernel
+    # FLASH_* selection flags (FLASH_MLP_KERNEL, FLASH_FP8_BASE, FLASH_TRITON_LORA, ...) AND set
+    # FLASH_CHALK_SPEC to an installable chalk spec (a git URL with access, or a wheel). The submit
+    # path (chalk_extra_pip) then appends that spec to the worker's `extra_pip`, which the worker
+    # pip-installs for EVERY job (baked-image RunPod _train_body + Vast bootstrap). Do NOT rely on
+    # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS for this: the durable baked-image submit path
+    # (jobs.build_function_input) returns the raw payload and never consults resolve_worker_deps, so
+    # those vars don't reach a default run; and FLASH_WORKER_DEPS would also REPLACE the whole stack.
 ]
 # NOTE on download speed: Flash's runtime already ships hf_transfer and exports
 # HF_HUB_ENABLE_HF_TRANSFER=1 on workers (measured: Qwen3-4B's ~8 GB pulled in 6.3 s,
@@ -143,6 +154,85 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
     return deps
 
 
+# FLASH_* flags that select a chalk install-on-call kernel (see engine.chalk_kernels). Any one
+# of these being set means the run opted into chalk, so chalk must be installed on the worker.
+_CHALK_KERNEL_FLAGS = (
+    "FLASH_MLP_KERNEL",
+    "FLASH_MLP_FP8",
+    "FLASH_FP8_BASE",
+    "FLASH_TRITON_LORA",
+    "FLASH_EMBED_KERNEL",
+    "FLASH_QKV_KERNEL",
+    "FLASH_ROPE_KERNEL",
+)
+
+
+def _effective_worker_env(spec=None) -> dict[str, str]:
+    """The env the WORKER process will actually see, for chalk-selection decisions.
+
+    chalk install-on-call is selected by ``FLASH_*`` flags read on the worker from its own process
+    env, which ``build_worker_env`` builds as the control-plane ``os.environ`` allowlist with the
+    run's ``[worker_env]`` overrides merged ON TOP (per-run ``spec.worker_env`` wins). A run that
+    opts into chalk via its ``[worker_env]`` block therefore sets the flag the worker reads — so the
+    SAME merge must decide whether chalk is selected and whether its spec is added to ``extra_pip``;
+    reading bare ``os.environ`` here would miss a per-run ``[worker_env]`` opt-in and the kernels
+    would never install for that run.
+
+    Returns ``os.environ`` overlaid with ``spec.worker_env`` (string-coerced). ``spec=None`` (no
+    per-run env) collapses to plain ``os.environ``.
+    """
+    eff: dict[str, str] = dict(os.environ)
+    for k, v in (getattr(spec, "worker_env", None) or {}).items():
+        eff[str(k)] = str(v)
+    return eff
+
+
+def _chalk_selected(spec=None) -> bool:
+    """True if any FLASH_* chalk kernel-selection flag is truthy in the EFFECTIVE worker env.
+
+    Reads the per-run ``[worker_env]`` (``spec.worker_env``) merged over ``os.environ`` so a chalk
+    opt-in set only in the run's ``[worker_env]`` block is detected (see ``_effective_worker_env``).
+    """
+    env = _effective_worker_env(spec)
+    for name in _CHALK_KERNEL_FLAGS:
+        v = env.get(name)
+        if v is not None and v.strip().lower() not in ("", "0", "false", "no", "off"):
+            return True
+    return False
+
+
+def chalk_extra_pip(spec=None) -> list[str]:
+    """Chalk pip spec(s) to ADD to the worker's ``extra_pip`` when a chalk kernel is selected.
+
+    This is the install hook that runs for DEFAULT remote jobs: the baked-image RunPod path
+    (``_train_body`` -> ``pip install *extra_pip``) and the Vast bootstrap both consume the
+    payload's ``extra_pip`` regardless of ``WORKER_IMAGE`` — unlike ``FLASH_WORKER_EXTRA_DEPS``
+    / ``resolve_worker_deps``, which the durable ``build_function_input`` baked-image path skips.
+
+    Selection (and the ``FLASH_CHALK_SPEC`` lookup) is resolved against the EFFECTIVE worker env —
+    the run's ``[worker_env]`` merged over ``os.environ`` — so it matches exactly what the worker
+    process will see (``build_worker_env``) and a per-run ``[worker_env]`` opt-in installs chalk.
+
+    freesolo-chalk is unpublished, so there is no auto-installable default: the operator MUST set
+    ``FLASH_CHALK_SPEC`` to an installable spec (a git URL with access, or a wheel/path). When a
+    chalk kernel flag is set but ``FLASH_CHALK_SPEC`` is empty we log a warning and add nothing —
+    ``install_chalk_kernels`` then finds no chalk on the worker and safely no-ops.
+    """
+    if not _chalk_selected(spec):
+        return []
+    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip()
+    if not spec_str:
+        logger.warning(
+            "a FLASH_* chalk kernel is selected but FLASH_CHALK_SPEC is unset; freesolo-chalk is "
+            "unpublished so it can't be auto-installed — set FLASH_CHALK_SPEC to an installable "
+            "spec (git URL or wheel) or the chalk kernels will no-op on the worker."
+        )
+        return []
+    import shlex
+
+    return [d for d in shlex.split(spec_str) if d.strip()]
+
+
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
 
 _ENDPOINT_CACHE: dict[str, Any] = {}
@@ -174,19 +264,13 @@ def upload_code(repo: str | None = None) -> str:
     token = os.environ.get("HF_TOKEN")
     pkg_dir = os.path.dirname(os.path.abspath(flash.__file__))
     api = HfApi(token=token)
-    # Worker pulls code/** by HTTP; HF FREE-TIER accounts cannot serve PRIVATE dataset
-    # downloads (worker gets 403), so operators on a free tier must publish artifact repos
-    # public. Default private (paid-tier safe); set FLASH_HF_REPO_PRIVATE=0 to create public.
-    private = os.environ.get("FLASH_HF_REPO_PRIVATE", "1") not in ("0", "false", "False")
-    api.create_repo(repo, repo_type="dataset", exist_ok=True, private=private)
-    # create_repo(exist_ok=True) is a no-op on an EXISTING repo, so it never flips a repo that
-    # already exists private back to public. When the operator wants public (free-tier: workers
-    # 403 on private downloads), force visibility explicitly so a reused private repo is fixed.
-    if not private:
-        try:
-            api.update_repo_settings(repo_id=repo, repo_type="dataset", private=False)
-        except Exception as e:
-            logger.warning("could not ensure %s is public (free-tier worker may 403): %s", repo, e)
+    # Run artifact repos are always private (they carry run code, adapters, and metrics).
+    api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True)
+    # create_repo(exist_ok=True) is a no-op on an EXISTING repo, so `private=True` above does NOT
+    # change the visibility of a repo that was created earlier as public. Force private explicitly
+    # so a reused/public artifact repo can't leak run code/adapters/metrics under the always-private
+    # invariant. (Idempotent: a no-op on a repo that is already private.)
+    api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True)
     api.upload_folder(
         folder_path=pkg_dir,
         path_in_repo="code/flash",
@@ -272,19 +356,14 @@ def _train_body(input_data: dict) -> dict:
 
     env = dict(os.environ)
     env.update(overrides)
-    # A large job_spec_json (e.g. many inline params/dataset refs) can blow past the
-    # ~128 KiB per-env-string exec limit ("Argument list too long"). Pass a large spec
-    # via a file (FLASH_JOB_SPEC_PATH); keep the inline env var for small specs.
-    # load_job_spec_from_env reads either.
-    spec_json = input_data["job_spec_json"]
-    if len(spec_json) > 96_000:
-        spec_path = "/tmp/job_spec.json"
-        with open(spec_path, "w") as sf:
-            sf.write(spec_json)
-        env["FLASH_JOB_SPEC_PATH"] = spec_path
-        env.pop("FLASH_JOB_SPEC_JSON", None)
-    else:
-        env["FLASH_JOB_SPEC_JSON"] = spec_json
+    # Always pass the spec via a file (FLASH_JOB_SPEC_PATH): a large inline spec can blow past the
+    # ~128 KiB per-env-string exec limit ("Argument list too long"), and a file is ONE code path for
+    # every size (cheap write). load_job_spec_from_env reads it.
+    spec_path = "/tmp/job_spec.json"
+    with open(spec_path, "w") as sf:
+        sf.write(input_data["job_spec_json"])
+    env["FLASH_JOB_SPEC_PATH"] = spec_path
+    env.pop("FLASH_JOB_SPEC_JSON", None)
     env["PHASE"] = input_data["phase"]
     env["SEED"] = str(input_data["seed"])
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -445,11 +524,8 @@ def min_cuda_for(friendly_gpu: str) -> str:
     unsupported toolchain" on driver 570.x). CUDA-13 drivers JIT it fine, so those
     classes are pinned to >=13.0 on the modern stack (per-GPU ``min_cuda_modern`` in
     providers.base.GPU_INFO). Ampere/Ada/Hopper have SASS in the wheels and run on 12.8.
-    Override with FLASH_MIN_CUDA.
+    Fully managed per-GPU (no override).
     """
-    explicit = os.environ.get("FLASH_MIN_CUDA")
-    if explicit:
-        return explicit
     from flash.providers.base import min_cuda_modern
 
     return min_cuda_modern(friendly_gpu)
@@ -772,6 +848,14 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
         "FLASH_QUANT",
+        # W&B account routing: the API key AND the optional WANDB_ENTITY that routes runs into a
+        # team/service-account workspace. These are operator ACCOUNT config (where the dashboards
+        # land), not training tuning — without the entity, `wandb_report_to()` still enables W&B
+        # under the key's default (personal) entity, so team runs vanish from the configured
+        # workspace and service-account setups that require an explicit entity can fail. (Run TUNING
+        # is still NOT an operator env knob: flash is fully managed — every training setting uses the
+        # optimal default and the only per-run config is the spec's structured [train] fields. The
+        # worker also pins WANDB_PROJECT itself.)
         "WANDB_API_KEY",
         "WANDB_ENTITY",
         "LORA_TARGETS",
@@ -785,6 +869,26 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # to stay under HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO
         # runs share one HF_REPO; the worker no-op's a non-positive/unparseable value back to 60s.
         "FLASH_HEARTBEAT_MIN_S",
+        # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
+        # the WORKER decides which installers to run from these flags. install_chalk_kernels runs
+        # INSIDE the worker subprocess and reads them from its own process env, so a control-plane
+        # FLASH_* selection must be forwarded here or every chalk kernel silently no-ops on every
+        # remote run. FLASH_CHALK_SPEC is the install spec install_chalk_kernels points operators
+        # at (and is also consumed at submit time to add chalk to the worker's extra_pip).
+        "FLASH_MLP_KERNEL",
+        "FLASH_MLP_FP8",
+        "FLASH_MLP_FP8_DOWN",
+        "FLASH_FP8_BASE",
+        "FLASH_FP8_BASE_ATTN",
+        "FLASH_FP8_BASE_MLP",
+        "FLASH_FP8_BASE_MIN_K",
+        "FLASH_TRITON_LORA",
+        "FLASH_EMBED_KERNEL",
+        "FLASH_QKV_KERNEL",
+        "FLASH_ROPE_KERNEL",
+        # The chalk install spec itself — install_chalk_kernels warns pointing at it when a
+        # FLASH_* flag is set but chalk is absent.
+        "FLASH_CHALK_SPEC",
     ):
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
@@ -822,7 +926,11 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         "phase": spec.phase,
         "seed": int(seed),
         "env": build_worker_env(spec, seed),
-        "extra_pip": list(spec.environment.pip) or worker_pip_for_env(spec.environment.id),
+        # extra_pip is installed by the worker for EVERY job (baked-image RunPod _train_body and
+        # Vast bootstrap both pip-install it), so it's where the chalk spec must go to reach a
+        # default run — see chalk_extra_pip().
+        "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
+        + chalk_extra_pip(spec),
         "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     if log is not None:

@@ -241,8 +241,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError(
             f"gpu type {gpu_type!r} has not passed Flash's live validation smoke"
             f"{' on ' + provider if provider != 'auto' else ''} "
-            f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true "
-            f"(or FLASH_GPU_ALLOW_UNVALIDATED=1) to use it anyway."
+            f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true to use it anyway."
         )
     try:
         info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
@@ -265,6 +264,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"supports thinking mode; the run proceeds with enable_thinking=true"
         )
 
+    # worker_env is the lower-level per-run escape hatch ([worker_env] table, string-valued,
+    # secret-guarded). The optional [wandb] naming table is folded ON TOP as the standard
+    # WANDB_PROJECT / WANDB_NAME env vars the worker honors — an explicit [worker_env] value wins
+    # (setdefault), so [wandb] never clobbers one a user set directly.
     worker_env = _worker_env(raw.get("worker_env"))
     _apply_wandb_naming(raw.get("wandb"), worker_env)
 
@@ -300,6 +303,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # minimum=0 so `eval_every_steps = 0` explicitly disables (matches "0/None disables");
             # negatives are rejected.
             eval_every_steps=_train_int(train_raw, "eval_every_steps", minimum=0),
+            # How many held-out rows each mid-run eval pass scores (a fixed seeded random sample);
+            # minimum=0 so an explicit `eval_examples = 0` is accepted as the documented "use the
+            # built-in default (64)" no-op (matches TrainSpec/eval_config, which map 0/None -> 64);
+            # negatives are rejected. None -> built-in default (64).
+            eval_examples=_train_int(train_raw, "eval_examples", minimum=0),
             # SFT caps: max_steps caps optimizer steps (cheap pre-flight smoke); max_examples
             # truncates the SFT dataset. minimum=0 so an explicit 0 means "no cap" (matches the
             # TrainSpec "None/0 -> no cap" contract); the worker reads these from [train].
@@ -388,7 +396,7 @@ def _apply_wandb_naming(raw: Any, worker_env: dict[str, str]) -> None:
     W&B project under its own run name instead of the hardcoded ``flash`` / ``flash-…``
     defaults. Settable in TOML or via ``slm train cfg.toml --set wandb.project=… --set
     wandb.run_name=…``. An explicit ``[worker_env]`` value wins (it's the lower-level escape
-    hatch), so this never clobbers one a user set directly."""
+    hatch) via ``setdefault``, so this never clobbers one a user set directly."""
     if raw is None:
         return
     if not isinstance(raw, dict):

@@ -148,6 +148,30 @@ def test_missing_eval_dataset_falls_back_to_train():
     assert [r["answer"] for r in env.dataset("eval")] == ["train"]
 
 
+def test_eval_limit_pool_not_shrunk_by_env_eval_examples():
+    """A positive ``limit`` (mid-run eval materializing a pool to sample itself) must NOT also be
+    shrunk by ``[environment.params] eval_examples`` (`_fixed_subset`). Otherwise an env-params
+    eval_examples smaller than the requested limit would starve the caller's seeded sample with no
+    warning. The plain ``dataset("eval")`` path (no limit) still applies the param subset."""
+    from flash.envs.adapter import VerifiersEnvironment
+
+    class _Env:
+        rubric = None
+        parser = None
+        dataset = None
+
+        def __init__(self):
+            self.eval_dataset = [{"answer": str(i)} for i in range(50)]
+
+    # env-params eval_examples=5 (the "eval on a different env" fixed-subset knob)
+    env = VerifiersEnvironment(_Env(), "fake/env", eval_examples=5)
+    # No limit -> param subset applied (5 rows).
+    assert len(env.dataset("eval")) == 5
+    # Explicit positive limit -> caller wants the raw pool; param subset is NOT applied, so the full
+    # 50 rows are available for the caller's own sampling (here 50 < limit, so all rows return).
+    assert len(env.dataset("eval", limit=40)) == 50
+
+
 def test_install_manifest_and_worker_deps():
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["FLASH_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
