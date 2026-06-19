@@ -30,6 +30,7 @@ from autoslm.providers.runpod.gpus import flash_gpu
 from autoslm.providers.runpod.train import (
     DEFAULT_EXECUTION_TIMEOUT_MS,
     FLASH_SDK_LOCK,
+    WORKER_IMAGE,
     WORKER_SYSTEM_DEPS,
     _patch_runpod_backoff,
     _train_body,
@@ -68,16 +69,12 @@ _SETUP_HEARTBEAT_STAGES = frozenset(
 )
 
 
-def stall_kwargs_from_env() -> dict:
-    """``poll_job`` stall-window kwargs from the operator env, shared by the submit and
-    reattach paths so a recovered run uses the same tuning as the original submit.
-    ``AUTOSLM_STALL_AFTER_S`` = post-training-heartbeat window; ``AUTOSLM_SETUP_GRACE_S`` =
-    the larger cold-start window before the first training heartbeat.
+def stall_kwargs() -> dict:
+    """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
+    run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
+    window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat.
     """
-    return {
-        "stall_after_s": float(os.environ.get("AUTOSLM_STALL_AFTER_S", "1500")),
-        "setup_grace_s": float(os.environ.get("AUTOSLM_SETUP_GRACE_S", "3000")),
-    }
+    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0}
 
 
 def volume_endpoint_kwargs(spec) -> dict:
@@ -110,7 +107,7 @@ def apply_disk_gb(config, disk_gb: int | None) -> None:
 
     The Flash SDK's ``PodTemplate.containerDiskInGb`` defaults to 64 GB and the
     ``Endpoint`` wrapper exposes no disk knob, which is what blocked models whose
-    checkpoint alone exceeds 64 GB (e.g. Qwen3.6-35B-A3B at ~72 GB bf16). The template
+    checkpoint alone exceeds 64 GB. The template
     is already populated by the SDK's validators when the resource config is built, so
     raising the field here is the supported injection point. Raise-only: shrinking
     below the SDK default buys nothing (serverless disk isn't billed separately) and
@@ -163,7 +160,13 @@ def deploy_train_endpoint(
     _patch_runpod_backoff()
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
-    image = os.environ.get("AUTOSLM_WORKER_IMAGE")
+    # The baked WORKER_IMAGE is now a self-contained RunPod Serverless worker (its CMD runs
+    # rp_handler.py, which reads job["input"] and runs the training) — deploy it directly (Flash
+    # "client mode"). build_function_input then sends the payload as the job input. AUTOSLM_WORKER_IMAGE
+    # overrides the baked image (e.g. a hotfix tag); since WORKER_IMAGE is a non-empty constant the
+    # image is always set, so the boot-install/live-function path is only reachable if both are
+    # explicitly cleared (not a normal configuration).
+    image = os.environ.get("AUTOSLM_WORKER_IMAGE") or WORKER_IMAGE
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
     # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
@@ -184,12 +187,16 @@ def deploy_train_endpoint(
         if image:
             kwargs["image"] = image
         else:
-            kwargs["dependencies"] = resolve_worker_deps()
+            # Pass the resolved GPU so Hopper (sm90) gets its fla-drop treatment (resolve_worker_deps
+            # is GPU-scoped); a bare call would ship the generic deps and run fla's #640-buggy GDN
+            # Triton kernel on an H100 instead of the correct pure-PyTorch delta rule.
+            kwargs["dependencies"] = resolve_worker_deps(friendly)
             kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
         ep = Endpoint(**kwargs)
         ep._qb_target = _train_body
         config = ep._build_resource_config()
         apply_disk_gb(config, disk_gb)
+        # Worker image is PUBLIC, so no container-registry credential is needed to pull it.
         rm = ResourceManager()
         resource = asyncio.run(rm.get_or_deploy_resource(config))
     endpoint_id = getattr(resource, "id", None)
@@ -198,26 +205,45 @@ def deploy_train_endpoint(
     return endpoint_id, name
 
 
-def build_function_input(payload: dict) -> dict:
-    """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`."""
+def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict:
+    """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`.
+
+    ``friendly_gpu`` is threaded into ``resolve_worker_deps`` so the request-level dependency
+    list is GPU-scoped exactly like the endpoint config (deploy_train_endpoint): on Hopper (sm90)
+    it must drop ``flash-linear-attention`` so the worker uses the pure-PyTorch delta rule instead
+    of fla's #640-buggy GDN Triton kernel. A bare call would reinstall the generic deps and
+    reintroduce that sm90 correctness issue even when the endpoint was configured correctly.
+    """
+    if os.environ.get("AUTOSLM_WORKER_IMAGE") or WORKER_IMAGE:
+        # Baked serverless-worker image (client mode): the image's rp_handler reads job["input"]
+        # and calls _train_body, so the job input IS the train payload (submit_job wraps it in
+        # {"input": ...}). No live-function source, no boot-install deps.
+        return payload
+    # Boot-install fallback (Flash default image + live function): ship _train_body's source for the
+    # generic worker to run, plus the GPU-scoped deps to install on first use (drops fla on Hopper).
     from runpod_flash.runtime.serialization import serialize_args
     from runpod_flash.stubs.live_serverless import get_function_source
 
     source, _src_hash = get_function_source(_train_body)
-    req: dict = {
+    return {
         "function_name": "_train_body",
         "function_code": source,
         "args": serialize_args((payload,)),
         "accelerate_downloads": True,
+        "dependencies": resolve_worker_deps(canonical_gpu(friendly_gpu) if friendly_gpu else None),
+        "system_dependencies": WORKER_SYSTEM_DEPS,
     }
-    if not os.environ.get("AUTOSLM_WORKER_IMAGE"):
-        req["dependencies"] = resolve_worker_deps()
-        req["system_dependencies"] = WORKER_SYSTEM_DEPS
-    return req
 
 
 def decode_output(output) -> dict:
-    """Decode a Flash FunctionResponse job output into the worker's metrics dict."""
+    """Decode a queue-job output into the worker's metrics dict. Handles BOTH job shapes:
+
+    - Flash LIVE-function (boot-install path): a FunctionResponse envelope
+      ``{"success": True, "result": <base64 cloudpickle of the dict>}``.
+    - Client-mode SERVERLESS handler (baked-image path): our baked rp_handler returns
+      ``_train_body(...)``'s metrics dict, which RunPod surfaces as ``job["output"]`` directly —
+      no envelope. The metrics dict has no ``success``/``result`` keys, so we return it as-is.
+    """
     if isinstance(output, str):
         try:
             output = json.loads(output)
@@ -225,16 +251,30 @@ def decode_output(output) -> dict:
             raise RuntimeError(f"unexpected job output: {output[:200]}") from exc
     if not isinstance(output, dict):
         raise RuntimeError(f"unexpected job output type: {type(output)}")
-    if output.get("success") and output.get("result") is not None:
-        import cloudpickle
+    # Flash live-function envelope (has success/result/error keys).
+    if "success" in output or "result" in output:
+        if output.get("success") and output.get("result") is not None:
+            import cloudpickle
 
-        result = cloudpickle.loads(base64.b64decode(output["result"]))
-        if not isinstance(result, dict):
-            raise RuntimeError(f"flash job returned no metrics: {result!r}")
-        return result
-    err = output.get("error") or "unknown worker error"
-    stdout_tail = (output.get("stdout") or "")[-1500:]
-    raise RuntimeError(f"Remote execution failed: {err}\n--- worker stdout tail ---\n{stdout_tail}")
+            result = cloudpickle.loads(base64.b64decode(output["result"]))
+            if not isinstance(result, dict):
+                raise RuntimeError(f"flash job returned no metrics: {result!r}")
+            return result
+        err = output.get("error") or "unknown worker error"
+        stdout_tail = (output.get("stdout") or "")[-1500:]
+        raise RuntimeError(
+            f"Remote execution failed: {err}\n--- worker stdout tail ---\n{stdout_tail}"
+        )
+    # Client-mode serverless handler: the metrics dict IS the output (baked rp_handler).
+    if output.get("error"):
+        # Mirror the Flash path: append the worker stdout tail when present so poll_job's
+        # root-cause diagnostics (e.g. a vLLM crash) survive the client-mode failure shape too.
+        stdout_tail = (output.get("stdout") or "")[-1500:]
+        msg = f"Remote execution failed: {output['error']}"
+        if stdout_tail:
+            msg += f"\n--- worker stdout tail ---\n{stdout_tail}"
+        raise RuntimeError(msg)
+    return output
 
 
 def poll_job(
@@ -375,7 +415,7 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
         "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     try:
-        job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
+        job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload, spec.gpu.type))
     except Exception:
         # The endpoint is registered but no run handle exists yet, and a
         # retry endpoint's rN-suffixed name can't be reconstructed from the run
@@ -397,7 +437,7 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
-    return poll_job(handle, log=log, heartbeat_reader=reader, **stall_kwargs_from_env())
+    return poll_job(handle, log=log, heartbeat_reader=reader, **stall_kwargs())
 
 
 def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float = 45.0):
@@ -423,7 +463,7 @@ def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float =
                 hf_repo,
                 path_in_repo,
                 repo_type="dataset",
-                token=os.environ.get("HUGGINGFACE_TOKEN"),
+                token=os.environ.get("HF_TOKEN"),
                 force_download=True,
             )
             with open(p) as f:

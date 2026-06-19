@@ -14,7 +14,7 @@ Core environment variables (set by the launching provider / runner):
   SEED          int
   HF_REPO       Hugging Face dataset repo for artifacts, populated per-run from the
                 JobSpec's [train] hf_repo by whichever provider launches the worker
-  HUGGINGFACE_TOKEN
+  HF_TOKEN
   RUN_ID        unique id for this run (namespacing in the repo)
 
 The AUTOSLM_*/RL_*/SFT_* env vars are A/B overrides documented at their use sites; the
@@ -98,13 +98,9 @@ def require_active_env():
     return ACTIVE_ENV
 
 
-# Thinking/reasoning mode: one flag per run, consumed identically by SFT rendering,
-# RL rollouts, and serving. The env fallback serves the bench/no-JobSpec path.
-THINKING = (
-    JOB_SPEC.thinking
-    if JOB_SPEC
-    else os.environ.get("AUTOSLM_THINKING", "1") not in ("0", "false", "False")
-)
+# Thinking/reasoning mode: one flag per run from the run config (TOML `thinking`), consumed
+# identically by SFT rendering, RL rollouts, and serving. Defaults off without a JobSpec.
+THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +115,7 @@ def error_artifact_name(mode: str) -> str:
 def hf_api():
     from huggingface_hub import HfApi
 
-    return HfApi(token=os.environ.get("HUGGINGFACE_TOKEN"))
+    return HfApi(token=os.environ.get("HF_TOKEN"))
 
 
 def hf_prefix() -> str:
@@ -199,7 +195,7 @@ def hf_resume_checkpoint() -> str | None:
             repo_type="dataset",
             allow_patterns=[f"{hf_prefix()}/checkpoint/**"],
             local_dir="/tmp/resume",
-            token=os.environ.get("HUGGINGFACE_TOKEN"),
+            token=os.environ.get("HF_TOKEN"),
         )
         base = os.path.join("/tmp/resume", hf_prefix(), "checkpoint")
         if not os.path.isdir(base):
@@ -300,8 +296,33 @@ def make_checkpoint_upload_callback():
 # terminal done/already_done — always commits so the control plane never misses a transition.
 # The local file + stdout line are always written regardless.
 _HB_LAST_UPLOAD = 0.0
-_HB_MIN_INTERVAL_S = float(os.environ.get("AUTOSLM_HEARTBEAT_MIN_S", "60"))
+
+
+def _hb_min_interval_s() -> float:
+    """The rl_step heartbeat-upload throttle, in seconds. Operators raise AUTOSLM_HEARTBEAT_MIN_S
+    to stay under HuggingFace's 128 commits/hour-per-repo limit when several concurrent GRPO runs
+    share one HF_REPO; default 60s. A non-positive or unparseable value falls back to 60s."""
+    raw = os.environ.get("AUTOSLM_HEARTBEAT_MIN_S")
+    if raw is None:
+        return 60.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 60.0
+    return value if value > 0 else 60.0
+
+
+_HB_MIN_INTERVAL_S = _hb_min_interval_s()
 _HB_THROTTLED_STAGES = frozenset({"rl_step"})
+# Terminal transitions the control plane must never miss — always committed.
+_HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
+_HB_TERMINAL_ONLY = False
+# Even in terminal-only mode, emit a SLOW heartbeat at this cadence so the control plane's stall
+# detector (poll_vast_job stall_after_s, default 1500s) keeps seeing progress through a long
+# training phase and doesn't false-stall the run. 600s -> ~6 commits/hr, far under the 128/hr cap.
+_HB_TERMINAL_ONLY_INTERVAL_S = 600.0
+
+
 # Serializes heartbeat.json writes and _HB_LAST_UPLOAD reads/updates. During GRPO,
 # heartbeat() is called concurrently from the trainer thread (reward callback) and the
 # checkpoint-upload daemon thread; without this lock two writers can interleave and
@@ -326,28 +347,31 @@ def heartbeat(stage: str, **kw):
     }
     os.makedirs("/tmp/hb", exist_ok=True)
     p = "/tmp/hb/heartbeat.json"
-    # _HB_LOCK guards ONLY the fast local work: the atomic write, the _HB_LAST_UPLOAD
-    # read/update, AND capturing the exact bytes to upload (snapshot). The slow HF network
-    # commit happens OUTSIDE it — holding _HB_LOCK across the upload would serialize the
-    # trainer's per-step reward callback behind the checkpoint-upload daemon's commit (a
-    # perf regression during GRPO). We capture the snapshot here so the upload sends the
-    # content we claimed the slot for, never a re-read of a file a newer heartbeat may have
-    # already replaced (stale-snapshot fix).
+    # _HB_LOCK guards ONLY the fast local work (atomic write + _HB_LAST_UPLOAD + snapshot capture);
+    # the slow HF commit runs OUTSIDE it so the trainer's per-step reward callback never blocks on
+    # the network behind the checkpoint daemon's commit (a GRPO perf regression).
     with _HB_LOCK:
-        # Atomic write: write to a temp file in the same dir, then os.replace() so a
-        # concurrent reader/writer never observes a partially written heartbeat.json.
+        # Atomic write: temp file + os.replace() so a concurrent reader never sees a partial file.
         tmp = p + f".{os.getpid()}.{threading.get_ident()}.tmp"
         snapshot = json.dumps(payload)
         with open(tmp, "w") as f:
             f.write(snapshot)
         os.replace(tmp, p)
         now = time.time()
-        throttled = stage in _HB_THROTTLED_STAGES
-        upload_due = not throttled or (now - _HB_LAST_UPLOAD) >= _HB_MIN_INTERVAL_S
+        if stage in _HB_TERMINAL_STAGES or stage.startswith("error_"):
+            upload_due = True  # never miss a terminal transition
+        elif _HB_TERMINAL_ONLY:
+            # Benchmark fan-out: keep commits far under the 128/hour cap, but still emit a SLOW
+            # heartbeat (~every _HB_TERMINAL_ONLY_INTERVAL_S) so the control-plane stall detector
+            # sees progress during a long training phase and doesn't false-stall the run.
+            upload_due = (
+                _HB_LAST_UPLOAD == 0.0 or (now - _HB_LAST_UPLOAD) >= _HB_TERMINAL_ONLY_INTERVAL_S
+            )
+        else:
+            throttled = stage in _HB_THROTTLED_STAGES
+            upload_due = not throttled or (now - _HB_LAST_UPLOAD) >= _HB_MIN_INTERVAL_S
         if upload_due:
-            # Claim the upload slot under the lock so a concurrent throttled heartbeat
-            # observing the same window doesn't also fire (the throttle stays atomic).
-            _HB_LAST_UPLOAD = now
+            _HB_LAST_UPLOAD = now  # claim the slot under the lock (throttle stays atomic)
     if upload_due:
         # Serialize the network commit under a SEPARATE lock so uploads can't reorder, and
         # upload the captured snapshot (via a private temp file, since hf_upload_file takes
@@ -413,9 +437,9 @@ def _patch_peft_weight_converter_compat() -> None:
     peft's ``build_peft_weight_mapping`` reconstructs transformers ``WeightConverter``
     objects passing ``distributed_operation=`` / ``quantization_operation=`` — kwargs
     the WeightConverter in transformers <5.11 doesn't accept (init=False dataclass
-    fields), so loading a LoRA adapter onto any arch WITH weight conversions (the MoE
-    tier; dense models have none) dies with ``TypeError: unexpected keyword argument
-    'distributed_operation'`` (observed live: Qwen3.6-35B-A3B eval on A100). The
+    fields), so loading a LoRA adapter onto any arch WITH weight conversions dies with
+    ``TypeError: unexpected keyword argument 'distributed_operation'`` (observed on a
+    weight-converting checkpoint eval). The
     worker can't take transformers>=5.11 (vllm 0.19.1 compat), so accept-and-drop
     unknown kwargs; on a single GPU those fields are unused. No-op once signatures
     match.
@@ -495,9 +519,305 @@ def vllm_language_model_only_kwargs(model_id: str) -> dict:
     ("PTX compiled with unsupported toolchain") — text-only loading sidesteps it and
     is the officially supported way to run Qwen3.5 as a pure LLM.
     """
-    if os.environ.get("AUTOSLM_TEXT_ONLY", "1") in ("0", "false", "False"):
-        return {}
     return {"language_model_only": True} if is_vl_checkpoint(model_id) else {}
+
+
+def _attn_impl_for_capability(major: int, minor: int) -> str | None:
+    """Map a CUDA compute capability to the trainer ``attn_implementation``.
+
+    Attention uses PyTorch SDPA (its flash/efficient backend is already selected automatically
+    on Ampere/Ada/Hopper) — the HF Kernels-Hub FA path is disabled because the torch2.10-
+    compatible ``kernels`` versions break transformers' import. So:
+      sm120 (Blackwell consumer 5090/RTX Pro) -> "sdpa" (forced to the cuDNN backend at train
+      time — its default SDPA can fall to the slow math kernel); all other archs -> None (let
+      transformers pick SDPA, which already flash-backs on Ampere/Ada/Hopper). The big LoRA
+      win comes from the Liger fused kernels, not the attention path. Pure function (no torch)
+      so it's unit-testable on CPU; override the whole thing with AUTOSLM_ATTN_IMPL.
+    """
+    if major == 12:  # Blackwell consumer: force cuDNN SDPA (avoid the math fallback)
+        return "sdpa"
+    return None
+
+
+def _flash_attn_available() -> bool:
+    """True when the ``flash_attn`` wheel is importable (our worker image builds it from source).
+
+    Gates the packing default: TRL's ``packing_strategy='bfd'`` produces flattened/padding-free
+    batches whose example boundaries are carried by ``position_ids`` and enforced ONLY by an
+    attention impl that honors them (FlashAttention-2 varlen / flex_attention). Under plain SDPA,
+    packed examples attend ACROSS boundaries (silent quality loss). find_spec only — no import side
+    effects (and no CUDA init)."""
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("flash_attn") is not None
+    except Exception:
+        return False
+
+
+def optimal_attn_impl() -> str | None:
+    """Best ``attn_implementation`` for the live GPU (None = leave transformers' default)."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability(0)
+    except Exception as e:
+        print("optimal_attn_impl probe failed:", e)
+        return None
+    impl = _attn_impl_for_capability(major, minor)
+    if impl:
+        print(f"[attn] sm{major}{minor} -> attn_implementation={impl}")
+    return impl
+
+
+# Liger's fused linear cross-entropy is a MEMORY optimization (it never materializes the fp32
+# [B,T,vocab] logits), not a fixed-batch speed win. PR #174 ledger: on a 1B model at fixed batch
+# it is a measured NET LOSS on EVERY arch (min-of-3: A100 0.86x, H100 0.90x, RTX 3090 0.78x,
+# RTX 4090 0.83x, RTX 5090 0.79x) — the per-step Triton overhead isn't repaid because the small
+# model's logits don't dominate memory. Its value appears on LARGE models (lets a bigger batch
+# fit / avoids OOM). So gate by estimated model size.
+_LIGER_MIN_PARAMS = 3e9  # ~3B; 1B-class models measured net-negative -> Liger off below this
+
+
+def _estimate_params(cfg) -> float:
+    """Rough param count from a HF config: embeddings (+untied lm_head) + transformer blocks.
+    For multimodal checkpoints (e.g. Qwen3.5-VL) the LM dims live under ``text_config`` — read it
+    when the top-level dims are absent, else the gate underestimates and wrongly disables the
+    memory path (GC/Liger) for the 4B/9B tiers."""
+    tc = getattr(cfg, "text_config", None)
+    src = cfg if getattr(cfg, "hidden_size", 0) else (tc or cfg)
+    h = getattr(src, "hidden_size", 0) or 0
+    v = getattr(src, "vocab_size", 0) or getattr(cfg, "vocab_size", 0) or 0
+    n = getattr(src, "num_hidden_layers", 0) or 0
+    tied = getattr(src, "tie_word_embeddings", getattr(cfg, "tie_word_embeddings", False))
+    emb = v * h * (1 if tied else 2)
+    blocks = n * 12 * h * h  # ~12 h^2 per transformer block (attn + MLP)
+    return float(emb + blocks)
+
+
+def _liger_default_for_model(model_id: str) -> bool:
+    """Default Liger ON only for models large enough that fused-CE's memory win pays off
+    (≥ _LIGER_MIN_PARAMS, ~3B). 1B-class models measured net-negative -> default OFF."""
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        return _estimate_params(cfg) >= _LIGER_MIN_PARAMS
+    except Exception as e:
+        print("liger model-size probe failed (default off):", e)
+        return False
+
+
+def liger_on(default_on: bool) -> bool:
+    """Whether to enable a Liger kernel path. ``default_on`` is the model-size decision (on only
+    for models large enough that fused-CE's memory win pays off; 1B-class is a measured net loss).
+    Even when on, require a CUDA GPU AND that ``liger_kernel`` is importable — the local
+    ``autoslm-train[gpu]`` extra doesn't ship it, so blindly setting use_liger_kernel would crash a
+    local GPU run. No GPU / absent -> off."""
+    if not default_on:
+        return False
+    try:
+        import importlib.util
+
+        import torch
+
+        return bool(
+            torch.cuda.is_available() and importlib.util.find_spec("liger_kernel") is not None
+        )
+    except Exception:
+        return False
+
+
+def setup_perf_backends() -> None:
+    """Universal, arch-agnostic throughput knobs — safe on every CUDA arch, no JIT/compile cost.
+
+    - TF32 for fp32 matmuls/cuDNN (Ampere+): the residual fp32 ops in a bf16 LoRA run (some
+      norms, the optimizer's fp32 master step, any fp32 GEMM) run on the TF32 tensor cores at
+      ~no accuracy cost. No-op on pre-Ampere.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        torch.set_float32_matmul_precision("high")  # TF32 for fp32 matmuls
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("[perf] TF32 matmul/cuDNN enabled")
+    except Exception as e:
+        print("setup_perf_backends skipped:", e)
+
+
+def finalize_alloc_conf_for_sleep() -> None:
+    """Sync the CUDA allocator conf with the worker's RESOLVED vLLM sleep default.
+
+    The launcher (providers/*/train.py build_worker_env) must pick PYTORCH_ALLOC_CONF before this
+    process starts, but it can't always know the GRPO sleep decision: for a small model with
+    RL_VLLM_SLEEP unset the worker resolves sleep OFF (the speed default), yet the launcher
+    conservatively assumes sleep ON and picks the non-expandable conf (safe, but fragments a long
+    colocate run). When the launcher cedes the decision (it sets AUTOSLM_ALLOC_AUTO=1 — only when
+    it applied a DEFAULT, never an operator override), we resolve the same sleep default here (we
+    have the model config + GPU) and, if sleep is OFF, switch to expandable_segments — which only
+    crashes WITH sleep on, a case we've just ruled out. PYTORCH_ALLOC_CONF is read lazily at the
+    first CUDA allocation, so this must run before any allocation (it does — called at boot)."""
+    if os.environ.get("AUTOSLM_ALLOC_AUTO") != "1":
+        return
+    try:
+        model_id = os.environ.get("BENCH_HF_MODEL", "")
+        # Resolve the GRPO context the SAME way the sleep gate does (run_rl): the run's
+        # [train].max_length, so a long-context run gets the right sleep default + alloc conf.
+        _spec_len = 0
+        try:
+            if JOB_SPEC and JOB_SPEC.train and JOB_SPEC.train.max_length:
+                _spec_len = int(JOB_SPEC.train.max_length)
+        except Exception:
+            _spec_len = 0
+        ctx = int(_spec_len or 0)
+        if not _memory_mode(model_id, ctx):  # sleep resolves OFF -> expandable is safe + better
+            conf = "expandable_segments:True"
+            os.environ["PYTORCH_ALLOC_CONF"] = conf
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = conf
+            print(f"[alloc] sleep resolves OFF -> {conf} (anti-fragmentation, matches worker gate)")
+        else:
+            print("[alloc] sleep resolves ON -> keeping launcher's non-expandable conf")
+    except Exception as e:
+        print("[alloc] auto-conf skipped:", e)
+
+
+def _remove_fla_from_disk() -> tuple[list[str], bool]:
+    """Physically delete every importable ``fla`` package dir from the worker's REAL sys.path.
+
+    Loops until ``find_spec('fla')`` is clean (removing one copy can expose another further down
+    the path) and invalidates import caches so transformers' is_fla_available() probe sees it
+    gone. ``pip uninstall`` alone is unreliable here — it targets one site-packages but the base
+    image bakes ``fla`` into another dir on the path (and can report success while leaving the
+    package dir). Returns ``(removed_dirs, still_importable)``. Used by the Hopper auto-drop.
+    """
+    import importlib
+    import importlib.util
+    import shutil
+
+    removed: list[str] = []
+    for _ in range(6):  # a few passes: removing one copy can reveal another earlier on the path
+        importlib.invalidate_caches()
+        spec = importlib.util.find_spec("fla")
+        if spec is None:
+            break
+        # Resolve the package directory (submodule_search_locations for a package, else the file dir).
+        locs = list(getattr(spec, "submodule_search_locations", None) or [])
+        if not locs and spec.origin:
+            locs = [os.path.dirname(spec.origin)]
+        progressed = False
+        for loc in locs:
+            if loc and os.path.isdir(loc) and os.path.basename(loc.rstrip("/")) == "fla":
+                try:
+                    shutil.rmtree(loc)
+                    removed.append(loc)
+                    progressed = True
+                except Exception as e:
+                    print(f"[fla] could not remove {loc}: {e}", flush=True)
+        if not progressed:
+            break
+    importlib.invalidate_caches()
+    return removed, importlib.util.find_spec("fla") is not None
+
+
+# Long-context runs are memory-bound (activations + vLLM KV cache scale with sequence length), so
+# they need the memory features even on a SMALL model — PR #174 measured a 1B model OOM on GRPO at
+# 4096 ctx in speed mode, but it fits in memory mode. So "memory mode" = large model OR long ctx.
+_LONG_CONTEXT_TOKENS = 2048
+
+
+def _memory_mode(model_id: str, max_length: int = 0) -> bool:
+    """Whether to default the memory-saving features (Liger, grad-checkpointing, vLLM sleep) ON:
+    a large model (fused-CE memory win) OR a long context (activations/KV dominate). Small model +
+    short context -> off (optimize for speed)."""
+    if max_length and max_length >= _LONG_CONTEXT_TOKENS:
+        return True
+    return _liger_default_for_model(model_id)
+
+
+def grad_checkpointing_on(model_id: str, max_length: int = 0) -> bool:
+    """Gradient checkpointing recomputes the forward in backward (~25% slower) to save activation
+    memory — a MEMORY feature, not speed. ON for large models / long context that need the
+    headroom; OFF for small+short runs that fit without it (the speed win)."""
+    return _memory_mode(model_id, max_length)
+
+
+def fused_optim_name() -> str:
+    """TRL/HF ``optim`` value: 8-bit paged AdamW (bitsandbytes int8 optimizer state paged to host
+    RAM). It fits a smaller/cheaper GPU and is the better default across the catalog."""
+    return "paged_adamw_8bit"
+
+
+def wandb_report_to() -> list[str]:
+    """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
+    but the autoslm migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
+    (silent, the metrics.json artifact is still the source of truth). Sets a default project so runs
+    land in one place."""
+    if not os.environ.get("WANDB_API_KEY"):
+        return []
+    import importlib.util
+
+    if importlib.util.find_spec("wandb") is None:
+        print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
+        return []
+    os.environ.setdefault("WANDB_PROJECT", "autoslm")
+    return ["wandb"]
+
+
+def wandb_run_name() -> str:
+    """Stable, human-readable W&B run name tying the dashboard run to the AutoSLM run id."""
+    return f"autoslm-{PHASE}-{RUN_ID}-seed{SEED}"
+
+
+def wandb_run_info() -> dict:
+    """The live W&B run's {url, id, project} if W&B is active, else {}. Recorded in metrics.json so
+    the W&B run is verifiable + the freesolo agent's `wandb_runs` / the SDK's link_wandb can point at
+    the real dashboard URL — the link the autoslm migration otherwise dropped. Never raises."""
+    try:
+        import wandb
+
+        run = getattr(wandb, "run", None)
+        if run is None:
+            return {}
+        return {
+            "wandb_url": getattr(run, "url", None),
+            "wandb_id": getattr(run, "id", None),
+            "wandb_project": getattr(run, "project", None),
+        }
+    except Exception:
+        return {}
+
+
+def _sdpa_cudnn_ctx(attn_impl: str | None):
+    """Context forcing the cuDNN SDPA backend (real Blackwell-consumer kernels) when we fell
+    back to plain SDPA on sm120; a no-op context otherwise. Best-effort."""
+    if attn_impl != "sdpa":
+        return contextlib.nullcontext()
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        # Priority-ordered: prefer the fast cuDNN/flash/efficient kernels, but ALWAYS include MATH
+        # as the final fallback. Restricting to only [CUDNN, EFFICIENT] makes sm120 GRPO crash with
+        # "RuntimeError: No available kernel" when neither has a kernel for the completion-batch
+        # attention shape (MEASURED: Qwen3.5 GRPO on RTX 5090). MATH is universal, so the candidate
+        # set is never empty; set_priority keeps cuDNN first whenever it CAN serve the shape (SFT
+        # fast path unchanged), only falling through for the shapes cuDNN/efficient reject.
+        return sdpa_kernel(
+            [
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ],
+            set_priority=True,
+        )
+    except Exception as e:
+        print("[attn] cuDNN SDPA backend unavailable, using default SDPA:", e)
+        return contextlib.nullcontext()
 
 
 def patch_vllm_language_model_only(model_id: str) -> bool:
@@ -535,7 +855,17 @@ def make_lora(model_id: str | None = None):
     ``lora_exclude_modules``)."""
     from peft import LoraConfig
 
-    targets = os.environ.get("LORA_TARGETS", "all-linear")
+    # PEFT target_modules accepts the special string "all-linear" OR a LIST of module-name
+    # suffixes. A comma-separated env (e.g. "q_proj,k_proj,v_proj,o_proj" to adapt attention only
+    # and leave the MoE experts frozen) MUST be split into a list — else PEFT treats the whole
+    # string as ONE module name and raises "Target modules ... not found in the base model".
+    _parts = [
+        t.strip() for t in os.environ.get("LORA_TARGETS", "all-linear").split(",") if t.strip()
+    ]
+    # "all-linear" is a PEFT SPECIAL string, not a module name — keep it as a string (incl. when a
+    # stray trailing comma made it the sole element, e.g. "all-linear," -> ["all-linear"]). Any
+    # real multi-module value becomes a list of suffixes.
+    targets = "all-linear" if (not _parts or _parts == ["all-linear"]) else _parts
     rank = JOB_SPEC.train.lora_rank if JOB_SPEC else RECIPE.lora.rank
     alpha = JOB_SPEC.train.lora_alpha if JOB_SPEC else RECIPE.lora.alpha
     kwargs = {
@@ -545,6 +875,15 @@ def make_lora(model_id: str | None = None):
         "target_modules": targets,
         "task_type": "CAUSAL_LM",
     }
+    # Adapter initialization (convergence lever, always-on: measured -35% train loss in A/B
+    # (gpu-bench)). PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds)
+    # so LoRA converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
+    # NOTE: PiSSA mutates the effective base, so the saved adapter is a PiSSA-residual unless
+    # converted — fine for our train+eval+serve-same-stack flow.
+    kwargs["init_lora_weights"] = "pissa_niter_16"
+    # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
+    kwargs["use_rslora"] = True
+    print("[lora] init_lora_weights=pissa_niter_16, rsLoRA scaling enabled")
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
         if exclude:
@@ -569,58 +908,21 @@ def model_quant(model_id: str) -> str:
     return "bf16"
 
 
-def quant_weights_repo(model_id: str) -> str:
-    """Pre-quantized weights repo for the QLoRA tier (or "" to quantize at load).
-
-    AUTOSLM_QUANT_REPO env (A/B / one-off override) > catalog ``quant_repo``. The
-    returned repo is what the trainer loads; the tokenizer/chat template still come
-    from the base ``model_id``.
-    """
-    env_repo = os.environ.get("AUTOSLM_QUANT_REPO")
-    if env_repo:
-        return env_repo
-    try:
-        from autoslm.catalog import MODELS
-
-        info = MODELS.get(model_id)
-        return getattr(info, "quant_repo", "") if info else ""
-    except Exception as e:
-        print("quant_weights_repo: catalog probe failed:", e)
-        return ""
-
-
-def resolve_weights_id(model_id: str) -> str:
-    """Weights repo the trainer should load for ``model_id``.
-
-    For the 4bit-qlora tier this is the pre-quantized export when one exists (~3.5x
-    smaller download/disk); otherwise the base ``model_id``. The tokenizer/chat template
-    always come from the base ``model_id``. ``prequantized`` is then ``weights_id != model_id``.
-    """
-    if model_quant(model_id) == "4bit-qlora":
-        return quant_weights_repo(model_id) or model_id
-    return model_id
-
-
-def qlora_model_init_kwargs(prequantized: bool = False) -> dict:
-    """Model-load kwargs for the 4-bit QLoRA tier (large MoEs on one consumer GPU).
-
-    ``prequantized``: the checkpoint already carries a bitsandbytes quantization
-    config (a ``quant_repo``), so we must not pass a second BitsAndBytesConfig —
-    transformers would ignore the checkpoint's and warn.
-    """
+def qlora_model_init_kwargs() -> dict:
+    """Model-load kwargs for the 4-bit QLoRA tier: bf16 compute + a bitsandbytes NF4
+    (double-quant) config so the frozen base loads in 4-bit and only the LoRA adapter trains."""
     import torch
+    from transformers import BitsAndBytesConfig
 
-    kwargs: dict = {"dtype": torch.bfloat16}
-    if not prequantized:
-        from transformers import BitsAndBytesConfig
-
-        kwargs["quantization_config"] = BitsAndBytesConfig(
+    return {
+        "dtype": torch.bfloat16,
+        "quantization_config": BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
-        )
-    return kwargs
+        ),
+    }
 
 
 def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_id: str) -> None:
@@ -628,15 +930,15 @@ def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_
 
     The multi-turn rollout closure (``multiturn_rollout.build_rollout_func``) drives generation
     through ``trainer.vllm_generation.llm``. TRL only creates that engine when ``use_vllm`` is
-    True, so with vLLM disabled (catalog ``grpo_use_vllm=False`` — e.g. the MoE 35B tier — or
-    ``RL_USE_VLLM=0``) the rollout would AttributeError at the first turn. Reject the combination
-    up front with an actionable message instead of crashing deep in training.
+    True, so with vLLM disabled the rollout would AttributeError at the first turn. GRPO now always
+    colocates vLLM (``use_vllm`` is unconditionally True), so this guard is defensive — keep it to
+    fail fast with an actionable message should a future tier disable the rollout engine.
     """
     if use_rollout_func and not use_vllm:
         raise RuntimeError(
-            f"multi-turn GRPO needs colocated vLLM, which is disabled for {model_id} "
-            "(grpo_use_vllm=False / RL_USE_VLLM=0). Use a single-turn environment for this "
-            "model, or a model tier that keeps vLLM enabled for rollouts."
+            f"multi-turn GRPO needs colocated vLLM, which is disabled for {model_id}. "
+            "Use a single-turn environment for this model, or a model tier that keeps "
+            "vLLM enabled for rollouts."
         )
 
 
@@ -660,11 +962,9 @@ def run_sft():
             "single-turn environment, or expect a single-turn-only fit."
         )
     wait_for_gpu()
+    setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
-    # QLoRA tier may load a pre-quantized export (~3.5x smaller download/disk);
-    # the tokenizer below still comes from the base id.
-    weights_id = resolve_weights_id(model_id)
-    download_seconds = prefetch_model(weights_id)
+    download_seconds = prefetch_model(model_id)
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -673,7 +973,11 @@ def run_sft():
     train = ACTIVE_ENV.dataset("train")
     rng = random.Random(SEED)
     rng.shuffle(train)
-    max_examples = int(os.environ.get("SFT_MAX_EXAMPLES", "0"))
+    max_examples = int(
+        JOB_SPEC.train.max_examples or 0
+        if JOB_SPEC and JOB_SPEC.train and JOB_SPEC.train.max_examples is not None
+        else 0
+    )
     if max_examples > 0:
         train = train[:max_examples]
     texts = []
@@ -728,8 +1032,8 @@ def run_sft():
     out_dir = f"/tmp/sft_seed{SEED}"
     resume_ckpt = hf_resume_checkpoint()
 
-    # SFT_MAX_STEPS>0 caps optimizer steps (used by the cheap pre-flight smoke).
-    max_steps = int(os.environ.get("SFT_MAX_STEPS", "0"))
+    # [train].max_steps>0 caps optimizer steps (used by the cheap pre-flight smoke).
+    max_steps = int(_t.max_steps or 0 if _t and _t.max_steps is not None else 0)
     cfg_kwargs = {
         "output_dir": out_dir,
         "num_train_epochs": epochs,
@@ -738,47 +1042,149 @@ def run_sft():
         "learning_rate": sft_lr,
         "warmup_ratio": RECIPE.sft.warmup_frac,
         "logging_steps": 10,
-        "save_steps": int(os.environ.get("SFT_SAVE_STEPS", str(sft_save_default))),
+        "save_steps": sft_save_default,
         "save_total_limit": 1,
+        # Memory-light checkpoints: save ONLY the (small LoRA) model, not the optimizer /
+        # scheduler / RNG state — skips the optimizer-state serialization spike at save and
+        # writes just the adapter. (We don't resume mid-run; seeds restart cleanly.)
+        "save_only_model": True,
         "max_length": sft_max_len,
         "bf16": True,
-        "report_to": [],
+        "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-autoslm-migration)
+        "run_name": wandb_run_name(),
+        # Dataloader parallelism: overlap host-side collation/tokenization with GPU compute so a
+        # real (large) training set isn't dataloader-bound. Pure throughput, zero quality change.
+        # Negligible on the tiny benchmark (pre-tokenized, in-memory); a real win at production
+        # dataset sizes.
+        "dataloader_num_workers": 4,
+        "dataloader_pin_memory": True,
+        "dataloader_persistent_workers": True,
         "seed": SEED,
-        "gradient_checkpointing": True,
+        "gradient_checkpointing": grad_checkpointing_on(model_id, sft_max_len),
+        # Non-reentrant checkpointing: composes cleanly with autograd hooks (verl #3629) and is
+        # required by TRL for correct grad flow through the LoRA adapters.
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
         "completion_only_loss": False,
+        # Optimizer: 8-bit paged AdamW (int8 state paged to host RAM -> fits a smaller GPU).
+        "optim": fused_optim_name(),
     }
     if max_steps > 0:
         cfg_kwargs["max_steps"] = max_steps
-    # A/B-gated throughput knobs (default off until the live A/B shows a win):
-    # SFT_PACKING=1 packs short examples into full max_length sequences (GSM8K targets
-    # are far shorter than max_seq_len, so unpacked batches are mostly pad tokens).
-    if os.environ.get("SFT_PACKING", "0") not in ("0", "false"):
+    # Example packing: concatenate short examples into full max_length sequences so a batch isn't
+    # mostly pad tokens — PR #174 measured a 4.4-10.7x SFT speedup (h100 8.2x, 4090 10.7x) because
+    # instruction targets are far shorter than max_seq_len; unpacked batches waste most of their
+    # FLOPs on padding. TRL's 'bfd' strategy makes padding-free batches whose example boundaries are
+    # honored ONLY by an attention impl that reads them — under plain SDPA packed examples
+    # cross-contaminate (silent quality loss). The boundary-correct backend is FlashAttention-2
+    # varlen (reads position_ids); but flash-attn has NO prebuilt wheel for torch 2.10 (PyPI
+    # sdist-only; Dao-AILab wheels stop at torch 2.9) so it would build from source on every cold
+    # start (~20 min, fragile) — it is NOT in the worker image. So _fa_ok is False on the current
+    # stack and packing is effectively unavailable until flash-attn is baked into a prebuilt image.
+    # Default: packing ON when FA2 is importable; else SKIP (don't silently cross-contaminate).
+    # SFT_PACKING=0 disables; SFT_PACKING=1 forces (bfd under SDPA, with the contamination warning).
+    _packing_env = os.environ.get("SFT_PACKING")
+    _want_packing = (_packing_env or "1") not in ("0", "false", "False")
+    _packing_forced = _packing_env not in (None, "")
+    _fa_ok = _flash_attn_available()
+    if _want_packing and _fa_ok:
         cfg_kwargs["packing"] = True
-        print("[sft] packing enabled (SFT_PACKING)")
-    # SFT_LIGER=1 swaps in Liger's fused CE/RMSNorm/RoPE kernels (needs the
-    # liger-kernel package on the worker: AUTOSLM_WORKER_EXTRA_DEPS=liger-kernel).
-    if os.environ.get("SFT_LIGER", "0") not in ("0", "false"):
+        print("[sft] example packing enabled (FA2 varlen; SFT_PACKING=0 to disable)")
+    elif _want_packing and _packing_forced:
+        cfg_kwargs["packing"] = True
+        print(
+            "[sft] WARNING: packing forced without FA2 — 'bfd' boundaries need varlen; "
+            "examples may cross-contaminate under SDPA. Set SFT_PACKING=0 to disable."
+        )
+    elif _want_packing:
+        print(
+            "[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
+            "2.10). Bake flash-attn into the worker image to enable FA2 varlen packing."
+        )
+    # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
+    # cross-entropy is the big large-vocab (Qwen ~152k) memory/throughput win.
+    if liger_on(_memory_mode(model_id, sft_max_len)):
         cfg_kwargs["use_liger_kernel"] = True
-        print("[sft] liger kernels enabled (SFT_LIGER)")
+        print("[sft] liger fused kernels enabled")
+    _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
+    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen attn.
+    # With FA2 importable force flash_attention_2 — a pure win over the SDPA default which would
+    # cross-contaminate packed examples.
+    if cfg_kwargs.get("packing") and _fa_ok:
+        _attn = "flash_attention_2"
+        print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
     quant = model_quant(model_id)
     if quant == "4bit-qlora":
-        # Large-MoE tier: 4-bit NF4 base + LoRA adapters (e.g. Qwen3.6-35B-A3B on a 5090).
-        _patch_peft_weight_converter_compat()  # MoE adapter (re)load, e.g. ckpt resume
-        cfg_kwargs["model_init_kwargs"] = qlora_model_init_kwargs(
-            prequantized=weights_id != model_id
-        )
-        print(f"[sft] loading {weights_id} in 4-bit (QLoRA tier)")
+        # QLoRA tier: 4-bit NF4 base + bf16 LoRA adapters (e.g. Qwen3.5-9B on a 5090).
+        _patch_peft_weight_converter_compat()  # adapter (re)load, e.g. ckpt resume
+        mik = qlora_model_init_kwargs()
+        print(f"[sft] loading {model_id} in 4-bit (QLoRA tier)")
     else:
         # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
         # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
         # accelerate-offload large models to meta ("expected device meta but got
         # cuda:0" in backward on the 9B).
-        cfg_kwargs["model_init_kwargs"] = {"dtype": "bfloat16", "device_map": None}
+        mik = {"dtype": "bfloat16", "device_map": None}
+    if _attn:
+        mik["attn_implementation"] = _attn
+    cfg_kwargs["model_init_kwargs"] = mik
     cfg = TRLSFTConfig(**cfg_kwargs)
+
+    # LoRA+ (convergence lever, arXiv 2402.12354; always-on: measured -52% train loss in A/B
+    # (gpu-bench)): give the LoRA B matrices a higher LR than A (ratio 16). Reported ~2x fewer steps
+    # to target at identical per-step FLOPs. TRL builds the model from a string inside __init__, so
+    # the optimizer (which needs the instantiated params) can't be pre-built — override
+    # create_optimizer to construct it from self.model once it exists.
+    _lp_ratio = 16
+    _SFT = SFTTrainer
+    if _lp_ratio > 1:
+
+        class _SFT(SFTTrainer):  # local LoRA+ subclass
+            def create_optimizer(self):
+                if self.optimizer is None:
+                    try:
+                        from peft.optimizers import create_loraplus_optimizer
+                        from transformers import Trainer as _HFTrainer
+
+                        # Respect the configured `optim` (the QLoRA tier sets paged_adamw_8bit so
+                        # bitsandbytes pages int8 optimizer state to host RAM — hardcoding plain
+                        # torch AdamW here would OOM 4-bit runs). Resolve the optimizer class +
+                        # kwargs from self.args exactly as the HF Trainer would, then build it via
+                        # LoRA+ so the B-matrix LR ratio still applies on top of the right optimizer.
+                        optimizer_cls, optimizer_kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(
+                            self.args, self.model
+                        )
+                        # LoRA+ assigns the lr per param-group, so drop any class-level lr; pass it
+                        # explicitly. The lr keyword name has shifted across PEFT versions, so pass
+                        # it via optimizer_kwargs (the stable form) and fall back to a top-level lr=.
+                        optimizer_kwargs.pop("lr", None)
+                        try:
+                            self.optimizer = create_loraplus_optimizer(
+                                model=self.model,
+                                optimizer_cls=optimizer_cls,
+                                optimizer_kwargs={**optimizer_kwargs, "lr": self.args.learning_rate},
+                                loraplus_lr_ratio=_lp_ratio,
+                            )
+                        except TypeError:
+                            self.optimizer = create_loraplus_optimizer(
+                                model=self.model,
+                                optimizer_cls=optimizer_cls,
+                                lr=self.args.learning_rate,
+                                loraplus_lr_ratio=_lp_ratio,
+                                **optimizer_kwargs,
+                            )
+                        print(
+                            f"[lora+] optimizer enabled (B-matrix LR ratio={_lp_ratio}, "
+                            f"optim={self.args.optim})"
+                        )
+                        return self.optimizer
+                    except Exception as e:  # never block training on the LoRA+ wiring
+                        print("[lora+] setup failed, falling back to default optimizer:", e)
+                return super().create_optimizer()
+
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
-    trainer = SFTTrainer(
-        model=weights_id,
+    trainer = _SFT(
+        model=model_id,
         args=cfg,
         train_dataset=ds,
         peft_config=make_lora(model_id),
@@ -787,7 +1193,8 @@ def run_sft():
     )
 
     t_train = time.time()
-    trainer.train(resume_from_checkpoint=resume_ckpt)
+    with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+        trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
 
     adapter_dir = f"{out_dir}/adapter"
@@ -814,6 +1221,12 @@ def run_sft():
             "download_seconds": download_seconds,
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "thinking": THINKING,
+            # Persist the loss curve so a CONVERGENCE A/B (PiSSA / LoRA+ init, etc.) is measurable
+            # without a checkpoint: trainer_state.json is only written on a save_step, and the
+            # console is only uploaded on failure, so a short successful run otherwise drops its
+            # loss history entirely.
+            "loss_curve": _metric_curve(trainer, "loss"),
+            **wandb_run_info(),
         },
     )
     free_gpu(trainer)
@@ -871,17 +1284,52 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     }
 
 
-def rl_per_device_comps() -> int:
+def rl_per_device_comps(
+    completion_len: int = 0,
+    vocab: int = 152_000,
+    *,
+    use_vllm: bool = True,
+    params_b: float | None = None,
+) -> int:
     """Per-device *completion* micro-batch for GRPO (TRL counts completions, not prompts).
 
-    This, not grad-accum, sets peak trainer VRAM: the logprob pass materializes
-    fp32 logits of shape [per_device, seq_len, vocab]. At Qwen's ~152k vocab a
-    2048-token thinking sequence is ~1.25 GiB per completion — micro-batch 8 OOMs a
-    24 GB card (observed live: 6.96 GiB single alloc on an RTX 4090), so thinking
-    runs default to 2. compute_grpo_batching puts the difference into grad-accum,
-    leaving the effective batch unchanged. RL_PER_DEVICE_PROMPTS overrides.
+    This, not grad-accum, sets peak trainer VRAM: the logprob pass materializes fp32 logits
+    of shape [per_device, completion_len, vocab]. At Qwen's ~152k vocab a long completion is
+    enormous (measured: per_device 8 x 4096 tok x 152k x 4 B = ~20 GiB single alloc -> OOMs
+    a small card). So we MEMORY-CAP per_device to a logits budget (RL_LOGITS_BUDGET_GB,
+    default 6) for the given completion length, then push the difference into grad-accum
+    (compute_grpo_batching) so the effective batch is unchanged. This keeps long-completion
+    GRPO on a cheaper GPU. RL_PER_DEVICE_PROMPTS forces an explicit value.
+
+    The logits budget is NOT the whole story: the per-device forward also holds the model's
+    attention/activation memory (the Qwen3.5 GDN/FLA kernels peak per micro-batch even with
+    grad checkpointing), which the logits term can't see. Under colocated vLLM (the rollout
+    engine + its card-sized KV pool + a 2nd weight copy share the GPU) that activation peak is
+    what OOMs a small card -- and Liger, which fuses away the logits, does NOT touch it.
+    MEASURED: Qwen3.5-2B (width ~1.41) group8 seq2048 OOMs a 32 GB card at per_device=8 but
+    TRAINS at 4. So for colocate, additionally cap per_device to the live card's VRAM scaled
+    by model width (~sqrt(params)): ~vram_gb/8 at 2B-width, tightened for wider models (4B/9B).
     """
-    return int(os.environ.get("RL_PER_DEVICE_PROMPTS", "2" if THINKING else "8"))
+    base = int(os.environ.get("RL_PER_DEVICE_PROMPTS", "2" if THINKING else "8"))
+    if "RL_PER_DEVICE_PROMPTS" in os.environ:
+        # Explicit operator force (A/B knob): bypass BOTH auto-caps -- they own the OOM risk.
+        return max(1, base)
+    if completion_len > 0:
+        budget = float(os.environ.get("RL_LOGITS_BUDGET_GB", "6")) * 1e9
+        cap = max(1, int(budget / (max(1, completion_len) * vocab * 4)))
+        base = min(base, cap)
+    if use_vllm:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                width = (max(float(params_b), 0.1) ** 0.5) if params_b else 1.41
+                act_cap = max(1, int(vram_gb / (7.5 * (width / 1.41))))
+                base = min(base, act_cap)
+        except Exception as e:
+            print("rl_per_device_comps colocate cap probe failed (keeping logits cap):", e)
+    return max(1, base)
 
 
 def make_reward_heartbeat_callback():
@@ -930,7 +1378,7 @@ def _maybe_attach_periodic_eval(
 
     Every N optimizer steps it greedily evaluates the policy on a FIXED held-out split and
     streams the result via ``heartbeat("rl_eval", ...)`` so the agent gets a live eval curve
-    between steps. Evaluation distinct from the reward comes from the env's zero-weight rubric
+    between steps. Evaluation distinct from the reward comes from the env's eval-metric rubric
     metrics (``rubric.add_metric``), surfaced via the adapter's ``evaluate``.
 
     Generation uses the TRAINER'S model (``trainer.model.generate``), NOT the colocate vLLM
@@ -952,6 +1400,23 @@ def _maybe_attach_periodic_eval(
         print("[rl][eval] mid-run eval is not supported for tool envs in v1; skipping")
         return None
     env = require_active_env()
+    # Mid-run eval is a HELD-OUT generalization signal: if the env has no DISTINCT eval split, skip
+    # it entirely (fail fast) rather than falling back to training rows — scoring train data and
+    # surfacing it as an eval curve is misleading. A missing split disables eval, not the training.
+    # has_eval_split() can itself raise (e.g. a separate Hub eval env whose get_eval_dataset returns
+    # None and eval_dataset is then accessed); like the materialize step below, a broken probe must
+    # disable eval, never abort the paid training run.
+    try:
+        _has_eval_split = getattr(env, "has_eval_split", lambda: True)()
+    except Exception as exc:
+        print(f"[rl][eval] has_eval_split() failed ({exc}); skipping mid-run eval")
+        return None
+    if not _has_eval_split:
+        print(
+            "[rl][eval] env has no held-out eval split; skipping mid-run eval "
+            "(refusing to fall back to training rows)"
+        )
+        return None
     # Materializing the eval split can raise (e.g. a separate Hub eval env whose get_eval_dataset
     # fails) — this runs at training start, so a raise here would abort the whole paid run. Guard
     # it: a broken eval split disables mid-run eval, never the training.
@@ -967,16 +1432,6 @@ def _maybe_attach_periodic_eval(
     if not examples:
         print("[rl][eval] env exposes no eval examples; skipping mid-run eval")
         return None
-    # When the env has no DISTINCT eval split, the adapter falls back to train rows — warn AND
-    # record it (eval_on_train) so the persisted eval_history is flagged, not silently read as
-    # held-out generalization when it's actually training data.
-    eval_on_train = not getattr(env, "has_eval_split", lambda: True)()
-    if eval_on_train:
-        print(
-            "[rl][eval] WARNING: env has no held-out eval split; mid-run eval runs on "
-            "TRAIN-derived rows (rl_eval reflects training data, not generalization)"
-        )
-
     def _render_messages(messages, add_generation_prompt):
         text = tok.apply_chat_template(
             messages,
@@ -1017,7 +1472,6 @@ def _maybe_attach_periodic_eval(
         heartbeat_fn=heartbeat,
         pass_threshold=pass_threshold,
         on_warn=print,
-        eval_on_train=eval_on_train,
     )
     # Resolve the live model lazily at eval time (it's the trainer's own model, always present).
     periodic.bind_model_getter(lambda: getattr(trainer, "model", None))
@@ -1096,12 +1550,22 @@ def _init_adapter_model(model_id: str):
     # bitsandbytes vLLM rollout).
     if model_quant(model_id) == "4bit-qlora":
         _patch_peft_weight_converter_compat()
+        _attn = optimal_attn_impl()  # arch-aware attention on the QLoRA path too
+        _mik = qlora_model_init_kwargs()
+        if _attn:  # else leave transformers' default (sdpa)
+            _mik["attn_implementation"] = _attn
         base = AutoModelForCausalLM.from_pretrained(
-            model_id, trust_remote_code=True, **qlora_model_init_kwargs()
+            model_id,
+            trust_remote_code=True,
+            **_mik,
         )
     else:
+        _attn = optimal_attn_impl()
         base = AutoModelForCausalLM.from_pretrained(
-            model_id, dtype="bfloat16", trust_remote_code=True
+            model_id,
+            dtype="bfloat16",
+            trust_remote_code=True,
+            **({"attn_implementation": _attn} if _attn else {}),
         )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
     return model, None
@@ -1128,12 +1592,11 @@ def run_rl():
     is_multi_turn = getattr(ACTIVE_ENV, "multi_turn", False)
     conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
     wait_for_gpu()
+    setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
-    # QLoRA tier: prefetch a pre-quantized export when one exists (~3.5x smaller), else the
-    # base bf16 checkpoint (vLLM/transformers quantize it to 4-bit NF4 at load).
+    # QLoRA tier loads the base bf16 checkpoint; vLLM/transformers quantize it to 4-bit NF4 at load.
     quant = model_quant(model_id)
-    weights_id = resolve_weights_id(model_id)
-    download_seconds = prefetch_model(weights_id)
+    download_seconds = prefetch_model(model_id)
     rl = RECIPE.rl
     steps = int(os.environ.get("RL_STEPS", str(rl.num_steps)))
     # Throughput/quality knobs (env-overridable): the number of prompts optimized per step,
@@ -1144,9 +1607,9 @@ def run_rl():
     gcfg = grpo_overrides()
     _t = JOB_SPEC.train if JOB_SPEC else None
     # batch_size = prompts per optimizer step for GRPO.
-    _pps_default = _t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step
-    prompts_per_step = int(os.environ.get("RL_PROMPTS_PER_STEP", str(_pps_default)))
-    group_size = int(os.environ.get("RL_GROUP_SIZE", gcfg.get("group_size") or rl.group_size))
+    # prompts per optimizer step = the run config's [train].batch_size (recipe default otherwise).
+    prompts_per_step = int(_t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step)
+    group_size = int(gcfg.get("group_size") or rl.group_size)
     # temperature: explicit None check, NOT `or` — a configured 0.0 (greedy/deterministic
     # rollouts) must be honored, not fall back to the recipe sampling temperature.
     _gcfg_temp = gcfg.get("temperature")
@@ -1154,20 +1617,26 @@ def run_rl():
     _kl_beta = float(gcfg.get("kl_penalty_coef") or 0.0)
     _adv_clip = float(gcfg.get("advantage_clip") or 0.0)
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
-    sleep_mode = os.environ.get("RL_VLLM_SLEEP", "1") not in ("0", "false", "False")
-    # Rollout backend: colocated vLLM (fast) unless the catalog disables it for this model
-    # (e.g. fused-MoE tiers whose experts bnb can't 4-bit, so a 2nd vLLM copy won't fit one
-    # GPU) — then TRL generates with the trainer model via transformers. Env RL_USE_VLLM wins.
+    # vLLM sleep mode offloads the rollout engine's weights between steps to free memory for the
+    # optimizer, but reloading each step is a large per-step cost — PR #174 measured ~2-2.6x faster
+    # GRPO with it OFF on models that fit. Default it by model size (same small=speed / large=memory
+    # gate as gradient checkpointing): OFF for small/fitting models, ON for large. RL_VLLM_SLEEP wins.
+    _sleep_env = os.environ.get("RL_VLLM_SLEEP")
+    if _sleep_env is not None:
+        sleep_mode = _sleep_env not in ("0", "false", "False")
+    else:
+        # Gate on the GRPO rollout context (the run's [train].max_length sizes the engine + KV
+        # cache): a long-context GRPO run is memory-tight and needs sleep mode. Matches the
+        # liger-loss gate below.
+        _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
+        sleep_mode = _memory_mode(model_id, _grpo_ctx)
+    # Rollout backend: always colocated vLLM (fast). The whole supported catalog runs GRPO with
+    # colocated vLLM; there is no transformers-generation fallback.
+    use_vllm = True
+    print("[rl] rollout backend: colocated vLLM")
     from autoslm.catalog import MODELS as _CATALOG
 
     _info = _CATALOG.get(model_id)
-    _catalog_use_vllm = _info.grpo_use_vllm if _info is not None else True
-    use_vllm = os.environ.get("RL_USE_VLLM", "1" if _catalog_use_vllm else "0") not in (
-        "0",
-        "false",
-        "False",
-    )
-    print(f"[rl] rollout backend: {'colocated vLLM' if use_vllm else 'transformers generation'}")
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -1182,26 +1651,26 @@ def run_rl():
     else:
         prompts = [{"prompt": render_prompt(tok, ex), "example": ex} for ex in train]
     # The colocated vLLM engine's model length is the hard cap on prompt+completion at
-    # rollout. Size it (honoring RL_VLLM_MAX_LEN) and derive the prompt budget from it so a
+    # rollout. Size it from [train].max_length and derive the prompt budget from it so a
     # bigger engine or a smaller completion automatically admits longer prompts (rather than
     # a fixed rl.max_prompt_len that no env override could lift).
     _max_completion = int(
-        os.environ.get(
-            "RL_MAX_COMPLETION",
-            gcfg.get("max_tokens")
-            or (rl.max_completion_len_thinking if THINKING else rl.max_completion_len),
-        )
+        gcfg.get("max_tokens")
+        or (rl.max_completion_len_thinking if THINKING else rl.max_completion_len)
     )
-    vllm_max_len = int(
-        os.environ.get("RL_VLLM_MAX_LEN", str(max(1024, rl.max_prompt_len + _max_completion)))
-    )
-    # The engine must fit completion + at least some prompt. If RL_VLLM_MAX_LEN is set below
-    # the completion budget, no prompt can ever fit — fail fast here rather than passing a
-    # 1-token budget that lets prompts through and then OOMs/overflows mid-rollout.
+    # Engine context = the run's [train].max_length (so a long-context GRPO config sized/paid for
+    # by the allocator actually RUNS at that length), else the recipe default. Without the
+    # train.max_length fallback the allocator provisions a big GPU for the long context but the
+    # engine runs short — paying for headroom we never use.
+    _train_ctx = _t.max_length if (_t and _t.max_length) else 0
+    vllm_max_len = int(_train_ctx or max(1024, rl.max_prompt_len + _max_completion))
+    # The engine must fit completion + at least some prompt. If [train].max_length is below the
+    # completion budget, no prompt can ever fit — fail fast here rather than passing a 1-token
+    # budget that lets prompts through and then OOMs/overflows mid-rollout.
     if vllm_max_len <= _max_completion:
         raise ValueError(
-            f"RL_VLLM_MAX_LEN={vllm_max_len} leaves no room for the {_max_completion}-token "
-            "completion; raise RL_VLLM_MAX_LEN or lower RL_MAX_COMPLETION"
+            f"engine length {vllm_max_len} leaves no room for the {_max_completion}-token "
+            "completion; raise [train].max_length or lower [train].max_tokens"
         )
     prompt_budget = vllm_max_len - _max_completion
 
@@ -1255,8 +1724,8 @@ def run_rl():
     if not kept:
         raise ValueError(
             f"every training prompt exceeds the {prompt_budget}-token prompt budget (engine "
-            f"{vllm_max_len} - completion {_max_completion}); raise RL_VLLM_MAX_LEN, lower "
-            "RL_MAX_COMPLETION, or shorten the environment's prompts"
+            f"{vllm_max_len} - completion {_max_completion}); raise [train].max_length, lower "
+            "[train].max_tokens, or shorten the environment's prompts"
         )
     prompts = kept
     ds = Dataset.from_list(prompts)
@@ -1286,7 +1755,16 @@ def run_rl():
     # the global completion batch = prompts_per_step * group_size, i.e. each optimizer step
     # actually optimizes `prompts_per_step` prompts. The per-device *completion* micro-batch
     # is the VRAM knob (thinking-aware; see rl_per_device_comps).
-    per_device_comps = rl_per_device_comps()
+    from autoslm.engine.vram import fetch_hf_params_b, params_b_from_str
+
+    _params_b = params_b_from_str(getattr(_info, "params", None)) if _info else None
+    # Open-model (uncataloged) GRPO: _info carries no param count, so size the colocate
+    # activation cap from the HF safetensors metadata (no download). Without this, a large
+    # open model falls back to the ~2B-width default in rl_per_device_comps and gets too LOOSE
+    # a per-device cap -> colocate OOM. Best-effort: stays None offline, keeping prior behavior.
+    if _params_b is None:
+        _params_b = fetch_hf_params_b(model_id)
+    per_device_comps = rl_per_device_comps(_max_completion, use_vllm=use_vllm, params_b=_params_b)
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
         print("WARN: generation batch not divisible by group size; check RL_PER_DEVICE_PROMPTS")
@@ -1317,16 +1795,19 @@ def run_rl():
         "top_p": rl.sampling_top_p,
         "use_vllm": use_vllm,
         "logging_steps": 1,
-        "save_steps": int(
-            os.environ.get(
-                "RL_SAVE_STEPS", str(_t.save_every if _t and _t.save_every is not None else 20)
-            )
-        ),
+        "save_steps": _t.save_every if _t and _t.save_every is not None else 20,
         "save_total_limit": 1,
+        # Memory-light checkpoints: adapter only, no optimizer/scheduler/RNG state -> no
+        # serialization spike at save (the save-step OOM guard).
+        "save_only_model": True,
         "bf16": True,
-        "report_to": [],
+        "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-autoslm-migration)
+        "run_name": wandb_run_name(),
         "seed": SEED,
-        "gradient_checkpointing": True,
+        "gradient_checkpointing": grad_checkpointing_on(model_id, vllm_max_len),
+        # Non-reentrant checkpointing: the modern path that composes correctly with autograd
+        # saved-tensor hooks and avoids the reentrant path's extra graph retention. (verl #3629.)
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
         # Pin a stable, well-conditioned GRPO recipe instead of inheriting TRL's defaults
         # (which on a short run suppress the lift): constant LR (TRL default 'linear' decays
         # to 0 over the run), advantages centered by group mean only (no std scaling, which
@@ -1338,7 +1819,20 @@ def run_rl():
         "beta": _kl_beta,
         "scale_rewards": "none",
         "loss_type": "dr_grpo",
+        # Optimizer: 8-bit paged AdamW (int8 state paged to host RAM -> fits a smaller GPU);
+        # colocated GRPO (trainer + vLLM on one GPU) is memory-tight, so this is the right default.
+        "optim": fused_optim_name(),
     }
+    # Liger fused GRPO loss: fuses the lm_head + per-token logprob so the fp32
+    # [batch, seq, ~152k vocab] logits never materialize — the documented GRPO OOM driver.
+    # TRL 1.6's GRPOConfig flag is `use_liger_kernel` (NOT `use_liger_loss`, which doesn't
+    # exist in 1.6). DEFAULT ON for the GRPO path regardless of model size: MEASURED that
+    # WITHOUT it even Qwen3.5-0.8B GRPO OOMs a 24 GB (and 32 GB) card because the per-completion
+    # logits over the 152k vocab dominate — the small-scale JIT cost is far cheaper than the OOM.
+    # (This differs from SFT, where Liger is gated by size since 1B-class SFT can be net-negative.)
+    if liger_on(True):
+        grpo_kwargs["use_liger_kernel"] = True
+        print("[rl] liger fused GRPO loss enabled")
     if use_vllm:
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
@@ -1349,6 +1843,48 @@ def run_rl():
             vllm_max_model_length=vllm_max_len,
             vllm_gpu_memory_utilization=float(os.environ.get("RL_VLLM_GPU_UTIL", "0.45")),
             vllm_enable_sleep_mode=sleep_mode,
+        )
+        # Rollout-memory + throughput knobs, applied ONLY if this TRL exposes the field (so an
+        # older TRL never crashes on an unknown kwarg). All verl-validated for GRPO colocate (#174).
+        _grpo_fields = set(getattr(GRPOConfig, "__dataclass_fields__", {}))
+
+        def _set_vllm_field(names, value, label):
+            for _f in names:
+                if _f in _grpo_fields:
+                    grpo_kwargs[_f] = value
+                    print(f"[rl] {label} ({_f}={value})")
+                    return True
+            return False
+
+        # fp8 KV cache only where the silicon has native fp8 (compute capability >= 8.9: Ada /
+        # Hopper / Blackwell) — ~halves the rollout KV pool. Ampere (A100/A5000/3090, sm80) lacks
+        # fp8, so it stays fp16 there (forcing it on would error / silently emulate).
+        try:
+            import torch as _torch
+
+            _want_fp8 = _torch.cuda.get_device_capability() >= (8, 9)
+        except Exception:
+            _want_fp8 = False
+        if _want_fp8:
+            _set_vllm_field(("vllm_kv_cache_dtype", "kv_cache_dtype"), "fp8", "fp8 KV cache")
+        # PREFIX CACHING: every GRPO group of `num_generations` rollouts shares the SAME prompt
+        # prefix, so caching the prompt KV computes it once and reuses it — the dominant rollout win
+        # on one GPU. CHUNKED PREFILL interleaves prefill with decode so a long prompt doesn't stall
+        # the batch. CUDAGRAPH MODE sets verl's full-graph-decode + piecewise-fallback rollout mode.
+        _set_vllm_field(
+            ("vllm_enable_prefix_caching", "enable_prefix_caching"),
+            True,
+            "vLLM prefix caching (shared GRPO prompt KV reuse)",
+        )
+        _set_vllm_field(
+            ("vllm_enable_chunked_prefill", "enable_chunked_prefill"),
+            True,
+            "vLLM chunked prefill",
+        )
+        _set_vllm_field(
+            ("vllm_compilation_config", "compilation_config"),
+            {"cudagraph_mode": "FULL_AND_PIECEWISE"},
+            "vLLM cudagraph_mode (verl rollout default)",
         )
     # Adapter init: continue training the SFT adapter (peft_config=None, model is the
     # loaded PeftModel) when train.init_from_adapter is set, else a fresh LoRA on the
@@ -1362,15 +1898,18 @@ def run_rl():
         # quantization="bitsandbytes" (so a 36B MoE fits an 80 GB GPU in 4-bit on both the
         # trainer and rollout sides). Otherwise force bf16 (TRL string-loading can fall
         # back to fp32 and double VRAM).
+        _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
         if quant == "4bit-qlora":
-            _patch_peft_weight_converter_compat()  # MoE adapter (re)load compatibility
-            grpo_kwargs["model_init_kwargs"] = qlora_model_init_kwargs(
-                prequantized=weights_id != model_id
-            )
+            _patch_peft_weight_converter_compat()  # adapter (re)load compatibility
+            grpo_kwargs["model_init_kwargs"] = qlora_model_init_kwargs()
             _vllm_note = "; vLLM rollout -> bitsandbytes" if use_vllm else ""
             print(f"[rl] loading {model_id} in 4-bit (QLoRA tier){_vllm_note}")
         else:
             grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
+        if _attn:
+            grpo_kwargs["model_init_kwargs"]["attn_implementation"] = _attn
+    else:
+        _attn = optimal_attn_impl()
     # stop_sequences: TRL forwards generation_kwargs to the (vLLM) sampler, whose
     # SamplingParams.stop truncates each rollout at the requested delimiter — so the reward
     # sees the same completion the config intends, instead of generating to max_completion.
@@ -1381,6 +1920,21 @@ def run_rl():
     # centered) and surface a note when a config asks for an explicit clamp.
     if _adv_clip > 0:
         print(f"[rl] advantage_clip={_adv_clip} recorded; TRL centers advantages (no value clip)")
+    # num_iterations (the one promoted GRPO speed lever, measured 1.38x faster) is feature-detected
+    # so an older TRL that lacks the field is simply skipped (GRPOConfig rejects unknown kwargs).
+    # Generation dominates GRPO wall-clock, so reusing each rollout batch for 2 optimizer steps is
+    # the cheapest large speedup; mu=2 is the standard GRPO config and TRL's importance-sampling
+    # correction (on by default) keeps the step stable. (The GSPO/DAPO A/B levers were dropped: the
+    # framework-scan in gpu-bench/RESEARCH_FINDINGS.md measured no robust win over baseline.)
+    import dataclasses as _dc
+
+    try:
+        _grpo_fields = {f.name for f in _dc.fields(GRPOConfig)}
+    except TypeError:
+        _grpo_fields = set()  # not a dataclass on this TRL -> skip the feature-detected knob
+    if "num_iterations" in _grpo_fields:
+        grpo_kwargs["num_iterations"] = 2
+        print("[rl] rollout amortization: num_iterations=2 (reuse each generation batch)")
     cfg = GRPOConfig(**grpo_kwargs)
     setup_seconds = time.time() - t_start
     heartbeat("rl_train_start", setup_seconds=setup_seconds)
@@ -1457,7 +2011,8 @@ def run_rl():
         max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
     )
     t_train = time.time()
-    trainer.train(resume_from_checkpoint=resume_ckpt)
+    with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
+        trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     reward_history = list(getattr(hb_cb, "reward_history", []))
     # Final eval on the actually-saved policy: the cadence only fires on multiples of
@@ -1467,7 +2022,6 @@ def run_rl():
     if periodic_eval is not None:
         periodic_eval.run_final(int(getattr(trainer.state, "global_step", 0) or 0))
     eval_history = periodic_eval.history_records() if periodic_eval is not None else []
-    eval_on_train = bool(getattr(periodic_eval, "eval_on_train", False))
 
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
@@ -1493,14 +2047,12 @@ def run_rl():
             "download_seconds": download_seconds,
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,
+            "loss_curve": _metric_curve(trainer, "loss"),
+            **wandb_run_info(),
             # The mid-run eval curve (per [train] eval_every_steps): each entry has step,
             # eval_reward, eval_pass_rate, and eval_metrics{}. Empty when eval is off. The agent
             # reads this to judge the run on held-out EVAL quality, not just the training reward.
             "eval_history": eval_history,
-            # True when the env had no held-out eval split and eval_history was computed on
-            # TRAIN-derived rows — so it is NOT held-out generalization. Agents must not read
-            # eval_history as held-out when this is set.
-            "eval_on_train_fallback": eval_on_train,
             "gen_tokens_is_upper_bound": True,
             "thinking": THINKING,
             "max_completion_len": _max_completion,
@@ -1601,6 +2153,18 @@ def free_gpu(trainer=None):
         print("free_gpu warn:", e)
 
 
+def _metric_curve(trainer, key: str, cap: int = 400) -> list:
+    """The logged values of `key` (e.g. 'loss' or 'reward') from the trainer's log history,
+    rounded + capped. Lets metrics.json carry the convergence/reward curve for an A/B without
+    relying on a checkpoint's trainer_state.json (only written on save_steps) or the console
+    (only uploaded on failure). Never raises."""
+    try:
+        vals = [round(float(h[key]), 4) for h in trainer.state.log_history if key in h]
+        return vals[:cap]
+    except Exception:
+        return []
+
+
 def write_train_meta(
     phase, adapter_dir, model_id, train_wall, setup_seconds, train_tokens, generated_tokens, notes
 ):
@@ -1662,7 +2226,7 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
         repo_type="dataset",
         allow_patterns=[f"{adapter_prefix}/adapter/*"],
         local_dir="/tmp/evdl",
-        token=os.environ.get("HUGGINGFACE_TOKEN"),
+        token=os.environ.get("HF_TOKEN"),
     )
     adir = os.path.join("/tmp/evdl", adapter_prefix, "adapter")
     return adir if os.path.isdir(adir) else None
@@ -1680,11 +2244,53 @@ def _finalize(metrics: RunMetrics, adapter_dir: str):
     print("NODE DONE:", metrics.to_json())
 
 
+def _drop_fla_on_hopper() -> None:
+    """Remove flash-linear-attention when running on a Hopper GPU (sm90, H100).
+
+    fla's gated chunk_bwd Triton kernel is miscomputed on Hopper with Triton>=3.4 and
+    HARD-RAISES (fla #640), so every gated-delta (Qwen3.5/3.6 family) GRPO backward crashes.
+    The worker base image BAKES fla in, and per-run installs (extra_pip / `prime env install`)
+    can pull it back, so the only reliable place to drop it is HERE: in the worker process,
+    after all installs and BEFORE any model import. transformers then uses the correct
+    pure-PyTorch delta rule (2-3x slower but it RUNS). Runs on BOTH substrates (RunPod and
+    Vast both exec this module). importlib caches are invalidated so the later
+    is_fla_available() probe sees it gone. Ampere/Ada/Blackwell keep fla for the speedup.
+    """
+    import importlib.util
+    import subprocess
+
+    try:
+        import torch
+
+        if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
+            return  # not Hopper: fla's Triton kernel is correct here, keep it.
+    except Exception:
+        return
+
+    if importlib.util.find_spec("fla") is None:
+        return
+    # pip first (clears metadata); _remove_fla_from_disk then deletes any package dir pip left
+    # behind (incomplete RECORD / non-pip base-image install / a copy on another sys.path entry).
+    subprocess.run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "flash-linear-attention"], check=False
+    )
+    removed, still = _remove_fla_from_disk()
+    print(
+        f"[hopper] fla removed {removed or 'nothing'} (still_importable={still}) -> "
+        f"{'WARNING fla remains' if still else 'pure-PyTorch delta rule'} (fla #640)",
+        flush=True,
+    )
+
+
 def main():
     # Idempotency: if DONE was already uploaded, a re-delivered job re-fetches the final
     # metrics from HF and returns them immediately. (The previous behavior — sleeping in
     # an infinite loop — kept a billable GPU worker alive until the execution timeout.)
     try:
+        # Idempotency FIRST — before any env-mutating pip install / package removal: a re-delivered
+        # job whose DONE already exists must return the persisted metrics and exit WITHOUT running
+        # _drop_fla_on_hopper() (pip-uninstalls fla) — that wasted a worker mutating its env on an
+        # already-complete run. It is called after the DONE check below (see _drop_fla_on_hopper()).
         if HF_REPO:
             from huggingface_hub import hf_hub_download
 
@@ -1693,7 +2299,7 @@ def main():
                     repo_id=HF_REPO,
                     repo_type="dataset",
                     filename=f"{hf_prefix()}/DONE",
-                    token=os.environ.get("HUGGINGFACE_TOKEN"),
+                    token=os.environ.get("HF_TOKEN"),
                 )
                 done = True
             except Exception:
@@ -1706,7 +2312,7 @@ def main():
                         repo_id=HF_REPO,
                         repo_type="dataset",
                         filename=f"{hf_prefix()}/metrics.json",
-                        token=os.environ.get("HUGGINGFACE_TOKEN"),
+                        token=os.environ.get("HF_TOKEN"),
                     )
                     import shutil
 
@@ -1715,7 +2321,10 @@ def main():
                     os._exit(0)
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
+        # Not a DONE re-delivery -> this worker will train. These must run before any model import:
+        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
         heartbeat("boot")
+        finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
             "sft": run_sft,  # SFT (TRL SFTTrainer)

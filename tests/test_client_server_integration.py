@@ -79,7 +79,7 @@ def make_client(tmp_path, monkeypatch):
     control-plane app via a ``urllib`` -> ``TestClient`` shim."""
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
     monkeypatch.setenv("PRIME_API_KEY", "pit-test")
-    monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf-test")
+    monkeypatch.setenv("HF_TOKEN", "hf-test")
 
     import autoslm.runner as runner
     import autoslm.server.auth as auth_mod

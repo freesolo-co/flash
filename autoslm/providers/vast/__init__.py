@@ -85,7 +85,7 @@ class VastProvider:
         # (see jobs.py), mirroring RunPod's reattach (runpod/__init__.py). Vast has no
         # server-side execution timeout, so a recovered run that dropped the client-side
         # deadline could bill unbounded.
-        stall = float(os.environ.get("AUTOSLM_STALL_AFTER_S", "1500"))
+        stall = 1500.0
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + 1800
         return poll_vast_job(
             vh,

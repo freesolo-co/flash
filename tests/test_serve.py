@@ -29,6 +29,23 @@ def test_deploy_dry_run():
     assert d["endpoint_name"] == "autoslm-serve-4090-r1"  # per-run endpoint
 
 
+def test_deploy_qlora_dry_run_is_not_rejected():
+    """A QLoRA tier (9B) is deployable: it serves the bf16 base + LoRA via --enable-lora just like
+    a bf16 tier (vLLM folds the bf16 LoRA delta into the bf16 base at load), instead of being
+    rejected up front. Dry-run resolves a Deployment instead of raising."""
+    from autoslm.serve.deploy import deploy_adapter
+
+    dep = deploy_adapter(
+        run_id="q1",
+        model="Qwen/Qwen3.5-9B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/q1/seed0",
+        gpu_name="RTX 5090",
+        dry_run=True,
+    )
+    assert dep.to_dict()["state"] == "dry_run"
+
+
 def test_deploy_rejects_unsupported_gpu():
     from autoslm.providers.base import UnsupportedGpuError
     from autoslm.serve.deploy import deploy_adapter

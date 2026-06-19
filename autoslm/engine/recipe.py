@@ -60,12 +60,16 @@ class SFTConfig:
 @dataclass(frozen=True)
 class RLConfig:
     learning_rate: float = 1e-5
-    max_prompt_len: int = 512
+    # Default engine prompt budget. 512 was too small for real envs with non-trivial system
+    # prompts (e.g. a schema/instructions block + the user query), which made every prompt
+    # overflow before training started. 2048 fits typical instruction prompts; the run's
+    # [train].max_length sets the engine length explicitly when it needs more/less.
+    max_prompt_len: int = 2048
     max_completion_len: int = 320
     # Thinking-mode completion budget: <think> blocks consume most of it (phase 0
     # showed 320 is hopeless — every completion hit the cap). 1536 is a consumer-GPU
     # compromise (KV cache + rollout cost scale linearly with completion length, ~5x
-    # tokens/step vs non-thinking); RL_MAX_COMPLETION remains the escape hatch.
+    # tokens/step vs non-thinking); the run's [train].max_tokens overrides it explicitly.
     max_completion_len_thinking: int = 1536
     prompts_per_step: int = 64
     group_size: int = 8  # G completions per prompt

@@ -23,8 +23,7 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 
 - `autoslm/catalog.py` — curated model catalog (Qwen3 dense supported tier;
   Qwen3.5/3.6 experimental tier) + `model_policy = "allow"` VRAM-fit check + each
-  model's `thinking` capability (opt-in reasoning mode `thinking = true`; see
-  [docs/config-reference.md](docs/config-reference.md#thinking-mode-thinking--true))
+  model's `thinking` capability (opt-in reasoning mode `thinking = true`)
 - `autoslm/schema.py`, `autoslm/spec.py` — TOML → `JobSpec`
 - `autoslm/runner.py` — server-side run supervisor (durable job handle,
   retries, cost guard, endpoint GC)
@@ -56,9 +55,8 @@ uv run slm --help
 uv run autoslm-server                      # control plane (operator-side, run once)
 ```
 
-The control plane owns provider credentials (`RUNPOD_API_KEY` and/or
-`VAST_API_KEY`, plus `HUGGINGFACE_TOKEN`); the artifact repo is per-run (the run TOML's
-`[train] hf_repo`), not an operator-wide env var. Clients authenticate with their
-freesolo API key (`slm login`). See `docs/config-reference.md` for the run TOML schema,
-`docs/algorithms.md` for choosing and tuning SFT/GRPO, and
-`docs/environments.md` for authoring a task.
+The control plane owns provider credentials: `RUNPOD_API_KEY` is always required
+(RunPod is the default substrate), `VAST_API_KEY` is opt-in (only checked when set),
+plus the shared `HF_TOKEN` (the legacy `HUGGINGFACE_TOKEN` name is still accepted).
+The artifact repo is per-run (the run TOML's `[train] hf_repo`), not an
+operator-wide env var. Clients authenticate with their freesolo API key (`slm login`).

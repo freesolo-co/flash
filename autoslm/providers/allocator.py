@@ -21,9 +21,6 @@ Vast classes come from a live offer book (collected through the provider's
 
 from __future__ import annotations
 
-import math
-import os
-
 from autoslm._logging import get_logger
 from autoslm.providers import PROVIDER_NAMES, available_providers, get_provider
 from autoslm.providers.base import (
@@ -38,29 +35,40 @@ logger = get_logger(__name__)
 
 # "Comfortably" = the open-model VRAM estimate plus headroom, so a full SFT+GRPO run
 # never lands in check_fit's "tight" band by construction. Curated catalog entries
-# already carry measured minimums and are used as-is.
-VRAM_HEADROOM = float(os.environ.get("AUTOSLM_VRAM_HEADROOM", "1.15"))
+# already carry measured minimums and are used as-is. The headroom (default 1.1 ==
+# model_required_vram_gb's own default) is read at call time via vram_headroom() so allocate()
+# and resolve_gpu_policy size identically and pick up a value exported after import.
 
 
-def required_vram_gb(model_id: str, algorithm: str) -> int:
-    """VRAM the full run needs. Catalog entries carry measured minimums; open models
-    get the coarse estimate sized for GRPO (the heavier phase of the usual SFT+GRPO
-    pipeline) plus headroom. Unknown sizes fall back to the 24 GB tier (same as
-    ``resolve_gpu_policy``)."""
-    from autoslm.catalog import catalog_min_vram_gb
+def vram_headroom() -> float:
+    """The sizing headroom multiplier, honored by both the submit-time allocator and the
+    parse-time resolve_gpu_policy so they never disagree (PR #176 review). A validated constant."""
+    return 1.1
 
-    # Catalog entries carry measured minimums (shared with the parse-time
-    # resolve_gpu_policy via catalog.catalog_min_vram_gb, incl. the grpo floor).
-    catalog_vram = catalog_min_vram_gb(model_id, algorithm)
-    if catalog_vram is not None:
-        return catalog_vram
-    from autoslm.engine.vram import estimate_vram_gb, fetch_hf_params_b
 
-    params_b = fetch_hf_params_b(model_id)
-    if params_b is None:
-        return 24
-    sizing_algo = algorithm if os.environ.get("AUTOSLM_SIZE_FOR_ALGO") == "job" else "grpo"
-    return math.ceil(estimate_vram_gb(params_b, sizing_algo) * VRAM_HEADROOM)
+def required_vram_gb(
+    model_id: str,
+    algorithm: str,
+    *,
+    train=None,
+    thinking: bool = False,
+) -> int:
+    """VRAM the full run needs, sized to the run's actual knobs (context length, LoRA
+    rank, batch / group size, thinking) via the shared ``model_required_vram_gb`` matrix.
+
+    Catalog GRPO floors stay hard floors (never under-provision a validated model); the
+    matrix sizes up from there for big contexts/groups and down to a cheaper card for
+    small runs. Unlisted open models size from HF metadata, falling back to the 24 GB tier
+    when unreadable (handled inside model_required_vram_gb)."""
+    from autoslm.engine.vram import model_required_vram_gb
+
+    return model_required_vram_gb(
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        headroom=vram_headroom(),
+    )
 
 
 def _runpod_candidates(need: int, pinned_gpu: str | None, allow_unval: bool) -> list[Candidate]:
@@ -149,11 +157,15 @@ def allocate(
     disk_gb: int = 60,
     allow_unvalidated: bool | None = None,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
+    train=None,
+    thinking: bool = False,
 ) -> Allocation:
     """Pick the cheapest (provider, GPU class) able to run the job across providers.
 
     ``gpu`` pins the class (the allocator then only picks the provider); ``provider``
     pins the substrate ("auto"/"runpod"/"vast"). Both default to fully automatic.
+    ``train``/``thinking`` size the requirement to the run's actual knobs (context, group,
+    rank, batch) via the matrix — long context / large group route up, small runs down.
     """
     if provider not in ("auto", *PROVIDER_NAMES):
         raise UnsupportedGpuError(
@@ -164,7 +176,7 @@ def allocate(
     # pin (e.g. Qwen3-8B on a 24 GB card) must drop out of the candidate filter and
     # raise here, not provision a paid worker that OOMs. The pin only narrows WHICH
     # fitting class is chosen, never lowers the VRAM bar.
-    need = required_vram_gb(model_id, algorithm)
+    need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
     allow_unval = unvalidated_allowed(allow_unvalidated)
     live = available_providers()
     if provider != "auto" and provider not in live:
@@ -173,29 +185,49 @@ def allocate(
             f"(available: {', '.join(live) or '(none)'}; vast needs VAST_API_KEY)"
         )
 
-    candidates: list[Candidate] = []
-    offer_book: tuple = ()
-    if provider in ("auto", "runpod") and "runpod" in live:
-        candidates += _runpod_candidates(need, pinned_gpu, allow_unval)
-    if provider in ("auto", "vast") and "vast" in live:
-        vast_cands, offer_book = _vast_candidates(
-            need,
-            pinned_gpu,
-            allow_unval,
-            disk_gb,
-            exclude_machine_ids,
-            required=(provider == "vast"),
-        )
-        candidates += vast_cands
+    def _gather(pin: str | None) -> tuple[list[Candidate], tuple]:
+        cands: list[Candidate] = []
+        book: tuple = ()
+        if provider in ("auto", "runpod") and "runpod" in live:
+            cands += _runpod_candidates(need, pin, allow_unval)
+        if provider in ("auto", "vast") and "vast" in live:
+            vcands, book = _vast_candidates(
+                need, pin, allow_unval, disk_gb, exclude_machine_ids, required=(provider == "vast")
+            )
+            cands += vcands
+        return cands, book
 
+    candidates, offer_book = _gather(pinned_gpu)
+    # NEVER hard-fail on availability: a pin that no live provider can serve (the class isn't
+    # offered right now, or is below ``need`` so it's filtered out) escalates to the cheapest
+    # FITTING class across providers instead of raising -- "one spot larger, and so on". The
+    # ``need`` floor is still absolute (we never drop below it -> no OOM), and the pin is only a
+    # preference. We only raise when NOTHING >= need is available anywhere (truly unsatisfiable).
+    escalated_from = None
+    if not candidates and pinned_gpu is not None:
+        escalated_from = pinned_gpu
+        candidates, offer_book = _gather(None)
     if not candidates:
-        constraint = (
-            f"gpu pinned to {pinned_gpu}" if pinned_gpu else f">= {need} GB VRAM for {model_id}"
-        )
         raise UnsupportedGpuError(
-            f"no allocatable GPU ({constraint}, provider={provider}, "
-            f"validated_only={not allow_unval}); widen with gpu.allow_unvalidated = true "
-            f"or a different gpu.type/provider"
+            f"no allocatable GPU (>= {need} GB VRAM for {model_id}, provider={provider}, "
+            f"validated_only={not allow_unval}); widen with gpu.allow_unvalidated = true, add a "
+            f"provider (VAST_API_KEY), or the run genuinely exceeds every available GPU class"
+        )
+    if escalated_from is not None:
+        order0 = {n: i for i, n in enumerate(PROVIDER_NAMES)}
+        _cheapest = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, order0.get(c.provider, 99)))[0]
+        # WARNING level so it surfaces at default `slm train` verbosity (configure_logging is
+        # WARNING) — a silently-escalated pin changes cost/hardware and operators must see it;
+        # still routed through the logger (stderr), so machine-readable stdout stays clean.
+        logger.warning(
+            "pinned GPU %r unavailable or below need (%s GB) on provider=%s; "
+            "escalated to cheapest fitting class %s (%s GB, %s)",
+            escalated_from,
+            need,
+            provider,
+            _cheapest.gpu,
+            _cheapest.vram_gb,
+            _cheapest.provider,
         )
     # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small
     # job), then registry order (runpod is the longest-validated substrate).

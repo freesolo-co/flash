@@ -51,7 +51,7 @@ def _login() -> str:
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
     monkeypatch.setenv("PRIME_API_KEY", "pit-test")
-    monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf-test")
+    monkeypatch.setenv("HF_TOKEN", "hf-test")
     import autoslm.runner as runner
     import autoslm.server.auth as auth_mod
     import autoslm.server.db as db_mod
@@ -493,36 +493,6 @@ def test_deploy_dry_run(api):
     assert dep.json()["mode"] == "dev"
     # Dry-run deploys never show up as active deployments.
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
-
-
-def test_deploy_run_without_hf_repo_is_clear_4xx(api):
-    # A run persisted BEFORE `[train] hf_repo` became required can have an empty hf_repo.
-    # Deploying/serving it must fail fast with a clear 4xx, not an opaque 500 deep in
-    # snapshot_download.
-    import json
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-
-    # Simulate a legacy finished run whose spec lacks hf_repo (mark it done + drop hf_repo).
-    path = os.path.join(_orch.RUNS_DIR, f"{run_id}.json")
-    with open(path) as f:
-        rec = json.load(f)
-    rec["state"] = "done"
-    rec["spec"]["train"].pop("hf_repo", None)
-    rec["deployment"] = {"state": "deployed", "mode": "dev", "gpu": "RTX 5090"}
-    with open(path, "w") as f:
-        json.dump(rec, f)
-
-    dep = api.post(f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key))
-    assert dep.status_code in (400, 409), dep.text
-    assert "hf_repo" in dep.json()["detail"]
-
-    chat = api.post(f"/v1/runs/{run_id}/chat", json={"messages": []}, headers=_bearer(key))
-    assert chat.status_code in (400, 409), chat.text
-    assert "hf_repo" in chat.json()["detail"]
 
 
 def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):

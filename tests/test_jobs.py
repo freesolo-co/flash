@@ -39,6 +39,30 @@ def test_decode_output_error_includes_stdout_tail():
     assert "boom" in str(ei.value)
 
 
+def test_decode_output_client_mode_serverless_handler():
+    """Baked-image path: the serverless rp_handler returns the metrics dict directly (RunPod
+    surfaces it as job["output"]), with no Flash success/result envelope — return it as-is."""
+    from autoslm.providers.runpod.jobs import decode_output
+
+    metrics = {"trained_eval_acc": 0.87, "train_wall": 12.3, "cost_usd": 0.04}
+    assert decode_output(metrics) == metrics
+    # a client-mode error surfaces as an error key
+    with pytest.raises(RuntimeError):
+        decode_output({"error": "handler blew up"})
+
+
+def test_decode_output_client_mode_error_includes_stdout_tail():
+    """Client-mode failures must also carry the worker stdout tail (poll_job root-causes
+    crashes from it) — same as the Flash envelope path."""
+    from autoslm.providers.runpod.jobs import decode_output
+
+    with pytest.raises(RuntimeError) as ei:
+        decode_output({"error": "vllm crashed", "stdout": "trace-line\n" + "z" * 5000})
+    msg = str(ei.value)
+    assert "vllm crashed" in msg
+    assert "worker stdout tail" in msg
+
+
 # ---------------------------------------------------------------------------
 # poll_job state machine (mocked runpod_api)
 # ---------------------------------------------------------------------------

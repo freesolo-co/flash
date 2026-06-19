@@ -9,17 +9,16 @@ must never be mistaken for a RunPod key.
 
 from __future__ import annotations
 
-import os
+from .._auth import ensure_provider_auth, load_provider_key
+
+_ENV_VAR = "RUNPOD_API_KEY"
 
 
 def load_api_key() -> str | None:
-    """RunPod API key from the environment (operator configuration)."""
-    return os.environ.get("RUNPOD_API_KEY") or None
+    """API key from the environment (operator configuration)."""
+    return load_provider_key(_ENV_VAR)
 
 
 def ensure_auth() -> str:
-    """Ensure ``RUNPOD_API_KEY`` is set for the Flash SDK; raise if unavailable."""
-    key = load_api_key()
-    if not key:
-        raise RuntimeError("no RunPod API key found; set RUNPOD_API_KEY on the control-plane host")
-    return key
+    """Ensure ``RUNPOD_API_KEY`` is set; raise if unavailable."""
+    return ensure_provider_auth(_ENV_VAR, "no RunPod API key found; set RUNPOD_API_KEY on the control-plane host")

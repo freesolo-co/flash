@@ -67,7 +67,7 @@ class RunpodProvider:
         from autoslm.providers.runpod.jobs import (
             make_hf_heartbeat_reader,
             poll_job,
-            stall_kwargs_from_env,
+            stall_kwargs,
         )
 
         hf_repo = spec.train.hf_repo
@@ -77,7 +77,7 @@ class RunpodProvider:
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         # Same stall tuning as the submit path so a reattached run isn't judged differently.
-        return poll_job(rh, log=log, heartbeat_reader=reader, **stall_kwargs_from_env())
+        return poll_job(rh, log=log, heartbeat_reader=reader, **stall_kwargs())
 
     def cancel(self, handle: JobHandle) -> None:
         from autoslm.providers.runpod import api as runpod_api

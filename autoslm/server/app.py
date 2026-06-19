@@ -1,7 +1,7 @@
 """FastAPI control plane for the managed AutoSLM service.
 
 This is the operator-side component. It holds the
-provider credentials (``RUNPOD_API_KEY``, ``HUGGINGFACE_TOKEN``, ``PRIME_API_KEY`` —
+provider credentials (``RUNPOD_API_KEY``, ``HF_TOKEN``, ``PRIME_API_KEY`` —
 the worker needs the last to ``prime env install`` the run's Prime Hub env) and
 exposes the full run lifecycle to clients that authenticate with their freesolo API
 key (verified against the freesolo backend) — clients never see provider credentials.
@@ -185,11 +185,6 @@ def create_app():
     def models(_: dict = Depends(require_key)):
         return {"models": public_model_rows()}
 
-    # Built-in env params that name a client-local filesystem path: the worker
-    # has no such path, so a managed run would provision a GPU and then fail
-    # opening it. Reject before submission.
-    _LOCAL_PATH_PARAMS = ("train_path", "workspace_path", "examples_path")
-
     def _parse_spec(payload: dict, run_id: str) -> JobSpec:
         spec_raw = payload.get("spec") or {}
         env_raw = spec_raw.get("environment") or {}
@@ -199,14 +194,6 @@ def create_app():
                 detail="local environment paths are not supported on the managed service; "
                 "publish the environment to the Prime Hub (`slm env push`), then reference it "
                 'by its Hub id (`[environment] id = "owner/name"`)',
-            )
-        params = env_raw.get("params") or {}
-        local = [p for p in _LOCAL_PATH_PARAMS if params.get(p)]
-        if local:
-            raise HTTPException(
-                status_code=400,
-                detail=f"environment.params {local} name client-local paths the managed "
-                "worker cannot read; upload/publish the data or use a Hub dataset id",
             )
         try:
             return spec_from_dict(spec_raw, run_id=run_id)
@@ -275,16 +262,15 @@ def create_app():
                         "trained adapter artifacts can be deployed"
                     ),
                 )
-            # A run persisted BEFORE `[train] hf_repo` became required can have an empty
-            # hf_repo; serving downloads the adapter from it, so without a clear guard
-            # snapshot_download would fail downstream with an opaque error. Reject early.
-            # (Dry-run deploys never download, so they don't need it.)
+            # Legacy runs persisted before [train].hf_repo was mandatory rehydrate with an empty
+            # hf_repo; without this guard deploy_adapter -> snapshot_download fails deep as an
+            # opaque 5xx (and for always-on, only after starting paid provisioning). Reject early.
             if not dry_run and not spec.train.hf_repo:
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        f"run {run_id} predates per-run `[train] hf_repo` and can't be served; "
-                        "re-run it so its adapter is published to a per-run HF repo"
+                        f"run {run_id} has no [train].hf_repo (legacy run); its adapter artifacts "
+                        "cannot be located, so it cannot be deployed"
                     ),
                 )
             mode = payload.get("mode", "dev")
@@ -425,16 +411,12 @@ def create_app():
                 status_code=409,
                 detail=f"run {run_id} has no active deployment; `slm deploy {run_id}` first",
             )
-        # A run persisted BEFORE `[train] hf_repo` became required can have an empty
-        # hf_repo; serving pulls the adapter from it, so a missing repo would fail
-        # downstream in snapshot_download with an opaque error. Reject early with a clear 409.
+        # Legacy run with no artifact repo: reject early with a clear 409 rather than letting
+        # serve_chat's adapter download fail deep as an opaque 502 (mirrors /deploy).
         if not spec.train.hf_repo:
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    f"run {run_id} predates per-run `[train] hf_repo` and can't be served; "
-                    "re-run it so its adapter is published to a per-run HF repo"
-                ),
+                detail=f"run {run_id} has no [train].hf_repo (legacy run); its adapter cannot be served",
             )
         try:
             return serve_chat(

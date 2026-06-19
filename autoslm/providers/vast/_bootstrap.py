@@ -41,7 +41,7 @@ def hf_upload(payload: dict, local_path: str, repo_subpath: str) -> None:
     try:
         from huggingface_hub import HfApi
 
-        HfApi(token=(payload.get("env") or {}).get("HUGGINGFACE_TOKEN")).upload_file(
+        HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
             path_or_fileobj=local_path,
             path_in_repo=f"{payload['hf_prefix']}/{repo_subpath}",
             repo_id=payload["hf_repo"],
@@ -84,7 +84,7 @@ def fetch_code(payload: dict) -> None:
         repo_type="dataset",
         allow_patterns=["code/**"],
         local_dir=CODE_ROOT,
-        token=(payload.get("env") or {}).get("HUGGINGFACE_TOKEN"),
+        token=(payload.get("env") or {}).get("HF_TOKEN"),
     )
 
 
@@ -161,12 +161,57 @@ def main() -> int:
     ok = False
     error = ""
     try:
+        # Fast model downloads on Vast: RunPod's Flash runtime ships hf_transfer + sets
+        # HF_HUB_ENABLE_HF_TRANSFER, but Vast hosts don't — so a cold model pull is serial and
+        # slow (measured ~84s for a 2 GB model vs ~6s on RunPod, where setup is now the dominant
+        # cost). Install it + enable so snapshot_download/from_pretrained saturate the NIC.
+        # Best-effort: only enable the flag if the package is present (enabling it WITHOUT the
+        # package makes huggingface_hub hard-error).
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("hf_transfer") is None:
+                subprocess.run([sys.executable, "-m", "pip", "install", "hf_transfer"], check=True)
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        except Exception as _e:
+            print("hf_transfer setup skipped (slow downloads):", _e)
+        # W&B logging (restored post-autoslm-migration): the prebuilt image predates wandb being
+        # added to the stack, so install it on-demand when a W&B key is present. The worker's
+        # wandb_report_to() gates report_to on the package actually importing, so this is what makes
+        # W&B logging real on the current image without a rebuild.
+        try:
+            import importlib.util  # local: the hf_transfer block above may fail before importing it
+
+            _penv = payload.get("env") or {}
+            if (_penv.get("WANDB_API_KEY") or os.environ.get("WANDB_API_KEY")) and (
+                importlib.util.find_spec("wandb") is None
+            ):
+                _wb = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "wandb>=0.17"], check=False
+                )
+                if _wb.returncode == 0 and importlib.util.find_spec("wandb") is not None:
+                    print("[wandb] installed wandb on-demand for W&B logging")
+                else:
+                    print(
+                        f"[wandb] on-demand wandb install FAILED (rc={_wb.returncode}); "
+                        "W&B logging will be disabled"
+                    )
+        except Exception as _e:
+            print("wandb setup skipped:", _e)
+        # NB: the Hopper fla guard lives in engine.worker._drop_fla_on_hopper (runs in the worker
+        # process after all installs, before any model import) — not here, where a later
+        # install could pull fla back in. The bootstrap just fetches code and runs the worker.
+
         extra_pip = payload.get("extra_pip") or []
         if extra_pip:
             # check=True: a deterministic dependency failure (GRPO / Prime Hub
             # / verifiers extras) must stop NOW with an actionable error, not proceed to
             # a later import crash while the paid instance runs (matches the RunPod path).
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
+        _wenv = payload.get("env") or {}
+        # NB: fla is dropped on Hopper (sm90) automatically by engine.worker._drop_fla_on_hopper at
+        # worker startup (fla's GDN backward is miscomputed on sm90, #640) — no bootstrap uninstall
+        # or env toggle. fla only ever runs on the consumer archs where its Triton kernel is correct.
         # Install the run's verifiers environment(s) from the Prime Hub via the
         # authenticated `prime` CLI (mirrors runpod/train.py:_train_body). The public pip
         # index does not serve PRIVATE env wheels; `prime env install` pulls/builds/installs
@@ -184,13 +229,23 @@ def main() -> int:
             # failure point every run.
             if shutil.which("prime") is None:
                 subprocess.run([sys.executable, "-m", "pip", "install", "prime"], check=True)
+            # Resolve the prime binary (located path if present, else the bare name) so the env
+            # install runs through the actually-installed CLI.
+            prime_bin = shutil.which("prime") or "prime"
             install_env = {
                 **os.environ,
                 "PRIME_API_KEY": prime_key,
                 "PRIME_DISABLE_VERSION_CHECK": "1",
+                "PIP_BREAK_SYSTEM_PACKAGES": "1",
             }
+            # --with pip: install the env into THIS python via pip, not prime's isolated uv env
+            # (the default), so the trainer can import the env module at load_environment.
             for env_id in hub_env_ids:
-                subprocess.run(["prime", "env", "install", env_id], check=True, env=install_env)
+                subprocess.run(
+                    [prime_bin, "env", "install", env_id, "--with", "pip"],
+                    check=True,
+                    env=install_env,
+                )
         fetch_code(payload)
         env = build_worker_env(payload)
         deadline = time.time() + float(payload.get("max_wall_s") or 24 * 3600)

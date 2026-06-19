@@ -176,7 +176,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     model_policy = (raw.get("model_policy") or "catalog").lower()
     if model_policy not in ("catalog", "allow"):
         raise ConfigError('model_policy must be "catalog" or "allow"')
-    thinking = raw.get("thinking", True)  # reasoning mode ON by default
+    thinking = raw.get("thinking", False)  # reasoning mode OFF by default (operator preference)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
 
@@ -212,7 +212,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         # sized from HF metadata); concrete names are canonicalized. The submit-time
         # allocator re-resolves policy words live across providers.
         gpu_type = resolve_gpu_policy(
-            requested_gpu, model, allow_unvalidated=allow_unval, algorithm=algorithm
+            requested_gpu,
+            model,
+            allow_unvalidated=allow_unval,
+            algorithm=algorithm,
+            train=train_raw,
+            thinking=thinking,
         )
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
@@ -286,6 +291,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # minimum=0 so `eval_every_steps = 0` explicitly disables (matches "0/None disables");
             # negatives are rejected.
             eval_every_steps=_train_int(train_raw, "eval_every_steps", minimum=0),
+            # SFT caps: max_steps caps optimizer steps (cheap pre-flight smoke); max_examples
+            # truncates the SFT dataset. minimum=0 so an explicit 0 means "no cap" (matches the
+            # TrainSpec "None/0 -> no cap" contract); the worker reads these from [train].
+            max_steps=_train_int(train_raw, "max_steps", minimum=0),
+            max_examples=_train_int(train_raw, "max_examples", minimum=0),
         ),
         gpu=GpuSpec(
             type=gpu_type,
@@ -300,11 +310,43 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             datacenter=gpu_raw.get("datacenter"),
         ),
         run_id=run_id or raw.get("run_id", "local"),
+        worker_env=_worker_env(raw.get("worker_env")),
         model_policy=model_policy,
         thinking=thinking,
     )
     _validate_spec(spec)
     return spec
+
+
+def _worker_env(raw: Any) -> dict[str, str]:
+    """Parse the optional [worker_env] table: per-run worker env overrides (string-valued)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("[worker_env] must be a table of string key/values")
+    env = {str(k): str(v) for k, v in raw.items()}
+    # [worker_env] is serialized into job_spec_json (persisted + logged), so it must NOT carry
+    # secrets — they would leak into run artifacts. Reject secret-looking keys; operators set
+    # those as real process environment variables (forwarded to the worker out-of-band) instead.
+    # Detect by `_`-delimited WORD components (not substring): flag a secret WORD, or `KEY`
+    # qualified by API/SECRET/PRIVATE/ACCESS/INTERNAL/AUTH. This catches HF_TOKEN, *_API_KEY,
+    # SECRET_KEY, INTERNAL_KEY, CREDENTIAL, AWS_SECRET_ACCESS_KEY while allowing legit knobs whose
+    # names merely contain a marker (RL_VLLM_MAX_BATCHED_TOKENS -> word TOKENS, not TOKEN; a bare
+    # SORT_KEY -> KEY without a secret qualifier).
+    _secret_words = {"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS", "APIKEY", "PRIVATEKEY"}
+    _key_qualifiers = {"API", "SECRET", "PRIVATE", "ACCESS", "INTERNAL", "AUTH", "SIGNING", "ENCRYPTION"}
+
+    def _is_secret_key(name: str) -> bool:
+        words = set(name.upper().split("_"))
+        return bool(words & _secret_words) or ("KEY" in words and bool(words & _key_qualifiers))
+
+    secrets = sorted(k for k in env if _is_secret_key(k))
+    if secrets:
+        raise ConfigError(
+            f"[worker_env] must not contain secret-bearing keys ({', '.join(secrets)}); these are "
+            "serialized into run artifacts — set them as real environment variables instead"
+        )
+    return env
 
 
 def _validate_spec(spec: JobSpec) -> None:
@@ -335,10 +377,18 @@ def _validate_spec(spec: JobSpec) -> None:
         spec.environment.id,
         '[environment] id must be a published Prime Hub slug "owner/name"',
     )
-    # A separate eval env ([environment.params] eval_env_id / eval_env) is also prime-installed
-    # on the worker (worker_hub_env_ids), so it must be a full "owner/name" slug too — else a
-    # bare eval id passes --dry-run but fails `prime env install` after a GPU is provisioned.
-    eval_ref = spec.environment.params.get("eval_env_id") or spec.environment.params.get("eval_env")
+    # A separate eval env ([environment.params] eval_env_id) is also prime-installed on the worker
+    # (worker_hub_env_ids), so it must be a full "owner/name" slug too — else a bare eval id passes
+    # --dry-run but fails `prime env install` after a GPU is provisioned.
+    if "eval_env" in spec.environment.params:
+        # Legacy alias: `eval_env` is no longer mapped (the worker installs only eval_env_id, and
+        # a stray `eval_env` would be forwarded into load_environment). Reject at parse rather than
+        # silently evaluating against the training env.
+        raise ConfigError(
+            "[environment.params] eval_env is no longer supported; use eval_env_id "
+            '(a published Prime Hub slug "owner/name")'
+        )
+    eval_ref = spec.environment.params.get("eval_env_id")
     if eval_ref:
         _require_slug(
             str(eval_ref),

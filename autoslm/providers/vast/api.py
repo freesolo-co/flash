@@ -2,8 +2,9 @@
 
 Mirrors ``providers/runpod/api.py``: stdlib urllib only, hardened retries, and nothing
 persisted locally — a fresh process can list/destroy any instance using only the
-persisted ids + VAST_API_KEY. Only verified DATACENTER offers are ever searched
-(``verified``/``datacenter`` server-side filters; callers re-check client-side).
+persisted ids + VAST_API_KEY. Only ``verified`` offers are searched (the datacenter-only
+filter is NOT applied, so verified community/marketplace hosts are included too); callers
+re-check hosting_type + verification + the reliability floor client-side.
 """
 
 from __future__ import annotations
@@ -65,15 +66,20 @@ def search_offers(
     limit: int = 64,
     extra_q: dict | None = None,
 ) -> list[dict]:
-    """Rentable single-GPU offers from VERIFIED DATACENTER hosts, cheapest first.
+    """Rentable single-GPU offers from verified hosts, cheapest first. We drop the server-side
+    datacenter-only filter so verified COMMUNITY/marketplace hosts are returned alongside
+    datacenter ones (usable_offers still re-checks hosting_type + verification + the reliability
+    floor, so quality is enforced downstream).
 
     ``datacenter`` here is Vast's hosting-type filter (professional datacenters vs
     consumer/hobbyist machines); results additionally carry ``hosting_type`` which
     callers must re-check (``usable_offers``) — never trust one filter layer alone.
     """
+    # We intentionally do NOT apply Vast's server-side datacenter-only filter: verified
+    # COMMUNITY/marketplace hosts are included too (scarce classes often have no verified-datacenter
+    # supply), and usable_offers re-checks hosting_type + verification + the reliability floor.
     q: dict[str, Any] = {
         "verified": {"eq": True},
-        "datacenter": {"eq": True},
         "rentable": {"eq": True},
         "num_gpus": {"eq": 1},
         "gpu_ram": {"gte": int(min_vram_mb)},
@@ -120,6 +126,8 @@ def create_instance(
         "label": label,
         "runtype": runtype,
     }
+    # The worker image is PUBLIC, so Vast pulls it with no docker-login (no image_login / pull
+    # token is ever shipped to the untrusted host).
     if runtype == "args":
         body["args"] = ["bash", "-c", onstart]
     else:

@@ -20,9 +20,15 @@ def test_endpoint_name_default():
 def test_endpoint_name_unique_per_run():
     a = endpoint_name("RTX 5090", _run_suffix("autoslm-1780837378-c220526e"))
     b = endpoint_name("RTX 5090", _run_suffix("autoslm-1780840000-deadbeef"))
-    assert a == "autoslm-train-5090-c220526e"
-    assert b == "autoslm-train-5090-deadbeef"
+    assert a.startswith("autoslm-train-5090-")
     assert a != b, "different runs must get different endpoint names (no template collision)"
+    # deterministic: same run_id -> same name (a retry reuses its own endpoint)
+    assert a == endpoint_name("RTX 5090", _run_suffix("autoslm-1780837378-c220526e"))
+    # COLLISION FIX: run_ids sharing a trailing segment (e.g. both end in the card name) must
+    # NOT collide onto one endpoint -- the old split("-")[-1] bug caused stale-config reuse.
+    c = endpoint_name("RTX 5090", _run_suffix("val-9b-grpo-s4096-a100"))
+    d = endpoint_name("RTX 5090", _run_suffix("mr-4b-grpo-s8192-a100"))
+    assert c != d, "run_ids sharing a tail must still get distinct endpoints"
 
 
 def test_endpoint_name_sanitizes_suffix():

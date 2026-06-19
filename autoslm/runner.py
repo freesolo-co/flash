@@ -115,7 +115,7 @@ def runs_file_path(run_id: str, suffix: str) -> str:
 def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
     """Spec dict with gpu.disk_gb raised to the model's min_disk_gb (catalog).
 
-    Big-checkpoint models (e.g. the 35B-A3B MoE at ~72 GB bf16) need more container
+    Big-checkpoint models (whose weights alone exceed the default) need more container
     disk than the platform's 64 GB default; this makes them work without users having
     to know the right ``gpu.disk_gb``.
     """
@@ -649,6 +649,12 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 disk_gb=spec.gpu.disk_gb,
                 allow_unvalidated=spec.gpu.allow_unvalidated,
                 exclude_machine_ids=frozenset(bad_machines),
+                # Pass the run's train knobs + thinking so the VRAM estimate reflects THIS job's
+                # max_length / group_size / batch_size / lora_rank (and the seq escalation) instead
+                # of the generic defaults — else a long-context / big-group run is sized at seq=1024
+                # and OOMs the card it picks.
+                train=spec.train,
+                thinking=spec.thinking,
             )
         except Exception as exc:
             from autoslm.providers.base import UnsupportedGpuError
@@ -739,6 +745,12 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             "Connection reset",
             "cuda not available",
             "GPU never became ready",
+            # Host vanished mid-run: the instance went "missing"/dead and NOTHING was captured
+            # (no marker error, no error_<phase>.txt, no console log) so _failure_detail falls back
+            # to this bare sentinel. A genuine worker code crash instead yields a RICHER detail
+            # (the captured traceback), so this exact phrase only ever marks a dead host -> retry it
+            # on a fresh one. Without this, a single ~1-in-200 host death killed the whole run.
+            "terminated without a DONE sentinel",
         )
         infra_shaped = res.failure in ("stalled", "poll_error") or any(
             m in (res.detail or "") for m in _infra_markers

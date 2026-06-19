@@ -4,7 +4,7 @@ The production core is pure with render/generate/engine INJECTED (mirrors
 ``test_multiturn_rollout``), so cadence gating, engine binding, skip handling, heartbeat
 emission, and both scorers are exercised end-to-end here. The single vLLM-touching helper
 (``build_hf_greedy_generate``) is tested against a fake ``torch`` + fake model/tok. Evaluation
-distinct from the reward (the env's zero-weight rubric metrics) is verified via the adapter in
+distinct from the reward (the env's eval-metric rubric metrics) is verified via the adapter in
 ``test_verifiers.py`` and surfaced through ``EvalRecord.metrics`` here.
 """
 
@@ -52,7 +52,7 @@ def test_summarize_mean_min_max_and_rewards_preserved():
 
 
 def test_summarize_averages_env_metrics_independently():
-    """Each zero-weight env metric is averaged across the examples that reported it."""
+    """Each eval-metric env metric is averaged across the examples that reported it."""
     s = summarize(
         [
             EvalRecord(0.3, {"accuracy": 1.0, "length": 10.0}),
@@ -156,7 +156,7 @@ def test_evaluate_policy_partial_failure_does_not_raise():
 
 
 class _SingleTurnEnv:
-    """Minimal env exposing evaluate(): a shaped reward + a zero-weight 'accuracy' metric."""
+    """Minimal env exposing evaluate(): a shaped reward + a eval-metric 'accuracy' metric."""
 
     def evaluate(self, completion, example):
         hit = completion == example["answer"]
@@ -458,11 +458,6 @@ def test_run_final_disabled_when_eval_off():
     pe = _periodic(every_steps=0)
     assert pe.run_final(25) is None
     assert pe.history == []
-
-
-def test_eval_on_train_flag_defaults_false_and_is_carried():
-    assert _periodic().eval_on_train is False
-    assert _periodic(eval_on_train=True).eval_on_train is True
 
 
 def test_bind_model_getter_overrides():

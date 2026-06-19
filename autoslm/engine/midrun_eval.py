@@ -9,9 +9,9 @@ detection, checkpoint selection) instead of only the reward stream.
 
 Evaluation distinct from reward lives in the environment. A verifiers
 ``environment.py`` expresses an evaluation metric SEPARATE from the GRPO reward as a
-**zero-weight rubric func** (``rubric.add_metric(fn, weight=0.0)``): it does not shape training
+**eval-metric rubric func** (``rubric.add_metric(fn, weight=0.0)``): it does not shape training
 but is computed and reported. The adapter's :meth:`VerifiersEnvironment.evaluate` returns both
-the weighted training ``reward`` and those zero-weight ``metrics`` in one rubric pass, and this
+the weighted training ``reward`` and those eval-metric ``metrics`` in one rubric pass, and this
 module surfaces both — so the agent watches the env's true eval metric, not just the reward.
 
 It generates with the **trainer's own model** (``trainer.model.generate`` in eval/no-grad mode),
@@ -46,7 +46,7 @@ _EVAL_ERROR_REWARD = 0.0
 
 @dataclass(frozen=True)
 class EvalRecord:
-    """One example's eval result: the training ``reward`` and the env's zero-weight ``metrics``."""
+    """One example's eval result: the training ``reward`` and the env's eval-metric ``metrics``."""
 
     reward: float
     metrics: dict[str, float] = field(default_factory=dict)
@@ -175,7 +175,7 @@ def single_turn_scorer(
     ``generate(prefix_ids, max_tokens) -> (token_ids, logprobs, text)`` mirrors the colocate
     engine wrapper used by the multi-turn rollout; only ``text`` is used here. ``graded_text``
     strips ``<think>`` blocks before scoring on thinking runs (worker parity). Uses the env's
-    :meth:`evaluate` so the env's zero-weight metrics come back alongside the reward."""
+    :meth:`evaluate` so the env's eval-metric metrics come back alongside the reward."""
 
     def score(example: dict) -> EvalRecord:
         prefix_ids = render_prompt_ids(example)
@@ -238,7 +238,6 @@ class PeriodicEval:
         pass_threshold: float = 0.5,
         label: str = "rl_eval",
         on_warn: Callable[[str], None] = print,
-        eval_on_train: bool = False,
     ) -> None:
         self.examples = list(examples)
         self.score_one_builder = score_one_builder
@@ -248,9 +247,6 @@ class PeriodicEval:
         self.pass_threshold = float(pass_threshold)
         self.label = label
         self.on_warn = on_warn
-        # True when the env has no held-out eval split and we fell back to TRAIN rows — surfaced to
-        # metrics.json so the agent doesn't read this eval_history as held-out generalization.
-        self.eval_on_train = bool(eval_on_train)
         self._disabled = False
         # Accumulated eval curve, persisted into metrics.json so the agent reads it post-run.
         self.history: list[EvalSummary] = []
@@ -358,7 +354,7 @@ def eval_config(default_max_new: int, *, spec_every: int | None = None) -> dict:
     operator override; 0/unset disables.
 
     Everything else comes from the ENVIRONMENT, not config: the eval queries are the env's
-    held-out ``eval_dataset``, the grading is its rubric (reward + zero-weight metrics), the
+    held-out ``eval_dataset``, the grading is its rubric (reward + eval-metric metrics), the
     completion budget equals the run's normal ``max_tokens`` (``default_max_new``), and the pass
     threshold is the env's own. ``num_examples`` is ONLY a safety cap so a huge env eval split
     can't dominate training (``AUTOSLM_EVAL_NUM``, default 64) — the agent sizes the eval set via

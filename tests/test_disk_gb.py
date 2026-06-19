@@ -44,23 +44,37 @@ def test_apply_disk_gb_noops():
     apply_disk_gb(_FakeConfig(template=None), 160)  # missing template: warn, don't raise
 
 
-def test_catalog_min_disk_for_big_moe():
-    from autoslm.catalog import get_model
+def test_default_catalog_models_need_no_disk_bump():
+    """The dense Qwen3.5 catalog fits the platform's default container disk (min_disk_gb == 0)."""
+    from autoslm.catalog import MODELS
 
-    assert get_model("Qwen/Qwen3.6-35B-A3B").min_disk_gb >= 100  # ~72 GB checkpoint
-    assert get_model("Qwen/Qwen3.5-4B").min_disk_gb == 0
+    assert all(m.min_disk_gb == 0 for m in MODELS.values())
 
 
 def test_submit_raises_disk_to_model_min(monkeypatch):
-    """submit_job (dry-run) bumps gpu.disk_gb to the catalog's min_disk_gb."""
+    """submit_job (dry-run) bumps gpu.disk_gb to a catalog model's min_disk_gb. No shipping model
+    needs a bump now, so inject a synthetic big-checkpoint entry to exercise the mechanism."""
     from autoslm import runner
+    from autoslm.catalog import MODELS, ModelInfo
     from autoslm.spec import JobSpec
 
+    monkeypatch.setitem(
+        MODELS,
+        "test/big-disk",
+        ModelInfo(
+            id="test/big-disk",
+            display_name="x",
+            params="4B",
+            algos=("sft",),
+            min_vram_gb=32,
+            min_disk_gb=160,
+        ),
+    )
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.6-35B-A3B",
+                "model": "test/big-disk",
                 "algorithm": "sft",
                 "environment": {"id": "primeintellect/gsm8k"},
                 "gpu": {"type": "RTX 5090", "disk_gb": 60},
@@ -71,7 +85,7 @@ def test_submit_raises_disk_to_model_min(monkeypatch):
         # explicit larger user value wins
         spec_big = JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.6-35B-A3B",
+                "model": "test/big-disk",
                 "algorithm": "sft",
                 "environment": {"id": "primeintellect/gsm8k"},
                 "gpu": {"type": "RTX 5090", "disk_gb": 200},

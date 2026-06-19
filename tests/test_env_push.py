@@ -122,12 +122,12 @@ def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
 
 
 def test_push_single_py_uses_sibling_config_id_name(monkeypatch, tmp_path):
-    # A bare environment.py with a sibling autoslm.toml whose [environment] id is
+    # A bare environment.py with a sibling autoslm_grpo.toml whose [environment] id is
     # "owner/myenv" must re-publish to that SAME env: prime is called with `--name myenv`
     # (the id's name part), so an edited env mints a new version of the existing env.
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "autoslm.toml").write_text(
+    (tmp_path / "autoslm_grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\nid = "owner/myenv"\n'
     )
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/prime")

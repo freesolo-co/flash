@@ -22,9 +22,9 @@ def missing_credentials(require_hf: bool = True) -> list[str]:
     problems: list[str] = []
     if not load_api_key():
         problems.append("  - RUNPOD_API_KEY: the operator's RunPod API key")
-    if require_hf and not os.environ.get("HUGGINGFACE_TOKEN"):
+    if require_hf and not os.environ.get("HF_TOKEN"):
         problems.append(
-            "  - HUGGINGFACE_TOKEN: a token with write access to each run's "
-            "`[train] hf_repo`, e.g. `export HUGGINGFACE_TOKEN=hf_...`"
+            "  - HF_TOKEN: a token with write access to each run's "
+            "`[train] hf_repo`, e.g. `export HF_TOKEN=hf_...`"
         )
     return problems

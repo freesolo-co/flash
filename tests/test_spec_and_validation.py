@@ -105,13 +105,12 @@ def test_bare_environment_id_is_rejected() -> None:
 
 
 def test_bare_eval_env_id_is_rejected() -> None:
-    # The eval env ([environment.params] eval_env_id / eval_env) is also prime-installed on the
-    # worker, so a bare eval id must be rejected up front (not fail after a GPU is provisioned).
-    for key in ("eval_env_id", "eval_env"):
-        raw = _raw()
-        raw["environment"] = {"id": "owner/train", "params": {key: "gsm8k"}}
-        with pytest.raises(ConfigError, match=r"eval_env_id must be a published Prime Hub slug"):
-            spec_from_dict(raw)
+    # The eval env ([environment.params] eval_env_id) is also prime-installed on the worker, so a
+    # bare eval id must be rejected up front (not fail after a GPU is provisioned).
+    raw = _raw()
+    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "gsm8k"}}
+    with pytest.raises(ConfigError, match=r"eval_env_id must be a published Prime Hub slug"):
+        spec_from_dict(raw)
     # A full owner/name eval slug is accepted.
     raw = _raw()
     raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "owner/eval"}}
@@ -138,6 +137,21 @@ def test_jobspec_from_dict_rejects_path() -> None:
 # ---------------------------------------------------------------------------
 # JobSpec serialization round-trips (what travels client -> server -> worker)
 # ---------------------------------------------------------------------------
+
+
+def test_sft_caps_parse_from_toml() -> None:
+    # [train].max_steps / max_examples are read by the worker; ensure spec_from_dict actually
+    # parses them (they were defined on TrainSpec but silently dropped at parse time).
+    spec = spec_from_dict(
+        _raw(**{"train.max_steps": 50, "train.max_examples": 200}), run_id="caps-1"
+    )
+    assert spec.train.max_steps == 50
+    assert spec.train.max_examples == 200
+    # explicit 0 means "no cap" (not rejected); negatives are rejected.
+    spec0 = spec_from_dict(_raw(**{"train.max_steps": 0}), run_id="caps-0")
+    assert spec0.train.max_steps == 0
+    with pytest.raises(ConfigError, match="max_examples must be >= 0"):
+        spec_from_dict(_raw(**{"train.max_examples": -5}))
 
 
 def test_job_spec_json_round_trip() -> None:
@@ -225,6 +239,21 @@ def test_vram_estimate_scales_with_params_and_algorithm() -> None:
     sft_big = vram.estimate_vram_gb(8.0, "sft")
     grpo_big = vram.estimate_vram_gb(8.0, "grpo")
     assert sft_small < sft_big < grpo_big  # GRPO colocates vLLM on top of the trainer
+
+
+def test_vram_sft_honors_per_device_bs_env(monkeypatch) -> None:
+    # The SFT activation term must track the worker's SFT_PER_DEVICE_BS (the operator env that
+    # build_worker_env forwards): raising it must size the estimate UP, not stay capped at 4.
+    from autoslm.engine import vram
+
+    monkeypatch.delenv("SFT_PER_DEVICE_BS", raising=False)
+    base = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
+    monkeypatch.setenv("SFT_PER_DEVICE_BS", "8")
+    bigger = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
+    assert bigger > base  # micro-batch 8 reserves more activation VRAM than the default 4
+    # a malformed value falls back to the default (no crash, same as base)
+    monkeypatch.setenv("SFT_PER_DEVICE_BS", "not-an-int")
+    assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32) == base
 
 
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:

@@ -36,25 +36,14 @@ class ModelInfo:
     recommended_gpu: str = DEFAULT_GPU
     # GRPO needs more VRAM than SFT (a colocated vLLM rollout engine holds a second copy of
     # the weights + KV cache). 0 => GRPO uses ``min_vram_gb`` like SFT; set it when the GRPO
-    # tier needs a bigger card than SFT (e.g. the 4-bit 36B MoE: SFT fits 32 GB, GRPO needs
-    # 80 GB for trainer-4bit + vLLM-4bit + KV). Used by providers.allocator.required_vram_gb.
+    # tier needs a bigger card than SFT (the colocate 2nd weight copy + KV pool). Consumed by
+    # engine.vram.model_required_vram_gb.
     grpo_min_vram_gb: int = 0
-    # GRPO rollout backend. True (default) = colocated vLLM (fast). False = generate with the
-    # trainer model via transformers (slower, but no 2nd weight copy). Needed for fused-MoE
-    # tiers whose experts bitsandbytes can't 4-bit quantize: the base stays ~bf16, so a 2nd
-    # vLLM copy won't fit one GPU — use_vllm=False keeps it to a single copy. Env override:
-    # RL_USE_VLLM. Used by engine.worker.run_rl.
-    grpo_use_vllm: bool = True
     notes: str = ""
     # Worker container disk this model needs (GB). 0 = the platform default (64 GB)
     # suffices. The runner raises gpu.disk_gb to at least this, so big-checkpoint
-    # models (MoE tiers whose bf16 weights alone exceed 64 GB) work out of the box.
+    # models whose weights alone exceed 64 GB work out of the box.
     min_disk_gb: int = 0
-    # Optional pre-quantized weights repo for the 4bit-qlora tier: the worker loads
-    # these (~0.55 B/param) instead of quantizing the full bf16 checkpoint at load
-    # (tokenizer/config still come from ``id``). Cuts the download ~3.5x and fits the
-    # stock 64 GB disk. Only trusted/own exports belong here.
-    quant_repo: str = ""
     # Thinking/reasoning capability of the checkpoint's chat template:
     #   "none"    no <think> support (or a non-thinking variant) — `thinking = true` is
     #             rejected for these models
@@ -124,34 +113,20 @@ MODELS: dict[str, ModelInfo] = {
         display_name="Qwen3.5 9B",
         params="9.7B (text-only fine-tune)",
         algos=("sft", "grpo"),
-        min_vram_gb=32,
-        grpo_min_vram_gb=80,  # bf16 colocate (trainer ~19GB + vLLM ~19GB + KV) won't fit 32GB
+        min_vram_gb=16,
+        # MEMORY-OPTIMIZED: 4-bit NF4 frozen base + bf16 LoRA adapter (QLoRA). The base
+        # drops from ~19 GB bf16 to ~5.3 GB, so colocated GRPO holds two 4-bit copies
+        # (trainer + bnb-quantized vLLM rollout) instead of two bf16 copies -> it fits a
+        # ~24-32 GB card instead of an 80 GB A100. NF4 is near-lossless for adapter training
+        # (QLoRA paper + follow-ups), a small quality trade for a ~3x cheaper GPU. No GRPO
+        # floor: the matrix sizes the (much smaller) 4-bit footprint directly.
+        grpo_min_vram_gb=0,
+        quant="4bit-qlora",
         recommended_gpu="RTX 5090",
         thinking="hybrid",
-        notes="SFT at micro-batch 1 on a 5090 (32 GB). GRPO keeps the normal bf16 base + LoRA "
-        "but the colocated vLLM rollout holds a 2nd copy, so it needs an 80 GB A100 "
-        "(auto-routed via grpo_min_vram_gb); colocated GRPO does not fit 32 GB bf16.",
-    ),
-    "Qwen/Qwen3.6-35B-A3B": ModelInfo(
-        id="Qwen/Qwen3.6-35B-A3B",
-        display_name="Qwen3.6 35B-A3B",
-        params="36B total / 3B active MoE",
-        algos=("sft", "grpo"),
-        min_vram_gb=32,
-        grpo_min_vram_gb=80,  # 64 GB ~bf16 base (fused experts can't 4-bit) -> needs 80 GB
-        grpo_use_vllm=False,  # fused MoE experts aren't bnb-4bit-quantizable, so a 2nd vLLM
-        # copy won't fit one GPU; GRPO generates with the trainer model (transformers) on a
-        # single A100. Slower rollouts, but the only single-GPU path for this MoE.
-        recommended_gpu="A100 PCIe",
-        quant="4bit-qlora",
-        thinking="hybrid",
-        min_disk_gb=160,  # ~72 GB bf16 checkpoint + worker stack + headroom
-        notes="QLoRA SFT + GRPO tier. SFT fits a 32 GB 5090. GRPO runs on one 80 GB A100: the "
-        "MoE experts are fused 3-D tensors bitsandbytes can't 4-bit quantize, so the base "
-        "stays ~bf16 (~64 GB) — too big for a 2nd colocated vLLM copy. GRPO therefore uses "
-        "transformers generation (grpo_use_vllm=False), keeping a single weight copy. "
-        "AutoSLM auto-provisions the bigger worker disk and auto-routes GRPO to the 80 GB "
-        "tier (grpo_min_vram_gb). For faster rollouts use 2 GPUs + a vLLM server (roadmap).",
+        notes="QLoRA (4-bit NF4 base + bf16 LoRA). GRPO's colocated vLLM rollout loads the "
+        "base 4-bit via bitsandbytes too, so both copies are 4-bit -> fits ~24-32 GB "
+        "instead of 80 GB bf16. ~near-lossless vs bf16 LoRA.",
     ),
 }
 
@@ -226,24 +201,6 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
         thinking="unknown",
         notes="unlisted model accepted via the open-model policy (not curated/validated)",
     )
-
-
-def catalog_min_vram_gb(model_id: str, algorithm: str) -> int | None:
-    """Curated VRAM floor for a catalog model under ``algorithm``, else ``None``.
-
-    GRPO can need a bigger card than SFT (the colocated vLLM rollout holds a 2nd copy
-    of the weights + KV), so honor ``grpo_min_vram_gb`` when set; otherwise GRPO sizes
-    like SFT. Returns ``None`` for non-catalog (open-model) ids so callers can apply
-    their own coarse estimate. Single source of truth for both the parse-time
-    ``providers.base.resolve_gpu_policy`` and the submit-time
-    ``providers.allocator.required_vram_gb``.
-    """
-    info = MODELS.get(model_id)
-    if info is None:
-        return None
-    if (algorithm or "").lower() == "grpo" and info.grpo_min_vram_gb:
-        return int(info.grpo_min_vram_gb)
-    return int(info.min_vram_gb)
 
 
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:

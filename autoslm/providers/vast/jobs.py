@@ -1,7 +1,7 @@
-"""Vast.ai run lifecycle: verified-datacenter offers -> instance -> HF-artifact poll.
+"""Vast.ai run lifecycle: verified offers -> instance -> HF-artifact poll.
 
 The Vast equivalent of ``providers/runpod/jobs.py``. Vast has no serverless queue:
-we rent a single-GPU instance from a VERIFIED DATACENTER offer, ship a self-contained
+we rent a single-GPU instance from a VERIFIED offer (datacenter or community), ship a self-contained
 bootstrap (the private ``_bootstrap`` module) through the onstart script, and detect
 completion purely via the worker's HF artifacts (DONE/metrics.json/heartbeat.json) +
 the instance's status — no inbound network to the box is ever needed.
@@ -33,11 +33,15 @@ from autoslm.providers.vast import api as vast_api
 
 logger = get_logger(__name__)
 
-# Offer-quality floors (beyond verified+datacenter, which are non-negotiable).
-RELIABILITY_FLOOR = float(os.environ.get("AUTOSLM_VAST_MIN_RELIABILITY", "0.95"))
-MIN_INET_MBPS = float(os.environ.get("AUTOSLM_VAST_MIN_INET_MBPS", "200"))
+# Offer-quality floors (beyond verified+datacenter, which are non-negotiable). reliability2 is
+# Vast's host-uptime/health score: 0.95 let ~1-in-20 long runs die mid-train ("worker terminated
+# without a DONE sentinel" when the host went down); 0.995 (~1-in-200) keeps supply usable (the
+# >=0.995 datacenter pool measured 67 offers) while nearly eliminating mid-run host deaths. These
+# are fixed correctness floors, not operator-tunable.
+RELIABILITY_FLOOR = 0.995
+MIN_INET_MBPS = 200.0
 # How long an instance may sit in a non-running state (image pull) before we give up.
-LOAD_TIMEOUT_S = float(os.environ.get("AUTOSLM_VAST_LOAD_TIMEOUT_S", "900"))
+LOAD_TIMEOUT_S = 900.0
 # Boards under-report VRAM vs the class nominal (measured live: L4 23034 MB / 24 GB,
 # A40 46068 MB / 48 GB = 0.938 of nominal); the server-side gpu_ram filter gets this
 # slack, the class gate stays exact (vast_gpu_for_offer).
@@ -57,15 +61,6 @@ def _effective_disk_gb(spec) -> float:
     disk between ``spec.gpu.disk_gb`` and the floor pass the search then fail to rent.
     """
     return max(float(spec.gpu.disk_gb), MIN_DISK_GB)
-
-
-# Worker image: torch 2.10 cu128 matches WORKER_DEPS's pin and, critically,
-# ships the CUDA 12.8 runtime libs the PyPI wheels link against (verified live: the
-# cuda13.0 image broke vllm with "libcudart.so.12: cannot open shared object file").
-# Blackwell's CUDA-13 requirement is about the host DRIVER (PTX JIT), enforced by
-# the ``cuda_max_good`` offer filter — not the image. -devel ships gcc/nvcc for
-# Triton (covers WORKER_SYSTEM_DEPS).
-DEFAULT_IMAGE = "pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel"
 
 
 @dataclass(frozen=True)
@@ -89,7 +84,8 @@ def usable_offers(
     disk_gb: float,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
 ) -> list[VastOffer]:
-    """Verified-datacenter offers able to run the job, cheapest first.
+    """Verified datacenter offers able to run the job, cheapest first (community hosts only
+    when ``AUTOSLM_VAST_ALLOW_COMMUNITY=1`` opts in — secrets ship to the box).
 
     Server-side filters do the heavy lifting; everything load-bearing is re-checked
     client-side (belt and suspenders — the result rows carry the proof fields).
@@ -99,7 +95,13 @@ def usable_offers(
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
     )
-    max_dph = float(os.environ.get("AUTOSLM_VAST_MAX_DPH", "0") or 0)
+    # Host tier: DEFAULT datacenter-only (hosting_type==1). The onstart payload ships run secrets
+    # (HF_TOKEN, PRIME_API_KEY, OpenRouter/OpenAI/W&B creds) to the box, so verified-but-lower-trust
+    # community/marketplace hosts (hosting_type 0) are an explicit operator opt-in via
+    # AUTOSLM_VAST_ALLOW_COMMUNITY=1 — needed for scarce classes whose verified-DATACENTER supply is
+    # empty (e.g. B200) while the RunPod equivalent is capacity-throttled. Community offers are still
+    # verified + reliability-floored (RELIABILITY_FLOOR above); datacenter-only is the safe default.
+    allow_community = os.environ.get("AUTOSLM_VAST_ALLOW_COMMUNITY") in ("1", "true", "True")
     out: list[VastOffer] = []
     for r in rows:
         gpu = vast_gpu_for_offer(str(r.get("gpu_name") or ""), float(r.get("gpu_ram") or 0))
@@ -108,8 +110,14 @@ def usable_offers(
         info = GPU_INFO[gpu]
         dph = float(r.get("dph_total") or 0)
         cuda = float(r.get("cuda_max_good") or 0)
+        # Host tier: accept verified datacenter (hosting_type==1) AND verified community
+        # (hosting_type==0) hosts — community is always allowed, still gated by the reliability
+        # floor + verification below; any other hosting_type is rejected.
+        _bad_host = r.get("hosting_type") != 1 and not (
+            allow_community and r.get("hosting_type") == 0
+        )
         if (
-            r.get("hosting_type") != 1  # datacenter (the result field `datacenter` is null)
+            _bad_host
             or r.get("verification") != "verified"
             # Exact class gate: guard against a board whose canonical class nominal VRAM
             # is below the request (e.g. asking for 48 GB but the mapping landed on a
@@ -120,7 +128,6 @@ def usable_offers(
             or float(r.get("inet_down") or 0) < MIN_INET_MBPS
             or cuda < float(min_cuda_modern(gpu))  # Blackwell needs CUDA-13 drivers
             or dph <= 0
-            or (max_dph and dph > max_dph)
             or int(r.get("machine_id") or 0) in exclude_machine_ids
         ):
             continue
@@ -142,13 +149,12 @@ def usable_offers(
 
 
 def vast_image() -> str:
-    """Docker image for the worker. AUTOSLM_WORKER_IMAGE (fully baked) wins, then
-    AUTOSLM_VAST_IMAGE, then the default cu128 stack image (every class — the
-    Blackwell driver floor lives in the offer filter, not the image)."""
-    baked = os.environ.get("AUTOSLM_WORKER_IMAGE")
-    if baked:
-        return baked
-    return os.environ.get("AUTOSLM_VAST_IMAGE") or DEFAULT_IMAGE
+    """Docker image for the worker: the prebuilt, PUBLIC WORKER_IMAGE (full training stack baked
+    in). Used for every GPU class — the Blackwell driver floor lives in the ``cuda_max_good`` offer
+    filter, not the image. There is no generic fallback image; the worker image is always used."""
+    from autoslm.providers.runpod.train import WORKER_IMAGE
+
+    return WORKER_IMAGE
 
 
 @dataclass
@@ -246,9 +252,20 @@ def build_onstart(payload: dict, install_deps: bool = True) -> str:
     bootstrap_src = (Path(__file__).parent / "_bootstrap.py").read_text()
     if install_deps:
         deps = " ".join(shlex.quote(d) for d in resolve_worker_deps())
-        pip_line = f'"$PYBIN" -m pip install --no-cache-dir {deps}'
+        # Vast cold-start is dominated by this dep install (torch/vllm/transformers cu128 stack) on
+        # fresh hosts — RunPod caches it as a Flash artifact, but Vast reinstalls per host, so use
+        # `uv pip` (validated in the worker image: resolves + installs the full pinned cu128 stack
+        # in ~12s, ~10x faster than pip). --break-system-packages: PYBIN is the image's
+        # externally-managed system python (newer pytorch images dropped /opt/conda); uv refuses it
+        # without this flag (and ignores pip's PIP_BREAK_SYSTEM_PACKAGES), which is what silently
+        # broke the earlier uv attempt. The flag is a no-op on a conda/venv python, so it's safe
+        # across image variants.
+        pip_line = (
+            '"$PYBIN" -m pip install --no-cache-dir uv '
+            f'&& "$PYBIN" -m uv pip install --python "$PYBIN" --break-system-packages --no-cache {deps}'
+        )
     else:
-        pip_line = ": # deps baked into the image (AUTOSLM_WORKER_IMAGE)"
+        pip_line = ": # deps baked into the image (WORKER_IMAGE)"
     # Verified live: Vast's args-mode wrapper resets PATH, so `python3` resolves to
     # the OS python (Ubuntu 24.04 = PEP 668 externally-managed -> pip refuses), not
     # the image's conda env. Prefer the conda python when present (torch baked in),
@@ -257,7 +274,7 @@ def build_onstart(payload: dict, install_deps: bool = True) -> str:
 # AutoSLM vast worker (generated by autoslm.providers.vast.jobs.build_onstart)
 set -x
 export PIP_BREAK_SYSTEM_PACKAGES=1
-PYBIN=/opt/conda/bin/python; [ -x "$PYBIN" ] || PYBIN=$(command -v python3)
+PYBIN=/opt/conda/bin/python; [ -x "$PYBIN" ] || PYBIN=/usr/local/bin/python; [ -x "$PYBIN" ] || PYBIN=$(command -v python3)
 mkdir -p /root/autoslm
 cat > /root/autoslm/payload.b64 <<'AUTOSLM_PAYLOAD_EOF'
 {payload_b64}AUTOSLM_PAYLOAD_EOF
@@ -324,7 +341,9 @@ def deploy_and_submit(
         raise vast_api.VastApiError("no usable vast offers (verified datacenter pool empty)")
     payload = build_payload(spec, seed, attempt)
     label = instance_label(spec.run_id, seed, attempt)
-    install_deps = not os.environ.get("AUTOSLM_WORKER_IMAGE")
+    from autoslm.providers.runpod.train import WORKER_IMAGE
+
+    install_deps = not WORKER_IMAGE
     tried: list[VastOffer] = []
     candidates = list(offers[:5])
     refreshed = False
@@ -624,7 +643,7 @@ def submit_run_vast(
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
-        stall = float(os.environ.get("AUTOSLM_STALL_AFTER_S", "1500"))
+        stall = 1500.0
         # Wall cap + provision/install grace; Vast has no server-side execution
         # timeout, so the client deadline (and the bootstrap's own cap) bound spend.
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + 1800

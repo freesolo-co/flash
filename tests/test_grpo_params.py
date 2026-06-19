@@ -315,6 +315,27 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     assert dropped.train.stop_sequences == ("x",)
 
 
+def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
+    """The per-device completion micro-batch caps to the fp32-logits budget: a short completion
+    keeps the base (8), a long one (4096 tok x ~152k vocab x 4 B ~ 2.5 GB/unit) caps to fit the
+    6 GB budget, pushing the rest into grad-accum. (CPU: the colocate VRAM cap is GPU-only.)"""
+    from autoslm.engine.worker import rl_per_device_comps
+
+    monkeypatch.delenv("RL_PER_DEVICE_PROMPTS", raising=False)
+    monkeypatch.delenv("THINKING", raising=False)
+    # short completion: budget non-binding -> base default 8
+    assert rl_per_device_comps(512, vocab=152_000, use_vllm=True) == 8
+    # long completion: 6e9 / (4096*152000*4) ~ 2.4 -> capped to 2
+    assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 2
+    # explicit override always wins (and disables the auto-caps)
+    monkeypatch.setenv("RL_PER_DEVICE_PROMPTS", "5")
+    assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 5
+    # a tighter budget caps harder
+    monkeypatch.delenv("RL_PER_DEVICE_PROMPTS", raising=False)
+    monkeypatch.setenv("RL_LOGITS_BUDGET_GB", "2")
+    assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 1
+
+
 def test_optimizer_knob_validation_rejects_bad_values() -> None:
     # schema is the server's 400 layer: nonsensical/malformed knobs must raise
     # ConfigError at parse time, not TypeError (500) or a silently-misbehaving worker.
