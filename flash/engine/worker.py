@@ -1908,30 +1908,33 @@ def _is_disaggregated_ddp_launcher() -> bool:
     inference_gpus = _env_inference_gpus(inference_gpus)
     if inference_gpus <= 0:
         return False
+    # The launcher-vs-single-trainer distinction is purely train_gpus>1, and train_gpus is exactly
+    # total-inference_gpus (== select_rollout_split(...).train_gpus). Compute it deterministically so
+    # the only thing that can fail is detect_total_gpus() itself — NOT the train_gpus decision. A
+    # broad `except: return True` around the whole block would mis-fire on a single-trainer 1:N split
+    # (e.g. 1:1, no accelerate children): that process IS the in-process trainer, so it must drop fla,
+    # and skipping it leaves Hopper fla in place -> gated-delta GRPO crashes (fla #640).
     try:
-        from flash.engine.rollout_bench import select_rollout_split
-
         total = _disagg.detect_total_gpus()
-        if inference_gpus >= total:
-            return False  # invalid split; run_rl raises with a clear message
-        return select_rollout_split(total, inference_gpus).train_gpus > 1
     except Exception as e:
-        # We are already in the disaggregated configuration (rl mode, not the trainer-only child,
-        # inference_gpus>0), and the only non-launcher split — inference_gpus>=total — is returned
-        # above before this try. So an UNEXPECTED split-detection failure here is NOT evidence that
-        # this is a colocated/single-trainer run; swallowing it as `return False` would let the
-        # caller (_drop_fla_on_hopper) run get_device_capability() and bind a retained CUDA context
-        # on the pinned trainer card for the whole DDP launch — the exact rank-0 VRAM/OOM hazard this
-        # guard exists to prevent. Fail SAFE to True (the launcher trains nothing, so skipping its fla
-        # probe is free; each accelerate child still drops fla rank-local), and log loudly so the
-        # mis-detection is visible rather than silent.
+        # Node size is genuinely UNKNOWN here (we already confirmed rl mode, not the trainer-only
+        # child, inference_gpus>0). We can't tell a 1:1 single-trainer from a 2:1/2:2 launcher, so
+        # bias to True: skipping the launcher's fla probe is free (it trains nothing) and avoids
+        # binding a retained CUDA context on the pinned trainer card (the rank-0 VRAM/OOM hazard this
+        # guard exists to prevent); a true single-trainer's accelerate-less child still has RUN_RL's
+        # later in-process fla handling, and any accelerate child drops fla rank-local regardless.
         print(
-            f"[rl][disagg] WARNING: _is_disaggregated_ddp_launcher split detection failed ({e!r}); "
+            f"[rl][disagg] WARNING: _is_disaggregated_ddp_launcher GPU-count detection failed ({e!r}); "
             "assuming multi-trainer launcher to avoid binding a CUDA context on the trainer card "
             "(skips the fla probe; children still drop fla rank-local).",
             flush=True,
         )
         return True
+    if inference_gpus >= total:
+        return False  # invalid split; run_rl raises with a clear message
+    # train_gpus == 1 -> single in-process trainer (no accelerate launcher): it MUST drop fla.
+    # train_gpus  > 1 -> multi-trainer DDP launcher: skip its fla probe (children drop fla rank-local).
+    return (total - inference_gpus) > 1
 
 
 def _pin_trainer_devices_for_disaggregated() -> None:

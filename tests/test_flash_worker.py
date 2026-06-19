@@ -493,18 +493,30 @@ def test_is_disaggregated_ddp_launcher_only_for_multi_trainer(monkeypatch):
     assert ne._is_disaggregated_ddp_launcher() is False
 
 
-def test_is_disaggregated_ddp_launcher_fails_safe_on_split_error(monkeypatch):
-    """An UNEXPECTED split-detection failure inside the disaggregated configuration (rl mode, not
-    the trainer child, inference_gpus>0) must fail SAFE to True, not silently to False. Returning
-    False would let _drop_fla_on_hopper run get_device_capability() and bind a retained CUDA context
-    on the pinned trainer card for the whole DDP launch — the exact rank-0 OOM hazard this guard
-    prevents. (The only legitimate non-launcher split, inference_gpus>=total, is handled explicitly
-    before the try, so reaching the except means a genuine error, where skipping the probe is safe.)"""
+def test_is_disaggregated_ddp_launcher_fails_safe_on_gpu_count_error(monkeypatch):
+    """When GPU-count detection genuinely fails (node size UNKNOWN) inside the disaggregated config
+    (rl mode, not the trainer child, inference_gpus>0), fail SAFE to True, not silently to False.
+    Returning False would let _drop_fla_on_hopper run get_device_capability() and bind a retained
+    CUDA context on the pinned trainer card for the whole DDP launch — the exact rank-0 OOM hazard
+    this guard prevents. Detection failure is the ONLY path that can reach this fallback now: the
+    launcher-vs-single-trainer decision is computed deterministically from total-inference_gpus."""
     ne = _launcher_worker(monkeypatch, inference_gpus=1, total_gpus=3)
-    import flash.engine.rollout_bench as _rb
+    import flash.engine.disaggregated as _d
 
-    def _boom(*_a, **_k):
-        raise RuntimeError("split detection blew up")
+    def _boom(env=None):
+        raise RuntimeError("nvidia-smi blew up")
 
-    monkeypatch.setattr(_rb, "select_rollout_split", _boom)
+    monkeypatch.setattr(_d, "detect_total_gpus", _boom)
     assert ne._is_disaggregated_ddp_launcher() is True
+
+
+def test_is_disaggregated_ddp_launcher_single_trainer_drops_fla_when_count_known(monkeypatch):
+    """Regression: a 1:1 single-trainer disaggregated run (total=2, inference_gpus=1, train_gpus=1)
+    has NO accelerate children — this process IS the in-process trainer and MUST drop Hopper fla.
+    The decision is made from total-inference_gpus, so a working GPU count returns False (don't skip
+    the fla probe) even though the broad earlier code path would have over-fired to True on error."""
+    ne = _launcher_worker(monkeypatch, inference_gpus=1, total_gpus=2)
+    assert ne._is_disaggregated_ddp_launcher() is False
+    # 1:3 (total=4, inference_gpus=3, train_gpus=1) is also single-trainer -> False
+    ne = _launcher_worker(monkeypatch, inference_gpus=3, total_gpus=4)
+    assert ne._is_disaggregated_ddp_launcher() is False
