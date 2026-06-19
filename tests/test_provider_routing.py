@@ -68,7 +68,7 @@ def _vast_handle_dict(instance_id=1, machine_id=2):
 def orch(monkeypatch, tmp_path):
     from flash import runner
 
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     return runner
@@ -292,7 +292,7 @@ def test_cancel_routes_vast(orch, monkeypatch):
     monkeypatch.setattr(runpod_api, "cancel_job", lambda *a: runpod_calls.append(a))
     # make the vast provider "available" so _gc_run_endpoints invokes its gc sweep
     monkeypatch.setenv("VAST_API_KEY", "x")
-    monkeypatch.delenv("AUTOSLM_SKIP_NET", raising=False)
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     spec = _spec()
     st = _seed_status(orch, spec)
@@ -368,8 +368,8 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
 def test_config_provider_fields(monkeypatch):
     from flash.schema import ConfigError, spec_from_dict
 
-    monkeypatch.setenv("AUTOSLM_SKIP_NET", "1")
-    monkeypatch.delenv("AUTOSLM_GPU_ALLOW_UNVALIDATED", raising=False)
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
+    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",

@@ -3,7 +3,7 @@
 Library code logs through the ``flash`` logger and never configures handlers on import (it
 attaches a :class:`logging.NullHandler`), so importing Flash stays silent for downstream
 applications. The CLI calls :func:`configure_logging` to attach a console handler whose
-level is controlled by ``-v/--verbose`` or the ``AUTOSLM_LOG_LEVEL`` environment variable.
+level is controlled by ``-v/--verbose`` or the ``FLASH_LOG_LEVEL`` environment variable.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def get_logger(name: str | None = None) -> logging.Logger:
 
 
 def _level_from_env(default: int = logging.WARNING) -> int:
-    raw = os.environ.get("AUTOSLM_LOG_LEVEL")
+    raw = os.environ.get("FLASH_LOG_LEVEL")
     if not raw:
         return default
     raw = raw.strip()
@@ -46,10 +46,10 @@ def configure_logging(verbosity: int = 0, level: int | None = None) -> None:
     """Attach a console handler to the ``flash`` logger and set its level.
 
     ``verbosity`` maps repeated ``-v`` flags to levels (0=WARNING, 1=INFO, >=2=DEBUG).
-    An explicit ``level`` (or the ``AUTOSLM_LOG_LEVEL`` env var) overrides the verbosity mapping.
+    An explicit ``level`` (or the ``FLASH_LOG_LEVEL`` env var) overrides the verbosity mapping.
     """
     if level is None:
-        if os.environ.get("AUTOSLM_LOG_LEVEL"):
+        if os.environ.get("FLASH_LOG_LEVEL"):
             level = _level_from_env()
         else:
             level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
