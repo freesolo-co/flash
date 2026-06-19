@@ -2088,6 +2088,14 @@ def run_rl():
                     f"requires heads % TP == 0). Valid inference_gpus for this model: {_valid}. "
                     f"Pick a [train] inference_gpus from that set (e.g. a 1:2 or 1:4 split)."
                 )
+        # Optional --enforce_eager: skip vLLM CUDA-graph capture at server boot. For very large
+        # models (e.g. the 35B-A3B MoE) graph capture dominates the boot window and can blow past
+        # RL_VLLM_SERVER_TIMEOUT before the server is ever healthy; eager trades a little decode
+        # throughput for a tractable boot. Opt-in via AUTOSLM_RL_VLLM_ENFORCE_EAGER so small models
+        # keep graphs (their boot is cheap and they want the decode speed).
+        _vllm_extra: list[str] = []
+        if os.environ.get("AUTOSLM_RL_VLLM_ENFORCE_EAGER", "").strip().lower() in ("1", "true", "yes"):
+            _vllm_extra += ["--enforce_eager", "true"]
         _cmd = _disagg.build_vllm_serve_cmd(
             model_id,
             _rollout_split,
@@ -2097,6 +2105,7 @@ def run_rl():
             quant=quant,
             kv_cache_dtype=_server_kv,
             parallel=_parallel,
+            extra=(_vllm_extra or None),
         )
         _server_timeout = float(os.environ.get("RL_VLLM_SERVER_TIMEOUT", "1200"))
         if _trainer_only:

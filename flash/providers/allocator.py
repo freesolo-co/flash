@@ -81,7 +81,14 @@ def required_vram_gb(
     if train is not None and int(getattr(train, "inference_gpus", 0) or 0) > 0:
         pb = _params_b_for_vram(model_id)
         if pb:
-            server_need = int(pb * 2.0 * 1.2)  # full bf16 weights + ~20% for KV / CUDA overhead
+            infer = max(1, int(getattr(train, "inference_gpus", 1) or 1))
+            # The rollout server is TENSOR-PARALLEL across the inference GPUs (build_vllm_serve_cmd
+            # parallel="tp" -> --tensor_parallel_size=infer): vLLM shards BOTH the bf16 weights and
+            # the KV cache across the TP ranks, so each inference card holds ~1/infer of the full
+            # server, not the whole model. infer==1 keeps the full-weight need (a single-card server).
+            # Without this, a 35B served TP=2 wrongly demanded a 94GB card per GPU and could not find a
+            # 3-/4-GPU whole-machine offer; sized per-shard it fits 2x A100-80G / H100-80G (abundant).
+            server_need = int(pb * 2.0 * 1.2 / infer)  # per-card bf16 shard + ~20% for KV / overhead
             disagg_need = max(server_need, int(colocate * 0.7))
             # Cap at the colocate estimate (disaggregation never needs more per GPU than the whole
             # colocated total) but NEVER below server_need: for an MoE whose colocate is sized by
