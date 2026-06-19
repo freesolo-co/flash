@@ -33,7 +33,7 @@ def _check_login():
         # Login verifies the freesolo key against the freesolo backend, then stores it. Stub
         # the network verify so the test stays offline; an invalid key would raise instead.
         verified: dict = {}
-        cli.verify_freesolo_key = lambda api_key, base_url=None: verified.update(
+        cli.commands.verify_freesolo_key = lambda api_key, base_url=None: verified.update(
             api_key=api_key, base_url=base_url
         )
         args = types.SimpleNamespace(api_key="fs-secret-123", api_url=None, freesolo_url=None)
