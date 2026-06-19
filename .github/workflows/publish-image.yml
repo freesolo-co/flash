@@ -1,0 +1,69 @@
+name: Publish flash image
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - "flash/**"
+      - "Dockerfile"
+      - "pyproject.toml"
+      - ".github/workflows/publish-image.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-flash-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish-flash-image:
+    name: Build and push flash control-plane image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/freesolo-co/freesolo-flash
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          # main publishes :main + :latest; any other branch (dev) publishes
+          # :<branch>. every build also gets an immutable :sha-<short> tag.
+          short_sha="$(git rev-parse --short HEAD)"
+          branch="${GITHUB_REF_NAME}"
+          {
+            echo "tags<<EOF"
+            if [ "$branch" = "main" ]; then
+              echo "${IMAGE}:main"
+              echo "${IMAGE}:latest"
+            else
+              echo "${IMAGE}:${branch}"
+            fi
+            echo "${IMAGE}:sha-${short_sha}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
