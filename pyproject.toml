@@ -22,6 +22,8 @@ dependencies = [
     "huggingface-hub>=0.25",
     "datasets>=2.19",
     "verifiers>=0.1.10",
+    # Thin HTTP client for the freesolo serving app (adapter deploy/undeploy/chat).
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
