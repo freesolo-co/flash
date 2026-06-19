@@ -2565,26 +2565,13 @@ def run_rl():
         if "num_iterations" in _grpo_fields:
             grpo_kwargs["num_iterations"] = 2
             print("[rl] rollout amortization: num_iterations=2 (reuse each generation batch)")
-        # N-step weight sync (verl-style sync interval) — the disaggregated "never slower" lever.
-        # In disaggregated mode TRL pushes the policy to the standalone vLLM server every generation
-        # buffer via a per-named-param NCCL broadcast+BARRIER storm (one collective round-trip PER
-        # param, latency-bound). For >=2B that sync cost exceeds the TP-generation gain, so
-        # disaggregated comes out SLOWER than colocate (which pays no sync — vLLM shares the trainer
-        # process). Raising steps_per_generation to grad_accum*N fires that sync once every N
-        # generation buffers (N x larger generation batch, consumed over N x more optimizer steps),
-        # amortizing the sync ~N x. Rollouts become up to N-step off-policy; TRL's importance-sampling
-        # correction (vllm_importance_sampling_correction, on by default) corrects the ratio. Gated by
-        # RL_SYNC_EVERY (default 2, clamped [1,4]; =1 restores per-step sync). Colocate is untouched.
-        if _inference_gpus > 0 and "steps_per_generation" in _grpo_fields:
-            _sync_n = max(1, min(int(os.environ.get("RL_SYNC_EVERY", "2")), 4))
-            if _sync_n > 1 and "generation_batch_size" not in grpo_kwargs:
-                _ga = int(grpo_kwargs.get("gradient_accumulation_steps", 1) or 1)
-                grpo_kwargs["steps_per_generation"] = _ga * _sync_n
-                print(
-                    f"[rl][disagg] N-step weight sync: steps_per_generation={_ga * _sync_n} "
-                    f"(sync every {_sync_n} generation buffers; IS-corrected off-policy rollouts). "
-                    f"Set RL_SYNC_EVERY=1 to restore per-step sync."
-                )
+        # NOTE: an N-step weight-sync knob (RL_SYNC_EVERY via steps_per_generation) was tried and
+        # REVERTED — raising steps_per_generation multiplies generation_batch_size past a small
+        # dataset into an empty dataloader (0 real steps / degenerate ~12s "done"), and the measured
+        # speedup was nil (2B 2:2 RL_SYNC_EVERY=4 = 118.0s vs per-step 109.7s). The real multi-GPU
+        # win is GPU SCALING (more inference TP + more DDP trainers): MiniCPM 1->8 GPU = 1.0x -> 5.21x,
+        # which needs no trainer-config change. Removing the broken knob; the path to >2x beyond
+        # scaling is async one-step-off OVERLAP (verl HybridEngine / TRL AsyncGRPOTrainer), separate.
         cfg = GRPOConfig(**grpo_kwargs)
         setup_seconds = time.time() - t_start
         heartbeat("rl_train_start", setup_seconds=setup_seconds)
