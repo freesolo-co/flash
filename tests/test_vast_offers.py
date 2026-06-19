@@ -29,7 +29,7 @@ FIXTURE = [
     _offer(id=3, gpu_name="RTX 6000Ada", gpu_ram=49140, dph_total=0.80),  # KEEP: alias mapping
     _offer(id=4, gpu_name="A100 SXM4", gpu_ram=40960, dph_total=0.87),  # KEEP: 40GB variant
     _offer(id=5, gpu_name="A100 SXM4", gpu_ram=81920, dph_total=1.20),  # KEEP: 80GB variant
-    _offer(id=10, dph_total=0.08, hosting_type=0),  # DROP by default: community host (secrets ship to it) -> opt-in only
+    _offer(id=10, dph_total=0.08, hosting_type=0),  # dropped: community host (secrets ship to it)
     _offer(id=11, dph_total=0.10, verification="unverified"),  # DROP: not verified
     _offer(id=12, dph_total=0.11, reliability2=0.80),  # DROP: reliability floor
     _offer(id=13, gpu_name="Tesla T4", gpu_ram=16384, dph_total=0.05),  # DROP: sub-Ampere
@@ -57,9 +57,8 @@ def test_usable_offers_filters_and_order(monkeypatch):
         return list(FIXTURE)
 
     monkeypatch.setattr(vast_api, "search_offers", fake_search)
-    monkeypatch.delenv("FLASH_VAST_ALLOW_COMMUNITY", raising=False)
     out = vast.usable_offers(24, disk_gb=60)
-    # community host (id=10) dropped by default — datacenter-only unless opted in
+    # community host (id=10) dropped — datacenter-only (run secrets ship to the box)
     assert [o.offer_id for o in out] == [1, 2, 17, 3, 4, 5]  # dph ascending, junk gone
     assert captured["min_disk_gb"] == 60
     # the server-side VRAM filter carries slack for under-reporting boards
@@ -73,16 +72,16 @@ def test_usable_offers_filters_and_order(monkeypatch):
     assert by_id[17].gpu == "RTX Pro 4000"
 
 
-def test_usable_offers_community_opt_in(monkeypatch):
-    """FLASH_VAST_ALLOW_COMMUNITY=1 widens the gate to verified community hosts."""
+def test_usable_offers_always_datacenter_only(monkeypatch):
+    """Community/marketplace hosts (hosting_type 0) are ALWAYS rejected — run secrets ship to the
+    box, so even a verified community host (id=10) never makes the cut."""
     from flash.providers.vast import api as vast_api
     from flash.providers.vast import jobs as vast
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
-    monkeypatch.setenv("FLASH_VAST_ALLOW_COMMUNITY", "1")
     out = vast.usable_offers(24, disk_gb=60)
-    # opted in: the verified community host (id=10) is now the cheapest survivor
-    assert [o.offer_id for o in out] == [10, 1, 2, 17, 3, 4, 5]
+    # the community host (id=10) is dropped; only verified datacenter hosts survive
+    assert [o.offer_id for o in out] == [1, 2, 17, 3, 4, 5]
 
 
 def test_usable_offers_vram_gate(monkeypatch):

@@ -30,13 +30,12 @@ from flash.client.config import load_credentials
 from flash.client.specs import spec_payload
 from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
-from flash.spec import _coerce_bool
 
 logger = get_logger(__name__)
 
 
 # Exceptions that represent expected user/config errors: report them as a clean one-line
-# message instead of a Python traceback (use --debug / FLASH_DEBUG=1 to see the full trace).
+# message instead of a Python traceback (use --debug to see the full trace).
 _USER_ERRORS = (
     ConfigError,
     ClientError,
@@ -55,14 +54,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="show full tracebacks on error (or set FLASH_DEBUG=1)",
+        help="show full tracebacks on error",
     )
     parser.add_argument(
         "-v",
         "--verbose",
         action="count",
         default=0,
-        help="increase log verbosity (-v for info, -vv for debug; or set FLASH_LOG_LEVEL)",
+        help="increase log verbosity (-v for info, -vv for debug)",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -205,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
-    debug = getattr(args, "debug", False) or _coerce_bool(os.environ.get("FLASH_DEBUG", ""))
+    debug = getattr(args, "debug", False)
     try:
         return args.func(args)
     except _USER_ERRORS as exc:

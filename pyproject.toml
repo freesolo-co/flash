@@ -19,9 +19,14 @@ classifiers = [
 ]
 dependencies = [
     "runpod-flash",
-    "huggingface-hub>=0.25",
+    # >=0.34: upload_code()'s update_repo_settings(private=True) needs the visibility-via-settings
+    # API (older 0.25.x update_repo_settings only accepts `gated` and raises TypeError on `private`;
+    # visibility there lived on the now-removed update_repo_visibility).
+    "huggingface-hub>=0.34",
     "datasets>=2.19",
     "verifiers>=0.1.10",
+    # Thin HTTP client for the freesolo serving app (adapter deploy/undeploy/chat).
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]

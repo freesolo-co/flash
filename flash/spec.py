@@ -130,10 +130,13 @@ class TrainSpec:
     # optimizer steps, greedily evaluate the policy on the ENVIRONMENT's held-out ``eval_dataset``
     # with the env's rubric (reward + eval-metric metrics) and record the curve into metrics.json,
     # so the agent judges the run on held-out eval, not just the training reward. 0/None disables.
-    # This cadence is the ONLY mid-run-eval knob: the eval queries and grading logic live in the
-    # environment, and the completion budget matches the run's normal ``max_tokens``.
-    # (``FLASH_EVAL_EVERY_STEPS`` env var overrides it — operator/bench escape hatch.)
+    # The eval queries and grading logic live in the environment, and the completion budget
+    # matches the run's normal ``max_tokens``.
     eval_every_steps: int | None = None
+    # How many held-out examples each mid-run eval pass scores: a FIXED random sample of this
+    # many rows (seeded, so the same subset every pass -> a comparable curve), instead of the
+    # whole eval split (which can be huge and dominate training). None/0 -> the built-in default (64).
+    eval_examples: int | None = None
     # Disaggregated (async) GRPO rollout: number of GPUs in the node dedicated to the vLLM rollout
     # server, the rest train (see engine.rollout_bench.select_rollout_split). 0 = colocate (the
     # current single-GPU TRL path). >0 requires a multi-GPU node ([gpu] count = train + inference).
@@ -156,7 +159,8 @@ class GpuSpec:
     # this is a policy word — ``type`` is then just the parse-time provisional; a
     # concrete ``requested`` pins the class and the allocator only picks the provider.
     requested: str = ""
-    # Carried into the submit-time allocator (None -> FLASH_GPU_ALLOW_UNVALIDATED).
+    # Whether to allow GPU classes Flash hasn't validated. Set only by the [gpu]
+    # allow_unvalidated TOML field; None leaves it disallowed.
     allow_unvalidated: bool | None = None
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
@@ -247,6 +251,7 @@ class JobSpec:
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 eval_every_steps=_opt_int(train.get("eval_every_steps")),
+                eval_examples=_opt_int(train.get("eval_examples")),
                 inference_gpus=_opt_int(train.get("inference_gpus")) or 0,
             ),
             gpu=GpuSpec(

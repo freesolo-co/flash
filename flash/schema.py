@@ -235,8 +235,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError(
             f"gpu type {gpu_type!r} has not passed Flash's live validation smoke"
             f"{' on ' + provider if provider != 'auto' else ''} "
-            f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true "
-            f"(or FLASH_GPU_ALLOW_UNVALIDATED=1) to use it anyway."
+            f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true to use it anyway."
         )
     try:
         # Pass [train] so the open-model ("allow") fit check is disaggregated-aware: an
@@ -294,6 +293,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # minimum=0 so `eval_every_steps = 0` explicitly disables (matches "0/None disables");
             # negatives are rejected.
             eval_every_steps=_train_int(train_raw, "eval_every_steps", minimum=0),
+            # How many held-out rows each mid-run eval pass scores (a fixed seeded random sample);
+            # minimum=0 so an explicit `eval_examples = 0` is accepted as the documented "use the
+            # built-in default (64)" no-op (matches TrainSpec/eval_config, which map 0/None -> 64);
+            # negatives are rejected. None -> built-in default (64).
+            eval_examples=_train_int(train_raw, "eval_examples", minimum=0),
             # SFT caps: max_steps caps optimizer steps (cheap pre-flight smoke); max_examples
             # truncates the SFT dataset. minimum=0 so an explicit 0 means "no cap" (matches the
             # TrainSpec "None/0 -> no cap" contract); the worker reads these from [train].
@@ -319,98 +323,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             datacenter=gpu_raw.get("datacenter"),
         ),
         run_id=run_id or raw.get("run_id", "local"),
-        worker_env=_worker_env(raw.get("worker_env")),
         model_policy=model_policy,
         thinking=thinking,
     )
     _validate_spec(spec)
     return spec
-
-
-def _worker_env(raw: Any) -> dict[str, str]:
-    """Parse the optional [worker_env] table: per-run worker env overrides (string-valued)."""
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise ConfigError("[worker_env] must be a table of string key/values")
-    env = {str(k): str(v) for k, v in raw.items()}
-    # [worker_env] is serialized into job_spec_json (persisted + logged), so it must NOT carry
-    # secrets — they would leak into run artifacts. Reject secret-looking keys; operators set
-    # those as real process environment variables (forwarded to the worker out-of-band) instead.
-    # Detect by `_`-delimited WORD components (not substring): flag a secret WORD, or `KEY`
-    # qualified by API/SECRET/PRIVATE/ACCESS/INTERNAL/AUTH. This catches HF_TOKEN, *_API_KEY,
-    # SECRET_KEY, INTERNAL_KEY, CREDENTIAL, AWS_SECRET_ACCESS_KEY while allowing legit knobs whose
-    # names merely contain a marker (RL_VLLM_MAX_BATCHED_TOKENS -> word TOKENS, not TOKEN; a bare
-    # SORT_KEY -> KEY without a secret qualifier).
-    _secret_words = {"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS", "APIKEY", "PRIVATEKEY"}
-    _key_qualifiers = {"API", "SECRET", "PRIVATE", "ACCESS", "INTERNAL", "AUTH", "SIGNING", "ENCRYPTION"}
-
-    def _is_secret_key(name: str) -> bool:
-        words = set(name.upper().split("_"))
-        return bool(words & _secret_words) or ("KEY" in words and bool(words & _key_qualifiers))
-
-    secrets = sorted(k for k in env if _is_secret_key(k))
-    if secrets:
-        raise ConfigError(
-            f"[worker_env] must not contain secret-bearing keys ({', '.join(secrets)}); these are "
-            "serialized into run artifacts — set them as real environment variables instead"
-        )
-    # The disaggregated-rollout TOPOLOGY is fixed at submit time: the allocator sizes per-GPU VRAM,
-    # picks the GPU class/provider, and bills the multi-GPU node from [train].inference_gpus and
-    # [gpu].count (+ the auto-derived inference parallelism). A per-run [worker_env]
-    # FLASH_INFERENCE_GPUS / FLASH_DISAGG_PARALLEL / FLASH_GPU_COUNT would silently change the
-    # worker's split AFTER all of that — e.g. a 35B sized as TP=2 onto 80 GB cards then started DP
-    # (full server per card) or as inference_gpus=1 (unsharded server needing the whole per-card
-    # footprint), OOMing the rented node; or =0 falling back to colocate while still billing a
-    # multi-GPU node; or FLASH_GPU_COUNT replacing the allocated node size after sizing (a larger
-    # value over-provisions the split past the visible GPUs, a smaller one shrinks it). The control
-    # plane sets FLASH_GPU_COUNT from [gpu].count in build_worker_env, and the per-run merge there
-    # would let this override win — so reject all three here. Set [train].inference_gpus / [gpu].count
-    # (the sized fields) and let the parallelism auto-derive (operators can still pin
-    # FLASH_DISAGG_PARALLEL as a real control-plane env var, which the allocator reads).
-    _topology = sorted(
-        k
-        for k in env
-        if k.upper() in {"FLASH_INFERENCE_GPUS", "FLASH_DISAGG_PARALLEL", "FLASH_GPU_COUNT"}
-    )
-    if _topology:
-        raise ConfigError(
-            f"[worker_env] must not set the disaggregated-rollout topology ({', '.join(_topology)}): "
-            "the GPU split is sized, allocated, and billed at submit time from [train].inference_gpus. "
-            "Set [train].inference_gpus instead (a per-run override here would mis-size/mis-bill the "
-            "provisioned node)"
-        )
-    # The disaggregated launcher sets these INTERNAL role/rank flags itself when it re-execs the
-    # worker under `accelerate launch` (FLASH_RL_TRAINER_ONLY marks the accelerate child; RANK /
-    # LOCAL_RANK / WORLD_SIZE / MASTER_* are the distributed-rendezvous coordinates accelerate
-    # injects per rank; FLASH_VLLM_GROUP_PORT is the trainer<->server NCCL rendezvous port). A per-run
-    # [worker_env] override is merged into the worker env (build_worker_env), so e.g.
-    # FLASH_RL_TRAINER_ONLY=1 would make the paid LAUNCHER process take the trainer-only branch —
-    # skipping the rollout-server launch and then hanging while GRPO connects to a server that was
-    # never started (or a stray RANK/group-port would corrupt the real children's rendezvous). These
-    # are control-plane/launcher-owned, never operator-set; reject them at parse.
-    _role = sorted(
-        k
-        for k in env
-        if k.upper()
-        in {
-            "FLASH_RL_TRAINER_ONLY",
-            "FLASH_VLLM_GROUP_PORT",
-            "RANK",
-            "LOCAL_RANK",
-            "WORLD_SIZE",
-            "MASTER_ADDR",
-            "MASTER_PORT",
-        }
-    )
-    if _role:
-        raise ConfigError(
-            f"[worker_env] must not set the disaggregated trainer role/rank flags ({', '.join(_role)}): "
-            "these are injected by the launcher / accelerate when it spawns the trainer ranks. A "
-            "per-run override would hijack the paid launcher into a broken trainer-only process (no "
-            "rollout server is started) or corrupt the distributed rendezvous"
-        )
-    return env
 
 
 def _validate_spec(spec: JobSpec) -> None:

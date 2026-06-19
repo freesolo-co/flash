@@ -73,61 +73,6 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        "FLASH_INFERENCE_GPUS",
-        "FLASH_DISAGG_PARALLEL",
-        "flash_disagg_parallel",
-        # FLASH_GPU_COUNT is the submit-time node-size hint (= [gpu].count) the control plane sets
-        # in build_worker_env; a per-run override there would replace the allocated count AFTER
-        # sizing, changing the split / over-provisioning past the visible GPUs.
-        "FLASH_GPU_COUNT",
-        "flash_gpu_count",
-    ],
-)
-def test_worker_env_rejects_topology_overrides(key) -> None:
-    """The disaggregated GPU split is sized/allocated/billed at submit time from
-    [train].inference_gpus; a per-run [worker_env] topology override would change the worker's split
-    after provisioning (OOM / mis-bill), so it must be rejected at parse (case-insensitively)."""
-    raw = _raw()
-    raw["worker_env"] = {key: "1"}
-    with pytest.raises(ConfigError, match="must not set the disaggregated-rollout topology"):
-        spec_from_dict(raw)
-
-
-@pytest.mark.parametrize(
-    "key",
-    [
-        "FLASH_RL_TRAINER_ONLY",
-        "flash_rl_trainer_only",
-        "FLASH_VLLM_GROUP_PORT",
-        "RANK",
-        "LOCAL_RANK",
-        "WORLD_SIZE",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-    ],
-)
-def test_worker_env_rejects_role_rank_flags(key) -> None:
-    """The launcher / accelerate inject the disaggregated trainer role + distributed-rank flags when
-    they spawn the trainer ranks. A per-run [worker_env] override is merged into the worker env, so
-    e.g. FLASH_RL_TRAINER_ONLY=1 would hijack the paid launcher into a broken trainer-only process
-    (no rollout server is started). Reject them at parse (case-insensitively)."""
-    raw = _raw()
-    raw["worker_env"] = {key: "1"}
-    with pytest.raises(ConfigError, match="must not set the disaggregated trainer role/rank flags"):
-        spec_from_dict(raw)
-
-
-def test_worker_env_allows_ordinary_knobs() -> None:
-    """A legit per-run knob (e.g. a kernel A/B flag) still passes through [worker_env]."""
-    raw = _raw()
-    raw["worker_env"] = {"FLASH_LORA_INIT": "default", "RL_VLLM_GPU_UTIL": "0.5"}
-    spec = spec_from_dict(raw)
-    assert spec.worker_env == {"FLASH_LORA_INIT": "default", "RL_VLLM_GPU_UTIL": "0.5"}
-
-
 def test_invalid_tensor_parallel_split_rejected_at_submit() -> None:
     """A TP split the catalog model's head count can't satisfy must fail at submit (before renting),
     not only at the worker's pre-server-boot guard. MiniCPM5-1B has 16 heads, so inference_gpus=3
@@ -346,19 +291,23 @@ def test_vram_estimate_scales_with_params_and_algorithm() -> None:
     assert sft_small < sft_big < grpo_big  # GRPO colocates vLLM on top of the trainer
 
 
-def test_vram_sft_honors_per_device_bs_env(monkeypatch) -> None:
-    # The SFT activation term must track the worker's SFT_PER_DEVICE_BS (the operator env that
-    # build_worker_env forwards): raising it must size the estimate UP, not stay capped at 4.
+def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
+    # SFT micro-batch is a MANAGED default: build_worker_env no longer forwards SFT_PER_DEVICE_BS,
+    # so the worker always runs the fixed default (4) and the allocator must size against that SAME
+    # fixed value. A control-plane process-env SFT_PER_DEVICE_BS must NOT move the estimate — sizing
+    # a card for a micro-batch the worker never uses would under-route an SFT_PER_DEVICE_BS=1 env to
+    # a too-small GPU that then OOMs at the default micro-batch 4.
     from flash.engine import vram
 
-    monkeypatch.delenv("SFT_PER_DEVICE_BS", raising=False)
-    base = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
-    monkeypatch.setenv("SFT_PER_DEVICE_BS", "8")
-    bigger = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
-    assert bigger > base  # micro-batch 8 reserves more activation VRAM than the default 4
-    # a malformed value falls back to the default (no crash, same as base)
-    monkeypatch.setenv("SFT_PER_DEVICE_BS", "not-an-int")
-    assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32) == base
+    at_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=4)
+    above_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32)
+    assert above_cap == at_cap  # batch_size above the per-device 4 is capped, not sized up
+    below_cap = vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=1)
+    assert below_cap < at_cap  # micro-batch 1 reserves less activation VRAM
+    # the removed env no longer changes the estimate (fully managed), whatever its value
+    for val in ("8", "1", "not-an-int"):
+        monkeypatch.setenv("SFT_PER_DEVICE_BS", val)
+        assert vram.estimate_vram_gb(8.0, "sft", seq_len=4096, batch_size=32) == at_cap
 
 
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
@@ -382,12 +331,12 @@ def test_get_logger_namespacing() -> None:
     assert get_logger("mymodule").name == "flash.mymodule"
 
 
-def test_log_level_from_env(monkeypatch) -> None:
+def test_configure_logging_verbosity() -> None:
     from flash import _logging
 
-    monkeypatch.setenv("FLASH_LOG_LEVEL", "debug")
-    assert _logging._level_from_env() == logging.DEBUG
-    monkeypatch.setenv("FLASH_LOG_LEVEL", "15")
-    assert _logging._level_from_env() == 15
-    monkeypatch.delenv("FLASH_LOG_LEVEL")
-    assert _logging._level_from_env(logging.WARNING) == logging.WARNING
+    _logging.configure_logging(verbosity=0)
+    assert logging.getLogger("flash").level == logging.WARNING
+    _logging.configure_logging(verbosity=1)
+    assert logging.getLogger("flash").level == logging.INFO
+    _logging.configure_logging(verbosity=2)
+    assert logging.getLogger("flash").level == logging.DEBUG
