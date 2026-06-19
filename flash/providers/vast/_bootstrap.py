@@ -62,16 +62,16 @@ def build_worker_env(payload: dict) -> dict:
     if len(spec_json) > 96_000:
         with open("/tmp/job_spec.json", "w") as f:
             f.write(spec_json)
-        env["AUTOSLM_JOB_SPEC_PATH"] = "/tmp/job_spec.json"
-        env.pop("AUTOSLM_JOB_SPEC_JSON", None)
+        env["FLASH_JOB_SPEC_PATH"] = "/tmp/job_spec.json"
+        env.pop("FLASH_JOB_SPEC_JSON", None)
     else:
-        env["AUTOSLM_JOB_SPEC_JSON"] = spec_json
+        env["FLASH_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
-    # Compute substrate for the RunMetrics record (engine.worker reads AUTOSLM_ARM). The
+    # Compute substrate for the RunMetrics record (engine.worker reads FLASH_ARM). The
     # payload env was built by the shared runpod env builder, which stamps "runpod"; this
     # bootstrap runs on the Vast instance, so override it to the real backend.
-    env["AUTOSLM_ARM"] = "vast"
+    env["FLASH_ARM"] = "vast"
     env["PYTHONPATH"] = CODE_DIR + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
 
