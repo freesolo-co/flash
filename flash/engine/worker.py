@@ -752,6 +752,121 @@ def fused_optim_name() -> str:
     return "paged_adamw_8bit"
 
 
+def _reset_peak_gpu() -> None:
+    """Reset the CUDA peak-memory counter so a subsequent ``_peak_gpu_gb`` measures only the work
+    that follows (e.g. the train loop, isolating the optimizer-state A/B from setup/model load)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def _peak_gpu_gb() -> float:
+    """Peak torch-allocated CUDA memory (GB) since the last reset; 0.0 if no CUDA. Note: bnb paged
+    8-bit optimizer state lives in unified/managed memory outside torch's caching allocator and is
+    NOT counted here — so this OVERSTATES the 8-bit saving. _GpuPeakSampler measures the true
+    device footprint (incl. bnb managed pages) for the honest A/B number."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return round(torch.cuda.max_memory_allocated() / 1e9, 3)
+    except Exception:
+        pass
+    return 0.0
+
+
+class _GpuPeakSampler:
+    """Background sampler of true device memory (GB) = (total - free) from cuda.mem_get_info, which
+    DOES include bitsandbytes managed/paged optimizer pages while they're GPU-resident (torch's
+    max_memory_allocated does not). This is the honest peak for the fp32-vs-8-bit optimizer A/B."""
+
+    def __init__(self, interval: float = 0.25):
+        self.interval = interval
+        self.peak_used = 0
+        self._stop = False
+        self._thread = None
+
+    def _run(self):
+        import torch
+
+        while not self._stop:
+            try:
+                free, total = torch.cuda.mem_get_info()
+                self.peak_used = max(self.peak_used, total - free)
+            except Exception:
+                pass
+            time.sleep(self.interval)
+
+    def start(self):
+        try:
+            import threading
+
+            import torch
+
+            if not torch.cuda.is_available():
+                return self
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        except Exception:
+            pass
+        return self
+
+    def stop_gb(self) -> float:
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        return round(self.peak_used / 1e9, 3)
+
+
+# Whether LoRA+ DEFAULTS to the 8-bit paged optimizer (the combination this change enables). The
+# combination is always AVAILABLE per-run via AUTOSLM_LORAPLUS_8BIT=1 / [worker_env]; this sets the
+# fleet default. Default True: an on-GPU A/B (Qwen3.5-4B SFT, rank-128 LoRA, 170M trainable, same
+# seed/data/init) measured LoRA+ on PagedAdamW8bit vs fp AdamW at -75% optimizer state (1359 ->
+# 346 MB) and -0.72 GB peak device memory (17.04 -> 16.33 GB) with NO convergence penalty (final
+# loss 10.64 vs 11.16 from an identical 14.45 start). A free memory win, so it's the default; set
+# AUTOSLM_LORAPLUS_8BIT=0 to fall back to fp AdamW per-run.
+_LORAPLUS_8BIT_DEFAULT = True
+
+
+def loraplus_optimizer_cls(optim_name: str):
+    """Optimizer class for the LoRA+ ``create_optimizer`` override (returns ``(cls, extra_kwargs)``).
+
+    The LoRA+ override has to *build* the optimizer itself (PEFT splits the LoRA A/B matrices into
+    separate param groups with different LRs), so it cannot inherit TRL's ``optim=`` string — it has
+    to choose a concrete class. Historically it always built a full-precision ``torch.optim.AdamW``,
+    which silently discarded the catalog's ``paged_adamw_8bit`` setting whenever LoRA+ was on.
+
+    PEFT's ``create_loraplus_optimizer`` accepts ANY ``optimizer_cls`` — including bitsandbytes 8-bit
+    optimizers (it registers embedding overrides with bnb's ``GlobalOptimManager`` to keep them
+    32-bit) — so LoRA+ and the 8-bit paged optimizer state CAN coexist.
+
+    Whether the 8-bit combination is the DEFAULT is gated by ``_LORAPLUS_8BIT_DEFAULT`` (set from the
+    on-GPU A/B, see that constant). When enabled, an ``8bit`` ``optim`` value selects
+    ``bnb.optim.PagedAdamW8bit``; otherwise (or for a non-8-bit ``optim``) LoRA+ keeps fp32 AdamW.
+    Either way ``AUTOSLM_LORAPLUS_8BIT`` forces the choice (1 -> 8-bit, 0 -> fp32), so the
+    combination is always available on demand. Falls back to fp32 AdamW if bitsandbytes is missing."""
+    import torch as _torch
+
+    # case-insensitive + str-safe: TRL normalizes optim to an OptimizerNames enum whose str() is
+    # "OptimizerNames.PAGED_ADAMW_8BIT" (uppercase), so a bare `"8bit" in optim_name` would miss it.
+    want_8bit = _LORAPLUS_8BIT_DEFAULT and "8bit" in str(optim_name or "").lower()
+    override = os.environ.get("AUTOSLM_LORAPLUS_8BIT")
+    if override is not None:
+        want_8bit = override.strip().lower() in ("1", "true", "yes", "on")
+    if want_8bit:
+        try:
+            import bitsandbytes as bnb
+
+            return bnb.optim.PagedAdamW8bit, {}
+        except Exception as e:  # bnb missing / no CUDA build -> safe fp32 fallback
+            print(f"[lora+] bitsandbytes 8-bit optimizer unavailable ({e}); using fp32 AdamW")
+    return _torch.optim.AdamW, {}
+
+
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
@@ -1139,42 +1254,43 @@ def run_sft():
     if _lp_ratio > 1:
 
         class _SFT(SFTTrainer):  # local LoRA+ subclass
+            _loraplus_applied = False  # True only once the LoRA+ grouping actually installs
+
             def create_optimizer(self):
                 if self.optimizer is None:
                     try:
                         from peft.optimizers import create_loraplus_optimizer
-                        from transformers import Trainer as _HFTrainer
 
-                        # Respect the configured `optim` (the QLoRA tier sets paged_adamw_8bit so
-                        # bitsandbytes pages int8 optimizer state to host RAM — hardcoding plain
-                        # torch AdamW here would OOM 4-bit runs). Resolve the optimizer class +
-                        # kwargs from self.args exactly as the HF Trainer would, then build it via
-                        # LoRA+ so the B-matrix LR ratio still applies on top of the right optimizer.
-                        optimizer_cls, optimizer_kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(
-                            self.args, self.model
+                        # Mirror the configured `optim` so LoRA+ and the 8-bit paged optimizer state
+                        # coexist (instead of silently forcing fp32 AdamW); see loraplus_optimizer_cls.
+                        # .value (not str()): self.args.optim is a TRL OptimizerNames enum whose
+                        # str() is "OptimizerNames.PAGED_ADAMW_8BIT"; pass the raw value
+                        # ("paged_adamw_8bit") so the 8-bit match works.
+                        opt_cls, extra = loraplus_optimizer_cls(
+                            getattr(self.args.optim, "value", self.args.optim)
                         )
-                        # LoRA+ assigns the lr per param-group, so drop any class-level lr; pass it
-                        # explicitly. The lr keyword name has shifted across PEFT versions, so pass
-                        # it via optimizer_kwargs (the stable form) and fall back to a top-level lr=.
-                        optimizer_kwargs.pop("lr", None)
+                        # PEFT's create_loraplus_optimizer forwards extra kwargs to the optimizer;
+                        # the lr keyword name has shifted across PEFT versions, so pass it via
+                        # optimizer_kwargs (the stable form) and fall back to a top-level lr=.
                         try:
                             self.optimizer = create_loraplus_optimizer(
                                 model=self.model,
-                                optimizer_cls=optimizer_cls,
-                                optimizer_kwargs={**optimizer_kwargs, "lr": self.args.learning_rate},
+                                optimizer_cls=opt_cls,
+                                optimizer_kwargs={"lr": self.args.learning_rate, **extra},
                                 loraplus_lr_ratio=_lp_ratio,
                             )
                         except TypeError:
                             self.optimizer = create_loraplus_optimizer(
                                 model=self.model,
-                                optimizer_cls=optimizer_cls,
+                                optimizer_cls=opt_cls,
                                 lr=self.args.learning_rate,
                                 loraplus_lr_ratio=_lp_ratio,
-                                **optimizer_kwargs,
+                                **extra,
                             )
+                        self._loraplus_applied = True
                         print(
                             f"[lora+] optimizer enabled (B-matrix LR ratio={_lp_ratio}, "
-                            f"optim={self.args.optim})"
+                            f"cls={opt_cls.__name__})"
                         )
                         return self.optimizer
                     except Exception as e:  # never block training on the LoRA+ wiring
@@ -1192,10 +1308,14 @@ def run_sft():
         callbacks=[make_checkpoint_upload_callback()],
     )
 
+    _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
+    _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. bnb managed optimizer pages
     t_train = time.time()
     with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
+    sft_peak_gpu_gb = _peak_gpu_gb()
+    sft_device_peak_gpu_gb = _gpu_sampler.stop_gb()
 
     adapter_dir = f"{out_dir}/adapter"
     trainer.model.save_pretrained(adapter_dir)
@@ -1226,6 +1346,24 @@ def run_sft():
             # console is only uploaded on failure, so a short successful run otherwise drops its
             # loss history entirely.
             "loss_curve": _metric_curve(trainer, "loss"),
+            # Peak torch-allocated GPU memory during the train loop (excludes bnb managed pages, so
+            # it overstates the 8-bit saving — use device_peak_gpu_gb for the true footprint).
+            "peak_gpu_gb": sft_peak_gpu_gb,
+            # True peak device memory (total-free, incl. bnb managed optimizer pages): the honest
+            # headline for the fp32-vs-8-bit LoRA+ optimizer A/B.
+            "device_peak_gpu_gb": sft_device_peak_gpu_gb,
+            # Report the optimizer ACTUALLY built on the trainer, not the planned class: if the
+            # LoRA+ create_optimizer override failed, training falls back to TRL's configured
+            # optimizer without LoRA+ grouping. loraplus_applied records which path actually ran.
+            # Accelerate wraps the optimizer (AcceleratedOptimizer) under transformers 5.x, so unwrap
+            # via `.optimizer` to record the underlying PagedAdamW8bit/AdamW the A/B cares about, not
+            # the wrapper name.
+            "loraplus_optim": (
+                type(getattr(trainer.optimizer, "optimizer", trainer.optimizer)).__name__
+                if getattr(trainer, "optimizer", None) is not None
+                else loraplus_optimizer_cls(fused_optim_name())[0].__name__
+            ),
+            "loraplus_applied": getattr(trainer, "_loraplus_applied", False),
             **wandb_run_info(),
         },
     )
