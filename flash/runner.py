@@ -424,12 +424,21 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # next seed index so a restart in that gap resumes the remaining seeds rather
         # than failing the run. (The last seed keeps its handle for post-run
         # observability, mirroring the fresh-submit seed loop.)
+        # Also clear any persisted resume_starved: a no_capacity recovery may have stored a
+        # starved (provider, class) exclusion for the seed we just finished. The next seed
+        # re-allocates against a clean market, so leaving it would make a later restart's
+        # resume_run rehydrate that exclusion and wrongly pre-exclude a now-recovered class
+        # on a seed that never starved (mirrors _run_seed_loop's resume_starved=None reset).
         _update(
             run_id,
             "running",
             cost_usd=total,
             artifacts_dir=artifacts_dir(spec),
-            **({"remote": None, "resume_seed_index": resumed_index} if more_seeds else {}),
+            **(
+                {"remote": None, "resume_seed_index": resumed_index, "resume_starved": None}
+                if more_seeds
+                else {}
+            ),
         )
         if more_seeds:
             _run_seed_loop(spec, log, start_index=resumed_index, prior_cost=total)

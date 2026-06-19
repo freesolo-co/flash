@@ -136,10 +136,17 @@ def _is_moe_model(model_id: str) -> bool:
     fall back to the same expert-count HF probe the worker uses (``num_experts`` /
     ``n_routed_experts`` / ``model_type`` contains "moe"), but with ``trust_remote_code=False``:
     the control plane must not run a model's arbitrary remote config code merely to size a rollout.
-    An unknown model whose probe is uncertain (offline / FLASH_SKIP_NET / config unreadable, incl.
-    a custom-architecture MoE that needs remote code) is treated as dense — the conservative side,
-    matching the worker's own uncertain-path downgrade to TP, since TP sizing shards the server and
-    never under-provisions a dense card."""
+
+    The only caller gates on ``FLASH_DISAGG_PARALLEL=dp`` already, so this only matters when ``dp``
+    is requested. There the SAFE-to-over-size answer is True (size each card for a full replica),
+    because the worker — which probes with ``trust_remote_code=True`` — runs a detected MoE as ``dp``
+    (whole server per card): mis-sizing such a model as dense/TP would divide VRAM and OOM. So a
+    custom-architecture MoE whose config ONLY loads with remote code (the probe below raises the
+    "requires you to execute custom code" error) is reported MoE here — we never run the remote code,
+    but we trust the worker will and size for the replica it will run. A genuinely-dense model wrongly
+    caught this way is only OVER-provisioned (the worker downgrades dp->tp, needing LESS), never OOM.
+    Other uncertainty (offline / FLASH_SKIP_NET / config unreadable) stays dense/TP — the worker also
+    downgrades to tp on an unreadable probe, so sharded sizing matches what it actually runs."""
     try:
         from flash.catalog import get_model
 
@@ -156,16 +163,20 @@ def _is_moe_model(model_id: str) -> bool:
         from transformers import AutoConfig
 
         # trust_remote_code=False on the CONTROL PLANE: this sizing probe must not execute a
-        # model's arbitrary remote config code just to read expert counts. A custom-architecture
-        # MoE whose config only loads with remote code can't be probed here and falls through to
-        # the conservative dense/TP side below — which never under-provisions (TP shards the
-        # server), matching the worker's own uncertain-path downgrade to TP.
+        # model's arbitrary remote config code just to read expert counts.
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
         return bool(
             getattr(cfg, "num_experts", 0) or getattr(cfg, "n_routed_experts", 0)
         ) or "moe" in (getattr(cfg, "model_type", "") or "").lower()
-    except Exception:
-        return False
+    except Exception as exc:
+        # A custom-architecture MoE whose config ONLY loads with remote code raises a recognizable
+        # "requires you to execute custom code" ValueError here. We won't run that code on the
+        # control plane, but the worker WILL (trust_remote_code=True) and will run it as `dp` (whole
+        # server per card). Report MoE so dp sizing provisions a full replica instead of dividing
+        # VRAM into an OOM. (A genuinely-dense model misjudged this way is only over-provisioned —
+        # the worker downgrades dp->tp, needing less.) Any other failure stays dense/TP, matching the
+        # worker's own unreadable-probe downgrade to tp.
+        return "execute custom code" in str(exc)
 
 
 def _params_b_for_vram(model_id: str) -> float | None:
