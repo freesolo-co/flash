@@ -643,6 +643,15 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
     gpu_walk_offset = 0
+    # GPU classes that failed ``no_capacity`` (throttled / stuck IN_QUEUE with no free worker).
+    # ``allocate()`` re-runs a LIVE-market price walk every retry, so a bare index walk
+    # (gpu_walk_offset) can re-select the same starved class if the ranking shifts between
+    # attempts. Excluding the class identity from the next allocation makes the walk robust to
+    # re-ranking — the capacity-starved class is dropped from the candidate pool entirely, so the
+    # offset can't land on it again. We exclude by class only (not provider): a class throttled on
+    # one provider is usually throttled market-wide for this run, and re-trying it elsewhere just
+    # burns another queue_grace_s.
+    starved_classes: set[str] = set()
     # Two independent budgets. ``crash_retries`` (bounded by max_retries) covers genuine
     # infra flakes (host died, network timeout) where we re-provision the SAME-or-next class.
     # ``capacity walks`` are different: a ``no_capacity`` (throttled / stuck IN_QUEUE) result
@@ -715,6 +724,9 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 disk_gb=spec.gpu.disk_gb,
                 allow_unvalidated=spec.gpu.allow_unvalidated,
                 exclude_machine_ids=frozenset(bad_machines),
+                # Drop classes that already failed no_capacity this run so the live re-ranking can't
+                # re-select a starved class at the new gpu_walk_offset (see starved_classes above).
+                exclude_gpu_classes=frozenset(starved_classes),
                 # Multi-GPU: the allocator must search for offers with this many GPUs (Vast) — else
                 # it builds the offer book at num_gpus=1 and a disaggregated run rents a 1-GPU
                 # instance (the real cause of "container has 1 GPU"). RunPod gets gpu_count on the
@@ -837,13 +849,17 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             pass
         # A capacity walk (no_capacity: the class is throttled / has no free workers right now)
         # hops to the next-cheapest candidate WITHOUT spending the crash-retry budget and WITHOUT
-        # blacklisting the class — we just prefer one that's available now. It stops only once
-        # every candidate class has been tried (a fully-throttled market). A genuine infra crash
-        # (host died / network) instead spends the bounded crash budget.
+        # blacklisting the class for good — it EXCLUDES the starved class from the next allocation
+        # (via starved_classes) so a live re-ranking can't re-select it, and the next allocation's
+        # cheapest remaining class becomes candidate[0]. It stops once every fitting class has been
+        # tried (a fully-throttled market: ncand here is the post-exclusion pool, so ncand <= 1 means
+        # only the class we just starved was left). A genuine infra crash (host died / network)
+        # instead spends the bounded crash budget by stepping gpu_walk_offset through the pool.
         is_capacity = res.failure == "no_capacity"
         ncand = len(alloc.candidates) if alloc is not None else 0
         if is_capacity:
-            can_retry = infra_shaped and chosen is not None and gpu_walk_offset < ncand - 1
+            # More than the just-starved class must remain in the (already exclusion-filtered) pool.
+            can_retry = infra_shaped and chosen is not None and ncand > 1
         else:
             can_retry = infra_shaped and crash_retries < max_retries
         print(
@@ -859,14 +875,22 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         # An allocation/pricing failure (chosen is None) never tried a card, so the next attempt
         # must retry from the cheapest, not walk past it.
         if chosen is not None:
-            gpu_walk_offset += 1
             if is_capacity:
+                # Exclude this class from the next allocation so a live re-ranking can't put the
+                # starved class back. Exclusion (not the index walk) drives the capacity hop: the
+                # re-allocation drops the starved class entirely, so the SAME gpu_walk_offset now
+                # selects the cheapest REMAINING class. Bumping the offset here would skip past it.
+                starved_classes.add(chosen.gpu)
                 print(
                     f"retry: {chosen.gpu} had no free workers (throttled / capacity-starved); "
-                    "walking to the next-cheapest available class (not blacklisting it)",
+                    "walking to the next-cheapest available class (excluding the starved class)",
                     file=log,
                     flush=True,
                 )
+            else:
+                # Infra crash: keep the class in the pool (it may recover) and step the index to the
+                # next-cheapest so a repeatedly-crashing class can't burn the whole crash budget.
+                gpu_walk_offset += 1
         if not is_capacity:
             crash_retries += 1
     # Retry budget exhausted: GC every endpoint this seed registered (the final

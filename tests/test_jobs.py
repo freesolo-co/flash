@@ -343,6 +343,62 @@ def test_poll_job_confirmed_no_capacity_survives_later_probe_flake(monkeypatch):
     assert "IN_QUEUE" in res.detail
 
 
+def test_poll_job_reprobes_at_no_capacity_boundary(monkeypatch):
+    # PR #4 review (thread 1): the 90s probe cadence means capacity_confirmed can be stale at the
+    # queue_grace_s boundary. A worker that starts `initializing` AFTER the confirming probe but
+    # before the boundary must NOT be walked away from as if capacity-starved. poll_job must REPROBE
+    # at the boundary: seeing a fresh `initializing` worker, it defers (cold start), keeps polling,
+    # and the job completes — it does NOT return no_capacity off the stale latch.
+    import base64
+    import itertools
+
+    import cloudpickle
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    # Stay IN_QUEUE long enough to reach the boundary, then complete.
+    statuses = iter(
+        [{"status": "IN_QUEUE"}] * 6
+        + [
+            {
+                "status": "COMPLETED",
+                "output": {
+                    "success": True,
+                    "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
+                },
+            }
+        ]
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(statuses))
+
+    # First 90s probe: CONFIRMED empty (capacity-starved) -> latches capacity_confirmed=True.
+    # At the no_capacity boundary the REPROBE sees a worker now `initializing` -> defer, not walk.
+    calls = {"n": 0}
+
+    def _health(eid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"workers": {"throttled": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}}
+        return {"workers": {"initializing": 1, "running": 0, "ready": 0, "idle": 0}}
+
+    monkeypatch.setattr(runpod_api, "endpoint_health", _health)
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        queue_grace_s=200.0,  # small: fires soon after the confirming probe
+        setup_grace_s=100000.0,  # large: the deferred cold start must NOT trip a stall here
+    )
+    # The boundary reprobe found a worker coming up, deferred, and the job ran to completion.
+    assert res.ok
+    assert res.metrics == {"acc": 1.0}
+    assert calls["n"] >= 2  # the boundary reprobe actually happened
+
+
 def test_poll_job_clears_init_flags_when_not_in_queue(monkeypatch):
     # Unit-level guard for the cross-episode reset (the "stale init flag after queue exit" thread):
     # `worker_initializing` / `init_probe_fresh` are meaningful only WHILE IN_QUEUE and are set
@@ -750,6 +806,67 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         rates = [hourly_rate(g) for g in gpus_seen]
         assert rates == sorted(rates)
         assert gpus_seen[0] == "RTX A5000"  # cheapest validated class with >= 12 GB
+
+
+def test_supervisor_no_capacity_excludes_starved_class(monkeypatch):
+    # PR #4 review (thread 2): a no_capacity failure must EXCLUDE the starved class from the next
+    # allocation, not just bump an index into a freshly re-ranked candidate list. Otherwise a live
+    # re-ranking could re-select the same capacity-starved class at the new offset. We assert the
+    # exact class that failed no_capacity is passed in exclude_gpu_classes to the re-allocation, and
+    # that the walk lands on a DIFFERENT class.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+
+        real_allocate = allocator.allocate
+        excluded_seen: list[frozenset] = []
+
+        def spy_allocate(*a, **k):
+            excluded_seen.append(frozenset(k.get("exclude_gpu_classes", frozenset())))
+            return real_allocate(*a, **k)
+
+        monkeypatch.setattr(allocator, "allocate", spy_allocate)
+
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            if attempt < 1:
+                # First class is capacity-starved (stuck IN_QUEUE, no free workers).
+                return jobs.PollResult(
+                    False, failure="no_capacity", detail="no worker assigned; throttled"
+                )
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="starved",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", requested="cheapest", provider="runpod", max_retries=2),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("starved").state == "done"
+        # Two attempts on two DIFFERENT classes (the first starved, the second served the run).
+        assert len(gpus_seen) == 2
+        assert gpus_seen[0] != gpus_seen[1]
+        # The first allocation excluded nothing; the retry allocation excluded the starved class.
+        assert excluded_seen[0] == frozenset()
+        assert gpus_seen[0] in excluded_seen[1]
 
 
 def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):

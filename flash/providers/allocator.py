@@ -101,7 +101,15 @@ def required_vram_gb(
             #     (--data_parallel_size=infer, tp=1), so each card needs the WHOLE server -> do NOT
             #     divide (dividing would under-provision into an OOM, esp. for the 35B MoE).
             # infer==1 collapses both to the full-weight single-card need.
-            _dp = (os.environ.get("FLASH_DISAGG_PARALLEL") or "").strip().lower() == "dp"
+            # Gate `dp` on the catalog's is_moe exactly as schema.py / engine.worker.run_rl do: vLLM
+            # rejects offline data parallelism for DENSE models, so the worker DOWNGRADES a dense `dp`
+            # request back to TP (shards the server). Sizing must mirror that downgrade — else a dense
+            # split is sized as a full per-card replica (_shards=1) the worker will never run, routing
+            # it to needlessly larger / costlier GPUs. Only honor dp here when the model is actually MoE.
+            _dp = (
+                (os.environ.get("FLASH_DISAGG_PARALLEL") or "").strip().lower() == "dp"
+                and _is_moe_model(model_id)
+            )
             _shards = 1 if _dp else infer
             # math.ceil (not int(): flooring under-provisions by up to ~1GB into an avoidable OOM on a
             # tight fit) — matches vram.py's conservative `math.ceil(est * headroom)` sizing.
@@ -113,6 +121,21 @@ def required_vram_gb(
             # and a bare min(colocate, ...) would under-provision the inference GPU into an OOM.
             return max(server_need, min(colocate, disagg_need))
     return colocate
+
+
+def _is_moe_model(model_id: str) -> bool:
+    """Whether the catalog marks ``model_id`` as MoE (mirrors schema.py / engine.worker.run_rl).
+
+    Drives the disaggregated `dp` sizing gate: vLLM only honors offline data parallelism for MoE
+    models, so the worker downgrades a dense `dp` request to TP and the allocator must size to TP
+    for dense models. An unknown model (not in the catalog) is treated as dense — the conservative
+    side, since TP sizing shards the server and never under-provisions a dense card."""
+    try:
+        from flash.catalog import get_model
+
+        return bool(getattr(get_model(model_id), "is_moe", False))
+    except Exception:
+        return False
 
 
 def _params_b_for_vram(model_id: str) -> float | None:

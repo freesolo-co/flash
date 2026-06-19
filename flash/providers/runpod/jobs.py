@@ -442,6 +442,32 @@ def poll_job(
             and capacity_confirmed
             and time.time() - last_progress > queue_grace_s
         ):
+            # REPROBE at the boundary before deleting the endpoint (PR #4 review). The 90s probe
+            # cadence means ``capacity_confirmed`` can be up to ~90s stale here: a worker could have
+            # started ``initializing`` AFTER the last good probe but before this boundary, and the
+            # latched empty-pool read would wrongly delete an endpoint that is actively cold-starting.
+            # Require a FRESH empty sample at the moment we'd walk away. If the fresh probe shows a
+            # worker now usable or initializing, treat it as a cold start (clear the latch, mark
+            # progress so setup_grace_s — not queue_grace_s — bounds it) and keep polling. A probe
+            # error here leaves the latched verdict intact (it was trustworthy when set), so a single
+            # flake can't strand the run; the fast-path still fires on the stale-but-confirmed read.
+            try:
+                _h = runpod_api.endpoint_health(handle.endpoint_id)
+                _w = _h.get("workers") or {}
+                _usable = _w.get("running") or _w.get("ready") or _w.get("idle")
+                _recovering = _w.get("initializing")
+                _ck = ("running", "ready", "idle", "initializing", "throttled", "unhealthy")
+                last_health_probe = time.time()
+                if any(k in _w for k in _ck) and (_usable or _recovering):
+                    # A worker appeared since the latch — this is a slow cold start, not starvation.
+                    capacity_confirmed = False
+                    last_progress = time.time()
+                    say(f"queued; worker appeared at no_capacity boundary, deferring: {_w}")
+                    time.sleep(interval_s)
+                    continue
+            except Exception:
+                # Reprobe failure: fall back to the latched (previously confirmed) verdict.
+                pass
             return PollResult(
                 False,
                 failure="no_capacity",
