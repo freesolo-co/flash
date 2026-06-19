@@ -64,6 +64,18 @@ def test_wandb_round_trips_through_json():
     assert rt.wandb.run_name == "rt-run"
 
 
+def test_from_dict_tolerates_malformed_wandb_payload():
+    # A malformed/older persisted spec can set wandb to a non-dict (e.g. a bare string); from_dict
+    # must not crash the worker with AttributeError — it coerces to default naming instead.
+    assert JobSpec.from_dict({"wandb": "oops"}).wandb == WandbSpec()
+    assert JobSpec.from_dict({"wandb": None}).wandb == WandbSpec()
+    assert JobSpec.from_dict({"wandb": ["a", "b"]}).wandb == WandbSpec()
+    # Non-string / blank leaves in a dict payload are coerced+trimmed (blank -> default None).
+    rt = JobSpec.from_dict({"wandb": {"project": 123, "run_name": "  "}})
+    assert rt.wandb.project == "123"
+    assert rt.wandb.run_name is None
+
+
 @pytest.mark.parametrize(
     "bad",
     [

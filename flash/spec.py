@@ -48,6 +48,26 @@ def _coerce_str_map(value: Any) -> dict[str, str]:
     return {str(k): str(v) for k, v in value.items()}
 
 
+def _coerce_wandb(value: Any) -> WandbSpec:
+    """Coerce a loosely-typed ``wandb`` spec field into a ``WandbSpec``.
+
+    A malformed/older persisted spec can set ``wandb`` to a non-dict (e.g. a bare string), and
+    ``(value or {}).get(...)`` would crash ``from_dict`` with AttributeError on the worker. Treat
+    a non-dict as empty (default naming), mirroring ``_coerce_str_map``. String-coerce + trim the
+    leaves so a non-string label can't reach the W&B SDK / run-name path; blank -> None (default).
+    """
+    if not isinstance(value, dict):
+        return WandbSpec()
+
+    def _label(v: Any) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    return WandbSpec(project=_label(value.get("project")), run_name=_label(value.get("run_name")))
+
+
 def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
@@ -273,10 +293,7 @@ class JobSpec:
             worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
             thinking=_coerce_bool(data.get("thinking", False)),
-            wandb=WandbSpec(
-                project=(data.get("wandb") or {}).get("project"),
-                run_name=(data.get("wandb") or {}).get("run_name"),
-            ),
+            wandb=_coerce_wandb(data.get("wandb")),
         )
 
     @classmethod
