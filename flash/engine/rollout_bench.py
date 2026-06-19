@@ -7,8 +7,9 @@ trainer:inference splits within a node for the benchmark sweep (colocate, 1:1, 1
 deliberately excluding absurd splits (e.g. 7 train : 1 infer).
 
 The live worker (``engine.worker.run_rl``) consumes :func:`select_rollout_split` to launch
-``trl vllm-serve`` on the inference devices and the FSDP trainer on the rest; this module stays
-GPU-free so the split math + grid are unit-testable on CPU.
+``trl vllm-serve`` on the inference devices and the trainer on the rest (single-trainer runs
+in-process; a multi-trainer disaggregated split is a DDP group via ``accelerate launch``); this
+module stays GPU-free so the split math + grid are unit-testable on CPU.
 
 verl ref (3D-HybridEngine / flexible device mapping): https://github.com/verl-project/verl
 """
@@ -134,7 +135,8 @@ def ratio_grid(max_gpus: int = 4) -> list[RolloutSplit]:
 
     Always starts with ``colocate`` (1 GPU, the baseline), then the 2..``max_gpus`` node splits with
     both sides >= 1 and the imbalance bounded by ``_MAX_RATIO`` (so no 7:1). Ordered by total GPUs,
-    then by infer count, so the table reads colocate → 1:1 → 1:2 → 2:1 → 3:1 → ...
+    then by infer count (labels are train:infer, so within a total the lower infer count sorts first),
+    so the table reads colocate → 1:1 → 2:1 → 1:2 → 3:1 → 2:2 → 1:3 → ...
     """
     grid = [select_rollout_split(1, 0)]  # colocate baseline
     seen = {grid[0].label}
