@@ -496,19 +496,18 @@ def test_eval_config_cadence_from_toml(monkeypatch):
     assert cfg["max_new_tokens"] == 256  # always the completion budget, never a separate knob
 
 
-def test_eval_config_env_overrides_toml_cadence(monkeypatch):
-    """FLASH_EVAL_EVERY_STEPS (operator/bench escape hatch) wins over the TOML value."""
+def test_eval_config_ignores_env_cadence_override(monkeypatch):
+    """The cadence comes ONLY from the run spec ([train] eval_every_steps); the old
+    FLASH_EVAL_EVERY_STEPS env override no longer exists."""
     monkeypatch.setenv("FLASH_EVAL_EVERY_STEPS", "25")
-    assert eval_config(256, spec_every=10)["every_steps"] == 25
+    assert eval_config(256, spec_every=10)["every_steps"] == 10  # spec wins, env ignored
 
 
-def test_eval_config_num_examples_is_operator_safety_cap(monkeypatch):
-    """num_examples is NOT a config knob — it's an operator safety cap (default 64) so a huge env
-    eval split can't dominate training; the agent sizes the eval set via the environment."""
-    monkeypatch.delenv("FLASH_EVAL_NUM", raising=False)
-    assert eval_config(256, spec_every=3)["num_examples"] == 64
+def test_eval_config_num_examples_is_fixed_safety_cap(monkeypatch):
+    """num_examples is a FIXED safety cap (64), not a knob — the old FLASH_EVAL_NUM env override no
+    longer applies."""
     monkeypatch.setenv("FLASH_EVAL_NUM", "8")
-    assert eval_config(256, spec_every=3)["num_examples"] == 8
+    assert eval_config(256, spec_every=3)["num_examples"] == 64  # fixed cap, env ignored
 
 
 # --------------------------------------------------------------------------- #
