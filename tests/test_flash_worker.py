@@ -4,7 +4,6 @@ Covers:
 - build_worker_env forwards the documented RL/vLLM tuning knobs to the GPU worker
   (they were silently dropped) and sets a fragmentation-safe allocator default;
 - the runpod_flash backoff OverflowError that aborted long runs is patched;
-- the serve cold-start execution timeout is generous + env-overridable;
 - per-phase error artifact names don't collide (train error survives a later eval error).
 """
 
@@ -324,6 +323,19 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
 
+def test_alloc_conf_rl_cedes_to_worker(monkeypatch):
+    # The launcher can't know the worker's sleep decision (resolved from model size + context),
+    # so RL ships the conservative non-expandable conf plus FLASH_ALLOC_AUTO=1, ceding the final
+    # choice to the worker (which upgrades to expandable_segments once it resolves sleep OFF).
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    env = build_worker_env(_spec(), 0)  # grpo
+    assert env["FLASH_ALLOC_AUTO"] == "1"
+    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
+
+
 def test_runpod_backoff_no_overflow_on_long_runs():
     """DEFECT: runpod_flash computed base*(2**attempt) then clamped, so a long poll loop
     overflowed (~80 min in) and killed a healthy job. The patch caps the exponent first."""
@@ -340,15 +352,6 @@ def test_runpod_backoff_no_overflow_on_long_runs():
     from runpod_flash.core.resources import serverless
 
     assert serverless.get_backoff_delay(100000, max_seconds=5) <= 5 * 1.2 + 1e-9
-
-
-def test_serve_execution_timeout_is_fixed():
-    """DEFECT: serve execution cap (10 min) was shorter than a cold serving worker's startup, so
-    the first slm chat/deploy failed with 'executionTimeout exceeded'. It is now a fixed, generous
-    constant (no env override)."""
-    from flash.serve import deploy
-
-    assert deploy.serve_execution_timeout_ms() >= 20 * 60 * 1000
 
 
 def test_require_vllm_for_rollout_func_rejects_vllm_off_multiturn():

@@ -25,7 +25,6 @@ when Vast is available (its billing-leak reap), so that path branches per provid
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -335,17 +334,9 @@ def vast_gpu_for_offer(gpu_name: str, gpu_ram_mb: float) -> str | None:
 
 
 def unvalidated_allowed(explicit: bool | None = None) -> bool:
-    """Whether configs may target a non-``validated`` GPU class."""
-    if explicit is not None:
-        return explicit
-    # Truthy allowlist (not a falsey denylist): only an explicit truthy value opts in, so
-    # "false"/"False"/"no"/"off"/"0"/"" all correctly leave unvalidated GPUs disabled.
-    return os.environ.get("FLASH_GPU_ALLOW_UNVALIDATED", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    """Whether configs may target a non-``validated`` GPU class — the per-run ``[gpu]
+    allow_unvalidated`` flag only (managed; no global env override)."""
+    return bool(explicit)
 
 
 def gpu_short(name: str) -> str:

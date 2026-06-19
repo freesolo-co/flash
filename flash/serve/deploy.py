@@ -1,19 +1,22 @@
-"""Serve a trained LoRA adapter for OpenAI-style chat via a managed RunPod Flash GPU.
+"""Serve a trained LoRA adapter via the freesolo platform's multi-LoRA serving app.
 
-Two deployment modes (the cost/latency trade-off is explicit and user-chosen):
+Flash no longer runs its own per-run vLLM endpoint. Instead the control plane is a
+thin client of the freesolo serving service (a Modal multi-LoRA app that serves every
+adapter on a single GPU per base model, scaling to zero when idle — so there is no
+flash-side idle billing to track). The same CLI commands and control-plane endpoints
+(`deploy`/`undeploy`/`chat`/`deployments`) stay; only what they do under the hood
+changed.
 
-- ``dev`` (default): scale-to-zero. ``workers=(0,1)`` with a configurable idle timeout
-  and FlashBoot — you accept a cold start after inactivity, and pay $0 while idle.
-- ``always-on``: ``workers=(1,1)`` — one worker stays warm 24/7 (no cold starts,
-  continuous billing). ``slm deployments`` shows the projected $/day so the cost is
-  never a surprise.
+The serving service exposes:
 
-Each run gets its OWN uniquely-named serve endpoint (``flash-serve-<gpu>-<run>``), so
-deployments never fight over a shared endpoint config and ``slm undeploy <run_id>``
-can tear down exactly one deployment (via the REST API, from any process).
+- ``POST {FREESOLO_SERVING_URL}/adapters`` — register/deploy an adapter (auth header).
+- ``DELETE {FREESOLO_SERVING_URL}/adapters/{adapterId}`` — undeploy (auth header).
+- ``POST {FREESOLO_SERVING_URL}/v1/chat/completions`` — OpenAI-style chat (no auth).
+- ``GET {FREESOLO_SERVING_URL}/healthz`` / ``GET .../adapters`` — health / list.
 
-The handler boots vLLM with the base model + the LoRA adapter (pulled from the HF
-dataset repo the trainer streamed it to) and returns an OpenAI-shaped chat-completion.
+The registration/teardown calls carry the shared ``X-Freesolo-Internal-Key`` header
+(the same internal credential flash already holds, ``FREESOLO_INTERNAL_KEY``); chat is
+unauthenticated.
 """
 
 from __future__ import annotations
@@ -21,74 +24,37 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass
 
+import httpx
+
 from flash._logging import get_logger
 from flash.providers.base import canonical_gpu, gpu_short
-from flash.providers.runpod.gpus import flash_gpu
 
 logger = get_logger(__name__)
 
+# Default freesolo serving base URL (the Modal multi-LoRA app). Overridable per-env.
+DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
 
-def _invoke_handler(handler, payload: dict) -> dict:
-    """Call a Flash serve handler, awaiting it if the live path returns a coroutine."""
-    import asyncio
-    import inspect
-
-    async def _call():
-        res = handler(payload)
-        if inspect.isawaitable(res):
-            res = await res
-        return res
-
-    return asyncio.run(_call())
-
-
-# Serving deps mirror the worker stack minus the trainer bits.
-SERVE_DEPS = [
-    "torch==2.10.0",
-    "vllm==0.19.1",
-    "transformers>=5.6,<5.11",
-    "huggingface_hub>=0.25",
-    "peft>=0.19",
-    "accelerate>=1.4",
-]
-SERVE_SYSTEM_DEPS = ["build-essential"]
-
-_ENDPOINT_CACHE: dict[str, object] = {}
-
-# Serving cold start (image pull + vLLM/PEFT install + ~8 GB base model + adapter) can
-# exceed 10 min on a fresh host; default the serve execution cap to 25 min
-# (env-overridable) so the first `slm chat` on a cold worker doesn't fail with
-# "executionTimeout exceeded".
-_DEFAULT_SERVE_TIMEOUT_MS = 25 * 60 * 1000
-
+# These remain so callers/tests that imported them keep resolving; they are cosmetic now
+# that serving is delegated to freesolo (no flash-owned endpoint to size or warm).
 MODES = ("dev", "always-on")
 DEFAULT_IDLE_TIMEOUT_S = 300
+_ENDPOINT_CACHE: dict[str, object] = {}
+# The serving deps used to live on the flash worker image; serving is now external.
+SERVE_DEPS: list[str] = []
 
-# Projected always-on cost uses live RunPod rates (static fallback):
-# providers/runpod/pricing.py (hourly_rate).
+
+def serving_base_url() -> str:
+    """The freesolo serving base URL (env-overridable, trailing slash stripped)."""
+    return (os.environ.get("FREESOLO_SERVING_URL") or DEFAULT_FREESOLO_SERVING_URL).rstrip("/")
 
 
-def serve_execution_timeout_ms() -> int:
-    return _DEFAULT_SERVE_TIMEOUT_MS
+def _internal_key_header() -> dict[str, str]:
+    key = os.environ.get("FREESOLO_INTERNAL_KEY") or ""
+    return {"X-Freesolo-Internal-Key": key} if key else {}
 
 
 def resolve_serve_deps() -> list[str]:
-    explicit = os.environ.get("FLASH_SERVE_DEPS")
-    if explicit:
-        # JSON list (use this for specs containing commas, e.g.
-        # "transformers>=5.6,<5.11") or a whitespace-separated string. NOT comma-split:
-        # a comma is part of a PEP 440 range and must not become two pip arguments
-        # (mirrors providers/runpod/train.resolve_worker_deps).
-        if explicit.strip().startswith("["):
-            import json as _json
-
-            deps = [str(d).strip() for d in _json.loads(explicit) if str(d).strip()]
-        else:
-            import shlex
-
-            deps = [d for d in shlex.split(explicit) if d.strip()]
-        if deps:
-            return deps
+    """Kept for back-compat; serving deps are external (freesolo), so this is empty."""
     return SERVE_DEPS
 
 
@@ -102,6 +68,8 @@ class Deployment:
     endpoint_name: str
     mode: str = "dev"
     idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S
+    # freesolo serving scales to zero per base model, so flash never bills for idle
+    # serving — there is no flash-side per-run endpoint to keep warm.
     est_idle_cost_usd_per_day: float = 0.0
     state: str = "ready"
 
@@ -110,275 +78,37 @@ class Deployment:
 
 
 def _language_model_only(model: str) -> bool:
-    """Natively-multimodal checkpoints are served text-only. Approximated here by
-    family name (the client can't load the HF config); the worker does the precise
-    config-based check (engine.worker.is_vl_checkpoint, which covers Qwen3.5/3.6).
-    Both families must match here or a Qwen3.6 checkpoint served via model_policy="allow"
-    loses the text-only guard and re-hits the vision-tower VRAM/flash-attn issues."""
+    """Cosmetic: the family-name guard the old flash worker used for text-only serving.
+
+    The freesolo serving app makes its own multimodal decisions; kept so any importer
+    keeps resolving."""
     return "Qwen3.5" in model or "Qwen3.6" in model
 
 
 def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
+    """Cosmetic endpoint label (the freesolo app serves all adapters on one endpoint)."""
     tail = (run_id or "").split("-")[-1][:24]
     base = f"flash-serve-{gpu_short(canonical_gpu(friendly_gpu))}"
     return f"{base}-{tail}" if tail else base
 
 
 def servable_gpu(gpu_name: str, model: str) -> str:
-    """Serving runs on RunPod Flash only: a run trained on a class that is not
-    RunPod-validated (a Vast-only class like L40S/RTX Pro 4000, OR a class that has a
-    RunPod enum member but was validated only on Vast, e.g. RTX 3090) is served from the
-    cheapest RunPod-VALIDATED class with at least the trained class's VRAM — NOT directly
-    on the unvalidated RunPod substrate (which can fail on first chat) and NOT the
-    catalog default (32 GB for open models, too small for the >32 GB class the allocator
-    proved was needed)."""
+    """Resolve a friendly GPU class for the deployment record.
+
+    Serving is delegated to freesolo (one GPU per base model, chosen there), so this is
+    now informational. We still canonicalize the name and fall back to the cheapest
+    RunPod-validated class big enough when the trained class isn't RunPod-validated, so
+    the recorded ``gpu`` is a sensible, valid class (and junk GPU names still raise)."""
     from flash.providers.base import GPU_INFO, UnsupportedGpuError, cheapest_gpu
 
     friendly = canonical_gpu(gpu_name)
     info = GPU_INFO[friendly]
-    # Enum presence is not enough: serve directly only on a RunPod-VALIDATED class.
     if "runpod" in info.validated_on:
         return friendly
     try:
-        # Prefer a RunPod-validated class big enough; only if none exists fall back
-        # to an unvalidated one (better than refusing to serve at all).
-        fallback = cheapest_gpu(info.vram_gb)
+        return cheapest_gpu(info.vram_gb)
     except UnsupportedGpuError:
-        fallback = cheapest_gpu(info.vram_gb, include_unvalidated=True)
-    logger.warning(
-        "%s is not RunPod-validated; serving %s on %s (>= %d GB)",
-        friendly,
-        model,
-        fallback,
-        info.vram_gb,
-    )
-    return fallback
-
-
-def _serve_body(input_data: dict) -> dict:
-    """Runs ON the GPU worker: forward a chat request to a persistent local vLLM server.
-
-    vLLM runs as a LONG-LIVED SUBPROCESS (the OpenAI api_server on localhost), not in
-    the handler process: importing torch inside the Flash handler process crashes
-    (torch dynamo config-module assertion against the runpod runtime's module state -
-    observed live), and a subprocess keeps the engine warm across requests anyway.
-    The handler boots it on first request (the cold start) and proxies afterwards.
-
-    NOTE: Flash serializes this handler and runs it standalone - all imports live
-    inside the body, and state is cached in module globals while the worker is warm.
-    """
-    import json as _json
-    import os
-    import subprocess
-    import sys
-    import time
-    import urllib.error
-    import urllib.request
-
-    g = globals()
-    base = "http://127.0.0.1:8199"
-
-    def _tail_serve_log(limit: int = 3000) -> str:
-        # Defined IN the body: Flash serializes _serve_body and runs it standalone, so
-        # the module-level helper of the same name is out of scope on the worker — a
-        # bare reference would NameError on the boot-failure path and hide the vLLM log.
-        try:
-            with open("/tmp/vllm_serve.log") as f:
-                return f.read()[-limit:]
-        except OSError:
-            return "(no serve log)"
-
-    _thinking = input_data.get("thinking", False)
-    # Robust bool: input_data may arrive loosely typed (serialized handler payload), and
-    # bool("false") is True — treat the usual falsey strings as False.
-    thinking = (
-        _thinking.strip().lower() not in ("", "0", "false", "no", "off", "none")
-        if isinstance(_thinking, str)
-        else bool(_thinking)
-    )
-    # thinking is part of the engine key: it changes --max-model-len, and the vLLM
-    # subprocess must be rebooted to change that.
-    key = (input_data["model"], input_data["adapter_prefix"], thinking)
-
-    def server_alive() -> bool:
-        proc = g.get("_FLASH_PROC")
-        if proc is None or proc.poll() is not None:
-            return False
-        try:
-            urllib.request.urlopen(f"{base}/health", timeout=3)
-            return True
-        except Exception:
-            return False
-
-    if g.get("_FLASH_KEY") != key or not server_alive():
-        from huggingface_hub import snapshot_download
-
-        prefix = input_data["adapter_prefix"]
-        snapshot_download(
-            repo_id=input_data["hf_repo"],
-            repo_type="dataset",
-            allow_patterns=[f"{prefix}/adapter/*"],
-            local_dir="/adapter",
-            token=input_data.get("token"),
-        )
-        adapter_dir = f"/adapter/{prefix}/adapter"
-        old = g.get("_FLASH_PROC")
-        if old is not None and old.poll() is None:
-            old.kill()
-        # Serve the bf16 base with the LoRA adapter attached (--enable-lora). This works for BOTH
-        # bf16 LoRA and 4-bit QLoRA adapters: vLLM folds the bf16 LoRA delta into the bf16 base at
-        # load, which for a QLoRA adapter is exactly the standard "apply onto bf16 base" recipe (the
-        # frozen base's NF4 error is near-lossless per the QLoRA paper). No merged checkpoint is
-        # needed — and a merged checkpoint can't be served for the multimodal Qwen3.5/3.6 catalog
-        # anyway (a text-only merge saves a Qwen3_5TextConfig, which vLLM's qwen3_5 path rejects).
-        cmd = [
-            sys.executable,
-            "-m",
-            "vllm.entrypoints.openai.api_server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8199",
-            "--model",
-            input_data["model"],
-            "--served-model-name",
-            "base",
-            "--dtype",
-            "bfloat16",
-            "--max-model-len",
-            "4096" if thinking else "2048",  # <think> blocks need completion headroom
-            "--gpu-memory-utilization",
-            "0.85",
-            "--enable-lora",
-            "--max-lora-rank",
-            str(int(input_data.get("max_lora_rank") or 64)),
-            "--lora-modules",
-            f"adapter={adapter_dir}",
-            "--trust-remote-code",
-        ]
-        if input_data.get("language_model_only"):
-            cmd.append("--language-model-only")
-        env = dict(os.environ)
-        env.setdefault("HF_TOKEN", input_data.get("token") or "")
-        # Popen dups the fd into the child, so the parent handle can close
-        # immediately while vLLM keeps writing to the log.
-        with open("/tmp/vllm_serve.log", "w") as log:
-            g["_FLASH_PROC"] = subprocess.Popen(
-                cmd, stdout=log, stderr=subprocess.STDOUT, env=env
-            )
-        # Align the vLLM boot budget with the endpoint execution cap: a large model can take
-        # several minutes to load on a cold host, and a hard-coded 900 s would 502 a first chat /
-        # fail an always-on warmup while the RunPod request still has time budget. Leave ~60 s of
-        # the window for the first generation.
-        # Inline the timeout as a constant (must stay in sync with serve_execution_timeout_ms):
-        # Flash serializes _serve_body and runs it standalone, so the module-level helper is out of
-        # scope on the worker (see _tail_serve_log) and a bare call would NameError before vLLM gets
-        # a chance to boot — so the value is hardcoded here rather than read via the helper/env.
-        serve_timeout_ms = 25 * 60 * 1000
-        default_boot = max(900, serve_timeout_ms // 1000 - 60)
-        deadline = time.time() + float(input_data.get("boot_timeout_s") or default_boot)
-        while time.time() < deadline:
-            if g["_FLASH_PROC"].poll() is not None:
-                tail = _tail_serve_log()
-                raise RuntimeError(f"vLLM server exited during boot:\n{tail}")
-            try:
-                urllib.request.urlopen(f"{base}/health", timeout=3)
-                break
-            except Exception:
-                time.sleep(2)
-        else:
-            tail = _tail_serve_log()
-            raise RuntimeError(f"vLLM server did not become healthy in time:\n{tail}")
-        g["_FLASH_KEY"] = key
-
-    # always-on warmup: pay the cold start (download + vLLM boot) at deploy time
-    # so the user's first real chat is warm, then return without a completion.
-    if input_data.get("warmup"):
-        return {"ok": True, "warmed": True}
-
-    body = {
-        "model": "adapter",
-        "messages": input_data.get("messages") or [],
-        "temperature": float(input_data.get("temperature", 0.0)),
-        "top_p": float(input_data.get("top_p", 1.0)),
-        "max_tokens": int(input_data.get("max_tokens", 512)),
-        # Serve with the run's training-time thinking flag (decoding parity). Thinking
-        # responses carry the raw <think>...</think> block in message.content.
-        "chat_template_kwargs": {"enable_thinking": thinking},
-    }
-
-    def post(payload: dict) -> dict:
-        req = urllib.request.Request(
-            f"{base}/v1/chat/completions",
-            data=_json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            return _json.loads(resp.read())
-
-    try:
-        out = post(body)
-    except urllib.error.HTTPError as e:
-        if e.code == 400:
-            # A vLLM build that rejects the kwarg falls back to the chat template's own
-            # default (thinking ON for hybrid Qwen3 — correct for thinking runs, a logged
-            # degradation for non-thinking ones).
-            body.pop("chat_template_kwargs", None)
-            print("vLLM rejected chat_template_kwargs; retrying without enable_thinking")
-            out = post(body)
-        else:
-            raise
-    out["model"] = input_data.get("served_model", "flash-adapter")
-    return out
-
-
-def _get_serve_endpoint(
-    friendly_gpu: str,
-    run_id: str,
-    mode: str = "dev",
-    idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S,
-):
-    os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
-    from runpod_flash import Endpoint
-
-    from flash.providers.runpod.auth import ensure_auth
-    from flash.providers.runpod.train import FLASH_SDK_LOCK, isolate_flash_state, min_cuda_for
-
-    ensure_auth()
-    friendly = canonical_gpu(friendly_gpu)
-    name = serve_endpoint_name(friendly, run_id)
-    cache_key = f"{name}:{mode}:{idle_timeout_s}"
-
-    # Serialize against training deploy/teardown on the same process: isolate_flash_state()
-    # swaps runpod_flash's process-wide registry globals and Endpoint() touches the SDK's
-    # asyncio singleton, so a concurrent terminate_endpoint()/always-on warmup on another
-    # thread could race the registry scope. Hold the same lock across isolation + construction.
-    with FLASH_SDK_LOCK:
-        isolate_flash_state(f"serve-{run_id.split('-')[-1]}")
-        if cache_key in _ENDPOINT_CACHE:
-            return _ENDPOINT_CACHE[cache_key]
-        kwargs = {
-            "name": name,
-            "gpu": flash_gpu(friendly),
-            "gpu_count": 1,
-            "min_cuda_version": min_cuda_for(friendly),
-            # dev: scale to zero after idle_timeout (cold start accepted, $0 idle).
-            # always-on: one permanently warm worker (no cold start, 24/7 billing).
-            "workers": (0, 1) if mode == "dev" else (1, 1),
-            "idle_timeout": int(idle_timeout_s),
-            "flashboot": True,
-            "execution_timeout_ms": serve_execution_timeout_ms(),
-        }
-        image = os.environ.get("FLASH_WORKER_IMAGE")
-        if image:
-            kwargs["image"] = image
-        else:
-            kwargs["dependencies"] = resolve_serve_deps()
-            kwargs["system_dependencies"] = SERVE_SYSTEM_DEPS
-        ep = Endpoint(**kwargs)
-        handler = ep(_serve_body)
-        _ENDPOINT_CACHE[cache_key] = handler
-        return handler
+        return cheapest_gpu(info.vram_gb, include_unvalidated=True)
 
 
 def deploy_adapter(
@@ -393,78 +123,67 @@ def deploy_adapter(
     lora_rank: int = 64,
     thinking: bool = False,
 ) -> Deployment:
-    """Provision a serving endpoint for a trained adapter (managed, no Docker)."""
+    """Register the trained adapter with the freesolo serving app.
+
+    The adapter artifacts already live in the run's HF dataset repo (the trainer
+    streamed them there); freesolo serving pulls them from
+    ``{hf_repo}:{adapter_prefix}/adapter``. ``dry_run`` validates/shapes the deployment
+    without making the network call.
+    """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
     friendly = servable_gpu(gpu_name, model)
-    from flash.runner import _gpu_rate
-
-    rate = _gpu_rate(friendly)
+    subfolder = f"{adapter_prefix}/adapter"
     dep = Deployment(
         run_id=run_id,
         model=model,
-        adapter_hf_prefix=adapter_prefix,
+        adapter_hf_prefix=subfolder,
         gpu=friendly,
-        openai_model=f"flash-{run_id}",
-        endpoint_name=serve_endpoint_name(friendly, run_id),
+        openai_model=run_id,
+        endpoint_name=serving_base_url(),
         mode=mode,
         idle_timeout_s=idle_timeout_s,
-        est_idle_cost_usd_per_day=0.0 if mode == "dev" else round(rate * 24, 2),
+        est_idle_cost_usd_per_day=0.0,
         state="dry_run" if dry_run else "ready",
     )
     if dry_run:
         return dep
-    handler = _get_serve_endpoint(friendly, run_id, mode=mode, idle_timeout_s=idle_timeout_s)
-    # always-on promises no cold start: warm the worker now (download + vLLM boot)
-    # BEFORE returning ready, so the user's first chat is genuinely warm. dev mode
-    # is scale-to-zero by design, so it warms lazily on first chat.
-    if mode == "always-on":
-        warmup = {
-            "hf_repo": hf_repo,
-            "model": model,
-            "adapter_prefix": adapter_prefix,
-            "token": os.environ.get("HF_TOKEN", ""),
-            "max_lora_rank": max(64, int(lora_rank)),
-            "language_model_only": _language_model_only(model),
-            # warm the engine with the run's thinking flag so the first real chat (same
-            # flag) reuses the warmed subprocess instead of rebooting for --max-model-len.
-            "thinking": thinking,
-            "warmup": True,
-        }
-        try:
-            _invoke_handler(handler, warmup)
-        except Exception:
-            # The warmup invocation is what actually provisions the always-on worker;
-            # if adapter download / vLLM boot fails the endpoint is registered (and may
-            # bill) but no deployment is persisted. Tear it down before propagating.
-            import contextlib
-
-            with contextlib.suppress(Exception):
-                undeploy_adapter(run_id, gpu_name=friendly)
-            raise
+    base = serving_base_url()
+    body = {
+        "adapterId": run_id,
+        "repoId": hf_repo,
+        "baseModel": model,
+        "subfolder": subfolder,
+        "status": "ready",
+    }
+    resp = httpx.post(
+        f"{base}/adapters",
+        json=body,
+        headers=_internal_key_header(),
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
     return dep
 
 
 def undeploy_adapter(run_id: str, gpu_name: str = "RTX 5090") -> list[str]:
-    """Tear down the run's serve endpoint via the REST API (works from any process)."""
-    from flash.providers.runpod import api as runpod_api
+    """Deregister the run's adapter from the freesolo serving app.
 
-    name = serve_endpoint_name(gpu_name, run_id)
-    # find_endpoints_by_name is a substring filter, so guard with an exact-name
-    # check (mirrors providers/runpod/train.py terminate_endpoint) — otherwise a
-    # name that is a substring of another run's endpoint would over-delete and
-    # mis-report the returned `deleted` list.
-    deleted = [
-        ep["name"]
-        for ep in runpod_api.find_endpoints_by_name(name)
-        if ep.get("name") == name and runpod_api.delete_endpoint(ep["id"])
-    ]
-    # Drop in-process handler cache entries for this endpoint (keyed name:mode:idle)
-    # so a later redeploy constructs a fresh endpoint instead of reusing a handler
-    # pointing at the just-deleted one.
-    for key in [k for k in _ENDPOINT_CACHE if k.startswith(f"{name}:")]:
-        _ENDPOINT_CACHE.pop(key, None)
-    return deleted
+    Returns ``[run_id]`` when the adapter was removed (200), ``[]`` when it was already
+    gone (404). Other statuses raise so the caller can surface a transient failure.
+    """
+    base = serving_base_url()
+    resp = httpx.delete(
+        f"{base}/adapters/{run_id}",
+        headers=_internal_key_header(),
+        timeout=60.0,
+    )
+    if resp.status_code == 404:
+        return []
+    resp.raise_for_status()
+    logger.info("deregistered adapter %s from freesolo serving (%s)", run_id, base)
+    return [run_id]
 
 
 def chat(
@@ -481,26 +200,25 @@ def chat(
     lora_rank: int = 64,
     thinking: bool = False,
 ) -> dict:
-    """Send an OpenAI-style chat request to the adapter's managed Flash GPU."""
-    handler = _get_serve_endpoint(
-        servable_gpu(gpu_name, model), run_id, mode=mode, idle_timeout_s=idle_timeout_s
-    )
-    # Natively-multimodal checkpoints are served text-only (no transformers needed
-    # client-side; the family-name check mirrors the worker's config-based one).
-    language_model_only = _language_model_only(model)
-    payload = {
-        "hf_repo": hf_repo,
-        "model": model,
-        "adapter_prefix": adapter_prefix,
-        "token": os.environ.get("HF_TOKEN", ""),
-        "served_model": f"flash-{run_id}",
+    """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
+
+    The adapter is addressed by ``model=run_id`` (its registered ``adapterId``); the
+    response is the parsed OpenAI chat-completion dict, so
+    ``resp["choices"][0]["message"]["content"]`` keeps working downstream.
+    """
+    base = serving_base_url()
+    body = {
+        "model": run_id,
         "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        # vLLM rejects an adapter whose rank exceeds --max-lora-rank; cover the
-        # run's configured rank, not just the 64 default.
-        "max_lora_rank": max(64, int(lora_rank)),
-        "language_model_only": language_model_only,
-        "thinking": thinking,
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        # Per-run thinking parity: a run trained with thinking must serve with thinking, so
+        # forward the flag to the chat template (enable_thinking is the kwarg the renderer and
+        # rollout path use, e.g. multiturn_rollout.build_rollout_func). Without this the served
+        # completions diverge from training behavior even though the caller passes thinking=.
+        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
     }
-    return _invoke_handler(handler, payload)
+    # Cold starts (scale-from-zero per base model) can take minutes; give it room.
+    resp = httpx.post(f"{base}/v1/chat/completions", json=body, timeout=30 * 60.0)
+    resp.raise_for_status()
+    return resp.json()

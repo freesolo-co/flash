@@ -1,12 +1,11 @@
-"""Tests for the Flash serving wiring (no GPU/network): dry-run + handler shaping."""
+"""Tests for the Flash serving wiring (no GPU/network).
+
+Serving is delegated to the freesolo platform's multi-LoRA serving app; flash is a thin
+client. These assert the deploy/undeploy/chat HTTP calls (httpx is monkeypatched) and the
+dry-run Deployment shaping — there is no flash-owned vLLM endpoint to provision anymore.
+"""
 
 from __future__ import annotations
-
-import json as _json
-import sys
-import threading
-import types
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -25,14 +24,16 @@ def test_deploy_dry_run():
     d = dep.to_dict()
     assert d["state"] == "dry_run"
     assert d["gpu"] == "RTX 4090"
-    assert d["openai_model"] == "flash-r1"
-    assert d["endpoint_name"] == "flash-serve-4090-r1"  # per-run endpoint
+    # The adapter is addressed by its run_id on the freesolo serving app.
+    assert d["openai_model"] == "r1"
+    assert d["adapter_hf_prefix"] == "sft/r1/seed0/adapter"
+    # freesolo serving scales to zero per base model — no flash-side idle billing.
+    assert d["est_idle_cost_usd_per_day"] == 0.0
 
 
 def test_deploy_qlora_dry_run_is_not_rejected():
-    """A QLoRA tier (9B) is deployable: it serves the bf16 base + LoRA via --enable-lora just like
-    a bf16 tier (vLLM folds the bf16 LoRA delta into the bf16 base at load), instead of being
-    rejected up front. Dry-run resolves a Deployment instead of raising."""
+    """A QLoRA tier (9B) is deployable: freesolo serving folds the bf16 LoRA delta into
+    the bf16 base just like a bf16 tier, instead of being rejected up front."""
     from flash.serve.deploy import deploy_adapter
 
     dep = deploy_adapter(
@@ -61,245 +62,144 @@ def test_deploy_rejects_unsupported_gpu():
         )
 
 
-def test_deploy_unvalidated_class_falls_back_to_runpod():
-    # Serving is RunPod-only: a run trained on a class that isn't RunPod-validated
-    # (RTX 3090, 24 GB) serves from the cheapest RunPod-VALIDATED class with >= that
-    # VRAM — not directly on the unvalidated class (which can fail on first chat).
-    from flash.providers.base import GPU_INFO, is_validated
-    from flash.serve.deploy import deploy_adapter
+def test_deploy_registers_with_freesolo_serving(monkeypatch):
+    """A non-dry-run deploy POSTs the adapter to {FREESOLO_SERVING_URL}/adapters with the
+    right body and the internal-key auth header."""
+    import flash.serve.deploy as d
 
-    dep = deploy_adapter(
-        run_id="r1",
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["url"] = url
+        seen["json"] = json
+        seen["headers"] = headers
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+
+    dep = d.deploy_adapter(
+        run_id="flash-7-abcd",
         model="Qwen/Qwen3.5-0.8B",
         hf_repo="org/repo",
-        adapter_prefix="sft/r1/seed0",
-        gpu_name="RTX 3090",
-        dry_run=True,
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        gpu_name="RTX 5090",
     )
-    assert dep.gpu != "RTX 3090"
-    assert is_validated(dep.gpu, "runpod"), "must serve on a RunPod-validated class"
-    assert GPU_INFO[dep.gpu].vram_gb >= 24  # >= RTX 3090's VRAM
-
-
-def _install_serve_mocks():
-    hf = types.ModuleType("huggingface_hub")
-    hf.snapshot_download = lambda **k: None
-    sys.modules["huggingface_hub"] = hf
-
-    tfm = types.ModuleType("transformers")
-
-    class _Tok:
-        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True, **k):
-            return msgs[-1]["content"]
-
-        @classmethod
-        def from_pretrained(cls, *a, **k):
-            return cls()
-
-    tfm.AutoTokenizer = _Tok
-    sys.modules["transformers"] = tfm
-
-    vllm = types.ModuleType("vllm")
-
-    class _O:
-        text = "hi there"
-        token_ids = (1, 2, 3)
-
-    class _R:
-        outputs = (_O(),)
-        prompt_token_ids = (1, 2)
-
-    class LLM:
-        def __init__(self, *a, **k):
-            pass
-
-        def generate(self, prompts, sp, lora_request=None):
-            return [_R() for _ in prompts]
-
-    class SamplingParams:
-        def __init__(self, *a, **k):
-            pass
-
-    vllm.LLM = LLM
-    vllm.SamplingParams = SamplingParams
-    lora_mod = types.ModuleType("vllm.lora")
-    req_mod = types.ModuleType("vllm.lora.request")
-
-    class LoRARequest:
-        def __init__(self, *a, **k):
-            pass
-
-    req_mod.LoRARequest = LoRARequest
-    sys.modules["vllm"] = vllm
-    sys.modules["vllm.lora"] = lora_mod
-    sys.modules["vllm.lora.request"] = req_mod
-
-
-def _openai_completion_bytes():
-    return _json.dumps(
-        {
-            "id": "chatcmpl-1",
-            "object": "chat.completion",
-            "model": "adapter",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "hi there"},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
-    ).encode()
-
-
-def test_serve_body_openai_shape():
-    """The serve handler boots a local vLLM OpenAI server (subprocess) and proxies to it.
-    Here a stdlib HTTP server stands in for vLLM; Popen/snapshot_download are mocked.
-
-    Also covers thinking parity: the run's flag rides the chat_template_kwargs and is
-    part of the engine key (a thinking deploy boots vLLM with a bigger --max-model-len)."""
-    seen_bodies = []
-    boot_cmds = []
-
-    class _VllmStub(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-
-        def do_POST(self):
-            n = int(self.headers.get("Content-Length") or 0)
-            seen_bodies.append(_json.loads(self.rfile.read(n)))
-            body = _openai_completion_bytes()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *a):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 8199), _VllmStub)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-
-    hub = types.ModuleType("huggingface_hub")
-    hub.snapshot_download = lambda **k: "/tmp"
-    sys.modules["huggingface_hub"] = hub
-
-    import subprocess as _sub
-
-    class _FakeProc:
-        def poll(self):
-            return None
-
-        def kill(self):
-            pass
-
-    orig_popen = _sub.Popen
-
-    def _fake_popen(cmd, *a, **k):
-        boot_cmds.append(list(cmd))
-        return _FakeProc()
-
-    _sub.Popen = _fake_popen
-    payload = {
-        "hf_repo": "org/repo",
-        "model": "Qwen/Qwen3.5-0.8B",
-        "adapter_prefix": "sft/r1/seed0",
-        "token": "x",
-        "served_model": "flash-r1",
-        "messages": [{"role": "user", "content": "2+2?"}],
-        "max_tokens": 8,
+    assert seen["url"] == "https://serve.example/adapters"
+    assert seen["json"] == {
+        "adapterId": "flash-7-abcd",
+        "repoId": "org/repo",
+        "baseModel": "Qwen/Qwen3.5-0.8B",
+        "subfolder": "sft/flash-7-abcd/seed0/adapter",
+        "status": "ready",
     }
-    try:
-        import flash.serve.deploy as d
-
-        for k in ("_FLASH_KEY", "_FLASH_PROC"):
-            d.__dict__.pop(k, None)
-        resp = d._serve_body(dict(payload))
-        resp_thinking = d._serve_body({**payload, "thinking": True})
-    finally:
-        _sub.Popen = orig_popen
-        server.shutdown()
-        sys.modules.pop("huggingface_hub", None)
-    assert resp["object"] == "chat.completion"
-    assert resp["model"] == "flash-r1"
-    assert resp["choices"][0]["message"]["content"] == "hi there"
-    assert resp["choices"][0]["message"]["role"] == "assistant"
-    # thinking disabled by default; the run's flag turns it on
-    assert seen_bodies[0]["chat_template_kwargs"] == {"enable_thinking": False}
-    assert seen_bodies[1]["chat_template_kwargs"] == {"enable_thinking": True}
-    assert resp_thinking["object"] == "chat.completion"
-    # the thinking flag is part of the engine key: a second boot with more context
-    assert len(boot_cmds) == 2
-    assert boot_cmds[0][boot_cmds[0].index("--max-model-len") + 1] == "2048"
-    assert boot_cmds[1][boot_cmds[1].index("--max-model-len") + 1] == "4096"
+    assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+    assert dep.openai_model == "flash-7-abcd"
+    assert dep.endpoint_name == "https://serve.example"
+    assert dep.state == "ready"
 
 
-def test_serve_body_drops_template_kwargs_on_old_vllm():
-    """Older vLLM 400s on chat_template_kwargs; the handler retries without it."""
-    seen_bodies = []
+def test_deploy_propagates_serving_error(monkeypatch):
+    """A non-2xx from the serving app surfaces (the server maps it to a 5xx)."""
+    import flash.serve.deploy as d
 
-    class _OldVllmStub(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
+    class _Resp:
+        status_code = 500
 
-        def do_POST(self):
-            n = int(self.headers.get("Content-Length") or 0)
-            body = _json.loads(self.rfile.read(n))
-            seen_bodies.append(body)
-            if "chat_template_kwargs" in body:
-                self.send_response(400)
-                self.end_headers()
-                return
-            out = _openai_completion_bytes()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(out)))
-            self.end_headers()
-            self.wfile.write(out)
+        def raise_for_status(self):
+            raise d.httpx.HTTPStatusError("boom", request=None, response=None)
 
-        def log_message(self, *a):
-            pass
+    monkeypatch.setattr(d.httpx, "post", lambda *a, **k: _Resp())
+    with pytest.raises(d.httpx.HTTPStatusError):
+        d.deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", "RTX 5090")
 
-    server = ThreadingHTTPServer(("127.0.0.1", 8199), _OldVllmStub)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    hub = types.ModuleType("huggingface_hub")
-    hub.snapshot_download = lambda **k: "/tmp"
-    sys.modules["huggingface_hub"] = hub
+def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
+    """undeploy DELETEs {FREESOLO_SERVING_URL}/adapters/{run_id} with the auth header and
+    returns [run_id] on success, [] on 404."""
+    import flash.serve.deploy as d
 
-    import subprocess as _sub
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
 
-    class _FakeProc:
-        def poll(self):
+    seen = {}
+
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+
+        def raise_for_status(self):
             return None
 
-        def kill(self):
-            pass
+    def fake_delete(url, headers=None, timeout=None):
+        seen["url"] = url
+        seen["headers"] = headers
+        return _Resp(200)
 
-    orig_popen = _sub.Popen
-    _sub.Popen = lambda *a, **k: _FakeProc()
-    try:
-        import flash.serve.deploy as d
+    monkeypatch.setattr(d.httpx, "delete", fake_delete)
+    out = d.undeploy_adapter("flash-7-abcd", gpu_name="RTX 5090")
+    assert out == ["flash-7-abcd"]
+    assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
+    assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
-        for k in ("_FLASH_KEY", "_FLASH_PROC"):
-            d.__dict__.pop(k, None)
-        resp = d._serve_body(
-            {
-                "hf_repo": "org/repo",
-                "model": "Qwen/Qwen3.5-0.8B",
-                "adapter_prefix": "sft/r1/seed0",
-                "token": "x",
-                "served_model": "flash-r1",
-                "messages": [{"role": "user", "content": "2+2?"}],
-                "max_tokens": 8,
-            }
-        )
-    finally:
-        _sub.Popen = orig_popen
-        server.shutdown()
-        sys.modules.pop("huggingface_hub", None)
-    assert resp["object"] == "chat.completion"
-    assert len(seen_bodies) == 2
-    assert "chat_template_kwargs" in seen_bodies[0]
-    assert "chat_template_kwargs" not in seen_bodies[1]
+    # A 404 (already gone) returns an empty list, not an error.
+    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
+    assert d.undeploy_adapter("flash-7-abcd", gpu_name="RTX 5090") == []
+
+
+def test_chat_posts_to_freesolo_serving(monkeypatch):
+    """chat POSTs to {FREESOLO_SERVING_URL}/v1/chat/completions addressing the adapter by
+    run_id, and returns the parsed OpenAI response dict."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+
+    seen = {}
+    completion = {
+        "object": "chat.completion",
+        "model": "flash-7-abcd",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi there"}}],
+    }
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return completion
+
+    def fake_post(url, json=None, timeout=None):
+        seen["url"] = url
+        seen["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(d.httpx, "post", fake_post)
+    out = d.chat(
+        run_id="flash-7-abcd",
+        messages=[{"role": "user", "content": "2+2?"}],
+        model="Qwen/Qwen3.5-0.8B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd/seed0",
+        temperature=0.0,
+        max_tokens=8,
+        thinking=True,
+    )
+    assert seen["url"] == "https://serve.example/v1/chat/completions"
+    assert seen["json"]["model"] == "flash-7-abcd"
+    assert seen["json"]["max_tokens"] == 8
+    assert seen["json"]["messages"] == [{"role": "user", "content": "2+2?"}]
+    # Per-run thinking parity: the thinking flag is forwarded to the chat template so a
+    # thinking-trained adapter serves with thinking (not silently dropped).
+    assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
+    # The OpenAI shape is preserved so resp["choices"][0]["message"]["content"] works.
+    assert out["choices"][0]["message"]["content"] == "hi there"
