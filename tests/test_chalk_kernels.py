@@ -78,50 +78,61 @@ def _clear_flags(monkeypatch):
         monkeypatch.delenv(k, raising=False)
 
 
-def test_no_flags_calls_nothing(monkeypatch):
-    """Default (no FLASH_* flag set) -> install nothing, even if chalk is importable."""
+def test_default_on_runs_gap_fillers(monkeypatch):
+    """Default (no FLASH_* flags) -> the Liger-complementary gap-fillers run AUTOMATICALLY:
+    RoPE/QKV/LoRA on the pre-build pass, embedding on the post-build pass. The opt-in kernels
+    (fused MLP that overlaps Liger, and the FP8 GEMMs) do NOT run by default."""
     _clear_flags(monkeypatch)
     calls = []
     _install_fake_chalk(monkeypatch, calls)
-    assert install_chalk_kernels() == {}
-    assert install_chalk_kernels(object()) == {}
-    assert calls == []  # chalk wasn't even consulted
+    install_chalk_kernels()  # pre-build (model=None)
+    install_chalk_kernels(object())  # post-build (model set)
+    names = {n for n, _, _ in calls}
+    assert names == {
+        "install_qwen35_rope",
+        "install_qwen35_qkv",
+        "install_lora",
+        "install_qwen35_embedding",
+    }
+    assert "install_qwen35_mlp" not in names  # opt-in (Liger SwiGLU overlap)
+    assert "install_fp8_base" not in names  # opt-in (FP8)
+    assert "install_qwen35_mlp_fp8" not in names  # opt-in (FP8)
 
 
 def test_noop_when_chalk_absent(monkeypatch):
-    """A flag is set but chalk isn't installed -> warn + no-op (returns {})."""
+    """Gap-fillers are default-on, but if freesolo-chalk isn't installed -> no-op (returns {})."""
     _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
     monkeypatch.setitem(sys.modules, "chalk", None)  # force ImportError on `import chalk.transformers`
     assert install_chalk_kernels() == {}
     assert install_chalk_kernels(object()) == {}
 
 
-def test_only_selected_installers_are_called(monkeypatch):
-    """Only the chalk installers whose FLASH_* flag is set get called."""
+def test_optin_flag_enables_extra_kernel(monkeypatch):
+    """A default-OFF kernel turns on with FLASH_<K>=1, alongside the default-on gap-fillers."""
     _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
-    monkeypatch.setenv("FLASH_TRITON_LORA", "1")
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # opt in to the fused MLP
     calls = []
     _install_fake_chalk(monkeypatch, calls)
-    install_chalk_kernels()  # model=None
+    install_chalk_kernels()  # pre-build (class/fn-level)
     names = {n for n, _, _ in calls}
-    assert names == {"install_qwen35_mlp", "install_lora"}
-    # unselected installers (including instance-level FP8 base/embedding) were NOT called
-    assert "install_fp8_base" not in names
-    assert "install_qwen35_qkv" not in names
+    # default-on gap-fillers (class/fn-level) + the opted-in MLP
+    assert names == {"install_qwen35_rope", "install_qwen35_qkv", "install_lora", "install_qwen35_mlp"}
 
 
-def test_falsey_flag_value_does_not_select(monkeypatch):
-    """FLASH_*=0/false/empty must NOT enable the kernel (so a leftover 0 is inert)."""
+def test_flag_zero_disables_default_on_kernel(monkeypatch):
+    """FLASH_<K>=0/false disables a default-ON gap-filler; a default-OFF kernel stays off."""
     _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "0")
-    monkeypatch.setenv("FLASH_QKV_KERNEL", "false")
-    monkeypatch.setenv("FLASH_TRITON_LORA", "")
+    monkeypatch.setenv("FLASH_ROPE_KERNEL", "0")  # disable default-on RoPE
+    monkeypatch.setenv("FLASH_QKV_KERNEL", "false")  # disable default-on QKV
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "0")  # default-off stays off
     calls = []
     _install_fake_chalk(monkeypatch, calls)
-    assert install_chalk_kernels() == {}
-    assert calls == []
+    install_chalk_kernels()  # pre-build
+    names = {n for n, _, _ in calls}
+    assert "install_qwen35_rope" not in names
+    assert "install_qwen35_qkv" not in names
+    assert "install_qwen35_mlp" not in names
+    assert "install_lora" in names  # still default-on (not disabled)
 
 
 def test_model_none_runs_only_class_level_installers(monkeypatch):

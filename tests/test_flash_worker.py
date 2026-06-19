@@ -150,13 +150,14 @@ def _clear_chalk_flags(monkeypatch):
         monkeypatch.delenv(k, raising=False)
 
 
-def test_chalk_extra_pip_empty_without_flags(monkeypatch):
-    """No FLASH_* kernel flag -> nothing added to the worker's extra_pip (default = no chalk)."""
+def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
+    """Default (no FLASH_* flags) -> chalk's gap-fillers are ON, so a set FLASH_CHALK_SPEC IS
+    appended to extra_pip (chalk installs + auto-applies, like Liger)."""
     from flash.providers.runpod.train import chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")  # spec alone must not opt in
-    assert chalk_extra_pip() == []
+    monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")
+    assert chalk_extra_pip() == ["freesolo-chalk"]
 
 
 def test_chalk_extra_pip_empty_without_spec(monkeypatch):
@@ -180,12 +181,14 @@ def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):
     assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
 
 
-def test_chalk_extra_pip_falsey_flag_does_not_opt_in(monkeypatch):
-    """FLASH_*=0 is inert: a leftover 0 must not pull chalk in even with a spec set."""
+def test_chalk_extra_pip_all_kernels_disabled_adds_nothing(monkeypatch):
+    """Disabling EVERY default-on gap-filler (FLASH_<K>=0) -> chalk not selected -> nothing added,
+    even with a spec set. (A single FLASH_MLP_KERNEL=0 is inert — that one is opt-in anyway.)"""
     from flash.providers.runpod.train import chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "0")
+    for k in ("FLASH_ROPE_KERNEL", "FLASH_QKV_KERNEL", "FLASH_TRITON_LORA", "FLASH_EMBED_KERNEL"):
+        monkeypatch.setenv(k, "0")
     monkeypatch.setenv("FLASH_CHALK_SPEC", "freesolo-chalk")
     assert chalk_extra_pip() == []
 
@@ -233,17 +236,18 @@ def test_chalk_extra_pip_worker_env_spec_with_os_env_flag(monkeypatch):
 
 
 def test_chalk_extra_pip_worker_env_overrides_os_env_flag(monkeypatch):
-    """[worker_env] wins over os.environ (same precedence build_worker_env applies): a per-run
-    FLASH_*=0 must DISABLE a chalk flag set globally, so chalk is not installed for that run."""
+    """[worker_env] wins over os.environ. chalk is default-on, so to turn it OFF for a run, every
+    gap-filler must be disabled via [worker_env] (selection is binary: install chalk or not)."""
     from flash.providers.runpod.train import chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # global opt-in
     monkeypatch.setenv("FLASH_CHALK_SPEC", "git+https://github.com/freesolo-co/chalk@main")
-    # without an override the global flag opts in
+    # default-on -> chalk selected, spec appended
     assert chalk_extra_pip() == ["git+https://github.com/freesolo-co/chalk@main"]
-    # a per-run [worker_env] FLASH_MLP_KERNEL=0 turns it OFF for this run
-    spec = _spec_worker_env({"FLASH_MLP_KERNEL": "0"})
+    # a per-run [worker_env] disabling every gap-filler turns chalk off for that run
+    spec = _spec_worker_env(
+        {k: "0" for k in ("FLASH_ROPE_KERNEL", "FLASH_QKV_KERNEL", "FLASH_TRITON_LORA", "FLASH_EMBED_KERNEL")}
+    )
     assert chalk_extra_pip(spec) == []
 
 

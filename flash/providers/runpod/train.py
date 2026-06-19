@@ -154,19 +154,6 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
     return deps
 
 
-# FLASH_* flags that select a chalk install-on-call kernel (see engine.chalk_kernels). Any one
-# of these being set means the run opted into chalk, so chalk must be installed on the worker.
-_CHALK_KERNEL_FLAGS = (
-    "FLASH_MLP_KERNEL",
-    "FLASH_MLP_FP8",
-    "FLASH_FP8_BASE",
-    "FLASH_TRITON_LORA",
-    "FLASH_EMBED_KERNEL",
-    "FLASH_QKV_KERNEL",
-    "FLASH_ROPE_KERNEL",
-)
-
-
 def _effective_worker_env(spec=None) -> dict[str, str]:
     """The env the WORKER process will actually see, for chalk-selection decisions.
 
@@ -188,15 +175,23 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 
 
 def _chalk_selected(spec=None) -> bool:
-    """True if any FLASH_* chalk kernel-selection flag is truthy in the EFFECTIVE worker env.
+    """True if ANY chalk kernel would run on the worker -> chalk must be installed.
 
-    Reads the per-run ``[worker_env]`` (``spec.worker_env``) merged over ``os.environ`` so a chalk
-    opt-in set only in the run's ``[worker_env]`` block is detected (see ``_effective_worker_env``).
+    chalk's gap-fillers (RoPE/QKV/LoRA/embedding) are ON BY DEFAULT (engine.chalk_kernels), so this
+    is True for a normal run and False only when EVERY kernel is explicitly disabled (``FLASH_<K>=0``)
+    in the EFFECTIVE worker env — the run's ``[worker_env]`` merged over ``os.environ`` so a per-run
+    override is honored (see ``_effective_worker_env``). Mirrors ``chalk_kernels._kernel_on``.
     """
+    from flash.engine.chalk_kernels import _KERNELS
+
     env = _effective_worker_env(spec)
-    for name in _CHALK_KERNEL_FLAGS:
-        v = env.get(name)
-        if v is not None and v.strip().lower() not in ("", "0", "false", "no", "off"):
+    for flag, _installer, _needs_model, default_on in _KERNELS:
+        v = env.get(flag)
+        if v is None or not v.strip():
+            on = default_on
+        else:
+            on = v.strip().lower() not in ("0", "false", "no", "off")
+        if on:
             return True
     return False
 
@@ -222,10 +217,10 @@ def chalk_extra_pip(spec=None) -> list[str]:
         return []
     spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip()
     if not spec_str:
-        logger.warning(
-            "a FLASH_* chalk kernel is selected but FLASH_CHALK_SPEC is unset; freesolo-chalk is "
-            "unpublished so it can't be auto-installed — set FLASH_CHALK_SPEC to an installable "
-            "spec (git URL or wheel) or the chalk kernels will no-op on the worker."
+        logger.info(
+            "chalk gap-filling kernels are default-on but FLASH_CHALK_SPEC is unset; freesolo-chalk "
+            "is unpublished so it can't be auto-installed — set FLASH_CHALK_SPEC to an installable "
+            "spec (git URL or wheel) to actually run the kernels (they no-op safely until then)."
         )
         return []
     import shlex
