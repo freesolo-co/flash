@@ -54,23 +54,7 @@ def _internal_key_header() -> dict[str, str]:
 
 
 def resolve_serve_deps() -> list[str]:
-    """Kept for back-compat; serving deps are external (freesolo), so this is empty.
-
-    An explicit ``FLASH_SERVE_DEPS`` override is still honored for any caller that
-    inspects it, but flash no longer installs a serving stack of its own.
-    """
-    explicit = os.environ.get("FLASH_SERVE_DEPS")
-    if explicit:
-        if explicit.strip().startswith("["):
-            import json as _json
-
-            deps = [str(d).strip() for d in _json.loads(explicit) if str(d).strip()]
-        else:
-            import shlex
-
-            deps = [d for d in shlex.split(explicit) if d.strip()]
-        if deps:
-            return deps
+    """Kept for back-compat; serving deps are external (freesolo), so this is empty."""
     return SERVE_DEPS
 
 

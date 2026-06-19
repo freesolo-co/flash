@@ -43,10 +43,10 @@ _BASE_OVERHEAD_GB = 4.0
 _ACT_COEF = 0.12
 # SFT activations peak on the worker's PER-DEVICE micro-batch, not [train].batch_size
 # (which is the global/effective batch realized via gradient accumulation). The worker
-# caps the micro-batch at SFT_PER_DEVICE_BS (default 4): per_device = min(batch_size, bs).
-# Mirror that here so an unset/long-context SFT run (batch defaults low) still reserves
-# the micro-batch activation peak, and a large effective batch isn't mis-counted as
-# resident VRAM (it's grad-accum, not in-flight activations).
+# caps the micro-batch at 4: per_device = min(batch_size, 4). Mirror that here so an
+# unset/long-context SFT run (batch defaults low) still reserves the micro-batch activation
+# peak, and a large effective batch isn't mis-counted as resident VRAM (it's grad-accum,
+# not in-flight activations).
 _SFT_PER_DEVICE_BS_DEFAULT = 4
 
 
@@ -78,7 +78,7 @@ _TRAIN_COEF = 0.27
 # (-> both need 32); 4B GRPO fits 32 (param est ~31 already clears this floor, so it's untouched).
 _VLLM_COLOCATE_FLOOR_GB = 28.0
 _VOCAB_DEFAULT = 152_000  # Qwen3.x tokenizer vocab (drives the fp32-logits GRPO term)
-# Matches the worker's RL_LOGITS_BUDGET_GB default: the per-device fp32 logits are capped to this
+# Matches the worker's logits budget (6 GB): the per-device fp32 logits are capped to this
 # (rl_per_device_comps spills the rest into grad-accum), so the estimator never reserves above it.
 _LOGITS_BUDGET_GB = 6.0
 
@@ -174,8 +174,8 @@ def estimate_vram_gb(
         think_factor = 1.3 if thinking else 1.0
         activations = _TRAIN_COEF * (seq_len / 1024.0) * width * group_factor * think_factor
         # fp32 logits [per_device, completion, vocab] are the documented GRPO OOM driver. The
-        # worker MEMORY-CAPS per_device (rl_per_device_comps) so the live logits never exceed
-        # RL_LOGITS_BUDGET_GB and the rest spills into grad-accum -- so the IRREDUCIBLE floor the
+        # worker MEMORY-CAPS per_device (rl_per_device_comps) so the live logits never exceed the
+        # logits budget (6 GB) and the rest spills into grad-accum -- so the IRREDUCIBLE floor the
         # card must hold is the per_device=1 logits for the completion length: it scales with
         # max_tokens (NOT seq_len) and is capped at the budget. completion defaults to the recipe
         # budget (~min(seq_len, 1024)) when max_tokens is unset.
@@ -183,8 +183,8 @@ def estimate_vram_gb(
         logits = min(completion * _VOCAB_DEFAULT * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
         return base + max(rollout, train)
-    # SFT: the activation peak is the worker's per-device micro-batch (capped at
-    # SFT_PER_DEVICE_BS), NOT the global/effective batch_size (gradient accumulation realizes
+    # SFT: the activation peak is the worker's per-device micro-batch (capped at 4),
+    # NOT the global/effective batch_size (gradient accumulation realizes
     # that). Size to the micro-batch the worker actually runs: a default/long-context run reserves
     # for the per-device cap (no under-routing to a too-small card), while a large effective
     # batch_size is capped at it (no over-routing, since accum isn't resident VRAM).
@@ -246,7 +246,7 @@ def model_required_vram_gb(
     seq_len = _pos_int(_g(train, "max_length"), _grpo_default_len)
     lora_rank = _pos_int(_g(train, "lora_rank"), 32)
     group_size = _pos_int(_g(train, "group_size"), 8)
-    # Default to the worker's per-device SFT micro-batch (SFT_PER_DEVICE_BS): an unset
+    # Default to the worker's per-device SFT micro-batch (4): an unset
     # [train].batch_size still realizes that micro-batch on the worker, so size for it
     # rather than 1 (which would under-route a long-context SFT run to a too-small card).
     batch_size = _pos_int(_g(train, "batch_size"), _sft_per_device_bs())
