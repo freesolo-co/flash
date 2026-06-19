@@ -58,13 +58,16 @@ BREAKEVEN_FACTOR_GLOBAL = 0.703  # method-agnostic fallback (whole-portfolio rat
 CALIBRATION_N = 13
 
 # Path to the committed measured-run summary the factors are derived from. In a source
-# checkout it lives at the repo root (next to its generator); in an installed wheel it is
-# force-included under the package as ``flash/cost/_data/summary_real.json`` (see
-# pyproject ``force-include``). Prefer the packaged copy so this resolves in both contexts.
+# checkout it lives at the repo root (next to its generator and the docs/report that
+# regenerate it) -- that is the single source of truth; in an installed wheel that path
+# is absent and it is force-included under the package as ``flash/cost/_data/summary_real.json``
+# (see pyproject ``force-include``). Prefer the source-root copy whenever it exists so a
+# refreshed summary is never shadowed by a stale packaged copy, and fall back to the
+# packaged copy so this still resolves in an installed wheel.
 _HERE = Path(__file__).resolve().parent
 _PACKAGED_SUMMARY = _HERE / "_data" / "summary_real.json"
 _SOURCE_SUMMARY = _HERE.parents[1] / "cost_estimator_results" / "real_runs" / "summary_real.json"
-_REAL_RUNS_SUMMARY = _PACKAGED_SUMMARY if _PACKAGED_SUMMARY.exists() else _SOURCE_SUMMARY
+_REAL_RUNS_SUMMARY = _SOURCE_SUMMARY if _SOURCE_SUMMARY.exists() else _PACKAGED_SUMMARY
 
 
 def breakeven_factor(method: str) -> float:
