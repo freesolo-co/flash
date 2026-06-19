@@ -35,7 +35,7 @@ import traceback
 from flash.engine.accounting import RunMetrics
 
 # Shared, substrate-neutral fine-tuning internals (live in this same package).
-from flash.engine.chalk_kernels import install_chalk_kernels
+from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
@@ -559,6 +559,32 @@ def optimal_attn_impl() -> str | None:
     return impl
 
 
+def force_vllm_backend_for_sm120() -> str | None:
+    """On RTX 5090 / consumer Blackwell (sm120), force a PTX-independent vLLM attention backend.
+
+    vLLM's default rollout backend is flash-attn, whose PRE-BUILT PTX needs a newer driver JIT than
+    many 5090 RunPod hosts have — when the JIT fails the colocated rollout silently produces NO
+    completions (empty reward_history, ~1.4 s "done"; a whole 22-run sweep hit this on every 5090).
+    FLASHINFER is vLLM's Blackwell-native backend (no flash-attn PTX dependency) and trains on a 5090
+    (measured: FLASHINFER/TORCH_SDPA/TRITON_ATTN all train, ~116 s). This mirrors the trainer's
+    cuDNN-SDPA forcing on sm120 (``_attn_impl_for_capability``). The GRPO no-op guard remains the
+    backstop. Returns the backend set (None if not sm120, or the operator already pinned one)."""
+    if os.environ.get("VLLM_ATTENTION_BACKEND"):
+        return None  # operator override wins
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 12:
+            return None
+    except Exception as e:
+        print("[rl] sm120 vLLM backend probe skipped:", e)
+        return None
+    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+    print("[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
+          "on consumer Blackwell hosts -> empty-rollout failures)")
+    return "FLASHINFER"
+
+
 # Liger's fused linear cross-entropy is a MEMORY optimization (it never materializes the fp32
 # [B,T,vocab] logits), not a fixed-batch speed win. PR #174 ledger: on a 1B model at fixed batch
 # it is a measured NET LOSS on EVERY arch (min-of-3: A100 0.86x, H100 0.90x, RTX 3090 0.78x,
@@ -979,15 +1005,23 @@ def make_lora(model_id: str | None = None):
         "target_modules": targets,
         "task_type": "CAUSAL_LM",
     }
-    # Adapter initialization (convergence lever, always-on: measured -35% train loss in A/B
-    # (gpu-bench)). PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds)
-    # so LoRA converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
+    # Adapter initialization (convergence lever: measured -35% train loss in A/B (gpu-bench)).
+    # PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds) so LoRA
+    # converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
     # NOTE: PiSSA mutates the effective base, so the saved adapter is a PiSSA-residual unless
     # converted — fine for our train+eval+serve-same-stack flow.
-    kwargs["init_lora_weights"] = "pissa_niter_16"
+    # BUT PiSSA's SVD needs an UNQUANTIZED base: on the 4-bit QLoRA tier peft raises "Please
+    # initialize PiSSA under float32/float16/bfloat16" and the whole run crashes at adapter init.
+    # The catalog's 9B is 4bit-qlora by default, so every 9B run died here. Fall back to the
+    # default LoRA init on the QLoRA tier; PiSSA stays on for the bf16/LoRA tier.
+    if model_id and model_quant(model_id) == "4bit-qlora":
+        print("[lora] 4-bit QLoRA base -> default LoRA init (PiSSA needs an fp base)")
+    else:
+        kwargs["init_lora_weights"] = "pissa_niter_16"
+        print("[lora] init_lora_weights=pissa_niter_16")
     # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
+    # Quant-independent (just the alpha/sqrt(r) scale), so on for both tiers.
     kwargs["use_rslora"] = True
-    print("[lora] init_lora_weights=pissa_niter_16, rsLoRA scaling enabled")
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
         if exclude:
@@ -1301,11 +1335,6 @@ def run_sft():
                         print("[lora+] setup failed, falling back to default optimizer:", e)
                 return super().create_optimizer()
 
-    # Install any opt-in chalk kernels (selected via FLASH_* flags) before TRL builds the model, so the
-    # class/function-level patches (LoRA delta, fused MLP/QKV, RoPE) apply to it. No-op unless
-    # a FLASH_* kernel flag is set and freesolo-chalk is installed.
-    install_chalk_kernels()
-
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
     trainer = _SFT(
@@ -1316,10 +1345,11 @@ def run_sft():
         processing_class=tok,
         callbacks=[make_checkpoint_upload_callback()],
     )
-    # The class/function-level chalk kernels installed above patch the layers TRL just built; the
-    # INSTANCE-level ones (FP8 base, embedding, FP8 MLP) need the materialized module, so install
-    # them now against the SFT trainer.model. No-op unless a FLASH_* kernel flag is set and chalk present.
-    install_chalk_kernels(getattr(trainer, "model", None))
+    # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
+    # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
+    # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
+    # freesolo-chalk is installed.
+    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
 
     _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
     _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. bnb managed optimizer pages
@@ -1377,6 +1407,9 @@ def run_sft():
                 else loraplus_optimizer_cls(fused_optim_name())[0].__name__
             ),
             "loraplus_applied": getattr(trainer, "_loraplus_applied", False),
+            # Which chalk gap-filling kernels actually ENGAGED (empty/None = chalk not installed or
+            # every kernel fell back) — verifies the chalk stack without the console.
+            "chalk_kernels": active_kernels(_chalk_report) or None,
             **wandb_run_info(),
         },
     )
@@ -1724,6 +1757,30 @@ def _init_adapter_model(model_id: str):
     return model, None
 
 
+def _grpo_resume_already_complete(resume_ckpt, target_steps: int, steps_run: int) -> bool:
+    """True when this worker resumed a checkpoint that already reached the target step count.
+
+    Such a resume legitimately performs ZERO new optimizer steps (so the fresh hb_cb has an empty
+    reward_history) yet the policy IS fully trained — it must NOT be flagged as a no-op failure.
+    """
+    return bool(resume_ckpt) and target_steps > 0 and steps_run >= target_steps
+
+
+def _grpo_is_no_op_failure(
+    reward_history, resume_ckpt, target_steps: int, steps_run: int
+) -> bool:
+    """True when a GRPO run trained NOTHING and must fail loudly instead of reporting as done.
+
+    An empty ``reward_history`` means the reward callback never fired — the rollout scored nothing
+    (e.g. vLLM silently returning no completions), so no real training happened. The sole exception
+    is a resume that already reached the target steps (see ``_grpo_resume_already_complete``): that
+    has an empty fresh history but a fully-trained policy, so it is NOT a failure.
+    """
+    if reward_history:
+        return False
+    return not _grpo_resume_already_complete(resume_ckpt, target_steps, steps_run)
+
+
 def run_rl():
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -1984,6 +2041,10 @@ def run_rl():
         grpo_kwargs["use_liger_kernel"] = True
         print("[rl] liger fused GRPO loss enabled")
     if use_vllm:
+        # RTX 5090 / sm120: pin a PTX-independent vLLM attention backend (FLASHINFER) BEFORE TRL
+        # builds the colocated engine — else the rollout can silently produce no completions on
+        # old-driver Blackwell hosts (flash-attn PTX JIT failure). No-op off sm120 / if pinned.
+        force_vllm_backend_for_sm120()
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
         # the model's FULL context and won't start on a consumer GPU). vllm_gpu_memory_utilization
@@ -2041,14 +2102,11 @@ def run_rl():
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
     # to fp32 and double VRAM).
     init_model, init_peft = _init_adapter_model(model_id)
-    # Install the CLASS/FUNCTION-level opt-in chalk kernels (LoRA delta, fused MLP/QKV, RoPE)
-    # BEFORE GRPOTrainer builds the model so the patches apply to its freshly-built layers. The
-    # INSTANCE-level kernels (FP8 base, embedding, FP8 MLP) need the actual nn.Module and are
-    # installed AFTER construction (below) against trainer.model — on the fresh-LoRA path
+    # chalk's kernels are applied AFTER construction (below) against trainer.model: chalk's apply
+    # patches the LIVE nn.Module, so there is nothing to install pre-build. On the fresh-LoRA path
     # init_model is just the model-id string (TRL builds the module), and even on the
     # continue-adapter path TRL may rebuild/wrap the PeftModel, so trainer.model is the
-    # authoritative target. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
-    install_chalk_kernels()
+    # authoritative target.
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
         # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
@@ -2155,11 +2213,11 @@ def run_rl():
         callbacks=[hb_cb, make_checkpoint_upload_callback()],
         **extra_trainer_kwargs,
     )
-    # Now that TRL has materialized the model, install the INSTANCE-level chalk kernels (FP8 base,
-    # embedding, FP8 MLP) against the actual module GRPOTrainer optimizes (trainer.model). Doing it
-    # here (not on init_model) is what makes them reach the fresh-LoRA path, where init_model was
-    # only the model-id string. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
-    install_chalk_kernels(getattr(trainer, "model", None))
+    # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
+    # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
+    # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
+    # Capture the install report so the engaged kernels land in metrics (active_kernels below).
+    _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
     # Opt-in periodic mid-run eval (the run's [train] eval_every_steps > 0): greedy eval on a
     # held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated
     # into metrics.json so the agent reads the eval curve (not just the noisy reward) judging a run.
@@ -2178,6 +2236,32 @@ def run_rl():
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
     reward_history = list(getattr(hb_cb, "reward_history", []))
+    # A GRPO run that finishes WITHOUT the reward callback ever firing (empty reward_history)
+    # produced NO real training — the rollout scored nothing (e.g. vLLM generation silently
+    # returning no completions, observed on RTX 5090 / sm120: ~1.4 s wall, empty reward + loss
+    # curves, but the run otherwise "succeeds"). That is a FAILURE, not a success: a no-op run with
+    # an unchanged adapter must not be reported as done — fail loudly so the operator/agent doesn't
+    # trust it. (An env returning all-zero rewards still appends 0.0s, so an EMPTY history uniquely
+    # means the reward path never ran.)
+    _steps_run = int(getattr(trainer.state, "global_step", 0) or 0)
+    # A resume that already reached the target steps legitimately performs ZERO new optimizer
+    # steps: the previous worker uploaded the final checkpoint (and scored its rewards) but died
+    # before writing metrics/DONE, so this worker's fresh hb_cb has an empty reward_history even
+    # though the policy IS fully trained. Don't fail those — finalize from the resumed state. The
+    # no-op guard below is only for a run that genuinely trained nothing (no resume, or the resume
+    # didn't reach the target steps).
+    _resumed_complete = _grpo_resume_already_complete(resume_ckpt, steps, _steps_run)
+    if _grpo_is_no_op_failure(reward_history, resume_ckpt, steps, _steps_run):
+        raise RuntimeError(
+            f"GRPO scored no reward in {train_wall:.1f}s over {_steps_run} step(s) — the rollout "
+            "produced no completions, so the policy was never actually trained. Failing loudly "
+            "instead of reporting a no-op run as done (seen on RTX 5090/sm120 vLLM rollout)."
+        )
+    if not reward_history and _resumed_complete:
+        print(
+            f"[resume] no new reward in this worker but resumed checkpoint already reached "
+            f"{_steps_run}/{steps} step(s) — finalizing the completed policy instead of failing."
+        )
     # Final eval on the actually-saved policy: the cadence only fires on multiples of
     # eval_every_steps, so when the run length isn't a multiple the last cadence eval predates the
     # saved adapter. run_final adds one eval on the final model (no-ops if the last step already
@@ -2211,6 +2295,9 @@ def run_rl():
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,
             "loss_curve": _metric_curve(trainer, "loss"),
+            # Which chalk gap-filling kernels actually ENGAGED (None = chalk not installed or every
+            # kernel fell back) — verifies the chalk stack on a GRPO run without the console.
+            "chalk_kernels": active_kernels(_chalk_report) or None,
             **wandb_run_info(),
             # The mid-run eval curve (per [train] eval_every_steps): each entry has step,
             # eval_reward, eval_pass_rate, and eval_metrics{}. Empty when eval is off. The agent

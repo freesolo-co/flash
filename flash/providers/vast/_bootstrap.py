@@ -92,7 +92,9 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """One worker process; console teed to a file and streamed to the instance log.
 
     On failure the console tail is uploaded as console_<mode>.txt — like _train_body,
-    because subprocess consoles are the only place engine-core crashes surface. On
+    because subprocess consoles are the only place engine-core crashes surface. With
+    FLASH_UPLOAD_CONSOLE=1 (forwarded into env via build_worker_env) it is also uploaded on
+    SUCCESS so operators can verify which optimizations engaged — matching runpod/train.py. On
     deadline the process is killed and we return a sentinel nonzero rc.
     """
     console = f"/tmp/console_{mode}.txt"
@@ -121,7 +123,12 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             proc.kill()
             proc.wait()
         t.join(timeout=10)
-    if proc.returncode != 0 or timed_out:
+    # FLASH_UPLOAD_CONSOLE=1 also uploads the console on SUCCESS (not just failure/timeout) so an
+    # operator can confirm which optimizations engaged — mirrors run_mode() in runpod/train.py.
+    _force_console = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
+        "", "0", "false", "no", "off",
+    )
+    if proc.returncode != 0 or timed_out or _force_console:
         try:
             tail_path = console + ".tail"
             with open(console) as f:
