@@ -1182,9 +1182,9 @@ def run_sft():
                         print("[lora+] setup failed, falling back to default optimizer:", e)
                 return super().create_optimizer()
 
-    # Install any opt-in chalk kernels (CHALK_* flags) before TRL builds the model, so the
+    # Install any opt-in chalk kernels (selected via FLASH_* flags) before TRL builds the model, so the
     # class/function-level patches (LoRA delta, fused MLP/QKV, RoPE) apply to it. No-op unless
-    # a CHALK_* flag is set and freesolo-chalk is installed.
+    # a FLASH_* kernel flag is set and freesolo-chalk is installed.
     install_chalk_kernels()
 
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
@@ -1199,7 +1199,7 @@ def run_sft():
     )
     # The class/function-level chalk kernels installed above patch the layers TRL just built; the
     # INSTANCE-level ones (FP8 base, embedding, FP8 MLP) need the materialized module, so install
-    # them now against the SFT trainer.model. No-op unless a CHALK_* flag is set and chalk present.
+    # them now against the SFT trainer.model. No-op unless a FLASH_* kernel flag is set and chalk present.
     install_chalk_kernels(getattr(trainer, "model", None))
 
     t_train = time.time()
@@ -1907,7 +1907,7 @@ def run_rl():
     # installed AFTER construction (below) against trainer.model — on the fresh-LoRA path
     # init_model is just the model-id string (TRL builds the module), and even on the
     # continue-adapter path TRL may rebuild/wrap the PeftModel, so trainer.model is the
-    # authoritative target. No-op unless a CHALK_* flag is set and freesolo-chalk is installed.
+    # authoritative target. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
     install_chalk_kernels()
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
@@ -2018,7 +2018,7 @@ def run_rl():
     # Now that TRL has materialized the model, install the INSTANCE-level chalk kernels (FP8 base,
     # embedding, FP8 MLP) against the actual module GRPOTrainer optimizes (trainer.model). Doing it
     # here (not on init_model) is what makes them reach the fresh-LoRA path, where init_model was
-    # only the model-id string. No-op unless a CHALK_* flag is set and freesolo-chalk is installed.
+    # only the model-id string. No-op unless a FLASH_* kernel flag is set and freesolo-chalk is installed.
     install_chalk_kernels(getattr(trainer, "model", None))
     # Opt-in periodic mid-run eval (the run's [train] eval_every_steps, or FLASH_EVAL_EVERY_STEPS,
     # > 0): greedy eval on a held-out split, streamed via heartbeat("rl_eval", ...) AND accumulated

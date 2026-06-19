@@ -383,7 +383,7 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     runner can persist {endpoint_id, job_id} for cross-process reattach.
     """
     from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
-    from flash.providers.runpod.train import _run_suffix, build_worker_env
+    from flash.providers.runpod.train import _run_suffix, build_worker_env, chalk_extra_pip
 
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
     # Per-attempt endpoint name: a retry must land on a genuinely fresh endpoint —
@@ -396,7 +396,12 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     # doing it after deploy_train_endpoint() would leak the just-created endpoint (its
     # rN-suffixed name can't be reconstructed from the run id later) against the account
     # quota — the runner would also treat the raise as a retryable poll_error.
-    extra_pip = list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
+    # extra_pip runs for EVERY job here (the durable baked-image path skips resolve_worker_deps /
+    # FLASH_WORKER_EXTRA_DEPS in build_function_input, but _train_body always pip-installs
+    # extra_pip), so the opt-in chalk spec is appended here to reach default runs.
+    extra_pip = (
+        list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
+    ) + chalk_extra_pip()
     worker_env = build_worker_env(spec, seed)
     endpoint_id, name = deploy_train_endpoint(
         spec.gpu.type,
