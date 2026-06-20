@@ -48,11 +48,10 @@ def gpu_hourly_usd(name: str) -> float:
     return info.hourly_usd
 
 
-# Realized $/hr a class is actually billed at -- the empirical effective rate (measured cost /
-# measured wall) over the real runs, NOT the on-demand list. A calibrated price INPUT, not an
-# output adjustment. Deliberately a single conservative per-class value (at/below the dataset
-# median, not method-specific): pricing GRPO at its full pricier-instance rate over-quotes the
-# total. ``fit_constants`` returns the exact medians to refresh these from.
+# Realized (spot/queue) $/hr a class is actually billed at -- a conservative single per-class
+# value, usually below the on-demand list. Deliberately not method-specific: pricing GRPO at
+# its full pricier-instance rate would over-quote the total. An unobserved class falls back to
+# the list price (no rate invented).
 REALIZED_HOURLY_USD: dict[str, float] = {
     "RTX 3090": 0.239,
     "RTX 4090": 0.426,
@@ -83,21 +82,15 @@ def pick_gpu(
     pin: str | None = None,
     provider: str | None = None,
     allow_unvalidated: bool = False,
-    pin_must_fit: bool = True,
 ) -> str:
     """Cheapest GPU class that fits ``required_vram_gb`` -- mirrors ``allocator.allocate``.
 
     Ranks the static registry by (hourly_usd, vram_gb, name), over validated classes by
     default (``allow_unvalidated`` widens the pool). A concrete ``pin`` is canonicalized (an
-    unknown one raises) and honored only if it fits; policy sentinels (auto/cheapest/empty)
-    fall through to cheapest-fit. ``provider`` restricts candidates to classes that provider
-    can provision (``providers_for``); this filter holds even with ``allow_unvalidated``.
-
-    ``pin_must_fit`` is True for a forward estimate (a too-small pin escalates). It is False
-    only when GRADING a measured run, where the pin is the card the run demonstrably ran on:
-    the pin is then honored even if the offline VRAM heuristic over-estimates and would drop
-    it -- otherwise the measured bill is priced on a different GPU. Only a concrete known pin
-    is force-honored; the provider/validation gates still apply.
+    unknown one raises) and honored only if it fits, else selection escalates to the cheapest
+    fitting class; policy sentinels (auto/cheapest/empty) fall through to cheapest-fit.
+    ``provider`` restricts candidates to classes that provider can provision (``providers_for``);
+    this filter holds even with ``allow_unvalidated``.
     """
 
     def _selectable(g: GpuClass) -> bool:
@@ -119,11 +112,7 @@ def pick_gpu(
         canonical = canonical_gpu(pin)  # raises UnsupportedGpuError for an unknown pin
         pinned = [g for g in candidates if g.name == canonical]
         if pinned:
-            candidates = pinned
-        elif not pin_must_fit and _selectable(GPU_INFO[canonical]):
-            # Grading a measured run: force the recorded class back in past the VRAM-fit gate
-            # only (provider/validation gates above still apply).
-            return GPU_INFO[canonical].name
+            candidates = pinned  # honor the pin when it fits; else escalate to cheapest-fit
     if not candidates:
         raise ValueError(
             f"no GPU class fits >= {required_vram_gb} GB (allow_unvalidated={allow_unvalidated})"
@@ -190,34 +179,17 @@ def download_weight_gb(model_id: str, params_str: str | None = None) -> float:
 
 
 # ===== Reward-grader latency (GRPO) =====
-# Seconds to grade one completion, by reward "weight".
-REWARD_TIERS: dict[str, float] = {
-    "trivial": 0.01,  # exact-match / regex / numeric check
-    "light": 0.15,  # parsing + multi-field scoring, classification
-    "medium": 0.6,  # light tool/eval, multi-step verifier
-    "heavy": 3.0,  # sandboxed code execution, LLM-as-judge, web/tool rollout
-}
-
-# Environment-slug keyword -> tier (first match wins).
-_ENV_KEYWORDS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("code", "swe", "exec", "contest", "leetcode"), "heavy"),
-    (("judge", "chat", "ticket", "support", "rubric", "dialog"), "heavy"),
-    (("search", "browse", "web", "tool", "agent", "linkd"), "medium"),
-    (("sentiment", "classif", "extract", "ner", "label"), "light"),
-    (("math", "gsm", "arith", "hendrycks", "aime", "bench", "mmlu"), "trivial"),
-)
-
-DEFAULT_REWARD_SECONDS = 0.3  # unknown env: assume a light-to-medium grader
+# A SINGLE average grader latency (seconds to score one completion), applied to every
+# environment. We deliberately don't classify the env from its slug: that isn't generalizable
+# (an unknown env gets mis-tiered), and real graders span ~0.01s (regex / exact-match / math)
+# to ~3s (LLM-as-judge, sandboxed code). One average means a heavier-than-average grader is
+# under-quoted (we charge less) and a lighter one over-quoted slightly -- we prefer the
+# under-quote. A run can still pin its own value via RunConfig.reward_seconds_per_completion.
+AVG_REWARD_SECONDS_PER_COMPLETION = 0.3
 
 
-def reward_seconds_per_completion(environment: str | None, override: float | None = None) -> float:
-    """Per-completion reward latency (s): explicit override, else inferred from the env."""
+def reward_seconds_per_completion(override: float | None = None) -> float:
+    """Per-completion reward latency (s): the explicit override, else the single average."""
     if override is not None:
         return max(0.0, override)
-    if not environment:
-        return DEFAULT_REWARD_SECONDS
-    slug = environment.lower()
-    for keywords, tier in _ENV_KEYWORDS:
-        if any(k in slug for k in keywords):
-            return REWARD_TIERS[tier]
-    return DEFAULT_REWARD_SECONDS
+    return AVG_REWARD_SECONDS_PER_COMPLETION

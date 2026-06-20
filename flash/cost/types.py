@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
-from typing import Any
+from dataclasses import dataclass, replace
 
 from flash.catalog import normalize_algorithm
 from flash.engine.recipe import RECIPE
@@ -28,7 +27,7 @@ class RunConfig:
     group_size: int | None = None  # GRPO completions per prompt (G)
     lora_rank: int | None = None
     thinking: bool = False
-    # GRPO only: seconds to score one completion. None -> inferred from the environment.
+    # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
 
     gpu: str | None = None  # pin a class; else cheapest fitting
@@ -165,20 +164,6 @@ class CostEstimate:
     @property
     def wall_clock_hours(self) -> float:
         return self.wall_clock_seconds / 3600.0
-
-    def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
-        d["wall_clock_hours"] = self.wall_clock_hours
-        return d
-
-    def describe(self) -> str:
-        """One-line human summary; the figure is exactly ``$/hr x h``."""
-        cap = " (wall-capped)" if self.wall_capped else ""
-        return (
-            f"{self.model_id} {self.method.upper()} x{self.steps} steps -> "
-            f"${self.total_usd:.2f} (${self.gpu_hourly_usd:.2f}/hr x {self.wall_clock_hours:.2f}h{cap}) "
-            f"on {self.gpu}@{self.provider}"
-        )
 
     def breakdown(self) -> str:
         """Multi-line itemized breakdown for CLI output."""

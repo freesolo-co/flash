@@ -1,7 +1,4 @@
-"""Cost estimator: the ``CostEstimate`` result type (breakdown, serialization).
-
-No network.
-"""
+"""Cost estimator: the ``CostEstimate`` result type (breakdown, provider). No network."""
 
 from __future__ import annotations
 
@@ -25,24 +22,6 @@ def test_is_frozen(est):
 
 def test_wall_clock_hours_derivation(est):
     assert est.wall_clock_hours == pytest.approx(est.wall_clock_seconds / 3600.0)
-
-
-def test_to_dict_round_trip(est):
-    d = est.to_dict()
-    assert d["model_id"] == est.model_id
-    assert d["total_usd"] == est.total_usd
-    assert d["wall_clock_hours"] == pytest.approx(est.wall_clock_hours)
-    # to_dict must be JSON-serializable (notes is a tuple -> list).
-    import json
-
-    json.loads(json.dumps(d))
-
-
-def test_describe_contains_key_facts(est):
-    line = est.describe()
-    assert est.gpu in line
-    assert f"${est.total_usd:.2f}" in line
-    assert est.method.upper() in line
 
 
 def test_breakdown_lists_every_term(est):

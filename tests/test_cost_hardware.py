@@ -65,22 +65,6 @@ def test_pick_gpu_pin_honored_only_when_it_fits():
     assert pick_gpu(40, pin="RTX 4090") == "A100 PCIe"
 
 
-def test_pick_gpu_pin_must_fit_false_honors_recorded_card_over_vram_gate():
-    # Grading a MEASURED run: the pin is the card the run demonstrably ran on, so a too-small
-    # VRAM estimate must NOT drop it for a cheaper/larger class -- pin_must_fit=False honors
-    # the recorded card. (Forward default still escalates: that's the test above.) Concretely,
-    # the RTX 5090 (32 GB) is kept at a 35 GB requirement instead of falling to a 48 GB card.
-    assert gpu_vram_gb("RTX 5090") < 35
-    assert pick_gpu(35, pin="RTX 5090", pin_must_fit=True) != "RTX 5090"  # forward: escalates
-    assert pick_gpu(35, pin="RTX 5090", pin_must_fit=False) == "RTX 5090"  # grading: honored
-    # An alias resolves the same way, and an unknown pin still raises (no silent fallback).
-    assert pick_gpu(35, pin="5090", pin_must_fit=False) == "RTX 5090"
-    with pytest.raises(UnsupportedGpuError):
-        pick_gpu(35, pin="Tesla T4", pin_must_fit=False)
-    # A policy sentinel is never a card to force, so it auto-selects even with pin_must_fit=False.
-    assert pick_gpu(12, pin="auto", pin_must_fit=False) == "RTX A5000"
-
-
 def test_pick_gpu_allow_unvalidated_widens_pool():
     # The unvalidated RTX 2000 Ada ($0.24, 16 GB) undercuts the validated A5000 ($0.27).
     assert pick_gpu(12, allow_unvalidated=True) == "RTX 2000 Ada"

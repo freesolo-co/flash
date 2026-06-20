@@ -31,9 +31,9 @@ SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
 
-# Model-FLOPs utilization: fraction of peak the run sustains. Jointly calibrated (with
-# cold-start below) against the measured wall clock of the real runs (_data/measured_runs.json)
-# by minimizing median cost APE. LoRA + small batches sit well below dense-pretraining MFU.
+# Model-FLOPs utilization: fraction of peak the run sustains. Calibrated (with cold-start
+# below) against real RunPod/Vast wall-clock measurements. LoRA + small batches sit well
+# below dense-pretraining MFU.
 MFU_TRAIN = 0.35  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences -> less efficient)
 MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
@@ -80,7 +80,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_TRAIN)
     # ceil() waves: a partial final wave still occupies the slots for a whole latency.
-    latency = reward_seconds_per_completion(n.environment, n.reward_seconds_per_completion)
+    latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
     reward_s = math.ceil(completions / REWARD_CONCURRENCY) * latency
     return gen_s + reward_s + update_s
 
@@ -125,12 +125,8 @@ def _offline_open_model_vram_gb(config: RunConfig) -> int | None:
     return need
 
 
-def select_gpu(config: RunConfig, *, pin_must_fit: bool = True) -> tuple[str, int]:
-    """(chosen GPU class, required VRAM GB) for the run, offline/deterministic.
-
-    ``pin_must_fit=False`` (calibration grader) prices a measured run on the card it actually
-    ran on even when the offline VRAM heuristic over-estimates (see ``pick_gpu``).
-    """
+def select_gpu(config: RunConfig) -> tuple[str, int]:
+    """(chosen GPU class, required VRAM GB) for the run, offline/deterministic."""
     need = _offline_open_model_vram_gb(config)
     if need is None:
         need = required_vram_gb(
@@ -143,7 +139,6 @@ def select_gpu(config: RunConfig, *, pin_must_fit: bool = True) -> tuple[str, in
         pin=config.gpu,
         provider=config.provider,
         allow_unvalidated=unvalidated_allowed(config.allow_unvalidated),
-        pin_must_fit=pin_must_fit,
     )
     return gpu, need
 
@@ -167,7 +162,7 @@ def _notes(
         notes.append(f"{quant}: smaller VRAM footprint -> cheaper GPU class fits")
     if n.is_grpo:
         comps = n.batch_size * n.group_size
-        rsec = reward_seconds_per_completion(n.environment, n.reward_seconds_per_completion)
+        rsec = reward_seconds_per_completion(n.reward_seconds_per_completion)
         notes.append(
             f"GRPO step = vLLM rollout of {n.batch_size}x{n.group_size}={comps} completions "
             f"@ {n.completion_len} tok + reward ({rsec:.2f}s/completion"
@@ -185,15 +180,9 @@ def _notes(
     return tuple(notes)
 
 
-def estimate_cost(
-    config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S, pin_must_fit: bool = True
-) -> CostEstimate:
-    """Deterministic pre-flight cost estimate -- the analytical ground truth.
-
-    ``pin_must_fit=False`` (calibration grader) prices a measured run on the card it actually
-    ran on, so the measured bill isn't compared against a different GPU's price.
-    """
-    gpu, need = select_gpu(config, pin_must_fit=pin_must_fit)
+def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
+    """Deterministic pre-flight cost estimate -- the analytical ground truth."""
+    gpu, need = select_gpu(config)
     hourly = realized_hourly_usd(gpu)  # market (spot/queue) rate runs are billed at
     # The runner enforces max(60, spec.gpu.max_wall_seconds); mirror that floor so a sub-60s cap
     # isn't priced below what the run actually bills (e.g. a zero-dollar estimate).

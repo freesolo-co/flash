@@ -70,8 +70,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["flash"]
-# Ship the PEP 561 marker (type hints) + the measured-run dataset the cost equation grades against.
-artifacts = ["flash/py.typed", "flash/cost/_data/measured_runs.json"]
+# Ship the PEP 561 marker so downstream type checkers pick up Flash's type hints.
+artifacts = ["flash/py.typed"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -188,21 +188,59 @@ def cmd_gpus(args) -> int:
     return 0
 
 
-def cmd_estimate(args) -> int:
-    """Pre-flight USD cost estimate for a run (local: wall-clock hours x market $/hr)."""
-    from flash.cost import RunConfig, estimate_cost
+def _spec_steps(spec) -> int:
+    """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 
-    cfg = RunConfig(
-        args.model,
-        args.method,
-        args.steps,
-        seq_len=args.seq_len,
-        thinking=args.thinking,
-        gpu=args.gpu,
-        environment=args.environment,
+    GRPO carries ``train.steps`` (default recipe num_steps). SFT runs by epochs over a
+    (capped) dataset, so derive steps = ceil(max_examples / batch) x epochs when known.
+    """
+    from flash.engine.recipe import RECIPE
+
+    t = spec.train
+    if t.steps is not None:
+        return max(1, int(t.steps))
+    if spec.algorithm == "grpo":
+        return RECIPE.rl.num_steps
+    cap = int(t.max_steps) if t.max_steps else 0  # SFT-only optimizer-step cap (0 = uncapped)
+    epochs = int(t.epochs) if t.epochs is not None else 1
+    batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
+    if t.max_examples is not None:
+        n = max(1, -(-int(t.max_examples) // max(1, batch)) * epochs)
+    else:
+        n = 100  # last-resort default when the dataset size isn't pinned in the config
+    return min(n, cap) if cap > 0 else n
+
+
+def _runconfig_from_spec(spec):
+    """Map a parsed training ``JobSpec`` to a cost ``RunConfig`` (for ``slm train --estimate``).
+
+    Each seed is its own job that re-pays the cold start (runner.py), so scale both the step
+    count and the setup repeats by the seed count -- the estimate then prices the same total
+    work the run would bill for.
+    """
+    from flash.cost import RunConfig
+
+    t, g = spec.train, spec.gpu
+    is_grpo = spec.algorithm == "grpo"
+    seeds = max(1, len(t.seeds or (0,)))
+    return RunConfig(
+        model_id=spec.model,
+        method=spec.algorithm,
+        steps=_spec_steps(spec) * seeds,
+        setup_repeats=seeds,
+        seq_len=t.max_length,
+        completion_len=t.max_tokens if is_grpo else None,
+        batch_size=t.batch_size,
+        group_size=t.group_size if is_grpo else None,
+        lora_rank=t.lora_rank,
+        thinking=spec.thinking,
+        gpu=g.type,
+        provider=g.provider,
+        allow_unvalidated=g.allow_unvalidated,
+        max_wall_seconds=g.max_wall_seconds,
+        environment=spec.environment.id or None,
+        label=spec.run_id,
     )
-    print(estimate_cost(cfg).breakdown())
-    return 0
 
 
 def cmd_env_init(args) -> int:
@@ -288,6 +326,12 @@ def cmd_train(args) -> int:
         overrides=getattr(args, "overrides", None),
         extra_configs=getattr(args, "extra_configs", None),
     )
+    if getattr(args, "estimate", False):
+        # Fully local pre-flight cost estimate from the config (no credentials/server/GPU).
+        from flash.cost import estimate_cost
+
+        print(estimate_cost(_runconfig_from_spec(spec)).breakdown())
+        return 0
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.
         print(
