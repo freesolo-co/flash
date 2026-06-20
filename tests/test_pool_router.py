@@ -7,8 +7,13 @@ across GPUs, rollout + reward run off the trainer, and per-step weight sync hot-
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from flash.pool.gateway import GatewayError
+from flash.pool.router import Router
+from flash.pool.state import Adapter, Backend, PoolState
 from tests._helpers.pool_harness import build_harness
 
 
@@ -182,3 +187,101 @@ def test_deregister_backend(harness):
         c.delete("/pool/backends/gpu1").raise_for_status()
         snap = c.get("/pool/status").json()
         assert snap["pool"]["summary"]["backends"] == 1
+
+
+# --------------------------------------------------------------------------------------
+# In-process Router tests (fake gateway) for the swap-vs-generate serialization + failed-reload
+# state. These drive Router directly (no loopback) so the concurrency is deterministic.
+# --------------------------------------------------------------------------------------
+class _RecordingGateway:
+    """A fake gateway that records a per-backend event timeline so a test can assert no chat is
+    forwarded to a backend while that backend is mid-(un)load. ``load_lora`` can be made to fail."""
+
+    def __init__(self, *, load_delay: float = 0.0, fail_load_on: set[str] | None = None):
+        self.load_delay = load_delay
+        self.fail_load_on = fail_load_on or set()
+        self.events: list[tuple[str, str, str]] = []  # (backend_id, op, name)
+        self.active_swap: dict[str, int] = {}  # backend_id -> in-progress (un)load count
+        self.chat_during_swap: list[str] = []  # backend_ids where a chat overlapped a swap
+
+    async def unload_lora(self, be, name):
+        self.events.append((be.id, "unload", name))
+        self.active_swap[be.id] = self.active_swap.get(be.id, 0) + 1
+        try:
+            await asyncio.sleep(self.load_delay)
+        finally:
+            self.active_swap[be.id] -= 1
+
+    async def load_lora(self, be, name, uri):
+        self.events.append((be.id, "load", name))
+        if name in self.fail_load_on:
+            raise GatewayError(f"load failed for {name}", status=500)
+        self.active_swap[be.id] = self.active_swap.get(be.id, 0) + 1
+        try:
+            await asyncio.sleep(self.load_delay)
+        finally:
+            self.active_swap[be.id] -= 1
+
+    async def chat(self, be, body):
+        if self.active_swap.get(be.id, 0) > 0:
+            self.chat_during_swap.append(be.id)  # a generate hit a backend mid-swap -> bug
+        self.events.append((be.id, "chat", body.get("model", "")))
+        return {"object": "chat.completion", "choices": [{"message": {"content": "ok"}}]}
+
+    async def completions(self, be, body):
+        return await self.chat(be, body)
+
+    async def aclose(self):
+        pass
+
+
+def _router_with(gw, *, backends, adapter="run", base="Q", replicas=1):
+    state = PoolState()
+    for bid in backends:
+        state.add_backend(Backend(id=bid, url=f"http://{bid}", base_model=base, max_loras=8))
+    r = Router(state, gateway=gw)
+    state.register_adapter(Adapter(name=adapter, base_model=base, uri="/lora/run/v0", replicas=replicas))
+    return r
+
+
+def test_generate_never_overlaps_a_backend_swap():
+    # HIGH: a per-step weight sync (hot-swap) must not race in-flight generates on the SAME backend.
+    # With the per-backend swap guard, a chat is never forwarded to a backend while it is mid
+    # unload/load, even while many generates and a sync run concurrently.
+    gw = _RecordingGateway(load_delay=0.01)
+    r = _router_with(gw, backends=["gpu0", "gpu1"], replicas=2)
+
+    async def scenario():
+        await r.place_adapter("run")  # warm both backends
+        gens = [r.generate({"model": "run", "messages": []}) for _ in range(20)]
+        syncs = [r.sync_adapter("run", f"/lora/run/v{i + 1}") for i in range(4)]
+        await asyncio.gather(*gens, *syncs)
+
+    asyncio.run(scenario())
+    assert gw.chat_during_swap == [], f"a generate overlapped a swap on {gw.chat_during_swap}"
+
+
+def test_sync_failed_reload_marks_backend_unsynced():
+    # MED: if a backend's reload fails (unload ok, load raises), the router must NOT keep treating it
+    # as hosting the adapter — the placement is dropped so tracked state matches vLLM reality.
+    gw = _RecordingGateway(fail_load_on={"run"})
+    r = _router_with(gw, backends=["gpu0"], replicas=1)
+
+    async def scenario():
+        # place it first WITHOUT the failing gateway so it's genuinely loaded...
+        ok_gw = _RecordingGateway()
+        r.gateway = ok_gw
+        await r.place_adapter("run")
+        assert "gpu0" in r.state.adapters["run"].placements
+        # ...now a sync whose load fails must drop the placement.
+        r.gateway = gw
+        return await r.sync_adapter("run", "/lora/run/v1")
+
+    out = asyncio.run(scenario())
+    assert out["reloaded"] == 0
+    assert out["placements"] == 1  # it WAS placed, but the reload failed
+    ad = r.state.adapters["run"]
+    assert "gpu0" not in ad.placements  # placement dropped (no longer marked as having the adapter)
+    assert "run" not in r.state.backends["gpu0"].adapters
+    # and it is NOT reported as a stale-but-present placement (which would imply "still loaded")
+    assert ad.stale_placements() == set()

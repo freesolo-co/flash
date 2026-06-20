@@ -95,6 +95,37 @@ def test_failover_excludes_tried_backend():
     assert {first, second} == {"a", "b"}
 
 
+def test_reregister_with_changed_uri_marks_placements_stale():
+    # Re-registering an adapter whose weight PATH changed must invalidate warm placements (bump the
+    # version) so the router reloads the new weights instead of treating backends as already serving
+    # the new policy.
+    s = _state(Backend(id="a", url="http://a", base_model="Q"))
+    ad = s.register_adapter(Adapter(name="run", base_model="Q", uri="/lora/run/v0"))
+    s.mark_loaded("a", "run")
+    assert ad.stale_placements() == set()  # warm at v0
+    again = s.register_adapter(Adapter(name="run", base_model="Q", uri="/lora/run/v1"))
+    assert again is ad  # same live entry, placements kept
+    assert ad.uri == "/lora/run/v1"
+    assert ad.version == 1  # bumped because the weights changed
+    assert ad.stale_placements() == {"a"}  # backend now flagged for reload
+    # the router's pick will see it as stale -> hot-swap
+    d = s.pick_backend("run")
+    assert d.backend.id == "a"
+    stale = ad.loaded_version.get("a", -1) != ad.version
+    assert stale is True
+
+
+def test_reregister_same_uri_does_not_bump_version():
+    # An idempotent re-register (same uri) must NOT churn a reload — only a real weight change does.
+    s = _state(Backend(id="a", url="http://a", base_model="Q"))
+    ad = s.register_adapter(Adapter(name="run", base_model="Q", uri="/lora/run/v0"))
+    s.mark_loaded("a", "run")
+    s.register_adapter(Adapter(name="run", base_model="Q", uri="/lora/run/v0", replicas=3))
+    assert ad.version == 0
+    assert ad.replicas == 3  # other fields still updated
+    assert ad.stale_placements() == set()
+
+
 def test_weight_version_staleness_tracks_placements():
     s = _state(Backend(id="a", url="http://a", base_model="Q"))
     ad = s.register_adapter(Adapter(name="run", base_model="Q", uri="/run"))

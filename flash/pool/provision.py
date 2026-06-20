@@ -150,12 +150,20 @@ def provision_pool(
     ``/health``, and returns its address. (The live renter lives in the operator CLI so this module
     stays provider-agnostic and unit-testable.)
     """
+    # A live provision MUST actually rent. Failing here (rather than silently taking the dry-run
+    # branch and returning unregistered "(dry-run)" backends) keeps a real provision from looking
+    # like a success while renting nothing.
+    if not dry_run and rent is None:
+        raise ValueError(
+            "provision_pool(dry_run=False) requires a `rent` callable to actually rent + launch "
+            "GPUs; refusing to silently skip renting. Pass rent=... or use dry_run=True."
+        )
     results: list[ProvisionResult] = []
     c = client or httpx.Client(timeout=30.0)
     try:
         for m in plan.members:
             for i in range(m.count):
-                if dry_run or rent is None:
+                if dry_run:
                     results.append(
                         ProvisionResult(
                             base_model=m.base_model,

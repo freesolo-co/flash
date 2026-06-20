@@ -26,6 +26,55 @@ from flash.pool.rewards import NoRewardCapacityError, RewardRegistry, RewardWork
 from flash.pool.state import Adapter, Backend, NoCapacityError, PlacementDecision, PoolState
 
 
+class _BackendSwapGuard:
+    """A per-backend single-writer / many-reader guard that serializes adapter (un)loads against
+    in-flight generations on the SAME backend, while keeping reads concurrent and DIFFERENT backends
+    fully parallel.
+
+    An adapter (un)load is a *writer* (hot-swap / lazy load / eviction): exclusive on that backend so
+    a generate never forwards a request while that backend is mid-swap. A generate is a *reader*:
+    many run at once, but none start (or are in flight) while a swap holds the backend. This is the
+    fix for the "parallel LoRA reload races generate" race — the swap window is no longer observable
+    by a forwarded request on the same backend, yet other backends keep serving.
+    """
+
+    def __init__(self) -> None:
+        self._readers = 0
+        self._writing = False
+        self._writers_waiting = 0  # writer-preference: don't let a stream of reads starve a swap
+        self._cond = asyncio.Condition()
+
+    @contextlib.asynccontextmanager
+    async def read(self) -> AsyncIterator[None]:
+        async with self._cond:
+            # Yield to a writing OR waiting writer so a per-step weight sync can't be starved by a
+            # continuous flow of generations on a hot backend.
+            await self._cond.wait_for(lambda: not self._writing and self._writers_waiting == 0)
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._readers -= 1
+                self._cond.notify_all()
+
+    @contextlib.asynccontextmanager
+    async def write(self) -> AsyncIterator[None]:
+        async with self._cond:
+            self._writers_waiting += 1
+            try:
+                await self._cond.wait_for(lambda: not self._writing and self._readers == 0)
+            finally:
+                self._writers_waiting -= 1
+            self._writing = True
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._writing = False
+                self._cond.notify_all()
+
+
 class Router:
     def __init__(
         self,
@@ -40,6 +89,16 @@ class Router:
         self.rewards = rewards or RewardRegistry()
         self.config = config or RouterConfig()
         self._lock = asyncio.Lock()
+        # Per-backend single-writer/many-reader guards: an adapter (un)load is a writer (exclusive
+        # on that backend), a forwarded generation is a reader. This serializes hot-swaps against
+        # in-flight generations on the SAME backend without serializing across DIFFERENT backends.
+        self._swap_guards: dict[str, _BackendSwapGuard] = {}
+
+    def _guard(self, backend_id: str) -> _BackendSwapGuard:
+        g = self._swap_guards.get(backend_id)
+        if g is None:
+            g = self._swap_guards[backend_id] = _BackendSwapGuard()
+        return g
 
     # ---------- adapter resolution ----------
     async def _resolve(self, model: str) -> tuple[str | None, str]:
@@ -96,26 +155,33 @@ class Router:
                 evict = decision.evict
                 self.state.acquire(be.id, adapter_name)  # reserve the slot before slow IO
 
-            # --- slow IO outside the lock ---
+            # --- slow IO outside the global lock; per-backend swap-guarded ---
+            guard = self._guard(be.id)
             try:
                 if must_load and ad is not None:
-                    if reload_existing:  # hot-swap: vLLM needs an unload before re-loading a name
-                        await self.gateway.unload_lora(be, adapter_name)
+                    # The (un)load is a WRITER on this backend: exclusive, so no generate forwards a
+                    # request to it while it's mid-swap (and no two swaps race each other here).
+                    async with guard.write():
+                        if reload_existing:  # hot-swap: vLLM needs an unload before re-loading a name
+                            await self.gateway.unload_lora(be, adapter_name)
+                            async with self._lock:
+                                self.state.mark_unloaded(be.id, adapter_name)
+                        if evict:
+                            await self.gateway.unload_lora(be, evict)
+                            async with self._lock:
+                                self.state.mark_unloaded(be.id, evict)
+                        await self.gateway.load_lora(be, adapter_name, ad.uri)
                         async with self._lock:
-                            self.state.mark_unloaded(be.id, adapter_name)
-                    if evict:
-                        await self.gateway.unload_lora(be, evict)
-                        async with self._lock:
-                            self.state.mark_unloaded(be.id, evict)
-                    await self.gateway.load_lora(be, adapter_name, ad.uri)
-                    async with self._lock:
-                        self.state.mark_loaded(be.id, adapter_name)
+                            self.state.mark_loaded(be.id, adapter_name)
 
                 payload = dict(body)
                 payload["model"] = adapter_name or base_model
-                resp = await (
-                    self.gateway.chat(be, payload) if kind == "chat" else self.gateway.completions(be, payload)
-                )
+                # Forwarding is a READER: concurrent with other generates, but never overlapping an
+                # adapter swap on this backend (so a request can't hit a half-loaded adapter).
+                async with guard.read():
+                    resp = await (
+                        self.gateway.chat(be, payload) if kind == "chat" else self.gateway.completions(be, payload)
+                    )
                 async with self._lock:
                     self.state.release(be.id)
                 return resp, be.id
@@ -176,7 +242,11 @@ class Router:
 
         This is the per-step GRPO weight transfer: the trainer pushes its updated LoRA, the router
         unloads+reloads it on each placement so the pool serves the fresh policy. Reloads run
-        concurrently; a backend that fails its reload is marked stale (lazy reload on next serve)."""
+        concurrently across DIFFERENT backends but are serialized against in-flight generations on
+        the SAME backend (the per-backend swap guard), so no request hits a half-swapped adapter. A
+        backend whose reload FAILS is recorded as no longer hosting the adapter (its placement is
+        dropped) so the tracked state matches reality — the next serve loads it fresh rather than
+        forwarding to a backend the router wrongly believes is warm."""
         async with self._lock:
             if name not in self.state.adapters:
                 raise NoCapacityError(f"unknown adapter {name!r}")
@@ -185,15 +255,22 @@ class Router:
             version = ad.version
 
         async def _reload(be: Backend) -> bool:
-            try:
-                await self.gateway.unload_lora(be, name)
-                await self.gateway.load_lora(be, name, ad.uri)
-            except GatewayError:
-                return False
-            async with self._lock:
-                cur = self.state.adapters.get(name)
-                if cur is not None and be.id in cur.placements:
-                    cur.loaded_version[be.id] = version
+            # Writer on this backend: exclusive vs generates + other swaps on the same backend.
+            async with self._guard(be.id).write():
+                try:
+                    await self.gateway.unload_lora(be, name)
+                    await self.gateway.load_lora(be, name, ad.uri)
+                except GatewayError:
+                    # The unload likely already removed it (or the load failed): vLLM no longer has
+                    # this adapter on this backend, so drop the placement instead of leaving it
+                    # marked synced/stale-but-present. State now reflects reality.
+                    async with self._lock:
+                        self.state.mark_unloaded(be.id, name)
+                    return False
+                async with self._lock:
+                    cur = self.state.adapters.get(name)
+                    if cur is not None and be.id in cur.placements:
+                        cur.loaded_version[be.id] = version
             return True
 
         results = await asyncio.gather(*[_reload(be) for be in placements]) if placements else []
@@ -208,13 +285,15 @@ class Router:
         for d in decisions:
             be = d.backend
             try:
-                if d.evict:
-                    await self.gateway.unload_lora(be, d.evict)
+                # Writer on this backend: don't race a concurrent generate's load/hot-swap.
+                async with self._guard(be.id).write():
+                    if d.evict:
+                        await self.gateway.unload_lora(be, d.evict)
+                        async with self._lock:
+                            self.state.mark_unloaded(be.id, d.evict)
+                    await self.gateway.load_lora(be, name, ad.uri)
                     async with self._lock:
-                        self.state.mark_unloaded(be.id, d.evict)
-                await self.gateway.load_lora(be, name, ad.uri)
-                async with self._lock:
-                    self.state.mark_loaded(be.id, name)
+                        self.state.mark_loaded(be.id, name)
                 loaded += 1
             except GatewayError:
                 continue

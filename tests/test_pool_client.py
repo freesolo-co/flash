@@ -3,12 +3,13 @@ makes reward latency free (it overlaps the optimizer step instead of costing tra
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
 
-from flash.pool.client import RolloutPoolClient
-from tests._helpers.pool_harness import build_harness
+from flash.pool.client import RolloutPoolClient, ShortCompletionGroupError
+from tests._helpers.pool_harness import build_harness, start_server
 
 
 @pytest.fixture
@@ -122,3 +123,54 @@ def test_reward_latency_does_not_cost_trainer_time():
     finally:
         fast.stop()
         slow.stop()
+
+
+def _producer_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "flash-rollout-producer" and t.is_alive()]
+
+
+def test_experience_stream_producer_stops_on_early_break():
+    # The producer must observe the consumer stopping early and wind down — not keep generating
+    # ahead forever and then block on a full prefetch queue (leaking the thread / wasting rollouts).
+    h = build_harness([{"id": "gpu0", "base_model": "Q", "latency": 0.02}], reward_workers=1)
+    try:
+        with _client(h) as c:
+            c.register(uri="/lora/run/v0", replicas=1)
+            many = [[f"p{i}"] for i in range(200)]  # far more than we'll consume
+            stream = c.experience_stream(many, n=1, prefetch=2, max_concurrency=4)
+            first = next(stream)  # consume exactly one, then abandon
+            assert first.step == 0
+            stream.close()  # consumer goes away (mirrors a `break` out of the for-loop)
+        # the producer thread must be gone (joined) shortly after close
+        deadline = time.monotonic() + 5.0
+        while _producer_threads() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _producer_threads(), "producer thread still alive after consumer stopped"
+        # and it stopped EARLY: it did not generate all 200 batches' worth of rollouts
+        total_chat = len(h.record("gpu0").chat_calls)
+        assert total_chat < 50, f"producer kept generating after stop: {total_chat} chat calls"
+    finally:
+        h.stop()
+
+
+def test_generate_rejects_short_completion_group():
+    # GRPO needs exactly n completions per prompt; a backend returning fewer must raise, not silently
+    # pass a short group into advantage normalization.
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    @app.post("/v1/chat/completions")
+    async def chat(body: dict) -> dict:
+        # Always return ONE choice regardless of the requested n.
+        return {"object": "chat.completion", "choices": [{"message": {"content": "only-one"}}]}
+
+    srv = start_server(app)
+    try:
+        c = RolloutPoolClient(srv.url, adapter="run", base_model="Q")
+        assert c.generate("hi", n=1) == ["only-one"]  # n matches -> fine
+        with pytest.raises(ShortCompletionGroupError):
+            c.generate("hi", n=4)  # asked for 4, got 1 -> error
+        c.close()
+    finally:
+        srv.stop()

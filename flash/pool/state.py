@@ -158,10 +158,17 @@ class PoolState:
     def register_adapter(self, adapter: Adapter) -> Adapter:
         existing = self.adapters.get(adapter.name)
         if existing is not None:
-            # Re-register = update the uri / desired replicas; keep live placements.
+            # Re-register = update the uri / desired replicas; keep live placements. If the weight
+            # path changed, the existing placements now hold STALE files, so bump the version: that
+            # marks every placement stale (``stale_placements``), and the router hot-swaps the new
+            # weights on the next serve (or an explicit sync/place) instead of treating warm
+            # backends as already serving the new policy.
+            weights_changed = existing.uri != adapter.uri
             existing.base_model = adapter.base_model
             existing.uri = adapter.uri
             existing.replicas = adapter.replicas
+            if weights_changed:
+                existing.version += 1
             return existing
         self.adapters[adapter.name] = adapter
         return adapter

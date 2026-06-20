@@ -22,6 +22,7 @@ with a thread pool and a prefetch queue.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import threading
@@ -31,6 +32,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import httpx
+
+
+class ShortCompletionGroupError(RuntimeError):
+    """The pool returned fewer completions than the requested group size ``n``.
+
+    GRPO needs exactly ``n`` samples per prompt to form a group (advantage normalization divides by
+    the group). A short/empty group would silently misalign rewards and skew the baseline, so the
+    client refuses it rather than passing it downstream."""
 
 
 @dataclass
@@ -144,7 +153,15 @@ class RolloutPoolClient:
         r = self._client.post(f"{self.base_url}/v1/chat/completions", json=body)
         r.raise_for_status()
         data = r.json()
-        return [c["message"]["content"] for c in data.get("choices", [])]
+        outs = [c["message"]["content"] for c in data.get("choices", [])]
+        # GRPO expects exactly ``n`` completions per prompt; a short/empty group would silently
+        # misalign rewards and skew advantage normalization. Fail loudly instead.
+        if len(outs) != n:
+            raise ShortCompletionGroupError(
+                f"requested n={n} completions but the pool returned {len(outs)} "
+                f"for model {body['model']!r}"
+            )
+        return outs
 
     def score(
         self,
@@ -185,21 +202,37 @@ class RolloutPoolClient:
         q: queue.Queue = queue.Queue(maxsize=max(1, prefetch))
         sentinel = object()
         err_box: list[BaseException] = []
+        # Set by the consumer when it stops early (break / exception / GC of the generator). The
+        # producer observes it and winds down promptly instead of generating ahead forever and then
+        # blocking on a full prefetch queue that nobody is draining.
+        stop = threading.Event()
+
+        def _gen_one(p):
+            if stop.is_set():  # don't start new rollouts once the consumer has gone away
+                return None
+            return self.generate(p, n=n, max_tokens=max_tokens, temperature=temperature, extra=gen_extra)
+
+        def _put(item) -> bool:
+            # Bounded put that re-checks ``stop`` so an abandoned full queue never deadlocks us.
+            while not stop.is_set():
+                try:
+                    q.put(item, timeout=0.2)
+                    return True
+                except queue.Full:
+                    continue
+            return False
 
         def _produce() -> None:
             try:
                 with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
                     for step, batch in enumerate(batches):
+                        if stop.is_set():
+                            break
                         prompts = list(batch)
                         t0 = time.monotonic()
-                        completions = list(
-                            pool.map(
-                                lambda p: self.generate(
-                                    p, n=n, max_tokens=max_tokens, temperature=temperature, extra=gen_extra
-                                ),
-                                prompts,
-                            )
-                        )
+                        completions = list(pool.map(_gen_one, prompts))
+                        if stop.is_set():  # consumer left mid-batch; drop the partial work
+                            break
                         gen_s = time.monotonic() - t0
                         t1 = time.monotonic()
                         rewards = (
@@ -208,7 +241,7 @@ class RolloutPoolClient:
                             else self._score_groups(prompts, completions)
                         )
                         score_s = time.monotonic() - t1
-                        q.put(
+                        if not _put(
                             Experience(
                                 step=step,
                                 prompts=prompts,
@@ -217,20 +250,38 @@ class RolloutPoolClient:
                                 gen_seconds=gen_s,
                                 score_seconds=score_s,
                             )
-                        )
+                        ):
+                            break  # stop requested while waiting on a full queue
             except BaseException as e:
                 err_box.append(e)
             finally:
-                q.put(sentinel)
+                # Deliver the end sentinel. On normal exhaustion / producer error the consumer is
+                # still reading, so block until it lands (a dropped sentinel would hang the consumer
+                # on a full queue). If the consumer already stopped, it isn't reading — a
+                # best-effort non-blocking put is enough (and avoids blocking on its full queue).
+                if stop.is_set():
+                    with contextlib.suppress(queue.Full):
+                        q.put_nowait(sentinel)
+                else:
+                    q.put(sentinel)
 
         thread = threading.Thread(target=_produce, name="flash-rollout-producer", daemon=True)
         thread.start()
-        while True:
-            item = q.get()
-            if item is sentinel:
-                break
-            yield item
-        thread.join()
+        try:
+            while True:
+                item = q.get()
+                if item is sentinel:
+                    break
+                yield item
+        finally:
+            # Runs on normal exhaustion AND on early stop (consumer break -> GeneratorExit, or an
+            # exception). Signal the producer, drain any pending item so a blocked _put can proceed,
+            # then join so the thread (and its ThreadPoolExecutor) is torn down — no leak.
+            stop.set()
+            with contextlib.suppress(queue.Empty):
+                while True:
+                    q.get_nowait()
+            thread.join(timeout=30.0)
         if err_box:
             raise err_box[0]
 

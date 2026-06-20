@@ -3,6 +3,8 @@ fake-renter that registers backends with a real router."""
 
 from __future__ import annotations
 
+import pytest
+
 from flash.pool.config import PoolMember, PoolPlan
 from flash.pool.provision import (
     build_vllm_serve_command,
@@ -43,6 +45,14 @@ def test_provision_dry_run_does_not_rent():
     results = provision_pool(plan, "http://router", dry_run=True)
     assert len(results) == 2
     assert all(not r.registered and r.url == "(dry-run)" for r in results)
+
+
+def test_provision_live_without_rent_raises():
+    # A live provision (dry_run=False) with no `rent` callable must fail loudly rather than silently
+    # taking the dry-run path and returning unregistered "(dry-run)" backends that look like success.
+    plan = PoolPlan(members=[PoolMember(base_model="Q", gpu="RTX5090", count=2)])
+    with pytest.raises(ValueError, match="rent"):
+        provision_pool(plan, "http://router", dry_run=False)
 
 
 def test_provision_with_fake_renter_registers_backends():
