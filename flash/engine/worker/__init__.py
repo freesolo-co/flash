@@ -1075,7 +1075,7 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
 
 def rl_per_device_comps(
     completion_len: int = 0,
-    vocab: int = 152_000,
+    vocab: int | None = None,
     *,
     use_vllm: bool = True,
     params_b: float | None = None,
@@ -1083,9 +1083,11 @@ def rl_per_device_comps(
     """Per-device *completion* micro-batch for GRPO (TRL counts completions, not prompts).
 
     This, not grad-accum, sets peak trainer VRAM: the logprob pass materializes fp32 logits
-    of shape [per_device, completion_len, vocab]. At Qwen's ~152k vocab a long completion is
-    enormous (measured: per_device 8 x 4096 tok x 152k x 4 B = ~20 GiB single alloc -> OOMs
-    a small card). So we MEMORY-CAP per_device to a logits budget (6 GB) for the
+    of shape [per_device, completion_len, vocab]. The cap is exact physics, so `vocab` must be
+    the model's real value (callers pass it; default falls back to VOCAB_FALLBACK only when it
+    can't be read). At Qwen3.5/3.6's ~248k vocab a long completion is enormous (per_device
+    8 x 4096 tok x 248k x 4 B = ~32 GiB single alloc -> OOMs a small card). So we MEMORY-CAP
+    per_device to a logits budget (6 GB) for the
     given completion length, then push the difference into grad-accum
     (compute_grpo_batching) so the effective batch is unchanged. This keeps long-completion
     GRPO on a cheaper GPU.
@@ -1102,8 +1104,10 @@ def rl_per_device_comps(
     # Default prompts/step; the auto-caps below (logits budget + colocate VRAM/width) handle OOM.
     base = 2 if THINKING else 8
     if completion_len > 0:
+        from flash.engine.vram import VOCAB_FALLBACK
+
         budget = 6.0 * 1e9
-        cap = max(1, int(budget / (max(1, completion_len) * vocab * 4)))
+        cap = max(1, int(budget / (max(1, completion_len) * (vocab or VOCAB_FALLBACK) * 4)))
         base = min(base, cap)
     if use_vllm:
         try:
@@ -1567,7 +1571,7 @@ def run_rl():
     # the global completion batch = prompts_per_step * group_size, i.e. each optimizer step
     # actually optimizes `prompts_per_step` prompts. The per-device *completion* micro-batch
     # is the VRAM knob (thinking-aware; see rl_per_device_comps).
-    from flash.engine.vram import fetch_hf_params_b, params_b_from_str
+    from flash.engine.vram import fetch_hf_params_b, fetch_hf_vocab_size, params_b_from_str
 
     _params_b = params_b_from_str(getattr(_info, "params", None)) if _info else None
     # Open-model (uncataloged) GRPO: _info carries no param count, so size the colocate
@@ -1576,7 +1580,13 @@ def run_rl():
     # a per-device cap -> colocate OOM. Best-effort: stays None offline, keeping prior behavior.
     if _params_b is None:
         _params_b = fetch_hf_params_b(model_id)
-    per_device_comps = rl_per_device_comps(_max_completion, use_vllm=use_vllm, params_b=_params_b)
+    # The fp32-logits cap scales with the model's REAL vocab (Qwen3.5/3.6 are ~248k, not the
+    # old ~152k); read it from the model's config so a large-vocab model isn't under-capped
+    # into a logits OOM. Best-effort: None falls back to VOCAB_FALLBACK inside the cap.
+    _vocab = fetch_hf_vocab_size(model_id)
+    per_device_comps = rl_per_device_comps(
+        _max_completion, vocab=_vocab, use_vllm=use_vllm, params_b=_params_b
+    )
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
         print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")

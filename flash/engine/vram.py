@@ -77,7 +77,12 @@ _TRAIN_COEF = 0.27
 # MEASURED at the default group_size=8: 0.8B GRPO OOMs a 20 GB card; 2B GRPO OOMs a 24 GB card
 # (-> both need 32); 4B GRPO fits 32 (param est ~31 already clears this floor, so it's untouched).
 _VLLM_COLOCATE_FLOOR_GB = 28.0
-_VOCAB_DEFAULT = 152_000  # Qwen3.x tokenizer vocab (drives the fp32-logits GRPO term)
+# Conservative fallback for the fp32-logits GRPO term, used ONLY when the model's real
+# vocab_size can't be read. Callers that have the model pass its actual vocab instead
+# (see fetch_hf_vocab_size / rl_per_device_comps). This is deliberately high: the natively
+# multimodal Qwen3.5/3.6 tokenizer is ~248k (not the ~152k of the old text-only Qwen), so a
+# stale low constant under-budgets the logits and risks OOM — over-budgeting only over-provisions.
+VOCAB_FALLBACK = 256_000
 # Matches the worker's logits budget (6 GB): the per-device fp32 logits are capped to this
 # (rl_per_device_comps spills the rest into grad-accum), so the estimator never reserves above it.
 _LOGITS_BUDGET_GB = 6.0
@@ -141,6 +146,7 @@ def estimate_vram_gb(
     group_size: int = 8,
     thinking: bool = False,
     use_vllm: bool = True,
+    vocab: int | None = None,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU, over the full knob matrix.
 
@@ -180,7 +186,7 @@ def estimate_vram_gb(
         # max_tokens (NOT seq_len) and is capped at the budget. completion defaults to the recipe
         # budget (~min(seq_len, 1024)) when max_tokens is unset.
         completion = max_tokens if max_tokens else min(seq_len, 1024)
-        logits = min(completion * _VOCAB_DEFAULT * 4 / 1e9, _LOGITS_BUDGET_GB)
+        logits = min(completion * (vocab or VOCAB_FALLBACK) * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
         return base + max(rollout, train)
     # SFT: the activation peak is the worker's per-device micro-batch (capped at 4),
@@ -342,6 +348,37 @@ def fetch_hf_params_b(model_id: str) -> float | None:
         # to None so callers report "size unknown" rather than failing.
         pass
     return None
+
+
+def fetch_hf_vocab_size(model_id: str) -> int | None:
+    """The model's real ``vocab_size`` from its HF ``config.json`` (no weight download).
+
+    This is the width of the fp32 logits tensor that drives GRPO memory, so it must be the
+    model's actual value — e.g. natively-multimodal Qwen3.5/3.6 are ~248k, well above the
+    ~152k of older text-only Qwen. Best-effort: returns None offline / when unreadable, so
+    callers fall back to the conservative VOCAB_FALLBACK.
+    """
+    if os.environ.get("FLASH_SKIP_NET"):
+        return None
+    try:
+        import json
+
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(model_id, "config.json", token=os.environ.get("HF_TOKEN"))
+        with open(path) as f:
+            cfg = json.load(f)
+        vocab = cfg.get("vocab_size")
+        # Multimodal configs may nest the LM config under text_config/llm_config etc.
+        if not vocab:
+            for sub in ("text_config", "llm_config", "language_config", "thinker_config"):
+                vocab = (cfg.get(sub) or {}).get("vocab_size")
+                if vocab:
+                    break
+        return int(vocab) if vocab else None
+    except Exception:
+        # Best-effort probe (network / private repo / odd config); fall through to None.
+        return None
 
 
 def check_fit(

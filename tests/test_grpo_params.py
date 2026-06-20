@@ -358,6 +358,34 @@ def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
     assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 2
 
 
+def test_rl_per_device_cap_uses_real_vocab(monkeypatch) -> None:
+    """The logits cap scales with the model's REAL vocab, not a stale constant. A larger vocab
+    (natively-multimodal Qwen3.5/3.6 ~248k vs the old text-only ~152k) caps per_device tighter
+    -- exactly the OOM the old hardcoded 152k masked. And vocab=None must fall back to the
+    conservative VOCAB_FALLBACK, NOT the old 152k."""
+    from flash.engine.vram import VOCAB_FALLBACK
+    from flash.engine.worker import rl_per_device_comps
+
+    monkeypatch.delenv("THINKING", raising=False)
+    # Same completion length: the larger real vocab forces a smaller per-device micro-batch.
+    small_vocab = rl_per_device_comps(2048, vocab=152_000, use_vllm=True)
+    real_vocab = rl_per_device_comps(2048, vocab=248_320, use_vllm=True)  # Qwen3.5/3.6
+    assert real_vocab < small_vocab  # under-counting vocab over-sizes per_device -> logits OOM
+    # The default (vocab=None) must not behave like the old 152k: VOCAB_FALLBACK is conservative,
+    # so the default caps at least as tight as the real Qwen3.5/3.6 vocab.
+    assert VOCAB_FALLBACK >= 248_320
+    assert rl_per_device_comps(2048, use_vllm=True) <= real_vocab
+
+
+def test_fetch_hf_vocab_size_is_offline_safe(monkeypatch) -> None:
+    """fetch_hf_vocab_size is a best-effort probe: under FLASH_SKIP_NET it makes no network call
+    and returns None, so callers fall back to VOCAB_FALLBACK."""
+    from flash.engine.vram import fetch_hf_vocab_size
+
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
+    assert fetch_hf_vocab_size("Qwen/Qwen3.5-4B") is None
+
+
 def test_optimizer_knob_validation_rejects_bad_values() -> None:
     # schema is the server's 400 layer: nonsensical/malformed knobs must raise
     # ConfigError at parse time, not TypeError (500) or a silently-misbehaving worker.
