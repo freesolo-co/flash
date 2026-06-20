@@ -1,0 +1,41 @@
+name: Notify freesolo to bump submodule
+
+# On every push to flash `main`, ping the freesolo repo so it advances its `flash`
+# submodule gitlink to the new tip. freesolo listens for this via a
+# `repository_dispatch` of type `flash-main-updated` (see freesolo's
+# bump-flash-submodule.yml), which opens/updates a PR into freesolo `dev`.
+#
+# Requires a `FREESOLO_GITHUB_PAT` secret in THIS repo (or an org secret shared with
+# it) that has write access to freesolo-co/freesolo. If it is missing, the step fails
+# loudly — but freesolo's scheduled fallback still catches the change within ~30 min.
+#
+# NOTE: `push` workflows run using the file as it exists on the pushed branch, so this
+# only takes effect once it is on `main` (promoted dev -> main).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notify-freesolo-submodule-bump
+  cancel-in-progress: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch flash-main-updated to freesolo
+        env:
+          GH_TOKEN: ${{ secrets.FREESOLO_GITHUB_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::FREESOLO_GITHUB_PAT is not set in this repo; cannot notify freesolo. Add it as a repo or org secret with write access to freesolo-co/freesolo."
+            exit 1
+          fi
+          gh api -X POST repos/freesolo-co/freesolo/dispatches \
+            -f event_type=flash-main-updated \
+            -f "client_payload[flash_sha]=${GITHUB_SHA}"
