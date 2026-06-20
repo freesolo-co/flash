@@ -152,6 +152,11 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                 tar.extract(member, dest)  # validated -> extract this member's payload now
     except tarfile.TarError as exc:
         raise EnvPublishError(f"env package is not a valid .tar.gz archive: {exc}") from exc
+    except OSError as exc:
+        # A malformed archive can still fail extraction at the filesystem layer — e.g. a file/dir
+        # name collision (member "a" as a file, then "a/b") or an unwritable path. That's bad client
+        # input, not a server fault, so surface it as a 400 rather than letting it bubble as a 500.
+        raise EnvPublishError(f"env package could not be extracted: {exc}") from exc
 
 
 def _slug_from(env_dir: Path, output: str, *, pushed_name: str | None = None) -> str | None:
@@ -258,6 +263,12 @@ def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> 
     owner (the managed Prime account) and the namespace are SERVER-controlled — never taken from the
     uploaded package — so one identity cannot publish into another's slug.
     """
+    # The payload is arbitrary client JSON, so these can arrive as non-strings (e.g. {"name": 1});
+    # validate types up front so malformed input is a clean 400, not a 500 from `.lower()`/`len()`.
+    if not isinstance(name, str):
+        raise EnvPublishError("env name must be a string")
+    if not isinstance(package_b64, str):
+        raise EnvPublishError("env package must be a base64 string")
     if not name:
         raise EnvPublishError("missing env name")
     # Reject an oversized upload BEFORE decoding it all into memory. base64 expands ~4/3, so the

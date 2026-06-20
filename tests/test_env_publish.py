@@ -254,6 +254,37 @@ def _tar_with_members(count: int) -> bytes:
     return buf.getvalue()
 
 
+def test_publish_rejects_non_string_inputs(monkeypatch):
+    # The payload is arbitrary client JSON: a non-string name/package must be a clean 400, not a 500
+    # from `.lower()` / `len()` on a non-string.
+    monkeypatch.setattr(envs, "_prime_push", lambda *a, **k: "x/y")
+    with pytest.raises(envs.EnvPublishError, match="name must be a string") as ei:
+        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name=1, is_new=True, key={})
+    assert ei.value.status == 400
+    with pytest.raises(envs.EnvPublishError, match="package must be a base64 string") as ei2:
+        envs.publish_package(package_b64=123, name="e", is_new=True, key={})
+    assert ei2.value.status == 400
+
+
+def test_safe_extract_rejects_filesystem_collision(tmp_path):
+    # A malformed archive that names "a" as a file and then "a/b" (a file/dir collision) fails at the
+    # filesystem layer with OSError during extract — that's bad client input, so it must surface as a
+    # 400 EnvPublishError, not bubble out as a 500.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = b"x"
+        a = tarfile.TarInfo("a")
+        a.size = len(data)
+        tar.addfile(a, io.BytesIO(data))  # "a" is a regular file
+        b = tarfile.TarInfo("a/b")  # ...now treat "a" as a directory -> collision on extract
+        b.size = len(data)
+        tar.addfile(b, io.BytesIO(data))
+    with pytest.raises(envs.EnvPublishError) as ei:
+        envs._safe_extract(buf.getvalue(), tmp_path)
+    assert ei.value.status == 400
+    assert "could not be extracted" in str(ei.value)
+
+
 def test_safe_extract_rejects_non_tar_input(tmp_path):
     # A non-tar / non-gzip / truncated upload must surface as a client error (400 EnvPublishError),
     # not an uncaught tarfile.ReadError bubbling out as a 500.
