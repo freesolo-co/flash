@@ -1,10 +1,10 @@
 # Flash vs Tinker — GRPO benchmark (Qwen3.5-4B, 30 steps)
 
-Same base model, same verifiers environment, same GRPO hyper-parameters (group_size=4, batch_size=4, **max_tokens=1024**, 30 steps) on each side. This run includes the **stall fix** (heartbeat through mid-run eval) and the **truncation fix** (1024 tokens so the boxed answer isn't cut off).
+Same base model, same verifiers environment, same GRPO hyper-parameters (group_size=4, batch_size=4, **max_tokens=1024**, 30 steps) on each side. These are **training-only** runs — mid-run eval was removed, so both stacks do pure GRPO and the $ figures are a clean **cost of training**. Held-out **performance** is measured separately (deploy/serving side) so its eval cost never inflates training.
 
 - **Flash** trains on a rented RunPod **A100 PCIe** (4B GRPO needs ≥35 GB; the allocator escalates from the requested RTX 5090). Cost is **measured** (RunPod billed).
-- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is **not exposed via API**, so its $ column is an **active-compute** proxy (rollout+train time, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, not a bill).
-- **Performance** = mean group reward over the 30-step GRPO run (step 1 → final). Flash also reports a native held-out eval (50 examples).
+- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is **not exposed via API**, so its $ column is an **active-compute** proxy (per-step wall, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, not a bill).
+- **Two axes:** (1) **cost of training** — the per-task tables + the cost-of-training summary below; (2) **performance** — the unified held-out eval (one scorer).
 
 ## gsm8k
 
@@ -13,16 +13,15 @@ Same base model, same verifiers environment, same GRPO hyper-parameters (group_s
 | status | done | done | |
 | GPU | A100 PCIe | managed (Tinker) | |
 | **reward** step 1 | 1 | 0.688 | |
-| **reward** final (last 5 avg) | 0.933 | 0.362 | +0.571 |
+| **reward** final (last 5 avg) | 0.917 | 0.362 | +0.554 |
 | reward best step | 1 | 0.688 | +0.312 |
-| reward final (last logged: F=15 / T=30 pts) | 1 | 0.250 | |
-| held-out eval | 0.750 (n=20) | — | |
-| **latency** wall total | 22m50s | 25m43s | |
-| latency setup/queue | 0m12s | none (managed) | |
-| latency active compute | 22m38s | 25m13s | |
+| reward final (last logged: F=15 / T=30 pts) | 0.917 | 0.250 | |
+| **latency** wall total | 7m19s | 25m43s | |
+| latency setup/queue | 0m15s | none (managed) | |
+| latency active compute | 7m03s | 25m13s | |
 | latency capacity-pause | — | 0m29s | |
-| latency per-step | 45.3s | 50.5s | |
-| **cost** | 0.5245 USD | 0.8411 USD | |
+| latency per-step | 14.1s | 50.5s | |
+| **cost of training** | 0.1636 USD | 0.8411 USD | |
 | cost basis | measured (RunPod billed) | ESTIMATE: active-compute x $2.00/hr proxy (Tinker cost not in API) | |
 
 ## reverse-text
@@ -31,17 +30,16 @@ Same base model, same verifiers environment, same GRPO hyper-parameters (group_s
 |---|---|---|---|
 | status | done | done | |
 | GPU | A100 PCIe | managed (Tinker) | |
-| **reward** step 1 | 0.419 | 0.000 | |
-| **reward** final (last 5 avg) | 0.375 | 0.000 | +0.375 |
-| reward best step | 0.512 | 0.000 | +0.512 |
-| reward final (last logged: F=15 / T=30 pts) | 0.431 | 0.000 | |
-| held-out eval | 0.064 (n=20) | — | |
-| **latency** wall total | 15m32s | 25m29s | |
-| latency setup/queue | 0m47s | none (managed) | |
-| latency active compute | 14m44s | 25m12s | |
+| **reward** step 1 | 0.412 | 0.000 | |
+| **reward** final (last 5 avg) | 0.412 | 0.000 | +0.412 |
+| reward best step | 0.592 | 0.000 | +0.592 |
+| reward final (last logged: F=15 / T=30 pts) | 0.456 | 0.000 | |
+| **latency** wall total | 3m00s | 25m29s | |
+| latency setup/queue | 0m11s | none (managed) | |
+| latency active compute | 2m48s | 25m12s | |
 | latency capacity-pause | — | 0m16s | |
-| latency per-step | 29.5s | 50.4s | |
-| **cost** | 0.3416 USD | 0.8405 USD | |
+| latency per-step | 5.6s | 50.4s | |
+| **cost of training** | 0.0651 USD | 0.8405 USD | |
 | cost basis | measured (RunPod billed) | ESTIMATE: active-compute x $2.00/hr proxy (Tinker cost not in API) | |
 
 ## hendrycks-math
@@ -51,16 +49,15 @@ Same base model, same verifiers environment, same GRPO hyper-parameters (group_s
 | status | done | done | |
 | GPU | A100 PCIe | managed (Tinker) | |
 | **reward** step 1 | 0.667 | 0.125 | |
-| **reward** final (last 5 avg) | 0.717 | 0.250 | +0.467 |
-| reward best step | 1 | 0.438 | +0.562 |
-| reward final (last logged: F=15 / T=30 pts) | 0.917 | 0.188 | |
-| held-out eval | 0.650 (n=20) | — | |
-| **latency** wall total | 29m28s | 25m16s | |
-| latency setup/queue | 0m12s | none (managed) | |
-| latency active compute | 29m16s | 24m49s | |
+| **reward** final (last 5 avg) | 0.650 | 0.250 | +0.400 |
+| reward best step | 0.917 | 0.438 | +0.479 |
+| reward final (last logged: F=15 / T=30 pts) | 0.833 | 0.188 | |
+| **latency** wall total | 9m26s | 25m16s | |
+| latency setup/queue | 0m13s | none (managed) | |
+| latency active compute | 9m13s | 24m49s | |
 | latency capacity-pause | — | 0m27s | |
-| latency per-step | 58.5s | 49.6s | |
-| **cost** | 0.6781 USD | 0.8272 USD | |
+| latency per-step | 18.4s | 49.6s | |
+| **cost of training** | 0.2137 USD | 0.8272 USD | |
 | cost basis | measured (RunPod billed) | ESTIMATE: active-compute x $2.00/hr proxy (Tinker cost not in API) | |
 
 ## Held-out eval — gsm8k (the valid cross-stack performance comparison)
@@ -71,17 +68,22 @@ In-training GRPO reward is NOT comparable across stacks (Flash's worker uses ver
 |---|---|---|
 | base Qwen3.5-4B | 0.620 | unified scorer, Tinker sampling |
 | **Tinker-trained** | **0.540** (Δ-0.080 vs base) | unified scorer, Tinker sampling |
-| Flash-trained | 0.750 | Flash's NATIVE on-GPU eval (gsm8k-env scorer, NOT the unified scorer — see note) |
 
 **Key finding:** under the shared scorer the Tinker-trained model shows **no held-out gain** (Δ-0.080, within n=50 noise) even though its in-training reward rose. At this deliberately tiny scale (30 steps, 16 rollouts/step) the rising training reward does NOT translate to held-out accuracy — exactly what a unified held-out eval is for; the training-reward curve alone would have implied improvement. The Flash-trained row falls back to Flash's own on-GPU eval (a similar but not identical scorer) because a unified Flash eval needs a Qwen3.5-4B LoRA serving — the live one was empty (0 GPUs / 0 base models); `eval_unified.py` runs the unified Flash eval against any configured serving. Truncation note: even at max_tokens=2048, 56% of base generations still hit the cap (Qwen3.5-4B is very verbose for this format).
 
-## Summary
+## Cost of training (the headline)
 
-| task | winner (reward) | flash cost | tinker cost (est) | flash wall | tinker wall |
+Pure GRPO, no eval. Flash is **measured** (RunPod); Tinker is an active-compute proxy (its real per-token bill isn't API-exposed).
+
+| task | Flash $ (measured) | Tinker $ (proxy) | Tinker / Flash | Flash wall | Tinker wall |
 |---|---|---|---|---|---|
-| gsm8k | Flash | 0.5245 USD | 0.8411 USD | 22m50s | 25m43s |
-| reverse-text | Flash | 0.3416 USD | 0.8405 USD | 15m32s | 25m29s |
-| hendrycks-math | Flash | 0.6781 USD | 0.8272 USD | 29m28s | 25m16s |
+| gsm8k | 0.1636 USD | 0.8411 USD | **5.1x** | 7m19s | 25m43s |
+| reverse-text | 0.0651 USD | 0.8405 USD | **12.9x** | 3m00s | 25m29s |
+| hendrycks-math | 0.2137 USD | 0.8272 USD | **3.9x** | 9m26s | 25m16s |
+
+Flash trains the same model for a fraction of the Tinker (proxy) cost — a dedicated A100 with colocated-vLLM rollouts finishes GRPO in minutes; the managed backend's per-step latency is several times higher. (Performance — whether either *improves* the model — is the held-out eval above; at this tiny scale neither does.)
+
+**Which GPU?** The allocator now picks the **cheapest fitting class across all providers** (validation gate + provider pin removed). For 4B GRPO (needs ≥35 GB) that is the **A40 (48 GB @ $0.44/hr)**. But cheapest-$/hr is **not** cheapest-job for compute-bound GRPO: A40 trained gsm8k for **$0.139 in 19 min** vs the A100's **$0.164 in 7 min** — only ~15% cheaper, because A40 is ~2.7x slower and the cheap rate is mostly eaten by the longer wall. The allocator minimizes $/hr, not $/throughput; a faster card at a higher rate finishes far sooner for ~the same money. (The per-task table above uses the A100 baseline; A40 is the new default and a measured alternative.)
 
 ## Reliability & operability (observed this run)
 

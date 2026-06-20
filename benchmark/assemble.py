@@ -363,6 +363,15 @@ def render_markdown(records: dict) -> str:
                  "A100 with colocated-vLLM rollouts finishes GRPO in minutes; the managed backend's "
                  "per-step latency is several times higher. (Performance — whether either *improves* the "
                  "model — is the held-out eval above; at this tiny scale neither does.)\n")
+    lines.append("**Which GPU?** The allocator now picks the **cheapest fitting class across all "
+                 "providers** (validation gate + provider pin removed). For 4B GRPO (needs ≥35 GB) that "
+                 "is the **A40 (48 GB @ $0.44/hr)**. But cheapest-$/hr is **not** cheapest-job for "
+                 "compute-bound GRPO: A40 trained gsm8k for **$0.139 in 19 min** vs the A100's "
+                 "**$0.164 in 7 min** — only ~15% cheaper, because A40 is ~2.7x slower and the cheap "
+                 "rate is mostly eaten by the longer wall. The allocator minimizes $/hr, not "
+                 "$/throughput; a faster card at a higher rate finishes far sooner for ~the same money. "
+                 "(The per-task table above uses the A100 baseline; A40 is the new default and a "
+                 "measured alternative.)\n")
 
     lines.append("## Reliability & operability (observed this run)\n")
     lines.append("- **Flash** rents a GPU per run. 4B GRPO needs ≥35 GB → the allocator escalates "
