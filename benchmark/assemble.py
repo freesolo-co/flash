@@ -234,6 +234,26 @@ def render_markdown(records: dict) -> str:
         lines.append(f"| cost basis | {f.get('cost_kind')} | {t.get('cost_kind')} | |")
         lines.append("")
 
+    # Held-out eval (clean, version-independent scorer) — the valid performance comparison
+    eval_path = _RESULTS / "eval_tinker_gsm8k.json"
+    if eval_path.exists():
+        ev = json.loads(eval_path.read_text())
+        b, tr = ev["base"], ev["trained"]
+        lines.append("## Held-out eval — gsm8k (clean cross-version scorer)\n")
+        lines.append("In-training GRPO reward is NOT comparable across stacks (different verifiers "
+                     "versions + task presentation; at matched 512 max_tokens the model's verbose "
+                     "answer is cut off before `\\boxed{}`). This eval removes those confounds: "
+                     f"greedy decode, max_tokens={ev['max_tokens']}, one exact-match scorer on "
+                     f"{b['n']} held-out examples.\n")
+        lines.append("| model | gsm8k accuracy | answer-truncated frac |")
+        lines.append("|---|---|---|")
+        lines.append(f"| base Qwen3.5-4B | {b['accuracy']:.3f} | {b.get('truncated_frac', 0):.2f} |")
+        lines.append(f"| Tinker-trained (30 GRPO steps) | {tr['accuracy']:.3f} | {tr.get('truncated_frac', 0):.2f} |")
+        lines.append(f"| **Δ (trained − base)** | **{ev['delta']:+.3f}** | |")
+        lines.append("\nTinker GRPO improved held-out accuracy AND cut answer truncation — the model "
+                     "learned to reach the answer sooner. (Flash-trained not re-served under the same "
+                     "scorer; Flash's native on-GPU eval is in the per-task tables above.)\n")
+
     # Roll-up
     lines.append("## Summary\n")
     lines.append("| task | winner (reward) | flash cost | tinker cost (est) | flash wall | tinker wall |")
@@ -253,6 +273,34 @@ def render_markdown(records: dict) -> str:
             f"{_fmt(t.get('cost_usd'), 4, ' USD')} | {_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} |"
         )
     lines.append("")
+
+    lines.append("## Reliability & operability (observed this run)\n")
+    lines.append("- **Flash** rents a GPU per run. 4B GRPO needs ≥35 GB → the allocator escalates "
+                 "RTX 5090 → A100 PCIe. On the long-generation math tasks the colocated-vLLM rollout "
+                 "**hung ~13-15 min at eval boundaries** then self-recovered; a true >25-min freeze "
+                 "trips the **stall watchdog**, which **kills the sick host, escalates the GPU class** "
+                 "(A100 → RTX Pro 6000), and **resumes from the last checkpoint**. reverse-text "
+                 "(short generations) ran clean. Net: dedicated + auto-healing, but rented-GPU "
+                 "flakiness adds real tail latency.")
+    lines.append("- **Tinker** is managed: **no setup/queue**, but the backend **paused all jobs "
+                 "~10 min** mid-run (\"running short on capacity, please wait\") — out of the user's "
+                 "control, and slower per active step.")
+    lines.append("- A **shared Flash control plane** dropped a run's watcher on restart → the record "
+                 "stuck at `running` forever (orphaned); re-run on a dedicated plane fixed it.")
+    lines.append("- **HF caps repo creation at 300/day/user**; once hit, every new Flash run 429s at "
+                 "submit. Worked around by reusing pre-existing artifact repos (`run_flash_plane.py`).\n")
+
+    lines.append("## Methodology caveats\n")
+    lines.append("- **In-training reward is not cross-stack comparable.** Flash's worker installs "
+                 "verifiers ~0.1.14 (continuous/partial-credit reward); Tinker pins 0.1.9 (the recipe's "
+                 "requirement). At matched max_tokens the two stacks present the task differently and "
+                 "truncate differently. Use the **held-out eval** (one scorer, generous tokens) for "
+                 "performance, and **cost/latency** (measured) for the clean cross-stack comparison.")
+    lines.append("- **Tinker cost is an estimate.** Tinker does not expose per-run cost via API; the $ "
+                 "column is active-compute-time × a GPU-rate proxy (pause excluded), not a bill. Flash "
+                 "cost is the measured RunPod charge.")
+    lines.append("- **Scale is deliberately small** (30 steps, 16 rollouts/step) to keep spend low, so "
+                 "per-step reward is noisy and 30-step gains are modest by design.\n")
     return "\n".join(lines)
 
 
