@@ -1,6 +1,7 @@
-"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the
-`flash` CLI and consumes its run-id / run-state / metrics outputs. This asserts that
-the flash side of that seam still provides what the agent depends on.
+"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the CLI —
+it invokes `slm`, the deprecated alias of `flash` (same entrypoint, kept for back-compat) —
+and consumes its run-id / run-state / metrics outputs. This asserts that the flash side of
+that seam still provides what the agent depends on.
 
 The agent package lives in a sibling folder (../agent/src) that is NOT installed in
 the flash venv, so we add it to sys.path here (mirroring how the existing
@@ -139,7 +140,7 @@ def test_new_run_id_format_is_filesystem_safe_and_stable() -> None:
 
 
 def test_agent_tracker_run_id_round_trips_through_resolver(tmp_path: Path) -> None:
-    """End-to-end of the run-id seam: an flash run id written into the agent's
+    """End-to-end of the run-id seam: a flash run id written into the agent's
     progress.json tracker (as best_run_id) must be read back unchanged by the agent's
     resolve_training_run_id, and reflected into the summary JSON. This is exactly the
     flow `flash train` -> tracker -> agent output uses, so a change to either the id
