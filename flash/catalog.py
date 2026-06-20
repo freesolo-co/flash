@@ -24,6 +24,14 @@ def normalize_algorithm(value: str) -> str:
 # recommended_gpu field default.
 DEFAULT_GPU = "RTX 5090"
 
+# Output vocab (== config.vocab_size, the lm_head / logits width — the PADDED model vocab,
+# NOT the raw tokenizer token count). Sizes the GRPO fp32-logits VRAM term (engine.vram) and
+# the per-device completion cap (engine.worker.rl_per_device_comps). This is the open-model
+# fallback; curated per-model values live on each ModelInfo below and are read via
+# vocab_size_for(). Over-estimating is the memory-SAFE direction (smaller cap, larger VRAM
+# estimate), so the fallback is the largest catalog vocab.
+_DEFAULT_VOCAB_SIZE = 248_320
+
 
 @dataclass(frozen=True)
 class ModelInfo:
@@ -52,6 +60,10 @@ class ModelInfo:
     #             so `thinking = true` is required
     #   "unknown" open-model-policy entries (capability not verified)
     thinking: str = "none"
+    # Output vocab = config.vocab_size (lm_head / logits width, the padded model vocab — not
+    # the raw tokenizer count). Drives the GRPO fp32-logits memory term and the per-device
+    # completion cap. Curated per model below; defaults to the open-model fallback.
+    vocab_size: int = _DEFAULT_VOCAB_SIZE
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -67,6 +79,7 @@ MODELS: dict[str, ModelInfo] = {
         id="openbmb/MiniCPM5-1B",
         display_name="MiniCPM5 1B",
         params="1.2B dense (Llama arch)",
+        vocab_size=130_560,
         algos=("sft", "grpo"),
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
@@ -82,6 +95,7 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.5-0.8B",
         display_name="Qwen3.5 0.8B",
         params="0.9B (text-only fine-tune)",
+        vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=12,
         recommended_gpu="RTX 4090",
@@ -92,6 +106,7 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.5-2B",
         display_name="Qwen3.5 2B",
         params="2.3B (text-only fine-tune)",
+        vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=16,
         recommended_gpu="RTX 4090",
@@ -101,6 +116,7 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.5-4B",
         display_name="Qwen3.5 4B",
         params="4.7B (text-only fine-tune)",
+        vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=32,
         recommended_gpu="RTX 5090",
@@ -112,6 +128,7 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.5-9B",
         display_name="Qwen3.5 9B",
         params="9.7B (text-only fine-tune)",
+        vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=16,
         # MEMORY-OPTIMIZED: 4-bit NF4 frozen base + bf16 LoRA adapter (QLoRA). The base
@@ -145,6 +162,15 @@ def get_model(model_id: str) -> ModelInfo:
             f'model_policy = "allow" in the config to run any HF model that fits the GPU '
             f"(open-model policy)"
         ) from exc
+
+
+def vocab_size_for(model_id: str) -> int:
+    """Output vocab (== config.vocab_size, the lm_head / logits width) for a model — the
+    number that sizes the GRPO fp32-logits VRAM term and the per-device completion cap.
+    Returns the curated catalog value, else the safe default for open-model-policy entries.
+    This is the PADDED model vocab, not the raw tokenizer token count."""
+    info = MODELS.get(model_id)
+    return info.vocab_size if info is not None else _DEFAULT_VOCAB_SIZE
 
 
 def resolve_model(
