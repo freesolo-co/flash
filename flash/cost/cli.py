@@ -15,7 +15,7 @@ import sys
 
 from .analytical import estimate_cost
 from .calibration import environment_cost_sweep, verify_accuracy
-from .config import RunConfig
+from .types import RunConfig
 
 
 def _cmd_estimate(args: argparse.Namespace) -> int:

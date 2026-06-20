@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from flash.catalog import MODELS
-from flash.cost.model_specs import (
+from flash.cost.facts import (
     DEFAULT_PARAMS_B,
     active_params_b,
     download_weight_gb,

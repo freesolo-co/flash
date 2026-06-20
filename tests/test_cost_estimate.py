@@ -10,7 +10,7 @@ import dataclasses
 import pytest
 
 from flash.cost import RunConfig, estimate_cost
-from flash.cost.estimate import CostEstimate
+from flash.cost.types import CostEstimate
 
 
 @pytest.fixture

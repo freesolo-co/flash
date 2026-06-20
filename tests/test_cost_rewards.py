@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from flash.cost import RunConfig, estimate_cost, seconds_per_step
-from flash.cost.rewards import REWARD_TIERS, reward_seconds_per_completion
+from flash.cost.facts import REWARD_TIERS, reward_seconds_per_completion
 
 
 def test_override_wins_and_clamps():

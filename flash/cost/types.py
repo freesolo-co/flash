@@ -1,15 +1,9 @@
-"""The estimator's input: a ``RunConfig`` plus recipe-default knob resolution.
-
-A ``RunConfig`` is the small, dependency-free description of a training run the
-estimator prices. Any knob left ``None`` is filled from the frozen ``flash`` recipe
-(``engine.recipe.RECIPE``) according to the method, exactly as a real run would
-default it -- so an estimate for ``RunConfig(model_id, "grpo", steps=150)`` uses the
-same group size / completion budget the worker would.
-"""
+"""The estimator's I/O types: ``RunConfig`` (input) and ``CostEstimate`` (result)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from typing import Any
 
 from flash.catalog import normalize_algorithm
 from flash.engine.recipe import RECIPE
@@ -143,3 +137,76 @@ class RunConfig:
         if n.group_size is not None:
             knobs["group_size"] = n.group_size
         return knobs
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    """A pre-flight training-cost estimate for one run.
+
+    All seconds are wall-clock; ``total_usd`` is the headline figure
+    (``wall_clock_hours * gpu_hourly_usd``).
+    """
+
+    # --- the run this estimate is for (echoed for traceability) ---
+    model_id: str
+    method: str  # "sft" | "grpo"
+    steps: int
+
+    # --- chosen hardware ---
+    gpu: str
+    provider: str
+    gpu_vram_gb: int
+    required_vram_gb: int
+    gpu_hourly_usd: float
+
+    # --- timing breakdown (seconds) ---
+    setup_seconds: float  # cold start: boot + deps + model download (+ vLLM init for GRPO)
+    seconds_per_step: float  # steady-state per optimizer step
+    train_seconds: float  # steps * seconds_per_step (post wall-clock cap)
+    wall_clock_seconds: float  # setup + train
+    wall_capped: bool  # True if train_seconds was clamped to the run's wall-clock cap
+
+    # --- money: wall-clock hours x market $/hr, first-principles, no output adjustment ---
+    total_usd: float
+
+    # --- free-form notes (assumptions, GRPO rollout split, MoE active params, …) ---
+    notes: tuple[str, ...] = ()
+
+    @property
+    def wall_clock_hours(self) -> float:
+        return self.wall_clock_seconds / 3600.0
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["wall_clock_hours"] = self.wall_clock_hours
+        return d
+
+    def describe(self) -> str:
+        """One-line human summary. The figure is exactly ``$/hr x h`` -- no adjustment."""
+        cap = " (wall-capped)" if self.wall_capped else ""
+        return (
+            f"{self.model_id} {self.method.upper()} x{self.steps} steps -> "
+            f"${self.total_usd:.2f} (${self.gpu_hourly_usd:.2f}/hr x {self.wall_clock_hours:.2f}h{cap}) "
+            f"on {self.gpu}@{self.provider}"
+        )
+
+    def breakdown(self) -> str:
+        """Multi-line itemized breakdown, suitable for CLI output."""
+        lines = [
+            f"Run        : {self.model_id}  [{self.method.upper()}, {self.steps} steps]",
+            f"GPU        : {self.gpu} on {self.provider} "
+            f"({self.gpu_vram_gb} GB; run needs >= {self.required_vram_gb} GB) "
+            f"@ ${self.gpu_hourly_usd:.2f}/hr",
+            f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + download"
+            + (" + vLLM init" if self.method == "grpo" else "")
+            + ")",
+            f"Per step   : {self.seconds_per_step:.2f} s",
+            f"Train      : {self.train_seconds / 60:.1f} min"
+            + ("  [CAPPED at the wall-clock limit]" if self.wall_capped else ""),
+            f"Wall clock : {self.wall_clock_hours:.2f} h",
+            f"TOTAL      : ${self.total_usd:.2f}",
+        ]
+        if self.notes:
+            lines.append("Notes      :")
+            lines.extend(f"  - {n}" for n in self.notes)
+        return "\n".join(lines)

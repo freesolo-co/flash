@@ -18,8 +18,8 @@ from flash.cost import (
     fit_constants,
     verify_accuracy,
 )
-from flash.cost.estimate import CostEstimate
-from flash.cost.hardware import gpu_hourly_usd, realized_hourly_usd
+from flash.cost.facts import gpu_hourly_usd, realized_hourly_usd
+from flash.cost.types import CostEstimate
 
 
 def test_no_output_multiplier_field():
@@ -95,7 +95,7 @@ def test_measured_rows_graded_on_the_gpu_they_actually_ran_on():
 
 def test_fit_constants_realized_rates_match_hardcoded():
     """The realized $/hr the equation prices at must track the measured billing data."""
-    from flash.cost.hardware import REALIZED_HOURLY_USD
+    from flash.cost.facts import REALIZED_HOURLY_USD
 
     fit = fit_constants()["realized_hourly_usd"]
     for cls, rate in REALIZED_HOURLY_USD.items():

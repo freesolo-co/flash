@@ -8,13 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.cost.hardware import (
-    GPU_COMPUTE_TFLOPS,
-    gpu_hourly_usd,
-    gpu_tflops,
-    gpu_vram_gb,
-    pick_gpu,
-)
+from flash.cost.facts import GPU_COMPUTE_TFLOPS, gpu_hourly_usd, gpu_tflops, gpu_vram_gb, pick_gpu
 from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
 
 

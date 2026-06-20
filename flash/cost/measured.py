@@ -19,8 +19,7 @@ from typing import Any
 
 from flash.engine.recipe import RECIPE
 
-from .config import RunConfig
-from .estimate import CostEstimate
+from .types import CostEstimate, RunConfig
 
 # A function returning the ground-truth cost for a run (``measured_ground_truth_fn``
 # builds one). Inlined here so the calculation/calibration path carries no dependency on

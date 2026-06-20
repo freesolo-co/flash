@@ -21,11 +21,18 @@ import math
 from flash.providers.allocator import required_vram_gb, vram_headroom
 from flash.providers.base import unvalidated_allowed
 
-from .config import RunConfig
-from .estimate import CostEstimate
-from .hardware import gpu_tflops, gpu_vram_gb, pick_gpu, realized_hourly_usd
-from .model_specs import active_params_b, download_weight_gb, model_quant, total_params_b
-from .rewards import reward_seconds_per_completion
+from .facts import (
+    active_params_b,
+    download_weight_gb,
+    gpu_tflops,
+    gpu_vram_gb,
+    model_quant,
+    pick_gpu,
+    realized_hourly_usd,
+    reward_seconds_per_completion,
+    total_params_b,
+)
+from .types import CostEstimate, RunConfig
 
 # --- compute model (FLOPs per token per active-parameter) ---
 SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
@@ -121,11 +128,7 @@ def _offline_open_model_vram_gb(config: RunConfig) -> int | None:
     import os
 
     from flash.catalog import MODELS
-    from flash.engine.vram import (
-        estimate_vram_gb,
-        fetch_hf_params_b,
-        grpo_seq_escalation_gb,
-    )
+    from flash.engine.vram import estimate_vram_gb, fetch_hf_params_b, grpo_seq_escalation_gb
 
     # Only the advertised offline mode (FLASH_SKIP_NET) sizes from the parsed id. A transient
     # HF/network failure must NOT silently switch strategy: the allocator still uses its flat 24 GB

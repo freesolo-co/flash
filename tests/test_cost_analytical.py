@@ -159,7 +159,7 @@ def test_wall_cap_is_applied_per_seed_not_to_the_aggregate():
 def test_allow_unvalidated_widens_gpu_selection():
     # When the spec permits unvalidated classes, GPU selection mirrors the allocator's
     # widened pool: an unvalidated class can be picked when it's the cheapest that fits.
-    from flash.cost.hardware import pick_gpu
+    from flash.cost.facts import pick_gpu
 
     cfg_strict = RunConfig(MID, "sft", 100, allow_unvalidated=False)
     cfg_open = RunConfig(MID, "sft", 100, allow_unvalidated=True)
@@ -179,7 +179,7 @@ def test_unspecified_allow_unvalidated_resolves_like_submit_time(monkeypatch):
     # now -- ``unvalidated_allowed`` honors the per-run flag only, with NO global env override --
     # so an unspecified (None) flag resolves to the validated-only pool regardless of any
     # FLASH_GPU_ALLOW_UNVALIDATED in the environment.
-    from flash.cost.hardware import pick_gpu
+    from flash.cost.facts import pick_gpu
     from flash.providers.base import unvalidated_allowed
 
     cfg_unspecified = RunConfig(MID, "sft", 100)  # allow_unvalidated defaults to None

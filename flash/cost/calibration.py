@@ -32,10 +32,8 @@ import statistics as st
 from pathlib import Path
 
 from .analytical import estimate_cost
-from .config import RunConfig
-from .estimate import CostEstimate
-from .hardware import gpu_tflops
-from .rewards import reward_seconds_per_completion
+from .facts import gpu_tflops, reward_seconds_per_completion
+from .types import CostEstimate, RunConfig
 
 # The measured-run dataset the equation is calibrated + graded against. In a source
 # checkout it lives at the repo root (next to its generator and the accuracy report); in an
