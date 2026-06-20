@@ -85,37 +85,53 @@ def test_best_is_max():
 # assemble: tinker active-compute parsing (pause excluded) + collect_tinker
 # --------------------------------------------------------------------------- #
 
-def test_active_compute_sums_rollout_and_train_only(tmp_path):
-    # One paused step (huge save_checkpoint) must NOT inflate active compute: only rollout+train.
-    rows = [
-        {"time/do_group_rollout_and_filter_constant_reward:total": 40.0, "time/train_step": 10.0},
-        {"time/do_group_rollout_and_filter_constant_reward:total": 40.0, "time/train_step": 10.0,
-         "time/save_checkpoint": 1500.0},  # the capacity-pause step — ignored by active compute
-    ]
+def test_pause_detection_flags_only_extreme_steps(tmp_path):
+    # per-step time/total is sequential ~= wall; a >300s step is a capacity pause, not compute.
+    # Normal steps + one 1500s pause step (median of the set is 30) -> pause = 1500 - 30.
+    rows = [{"time/total": 30.0}, {"time/total": 30.0}, {"time/total": 1500.0}]
     (tmp_path / "metrics.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
-    assert assemble._tinker_active_compute_s(str(tmp_path)) == pytest.approx(100.0)
-    assert assemble._tinker_active_compute_s(None) is None
-    assert assemble._tinker_active_compute_s(str(tmp_path / "missing")) is None
+    assert assemble._tinker_pause_s(str(tmp_path)) == pytest.approx(1470.0)
+    # A checkpoint-ish step (217s, < 300s) must NOT be mistaken for a pause.
+    (tmp_path / "metrics.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in [{"time/total": 23.0}, {"time/total": 217.0}])
+    )
+    assert assemble._tinker_pause_s(str(tmp_path)) is None
+    assert assemble._tinker_pause_s(None) is None
+    assert assemble._tinker_pause_s(str(tmp_path / "missing")) is None
 
 
-def test_collect_tinker_uses_active_compute_for_cost_and_splits_pause(tmp_path, monkeypatch):
+def test_collect_tinker_splits_pause_and_costs_active(tmp_path, monkeypatch):
     logp = tmp_path / "log"
     logp.mkdir()
-    (logp / "metrics.jsonl").write_text("\n".join(json.dumps(r) for r in [
-        {"time/do_group_rollout_and_filter_constant_reward:total": 1700.0, "time/train_step": 100.0},
-    ]))
+    # 28 normal 60s steps + one 600s capacity-pause step. median=60 -> pause = 600-60 = 540.
+    rows = [{"time/total": 60.0} for _ in range(28)] + [{"time/total": 600.0}]
+    (logp / "metrics.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
     result = {"platform": "tinker", "status": "done", "steps": 30,
               "reward_history": [0.0, 0.2, 0.4], "wall_s": 2400.0, "log_path": str(logp)}
     (tmp_path / "tinker_gsm8k.json").write_text(json.dumps(result))
     monkeypatch.setattr(assemble, "_RESULTS", tmp_path)
 
     rec = assemble.collect_tinker("gsm8k", "tinker_gsm8k.json")
-    assert rec["train_s"] == pytest.approx(1800.0)          # active compute, not wall
+    assert rec["paused_s"] == pytest.approx(540.0)          # 600 - median(60)
+    assert rec["train_s"] == pytest.approx(1860.0)          # active = wall(2400) - pause(540)
     assert rec["total_s"] == pytest.approx(2400.0)          # wall (incl pause)
-    assert rec["paused_s"] == pytest.approx(600.0)          # 2400 - 1800
     assert rec["final_smoothed"] == pytest.approx(0.2)      # mean of <=5 rewards
-    # cost proxy is on ACTIVE compute, not wall
-    assert rec["cost_usd"] == pytest.approx(1800.0 / 3600 * assemble._TINKER_PROXY_USD_PER_HR)
+    assert rec["cost_usd"] == pytest.approx(round(1860.0 / 3600 * assemble._TINKER_PROXY_USD_PER_HR, 4))
+
+
+def test_collect_tinker_no_pause_costs_full_wall(tmp_path, monkeypatch):
+    logp = tmp_path / "log"
+    logp.mkdir()
+    rows = [{"time/total": 50.0} for _ in range(30)]  # no >300s step
+    (logp / "metrics.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    result = {"status": "done", "steps": 30, "reward_history": [0.3],
+              "wall_s": 1500.0, "log_path": str(logp)}
+    (tmp_path / "tinker_gsm8k.json").write_text(json.dumps(result))
+    monkeypatch.setattr(assemble, "_RESULTS", tmp_path)
+    rec = assemble.collect_tinker("gsm8k", "tinker_gsm8k.json")
+    assert rec["paused_s"] is None
+    assert rec["train_s"] == pytest.approx(1500.0)  # active == wall when no pause
+    assert rec["cost_usd"] == pytest.approx(round(1500.0 / 3600 * assemble._TINKER_PROXY_USD_PER_HR, 4))
 
 
 def test_collect_tinker_pending_when_no_file(tmp_path, monkeypatch):

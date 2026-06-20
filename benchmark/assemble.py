@@ -113,19 +113,25 @@ def collect_flash(task: str, entry: dict, key: str) -> dict:
     }
 
 
-def _tinker_active_compute_s(log_path: str | None) -> float | None:
-    """Sum the real per-step work (rollout + train step) from metrics.jsonl.
+_PAUSE_STEP_S = 300.0  # a step longer than this is a managed-backend capacity pause, not compute
 
-    Tinker's wall-clock includes managed-backend *capacity pauses* (idle, not billed
-    compute), which get absorbed into a checkpoint step's timing. Summing the rollout +
-    train-step times gives the active-compute basis — the fair latency/cost number.
+
+def _tinker_pause_s(log_path: str | None) -> float | None:
+    """Detect managed-backend *capacity pause* time from metrics.jsonl.
+
+    Each row's ``time/total`` is that step's wall time (steps run sequentially, so they sum to
+    the run wall). A normal GRPO step is tens of seconds; a backend pause ("running short on
+    capacity, please wait") shows up as ONE step hundreds-to-thousands of seconds long. We treat
+    the excess of any >``_PAUSE_STEP_S`` step over the median step as idle pause (not billed
+    compute). NB: do NOT sum the concurrent ``rollout:total`` field — overlapping rollouts make
+    it exceed wall-clock.
     """
     if not log_path:
         return None
     mp = pathlib.Path(log_path) / "metrics.jsonl"
     if not mp.exists():
         return None
-    roll = train = 0.0
+    times = []
     for line in mp.read_text().splitlines():
         if not line.strip():
             continue
@@ -133,10 +139,13 @@ def _tinker_active_compute_s(log_path: str | None) -> float | None:
             r = json.loads(line)
         except json.JSONDecodeError:
             continue
-        roll += r.get("time/do_group_rollout_and_filter_constant_reward:total", 0) or 0
-        train += r.get("time/train_step", 0) or 0
-    total = roll + train
-    return total or None
+        if "time/total" in r:
+            times.append(r["time/total"])
+    if not times:
+        return None
+    med = sorted(times)[len(times) // 2]
+    pause = sum(t - med for t in times if t > _PAUSE_STEP_S)
+    return pause or None
 
 
 def collect_tinker(task: str, rel_path: str) -> dict:
@@ -148,11 +157,11 @@ def collect_tinker(task: str, rel_path: str) -> dict:
     rh = d.get("reward_history", []) or []
     wall = d.get("wall_s")
     steps = d.get("steps") or len(rh)
-    active = _tinker_active_compute_s(d.get("log_path"))
-    # Cost proxy on ACTIVE compute (not wall — wall includes unbilled capacity pauses).
-    basis = active if active else wall
-    cost = round((basis or 0) / 3600 * _TINKER_PROXY_USD_PER_HR, 4) if basis else None
-    paused_s = (wall - active) if (wall and active and wall > active) else None
+    paused_s = _tinker_pause_s(d.get("log_path"))
+    # Active compute = wall minus any backend capacity pause (idle, not billed). Cost proxy is
+    # on active compute; latency reports both wall and the pause split.
+    active = (wall - paused_s) if (wall and paused_s) else wall
+    cost = round((active or 0) / 3600 * _TINKER_PROXY_USD_PER_HR, 4) if active else None
     return {
         "platform": "tinker",
         "task": task,
@@ -168,7 +177,7 @@ def collect_tinker(task: str, rel_path: str) -> dict:
         "cost_usd": cost,
         "cost_kind": f"ESTIMATE: active-compute x ${_TINKER_PROXY_USD_PER_HR:.2f}/hr proxy (Tinker cost not in API)",
         "setup_s": None,
-        "train_s": active or wall,        # active compute (rollout+train), pause excluded
+        "train_s": active or wall,        # active compute = wall - capacity pause
         "total_s": wall,                  # full wall, INCLUDING any capacity pause
         "paused_s": paused_s,             # idle time the managed backend paused us
         "per_step_s": ((active or wall) / steps) if ((active or wall) and steps) else None,
