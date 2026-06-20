@@ -12,8 +12,9 @@ That is the SAME billing model the launch banner prints:
     "Pricing (per 1M tokens, charged on actual usage)
        Training: $0.3   Inference Input: $0.1   Inference Output: $0.3"
 
-Unlike Tinker (whose per-run $ is not API-exposed -> the benchmark uses a
-GPU-time proxy), Prime Lab's bill IS exposed: after a run,
+Tinker is estimated from its published per-token rate card (its per-run $ is not
+API-exposed); the old GPU-time proxy ($2/hr) is kept only as a historical
+comparison column. Prime Lab's bill IS exposed: after a run,
 `prime train usage <run_id>` returns the exact token counts and price. We were
 billing-gated (wallet $0), so this script estimates the cost analytically from
 the GRPO config + Prime Lab's confirmed rates. Run the configs in ../primelab/

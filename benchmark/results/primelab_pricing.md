@@ -121,9 +121,11 @@ per-token path is the cost-optimal Prime route at this scale.
   comparison. In-training reward is not cross-stack comparable (verifiers
   version/scoring differences, per the Flash-vs-Tinker writeup); use a unified
   held-out eval for performance, not the reward curve.
-- **Tinker remains a GPU-time proxy** (its per-run $ is not API-exposed); Flash
-  remains a measured RunPod charge. Only Prime Lab's meter is per-token, so the
-  three columns are "best available basis," labelled per cell.
+- **Tinker is priced per-token** via its published rate card (its per-run $ is not
+  API-exposed; the old GPU-time proxy is shown only as a historical comparison
+  column). Flash remains a measured RunPod charge. So Tinker and Prime Lab are both
+  per-token meters and Flash is the measured GPU bill — "best available basis,"
+  labelled per cell.
 - **Scale is deliberately tiny** to keep spend low — which structurally favors
   the per-token meter. The crossover above is the load-bearing caveat for
   generalizing these numbers.
