@@ -803,3 +803,154 @@ def test_eval_via_serving_omits_stop_when_empty(monkeypatch):
     monkeypatch.setattr(eval_unified.urllib.request, "urlopen", _fake_urlopen)
     eval_unified.eval_via_serving(rows, "https://serve.example", "run-x", max_tokens=128, stop=[])
     assert "stop" not in captured["body"]
+
+
+# ===========================================================================
+# PR #20 review (post dev-merge): paused_s 0.0/clamp, 0.0-cost ratio,
+# _flash_api_url env precedence, and the mid-run-eval-removal doc/label fixes.
+# ===========================================================================
+
+# --- Group C: paused_s = max(0, wall-active), recorded even when 0.0 -------------------
+
+def test_collect_tinker_records_zero_pause_not_null(tmp_path, monkeypatch):
+    # active == wall -> a REAL 0.0 pause. It must be recorded as 0.0, not dropped to None
+    # (the old `wall > active` guard made an exact-0 pause null).
+    _write_tinker_result(
+        tmp_path, wall_s=1800.0, active_compute_s=1800.0,
+        cost_usd_estimated=1.0, log_path="/nonexistent",
+    )
+    monkeypatch.setattr(assemble, "_RESULTS", tmp_path)
+    rec = assemble.collect_tinker("gsm8k", "results/tinker_gsm8k.json")
+    assert rec["paused_s"] == 0.0
+
+
+def test_collect_tinker_clamps_negative_pause_and_warns(tmp_path, monkeypatch, capsys):
+    # Anomaly: active > wall (different timing sources). paused must clamp to 0.0 (never
+    # negative / hidden) and the anomaly must be logged, not silently swallowed.
+    _write_tinker_result(
+        tmp_path, wall_s=1000.0, active_compute_s=1200.0,
+        cost_usd_estimated=1.0, log_path="/nonexistent",
+    )
+    monkeypatch.setattr(assemble, "_RESULTS", tmp_path)
+    rec = assemble.collect_tinker("gsm8k", "results/tinker_gsm8k.json")
+    assert rec["paused_s"] == 0.0  # clamped, not -200.0
+    assert "clamping paused_s to 0.0" in capsys.readouterr().out
+
+
+def test_collect_tinker_pause_is_none_only_when_active_missing(tmp_path, monkeypatch):
+    # No active anywhere -> paused genuinely unknown -> None (not 0.0).
+    _write_tinker_result(
+        tmp_path, wall_s=1000.0, active_compute_s=None,
+        cost_usd_estimated=None, log_path="/nonexistent",
+    )
+    monkeypatch.setattr(assemble, "_RESULTS", tmp_path)
+    rec = assemble.collect_tinker("gsm8k", "results/tinker_gsm8k.json")
+    assert rec["paused_s"] is None
+
+
+def test_runner_main_records_zero_pause_not_null(tmp_path, monkeypatch):
+    # End-to-end through the runner: active sums to a positive value EQUAL to wall -> the
+    # written JSON's paused_s is 0.0 (a measured zero pause), never null.
+    log_dir = tmp_path / "logdir"
+    log_dir.mkdir()
+    (log_dir / "metrics.jsonl").write_text(
+        json.dumps({"time/do_group_rollout_and_filter_constant_reward:total": 80.0,
+                    "time/train_step": 40.0, "env/all/reward/total": 0.5}) + "\n"
+    )
+    out = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv",
+                        ["tinker_runner.py", "--log-path", str(log_dir), "--output", str(out)])
+    async def _fake_run(_args):
+        return {"wall_s": 120.0}  # equals active (80+40) -> 0.0 pause
+    monkeypatch.setattr(tinker_runner, "_run", _fake_run)
+    tinker_runner.main()
+    written = json.loads(out.read_text())
+    assert written["paused_s"] == 0.0
+
+
+# --- Group C: cost ratio guards on `is not None`, handles 0.0 Flash denominator --------
+
+def test_cost_ratio_shows_when_flash_cost_is_zero():
+    # A legit measured Flash cost of 0.0 must NOT be treated as "missing" (—); a 0.0
+    # denominator can't form a finite multiple, so show ∞ rather than dropping the row.
+    recs = _records_for_md(0.0)
+    recs["gsm8k"]["flash"]["cost_usd"] = 0.0   # real measured zero
+    recs["gsm8k"]["tinker"]["cost_usd"] = 1.0
+    md = assemble.render_markdown(recs)
+    # The gsm8k cost-of-training row carries the ∞ marker, not a bare "—".
+    row = next(ln for ln in md.splitlines() if ln.startswith("| gsm8k |"))
+    assert "∞ (Flash $0)" in row
+
+
+def test_cost_ratio_dash_only_when_value_absent():
+    recs = _records_for_md(None)
+    recs["gsm8k"]["flash"]["cost_usd"] = None   # genuinely missing
+    recs["gsm8k"]["tinker"]["cost_usd"] = 1.0
+    md = assemble.render_markdown(recs)
+    row = next(ln for ln in md.splitlines() if ln.startswith("| gsm8k |"))
+    # absent value -> "—" in the ratio column (the 4th pipe-cell)
+    assert row.split("|")[4].strip() == "—"
+
+
+# --- Group D: _flash_api_url prefers FLASH_API_URL over ~/.flash/config.json ----------
+
+def test_flash_api_url_env_overrides_config_file(monkeypatch, tmp_path):
+    # A config file exists with one url, but the env var must win (env-over-configfile,
+    # mirroring _flash_api_key). Point HOME at a dir that HAS a config.json.
+    home = tmp_path / "home"
+    (home / ".flash").mkdir(parents=True)
+    (home / ".flash" / "config.json").write_text(json.dumps({"api_url": "http://from-config:9999"}))
+    monkeypatch.setattr(flash_runner.pathlib.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setenv("FLASH_API_URL", "http://from-env:8085")
+    assert flash_runner._flash_api_url() == "http://from-env:8085"
+
+
+def test_flash_api_url_falls_back_to_config_then_default(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    (home / ".flash").mkdir(parents=True)
+    (home / ".flash" / "config.json").write_text(json.dumps({"api_url": "http://from-config:9999"}))
+    monkeypatch.setattr(flash_runner.pathlib.Path, "home", staticmethod(lambda: home))
+    monkeypatch.delenv("FLASH_API_URL", raising=False)
+    assert flash_runner._flash_api_url() == "http://from-config:9999"
+    # No env, no config file -> the baked-in default.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(flash_runner.pathlib.Path, "home", staticmethod(lambda: empty))
+    assert flash_runner._flash_api_url() == "https://flash.freesolo.co"
+
+
+# --- Group B: mid-run-eval removal reflected in labels / generated markdown ------------
+
+def test_bench_table_has_no_held_out_eval_reward_row():
+    # The "Eval reward (held-out)" row is gone (mid-run eval removed); it's replaced by a
+    # pointer to the serving-side eval_unified.py, never implying a held-out metric is
+    # collected during training.
+    flash = {"status": "done", "steps": 30, "first_train_reward": 0.1,
+             "final_train_reward": 0.2, "final_eval_reward": None, "reward_history": [0.1]}
+    tinker = dict(flash)
+    bench._print_table(flash, tinker)  # must not raise
+    # The label assembled in the rows uses the new wording.
+    src = pathlib.Path(bench.__file__).read_text()
+    assert "Eval reward (held-out)" not in src
+    assert "Held-out eval" in src
+    assert "eval_unified.py" in src
+
+
+def test_render_markdown_verdict_has_no_on_gpu_eval_claim():
+    # The verdict must not claim a fallback to "Flash's own on-GPU eval" (that eval was
+    # removed). With no serving-side flash eval present, the Flash-trained row is absent.
+    recs = _records_for_md(0.0)
+    md = assemble.render_markdown(recs)
+    assert "on-GPU eval" not in md
+    assert "NATIVE on-GPU" not in md
+
+
+def test_render_markdown_gpu_prose_derived_from_records():
+    # The GPU narrative must be DERIVED from the records (here A100 PCIe), never a hardcoded
+    # contradicting GPU/cost story (the old text asserted an A40 default with $0.139/19min).
+    recs = _records_for_md(0.0)  # flash gpu == "A100 PCIe"
+    md = assemble.render_markdown(recs)
+    assert "A100 PCIe" in md
+    assert "$0.139" not in md           # the fabricated A40 number is gone
+    assert "A40 is the new default" not in md
+    assert assemble._flash_gpus_used(recs) == ["A100 PCIe"]

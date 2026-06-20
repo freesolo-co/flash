@@ -313,7 +313,17 @@ def main() -> None:
     wall = timing["wall_s"]
     active = active_compute_s(records)
     basis = active if active is not None else wall
-    paused = (wall - active) if (active is not None and wall > active) else None
+    # paused_s := max(0, wall - active), defined whenever BOTH are known (so a real 0.0 pause is
+    # recorded as 0.0, never null). active should be <= wall post-clamp; if it somehow exceeds
+    # wall (different timing sources), that's a data anomaly — clamp to 0.0 and log it rather
+    # than silently hide a negative pause.
+    if wall is not None and active is not None:
+        if active > wall:
+            print(f"[tinker] anomaly: active_compute ({active:.1f}s) > wall ({wall:.1f}s); "
+                  "clamping paused_s to 0.0")
+        paused = max(0.0, wall - active)
+    else:
+        paused = None
 
     result = {
         "platform": "tinker",

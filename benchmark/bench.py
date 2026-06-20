@@ -190,9 +190,12 @@ def _print_table(flash: dict, tinker: dict, env_id: str = "gsm8k", steps: int = 
         ("Train reward final",
          _fmt_reward(flash.get("final_train_reward")),
          _fmt_reward(tinker.get("final_train_reward"))),
-        ("Eval reward (held-out)",
-         _fmt_reward(flash.get("final_eval_reward")),
-         "N/A (see log)"),
+        # Mid-run (in-worker) held-out eval was removed: these are training-only runs, so
+        # neither side reports a held-out reward here. Held-out PERFORMANCE is measured
+        # separately on the serving side — run eval_unified.py and see comparison.md.
+        ("Held-out eval",
+         "see eval_unified.py",
+         "see eval_unified.py"),
         ("─" * 28, "─" * 22, "─" * 22),
         ("Reward curve (train)",
          _reward_curve_ascii(flash.get("reward_history", [])),

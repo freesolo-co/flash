@@ -80,6 +80,54 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
+# The [gpu] keys the schema actually reads (see the GpuSpec construction below). A key
+# outside this set is either a typo or a since-removed field; either way the value would be
+# silently ignored, so we surface it instead of letting a stale config look honored.
+_GPU_KEYS = (
+    "requested",
+    "type",
+    "disk_gb",
+    "max_wall_seconds",
+    "max_retries",
+    "network_volume",
+    "network_volume_gb",
+    "datacenter",
+)
+# Removed [gpu] knobs: provider/allow_unvalidated are gone — the allocator now always picks
+# the cheapest fitting class across ALL providers (no provider pin, no validation gate), so a
+# config still setting them would be silently ignored and pick different hardware than intended.
+# Reject loudly (matching how [environment] path / eval_env are handled) with what replaced them.
+_GPU_REMOVED = {
+    "provider": (
+        "gpu.provider was removed: the allocator now always picks the cheapest fitting GPU "
+        "class across ALL providers (runpod + vast) — there is no provider pin. Remove it."
+    ),
+    "allow_unvalidated": (
+        "gpu.allow_unvalidated was removed: there is no validation gate anymore (every fitting "
+        "class is eligible; validated_on is informational only). Remove it."
+    ),
+}
+
+
+def _check_gpu_fields(gpu_raw: dict[str, Any]) -> None:
+    """Reject removed [gpu] knobs loudly and warn on otherwise-unknown ones.
+
+    A since-removed or mistyped [gpu] key would be read by none of the GpuSpec lookups below
+    and silently ignored, so the run could provision different hardware than the config asks
+    for. Removed knobs (provider/allow_unvalidated) raise a ConfigError naming what replaced
+    them (the same loud treatment [environment] path / eval_env get); any other unknown key
+    gets a warning (forward-compatible: a future-known key shouldn't hard-fail an old client)."""
+    for key, msg in _GPU_REMOVED.items():
+        if key in gpu_raw:
+            raise ConfigError(msg)
+    unknown = sorted(set(gpu_raw) - set(_GPU_KEYS))
+    if unknown:
+        print(
+            f"warning: [gpu] unknown key(s) ignored: {', '.join(unknown)} "
+            f"(known: {', '.join(_GPU_KEYS)})"
+        )
+
+
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     try:
         model = raw["model"]
@@ -110,6 +158,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         )
     train_raw = raw.get("train") or {}
     gpu_raw = raw.get("gpu") or {}
+    if not isinstance(gpu_raw, dict):
+        raise ConfigError("[gpu] must be a table")
+    _check_gpu_fields(gpu_raw)
 
     # Smart allocation is the default: an omitted gpu.type means "the cheapest GPU
     # (across providers) that fits the model", re-resolved live at submit time. The

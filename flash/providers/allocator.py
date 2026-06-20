@@ -97,13 +97,13 @@ def _vast_candidates(
     pinned_gpu: str | None,
     disk_gb: int,
     exclude_machine_ids,
-    *,
-    required: bool,
 ) -> tuple[list[Candidate], tuple]:
     """Vast's fitting classes from the live offer book (cheapest per class).
 
-    Returns (candidates, full_offer_book). ``required`` (a hard ``provider="vast"``
-    pin) re-raises a search failure; otherwise it degrades to RunPod-only.
+    Returns (candidates, full_offer_book). A Vast offer-search failure is NEVER fatal: it
+    degrades to RunPod-only (and ``allocate`` then escalates a pin or raises only when
+    nothing across any provider fits). There is no hard ``provider="vast"`` pin anymore —
+    the provider pin was removed, so allocation always considers every live provider.
     """
     from flash.providers.base import GPU_INFO
     from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
@@ -123,8 +123,6 @@ def _vast_candidates(
             search_vram, max(float(disk_gb), MIN_DISK_GB), exclude_machine_ids=exclude_machine_ids
         )
     except Exception as exc:
-        if required:
-            raise UnsupportedGpuError(f"vast offer search failed: {exc}") from exc
         logger.warning("vast offer search failed (%s); allocating on runpod only", exc)
     out: list[Candidate] = []
     seen: set[str] = set()
@@ -174,9 +172,7 @@ def allocate(
         if "runpod" in live:
             cands += _runpod_candidates(need, pin)
         if "vast" in live:
-            vcands, book = _vast_candidates(
-                need, pin, disk_gb, exclude_machine_ids, required=False
-            )
+            vcands, book = _vast_candidates(need, pin, disk_gb, exclude_machine_ids)
             cands += vcands
         return cands, book
 

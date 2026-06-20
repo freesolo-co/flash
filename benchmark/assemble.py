@@ -203,7 +203,17 @@ def collect_tinker(task: str, rel_path: str) -> dict:
                 cost = _tinker_cost_from_basis(wall)
     # Latency/per-step basis: active when present (pause excluded), else wall (is not None).
     basis = active if active is not None else wall
-    paused_s = (wall - active) if (wall is not None and active is not None and wall > active) else None
+    # paused_s := max(0, wall - active), set whenever BOTH are known so a real 0.0 pause is
+    # recorded as 0.0 (not null). active should be <= wall (the runner clamps); if a stored
+    # record ever has active > wall (differing timing sources), clamp to 0.0 and warn rather
+    # than encode a negative/hidden pause. Mirrors the runner's paused_s invariant.
+    if wall is not None and active is not None:
+        if active > wall:
+            print(f"warning: {task}: active_compute ({active:.1f}s) > wall ({wall:.1f}s); "
+                  "clamping paused_s to 0.0")
+        paused_s = max(0.0, wall - active)
+    else:
+        paused_s = None
     return {
         "platform": "tinker",
         "task": task,
@@ -264,10 +274,26 @@ def _configured_steps(records: dict) -> int | None:
     return max(vals) if vals else None
 
 
+def _flash_gpus_used(records: dict) -> list[str]:
+    """Distinct Flash GPU classes actually used across the runs (from the records, not
+    hard-coded), in first-seen order. The prose derives its GPU claims from THIS so it can
+    never contradict the per-task tables (e.g. asserting an A40 default while the tables show
+    A100)."""
+    out: list[str] = []
+    for task in TASKS:
+        g = records.get(task, {}).get("flash", {}).get("gpu")
+        if g and g not in out:
+            out.append(g)
+    return out
+
+
 def render_markdown(records: dict) -> str:
     """records: {task: {'flash': rec, 'tinker': rec}}"""
     steps = _configured_steps(records)
     steps_str = str(steps) if steps is not None else "N"
+    # GPU prose is derived from the runs (never hard-coded) so it always agrees with the tables.
+    gpus_used = _flash_gpus_used(records)
+    gpu_phrase = " / ".join(gpus_used) if gpus_used else "the cheapest fitting GPU class"
     lines = []
     lines.append(f"# Flash vs Tinker — GRPO benchmark (Qwen3.5-4B, {steps_str} steps)\n")
     lines.append("Same base model, same verifiers environment, same GRPO hyper-parameters "
@@ -275,8 +301,9 @@ def render_markdown(records: dict) -> str:
                  "These are **training-only** runs — mid-run eval was removed, so both stacks do pure "
                  "GRPO and the $ figures are a clean **cost of training**. Held-out **performance** is "
                  "measured separately (deploy/serving side) so its eval cost never inflates training.\n")
-    lines.append("- **Flash** trains on a rented RunPod **A100 PCIe** (4B GRPO needs ≥35 GB; the "
-                 "allocator escalates from the requested RTX 5090). Cost is **measured** (RunPod billed).")
+    lines.append(f"- **Flash** trains on a rented RunPod GPU — the allocator picks the cheapest "
+                 f"fitting class (4B GRPO needs ≥35 GB); these runs landed on **{gpu_phrase}** (see "
+                 "the per-task GPU rows). Cost is **measured** (RunPod billed).")
     lines.append("- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is "
                  "**not exposed via API**, so its $ column is an **active-compute** proxy "
                  "(per-step wall, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, not a bill).")
@@ -320,7 +347,6 @@ def render_markdown(records: dict) -> str:
         b = ev.get("base", {})
         tr = ev.get("tinker_trained", {})
         ft = ev.get("flash_trained")  # present only if the Flash serving eval ran
-        flash_native = records["gsm8k"]["flash"].get("eval_reward")  # Flash's own on-GPU eval
 
         def _d(rec):  # "Δ+0.080 vs base" suffix
             dd = rec.get("delta_vs_base")
@@ -340,9 +366,6 @@ def render_markdown(records: dict) -> str:
             lines.append(f"| **Tinker-trained** | **{tr['accuracy']:.3f}**{_d(tr)} | unified scorer, Tinker sampling |")
         if ft:
             lines.append(f"| **Flash-trained** | **{ft['accuracy']:.3f}**{_d(ft)} | unified scorer, Flash serving |")
-        elif flash_native is not None:
-            lines.append(f"| Flash-trained | {flash_native:.3f} | Flash's NATIVE on-GPU eval "
-                         "(gsm8k-env scorer, NOT the unified scorer — see note) |")
         tr_delta = tr.get("delta_vs_base") if tr else None
         # Single ±_VERDICT_BAND rule for BOTH the held-out delta and the in-training trend, so the
         # sentence can never say "rose" when the curve is flat/falling. The in-training direction
@@ -367,11 +390,19 @@ def render_markdown(records: dict) -> str:
                        f"noise band); its in-training smoothed reward {train_word} over the run.")
         else:
             verdict = "Under the shared scorer the GRPO-trained model's held-out accuracy moves as shown."
-        lines.append(f"\n{verdict} The Flash-trained row falls back to Flash's own on-GPU eval (a "
-                     "similar but not identical scorer) because a unified Flash eval needs a Qwen3.5-4B "
-                     "LoRA serving — the live one was empty (0 GPUs / 0 base models); `eval_unified.py` "
-                     "runs the unified Flash eval against any configured serving. Truncation note: even "
-                     f"at max_tokens={ev.get('max_tokens')}, {int(b.get('truncated_frac', 0) * 100)}% of "
+        # Mid-run (in-worker) Flash eval was removed, so there is no native on-GPU fallback row.
+        # The Flash-trained row appears ONLY when the serving-side unified eval ran (`ft`); when
+        # it's absent, the Flash serving eval wasn't run for this assembly (run eval_unified.py
+        # against a Qwen3.5-4B LoRA serving to populate it) — we do NOT substitute a different scorer.
+        flash_eval_note = (
+            "The Flash-trained row above is the unified scorer against the Flash serving."
+            if ft else
+            "The Flash-trained row is absent here: mid-run eval was removed, so a Flash held-out "
+            "number requires running `eval_unified.py` against a Qwen3.5-4B LoRA serving (not run "
+            "for this assembly) — we do not substitute a different scorer."
+        )
+        lines.append(f"\n{verdict} {flash_eval_note} Truncation note: even at "
+                     f"max_tokens={ev.get('max_tokens')}, {int(b.get('truncated_frac', 0) * 100)}% of "
                      "base generations still hit the cap (Qwen3.5-4B is very verbose for this format).\n")
 
     # Roll-up — cost of training is the headline (training-only runs).
@@ -384,7 +415,15 @@ def render_markdown(records: dict) -> str:
         f = records[task]["flash"]
         t = records[task]["tinker"]
         fc, tc = f.get("cost_usd"), t.get("cost_usd")
-        ratio = f"**{tc / fc:.1f}x**" if (fc and tc and fc > 0) else "—"
+        # Guard on `is not None` (a legitimate measured 0.0 cost is NOT "missing"): only "—"
+        # when a value is genuinely absent. A true 0.0 Flash denominator can't form a finite
+        # multiple — show "n/a (Flash $0)" instead of silently dropping the row to "—".
+        if fc is None or tc is None:
+            ratio = "—"
+        elif fc == 0:
+            ratio = "∞ (Flash $0)" if tc > 0 else "n/a (both $0)"
+        else:
+            ratio = f"**{tc / fc:.1f}x**"
         lines.append(
             f"| {task} | {_fmt(fc, 4, ' USD')} | {_fmt(tc, 4, ' USD')} | {ratio} | "
             f"{_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} |"
@@ -393,24 +432,23 @@ def render_markdown(records: dict) -> str:
                  "A100 with colocated-vLLM rollouts finishes GRPO in minutes; the managed backend's "
                  "per-step latency is several times higher. (Performance — whether either *improves* the "
                  "model — is the held-out eval above; at this tiny scale neither does.)\n")
-    lines.append("**Which GPU?** The allocator now picks the **cheapest fitting class across all "
-                 "providers** (validation gate + provider pin removed). For 4B GRPO (needs ≥35 GB) that "
-                 "is the **A40 (48 GB @ $0.44/hr)**. But cheapest-$/hr is **not** cheapest-job for "
-                 "compute-bound GRPO: A40 trained gsm8k for **$0.139 in 19 min** vs the A100's "
-                 "**$0.164 in 7 min** — only ~15% cheaper, because A40 is ~2.7x slower and the cheap "
-                 "rate is mostly eaten by the longer wall. The allocator minimizes $/hr, not "
-                 "$/throughput; a faster card at a higher rate finishes far sooner for ~the same money. "
-                 "(The per-task table above uses the A100 baseline; A40 is the new default and a "
-                 "measured alternative.)\n")
+    lines.append(f"**Which GPU?** The allocator picks the **cheapest fitting class across all "
+                 f"providers** (no validation gate, no provider pin). For 4B GRPO (needs ≥35 GB) the "
+                 f"eligible pool is the ≥48 GB cards; these runs landed on **{gpu_phrase}** (the "
+                 "per-task GPU rows above are authoritative). Caveat for compute-bound GRPO: the "
+                 "allocator minimizes **$/hr, not $/throughput**, so a card with the lowest hourly rate "
+                 "is not always the cheapest *job* — a faster card at a higher rate can finish sooner "
+                 "for about the same total spend. Compare the per-task **cost of training** against the "
+                 "**Flash wall** column above to see this trade-off on the actual runs.\n")
 
     lines.append("## Reliability & operability (observed this run)\n")
-    lines.append("- **Flash** rents a GPU per run. 4B GRPO needs ≥35 GB → the allocator escalates "
-                 "RTX 5090 → A100 PCIe. On the long-generation math tasks the colocated-vLLM rollout "
-                 "**hung ~13-15 min at eval boundaries** then self-recovered; a true >25-min freeze "
-                 "trips the **stall watchdog**, which **kills the sick host, escalates the GPU class** "
-                 "(A100 → RTX Pro 6000), and **resumes from the last checkpoint**. reverse-text "
-                 "(short generations) ran clean. Net: dedicated + auto-healing, but rented-GPU "
-                 "flakiness adds real tail latency.")
+    lines.append(f"- **Flash** rents a GPU per run; the allocator picks the cheapest fitting class "
+                 f"(≥35 GB for 4B GRPO), which here was **{gpu_phrase}** (per the GPU rows above). On "
+                 "the long-generation math tasks the colocated-vLLM rollout **hung ~13-15 min at step "
+                 "boundaries** then self-recovered; a true >25-min freeze trips the **stall watchdog**, "
+                 "which **kills the sick host, escalates to the next-larger fitting class, and resumes "
+                 "from the last checkpoint**. reverse-text (short generations) ran clean. Net: "
+                 "dedicated + auto-healing, but rented-GPU flakiness adds real tail latency.")
     lines.append("- **Tinker** is managed: **no setup/queue**, but the backend **paused all jobs "
                  "~10 min** mid-run (\"running short on capacity, please wait\") — out of the user's "
                  "control, and slower per active step.")

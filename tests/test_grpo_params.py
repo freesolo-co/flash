@@ -104,7 +104,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
             "steps": 10,
@@ -209,7 +209,7 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
             "steps": 10,
@@ -237,7 +237,7 @@ def test_hf_repo_per_run_parses_and_validates() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
         "train": {"seeds": [0], "steps": 10, "hf_repo": "myorg/runs"},
     }
     spec = spec_from_dict(raw, run_id="hf-x")
@@ -265,7 +265,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
             "hf_repo": "owner/runs",
@@ -335,7 +335,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
     }
     bad_cases = [
         {"batch_size": 0},  # must be >= 1
@@ -374,7 +374,7 @@ def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
     }
     for bad in ({"steps": 1.5}, {"epochs": 2.5}, {"steps": 0}, {"epochs": -1}):
         with pytest.raises(ConfigError):

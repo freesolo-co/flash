@@ -353,7 +353,12 @@ def cheapest_gpu(min_vram_gb: int) -> str:
     """
     pool = [g for g in GPU_INFO.values() if g.enum_member and g.vram_gb >= min_vram_gb]
     if not pool:
-        raise UnsupportedGpuError(f"no known GPU has >= {min_vram_gb} GB VRAM")
+        # This helper filters to RunPod-provisionable classes (enum_member set) on purpose;
+        # a Vast-only class can still fit. Say so, so the message isn't misleading when a
+        # fitting GPU exists on Vast but not RunPod (the cross-provider allocator may still place it).
+        raise UnsupportedGpuError(
+            f"no RunPod-provisionable GPU class has >= {min_vram_gb} GB VRAM"
+        )
     from flash.providers.runpod.pricing import hourly_rate
 
     return min(pool, key=lambda g: (hourly_rate(g.name), g.vram_gb)).name

@@ -79,7 +79,9 @@ def test_cheapest_gpu_policy(monkeypatch):
     # A40 (48G @ $0.44) beats RTX 5090 (32G @ $0.99) at the 32G tier — bigger AND cheaper.
     assert gpus.cheapest_gpu(32) == "A40"
     assert gpus.cheapest_gpu(48) == "A40"
-    with pytest.raises(gpus.UnsupportedGpuError):
+    # The error names the REAL constraint: this helper filters to RunPod-provisionable
+    # classes, so a fitting Vast-only class doesn't make the message a lie.
+    with pytest.raises(gpus.UnsupportedGpuError, match="no RunPod-provisionable GPU class"):
         gpus.cheapest_gpu(4096)
     # static fallback rates cover every known class
     rates = pricing.live_rates()

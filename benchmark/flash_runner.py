@@ -48,11 +48,18 @@ def _slm_cmd() -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _flash_api_url() -> str:
+    # FLASH_API_URL env first, then ~/.flash/config.json, then the default — env-over-config
+    # precedence (mirrors _flash_api_key) so an explicit env override wins in CI / when
+    # switching control planes, instead of being shadowed by a stale config file.
+    env_url = os.environ.get("FLASH_API_URL")
+    if env_url:
+        return env_url.rstrip("/")
     cfg_path = pathlib.Path.home() / ".flash" / "config.json"
     if cfg_path.exists():
-        cfg = json.loads(cfg_path.read_text())
-        return cfg.get("api_url", "https://flash.freesolo.co").rstrip("/")
-    return os.environ.get("FLASH_API_URL", "https://flash.freesolo.co").rstrip("/")
+        url = json.loads(cfg_path.read_text()).get("api_url")
+        if url:
+            return url.rstrip("/")
+    return "https://flash.freesolo.co"
 
 
 def _flash_api_key() -> str:

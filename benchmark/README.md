@@ -35,8 +35,9 @@ so both train against the byte-identical task definition + reward function.
   reward scales and definitions differ. For an apples-to-apples performance number, use the
   **held-out eval** (one version-independent scorer, generous tokens — see
   `results/comparison.md`); the in-training curves show learning *direction* per stack, not
-  a cross-stack ranking. Flash also emits a native held-out eval (50 examples) on the GPU
-  worker.
+  a cross-stack ranking. Mid-run (in-worker) eval was removed: these are **training-only**
+  runs, and held-out performance is measured separately on the deploy/serving side
+  (`eval_unified.py`), so its eval cost never inflates the cost-of-training figures.
 - **Latency** — total wall-clock per run, the setup/queue component (Flash rents a GPU:
   queue + boot + model download), and per-step time.
 - **Cost** — Flash is the **measured** RunPod bill (`metrics.json:cost_usd`). Tinker is
