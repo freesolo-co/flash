@@ -213,7 +213,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=30, help="GRPO steps for both platforms")
     p.add_argument("--groups-per-batch", type=int, default=4)
     p.add_argument("--group-size", type=int, default=4)
-    p.add_argument("--max-tokens", type=int, default=512)
+    p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--model", default="Qwen/Qwen3.5-4B")
     p.add_argument("--env-id", default="gsm8k")
     p.add_argument("--flash-config", default=None, help="Path to flash TOML (default: configs/gsm8k_4b.toml)")

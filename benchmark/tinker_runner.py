@@ -5,7 +5,7 @@ Must be invoked with a Python that has `verifiers` installed, e.g.:
 
 Runs Qwen3.5-4B GRPO on the GSM8K verifiers env via tinker_cookbook,
 matched to the flash side: 30 steps, groups_per_batch=4, group_size=4,
-max_tokens=512.
+max_tokens=1024.
 
 Writes a JSON result to --output (default /tmp/tinker_bench_result.json)
 so the bench.py orchestrator can read it after the subprocess exits.
@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=30)
     p.add_argument("--groups-per-batch", type=int, default=4)
     p.add_argument("--group-size", type=int, default=4)
-    p.add_argument("--max-tokens", type=int, default=512)
+    p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--lora-rank", type=int, default=32)
     p.add_argument("--model", default="Qwen/Qwen3.5-4B")
     p.add_argument("--env-id", default="gsm8k")
