@@ -203,9 +203,26 @@ def create_app():
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/v1/runs")
-    def create_run(payload: dict, key: dict = Depends(require_key)):
+    def create_run(
+        payload: dict,
+        key: dict = Depends(require_key),
+        authorization: str | None = Header(default=None),
+    ):
         spec = _parse_spec(payload, run_id=new_run_id())
         dry_run = bool(payload.get("dry_run", False))
+        # Charge the run's pre-flight estimate to the submitting user's org BEFORE accepting
+        # it, so the run is gated on a sufficient prepaid balance and never starts GPU work
+        # for free. Skipped for --dry-run (no run) and the operator's internal service
+        # identity (no user org to bill). FLASH_SKIP_NET disables the call (offline / tests).
+        if not dry_run and key.get("key_prefix") != "internal":
+            from flash.server.billing import BillingError as _BillingError
+            from flash.server.billing import charge_run_estimate
+
+            token = (authorization or "").removeprefix("Bearer ").strip()
+            try:
+                charge_run_estimate(token=token, spec=spec)
+            except _BillingError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         db.record_run(spec.run_id, key["id"])
         try:
             status = submit_job(spec, dry_run=dry_run, background=True)

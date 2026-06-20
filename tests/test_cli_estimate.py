@@ -6,7 +6,9 @@ import copy
 import os
 import types
 
-from flash.cli.main.commands import _runconfig_from_spec, _spec_steps, cmd_train
+from flash.cli.main.commands import cmd_train
+from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
+from flash.cost.spec import spec_steps as _spec_steps
 from flash.engine.recipe import RECIPE
 from flash.schema import spec_from_dict
 
@@ -169,7 +171,12 @@ def test_cmd_train_estimate_prints_breakdown_without_submitting(tmp_path, monkey
         'type = "RTX 5090"\n'
     )
     args = types.SimpleNamespace(
-        config=str(cfg), overrides=[], extra_configs=[], estimate=True, dry_run=False, background=False
+        config=str(cfg),
+        overrides=[],
+        extra_configs=[],
+        estimate=True,
+        dry_run=False,
+        background=False,
     )
     # --estimate is fully local: it must NOT touch the control-plane client.
     rc = cmd_train(args)
@@ -221,11 +228,18 @@ def _record_hfapi(monkeypatch) -> list[int]:
 
 def _estimate_args(cfg) -> types.SimpleNamespace:
     return types.SimpleNamespace(
-        config=str(cfg), overrides=[], extra_configs=[], estimate=True, dry_run=False, background=False
+        config=str(cfg),
+        overrides=[],
+        extra_configs=[],
+        estimate=True,
+        dry_run=False,
+        background=False,
     )
 
 
-def test_estimate_unlisted_model_does_no_network_without_flash_skip_net(tmp_path, monkeypatch, capsys):
+def test_estimate_unlisted_model_does_no_network_without_flash_skip_net(
+    tmp_path, monkeypatch, capsys
+):
     # Pre-fix this fails: cmd_train parsed the spec BEFORE checking --estimate, so the open-model
     # spec-parse + GPU sizing each constructed HfApi (network) when FLASH_SKIP_NET was unset.
     monkeypatch.delenv("FLASH_SKIP_NET", raising=False)

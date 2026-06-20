@@ -26,6 +26,10 @@ from flash.client import (
 )
 from flash.client.config import load_credentials
 from flash.client.specs import spec_payload
+from flash.cost.spec import (
+    SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED as _SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED,
+)
+from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
 from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
 
@@ -186,93 +190,6 @@ def cmd_gpus(args) -> int:
         "across providers that fits the model; gpu.provider pins runpod/vast."
     )
     return 0
-
-
-# Assumed SFT dataset size (examples) when the config pins no ``train.max_examples``: the
-# worker trains the FULL environment dataset, whose size isn't readable here (``--estimate`` is
-# fully local — no Hub/env load). This stand-in makes the omitted-cap estimate a documented
-# FLOOR rather than a magic optimizer-step constant; cmd_train surfaces the floor caveat. A real
-# env's train split is typically far larger, so a pinned ``max_examples`` always estimates tighter.
-_SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED = 1000
-
-
-def _sft_realized_batch(batch_size: int) -> int:
-    """The SFT global batch the WORKER realizes for a requested ``batch_size``.
-
-    The worker (engine.worker) never trains at the raw requested batch: it fixes the per-device
-    micro-batch at ``_sft_per_device_bs()`` (4) and reaches the target via CEIL grad-accum, so the
-    realized global batch is ``per_device x ceil(target / per_device)`` -- which can EXCEED the
-    request when it isn't a multiple of the micro-batch (e.g. 16/6 -> per_device 4, accum 2 -> 8).
-    Mirror that here so the optimizer-step count matches what actually runs.
-    """
-    from flash.engine.vram import _sft_per_device_bs
-
-    target = max(1, int(batch_size))
-    per_device = max(1, min(_sft_per_device_bs(), target))
-    grad_accum = max(1, -(-target // per_device))  # ceil
-    return per_device * grad_accum
-
-
-def _spec_steps(spec) -> int:
-    """Per-seed optimizer steps implied by a train spec (mirrors the worker).
-
-    GRPO carries ``train.steps`` (default recipe ``num_steps``) -- ``train.steps`` is a GRPO
-    concept and is NOT consulted for SFT. SFT runs by epochs over a (capped) dataset, so steps =
-    ``epochs x ceil(num_examples / realized_batch)``, capped by ``max_steps``, where ``epochs``
-    defaults to ``RECIPE.sft.num_epochs`` (2), ``realized_batch`` is the worker's grad-accum global
-    batch (``_sft_realized_batch``), and ``num_examples`` is ``max_examples`` if pinned else the
-    documented unpinned floor (``_SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED``).
-    """
-    from flash.engine.recipe import RECIPE
-
-    t = spec.train
-    if spec.algorithm == "grpo":
-        if t.steps is not None:
-            return max(1, int(t.steps))
-        return RECIPE.rl.num_steps
-    # --- SFT ---
-    cap = int(t.max_steps) if t.max_steps else 0  # SFT-only optimizer-step cap (0 = uncapped)
-    epochs = int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
-    requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
-    batch = _sft_realized_batch(requested_batch)  # worker's grad-accum-realized global batch
-    examples = (
-        int(t.max_examples)
-        if t.max_examples is not None
-        else _SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED
-    )
-    n = max(1, -(-examples // batch) * epochs)  # epochs x ceil(examples / realized_batch)
-    return min(n, cap) if cap > 0 else n
-
-
-def _runconfig_from_spec(spec):
-    """Map a parsed training ``JobSpec`` to a cost ``RunConfig`` (for ``slm train --estimate``).
-
-    Each seed is its own job that re-pays the cold start (runner.py), so scale both the step
-    count and the setup repeats by the seed count -- the estimate then prices the same total
-    work the run would bill for.
-    """
-    from flash.cost import RunConfig
-
-    t, g = spec.train, spec.gpu
-    is_grpo = spec.algorithm == "grpo"
-    seeds = max(1, len(t.seeds or (0,)))
-    return RunConfig(
-        model_id=spec.model,
-        method=spec.algorithm,
-        steps=_spec_steps(spec) * seeds,
-        setup_repeats=seeds,
-        seq_len=t.max_length,
-        completion_len=t.max_tokens if is_grpo else None,
-        batch_size=t.batch_size,
-        group_size=t.group_size if is_grpo else None,
-        lora_rank=t.lora_rank,
-        thinking=spec.thinking,
-        gpu=g.type,
-        provider=g.provider,
-        allow_unvalidated=g.allow_unvalidated,
-        max_wall_seconds=g.max_wall_seconds,
-        environment=spec.environment.id or None,
-    )
 
 
 def cmd_env_init(args) -> int:
