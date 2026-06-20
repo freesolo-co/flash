@@ -31,12 +31,28 @@ def _pkg_b64(files: dict[str, str]) -> str:
 
 
 def test_namespace_is_stable_and_hub_safe():
-    # Case-insensitive + sanitized, and stable across calls so re-publishes hit the same env.
+    # A real, user-specific email is used as-is: case-insensitive + sanitized, and stable across
+    # calls so re-publishes hit the same env.
     assert envs.namespace_for({"email": "Dev@Clado.ai"}) == "dev-clado-ai"
     assert envs.namespace_for({"email": "dev@clado.ai"}) == "dev-clado-ai"
-    # Falls back to key_prefix, then id, then a constant.
+    # No email at all: fall back to the per-key id, then key_prefix, then a constant.
+    assert envs.namespace_for({"id": 7}) == "key-7"
     assert envs.namespace_for({"key_prefix": "fslo-abc"}) == "fslo-abc"
     assert envs.namespace_for({}) == "user"
+
+
+def test_namespace_distinct_for_placeholder_emails():
+    # REGRESSION: the server DB stores the SAME placeholder email for every external key
+    # (db.ensure_external_key -> "freesolo-user"), so namespacing on email alone would collapse all
+    # external users into one namespace and let them collide on env names. The per-key `id` must
+    # disambiguate them even though the (placeholder) email and key_prefix are identical.
+    k1 = {"id": 11, "email": "freesolo-user", "key_prefix": "freesolo"}
+    k2 = {"id": 12, "email": "freesolo-user", "key_prefix": "freesolo"}
+    ns1, ns2 = envs.namespace_for(k1), envs.namespace_for(k2)
+    assert ns1 != ns2, "external keys with the placeholder email must NOT share a namespace"
+    assert "freesolo-user" not in (ns1, ns2)  # the placeholder is never the namespace
+    # Stable: the same key always maps to the same namespace (re-publish -> same Hub env).
+    assert envs.namespace_for(dict(k1)) == ns1
 
 
 def test_publish_namespaces_and_returns_slug(monkeypatch):
@@ -84,6 +100,40 @@ def test_safe_extract_rejects_traversal(tmp_path):
     with pytest.raises(envs.EnvPublishError, match="unsafe path"):
         envs._safe_extract(buf.getvalue(), tmp_path)
     assert not (tmp_path.parent / "escape.txt").exists()
+
+
+def test_safe_extract_extracts_regular_files_and_dirs(tmp_path):
+    # The happy path: a normal package (a dir + a regular file) extracts.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        d = tarfile.TarInfo("pkg")
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o755
+        tar.addfile(d)
+        data = b"[project]\nname='e'\n"
+        f = tarfile.TarInfo("pkg/pyproject.toml")
+        f.size = len(data)
+        f.mode = 0o644
+        tar.addfile(f, io.BytesIO(data))
+    envs._safe_extract(buf.getvalue(), tmp_path)
+    assert (tmp_path / "pkg").is_dir()
+    assert (tmp_path / "pkg" / "pyproject.toml").read_text() == "[project]\nname='e'\n"
+
+
+def test_safe_extract_rejects_special_members(tmp_path):
+    # A malicious tarball can carry non-regular members (device nodes, FIFOs). Even though they're
+    # within the destination and not links, `extractall` would try to materialize them — reject them.
+    for typeflag, label in ((tarfile.FIFOTYPE, "fifo"), (tarfile.CHRTYPE, "char-device")):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            info = tarfile.TarInfo(f"evil-{label}")
+            info.type = typeflag
+            if typeflag == tarfile.CHRTYPE:
+                info.devmajor, info.devminor = 1, 3  # e.g. /dev/null
+            tar.addfile(info)
+        with pytest.raises(envs.EnvPublishError, match="special file"):
+            envs._safe_extract(buf.getvalue(), tmp_path)
+        assert not (tmp_path / f"evil-{label}").exists()
 
 
 def test_prime_push_503_when_control_plane_unconfigured(monkeypatch, tmp_path):

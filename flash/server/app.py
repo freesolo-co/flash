@@ -33,7 +33,7 @@ from flash.runner import (
 from flash.schema import ConfigError, spec_from_dict
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import deploy_adapter, undeploy_adapter
-from flash.spec import JobSpec
+from flash.spec import JobSpec, coerce_bool
 
 from . import auth, db
 
@@ -198,7 +198,9 @@ def create_app():
             slug = envs.publish_package(
                 package_b64=payload.get("package_b64") or "",
                 name=payload.get("name") or "",
-                is_new=bool(payload.get("is_new", True)),
+                # Robust bool parse: JSON `"is_new": "false"`/`"0"` must NOT become True
+                # (plain bool() is truthy for any non-empty string). Defaults True when absent.
+                is_new=coerce_bool(payload.get("is_new", True)),
                 key=key,
             )
         except envs.EnvPublishError as exc:

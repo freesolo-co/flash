@@ -339,3 +339,34 @@ def test_worker_env_rejects_invalid_env_names(name: str) -> None:
     # fail at parse time, not after a worker has been provisioned.
     with pytest.raises(ConfigError, match="invalid environment variable name"):
         spec_from_dict(_raw(worker_env={name: "v"}))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Falsey string forms (the bug a plain bool() has: any non-empty string is True).
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+        ("none", False),
+        ("", False),
+        ("  false  ", False),
+        # Truthy string forms.
+        ("true", True),
+        ("1", True),
+        ("yes", True),
+        ("anything-else", True),
+        # Already-typed values pass through bool().
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        (None, False),
+    ],
+)
+def test_coerce_bool(value, expected) -> None:
+    from flash.spec import coerce_bool
+
+    assert coerce_bool(value) is expected

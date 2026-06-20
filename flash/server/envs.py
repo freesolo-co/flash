@@ -34,11 +34,23 @@ class EnvPublishError(Exception):
 
 
 def namespace_for(key: dict) -> str:
-    """Stable, Hub-safe prefix isolating one identity's envs under the shared FreeSolo Prime
-    account. Derived from the verified email (stable across key rotations), falling back to the
-    key prefix, so a user's re-publishes land on the SAME Hub env (version bump, not a new one)."""
-    raw = str(key.get("email") or key.get("key_prefix") or key.get("id") or "user").lower()
-    slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    """Stable, Hub-safe prefix isolating one identity's envs under the shared FreeSolo Prime account.
+
+    It MUST be per-key distinct: the server DB stores the SAME placeholder email for every external
+    key ("freesolo-user") and the internal key ("freesolo-internal") — see ``db.ensure_external_key``
+    / ``ensure_internal_key`` — so namespacing on ``email`` would collapse every external user into
+    one namespace and let them collide on env names. So we only trust ``email`` when it's a real,
+    user-specific address (contains ``@``); otherwise we fall back to the per-key primary-key ``id``
+    (each external token gets its own ``api_keys`` row), then a non-placeholder ``key_prefix``. The
+    chosen identifier is stable across re-publishes, so a user's re-push bumps the SAME Hub env."""
+    email = str(key.get("email") or "")
+    if "@" in email:
+        raw = email
+    elif key.get("id") is not None:
+        raw = f"key-{key['id']}"
+    else:
+        raw = str(key.get("key_prefix") or "user")
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
     return slug or "user"
 
 
@@ -49,7 +61,15 @@ def _sanitize_name(name: str) -> str:
 
 
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
-    """Extract a .tar.gz into ``dest``, rejecting absolute paths and parent traversal."""
+    """Extract a .tar.gz into ``dest``, rejecting absolute paths and parent traversal.
+
+    Defence in depth for an uploaded archive: besides path traversal, we explicitly gate member
+    TYPES — only regular files and directories are allowed. Symlinks/hardlinks are rejected (a link
+    could point outside ``dest``), and so are every other special member ``tarfile`` understands
+    (device/block/char nodes, FIFOs): there's no legitimate reason an env package contains them, and
+    ``extractall`` would otherwise attempt to materialize them. We don't rely on tarfile's own
+    extraction filter alone; the gate here is the contract.
+    """
     root = dest.resolve()
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
         for member in tar.getmembers():
@@ -58,6 +78,11 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                 raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
             if member.islnk() or member.issym():
                 raise EnvPublishError(f"links are not allowed in env packages: {member.name!r}")
+            if not (member.isreg() or member.isdir()):
+                raise EnvPublishError(
+                    f"only regular files and directories are allowed in env packages, but "
+                    f"{member.name!r} is a special file (device/fifo/etc.)"
+                )
         tar.extractall(dest)
 
 

@@ -25,15 +25,20 @@ def _str_tuple(value: Any) -> tuple[str, ...]:
     return tuple(s for s in (str(x) for x in value) if s)
 
 
-def _coerce_bool(value: Any) -> bool:
-    """Parse a bool from loosely-typed spec sources (JSON/env/persisted dicts).
+def coerce_bool(value: Any) -> bool:
+    """Parse a bool from loosely-typed sources (JSON request bodies / env / persisted dicts).
 
-    bool(...) on a string is truthy for ANY non-empty string, so "false"/"0" would
-    wrongly become True; treat the usual falsey strings as False.
+    bool(...) on a string is truthy for ANY non-empty string, so "false"/"0"/"no" would
+    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False, so
+    e.g. JSON ``"is_new": "false"`` is parsed as False. An already-bool value passes through.
     """
     if isinstance(value, str):
         return value.strip().lower() not in _FALSE_STRINGS
     return bool(value)
+
+
+# Back-compat private alias (the helper was internal before it was shared with the server API).
+_coerce_bool = coerce_bool
 
 
 def _coerce_str_map(value: Any) -> dict[str, str]:
