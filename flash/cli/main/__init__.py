@@ -151,9 +151,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     train.add_argument("--dry-run", action="store_true")
     train.add_argument(
-        "--estimate",
+        "--cost",
         action="store_true",
-        help="print the pre-flight USD cost estimate for the config and exit (no submit)",
+        help="print the pre-flight USD cost for the config and exit (no submit)",
     )
     train.add_argument(
         "--background",

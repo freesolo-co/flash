@@ -1,10 +1,11 @@
-"""`slm train --estimate`: map a training config to a pre-flight cost estimate. No network."""
+"""`slm train --cost`: map a training config to a pre-flight cost estimate."""
 
 from __future__ import annotations
 
 import copy
-import os
 import types
+
+import pytest
 
 from flash.cli.main.commands import cmd_train
 from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
@@ -137,18 +138,22 @@ def test_sft_ignores_train_steps_for_step_count():
     assert _spec_steps(spec) == 40
 
 
-def test_sft_steps_unpinned_examples_is_documented_floor_not_100():
-    # No max_examples -> the worker trains the full dataset (size unknown locally). The estimate
-    # uses the documented assumed-examples floor, NOT the old hardcoded 100 optimizer steps.
-    from flash.cli.main.commands import _SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED
-
+def test_sft_steps_unpinned_counts_the_env_dataset(monkeypatch):
+    # No max_examples -> the worker trains the FULL dataset, so the step count must use the env's
+    # REAL train-split size (count_env_examples), not a magic constant.
+    monkeypatch.setattr("flash.cost.spec.count_env_examples", lambda env_id, params=None: 320)
     spec = _sft_spec(batch_size=16, epochs=2)  # max_examples omitted
     assert spec.train.max_examples is None
-    expected = _worker_sft_steps(
-        examples=_SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED, requested_batch=16, epochs=2
-    )
-    assert _spec_steps(spec) == expected
-    assert _spec_steps(spec) != 100
+    assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
+
+
+def test_sft_steps_unpinned_raises_when_env_cannot_be_counted(monkeypatch):
+    # If the env can't be loaded to count (not installed / offline), pricing fails loudly with
+    # guidance instead of guessing a dataset size.
+    monkeypatch.setattr("flash.cost.spec.count_env_examples", lambda env_id, params=None: None)
+    spec = _sft_spec(batch_size=16, epochs=2)
+    with pytest.raises(ValueError, match="max_examples"):
+        _spec_steps(spec)
 
 
 def test_sft_max_steps_caps_the_derived_count():
@@ -156,8 +161,7 @@ def test_sft_max_steps_caps_the_derived_count():
     assert _spec_steps(spec) == 5
 
 
-def test_cmd_train_estimate_prints_breakdown_without_submitting(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
+def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "Qwen/Qwen3.5-9B"\n'
@@ -174,11 +178,12 @@ def test_cmd_train_estimate_prints_breakdown_without_submitting(tmp_path, monkey
         config=str(cfg),
         overrides=[],
         extra_configs=[],
-        estimate=True,
+        cost=True,
         dry_run=False,
         background=False,
     )
-    # --estimate is fully local: it must NOT touch the control-plane client.
+    # --cost is local: it must NOT touch the control-plane client. GRPO needs no env load, and
+    # estimate_cost sizes VRAM offline, so no network is required for a listed model.
     rc = cmd_train(args)
     out = capsys.readouterr().out
     assert rc == 0
@@ -186,97 +191,3 @@ def test_cmd_train_estimate_prints_breakdown_without_submitting(tmp_path, monkey
     assert "$" in out
     assert "RTX 5090" in out
 
-
-# --- --estimate is network-free even for an unlisted (open-model-policy) model ---------------
-# An UNLISTED model under model_policy="allow" parses via resolve_model -> check_fit and sizes via
-# resolve_gpu_policy -> model_required_vram_gb; both reach engine.vram.fetch_hf_params_b, which probes
-# the Hugging Face API (constructs HfApi) UNLESS FLASH_SKIP_NET is set. cmd_train's --estimate branch
-# forces FLASH_SKIP_NET on for the whole flow (parse + size), so estimation never does network I/O
-# even when the user hasn't set it. We detect the network probe by recording HfApi construction:
-# fetch_hf_params_b builds HfApi only AFTER its skip-net short-circuit AND swallows exceptions
-# internally, so a side-effect FLAG (not a raise) is the reliable detector.
-_UNLISTED_ESTIMATE_TOML = (
-    'model = "acme/unlisted-7b"\n'
-    'model_policy = "allow"\n'
-    'algorithm = "grpo"\n'
-    "[environment]\n"
-    'id = "primeintellect/gsm8k"\n'
-    "[train]\n"
-    "steps = 50\n"
-    'hf_repo = "owner/runs"\n'
-    "[gpu]\n"
-    'type = "auto"\n'  # policy word -> also exercises resolve_gpu_policy's sizing probe
-)
-
-
-def _record_hfapi(monkeypatch) -> list[int]:
-    """Replace huggingface_hub.HfApi with a recorder; returns a list that gains an entry per
-    construction (== one network probe). model_info raises so any caller that DID reach the
-    network falls back as if offline (matching the real best-effort path)."""
-    calls: list[int] = []
-
-    class _Recorder:
-        def __init__(self, *a, **k):
-            calls.append(1)
-
-        def model_info(self, *a, **k):
-            raise RuntimeError("offline (test: no network)")
-
-    monkeypatch.setattr("huggingface_hub.HfApi", _Recorder, raising=True)
-    return calls
-
-
-def _estimate_args(cfg) -> types.SimpleNamespace:
-    return types.SimpleNamespace(
-        config=str(cfg),
-        overrides=[],
-        extra_configs=[],
-        estimate=True,
-        dry_run=False,
-        background=False,
-    )
-
-
-def test_estimate_unlisted_model_does_no_network_without_flash_skip_net(
-    tmp_path, monkeypatch, capsys
-):
-    # Pre-fix this fails: cmd_train parsed the spec BEFORE checking --estimate, so the open-model
-    # spec-parse + GPU sizing each constructed HfApi (network) when FLASH_SKIP_NET was unset.
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
-    calls = _record_hfapi(monkeypatch)
-    cfg = tmp_path / "run.toml"
-    cfg.write_text(_UNLISTED_ESTIMATE_TOML)
-
-    rc = cmd_train(_estimate_args(cfg))
-
-    assert rc == 0
-    assert calls == [], "--estimate must not construct HfApi (no network) for an unlisted model"
-    out = capsys.readouterr().out
-    assert "TOTAL" in out
-    assert "$" in out
-    # The estimate still produced a fully-validated spec sized via the offline heuristic.
-    assert "acme/unlisted-7b" in out
-
-
-def test_estimate_restores_preexisting_flash_skip_net(tmp_path, monkeypatch):
-    # The scoped env guard must restore a PRE-EXISTING FLASH_SKIP_NET value afterward (not leave the
-    # forced "1" behind, and not delete a value the caller had set).
-    monkeypatch.setenv("FLASH_SKIP_NET", "preexisting")
-    _record_hfapi(monkeypatch)
-    cfg = tmp_path / "run.toml"
-    cfg.write_text(_UNLISTED_ESTIMATE_TOML)
-
-    assert cmd_train(_estimate_args(cfg)) == 0
-    assert os.environ.get("FLASH_SKIP_NET") == "preexisting"
-
-
-def test_estimate_does_not_set_flash_skip_net_when_unset(tmp_path, monkeypatch):
-    # When FLASH_SKIP_NET was UNSET, the guard must leave it unset afterward (no leak of the forced
-    # value into the rest of the process / a later real run).
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
-    _record_hfapi(monkeypatch)
-    cfg = tmp_path / "run.toml"
-    cfg.write_text(_UNLISTED_ESTIMATE_TOML)
-
-    assert cmd_train(_estimate_args(cfg)) == 0
-    assert "FLASH_SKIP_NET" not in os.environ

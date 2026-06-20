@@ -223,6 +223,11 @@ def create_app():
                 charge_run_estimate(token=token, spec=spec)
             except _BillingError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+            except ValueError as exc:
+                # The estimate couldn't price the config (e.g. an SFT run with no max_examples
+                # whose env can't be loaded here to count its dataset). A 400 with the message
+                # tells the user how to fix it, rather than a 500.
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         db.record_run(spec.run_id, key["id"])
         try:
             status = submit_job(spec, dry_run=dry_run, background=True)

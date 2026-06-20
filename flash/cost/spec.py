@@ -1,22 +1,12 @@
-"""Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / ``CostEstimate``.
+"""Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / step count.
 
-Shared by the CLI (``slm train --estimate``) and the control plane (which charges the
-estimate to the user's org at submit time), so both price the SAME work the run will bill
-for. Kept network-free: ``estimate_cost`` sizes VRAM offline, and the spec passed here is
-already parsed, so nothing in this module touches the Hugging Face API.
+Shared by the CLI (``slm train --cost``) and the control plane (which charges the estimate
+to the user's org at submit), so both price the SAME work the run will bill for.
 """
 
 from __future__ import annotations
 
-from flash.cost.analytical import estimate_cost
-from flash.cost.types import CostEstimate, RunConfig
-
-# Assumed SFT dataset size (examples) when the config pins no ``train.max_examples``: the
-# worker trains the FULL environment dataset, whose size isn't readable here (the estimate is
-# fully local — no Hub/env load). This stand-in makes the omitted-cap estimate a documented
-# FLOOR rather than a magic optimizer-step constant; the CLI surfaces the floor caveat. A real
-# env's train split is typically far larger, so a pinned ``max_examples`` always estimates tighter.
-SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED = 1000
+from flash.cost.types import RunConfig
 
 
 def sft_realized_batch(batch_size: int) -> int:
@@ -36,6 +26,26 @@ def sft_realized_batch(batch_size: int) -> int:
     return per_device * grad_accum
 
 
+def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
+    """Number of training rows in ``env_id``'s dataset, or ``None`` if it can't be loaded.
+
+    Loads the verifiers env (installed via ``slm env install``) and counts its train split --
+    the same ``ACTIVE_ENV.dataset("train")`` the worker trains over -- so an SFT run with no
+    ``[train].max_examples`` cap is priced on the REAL dataset size, not a guess. Best-effort:
+    returns ``None`` on any failure (env not installed, missing deps, load/download error) so
+    the caller can surface a clear message rather than bill a wrong number.
+    """
+    if not env_id:
+        return None
+    try:
+        from flash.envs import load_environment
+
+        rows = load_environment(env_id, params or {}).dataset("train")
+    except Exception:
+        return None
+    return len(rows) if rows is not None else None
+
+
 def spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 
@@ -44,7 +54,7 @@ def spec_steps(spec) -> int:
     ``epochs x ceil(num_examples / realized_batch)``, capped by ``max_steps``, where ``epochs``
     defaults to ``RECIPE.sft.num_epochs`` (2), ``realized_batch`` is the worker's grad-accum global
     batch (``sft_realized_batch``), and ``num_examples`` is ``max_examples`` if pinned else the
-    documented unpinned floor (``SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED``).
+    REAL env train-split size (``count_env_examples``) -- the full dataset the worker trains over.
     """
     from flash.engine.recipe import RECIPE
 
@@ -58,9 +68,17 @@ def spec_steps(spec) -> int:
     epochs = int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
     requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
     batch = sft_realized_batch(requested_batch)  # worker's grad-accum-realized global batch
-    examples = (
-        int(t.max_examples) if t.max_examples is not None else SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED
-    )
+    if t.max_examples is not None:
+        examples = int(t.max_examples)
+    else:
+        # No cap: the worker trains the FULL env dataset, so price its real size.
+        examples = count_env_examples(spec.environment.id, spec.environment.params)
+        if examples is None:
+            raise ValueError(
+                f"could not load environment {spec.environment.id!r} to count its training "
+                f"examples for the cost; install it (`slm env install {spec.environment.id}`) "
+                "or pin [train].max_examples"
+            )
     n = max(1, -(-examples // batch) * epochs)  # epochs x ceil(examples / realized_batch)
     return min(n, cap) if cap > 0 else n
 
@@ -92,8 +110,3 @@ def runconfig_from_spec(spec) -> RunConfig:
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
     )
-
-
-def estimate_for_spec(spec) -> CostEstimate:
-    """The pre-flight ``CostEstimate`` for a parsed training ``JobSpec``."""
-    return estimate_cost(runconfig_from_spec(spec))

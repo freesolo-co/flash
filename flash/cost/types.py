@@ -64,7 +64,7 @@ class RunConfig:
         # ``max_wall_seconds`` is deliberately NOT here -- the submit/run paths floor it with
         # ``max(60, int(spec.gpu.max_wall_seconds))`` and so ACCEPT a 0/negative cap, flooring it
         # to 60s. ``estimate_cost`` mirrors that floor (``cap_s = max(60.0, ...)``), so rejecting a
-        # non-positive cap here would make --estimate unable to price configs the runner accepts.
+        # non-positive cap here would make --cost unable to price configs the runner accepts.
         for _name in ("seq_len", "batch_size", "group_size", "completion_len", "lora_rank"):
             _val = getattr(self, _name)
             if _val is not None and _val < 1:

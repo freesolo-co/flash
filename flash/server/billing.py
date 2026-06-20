@@ -19,7 +19,8 @@ import os
 import urllib.error
 import urllib.request
 
-from flash.cost.spec import estimate_for_spec
+from flash.cost.analytical import estimate_cost
+from flash.cost.spec import runconfig_from_spec
 
 from .auth import DEFAULT_FREESOLO_BASE_URL, FREESOLO_BASE_URL_ENV
 
@@ -76,7 +77,7 @@ def charge_run_estimate(*, token: str, spec) -> dict:
     if os.environ.get("FLASH_SKIP_NET"):
         return {}
 
-    estimate = estimate_for_spec(spec)
+    estimate = estimate_cost(runconfig_from_spec(spec))
     payload = json.dumps(
         {
             "runId": spec.run_id,

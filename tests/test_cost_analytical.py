@@ -148,7 +148,7 @@ def test_sub_60s_wall_cap_is_floored_to_the_runner_minimum():
 def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
     # A 0/negative max_wall_seconds is ACCEPTED, mirroring the runner: submit/run floor it with
     # max(60, int(spec.gpu.max_wall_seconds)), so the runner accepts a non-positive cap and runs
-    # it for 60s of wall. RunConfig must NOT reject it (else --estimate can't price configs the
+    # it for 60s of wall. RunConfig must NOT reject it (else --cost can't price configs the
     # runner accepts), and estimate_cost's cap_s = max(60.0, ...) floor turns it into a 60s wall
     # with a strictly-positive total_usd -- NOT a negative/zero quote.
     for cap in (0, -5):
