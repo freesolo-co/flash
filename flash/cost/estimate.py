@@ -1,9 +1,10 @@
 """The cost-estimate result type: a fully itemized, serializable breakdown.
 
-``CostEstimate`` is what the analytical model emits and what the LLM estimator is
-graded against. It carries every term that goes into the dollar figure (chosen GPU
-class + rate, the cold-start overhead, the per-step wall time, the step count, and
-the resulting wall-clock hours) so the number is auditable rather than a black box.
+``CostEstimate`` is what the analytical model emits and what the calibration grader
+scores against measured cost. It carries every term that goes into the dollar figure
+(chosen GPU class + rate, the cold-start overhead, the per-step wall time, the step
+count, and the resulting wall-clock hours) so the number is auditable rather than a
+black box.
 """
 
 from __future__ import annotations

@@ -47,13 +47,13 @@ python -m flash.cost verify    # grade the equation vs measured cost + env sweep
 
 | Group | n | mean MAPE | median APE | agg bias | within 33% |
 |---|---:|---:|---:|---:|---:|
-| all | 56 | 112% | 34% | 1.17 | 50% |
-| **real** (≥500s) | 40 | 39% | **24%** | 0.89 | 62% |
-| **real GRPO** | 33 | 37% | **22%** | 0.88 | **73%** |
-| real SFT | 7 | 49% | 43% | 0.99 | 14% |
+| all | 58 | 108% | 34% | 1.17 | 50% |
+| **real** (≥500s) | 41 | 37% | **22%** | 0.90 | 63% |
+| **real GRPO** | 35 | 35% | **22%** | 0.89 | **71%** |
+| real SFT | 6 | 50% | 47% | 1.00 | 17% |
 
 The meaningful rows are **`real`** — runs ≥500s that actually executed their configured
-work. **Real GRPO is accurate: 22% median APE, 73% of runs within a third of measured.**
+work. **Real GRPO is accurate: 22% median APE, 71% of runs within a third of measured.**
 `agg bias` is **not forced to 1.0** (that would be the output hack this avoids).
 
 Two things to read honestly:
@@ -63,7 +63,7 @@ Two things to read honestly:
   equation prices. An invalid comparison, not an estimator error.
 - The real-run residual is **cold-start spread** (implied cold-start is a stable ~480–520s
   on long runs) **+ per-step scatter** — a central estimate, not a fake-precise point. SFT
-  (n=7) is centered (bias ~1.0) but data-limited; more long SFT runs will tighten its spread.
+  (n=6) is centered (bias ~1.0) but data-limited; more long SFT runs will tighten its spread.
 
 Refresh the calibration as new runs land: harvest the control plane into `measured_runs.json`,
 re-run `fit_constants` to refresh `REALIZED_HOURLY_USD` + the MFU/concurrency constants, and

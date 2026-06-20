@@ -11,8 +11,7 @@ fit rule, so the chosen GPU class matches what the allocator would pick.
 
 These constants are calibrated so end-to-end figures land in a realistic band (cents
 for a small SFT smoke; a few-to-tens of dollars for a large GRPO run) rather than to
-any single measured run. The model is the *reference* the LLM estimator is graded
-against in ``experiment.py``.
+any single measured run. ``calibration`` grades this model against the measured runs.
 """
 
 from __future__ import annotations
@@ -227,7 +226,7 @@ def _notes(
 def estimate_cost(
     config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S, pin_must_fit: bool = True
 ) -> CostEstimate:
-    """Deterministic pre-flight cost estimate -- the experiment's ground truth.
+    """Deterministic pre-flight cost estimate -- the analytical ground truth.
 
     ``pin_must_fit`` defaults True (forward estimate: a too-small GPU pin escalates). The
     calibration grader passes False to price a measured run on the card it actually ran on

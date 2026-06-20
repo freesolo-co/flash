@@ -78,8 +78,8 @@ def runconfig_from_status(
     # `cost_usd` across all of them (runner.py), so the measured bill covers N seeds.
     # Each seed is its own job that reprovisions and re-pays the cold start, so scale
     # BOTH the reconstructed step count AND the setup repeats by the seed count -- the
-    # analytical estimate and the LLM prompt then price the SAME total work (N x train
-    # + N x setup) the measured dollars paid for.
+    # analytical estimate then prices the SAME total work (N x train + N x setup) the
+    # measured dollars paid for.
     n_seeds = max(1, len(train.get("seeds") or (0,)))
     gpu_spec = spec.get("gpu") or {}
     # The spec's per-run wall cap (``gpu.max_wall_seconds``) and unvalidated-GPU policy
