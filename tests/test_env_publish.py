@@ -283,21 +283,19 @@ def test_safe_extract_rejects_too_many_members(tmp_path, monkeypatch):
 
 
 def test_safe_extract_rejects_oversized_uncompressed(tmp_path, monkeypatch):
-    # A small .tar.gz can DECLARE enormous members (a decompression bomb). We sum the declared sizes
-    # and abort before extractall, so we never write the bomb to disk — even though the compressed
-    # bytes are tiny (the body here is sparse/zero, so gzip stays small).
-    monkeypatch.setattr(envs, "_MAX_UNCOMPRESSED_BYTES", 1024)
-    declared = 256 * 1024 * 1024  # 256 MB declared, far over the 1 KB cap
+    # The cumulative-uncompressed cap: members whose summed sizes exceed the cap are rejected before
+    # extraction. We exercise this with a tiny cap and small members (no multi-hundred-MB allocation
+    # that would slow/OOM CI) — the logic is identical regardless of the absolute sizes.
+    monkeypatch.setattr(envs, "_MAX_UNCOMPRESSED_BYTES", 100)
+    body = b"x" * 4096  # 4 KB, comfortably over the 100-byte cap
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        info = tarfile.TarInfo("huge.bin")
-        info.size = declared
-        tar.addfile(info, io.BytesIO(b"\0" * declared))
-    # The compressed bomb is a tiny fraction of what it expands to — that's the whole danger.
-    assert len(buf.getvalue()) < declared // 100
+        info = tarfile.TarInfo("big.bin")
+        info.size = len(body)
+        tar.addfile(info, io.BytesIO(body))
     with pytest.raises(envs.EnvPublishError, match="too large uncompressed"):
         envs._safe_extract(buf.getvalue(), tmp_path)
-    assert not (tmp_path / "huge.bin").exists()  # the bomb was never written
+    assert not (tmp_path / "big.bin").exists()  # rejected before its payload was written
 
 
 def test_publish_rejects_oversized_upload_before_decode(monkeypatch):
