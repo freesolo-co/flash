@@ -62,6 +62,9 @@ slm = "flash.cli.main:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `slm`
 # subcommand. Requires the `server` extra (`pip install 'flash[server]'`).
 flash-server = "flash.server.__main__:main"
+# Operator-only: the shared rollout-pool router (an "nginx for GRPO rollouts") + reward workers.
+# Requires the `server` extra. See flash/pool/ and docs/rollout-pool-design.md.
+flash-pool = "flash.pool.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -117,3 +120,6 @@ ignore = ["E501", "B008"]
 # Annotated[..., Depends(closure_local)] cannot be resolved by get_type_hints,
 # so the definition-time `= Depends(...)` form is required here.
 "flash/server/app.py" = ["FAST002"]
+# The gateway's `timeout` kwargs are forwarded straight to httpx (its native timeout API),
+# not an asyncio.timeout() concern — ASYNC109 doesn't apply.
+"flash/pool/gateway.py" = ["ASYNC109"]

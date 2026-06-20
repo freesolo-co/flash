@@ -1670,13 +1670,20 @@ def _grpo_is_no_op_failure(
 
 
 def run_rl():
-    # Backend dispatch: FLASH_FRAMEWORK=verl runs the verl GRPO+LoRA path (one-step-off
-    # rollout/train OVERLAP — generation of step t+1 overlaps the optimizer of step t — which the
-    # baked TRL/vLLM server-mode path cannot do). The TRL path below is byte-for-byte unchanged.
-    if os.environ.get("FLASH_FRAMEWORK", "trl").strip().lower() == "verl":
+    # Backend dispatch (the TRL path below is byte-for-byte unchanged):
+    #   FLASH_FRAMEWORK=verl -> verl GRPO+LoRA one-step-off rollout/train OVERLAP (separate stack);
+    #   FLASH_FRAMEWORK=pool -> shared-rollout-pool GRPO: rollout + reward run on the pool (off this
+    #     GPU), only the LoRA optimizer step runs here (flash.engine.pool_trainer).
+    _framework = os.environ.get("FLASH_FRAMEWORK", "trl").strip().lower()
+    if _framework == "verl":
         from flash.engine import verl_runner
 
         verl_runner.run()  # uploads its own metrics.json + DONE; main() ignores the return value
+        return
+    if _framework == "pool":
+        from flash.engine import pool_trainer
+
+        pool_trainer.run()  # uploads its own metrics.json + DONE
         return
 
     from datasets import Dataset
