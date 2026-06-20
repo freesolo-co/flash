@@ -153,6 +153,10 @@ def test_multiple_concurrent_real_runs_share_pool(tiny_model, tmp_path):
             t.start()
         for t in threads:
             t.join(timeout=300)
+        # If a run hung past the timeout, fail loudly here instead of letting a still-running thread
+        # block teardown / mask the real failure.
+        alive = [t.name for t in threads if t.is_alive()]
+        assert not alive, f"training threads did not finish in time: {alive}"
 
         assert not errors, errors
         assert set(results) == set(names)
@@ -213,6 +217,8 @@ def test_concurrent_runs_keep_distinct_policies(tiny_model, tmp_path):
         t2.start()
         t1.join(300)
         t2.join(300)
+        still_alive = [t.name for t in (t1, t2) if t.is_alive()]
+        assert not still_alive, f"training threads did not finish in time: {still_alive}"
         # each run increased the logprob of ITS OWN target relative to the other completion
         assert out["good"] > 0, out
         assert out["bad"] > 0, out

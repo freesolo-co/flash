@@ -157,6 +157,11 @@ class Router:
 
             # --- slow IO outside the global lock; per-backend swap-guarded ---
             guard = self._guard(be.id)
+            # True only once we're past (re)load and into the generation call, so a "missing adapter"
+            # error is attributed to a chat miss (concurrent swap / LRU eviction) — NOT to a failed
+            # load_lora (e.g. a bad adapter URI surfacing "not found"/"does not exist"), which must
+            # fail over to a different backend instead of looping reloads on this one.
+            in_generation = False
             try:
                 if must_load and ad is not None:
                     # The (un)load is a WRITER on this backend: exclusive, so no generate forwards a
@@ -179,6 +184,7 @@ class Router:
                 # Forwarding is a READER: concurrent with other generates, but never overlapping an
                 # adapter swap on this backend (so a request can't hit a half-loaded adapter).
                 async with guard.read():
+                    in_generation = True
                     resp = await (
                         self.gateway.chat(be, payload) if kind == "chat" else self.gateway.completions(be, payload)
                     )
@@ -189,9 +195,15 @@ class Router:
                 last_err = e
                 async with self._lock:
                     self.state.release(be.id, failed=True)
-                # Adapter swapped/evicted out from under us -> drop its placement here and retry
-                # (the next pick reloads it). Don't fail over, don't mark the backend unhealthy.
-                if adapter_name is not None and _is_missing_adapter(e) and reloads < max_reloads:
+                # Adapter swapped/evicted out from under us AT GENERATION TIME -> drop its placement
+                # here and retry the SAME backend (the next pick reloads it). Only for a chat miss,
+                # not a load/unload failure. Don't fail over, don't mark the backend unhealthy.
+                if (
+                    in_generation
+                    and adapter_name is not None
+                    and _is_missing_adapter(e)
+                    and reloads < max_reloads
+                ):
                     reloads += 1
                     async with self._lock:
                         self.state.mark_unloaded(be.id, adapter_name)

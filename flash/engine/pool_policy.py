@@ -80,7 +80,9 @@ def build_lora_policy_update(
             opt.step()
             policy_update.last_loss = float(total.item())
         else:
-            policy_update.last_loss = 0.0
+            # No usable loss this step (e.g. empty/degenerate groups): record None — the "no update"
+            # sentinel — rather than 0.0, which would read as a real zero-loss step in telemetry.
+            policy_update.last_loss = None
         step_dir = os.path.join(out_dir, f"step_{exp.step + 1}")
         model.save_pretrained(step_dir)
         state["uri"] = step_dir

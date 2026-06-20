@@ -197,9 +197,16 @@ class _RecordingGateway:
     """A fake gateway that records a per-backend event timeline so a test can assert no chat is
     forwarded to a backend while that backend is mid-(un)load. ``load_lora`` can be made to fail."""
 
-    def __init__(self, *, load_delay: float = 0.0, fail_load_on: set[str] | None = None):
+    def __init__(
+        self,
+        *,
+        load_delay: float = 0.0,
+        fail_load_on: set[str] | None = None,
+        fail_load_on_backend: dict[str, str] | None = None,
+    ):
         self.load_delay = load_delay
-        self.fail_load_on = fail_load_on or set()
+        self.fail_load_on = fail_load_on or set()  # adapter names whose load always fails
+        self.fail_load_on_backend = fail_load_on_backend or {}  # backend_id -> error message
         self.events: list[tuple[str, str, str]] = []  # (backend_id, op, name)
         self.active_swap: dict[str, int] = {}  # backend_id -> in-progress (un)load count
         self.chat_during_swap: list[str] = []  # backend_ids where a chat overlapped a swap
@@ -216,6 +223,8 @@ class _RecordingGateway:
         self.events.append((be.id, "load", name))
         if name in self.fail_load_on:
             raise GatewayError(f"load failed for {name}", status=500)
+        if be.id in self.fail_load_on_backend:
+            raise GatewayError(self.fail_load_on_backend[be.id], status=400)
         self.active_swap[be.id] = self.active_swap.get(be.id, 0) + 1
         try:
             await asyncio.sleep(self.load_delay)
@@ -285,3 +294,24 @@ def test_sync_failed_reload_marks_backend_unsynced():
     assert "run" not in r.state.backends["gpu0"].adapters
     # and it is NOT reported as a stale-but-present placement (which would imply "still loaded")
     assert ad.stale_placements() == set()
+
+
+def test_load_failure_fails_over_instead_of_looping_reloads():
+    # MED: a missing-adapter-style 400 from load_lora (e.g. a bad adapter URI -> "does not exist")
+    # must NOT be treated as a transient chat miss and looped as reloads on the same backend; it has
+    # to fail over to a different backend promptly. gpu0's load always fails; gpu1's succeeds.
+    gw = _RecordingGateway(fail_load_on_backend={"gpu0": "adapter does not exist"})
+    r = _router_with(gw, backends=["gpu0", "gpu1"], replicas=2)
+
+    async def scenario():
+        return await r.generate({"model": "run", "messages": []})
+
+    resp, backend_id = asyncio.run(scenario())
+    assert resp["choices"][0]["message"]["content"] == "ok"
+    assert backend_id == "gpu1"  # served by the failover backend, not gpu0
+    # gpu0 was tried for a load (and failed); the request was served by gpu1's chat, not by
+    # endlessly reloading gpu0.
+    chats = [bid for bid, op, _ in gw.events if op == "chat"]
+    assert chats == ["gpu1"], gw.events
+    gpu0_loads = sum(1 for bid, op, _ in gw.events if op == "load" and bid == "gpu0")
+    assert gpu0_loads == 1, f"gpu0 load should be attempted once then failed over, not looped: {gw.events}"
