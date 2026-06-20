@@ -48,18 +48,21 @@ def gpu_hourly_usd(name: str) -> float:
     return info.hourly_usd
 
 
-# Realized $/hr a class is ACTUALLY billed at -- the empirical MEDIAN effective rate
-# (measured cost / measured wall) per class over the RunPod/Vast runs in
-# cost_estimator_results/real_runs/measured_runs.json, NOT the static on-demand list
-# snapshot. It is usually below list (the spot/queue discount: RTX 5090 lists $0.99 but
-# bills ~$0.87, A100 PCIe lists $1.39 but bills ~$1.04), but it is NOT guaranteed to be --
-# a class can bill ABOVE its static list when the live market is tight or surge-priced
-# (e.g. RTX A5000 bills ~$0.30 vs a $0.27 list; an H100 GRPO run billed ~$10/hr against a
-# $3.29 list). That's exactly why this is calibrated from observed billing rather than
-# derived from list +/- a fixed discount. A calibrated price INPUT, not an output
-# adjustment -- regenerate with ``calibration.fit_constants`` and refresh here as new runs
-# land (pinned by tests). A class without measured runs falls back to the list price (no
-# rate invented -- an honest estimate until it's been observed).
+# Realized $/hr a class is ACTUALLY billed at -- the empirical effective rate (measured cost
+# / measured wall) over the RunPod/Vast runs in cost_estimator_results/real_runs/, NOT the
+# static on-demand list. Usually below list (the spot/queue discount: RTX 5090 lists $0.99
+# but bills ~$0.87, A100 PCIe $1.39 -> ~$1.04) but not always (A5000 ~$0.30 vs $0.27 list;
+# an H100 GRPO run billed ~$10/hr vs $3.29 list) -- so it's calibrated from observed billing,
+# not list +/- a discount. A calibrated price INPUT, not an output adjustment.
+#
+# Deliberately a single conservative rate per class, NOT method-specific. The same nominal
+# card does bill more for GRPO (it rents a pricier high-VRAM instance for the vLLM rollout --
+# a 3090 bills ~$0.24/hr SFT vs ~$0.95 GRPO), but pricing GRPO at that full rate over-quotes
+# the *total* and worsens per-run accuracy (the low rate was canceling a slightly-high wall
+# estimate). With a right-skewed cost distribution this single-rate model is per-run accurate
+# AND under-quotes the aggregate -- the conservative side we prefer. KNOWN LIMITATION: it
+# under-prices GRPO on consumer cards (3090/4090); tightening that needs a joint rate+wall
+# recalibration once there are enough consumer-card GRPO runs to fit both without regressing.
 REALIZED_HOURLY_USD: dict[str, float] = {
     "RTX 3090": 0.239,
     "RTX 4090": 0.426,

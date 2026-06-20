@@ -139,7 +139,7 @@ def verify_accuracy(path: Path | str | None = None) -> dict:
     for name, sub in groups.items():
         if not sub:
             continue
-        apes, sum_est, sum_meas = [], 0.0, 0.0
+        apes, diffs, sum_est, sum_meas = [], [], 0.0, 0.0
         for r in sub:
             # ``pin_must_fit=False``: the run's recorded GPU is the card it DEMONSTRABLY ran on,
             # so honor it even when the offline VRAM heuristic over-estimates and would drop it
@@ -148,6 +148,7 @@ def verify_accuracy(path: Path | str | None = None) -> dict:
             est = estimate_cost(_config_of(r), pin_must_fit=False).total_usd
             meas = r["cost_usd"]
             apes.append(100 * abs(est - meas) / meas)
+            diffs.append(est - meas)  # signed $: + = quoted ABOVE cost (gain), - = BELOW (loss)
             sum_est += est
             sum_meas += meas
         apes.sort()
@@ -158,6 +159,12 @@ def verify_accuracy(path: Path | str | None = None) -> dict:
             "agg_bias": sum_est / sum_meas,  # 1.0 = unbiased in aggregate (not forced)
             "within_33pct": sum(a <= 33 for a in apes) / len(apes),
             "within_50pct": sum(a <= 50 for a in apes) / len(apes),
+            # --- profit/loss in DOLLARS if the estimate were the quote and measured the cost ---
+            "sum_measured_usd": sum_meas,  # what we'd pay the providers
+            "sum_estimated_usd": sum_est,  # what we'd quote
+            "net_usd": sum_est - sum_meas,  # >0 = gain (over-quote), <0 = loss (under-quote)
+            "net_pct": 100 * (sum_est - sum_meas) / sum_meas,  # net as % of cost
+            "mean_diff_usd": sum(diffs) / len(diffs),  # avg per-run signed $ gap
         }
     return out
 

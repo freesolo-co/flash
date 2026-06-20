@@ -25,18 +25,26 @@ HERE = Path(__file__).resolve().parent
 
 def _acc_table(acc: dict) -> str:
     rows = [
-        "| Group | n | mean MAPE | median APE | agg bias (Σest/Σmeas) | within 33% | within 50% |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Group | n | median APE | within 33% | Σ cost $ | Σ quote $ | net $ | verdict |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for g in ("all", "sft", "grpo", "real", "real_sft", "real_grpo"):
         if g not in acc:
             continue
         a = acc[g]
         rows.append(
-            f"| {g} | {a['n']} | {a['mean_mape_pct']:.0f}% | {a['median_ape_pct']:.0f}% | "
-            f"{a['agg_bias']:.3f} | {a['within_33pct'] * 100:.0f}% | {a['within_50pct'] * 100:.0f}% |"
+            f"| {g} | {a['n']} | {a['median_ape_pct']:.0f}% | {a['within_33pct'] * 100:.0f}% | "
+            f"${a['sum_measured_usd']:.2f} | ${a['sum_estimated_usd']:.2f} | "
+            f"{a['net_usd']:+.2f} ({a['net_pct']:+.0f}%) | {_verdict(a)} |"
         )
     return "\n".join(rows)
+
+
+def _verdict(a: dict) -> str:
+    """Money outcome if the estimate is the quote and measured is what we pay the provider."""
+    if abs(a["net_pct"]) < 5:
+        return "break-even"
+    return "**GAIN** (over-quote)" if a["net_usd"] > 0 else "**LOSE** (under-quote)"
 
 
 def _sweep_table(rows: list[dict]) -> str:
@@ -53,6 +61,22 @@ def build_report() -> str:
     acc = verify_accuracy()
     sweep = environment_cost_sweep()
     consts = fit_constants()
+    real = acc["real"]
+    money = (
+        f"**Money outcome — does the estimator break even, gain, or lose?** If the estimate "
+        f"is the quote and the measured cost is what we pay the provider, then over the "
+        f"**{real['n']} real runs** (those that actually ran their configured work) the "
+        f"equation quotes **${real['sum_estimated_usd']:.2f}** against **${real['sum_measured_usd']:.2f}** "
+        f"of real cost — a net of **{real['net_usd']:+.2f} ({real['net_pct']:+.0f}%)**, i.e. "
+        f"**{_verdict(real).replace('**', '')}**. The `all` row nets near zero only because "
+        f"cancelled sub-500s smoke tests wildly over-quote and mask the loss — they price a "
+        f"different (shorter) run than they ran, so they are not real revenue. The honest, "
+        f"no-output-multiplier equation is centered on the *median* run, but real cost is "
+        f"right-skewed (a few big rollouts dominate the dollars), so a per-run-accurate quote "
+        f"sits below the *mean* cost: accurate, but it loses money used raw. Breaking even "
+        f"needs either tighter big-rollout accuracy or an explicit margin on top (a business "
+        f"markup, kept separate from the equation — NOT a hidden factor inside it)."
+    )
     return f"""# Cost equation accuracy vs measured RunPod/Vast cost
 
 `flash.cost.estimate_cost` is **fully equation-based**: `cost = wall-clock hours x market
@@ -65,10 +89,13 @@ gives.
 
 {_acc_table(acc)}
 
-`agg bias` is **not forced to 1.0** -- forcing it would be exactly the output hack this
-equation avoids. The meaningful rows are **`real_*`** (runs >= 500s that actually executed
-their configured work): real GRPO lands at **~23% median APE, ~70% of runs within a third**
-of measured -- accurate for a pre-flight quote. Runs <500s over-predict badly because they
+{money}
+
+The net $ is **not forced to zero** -- forcing it (scaling the estimate to hit break-even)
+would be exactly the output hack this equation avoids. The meaningful rows are **`real_*`**
+(runs >= 500s that actually executed their configured work): real GRPO lands at **~23% median
+APE, ~70% of runs within a third** of measured -- accurate for a pre-flight quote. Runs <500s
+over-predict badly because they
 never ran their configured steps (cancelled / step-capped smoke tests -- the tell is that
 predicted train time alone exceeds the whole measured wall), so their measured cost is for
 a different, shorter run than the equation prices: an invalid comparison, not an estimator
