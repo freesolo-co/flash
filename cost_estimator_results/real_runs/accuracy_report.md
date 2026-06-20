@@ -6,16 +6,16 @@ grading, the spot/queue rate the provider bills). **There is no output multiplie
 dollar figure is not scaled to hit any target. The numbers below are whatever the equation
 gives.
 
-## Accuracy vs measured cost (n=58 real runs)
+## Accuracy vs measured cost (n=60 real runs)
 
 | Group | n | mean MAPE | median APE | agg bias (Σest/Σmeas) | within 33% | within 50% |
 |---|---:|---:|---:|---:|---:|---:|
-| all | 58 | 108% | 34% | 1.166 | 50% | 66% |
+| all | 60 | 107% | 37% | 1.008 | 48% | 63% |
 | sft | 13 | 186% | 51% | 1.535 | 15% | 46% |
-| grpo | 45 | 86% | 23% | 1.135 | 60% | 71% |
-| real | 41 | 37% | 22% | 0.896 | 63% | 80% |
+| grpo | 47 | 86% | 23% | 0.972 | 57% | 68% |
+| real | 43 | 39% | 23% | 0.776 | 60% | 77% |
 | real_sft | 6 | 50% | 47% | 0.999 | 17% | 50% |
-| real_grpo | 35 | 35% | 22% | 0.888 | 71% | 86% |
+| real_grpo | 37 | 37% | 22% | 0.763 | 68% | 81% |
 
 `agg bias` is **not forced to 1.0** -- forcing it would be exactly the output hack this
 equation avoids. The meaningful rows are **`real_*`** (runs >= 500s that actually executed
@@ -27,15 +27,16 @@ a different, shorter run than the equation prices: an invalid comparison, not an
 error. The remaining real-run residual is cold-start spread (implied cold-start is a stable
 ~480-520s on long runs) + per-step scatter; it is a central estimate, not a fake-precise point.
 
-## Calibrated physical inputs (realized market $/hr, from 57 runs' billing)
+## Calibrated physical inputs (realized market $/hr, from 59 runs' billing)
 
 The equation prices at the **realized (spot/queue) rate** providers actually bill, not the
 on-demand list price. Median of the providers' recorded rate per class:
 
 "A100 PCIe": 1.035,
 "A100 SXM": 1.133,
+"H100": 10.037,
 "RTX 3090": 0.239,
-"RTX 4090": 0.419,
+"RTX 4090": 0.426,
 "RTX 5090": 0.871,
 "RTX 6000 Ada": 0.601,
 "RTX A5000": 0.304

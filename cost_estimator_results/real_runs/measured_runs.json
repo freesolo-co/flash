@@ -986,6 +986,40 @@
    "gpu": "RTX 5090",
    "provider": "vast",
    "hourly_usd": 0.9362962962962962
+  },
+  {
+   "run_id": "autoslm-1781913361-c783648c",
+   "model": "Qwen/Qwen3.5-0.8B",
+   "method": "grpo",
+   "steps": 6,
+   "group_size": 8,
+   "batch_size": 64,
+   "completion_len": 1024,
+   "seq_len": 2048,
+   "environment": "freesolo-co/autoslm-bench",
+   "setup_repeats": 1,
+   "cost_usd": 4.060161,
+   "wall_seconds": 1456.2,
+   "gpu": "H100",
+   "provider": "vast",
+   "hourly_usd": 10.213777777777777
+  },
+  {
+   "run_id": "autoslm-1781916651-1de2859c",
+   "model": "Qwen/Qwen3.5-9B",
+   "method": "grpo",
+   "steps": 6,
+   "group_size": 8,
+   "batch_size": 64,
+   "completion_len": 1024,
+   "seq_len": 2048,
+   "environment": "freesolo-co/autoslm-bench",
+   "setup_repeats": 1,
+   "cost_usd": 0.545165,
+   "wall_seconds": 1138.5,
+   "gpu": "RTX 4090",
+   "provider": "vast",
+   "hourly_usd": 1.76
   }
  ]
 }
