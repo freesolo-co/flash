@@ -1,4 +1,4 @@
-# Flash GRPO benchmark: Qwen3.5-4B on GSM8K.
+# Flash GRPO benchmark: Qwen3.5-4B on reverse-text.
 # Matched to the Tinker side: 30 steps, group_size=4, batch_size=4, max_tokens=512.
 # 4B GRPO needs >=35 GB VRAM, so the allocator escalates RTX 5090 -> A100 PCIe.
 
@@ -6,14 +6,14 @@ model = "Qwen/Qwen3.5-4B"
 algorithm = "grpo"
 
 [environment]
-id = "primeintellect/gsm8k"
+id = "primeintellect/reverse-text"
 
 [train]
 steps            = 30
 group_size       = 4
 batch_size       = 4
 max_tokens       = 512
-hf_repo          = "DavidBShan/flash-bench-gsm8k-4b"
+hf_repo          = "DavidBShan/flash-bench-reverse-text-4b"
 eval_examples    = 50
 eval_every_steps = 10
 

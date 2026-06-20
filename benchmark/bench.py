@@ -39,7 +39,9 @@ _HERE = pathlib.Path(__file__).parent
 _REPO_ROOT = _HERE.parent
 
 # Python interpreter that has `tinker` + `verifiers` installed.
-_DEFAULT_TINKER_PYTHON = "/home/azureuser/workspace/flash-fulltest/.venv/bin/python"
+# Tinker trains server-side, so the local interpreter only needs the tinker SDK +
+# verifiers' rollout/scoring machinery (no torch/vllm). The system python carries both.
+_DEFAULT_TINKER_PYTHON = os.environ.get("TINKER_PYTHON", "/usr/bin/python3")
 _TINKER_RESULT_PATH = "/tmp/tinker_bench_result.json"
 
 

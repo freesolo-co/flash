@@ -34,8 +34,104 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _patch_dataset_builder_for_verifiers_skew() -> None:
+    """Tolerate the tinker_cookbook 0.4.0 <-> verifiers 0.1.14 schema skew.
+
+    The recipe's VerifiersRLDatasetBuilder hard-requires a ``task`` column, but
+    verifiers 0.1.14 single-turn env datasets (gsm8k / hendrycks-math / reverse-text)
+    expose ``[question/prompt/answer/example_id]`` with no ``task`` column. ``task`` is
+    only used as a rollout-group label downstream (it does not feed the reward), so we
+    default it to the env id when absent. Mirrors the original builder otherwise.
+    """
+    from tinker_cookbook.recipes.verifiers_rl import verifiers_env as _ve
+    import verifiers as vf
+
+    async def _call(self):  # noqa: ANN001
+        env = _ve.get_vf_env()
+        if env is None:
+            env = vf.load_environment(self.vf_env_id, **self.vf_env_args)
+            _ve.set_vf_env(env)
+        ds = env.get_dataset(n=self.dataset_n, seed=self.dataset_seed)
+        cols = ds.column_names
+        rows = [
+            {
+                "prompt": ds["prompt"][i],
+                "example_id": ds["example_id"][i] if "example_id" in cols else i,
+                "task": ds["task"][i] if "task" in cols else self.vf_env_id,
+                **({"answer": ds["answer"][i]} if "answer" in cols else {}),
+                **({"info": ds["info"][i]} if "info" in cols else {}),
+            }
+            for i in range(len(ds))
+        ]
+        return _ve.VerifiersRLDataset(rows, env, self.groups_per_batch), None
+
+    _ve.VerifiersRLDatasetBuilder.__call__ = _call
+
+
+def _patch_rollout_for_verifiers(model_name: str, group_size: int) -> None:
+    """Wire the verifiers rollout into the *actual* call site.
+
+    The recipe sets ``train.do_group_rollout = custom`` for monkey-patching, but in
+    tinker_cookbook 0.4.0 the sync training loop reaches rollouts via
+    ``rollouts.do_group_rollout_and_filter_constant_reward`` -> the module-local
+    ``rollouts.do_group_rollout`` — so the recipe's patch on ``train`` is dead code and
+    the generic rollout path returns no trajectories (``zip(*[])`` -> ValueError). We
+    patch ``rollouts.do_group_rollout`` directly with the recipe's verifiers logic
+    (generate via the Tinker OpenAI shim, score with the verifiers env, convert to a
+    TrajectoryGroup). State (client/renderer/tokenizer) is cached across groups.
+    """
+    from typing import cast
+
+    import tinker_cookbook.rl.rollouts as rollouts
+    from tinker_cookbook import model_info, renderers
+    from tinker_cookbook.completers import TinkerTokenCompleter
+    from tinker_cookbook.recipes.verifiers_rl.tinker_openai import TinkerAsyncOpenAIClient
+    from tinker_cookbook.recipes.verifiers_rl.verifiers_env import (
+        VerifiersEnvGroupBuilder,
+        convert_states_to_trajectory_group,
+    )
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
+    from verifiers.utils.async_utils import maybe_semaphore
+
+    cache: dict = {"client": None, "renderer": None, "tokenizer": None}
+
+    async def _custom(env_group_builder, policy, strategy=None):  # noqa: ANN001
+        if cache["tokenizer"] is None:
+            cache["tokenizer"] = get_tokenizer(model_name)
+            rname = model_info.get_recommended_renderer_name(model_name)
+            cache["renderer"] = renderers.get_renderer(rname, cache["tokenizer"])
+        sampling_client = cast(TinkerTokenCompleter, policy).sampling_client
+        if cache["client"] is None:
+            cache["client"] = TinkerAsyncOpenAIClient(
+                sampling_client, cache["renderer"], cache["tokenizer"]
+            )
+        else:
+            cache["client"].set_sampling_client(sampling_client)
+
+        vf_builder = cast(VerifiersEnvGroupBuilder, env_group_builder)
+        rollout_inputs = vf_builder.get_rollout_inputs(group_size)
+        gen_sem = await maybe_semaphore(-1)
+        score_sem = await maybe_semaphore(-1)
+        states = await vf_builder.vf_env.run_group(
+            group_inputs=rollout_inputs,
+            client=cache["client"],
+            model="tinker",
+            gen_sampling_args={
+                "max_tokens": policy.max_tokens,
+                "temperature": policy.temperature,
+            },
+            gen_sem=gen_sem,
+            score_sem=score_sem,
+        )
+        return convert_states_to_trajectory_group(states)
+
+    rollouts.do_group_rollout = _custom
+
+
 async def _run(args: argparse.Namespace) -> dict:
     """Run Tinker GRPO training and return a metrics dict."""
+    _patch_dataset_builder_for_verifiers_skew()
+    _patch_rollout_for_verifiers(args.model, args.group_size)
     from tinker_cookbook.recipes.verifiers_rl.train import CLIConfig, cli_main
 
     cfg = CLIConfig(
@@ -46,8 +142,10 @@ async def _run(args: argparse.Namespace) -> dict:
         group_size=args.group_size,
         max_tokens=args.max_tokens,
         max_steps=args.steps,
-        # eval every 10 steps (disable with 0 to keep parity with flash eval cadence)
-        eval_every=10,
+        # The verifiers_rl recipe does not wire evaluator_builders, so in-loop eval
+        # would no-op. Held-out eval is done separately (eval_runner.py) for both
+        # platforms on the same GSM8K test split — that is the apples-to-apples metric.
+        eval_every=0,
         save_every=args.steps,
         log_path=args.log_path,
         behavior_if_log_dir_exists="delete",
@@ -88,9 +186,21 @@ def main() -> None:
     # Run the async training
     timing = asyncio.run(_run(args))
 
-    # Extract reward trajectory from metrics.jsonl
+    # Extract reward trajectory from metrics.jsonl. The mean group reward per step is
+    # logged under "env/all/reward/total" (tinker_cookbook 0.4.0 + verifiers 0.1.9).
     records = _read_metrics_jsonl(args.log_path)
-    reward_history = [r.get("reward/total", 0.0) for r in records if "reward/total" in r]
+
+    def _reward_of(rec: dict) -> float | None:
+        for key in ("env/all/reward/total", "reward/total"):
+            if key in rec:
+                return rec[key]
+        # fall back to any "<scope>/reward/total" key
+        for k, v in rec.items():
+            if k.endswith("reward/total"):
+                return v
+        return None
+
+    reward_history = [r for r in (_reward_of(rec) for rec in records) if r is not None]
 
     result = {
         "platform": "tinker",
