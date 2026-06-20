@@ -52,47 +52,16 @@ def test_pinned_undersized_gpu_escalates_never_below_need(monkeypatch):
         allocator.allocate("Qwen/Qwen3.5-4B", "grpo", gpu="RTX 4090")
 
 
-def test_validation_gate_and_opt_in(monkeypatch):
+def test_no_validation_gate_picks_cheapest_fitting(monkeypatch):
     from flash.providers import allocator
 
     monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
-    # L4 is validated nowhere -> excluded by default...
+    # There is no validation gate: the cheapest fitting class wins even if it's a class
+    # Flash hasn't smoke-tested (previously the gate forced the cheapest VALIDATED class,
+    # RTX A5000 @ $0.27, for 0.8B GRPO). Offline only RunPod is available.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
-    # ...but the explicit opt-in admits cheaper unvalidated classes
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", allow_unvalidated=True)
     assert a.provider == "runpod"
-    assert a.hourly_usd <= 0.27  # an unvalidated class is at least as cheap as the A5000
-
-
-def test_provider_pin_runpod(monkeypatch):
-    from flash.providers import allocator
-
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="runpod")
-    assert a.provider == "runpod"
-    assert all(c.provider == "runpod" for c in a.candidates)
-
-
-def test_unknown_provider_rejected(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
-
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    # A name not in PROVIDER_NAMES is an "unknown provider".
-    with pytest.raises(UnsupportedGpuError, match="unknown provider"):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="lambda")
-
-
-def test_known_provider_unavailable_offline(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
-
-    # vast is a known provider but offline (FLASH_SKIP_NET) it is not available.
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    with pytest.raises(UnsupportedGpuError, match="not available"):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="vast")
+    assert a.hourly_usd <= 0.27  # at least as cheap as the previously-validated A5000 floor
 
 
 def test_skip_net_matches_static_cheapest(monkeypatch):
@@ -218,5 +187,5 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
     ]
     for model, algo, tr in grid:
         need = required_vram_gb(model, algo, train=tr)
-        alloc = allocate(model, algo, provider="runpod", allow_unvalidated=True, train=tr)
+        alloc = allocate(model, algo, train=tr)
         assert get_gpu_info(alloc.gpu).vram_gb >= need, (model, algo, tr, alloc.gpu, need)

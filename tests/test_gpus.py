@@ -73,12 +73,12 @@ def test_cheapest_gpu_policy(monkeypatch):
     from flash.providers.runpod import pricing
 
     monkeypatch.setenv("FLASH_SKIP_NET", "1")  # static rates only
-    # RTX A5000 (validated 2026-06-11) is the cheapest 24GB-capable class.
-    assert gpus.cheapest_gpu(24) == "RTX A5000"
-    assert gpus.cheapest_gpu(32) == "RTX 5090"
-    # With unvalidated classes allowed, cheaper Ampere cards win on static rates.
-    assert gpus.cheapest_gpu(16, include_unvalidated=True) == "RTX 2000 Ada"
-    assert gpus.cheapest_gpu(48, include_unvalidated=True) == "A40"
+    # No validation gate: the cheapest enum class that fits each VRAM tier wins on static rates.
+    assert gpus.cheapest_gpu(16) == "RTX 2000 Ada"
+    assert gpus.cheapest_gpu(24) == "RTX A5000"  # cheapest >=24G enum class
+    # A40 (48G @ $0.44) beats RTX 5090 (32G @ $0.99) at the 32G tier — bigger AND cheaper.
+    assert gpus.cheapest_gpu(32) == "A40"
+    assert gpus.cheapest_gpu(48) == "A40"
     with pytest.raises(gpus.UnsupportedGpuError):
         gpus.cheapest_gpu(4096)
     # static fallback rates cover every known class
@@ -90,20 +90,18 @@ def test_resolve_gpu_policy(monkeypatch):
     from flash.providers.base import resolve_gpu_policy
 
     monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
-    # small model GRPO -> cheapest validated 24 GB class (A5000); 9B GRPO needs the 32 GB
-    # tier (5090). (resolve_gpu_policy sizes for the passed algorithm; 9B SFT is lighter.)
+    # No gate: pick the cheapest fitting class. 0.8B GRPO -> cheapest >=24G (A5000). 9B GRPO
+    # needs the 32G tier, where A40 (48G @ $0.44) is cheaper than RTX 5090 (32G @ $0.99).
     assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX A5000"
-    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-9B", algorithm="grpo") == "RTX 5090"
+    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-9B", algorithm="grpo") == "A40"
     # concrete names pass through canonicalization
     assert resolve_gpu_policy("rtx5090", "Qwen/Qwen3.5-4B") == "RTX 5090"
 
 
-def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
-    from flash.schema import ConfigError, spec_from_dict
+def test_config_cheapest_policy_no_gate(monkeypatch):
+    from flash.schema import spec_from_dict
 
     monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
@@ -112,26 +110,11 @@ def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
         "gpu": {"type": "cheapest"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    assert spec.gpu.type == "RTX A5000"  # cheapest validated class for a small model
-    # class validated on NO provider blocked without opt-in...
-    raw["gpu"] = {"type": "L4"}
-    with pytest.raises(ConfigError):
-        spec_from_dict(raw, run_id="x")
-    # ...allowed with the config opt-in
-    raw["gpu"] = {"type": "L4", "allow_unvalidated": True}
-    spec = spec_from_dict(raw, run_id="x")
-    assert spec.gpu.type == "L4"
-    # RTX 3090 is validated on vast (validated on ANY provider) so it parses with no
-    # opt-in when the provider is left "auto".
-    raw["gpu"] = {"type": "RTX 3090"}
-    assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 3090"
-    # ...but pinning it to runpod (where it is NOT validated) is blocked without opt-in
-    raw["gpu"] = {"type": "RTX 3090", "provider": "runpod"}
-    with pytest.raises(ConfigError):
-        spec_from_dict(raw, run_id="x")
-    # ...and allowed with the opt-in
-    raw["gpu"] = {"type": "RTX 3090", "provider": "runpod", "allow_unvalidated": True}
-    assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 3090"
+    assert spec.gpu.type == "RTX 2000 Ada"  # cheapest fitting class for a small model (no gate)
+    # A class Flash hasn't smoke-tested is now accepted with no opt-in (no validation gate).
+    for klass in ("L4", "L40S", "RTX 3090", "A40"):
+        raw["gpu"] = {"type": klass}
+        assert spec_from_dict(raw, run_id="x").gpu.type == klass
 
 
 def test_flash_gpu_enum_members():
@@ -156,7 +139,7 @@ def test_config_rejects_unsupported_gpu():
         "algorithm": "grpo",
         "environment": {"id": "primeintellect/gsm8k"},
         "train": {"steps": 1, "seeds": [0], "hf_repo": "owner/runs"},
-        "gpu": {"type": "L40S"},  # not a managed GPU class
+        "gpu": {"type": "Banana GPU 9000"},  # not a known GPU class at all
     }
     with pytest.raises(ConfigError):
         spec_from_dict(raw, run_id="x")
@@ -172,7 +155,7 @@ def test_config_defaults_gpu_from_model():
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    assert spec.gpu.type == "RTX A5000"  # 9B is 4-bit QLoRA now -> fits 24GB
+    assert spec.gpu.type == "RTX 2000 Ada"  # 9B 4-bit QLoRA fits 16GB; no gate -> cheapest class
 
 
 def test_build_worker_env():

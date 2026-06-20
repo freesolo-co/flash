@@ -28,7 +28,6 @@ from flash.providers.base import (
     Candidate,
     UnsupportedGpuError,
     canonical_gpu,
-    unvalidated_allowed,
 )
 
 logger = get_logger(__name__)
@@ -71,16 +70,15 @@ def required_vram_gb(
     )
 
 
-def _runpod_candidates(need: int, pinned_gpu: str | None, allow_unval: bool) -> list[Candidate]:
-    """RunPod's fitting classes priced live (static fallback)."""
+def _runpod_candidates(need: int, pinned_gpu: str | None) -> list[Candidate]:
+    """RunPod's fitting classes priced live (static fallback). Every fitting class is
+    eligible — there is no validation gate."""
     provider = get_provider("runpod")
     out: list[Candidate] = []
     for g in provider.gpu_classes():
         if g.vram_gb < need:
             continue
         if pinned_gpu and g.name != pinned_gpu:
-            continue
-        if "runpod" not in g.validated_on and not allow_unval:
             continue
         out.append(
             Candidate(
@@ -97,7 +95,6 @@ def _runpod_candidates(need: int, pinned_gpu: str | None, allow_unval: bool) -> 
 def _vast_candidates(
     need: int,
     pinned_gpu: str | None,
-    allow_unval: bool,
     disk_gb: int,
     exclude_machine_ids,
     *,
@@ -135,8 +132,6 @@ def _vast_candidates(
         if pinned_gpu and o.gpu != pinned_gpu:
             continue
         info = GPU_INFO[o.gpu]
-        if "vast" not in info.validated_on and not allow_unval:
-            continue
         if o.gpu in seen:  # offers are price-sorted; keep the cheapest per class
             continue
         seen.add(o.gpu)
@@ -153,46 +148,34 @@ def allocate(
     algorithm: str,
     *,
     gpu: str | None = None,
-    provider: str = "auto",
     disk_gb: int = 60,
-    allow_unvalidated: bool | None = None,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
     train=None,
     thinking: bool = False,
 ) -> Allocation:
-    """Pick the cheapest (provider, GPU class) able to run the job across providers.
+    """Pick the cheapest (provider, GPU class) able to run the job across ALL providers.
 
-    ``gpu`` pins the class (the allocator then only picks the provider); ``provider``
-    pins the substrate ("auto"/"runpod"/"vast"). Both default to fully automatic.
-    ``train``/``thinking`` size the requirement to the run's actual knobs (context, group,
-    rank, batch) via the matrix — long context / large group route up, small runs down.
+    ``gpu`` pins the class (the allocator then only picks the provider); with no pin it picks
+    the cheapest fitting class across runpod+vast. There is no validation gate and no provider
+    pin — every fitting class on every live provider is eligible. ``train``/``thinking`` size
+    the requirement to the run's actual knobs (context, group, rank, batch) via the matrix.
     """
-    if provider not in ("auto", *PROVIDER_NAMES):
-        raise UnsupportedGpuError(
-            f"unknown provider {provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
-        )
     pinned_gpu = canonical_gpu(gpu) if gpu else None
     # The model's requirement is the floor regardless of a pin: an undersized concrete
     # pin (e.g. Qwen3-8B on a 24 GB card) must drop out of the candidate filter and
     # raise here, not provision a paid worker that OOMs. The pin only narrows WHICH
     # fitting class is chosen, never lowers the VRAM bar.
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
-    allow_unval = unvalidated_allowed(allow_unvalidated)
     live = available_providers()
-    if provider != "auto" and provider not in live:
-        raise UnsupportedGpuError(
-            f"provider {provider!r} requested but not available on this control plane "
-            f"(available: {', '.join(live) or '(none)'}; vast needs VAST_API_KEY)"
-        )
 
     def _gather(pin: str | None) -> tuple[list[Candidate], tuple]:
         cands: list[Candidate] = []
         book: tuple = ()
-        if provider in ("auto", "runpod") and "runpod" in live:
-            cands += _runpod_candidates(need, pin, allow_unval)
-        if provider in ("auto", "vast") and "vast" in live:
+        if "runpod" in live:
+            cands += _runpod_candidates(need, pin)
+        if "vast" in live:
             vcands, book = _vast_candidates(
-                need, pin, allow_unval, disk_gb, exclude_machine_ids, required=(provider == "vast")
+                need, pin, disk_gb, exclude_machine_ids, required=False
             )
             cands += vcands
         return cands, book
@@ -209,9 +192,9 @@ def allocate(
         candidates, offer_book = _gather(None)
     if not candidates:
         raise UnsupportedGpuError(
-            f"no allocatable GPU (>= {need} GB VRAM for {model_id}, provider={provider}, "
-            f"validated_only={not allow_unval}); widen with gpu.allow_unvalidated = true, add a "
-            f"provider (VAST_API_KEY), or the run genuinely exceeds every available GPU class"
+            f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any live provider "
+            f"({', '.join(live) or '(none)'}); add VAST_API_KEY for more classes, or the run "
+            "genuinely exceeds every available GPU class"
         )
     if escalated_from is not None:
         order0 = {n: i for i, n in enumerate(PROVIDER_NAMES)}
@@ -220,11 +203,10 @@ def allocate(
         # WARNING) — a silently-escalated pin changes cost/hardware and operators must see it;
         # still routed through the logger (stderr), so machine-readable stdout stays clean.
         logger.warning(
-            "pinned GPU %r unavailable or below need (%s GB) on provider=%s; "
+            "pinned GPU %r unavailable or below need (%s GB); "
             "escalated to cheapest fitting class %s (%s GB, %s)",
             escalated_from,
             need,
-            provider,
             _cheapest.gpu,
             _cheapest.vram_gb,
             _cheapest.provider,

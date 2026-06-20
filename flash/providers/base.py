@@ -333,12 +333,6 @@ def vast_gpu_for_offer(gpu_name: str, gpu_ram_mb: float) -> str | None:
     return max(fitting, key=lambda g: g.vram_gb).name
 
 
-def unvalidated_allowed(explicit: bool | None = None) -> bool:
-    """Whether configs may target a non-``validated`` GPU class — the per-run ``[gpu]
-    allow_unvalidated`` flag only (managed; no global env override)."""
-    return bool(explicit)
-
-
 def gpu_short(name: str) -> str:
     """Short, endpoint-name-safe token for a GPU (e.g. '4090')."""
     return get_gpu_info(name).short
@@ -349,24 +343,17 @@ def min_cuda_modern(name: str) -> str:
     return get_gpu_info(name).min_cuda_modern or "12.8"
 
 
-def cheapest_gpu(min_vram_gb: int, include_unvalidated: bool = False) -> str:
+def cheapest_gpu(min_vram_gb: int) -> str:
     """Cheapest RunPod GPU class with at least ``min_vram_gb`` VRAM (live rates, cached).
 
     RunPod-static by design (the cross-provider equivalent lives in
     ``flash.providers.allocator``): Vast-only classes are excluded so the result is
-    always deployable via Flash, and offline resolution stays deterministic.
+    always deployable via Flash, and offline resolution stays deterministic. Every
+    fitting class is eligible — there is no validation gate.
     """
-    pool = [
-        g
-        for g in GPU_INFO.values()
-        if g.enum_member
-        and g.vram_gb >= min_vram_gb
-        and (include_unvalidated or "runpod" in g.validated_on)
-    ]
+    pool = [g for g in GPU_INFO.values() if g.enum_member and g.vram_gb >= min_vram_gb]
     if not pool:
-        raise UnsupportedGpuError(
-            f"no {'known' if include_unvalidated else 'validated'} GPU has >= {min_vram_gb} GB VRAM"
-        )
+        raise UnsupportedGpuError(f"no known GPU has >= {min_vram_gb} GB VRAM")
     from flash.providers.runpod.pricing import hourly_rate
 
     return min(pool, key=lambda g: (hourly_rate(g.name), g.vram_gb)).name
@@ -375,7 +362,6 @@ def cheapest_gpu(min_vram_gb: int, include_unvalidated: bool = False) -> str:
 def resolve_gpu_policy(
     requested: str,
     model_id: str,
-    allow_unvalidated: bool | None = None,
     algorithm: str = "sft",
     *,
     train=None,
@@ -383,10 +369,9 @@ def resolve_gpu_policy(
 ) -> str:
     """Resolve ``gpu.type`` (a concrete class or a policy word) to a friendly name.
 
-    Parse-time, RunPod-static provisional: "cheapest"/"auto" pick the cheapest
-    RunPod-validated class whose VRAM covers the model; concrete names are
-    canonicalized. The submit-time allocator (``flash.providers.allocator``)
-    re-resolves policy words live across providers.
+    Parse-time, RunPod-static provisional: "cheapest"/"auto" pick the cheapest RunPod
+    class whose VRAM covers the model; concrete names are canonicalized. The submit-time
+    allocator (``flash.providers.allocator``) re-resolves policy words live across providers.
     """
     key = (requested or "").strip().lower()
     if key not in POLICY_NAMES:
@@ -399,7 +384,7 @@ def resolve_gpu_policy(
     min_vram = model_required_vram_gb(
         model_id, algorithm, train=train, thinking=thinking, headroom=vram_headroom()
     )
-    return cheapest_gpu(min_vram, include_unvalidated=unvalidated_allowed(allow_unvalidated))
+    return cheapest_gpu(min_vram)
 
 
 # ---------------------------------------------------------------------------

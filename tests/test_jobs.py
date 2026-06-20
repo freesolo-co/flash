@@ -356,7 +356,7 @@ def _spec(run_id):
         model="Qwen/Qwen3.5-0.8B",
         algorithm="grpo",
         train=TrainSpec(seeds=(0,), steps=1),
-        gpu=GpuSpec(type="RTX 4090", provider="runpod", max_retries=2),
+        gpu=GpuSpec(type="RTX 4090", max_retries=2),
     )
 
 
@@ -446,7 +446,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(seeds=(0,), steps=1),
-            gpu=GpuSpec(type="cheapest", requested="cheapest", provider="runpod", max_retries=2),
+            gpu=GpuSpec(type="cheapest", requested="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -492,7 +492,7 @@ def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(seeds=(0,), steps=1),
-            gpu=GpuSpec(type="RTX 4090", requested="RTX 4090", provider="runpod", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", requested="RTX 4090", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -543,7 +543,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(seeds=(0,), steps=1),
-            gpu=GpuSpec(type="cheapest", requested="cheapest", provider="runpod", max_retries=2),
+            gpu=GpuSpec(type="cheapest", requested="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -662,7 +662,7 @@ def test_attach_clears_stale_handle_before_resuming_seeds(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(seeds=(0, 1), steps=1),
-            gpu=GpuSpec(type="RTX 4090", provider="runpod", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         orch._save_status(
             orch.RunStatus(

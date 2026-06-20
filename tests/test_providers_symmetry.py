@@ -204,20 +204,12 @@ def test_allocator_prefers_runpod_on_price_tie(monkeypatch):
     from flash.providers.allocator import allocate
 
     _mock_both_available(monkeypatch)
-    # vast RTX A5000 at the same price as runpod's RTX A5000 ($0.27 static): runpod wins
-    # the tie (longest-validated substrate / registry order).
+    # Same class at the same price on both providers: runpod wins the tie (registry order).
+    # Pin the class so the tie is between providers, not classes (no gate now, so an
+    # unpinned 0.8B run would otherwise pick the globally-cheapest class).
     _mock_vast_offers(monkeypatch, [_offer(gpu="RTX A5000", dph=0.27)])
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft")
+    a = allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="RTX A5000")
     assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
-
-
-def test_allocator_provider_pin_vast(monkeypatch):
-    from flash.providers.allocator import allocate
-
-    _mock_both_available(monkeypatch)
-    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 3090", dph=0.50)])
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft", provider="vast")
-    assert a.provider == "vast"  # pinned even though a cheaper runpod class exists
 
 
 def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):
@@ -230,12 +222,9 @@ def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):
         raise RuntimeError("vast offer search 500")
 
     monkeypatch.setattr(jobs, "usable_offers", boom)
-    # provider="auto": a vast failure degrades to runpod-only, never raises
+    # A vast offer-search failure degrades to runpod-only and never raises (no provider pin).
     a = allocate("Qwen/Qwen3.5-0.8B", "sft")
     assert a.provider == "runpod"
-    # provider="vast": the same failure is a hard error
-    with pytest.raises(Exception, match="vast offer search failed"):
-        allocate("Qwen/Qwen3.5-0.8B", "sft", provider="vast")
 
 
 def test_allocator_gpu_pin_chooses_provider(monkeypatch):
@@ -244,7 +233,7 @@ def test_allocator_gpu_pin_chooses_provider(monkeypatch):
 
     _mock_both_available(monkeypatch)
     _mock_vast_offers(monkeypatch, [_offer(gpu="L40S", dph=0.80)])
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="L40S", allow_unvalidated=True)
+    a = allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="L40S")
     assert (a.provider, a.gpu) == ("vast", "L40S")
 
 
@@ -266,7 +255,7 @@ def test_allocator_pinned_larger_gpu_searches_at_pin_size(monkeypatch):
 
     monkeypatch.setattr(jobs, "usable_offers", fake_offers)
     # Qwen3-0.6B needs ~24 GB, but the user pinned the 48 GB A40 -> search at 48
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="A40", allow_unvalidated=True)
+    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="A40")
     assert (a.provider, a.gpu) == ("vast", "A40")
     assert captured["min_vram_gb"] == GPU_INFO["A40"].vram_gb  # searched at the pin size
 

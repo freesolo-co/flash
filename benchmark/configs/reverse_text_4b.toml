@@ -16,5 +16,6 @@ max_tokens       = 1024
 hf_repo          = "DavidBShan/flash-bench-reverse-text-4b"
 
 [gpu]
-requested = "RTX 5090"   # escalates to A100 PCIe (>=35 GB) for 4B GRPO
-provider  = "runpod"
+# Cheapest GPU class that fits, across all providers — no validation gate, no provider
+# pin. 4B GRPO (needs >=35 GB) lands on the A40 (48 GB) at ~$0.44/hr.
+requested = "cheapest"

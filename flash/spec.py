@@ -151,17 +151,12 @@ class TrainSpec:
 @dataclass(frozen=True)
 class GpuSpec:
     type: str = DEFAULT_GPU
-    # GPU substrate: "auto" (cheapest across providers at submit time), "runpod", or
-    # "vast" (verified datacenters only).
-    provider: str = "auto"
     # The raw user gpu.type input ("cheapest"/"auto" or a concrete class), always set
-    # by config parsing. The runner re-allocates the class at submit time iff
-    # this is a policy word — ``type`` is then just the parse-time provisional; a
-    # concrete ``requested`` pins the class and the allocator only picks the provider.
+    # by config parsing. The runner re-allocates the class at submit time iff this is a
+    # policy word — ``type`` is then just the parse-time provisional. The allocator always
+    # picks the cheapest fitting class across ALL providers (no validation gate, no
+    # provider pin); a concrete ``requested`` only narrows which class is chosen.
     requested: str = ""
-    # Whether to allow GPU classes Flash hasn't validated. Set only by the [gpu]
-    # allow_unvalidated TOML field; None leaves it disallowed.
-    allow_unvalidated: bool | None = None
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
@@ -266,9 +261,7 @@ class JobSpec:
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),
-                provider=gpu.get("provider", "auto"),
                 requested=gpu.get("requested", ""),
-                allow_unvalidated=gpu.get("allow_unvalidated"),
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 2)),

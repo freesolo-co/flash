@@ -63,9 +63,9 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
     live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
     fresh per attempt because offers are a live market. A policy ``gpu.requested``
-    ("cheapest"/"auto") lets the allocator pick the class; a concrete ``gpu.requested``
-    pins the class (the allocator then only picks the provider); ``gpu.provider`` pins
-    the substrate.
+    ("cheapest"/"auto") lets the allocator pick the cheapest fitting class across ALL
+    providers; a concrete ``gpu.requested`` pins the class (the allocator then only picks
+    the provider). There is no validation gate and no provider pin.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF
     checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
@@ -186,9 +186,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 spec.model,
                 spec.algorithm,
                 gpu=pinned_gpu,
-                provider=spec.gpu.provider,
                 disk_gb=spec.gpu.disk_gb,
-                allow_unvalidated=spec.gpu.allow_unvalidated,
                 exclude_machine_ids=frozenset(bad_machines),
                 # Pass the run's train knobs + thinking so the VRAM estimate reflects THIS job's
                 # max_length / group_size / batch_size / lora_rank (and the seq escalation) instead

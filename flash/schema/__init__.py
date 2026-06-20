@@ -6,16 +6,10 @@ import tomllib
 from typing import Any
 
 from flash.catalog import normalize_algorithm, resolve_model
-from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
-    POLICY_NAMES,
-    SUPPORTED,
     UnsupportedGpuError,
     canonical_gpu,
-    is_validated,
-    providers_for,
     resolve_gpu_policy,
-    unvalidated_allowed,
 )
 from flash.schema.fields import (
     ConfigError,
@@ -122,44 +116,20 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # original request survives in gpu.requested so the runner knows whether
     # it may re-allocate (policy words) or must honor a concrete pin.
     requested_gpu = str(gpu_raw.get("requested") or gpu_raw.get("type") or "auto")
-    provider = str(gpu_raw.get("provider") or "auto").strip().lower()
-    if provider not in ("auto", *PROVIDER_NAMES):
-        allowed = '", "'.join(("auto", *PROVIDER_NAMES))
-        raise ConfigError(f'gpu.provider must be "{allowed}"')
-    allow_unval = gpu_raw.get("allow_unvalidated")
-    if allow_unval is not None and not isinstance(allow_unval, bool):
-        raise ConfigError("gpu.allow_unvalidated must be a boolean")
     try:
-        # Parse-time provisional: "cheapest"/"auto" resolve to the cheapest validated
-        # GPU class that fits (across providers, deterministic offline; open models
-        # sized from HF metadata); concrete names are canonicalized. The submit-time
-        # allocator re-resolves policy words live across providers.
+        # Parse-time provisional: "cheapest"/"auto" resolve to the cheapest GPU class that
+        # fits (deterministic offline; open models sized from HF metadata); concrete names are
+        # canonicalized. The submit-time allocator re-resolves policy words live across ALL
+        # providers — every fitting class is eligible (no validation gate, no provider pin).
         gpu_type = resolve_gpu_policy(
             requested_gpu,
             model,
-            allow_unvalidated=allow_unval,
             algorithm=algorithm,
             train=train_raw,
             thinking=thinking,
         )
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
-    pinned = requested_gpu.strip().lower() not in POLICY_NAMES
-    if pinned and provider != "auto" and provider not in providers_for(gpu_type):
-        raise ConfigError(
-            f"gpu type {gpu_type!r} is not available on provider {provider!r} "
-            f"(providers: {', '.join(providers_for(gpu_type))})"
-        )
-    if (
-        pinned
-        and not is_validated(gpu_type, provider if provider != "auto" else None)
-        and not unvalidated_allowed(allow_unval)
-    ):
-        raise ConfigError(
-            f"gpu type {gpu_type!r} has not passed Flash's live validation smoke"
-            f"{' on ' + provider if provider != 'auto' else ''} "
-            f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true to use it anyway."
-        )
     try:
         info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
     except ValueError as exc:
@@ -224,9 +194,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         ),
         gpu=GpuSpec(
             type=gpu_type,
-            provider=provider,
             requested=requested_gpu,
-            allow_unvalidated=allow_unval,
             disk_gb=int(gpu_raw.get("disk_gb", 60)),
             max_wall_seconds=int(gpu_raw.get("max_wall_seconds", 24 * 3600)),
             max_retries=int(gpu_raw.get("max_retries", 2)),

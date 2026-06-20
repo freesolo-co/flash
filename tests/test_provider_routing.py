@@ -365,40 +365,24 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
 # ---------------------------------------------------------------------------
 # config: provider fields
 # ---------------------------------------------------------------------------
-def test_config_provider_fields(monkeypatch):
-    from flash.schema import ConfigError, spec_from_dict
+def test_config_gpu_fields(monkeypatch):
+    from flash.schema import spec_from_dict
 
     monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "environment": {"id": "owner/env"},
     }
-    # omitted gpu.type -> smart-allocation default, original request preserved
+    # omitted gpu.type -> smart-allocation default (cheapest fitting), original request preserved
     spec = spec_from_dict(dict(base), run_id="x")
     assert spec.gpu.requested == "auto"
-    assert spec.gpu.provider == "auto"
-    assert spec.gpu.type == "RTX A5000"  # deterministic offline provisional
-    # round-trip keeps the routing fields
+    assert spec.gpu.type == "RTX 2000 Ada"  # deterministic offline cheapest-fitting provisional
+    # round-trip keeps the request word
     again = JobSpec.from_dict(spec.to_dict())
-    assert (again.gpu.provider, again.gpu.requested) == ("auto", "auto")
-
-    with pytest.raises(ConfigError, match="provider"):
-        spec_from_dict({**base, "gpu": {"provider": "lambda"}}, run_id="x")
-    # class/provider mismatch fails at parse time
-    with pytest.raises(ConfigError, match="not available on provider"):
-        spec_from_dict(
-            {**base, "gpu": {"type": "L40S", "provider": "runpod", "allow_unvalidated": True}},
-            run_id="x",
-        )
-    # vast-only class pinned to vast parses (with the unvalidated opt-in)
-    spec = spec_from_dict(
-        {**base, "gpu": {"type": "L40S", "provider": "vast", "allow_unvalidated": True}},
-        run_id="x",
-    )
+    assert again.gpu.requested == "auto"
+    # any known class is accepted with no provider pin or validation gate
+    spec = spec_from_dict({**base, "gpu": {"type": "L40S"}}, run_id="x")
     assert spec.gpu.type == "L40S"
-    assert spec.gpu.provider == "vast"
     assert spec.gpu.requested == "L40S"
-    assert spec.gpu.allow_unvalidated is True

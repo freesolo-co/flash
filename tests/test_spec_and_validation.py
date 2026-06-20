@@ -54,7 +54,6 @@ def _raw(**overrides) -> dict:
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         ({"model_policy": "yolo"}, "model_policy"),
-        ({"gpu.allow_unvalidated": "yes"}, "must be a boolean"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
