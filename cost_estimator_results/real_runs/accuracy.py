@@ -72,10 +72,18 @@ def build_report() -> str:
         runs_label = f"{real['n']} real runs (those that actually ran their configured work)"
     else:
         runs_label = f"{real['n']} runs (all groups; no ≥500s subset in this dataset)"
-    # Compute dynamic accuracy numbers from the data to avoid prose drifting from the table.
-    rg = acc.get("real_grpo") or acc.get("real") or {}
-    grpo_ape = f"~{rg['median_ape_pct']:.0f}%" if rg else "N/A"
-    grpo_within = f"~{rg['within_33pct'] * 100:.0f}%" if rg else "N/A"
+    # Headline the meaningful accuracy row dynamically (avoids prose drifting from the table).
+    # Use ``real_grpo`` ONLY for the "real GRPO" claim — never blend in the broader ``real``
+    # group (which may include SFT), which would mislabel SFT/blended stats as GRPO. When
+    # ``real_grpo`` is absent, label the sentence for whatever group actually backs the number.
+    if "real_grpo" in acc:
+        rg, grpo_label = acc["real_grpo"], "real GRPO"
+    elif "real" in acc:
+        rg, grpo_label = acc["real"], "the real (≥500s) runs"
+    else:
+        rg, grpo_label = acc["all"], "all runs"  # acc["all"] is always present
+    grpo_ape = f"~{rg['median_ape_pct']:.0f}%"
+    grpo_within = f"~{rg['within_33pct'] * 100:.0f}%"
     money = (
         f"**Money outcome — does the estimator break even, gain, or lose?** If the estimate "
         f"is the quote and the measured cost is what we pay the provider, then over the "
@@ -107,7 +115,7 @@ gives.
 
 The net $ is **not forced to zero** -- forcing it (scaling the estimate to hit break-even)
 would be exactly the output hack this equation avoids. The meaningful rows are **`real_*`**
-(runs >= 500s that actually executed their configured work): real GRPO lands at **{grpo_ape} median
+(runs >= 500s that actually executed their configured work): {grpo_label} lands at **{grpo_ape} median
 APE, {grpo_within} of runs within a third** of measured -- accurate for a pre-flight quote. Runs <500s
 over-predict badly because they
 never ran their configured steps (cancelled / step-capped smoke tests -- the tell is that
