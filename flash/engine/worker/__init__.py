@@ -832,7 +832,7 @@ def run_sft():
             "2.10). Bake flash-attn into the worker image to enable FA2 varlen packing."
         )
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
-    # cross-entropy is the big large-vocab (Qwen ~152k) memory/throughput win.
+    # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
     if liger_on(_memory_mode(model_id, sft_max_len)):
         cfg_kwargs["use_liger_kernel"] = True
         print("[sft] liger fused kernels enabled")
@@ -1075,7 +1075,7 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
 
 def rl_per_device_comps(
     completion_len: int = 0,
-    vocab: int = 152_000,
+    vocab: int = 248_320,
     *,
     use_vllm: bool = True,
     params_b: float | None = None,
@@ -1083,8 +1083,8 @@ def rl_per_device_comps(
     """Per-device *completion* micro-batch for GRPO (TRL counts completions, not prompts).
 
     This, not grad-accum, sets peak trainer VRAM: the logprob pass materializes fp32 logits
-    of shape [per_device, completion_len, vocab]. At Qwen's ~152k vocab a long completion is
-    enormous (measured: per_device 8 x 4096 tok x 152k x 4 B = ~20 GiB single alloc -> OOMs
+    of shape [per_device, completion_len, vocab]. At Qwen3.5's ~248k vocab a long completion is
+    enormous (measured: per_device 8 x 4096 tok x 248k x 4 B = ~30 GiB single alloc -> OOMs
     a small card). So we MEMORY-CAP per_device to a logits budget (6 GB) for the
     given completion length, then push the difference into grad-accum
     (compute_grpo_batching) so the effective batch is unchanged. This keeps long-completion
@@ -1576,7 +1576,11 @@ def run_rl():
     # a per-device cap -> colocate OOM. Best-effort: stays None offline, keeping prior behavior.
     if _params_b is None:
         _params_b = fetch_hf_params_b(model_id)
-    per_device_comps = rl_per_device_comps(_max_completion, use_vllm=use_vllm, params_b=_params_b)
+    from flash.catalog import vocab_size_for
+
+    per_device_comps = rl_per_device_comps(
+        _max_completion, vocab=vocab_size_for(model_id), use_vllm=use_vllm, params_b=_params_b
+    )
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
         print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
@@ -1636,11 +1640,11 @@ def run_rl():
         "optim": fused_optim_name(),
     }
     # Liger fused GRPO loss: fuses the lm_head + per-token logprob so the fp32
-    # [batch, seq, ~152k vocab] logits never materialize — the documented GRPO OOM driver.
+    # [batch, seq, ~248k vocab] logits never materialize — the documented GRPO OOM driver.
     # TRL 1.6's GRPOConfig flag is `use_liger_kernel` (NOT `use_liger_loss`, which doesn't
     # exist in 1.6). DEFAULT ON for the GRPO path regardless of model size: MEASURED that
     # WITHOUT it even Qwen3.5-0.8B GRPO OOMs a 24 GB (and 32 GB) card because the per-completion
-    # logits over the 152k vocab dominate — the small-scale JIT cost is far cheaper than the OOM.
+    # logits over the 248k vocab dominate — the small-scale JIT cost is far cheaper than the OOM.
     # (This differs from SFT, where Liger is gated by size since 1B-class SFT can be net-negative.)
     if liger_on(True):
         grpo_kwargs["use_liger_kernel"] = True
