@@ -122,6 +122,17 @@ def test_environment_must_be_a_table() -> None:
         spec_from_dict(raw)
 
 
+@pytest.mark.parametrize("section", ["gpu", "environment", "train"])
+def test_falsy_non_table_section_is_rejected_not_coerced(section: str) -> None:
+    # A present-but-falsy non-dict (e.g. `gpu = false`) must hit the "must be a table" check,
+    # not be silently coerced to {} by `or {}` (which would bypass validation). A MISSING
+    # section still defaults to an empty table (covered by the happy-path tests).
+    raw = _raw()
+    raw[section] = False
+    with pytest.raises(ConfigError, match=rf"\[{section}\] must be a table"):
+        spec_from_dict(raw)
+
+
 def test_jobspec_from_dict_rejects_path() -> None:
     # Defense-in-depth: a stale worker payload carrying a local path must be rejected.
     data = {

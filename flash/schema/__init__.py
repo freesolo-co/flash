@@ -98,7 +98,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
 
-    env_raw = raw.get("environment") or {}
+    # ``is None`` (not ``or {}``): a missing section defaults to an empty table, but a present-
+    # but-non-dict value (e.g. ``environment = false``) must reach the "must be a table" check
+    # rather than being silently coerced to ``{}`` and bypassing validation.
+    env_raw = raw.get("environment")
+    if env_raw is None:
+        env_raw = {}
     if not isinstance(env_raw, dict):
         raise ConfigError("[environment] must be a table")
     # Local environment paths are gone: a run names a published Hub env by [environment] id.
@@ -109,8 +114,14 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             "local environment paths are no longer supported — remove `path` and reference a "
             'published Hub `id` ("owner/name")'
         )
-    train_raw = raw.get("train") or {}
-    gpu_raw = raw.get("gpu") or {}
+    train_raw = raw.get("train")
+    if train_raw is None:
+        train_raw = {}
+    if not isinstance(train_raw, dict):
+        raise ConfigError("[train] must be a table")
+    gpu_raw = raw.get("gpu")
+    if gpu_raw is None:
+        gpu_raw = {}
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
 
