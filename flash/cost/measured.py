@@ -115,7 +115,10 @@ def runconfig_from_status(
     # and only fall back to the requested type/default when the run never recorded one.
     remote = status.get("remote") or {}
     allocated_gpu = remote.get("allocated_gpu") or gpu_spec.get("type")
-    allocated_provider = remote.get("provider")
+    # Mirror the GPU fallback: when the run didn't record an allocated provider, fall back to
+    # the spec's pinned provider before the "auto" sentinel -- else a run submitted to a pinned
+    # pool gets re-derived against the whole "auto" pool at grading time.
+    allocated_provider = remote.get("provider") or gpu_spec.get("provider")
     return RunConfig(
         model_id=spec["model"],
         method=method,
@@ -128,7 +131,7 @@ def runconfig_from_status(
         lora_rank=train.get("lora_rank"),
         thinking=bool(spec.get("thinking", False)),
         gpu=allocated_gpu,
-        provider=allocated_provider if allocated_provider is not None else "auto",
+        provider=allocated_provider or "auto",
         allow_unvalidated=allow_unvalidated,
         max_wall_seconds=int(max_wall) if max_wall is not None else None,
         environment=(spec.get("environment") or {}).get("id"),
@@ -187,7 +190,11 @@ def measured_from_status(
         cost_usd=float(status.get("cost_usd") or 0.0),
         wall_seconds=wall,
         gpu=remote.get("allocated_gpu") or (status["spec"].get("gpu") or {}).get("type", "?"),
-        provider=remote.get("provider", "?"),
+        provider=(
+            remote.get("provider")
+            or (status["spec"].get("gpu") or {}).get("provider")
+            or "auto"
+        ),
         hourly_usd=remote.get("hourly_usd"),
     )
 

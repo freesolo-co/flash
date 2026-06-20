@@ -241,6 +241,28 @@ def test_measured_from_status_fields():
     assert m.hourly_usd == pytest.approx(0.4689)
 
 
+def test_provider_falls_back_to_spec_pin_when_remote_omits_it():
+    # remote.provider missing but the spec pinned one -> use the pin (not "auto"/"?"), so a run
+    # submitted to a specific pool is re-priced against THAT pool, not the whole "auto" pool.
+    status = {
+        **GRPO_STATUS,
+        "spec": {**GRPO_STATUS["spec"], "gpu": {"type": "RTX 5090", "provider": "runpod"}},
+        "remote": {"allocated_gpu": "RTX 5090", "hourly_usd": 0.4689, "started_ts": 1000.7},
+    }
+    assert runconfig_from_status(status).provider == "runpod"
+    assert measured_from_status(status).provider == "runpod"
+
+
+def test_provider_defaults_to_auto_when_neither_remote_nor_spec_pin_it():
+    status = {
+        **GRPO_STATUS,
+        "spec": {**GRPO_STATUS["spec"], "gpu": {"type": "RTX 5090"}},
+        "remote": {"allocated_gpu": "RTX 5090", "hourly_usd": 0.4689, "started_ts": 1000.7},
+    }
+    assert runconfig_from_status(status).provider == "auto"
+    assert measured_from_status(status).provider == "auto"
+
+
 def test_measured_as_estimate_is_the_ground_truth():
     m = measured_from_status(GRPO_STATUS)
     e = measured_as_estimate(m)
