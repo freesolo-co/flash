@@ -294,7 +294,8 @@ def allocate(
     disk_gb: int = 60,
     allow_unvalidated: bool | None = None,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
-    exclude_gpu_classes: set = frozenset(),
+    exclude_gpu_classes: set[str | tuple[str, str]]
+    | frozenset[str | tuple[str, str]] = frozenset(),
     gpu_count: int = 1,
     train=None,
     thinking: bool = False,

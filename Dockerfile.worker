@@ -21,9 +21,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1 \
-    # Expose ALL of the instance's GPUs to the container. The NVIDIA container runtime decides GPU
-    # visibility at container-launch from the IMAGE's NVIDIA_VISIBLE_DEVICES (a runtime -e is too
-    # late). The pytorch/pytorch base does not guarantee "all", so a multi-GPU Vast instance
+    # Expose ALL of the instance's GPUs to the container. The NVIDIA container runtime injects GPU
+    # device nodes at container creation based on NVIDIA_VISIBLE_DEVICES; a runtime `-e` could in
+    # principle override this, but on Vast/RunPod the `docker run` invocation is owned by the
+    # provider's template — flash does not control it, so baking "all" into the image is the only
+    # lever we have. The pytorch/pytorch base does not set this, so a multi-GPU Vast instance
     # (verified: rents a real 2-GPU instance) was launching the container with only 1 visible GPU,
     # breaking the disaggregated trainer/server split. Required for multi-GPU async rollouts.
     NVIDIA_VISIBLE_DEVICES=all \
