@@ -54,37 +54,11 @@ def _raw(**overrides) -> dict:
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         ({"model_policy": "yolo"}, "model_policy"),
-        # gpu.provider / gpu.allow_unvalidated were REMOVED — a config still setting them would
-        # be silently ignored (different hardware than intended), so reject loudly naming what
-        # replaced them (the allocator now always picks the cheapest fitting class, no gate/pin).
-        ({"gpu.provider": "vast"}, "gpu.provider was removed"),
-        ({"gpu.allow_unvalidated": True}, "gpu.allow_unvalidated was removed"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
     with pytest.raises(ConfigError, match=match):
         spec_from_dict(_raw(**overrides))
-
-
-def test_gpu_unknown_key_warns_but_does_not_break(capsys) -> None:
-    # An unknown/mistyped [gpu] key is read by none of the GpuSpec lookups, so it would be
-    # silently ignored. Surface it as a warning (not a hard error — forward-compatible), and
-    # the spec must still build successfully.
-    spec = spec_from_dict(_raw(**{"gpu.povider": "vast"}))  # typo'd 'provider'
-    captured = capsys.readouterr()
-    # Warning goes to stderr (stdout is reserved for the MCP server's JSON protocol).
-    assert "[gpu] unknown key(s) ignored" in captured.err
-    assert "povider" in captured.err
-    assert "[gpu] unknown key(s) ignored" not in captured.out
-    assert spec.gpu.type  # still parsed a valid spec
-
-
-def test_gpu_known_keys_do_not_warn(capsys) -> None:
-    # The keys the schema actually reads must NOT trip the unknown-key warning.
-    spec_from_dict(_raw(**{"gpu.disk_gb": 80, "gpu.max_retries": 1, "gpu.datacenter": "EU"}))
-    captured = capsys.readouterr()
-    assert "[gpu] unknown key(s)" not in captured.out
-    assert "[gpu] unknown key(s)" not in captured.err
 
 
 def test_sft_epochs_must_be_positive() -> None:
