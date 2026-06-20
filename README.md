@@ -46,14 +46,21 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 
 ## Local commands
 
+Everything runs from the repo root and needs [`uv`](https://docs.astral.sh/uv/).
+A `Makefile` wraps the common tasks — run `make` to list them:
+
 ```bash
-cd flash
-uv sync --extra server
-FLASH_SKIP_NET=1 uv run pytest          # CPU tests (no GPU/network)
-uv run ruff check . && uv run ruff format .
-uv run slm --help
-uv run flash-server                      # control plane (operator-side, run once)
+make setup        # uv sync --extra server --dev
+make test         # CPU tests, offline (FLASH_SKIP_NET=1, no GPU/network)
+make lint         # ruff check
+make fmt          # ruff format
+make check        # lint + tests (what CI runs)
+
+uv run slm --help        # the client CLI
+uv run flash-server      # control plane (operator-side, run once)
 ```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev → main branch flow.
 
 The control plane owns provider credentials: `RUNPOD_API_KEY` is always required
 (RunPod is the default substrate), `VAST_API_KEY` is opt-in (only checked when set),
