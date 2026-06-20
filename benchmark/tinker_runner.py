@@ -14,10 +14,33 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import pathlib
 import time
+
+# Single shared Tinker cost proxy for the WHOLE benchmark (runner + assembler + results).
+# Tinker is managed and does NOT expose per-run cost via API; this is an explicit, labelled
+# proxy so the $ column is order-of-magnitude comparable to Flash's MEASURED cost. The
+# basis is ACTIVE compute (rollout + train step), excluding managed-backend capacity pauses,
+# matching assemble.py / results/comparison.json. assemble.py imports this constant.
+TINKER_PROXY_USD_PER_HR = 2.00
+
+
+def active_compute_s(records: list[dict]) -> float | None:
+    """Sum real per-step work (rollout + train step) from metrics.jsonl records.
+
+    Tinker's wall-clock absorbs managed-backend capacity pauses (idle, unbilled) into a
+    step's timing; summing rollout + train-step time is the fair active-compute basis used
+    for both latency and the cost proxy. Returns None if neither timing key is present.
+    """
+    roll = train = 0.0
+    for r in records:
+        roll += r.get("time/do_group_rollout_and_filter_constant_reward:total", 0) or 0
+        train += r.get("time/train_step", 0) or 0
+    total = roll + train
+    return total or None
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,10 +66,10 @@ def _patch_dataset_builder_for_verifiers_skew() -> None:
     only used as a rollout-group label downstream (it does not feed the reward), so we
     default it to the env id when absent. Mirrors the original builder otherwise.
     """
-    from tinker_cookbook.recipes.verifiers_rl import verifiers_env as _ve
     import verifiers as vf
+    from tinker_cookbook.recipes.verifiers_rl import verifiers_env as _ve
 
-    async def _call(self):  # noqa: ANN001
+    async def _call(self):
         env = _ve.get_vf_env()
         if env is None:
             env = vf.load_environment(self.vf_env_id, **self.vf_env_args)
@@ -95,7 +118,7 @@ def _patch_rollout_for_verifiers(model_name: str, group_size: int) -> None:
 
     cache: dict = {"client": None, "renderer": None, "tokenizer": None}
 
-    async def _custom(env_group_builder, policy, strategy=None):  # noqa: ANN001
+    async def _custom(env_group_builder, policy, strategy=None):
         if cache["tokenizer"] is None:
             cache["tokenizer"] = get_tokenizer(model_name)
             rname = model_info.get_recommended_renderer_name(model_name)
@@ -171,10 +194,8 @@ def _read_metrics_jsonl(log_path: str) -> list[dict]:
                 for line in f:
                     line = line.strip()
                     if line:
-                        try:
+                        with contextlib.suppress(json.JSONDecodeError):
                             records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
             if records:
                 return records
     return []
@@ -202,17 +223,29 @@ def main() -> None:
 
     reward_history = [r for r in (_reward_of(rec) for rec in records) if r is not None]
 
+    # Cost on the SAME basis as assemble.py / comparison.json: active compute (rollout +
+    # train step, capacity pauses excluded) x the shared $/hr proxy. Falls back to full wall
+    # only if metrics carry no timing. Emit active/paused so the JSON is self-consistent.
+    wall = timing["wall_s"]
+    active = active_compute_s(records)
+    basis = active if active else wall
+    paused = (wall - active) if (active and wall > active) else None
+
     result = {
         "platform": "tinker",
         "status": "done",
         "model": args.model,
         "env_id": args.env_id,
         "steps": args.steps,
-        "wall_s": timing["wall_s"],
-        # Tinker does not expose billing via API; compute from time × list price.
-        # H100 SXM at ~$3.50/hr is a representative Tinker training GPU.
-        "cost_usd_estimated": round(timing["wall_s"] / 3600 * 3.50, 4),
-        "cost_note": "estimated (Tinker does not expose cost via API; check your dashboard)",
+        "wall_s": wall,
+        "active_compute_s": active,
+        "paused_s": paused,
+        # Tinker does not expose billing via API; this is a labelled proxy, NOT a bill.
+        "cost_usd_estimated": round(basis / 3600 * TINKER_PROXY_USD_PER_HR, 4) if basis else None,
+        "cost_note": (
+            f"estimated: active-compute x ${TINKER_PROXY_USD_PER_HR:.2f}/hr proxy "
+            "(pause excluded; Tinker cost not in API - check your dashboard)"
+        ),
         "first_train_reward": reward_history[0] if reward_history else None,
         "final_train_reward": reward_history[-1] if reward_history else None,
         "reward_history": reward_history,

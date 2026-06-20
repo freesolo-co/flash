@@ -5,8 +5,10 @@
   "env_id": "gsm8k",
   "steps": 30,
   "wall_s": 2380.6999023510143,
-  "cost_usd_estimated": 2.3146,
-  "cost_note": "estimated (Tinker does not expose cost via API; check your dashboard)",
+  "active_compute_s": 1772.641832546331,
+  "paused_s": 608.0580698046833,
+  "cost_usd_estimated": 0.9848,
+  "cost_note": "estimated: active-compute \u00d7 $2.00/hr proxy (pause excluded; Tinker cost not in API \u2014 check your dashboard)",
   "first_train_reward": 0.25,
   "final_train_reward": 0.0,
   "reward_history": [

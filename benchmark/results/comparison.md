@@ -8,58 +8,58 @@ Same base model, same verifiers environment, same GRPO hyper-parameters (group_s
 
 ## gsm8k
 
-| metric | Flash | Tinker | Δ (Flash − Tinker) |
+| metric | Flash | Tinker | Δ (Flash - Tinker) |
 |---|---|---|---|
 | status | done | done | |
 | GPU | A100 PCIe | managed (Tinker) | |
 | **reward** step 1 | 1 | 0.250 | |
 | **reward** final (last 5 avg) | 0.900 | 0.125 | +0.775 |
 | reward best step | 1 | 0.312 | +0.688 |
-| reward final (raw step 30) | 1 | 0.000 | |
+| reward final (last logged: F=15 / T=30 pts) | 1 | 0.000 | |
 | held-out eval | 0.880 (n=50) | — | |
 | **latency** wall total | 45m52s | 39m40s | |
 | latency setup/queue | 0m11s | none (managed) | |
 | latency active compute | 45m41s | 29m32s | |
 | latency capacity-pause | — | 10m08s | |
-| latency per-step | 182.8s | 59.1s | |
+| latency per-step | 91.4s | 59.1s | |
 | **cost** | 1.0585 USD | 0.9848 USD | |
 | cost basis | measured (RunPod billed) | ESTIMATE: active-compute x $2.00/hr proxy (Tinker cost not in API) | |
 
 ## reverse-text
 
-| metric | Flash | Tinker | Δ (Flash − Tinker) |
+| metric | Flash | Tinker | Δ (Flash - Tinker) |
 |---|---|---|---|
 | status | done | done | |
 | GPU | A100 PCIe | managed (Tinker) | |
 | **reward** step 1 | 0.437 | 0.000 | |
 | **reward** final (last 5 avg) | 0.362 | 0.000 | +0.362 |
 | reward best step | 0.512 | 0.000 | +0.512 |
-| reward final (raw step 30) | 0.408 | 0.000 | |
+| reward final (last logged: F=15 / T=30 pts) | 0.408 | 0.000 | |
 | held-out eval | 0.259 (n=50) | — | |
 | **latency** wall total | 8m37s | 39m14s | |
 | latency setup/queue | 0m10s | none (managed) | |
 | latency active compute | 8m26s | 28m47s | |
 | latency capacity-pause | — | 10m27s | |
-| latency per-step | 33.8s | 57.6s | |
+| latency per-step | 16.9s | 57.6s | |
 | **cost** | 0.1956 USD | 0.9596 USD | |
 | cost basis | measured (RunPod billed) | ESTIMATE: active-compute x $2.00/hr proxy (Tinker cost not in API) | |
 
 ## hendrycks-math
 
-| metric | Flash | Tinker | Δ (Flash − Tinker) |
+| metric | Flash | Tinker | Δ (Flash - Tinker) |
 |---|---|---|---|
 | status | done | done | |
 | GPU | RTX Pro 6000 WK | managed (Tinker) | |
 | **reward** step 1 | 0.062 | 0.000 | |
 | **reward** final (last 5 avg) | 0.237 | 0.087 | +0.150 |
 | reward best step | 0.500 | 0.312 | +0.188 |
-| reward final (raw step 30) | 0.312 | 0.062 | |
+| reward final (last logged: F=15 / T=30 pts) | 0.312 | 0.062 | |
 | held-out eval | 0.320 (n=50) | — | |
 | **latency** wall total | 38m07s | 39m14s | |
 | latency setup/queue | 0m10s | none (managed) | |
 | latency active compute | 37m57s | 27m36s | |
 | latency capacity-pause | — | 11m38s | |
-| latency per-step | 151.8s | 55.2s | |
+| latency per-step | 75.9s | 55.2s | |
 | **cost** | 1.1957 USD | 0.9203 USD | |
 | cost basis | measured (RunPod billed) | ESTIMATE: active-compute x $2.00/hr proxy (Tinker cost not in API) | |
 
@@ -71,7 +71,7 @@ In-training GRPO reward is NOT comparable across stacks (different verifiers ver
 |---|---|---|
 | base Qwen3.5-4B | 0.360 | 0.90 |
 | Tinker-trained (30 GRPO steps) | 0.440 | 0.68 |
-| **Δ (trained − base)** | **+0.080** | |
+| **Δ (trained - base)** | **+0.080** | |
 
 Tinker GRPO improved held-out accuracy AND cut answer truncation — the model learned to reach the answer sooner. (Flash-trained not re-served under the same scorer; Flash's native on-GPU eval is in the per-task tables above.)
 
@@ -93,5 +93,5 @@ Tinker GRPO improved held-out accuracy AND cut answer truncation — the model l
 ## Methodology caveats
 
 - **In-training reward is not cross-stack comparable.** Flash's worker installs verifiers ~0.1.14 (continuous/partial-credit reward); Tinker pins 0.1.9 (the recipe's requirement). At matched max_tokens the two stacks present the task differently and truncate differently. Use the **held-out eval** (one scorer, generous tokens) for performance, and **cost/latency** (measured) for the clean cross-stack comparison.
-- **Tinker cost is an estimate.** Tinker does not expose per-run cost via API; the $ column is active-compute-time × a GPU-rate proxy (pause excluded), not a bill. Flash cost is the measured RunPod charge.
+- **Tinker cost is an estimate.** Tinker does not expose per-run cost via API; the $ column is active-compute-time x a GPU-rate proxy (pause excluded), not a bill. Flash cost is the measured RunPod charge.
 - **Scale is deliberately small** (30 steps, 16 rollouts/step) to keep spend low, so per-step reward is noisy and 30-step gains are modest by design.

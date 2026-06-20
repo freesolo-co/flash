@@ -7,7 +7,7 @@
       "run_id": "flash-1781931136-29ad2400",
       "gpu": "A100 PCIe",
       "provider": "runpod",
-      "steps": 15,
+      "steps": 30,
       "first_reward": 1,
       "final_reward": 1,
       "final_smoothed": 0.9,
@@ -36,7 +36,7 @@
       "setup_s": 11.494284868240356,
       "train_s": 2741.4956047534943,
       "total_s": 2752.9898896217346,
-      "per_step_s": 182.76637365023296,
+      "per_step_s": 91.38318682511648,
       "train_tok_per_s": 67.23337425032035
     },
     "tinker": {
@@ -100,7 +100,7 @@
       "run_id": "flash-1781929264-14e0889f",
       "gpu": "A100 PCIe",
       "provider": "runpod",
-      "steps": 15,
+      "steps": 30,
       "first_reward": 0.4373764991760254,
       "final_reward": 0.4080543518066406,
       "final_smoothed": 0.36170936822891236,
@@ -129,7 +129,7 @@
       "setup_s": 10.65793776512146,
       "train_s": 506.66717433929443,
       "total_s": 517.3251121044159,
-      "per_step_s": 33.77781162261963,
+      "per_step_s": 16.888905811309815,
       "train_tok_per_s": 363.78910917281644
     },
     "tinker": {
@@ -193,7 +193,7 @@
       "run_id": "flash-1781929264-6d2eb57c",
       "gpu": "RTX Pro 6000 WK",
       "provider": "runpod",
-      "steps": 15,
+      "steps": 30,
       "first_reward": 0.0625,
       "final_reward": 0.3125,
       "final_smoothed": 0.2375,
@@ -222,7 +222,7 @@
       "setup_s": 10.058109521865845,
       "train_s": 2277.535736322403,
       "total_s": 2287.593845844269,
-      "per_step_s": 151.83571575482685,
+      "per_step_s": 75.91785787741343,
       "train_tok_per_s": 107.90610047543542
     },
     "tinker": {

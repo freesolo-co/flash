@@ -33,29 +33,50 @@ def _is_rate_limit(exc: Exception) -> bool:
     return "429" in text or "too many requests" in text or "rate limit" in text
 
 
-def _safe_create_repo(self, repo_id, *args, **kwargs):  # noqa: ANN001
+def _safe_create_repo(self, repo_id, *args, **kwargs):
     try:
         return _orig_create(self, repo_id, *args, **kwargs)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         if _is_rate_limit(exc):
             repo_type = kwargs.get("repo_type", "model")
             try:
                 if self.repo_exists(repo_id, repo_type=repo_type):
                     print(f"[plane-shim] create_repo 429 but {repo_id} exists — reusing it")
                     return None
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         raise
 
 
-def _safe_update_repo_settings(self, *args, **kwargs):  # noqa: ANN001
+def _safe_update_repo_settings(self, repo_id=None, *args, **kwargs):
     try:
-        return _orig_update(self, *args, **kwargs)
-    except Exception as exc:  # noqa: BLE001
-        if _is_rate_limit(exc):
-            print("[plane-shim] update_repo_settings 429 — leaving existing visibility as-is")
+        return _orig_update(self, repo_id, *args, **kwargs)
+    except Exception as exc:
+        if not _is_rate_limit(exc):
+            raise
+        # A swallowed 429 on update_repo_settings is NOT safe to ignore when it carries the
+        # intended visibility: a reused artifact repo (run code / adapters / metrics) could
+        # be left PUBLIC. Only swallow if the repo ALREADY matches the requested `private`;
+        # otherwise re-raise so the caller can't proceed with the wrong visibility.
+        want_private = kwargs.get("private")
+        if want_private is None:
+            print("[plane-shim] update_repo_settings 429 (no visibility change requested) "
+                  "— leaving existing settings as-is")
             return None
-        raise
+        repo_type = kwargs.get("repo_type", "model")
+        try:
+            info = self.repo_info(repo_id, repo_type=repo_type)
+            if bool(getattr(info, "private", None)) == bool(want_private):
+                print(f"[plane-shim] update_repo_settings 429 but {repo_id} already "
+                      f"private={want_private} — safe to continue")
+                return None
+        except Exception:
+            pass
+        # Could not confirm the intended visibility — fail loudly rather than risk exposure.
+        raise RuntimeError(
+            f"update_repo_settings rate-limited and could not ensure private={want_private} "
+            f"on {repo_id}; refusing to continue with unverified visibility"
+        ) from exc
 
 
 HfApi.create_repo = _safe_create_repo
