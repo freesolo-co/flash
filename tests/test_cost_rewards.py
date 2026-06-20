@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from flash.cost import RunConfig, estimate_cost, seconds_per_step
+from flash.cost import RunConfig, estimate_cost
+from flash.cost.analytical import seconds_per_step
 from flash.cost.facts import AVG_REWARD_SECONDS_PER_COMPLETION, reward_seconds_per_completion
 
 

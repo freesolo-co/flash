@@ -17,8 +17,8 @@ class RunConfig:
     method: str  # "sft" | "grpo"
     steps: int
 
-    # Cold-start setups the bill covers. A multi-seed run reprovisions per seed (each seed is
-    # its own job in runner.py), so set this to the seed count to charge the repeated boot.
+    # Cold-start setups the bill covers: a multi-seed run reprovisions (and re-pays boot) per
+    # seed, so this is the seed count.
     setup_repeats: int = 1
 
     seq_len: int | None = None  # SFT max_seq_len / GRPO max_prompt_len
@@ -31,53 +31,35 @@ class RunConfig:
     reward_seconds_per_completion: float | None = None
 
     gpu: str | None = None  # pin a class; else cheapest fitting
-    # Tri-state, mirroring the spec/allocator: None means "unspecified" and is resolved at
-    # selection time via ``providers.base.unvalidated_allowed`` (the managed default). Don't
-    # coerce a missing value to False, or the estimate would disagree with the allocator's pick.
+    # Tri-state (None = unspecified): resolved at selection via ``unvalidated_allowed`` (the
+    # managed default), so the estimate's GPU pool matches what the allocator would pick.
     allow_unvalidated: bool | None = None
-    # Per-run wall-clock cap in seconds (spec ``gpu.max_wall_seconds``; default 24h), applied
-    # per seed. None -> the estimator's default cap.
-    max_wall_seconds: int | None = None
+    max_wall_seconds: int | None = None  # per-seed wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
-    environment: str | None = None  # verifiers env slug (owner/name); descriptive only
-    label: str | None = None
+    environment: str | None = None  # verifiers env slug; descriptive only
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
-        # Same for the provider: GPU selection (``pick_gpu``) and the allocator expect an exact
-        # substrate ("runpod"/"vast") or the "auto" sentinel. Normalize case/whitespace, treat
-        # empty as "auto", and reject an unknown substrate here (mirrors ``allocator.allocate``'s
-        # guard) -- otherwise a variant like "RunPod"/" vast " filters out every candidate and
-        # surfaces as a confusing "no GPU class fits" instead of a clear provider error.
+        # Normalize the provider like the allocator does (case/whitespace, empty -> "auto") and
+        # reject an unknown substrate up front, else it filters out every candidate downstream
+        # and surfaces as a confusing "no GPU class fits".
         prov = (self.provider or "auto").strip().lower() or "auto"
         if prov not in ("auto", *PROVIDER_NAMES):
-            raise ValueError(
-                f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
-            )
+            raise ValueError(f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})")
         object.__setattr__(self, "provider", prov)
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
         if self.setup_repeats < 1:
             raise ValueError(f"setup_repeats must be >= 1, got {self.setup_repeats}")
-        # ``estimate_cost`` divides steps evenly across seeds, so a non-divisible split would
-        # price fractional steps per seed (impossible in a real run) and skew per-seed capping.
+        # Steps are split evenly across seeds, so a non-divisible split would price fractional
+        # steps per seed (impossible in a real run).
         if self.steps % self.setup_repeats != 0:
             raise ValueError(
-                f"steps ({self.steps}) must be a multiple of setup_repeats "
-                f"({self.setup_repeats}): each seed runs an equal share of the steps"
+                f"steps ({self.steps}) must be a multiple of setup_repeats ({self.setup_repeats})"
             )
-        # ``max_wall_seconds`` is included: a 0/negative cap would drive ``estimate_cost`` to a
-        # negative wall (cap used in ``min(setup, cap)`` then ``cap - setup``) and a negative
-        # ``total_usd``. A sub-60s but positive cap is valid -- the estimator floors it at the
-        # runner's 60s minimum -- so only reject <= 0 here.
-        for _name in (
-            "seq_len",
-            "batch_size",
-            "group_size",
-            "completion_len",
-            "lora_rank",
-            "max_wall_seconds",
-        ):
+        # A 0/negative cap or knob yields a bogus (negative/zero) quote; reject. A sub-60s but
+        # positive cap is valid (floored at the runner's 60s minimum in ``estimate_cost``).
+        for _name in ("seq_len", "batch_size", "group_size", "completion_len", "lora_rank", "max_wall_seconds"):
             _val = getattr(self, _name)
             if _val is not None and _val < 1:
                 raise ValueError(f"{_name} must be >= 1, got {_val}")
@@ -107,22 +89,14 @@ class RunConfig:
             comp = None
             batch = self.batch_size if self.batch_size is not None else RECIPE.sft.effective_batch
             group = None
-        return replace(
-            self,
-            seq_len=seq,
-            completion_len=comp,
-            batch_size=batch,
-            group_size=group,
-            lora_rank=lora,
-        )
+        return replace(self, seq_len=seq, completion_len=comp, batch_size=batch, group_size=group, lora_rank=lora)
 
     def train_knobs(self) -> dict[str, int]:
         """The knob dict ``engine.vram.model_required_vram_gb`` consumes for VRAM sizing.
 
-        Only an EXPLICIT batch_size is forwarded: for an omitted batch the allocator
-        (``engine.vram.model_required_vram_gb``) sizes against the worker's per-device SFT
-        micro-batch (``_sft_per_device_bs()`` = 4), so feeding the recipe effective batch (32)
-        here would over-provision; leaving it out lets the allocator apply that same default.
+        Only an EXPLICIT batch_size is forwarded: the allocator sizes an omitted SFT batch as
+        the worker's per-device micro-batch (4), so feeding the recipe effective batch (32)
+        here would over-provision; leaving it out applies that same default.
         """
         n = self.normalized()
         knobs: dict[str, int] = {"lora_rank": n.lora_rank}
@@ -139,28 +113,22 @@ class RunConfig:
 
 @dataclass(frozen=True)
 class CostEstimate:
-    """A pre-flight training-cost estimate. ``total_usd`` = ``wall_clock_hours * gpu_hourly_usd``."""
+    """A pre-flight estimate. ``total_usd`` = ``wall_clock_hours * gpu_hourly_usd``, no multiplier."""
 
-    # the run this estimate is for (echoed for traceability)
     model_id: str
-    method: str  # "sft" | "grpo"
+    method: str
     steps: int
-
-    # chosen hardware
     gpu: str
     provider: str
     gpu_vram_gb: int
     required_vram_gb: int
     gpu_hourly_usd: float
-
-    # timing breakdown (seconds)
-    setup_seconds: float  # cold start: boot + deps + model download (+ vLLM init for GRPO)
+    setup_seconds: float  # cold start: boot + deps + download (+ vLLM init for GRPO)
     seconds_per_step: float
     train_seconds: float  # steps * seconds_per_step (post wall-clock cap)
-    wall_clock_seconds: float  # setup + train
+    wall_clock_seconds: float
     wall_capped: bool
-
-    total_usd: float  # wall-clock hours x market $/hr, no output adjustment
+    total_usd: float
     notes: tuple[str, ...] = ()
 
     @property

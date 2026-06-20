@@ -272,7 +272,6 @@ def _runconfig_from_spec(spec):
         allow_unvalidated=g.allow_unvalidated,
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
-        label=spec.run_id,
     )
 
 

@@ -89,17 +89,14 @@ def pick_gpu(
 ) -> str:
     """Cheapest GPU class that fits ``required_vram_gb`` -- mirrors ``allocator.allocate``.
 
-    Ranks the static registry by (hourly_usd, vram_gb, name), over validated classes by
-    default (``allow_unvalidated`` widens the pool). A concrete ``pin`` is canonicalized (an
-    unknown one raises) and honored only if it fits, else selection escalates to the cheapest
-    fitting class; policy sentinels (auto/cheapest/empty) fall through to cheapest-fit.
-    ``provider`` restricts candidates to classes that provider can provision (``providers_for``);
-    this filter holds even with ``allow_unvalidated``.
+    Ranks by (hourly_usd, vram_gb, name) over validated classes (``allow_unvalidated`` widens
+    the pool). A concrete ``pin`` is canonicalized (unknown raises) and honored only if it fits,
+    else selection escalates to cheapest-fit; policy sentinels (auto/cheapest) auto-select.
+    ``provider`` restricts candidates to what it can provision (even with ``allow_unvalidated``).
     """
 
     def _selectable(g: GpuClass) -> bool:
         # Provisionability gate (always) + validation gate (relaxed by allow_unvalidated).
-        # allow_unvalidated never lets a class be priced on a substrate that can't serve it.
         if provider not in (None, "auto") and provider not in providers_for(g.name):
             return False
         if allow_unvalidated:
@@ -183,12 +180,10 @@ def download_weight_gb(model_id: str, params_str: str | None = None) -> float:
 
 
 # ===== Reward-grader latency (GRPO) =====
-# A SINGLE average grader latency (seconds to score one completion), applied to every
-# environment. We deliberately don't classify the env from its slug: that isn't generalizable
-# (an unknown env gets mis-tiered), and real graders span ~0.01s (regex / exact-match / math)
-# to ~3s (LLM-as-judge, sandboxed code). One average means a heavier-than-average grader is
-# under-quoted (we charge less) and a lighter one over-quoted slightly -- we prefer the
-# under-quote. A run can still pin its own value via RunConfig.reward_seconds_per_completion.
+# A SINGLE average grader latency (s/completion) for every environment -- we don't classify the
+# env from its slug (not generalizable). Real graders span ~0.01s (regex/math) to ~3s (LLM
+# judge / code): one average under-quotes a heavier grader (we charge less, preferred) and
+# over-quotes a lighter one. A run can pin its own via RunConfig.reward_seconds_per_completion.
 AVG_REWARD_SECONDS_PER_COMPLETION = 0.3
 
 

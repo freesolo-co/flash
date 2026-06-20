@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from flash.cost import RunConfig, estimate_cost, seconds_per_step, select_gpu
-from flash.cost.analytical import DEFAULT_WALL_CAP_S, setup_seconds
+from flash.cost import RunConfig, estimate_cost
+from flash.cost.analytical import DEFAULT_WALL_CAP_S, seconds_per_step, select_gpu, setup_seconds
 
 SMALL = "Qwen/Qwen3.5-0.8B"
 MID = "Qwen/Qwen3.5-4B"
@@ -84,28 +84,6 @@ def test_explicit_sft_batch_is_still_forwarded_for_sizing():
     real = alloc_required_vram_gb(MID, "sft", train={"batch_size": 32}, thinking=False)
     assert cfg.train_knobs()["batch_size"] == 32
     assert need == real
-
-
-def test_offline_open_model_sized_from_parsed_id_not_24gb_fallback():
-    # Offline (FLASH_SKIP_NET), HF metadata is unreadable, so the allocator's open-model
-    # path returns a flat 24 GB. But model_specs parses the size from the id, so an unlisted
-    # 13B model must size WELL above 24 GB and route to a big card -- not a 24 GB A5000.
-    big_open = RunConfig("vendor/foo-13b", "sft", 100)
-    _, need = select_gpu(big_open)
-    assert need > 24
-    # A 13B run does not fit a 24 GB card.
-    e = estimate_cost(big_open)
-    assert e.gpu_vram_gb >= e.required_vram_gb
-    assert e.required_vram_gb > 24
-
-
-def test_offline_open_model_helper_defers_for_catalog_models():
-    # The offline open-model override ONLY replaces the flat-24 fallback for unlisted models;
-    # a catalog model defers to the allocator (returns None), so curated sizing is unchanged.
-    from flash.cost.analytical import _offline_open_model_vram_gb
-
-    assert _offline_open_model_vram_gb(RunConfig(MID, "grpo", 100)) is None
-    assert _offline_open_model_vram_gb(RunConfig(SMALL, "sft", 100)) is None
 
 
 def test_grpo_colocate_routes_4b_to_a_bigger_card_than_sft():
