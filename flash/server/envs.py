@@ -20,7 +20,6 @@ import tempfile
 from pathlib import Path
 
 _PUSH_MAX_ATTEMPTS = 8
-_PUSH_CONFLICT_MARKERS = ("already exists", "version already", "duplicate", "conflict", "409")
 
 # Namespace/name join delimiter. A `namespace_for` slug can NEVER contain ``--`` (its regex
 # collapses any run of non-alphanumerics to a single ``-`` and strips leading/trailing ``-``), so
@@ -191,14 +190,18 @@ def _slug_from(env_dir: Path, output: str, *, pushed_name: str | None = None) ->
     return None
 
 
-def _is_version_conflict(text: str) -> bool:
-    low = text.lower()
-    return any(marker in low for marker in _PUSH_CONFLICT_MARKERS)
-
-
 def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
     """`prime env push` the package under the control plane's Prime account (PRIVATE), climbing
-    past version conflicts. Returns the published slug. Raises EnvPublishError on failure."""
+    past version conflicts. Returns the published slug. Raises EnvPublishError on failure.
+
+    prime rejects a push whose (version, source-content-hash) already exists on the Hub. Rather
+    than parse prime's rejection message — it varies by version and phrasing (``Upload failed``,
+    ``HTTP 400: Wheel version with content hash …``, ``version already exists`` …), so any literal
+    marker list silently rots — we drive the retry off prime's **exit code** and let ``--auto-bump``
+    resolve the version: it rewrites ``pyproject``'s version to the next patch *in place*, so each
+    retry climbs to a fresh version until one is free. A brand-new env (``is_new``) publishes at its
+    declared version on the first attempt; a re-publish climbs from the start. The non-retriable
+    failures (no key / no CLI) are pre-checked below, so a bounded climb is safe."""
     if not os.environ.get("PRIME_API_KEY"):
         raise EnvPublishError(
             "this control plane has no PRIME_API_KEY configured, so it cannot publish to the "
@@ -227,10 +230,10 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
         name,
     ]
     env = {**os.environ, "PRIME_DISABLE_VERSION_CHECK": "1"}
-    auto_bump = not is_new  # a re-publish must land on a fresh version
     last = ""
-    for _ in range(_PUSH_MAX_ATTEMPTS):
-        cmd = [*base, "--auto-bump"] if auto_bump else list(base)
+    for attempt in range(_PUSH_MAX_ATTEMPTS):
+        # is_new starts at the declared version; otherwise (and on every retry) --auto-bump climbs.
+        cmd = list(base) if (is_new and attempt == 0) else [*base, "--auto-bump"]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
         last = f"{proc.stdout or ''}{proc.stderr or ''}"
         if proc.returncode == 0:
@@ -246,13 +249,8 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
                     status=502,
                 )
             return slug
-        if _is_version_conflict(last):
-            auto_bump = True
-            continue
-        raise EnvPublishError(f"`prime env push` failed: {last.strip()[:500]}")
-    raise EnvPublishError(
-        f"`prime env push` failed after {_PUSH_MAX_ATTEMPTS} version-conflict retries"
-    )
+    raise EnvPublishError(f"`prime env push` failed after {_PUSH_MAX_ATTEMPTS} attempts: "
+                          f"{last.strip()[:500]}")
 
 
 def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> str:
