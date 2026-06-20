@@ -49,7 +49,7 @@ gpu = [
 # setting the FLASH_* kernel flag(s) AND FLASH_CHALK_SPEC=<installable chalk spec> (git URL with
 # access, or a wheel); the submit path appends that spec to the worker's extra_pip, which is
 # installed for every job (works on the default baked-image path, unlike FLASH_WORKER_EXTRA_DEPS).
-server = ["fastapi", "uvicorn"]
+server = ["fastapi", "uvicorn", "prime"]
 # Convenience aggregate of all optional runtime extras.
 all = ["flash[gpu,server]"]
 

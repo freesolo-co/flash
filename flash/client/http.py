@@ -120,6 +120,18 @@ class ApiClient:
     def health(self) -> dict:
         return self._request("GET", "/v1/health", timeout=10.0)
 
+    # -- environments ------------------------------------------------------------------
+    def publish_env(self, *, name: str, is_new: bool, package_b64: str) -> dict:
+        """Upload a packaged verifiers env to the managed Environments Hub (the control plane
+        publishes it under FreeSolo's Prime account); returns ``{"id": "owner/name"}``. The
+        push + Hub build can take a while, so use a generous timeout."""
+        return self._request(
+            "POST",
+            "/v1/envs",
+            body={"name": name, "is_new": is_new, "package_b64": package_b64},
+            timeout=300.0,
+        )
+
     # -- runs --------------------------------------------------------------------------
     def create_run(self, spec: dict) -> dict:
         return self._request("POST", "/v1/runs", body={"spec": spec})

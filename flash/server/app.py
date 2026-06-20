@@ -187,6 +187,24 @@ def create_app():
     def models(_: dict = Depends(require_key)):
         return {"models": public_model_rows()}
 
+    @app.post("/v1/envs")
+    def publish_env(payload: dict, key: dict = Depends(require_key)):
+        # Publish a client-built verifiers env package to the MANAGED Prime account (this control
+        # plane's PRIME_API_KEY), namespaced per identity and PRIVATE — so users never need their
+        # own Prime account. The client just packages local source and uploads it here.
+        from flash.server import envs
+
+        try:
+            slug = envs.publish_package(
+                package_b64=payload.get("package_b64") or "",
+                name=payload.get("name") or "",
+                is_new=bool(payload.get("is_new", True)),
+                key=key,
+            )
+        except envs.EnvPublishError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {"id": slug}
+
     def _parse_spec(payload: dict, run_id: str) -> JobSpec:
         spec_raw = payload.get("spec") or {}
         env_raw = spec_raw.get("environment") or {}

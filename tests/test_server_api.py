@@ -605,3 +605,42 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
 
     assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint"
     assert runner.get_status("nohandle-1").state == "failed"
+
+
+def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
+    """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
+    plane's PRIME_API_KEY), namespaced per identity — so the user needs no Prime account."""
+    import base64
+    import io
+    import tarfile
+
+    import flash.server.envs as envs_mod
+
+    # Stub the actual `prime env push` so the test doesn't hit Prime; echo the namespaced name.
+    monkeypatch.setattr(
+        envs_mod, "_prime_push", lambda env_dir, *, name, is_new: f"freesolo-co/{name}"
+    )
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in (
+            ("pyproject.toml", b"[project]\nname='e'\n"),
+            ("e/__init__.py", b"x=1\n"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    pkg = base64.b64encode(buf.getvalue()).decode()
+
+    resp = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "MyEnv", "is_new": True, "package_b64": pkg},
+    )
+    assert resp.status_code == 200
+    slug = resp.json()["id"]
+    assert slug.startswith("freesolo-co/")  # published under the managed account
+    assert slug.endswith("-myenv")  # per-identity namespaced + sanitized
+
+    # Unauthenticated requests are rejected.
+    assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
