@@ -1,6 +1,6 @@
-"""Regression test: the documented `slm env install <prime-hub-env>` flow.
+"""Regression test: the documented `flash env install <prime-hub-env>` flow.
 
-DEFECT (fixed in this PR): `slm env install primeintellect/hendrycks-math` ran
+DEFECT (fixed in this PR): `flash env install primeintellect/hendrycks-math` ran
 `pip install primeintellect/hendrycks-math` (a local path) with no Prime Hub index, so it
 always failed. The fix derives the bare wheel name from the `owner/name` slug, defaults
 Hub slugs to the Prime index via `--extra-index-url`, and records the index in the manifest

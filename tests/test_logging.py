@@ -38,7 +38,7 @@ def test_configure_logging_sets_level():
 
 
 def test_importing_flash_emits_no_stderr():
-    # A fresh interpreter importing slm must produce no output.
+    # A fresh interpreter importing flash must produce no output.
     proc = subprocess.run(
         [sys.executable, "-c", "import flash, flash.runner, flash.providers.runpod.train"],
         cwd=ROOT,

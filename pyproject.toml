@@ -18,7 +18,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "runpod-flash",
     # >=0.34: upload_code()'s update_repo_settings(private=True) needs the visibility-via-settings
     # API (older 0.25.x update_repo_settings only accepts `gated` and raises TypeError on `private`;
     # visibility there lived on the now-removed update_repo_visibility).
@@ -49,7 +48,11 @@ gpu = [
 # setting the FLASH_* kernel flag(s) AND FLASH_CHALK_SPEC=<installable chalk spec> (git URL with
 # access, or a wheel); the submit path appends that spec to the worker's extra_pip, which is
 # installed for every job (works on the default baked-image path, unlike FLASH_WORKER_EXTRA_DEPS).
-server = ["fastapi", "uvicorn"]
+# Control-plane / operator deps: the FastAPI app + the RunPod Flash provider SDK.
+# runpod-flash is imported only by flash/providers/runpod (server-side); the client never
+# needs it — keeping it out of the base install also keeps its `flash` console script from
+# shadowing ours, so `pip install flash` gives an unambiguous `flash` command.
+server = ["fastapi", "uvicorn", "runpod-flash"]
 # Convenience aggregate of all optional runtime extras.
 all = ["flash[gpu,server]"]
 
@@ -58,8 +61,11 @@ Homepage = "https://github.com/freesolo-co/flash"
 Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
+# `flash` is the CLI. `slm` is a deprecated alias kept for back-compat (same entrypoint) —
+# e.g. the agent worker shells out to `slm`; remove it once those callers move to `flash`.
+flash = "flash.cli.main:main"
 slm = "flash.cli.main:main"
-# Operator-only: the control plane is a separate service, run once on the host, not a `slm`
+# Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'flash[server]'`).
 flash-server = "flash.server.__main__:main"
 

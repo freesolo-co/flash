@@ -1017,7 +1017,6 @@ dependencies = [
     { name = "datasets" },
     { name = "httpx" },
     { name = "huggingface-hub" },
-    { name = "runpod-flash" },
     { name = "verifiers" },
 ]
 
@@ -1027,6 +1026,7 @@ all = [
     { name = "bitsandbytes" },
     { name = "fastapi" },
     { name = "peft" },
+    { name = "runpod-flash" },
     { name = "torch" },
     { name = "transformers" },
     { name = "trl" },
@@ -1044,6 +1044,7 @@ gpu = [
 ]
 server = [
     { name = "fastapi" },
+    { name = "runpod-flash" },
     { name = "uvicorn" },
 ]
 
@@ -1062,9 +1063,9 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'server'" },
     { name = "flash", extras = ["gpu", "server"], marker = "extra == 'all'" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "huggingface-hub", specifier = ">=0.25" },
+    { name = "huggingface-hub", specifier = ">=0.34" },
     { name = "peft", marker = "extra == 'gpu'", specifier = ">=0.19" },
-    { name = "runpod-flash" },
+    { name = "runpod-flash", marker = "extra == 'server'" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.10.0" },
     { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.11" },
     { name = "trl", marker = "extra == 'gpu'", specifier = ">=1.6,<1.7" },
