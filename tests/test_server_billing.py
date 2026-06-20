@@ -147,6 +147,129 @@ def test_charge_unreachable_raises_503(monkeypatch):
     assert exc.value.status_code == 503
 
 
+def test_http_error_detail_falls_back_to_reason():
+    """When the error body is missing/unparseable, the detail keeps the backend REASON
+    (not a bare ``billing failed (<code>)``) so a 4xx/5xx stays diagnosable (PR #3 review)."""
+    from flash.server.billing import _http_error_detail
+
+    # Unparseable body -> reason phrase is preserved in the detail.
+    bad_body = urllib.error.HTTPError(
+        "http://x/api/billing/training-usage", 502, "Bad Gateway", {}, io.BytesIO(b"<html>nope")
+    )
+    detail = _http_error_detail(bad_body)
+    assert "502" in detail
+    assert "Bad Gateway" in detail
+
+    # Empty JSON object (no `detail`) -> still falls back to code + reason, not just the code.
+    empty = urllib.error.HTTPError(
+        "http://x/api/billing/training-usage", 402, "Payment Required", {}, io.BytesIO(b"{}")
+    )
+    assert "Payment Required" in _http_error_detail(empty)
+
+
+def test_charge_uses_offline_estimate_and_never_exceeds_quote(monkeypatch):
+    """CHARGE == QUOTE: for a ``model_policy = "allow"`` unlisted model, the server's parse can
+    size VRAM from a live HF probe and resolve a *larger* GPU than the fully-offline
+    ``--estimate`` quote. The charge must use the OFFLINE-consistent amount the user saw, and
+    in no case bill more than that quote (PR #3 review: estimate differs from submit charge)."""
+    from flash.cost.spec import estimate_for_spec, offline_estimate_for_spec
+    from flash.server import billing
+
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+
+    # Simulate the HF probe: live -> 14B (a bigger card), offline -> heuristic fallback.
+    import flash.engine.vram as vram
+
+    def fake_fetch(model_id, *, skip_net=False):
+        if skip_net or __import__("os").environ.get("FLASH_SKIP_NET"):
+            return None
+        return 14.0
+
+    monkeypatch.setattr(vram, "fetch_hf_params_b", fake_fetch)
+
+    from flash.schema import spec_from_dict
+
+    raw = {
+        "model": "some-org/unlisted-14b",
+        "model_policy": "allow",
+        "algorithm": "sft",
+        "environment": {"id": "primeintellect/gsm8k"},
+        "train": {"steps": 5, "seeds": [0], "hf_repo": "org/runs", "max_examples": 100},
+        "gpu": {"type": "cheapest"},
+    }
+    spec = spec_from_dict(raw, run_id="run-div")  # server-style parse: network ON
+
+    online = estimate_for_spec(spec)
+    offline = offline_estimate_for_spec(spec)
+    # Precondition: the two genuinely diverge (else the test proves nothing).
+    assert online.total_usd > offline.total_usd
+
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"amountCents": captured.get("cost", 0)}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        captured["cost"] = captured["body"]["costCents"]
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    billing.charge_run_estimate(token="fslo-user-9", spec=spec)
+
+    # Charged the offline quote, and strictly less than the (larger) online amount.
+    assert captured["body"]["costCents"] == billing._cents(offline.total_usd)
+    assert captured["body"]["costCents"] <= billing._cents(online.total_usd)
+    assert captured["body"]["gpu"] == offline.gpu
+
+
+def test_reverse_run_charge_posts_and_is_noop_offline(monkeypatch):
+    """The refund POSTs a reversal for the run; ``FLASH_SKIP_NET`` makes it a no-op (mirrors
+    the charge), and the original charge's amount is forwarded for the backend to match."""
+    from flash.server import billing
+
+    # Offline no-op.
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
+
+    def explode(*a, **k):
+        raise AssertionError("no network under FLASH_SKIP_NET")
+
+    monkeypatch.setattr(urllib.request, "urlopen", explode)
+    assert billing.reverse_run_charge(token="tok", run_id="r1", charge={"amountCents": 50}) == {}
+
+    # Online: POSTs a reversal carrying runId + the original amount.
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"reversed": True, "amountCents": 50}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data)
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    out = billing.reverse_run_charge(token="tok", run_id="r1", charge={"amountCents": 50})
+    assert out == {"reversed": True, "amountCents": 50}
+    assert captured["url"].endswith("/api/billing/training-usage/reverse")
+    assert captured["body"] == {"runId": "r1", "reverse": True, "costCents": 50}
+
+
 # ------------------------------------------------------------------------- create_run gate
 
 
@@ -230,3 +353,88 @@ def test_internal_identity_skips_billing(api, monkeypatch):
 
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-internal-secret"))
     assert res.status_code == 200, res.text
+
+
+def test_submit_failure_after_charge_reverses_the_debit(api, monkeypatch):
+    """If the charge succeeds but ``submit_job`` then fails, the org is debited for a run that
+    never started — the debit MUST be reversed (PR #3 review: debit not reversed on submit
+    failure). Assert the reversal fires with the run id + the original charge, and that no run
+    row is left behind."""
+    import flash.server.app as app_mod
+
+    charged = {"amountCents": 777}
+    monkeypatch.setattr(
+        "flash.server.billing.charge_run_estimate", lambda *, token, spec: charged
+    )
+
+    def failing_submit(spec, dry_run=False, background=True):
+        raise RuntimeError("provider out of capacity")
+
+    monkeypatch.setattr(app_mod, "submit_job", failing_submit)
+
+    reversed_calls = []
+    monkeypatch.setattr(
+        "flash.server.billing.reverse_run_charge",
+        lambda *, token, run_id, charge: reversed_calls.append((token, run_id, charge)) or {},
+    )
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-r"))
+    assert res.status_code == 400, res.text
+    assert "out of capacity" in res.json()["detail"]
+    # The charge was reversed for exactly this run, forwarding the original charge.
+    assert len(reversed_calls) == 1
+    token, run_id, charge = reversed_calls[0]
+    assert token == "fslo-user-r"
+    assert charge == charged
+    assert isinstance(run_id, str)
+    assert run_id
+    # A failed submit leaves no run row behind (so a retry re-charges cleanly).
+    assert api.get("/v1/runs", headers=_bearer("fslo-user-r")).json()["runs"] == []
+
+
+def test_refund_failure_does_not_mask_submit_error(api, monkeypatch):
+    """A best-effort refund: if the reversal ITSELF fails, the original submit error is still
+    surfaced (the refund failure is swallowed + logged, never raised to the client)."""
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(
+        "flash.server.billing.charge_run_estimate", lambda *, token, spec: {"amountCents": 5}
+    )
+
+    def failing_submit(spec, dry_run=False, background=True):
+        raise RuntimeError("provider out of capacity")
+
+    monkeypatch.setattr(app_mod, "submit_job", failing_submit)
+
+    def failing_reverse(*, token, run_id, charge):
+        raise RuntimeError("billing down during refund")
+
+    monkeypatch.setattr("flash.server.billing.reverse_run_charge", failing_reverse)
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-rr"))
+    # The submit error wins; the refund failure does not turn into a 500.
+    assert res.status_code == 400, res.text
+    assert "out of capacity" in res.json()["detail"]
+    assert api.get("/v1/runs", headers=_bearer("fslo-user-rr")).json()["runs"] == []
+
+
+def test_submit_failure_for_internal_identity_does_not_refund(api, monkeypatch):
+    """The internal service identity is never charged, so a submit failure must NOT attempt a
+    (meaningless) reversal."""
+    import flash.server.app as app_mod
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-secret")
+
+    def failing_submit(spec, dry_run=False, background=True):
+        raise RuntimeError("provider out of capacity")
+
+    monkeypatch.setattr(app_mod, "submit_job", failing_submit)
+    monkeypatch.setattr(
+        "flash.server.billing.reverse_run_charge",
+        lambda *, token, run_id, charge: (_ for _ in ()).throw(
+            AssertionError("internal identity was never charged; must not refund")
+        ),
+    )
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-internal-secret"))
+    assert res.status_code == 400, res.text

@@ -1,12 +1,24 @@
-"""Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / step count.
+"""Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / step count / estimate.
 
 Shared by the CLI (``slm train --cost``) and the control plane (which charges the estimate
 to the user's org at submit), so both price the SAME work the run will bill for.
+
+The CHARGE-vs-QUOTE invariant (PR #3 review): ``slm train --cost`` resolves the spec fully
+OFFLINE (the CLI scopes ``FLASH_SKIP_NET`` over parse + sizing), but the control plane parses
+the submitted spec WITHOUT that guard — so for a ``model_policy = "allow"`` unlisted model,
+the server's parse can read the real param count from the HF API and resolve a different
+(e.g. larger) GPU class into ``spec.gpu.type`` than the offline CLI quote showed.
+``offline_estimate_for_spec`` re-prices the spec on the SAME offline basis the user saw
+(``FLASH_SKIP_NET`` forced over the estimate, and a policy-word GPU re-resolved offline from
+``gpu.requested``), so the amount charged equals the amount quoted for the same spec.
 """
 
 from __future__ import annotations
 
-from flash.cost.types import RunConfig
+import os
+
+from flash.cost.analytical import estimate_cost
+from flash.cost.types import CostEstimate, RunConfig
 
 
 def sft_realized_batch(batch_size: int) -> int:
@@ -83,16 +95,27 @@ def spec_steps(spec) -> int:
     return min(n, cap) if cap > 0 else n
 
 
-def runconfig_from_spec(spec) -> RunConfig:
+def runconfig_from_spec(spec, *, offline_gpu: bool = False) -> RunConfig:
     """Map a parsed training ``JobSpec`` to a cost ``RunConfig``.
 
     Each seed is its own job that re-pays the cold start (runner.py), so scale both the step
     count and the setup repeats by the seed count -- the estimate then prices the same total
     work the run would bill for.
+
+    ``offline_gpu``: when the GPU was a policy word (``auto``/``cheapest``), forward that word
+    (from ``gpu.requested``) instead of the parse-time resolved ``gpu.type``, so the estimator
+    re-picks the class from its own OFFLINE VRAM sizing. This makes the charge match the
+    offline ``--estimate`` quote even when the server resolved ``gpu.type`` from a live HF probe
+    (a concrete user pin is always honored as-is). See ``offline_estimate_for_spec``.
     """
     t, g = spec.train, spec.gpu
     is_grpo = spec.algorithm == "grpo"
     seeds = max(1, len(t.seeds or (0,)))
+    gpu = g.type
+    if offline_gpu and _requested_is_policy(g):
+        # Re-resolve the cheapest fitting class from the estimator's offline sizing rather
+        # than trusting the (possibly HF-sized) parse-time pin.
+        gpu = (g.requested or "auto").strip().lower()
     return RunConfig(
         model_id=spec.model,
         method=spec.algorithm,
@@ -104,9 +127,41 @@ def runconfig_from_spec(spec) -> RunConfig:
         group_size=t.group_size if is_grpo else None,
         lora_rank=t.lora_rank,
         thinking=spec.thinking,
-        gpu=g.type,
+        gpu=gpu,
         provider=g.provider,
         allow_unvalidated=g.allow_unvalidated,
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
     )
+
+
+def _requested_is_policy(gpu_spec) -> bool:
+    """True when the user asked for a policy word (``auto``/``cheapest``), not a concrete pin."""
+    from flash.providers.base import POLICY_NAMES
+
+    return (gpu_spec.requested or "").strip().lower() in POLICY_NAMES
+
+
+def estimate_for_spec(spec) -> CostEstimate:
+    """The pre-flight ``CostEstimate`` for a parsed training ``JobSpec`` (as parsed)."""
+    return estimate_cost(runconfig_from_spec(spec))
+
+
+def offline_estimate_for_spec(spec) -> CostEstimate:
+    """The OFFLINE-consistent estimate -- what ``slm train --cost`` would have quoted.
+
+    Mirrors the CLI's scoped offline guard: forces ``FLASH_SKIP_NET`` over the whole estimate
+    (so any VRAM (re)sizing falls back to the offline heuristic for an unlisted model, never an
+    HF probe) and re-resolves a policy-word GPU offline. The control plane charges THIS amount,
+    so the org is billed exactly what the user was quoted for the same spec (and, paired with
+    the ``min(...)`` guard in ``charge_run_estimate``, never more than that quote).
+    """
+    prior = os.environ.get("FLASH_SKIP_NET")
+    os.environ["FLASH_SKIP_NET"] = "1"
+    try:
+        return estimate_cost(runconfig_from_spec(spec, offline_gpu=True))
+    finally:
+        if prior is None:
+            os.environ.pop("FLASH_SKIP_NET", None)
+        else:
+            os.environ["FLASH_SKIP_NET"] = prior

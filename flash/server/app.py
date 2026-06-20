@@ -14,6 +14,7 @@ to their persisted RunPod job handles.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import threading
 import weakref
@@ -41,6 +42,30 @@ _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
+
+_log = logging.getLogger("flash.server")
+
+
+def _reverse_charge_best_effort(*, token: str, run_id: str, charge: dict) -> None:
+    """Refund a run's pre-flight charge after its submit failed; never raise.
+
+    Called from ``create_run`` when ``submit_job`` raises AFTER the org was charged: the org
+    paid for a run that never started, so we credit the debit back. Best-effort — the refund's
+    own failure is logged (for an operator to reconcile) but never replaces the original submit
+    error the caller is about to surface. The reversal is idempotent by ``run_id`` (see
+    ``billing.reverse_run_charge``), so a later retried submit can re-charge safely.
+    """
+    try:
+        from flash.server.billing import reverse_run_charge
+
+        reverse_run_charge(token=token, run_id=run_id, charge=charge)
+    except Exception:
+        # A refund failure must NOT mask the submit error: log and swallow.
+        _log.exception(
+            "failed to reverse the pre-flight charge for run %s after a submit failure; "
+            "the org may be charged for a run that never started — reconcile manually",
+            run_id,
+        )
 
 
 class _RunLock:
@@ -214,13 +239,15 @@ def create_app():
         # it, so the run is gated on a sufficient prepaid balance and never starts GPU work
         # for free. Skipped for --dry-run (no run) and the operator's internal service
         # identity (no user org to bill). FLASH_SKIP_NET disables the call (offline / tests).
-        if not dry_run and key.get("key_prefix") != "internal":
+        billed = not dry_run and key.get("key_prefix") != "internal"
+        token = (authorization or "").removeprefix("Bearer ").strip()
+        charge: dict = {}
+        if billed:
             from flash.server.billing import BillingError as _BillingError
             from flash.server.billing import charge_run_estimate
 
-            token = (authorization or "").removeprefix("Bearer ").strip()
             try:
-                charge_run_estimate(token=token, spec=spec)
+                charge = charge_run_estimate(token=token, spec=spec)
             except _BillingError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
             except ValueError as exc:
@@ -233,6 +260,12 @@ def create_app():
             status = submit_job(spec, dry_run=dry_run, background=True)
         except Exception as exc:
             db.delete_run(spec.run_id)
+            # The org was charged above but the run never started — reverse the debit so the
+            # user isn't billed for a run that didn't run. Best-effort: a failed refund must
+            # not mask the original submit error (it's logged for an operator to reconcile),
+            # and the reversal is idempotent by run_id so a retried submit re-charges cleanly.
+            if billed:
+                _reverse_charge_best_effort(token=token, run_id=spec.run_id, charge=charge)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return status.to_dict()
 

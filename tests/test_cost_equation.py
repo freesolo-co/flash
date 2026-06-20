@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import dataclasses
 
-import pytest
-
 from flash.cost import RunConfig, estimate_cost
 from flash.cost.facts import gpu_hourly_usd, realized_hourly_usd
 from flash.cost.types import CostEstimate
@@ -20,11 +18,19 @@ def test_no_output_multiplier_field():
 
 
 def test_total_is_exactly_wall_hours_times_rate():
-    """The dollar figure is wall-clock hours x market $/hr -- nothing else, no factor."""
+    """The dollar figure is wall-clock hours x market $/hr -- nothing else, no factor.
+
+    This is the anti-reward-hacking invariant, and it is EXACT by construction: ``total_usd``
+    is computed as ``wall_clock_seconds / 3600 * hourly`` and ``wall_clock_hours`` divides the
+    same seconds by the same 3600, so re-deriving the product reproduces ``total_usd`` to the
+    bit. Assert exact equality (not ``approx``) so any smuggled-in multiplier/scaling — however
+    small — fails the test instead of hiding under a tolerance.
+    """
+    rate = realized_hourly_usd("RTX 5090")
     cfg = RunConfig("Qwen/Qwen3.5-9B", "grpo", 50, gpu="RTX 5090")
     e = estimate_cost(cfg)
-    assert e.total_usd == pytest.approx(e.wall_clock_hours * realized_hourly_usd("RTX 5090"))
-    assert e.gpu_hourly_usd == pytest.approx(realized_hourly_usd("RTX 5090"))
+    assert e.total_usd == e.wall_clock_hours * rate
+    assert e.gpu_hourly_usd == rate
 
 
 def test_prices_at_realized_rate():
