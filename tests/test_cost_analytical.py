@@ -151,6 +151,25 @@ def test_wall_cap_is_applied_per_seed_not_to_the_aggregate():
     e = estimate_cost(cfg)
     assert e.wall_capped is True
     assert e.wall_clock_seconds == pytest.approx(3 * 3600.0)
+
+
+def test_sub_60s_wall_cap_is_floored_to_the_runner_minimum():
+    # The runner enforces max(60, max_wall_seconds); the estimate must mirror it so a sub-60s
+    # cap isn't priced below what the run actually bills (otherwise a ~$0 estimate). A 10s and a
+    # 30s cap both floor to 60s of (capped) wall, and the dollar figure is strictly positive.
+    e10 = estimate_cost(RunConfig(BIG, "grpo", 100_000, max_wall_seconds=10))
+    e30 = estimate_cost(RunConfig(BIG, "grpo", 100_000, max_wall_seconds=30))
+    assert e10.wall_clock_seconds == pytest.approx(60.0)
+    assert e30.wall_clock_seconds == pytest.approx(60.0)
+    assert e10.total_usd > 0.0
+
+
+def test_nonpositive_max_wall_seconds_is_rejected():
+    # A 0/negative cap would drive estimate_cost to a negative wall and negative total_usd, so
+    # RunConfig rejects it up front (a sub-60s but positive cap is fine -- it's floored above).
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="max_wall_seconds must be >= 1"):
+            RunConfig(BIG, "grpo", 10, max_wall_seconds=bad)
     # One seed of the same shape caps at exactly one per-seed window.
     one = RunConfig(BIG, "grpo", 100_000, setup_repeats=1, max_wall_seconds=3600)
     assert estimate_cost(one).wall_clock_seconds == pytest.approx(3600.0)

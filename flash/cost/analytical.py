@@ -195,7 +195,13 @@ def estimate_cost(
     """
     gpu, need = select_gpu(config, pin_must_fit=pin_must_fit)
     hourly = realized_hourly_usd(gpu)  # market (spot/queue) rate runs are billed at
-    cap_s = float(config.max_wall_seconds) if config.max_wall_seconds is not None else wall_cap_s
+    # The runner enforces max(60, spec.gpu.max_wall_seconds); mirror that floor so a sub-60s cap
+    # isn't priced below what the run actually bills (e.g. a zero-dollar estimate).
+    cap_s = (
+        max(60.0, float(config.max_wall_seconds))
+        if config.max_wall_seconds is not None
+        else wall_cap_s
+    )
 
     # A multi-seed run is N independent jobs, each cold-starting and capped on its OWN wall.
     # Price one seed, clamp THAT to the cap, then multiply -- not capping the aggregate once.

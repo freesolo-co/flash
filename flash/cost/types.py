@@ -67,7 +67,18 @@ class RunConfig:
                 f"steps ({self.steps}) must be a multiple of setup_repeats "
                 f"({self.setup_repeats}): each seed runs an equal share of the steps"
             )
-        for _name in ("seq_len", "batch_size", "group_size", "completion_len", "lora_rank"):
+        # ``max_wall_seconds`` is included: a 0/negative cap would drive ``estimate_cost`` to a
+        # negative wall (cap used in ``min(setup, cap)`` then ``cap - setup``) and a negative
+        # ``total_usd``. A sub-60s but positive cap is valid -- the estimator floors it at the
+        # runner's 60s minimum -- so only reject <= 0 here.
+        for _name in (
+            "seq_len",
+            "batch_size",
+            "group_size",
+            "completion_len",
+            "lora_rank",
+            "max_wall_seconds",
+        ):
             _val = getattr(self, _name)
             if _val is not None and _val < 1:
                 raise ValueError(f"{_name} must be >= 1, got {_val}")
