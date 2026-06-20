@@ -2,7 +2,7 @@
 
 Same base model, same verifiers environment, same GRPO hyper-parameters (group_size=4, batch_size=4, **max_tokens=1024**, 30 steps) on each side. These are **training-only** runs — mid-run eval was removed, so both stacks do pure GRPO and the $ figures are a clean **cost of training**. Held-out **performance** is measured separately (deploy/serving side) so its eval cost never inflates training.
 
-- **Flash** trains on a rented RunPod GPU — the allocator picks the cheapest fitting class (4B GRPO needs ≥35 GB); these runs landed on **A100 PCIe** (see the per-task GPU rows). Cost is **measured** (RunPod billed).
+- **Flash** trains on a rented RunPod GPU — the allocator picks the cheapest fitting class (4B GRPO needs ≥35 GB); these runs landed on **A100 PCIe** in the per-task GPU rows. Cost is **measured** (RunPod billed).
 - **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is **not exposed via API**, so its $ column is an **active-compute** proxy (per-step wall, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, not a bill).
 - **Two axes:** (1) **cost of training** — the per-task tables + the cost-of-training summary below; (2) **performance** — the unified held-out eval (one scorer).
 
@@ -81,13 +81,13 @@ Pure GRPO, no eval. Flash is **measured** (RunPod); Tinker is an active-compute 
 | reverse-text | 0.0651 USD | 0.8405 USD | **12.9x** | 3m00s | 25m29s |
 | hendrycks-math | 0.2137 USD | 0.8272 USD | **3.9x** | 9m26s | 25m16s |
 
-Flash trains the same model for a fraction of the Tinker (proxy) cost — a dedicated A100 with colocated-vLLM rollouts finishes GRPO in minutes; the managed backend's per-step latency is several times higher. (Performance — whether either *improves* the model — is the held-out eval above; at this tiny scale neither does.)
+Flash trains the same model for a fraction of the Tinker (proxy) cost — a dedicated GPU with colocated-vLLM rollouts finishes GRPO in minutes; the managed backend's per-step latency is several times higher. (Performance — whether either *improves* the model — is the held-out eval above; at this tiny scale neither does.)
 
 **Which GPU?** The allocator picks the **cheapest fitting class across all providers** (no validation gate, no provider pin). For 4B GRPO (needs ≥35 GB) the eligible pool is the ≥48 GB cards; these runs landed on **A100 PCIe** (the per-task GPU rows above are authoritative). Caveat for compute-bound GRPO: the allocator minimizes **$/hr, not $/throughput**, so a card with the lowest hourly rate is not always the cheapest *job* — a faster card at a higher rate can finish sooner for about the same total spend. Compare the per-task **cost of training** against the **Flash wall** column above to see this trade-off on the actual runs.
 
 ## Reliability & operability (observed this run)
 
-- **Flash** rents a GPU per run; the allocator picks the cheapest fitting class (≥35 GB for 4B GRPO), which here was **A100 PCIe** (per the GPU rows above). On the long-generation math tasks the colocated-vLLM rollout **hung ~13-15 min at step boundaries** then self-recovered; a true >25-min freeze trips the **stall watchdog**, which **kills the sick host, escalates to the next-larger fitting class, and resumes from the last checkpoint**. reverse-text (short generations) ran clean. Net: dedicated + auto-healing, but rented-GPU flakiness adds real tail latency.
+- **Flash** rents a GPU per run; the allocator picks the cheapest fitting class (≥35 GB for 4B GRPO), which here was **A100 PCIe**. On the long-generation math tasks the colocated-vLLM rollout **hung ~13-15 min at step boundaries** then self-recovered; a true >25-min freeze trips the **stall watchdog**, which **kills the sick host, escalates to the next-larger fitting class, and resumes from the last checkpoint**. reverse-text (short generations) ran clean. Net: dedicated + auto-healing, but rented-GPU flakiness adds real tail latency.
 - **Tinker** is managed: **no setup/queue**, but the backend **paused all jobs ~10 min** mid-run ("running short on capacity, please wait") — out of the user's control, and slower per active step.
 - A **shared Flash control plane** dropped a run's watcher on restart → the record stuck at `running` forever (orphaned); re-run on a dedicated plane fixed it.
 - **HF caps repo creation at 300/day/user**; once hit, every new Flash run 429s at submit. Worked around by reusing pre-existing artifact repos (`run_flash_plane.py`).

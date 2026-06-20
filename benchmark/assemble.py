@@ -292,8 +292,22 @@ def render_markdown(records: dict) -> str:
     steps = _configured_steps(records)
     steps_str = str(steps) if steps is not None else "N"
     # GPU prose is derived from the runs (never hard-coded) so it always agrees with the tables.
+    # When NO GPU was recorded (unreachable control plane / missing gpu on records, tables show
+    # "—"), we must NOT assert any hardware — the wording degrades to "the GPU it picks" instead
+    # of claiming the runs "landed on" a specific class that was never recorded.
     gpus_used = _flash_gpus_used(records)
-    gpu_phrase = " / ".join(gpus_used) if gpus_used else "the cheapest fitting GPU class"
+    have_gpu = bool(gpus_used)
+    gpu_phrase = " / ".join(gpus_used) if have_gpu else "the cheapest fitting GPU class"
+    # "landed on **X**" only when X is real; otherwise neutral (no recorded-hardware claim).
+    gpu_landed = f"these runs landed on **{gpu_phrase}**" if have_gpu else "the GPU per run is recorded"
+    # For the "Which GPU?" / reliability prose: name the recorded class only when we have one.
+    gpu_which = (
+        f"these runs landed on **{gpu_phrase}**" if have_gpu
+        else "the chosen class is shown per task"
+    )
+    gpu_reliability = (
+        f"which here was **{gpu_phrase}**" if have_gpu else "shown per task in the GPU rows above"
+    )
     lines = []
     lines.append(f"# Flash vs Tinker — GRPO benchmark (Qwen3.5-4B, {steps_str} steps)\n")
     lines.append("Same base model, same verifiers environment, same GRPO hyper-parameters "
@@ -302,8 +316,8 @@ def render_markdown(records: dict) -> str:
                  "GRPO and the $ figures are a clean **cost of training**. Held-out **performance** is "
                  "measured separately (deploy/serving side) so its eval cost never inflates training.\n")
     lines.append(f"- **Flash** trains on a rented RunPod GPU — the allocator picks the cheapest "
-                 f"fitting class (4B GRPO needs ≥35 GB); these runs landed on **{gpu_phrase}** (see "
-                 "the per-task GPU rows). Cost is **measured** (RunPod billed).")
+                 f"fitting class (4B GRPO needs ≥35 GB); {gpu_landed} in the per-task GPU rows. "
+                 "Cost is **measured** (RunPod billed).")
     lines.append("- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is "
                  "**not exposed via API**, so its $ column is an **active-compute** proxy "
                  "(per-step wall, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, not a bill).")
@@ -429,12 +443,12 @@ def render_markdown(records: dict) -> str:
             f"{_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} |"
         )
     lines.append("\nFlash trains the same model for a fraction of the Tinker (proxy) cost — a dedicated "
-                 "A100 with colocated-vLLM rollouts finishes GRPO in minutes; the managed backend's "
+                 "GPU with colocated-vLLM rollouts finishes GRPO in minutes; the managed backend's "
                  "per-step latency is several times higher. (Performance — whether either *improves* the "
                  "model — is the held-out eval above; at this tiny scale neither does.)\n")
     lines.append(f"**Which GPU?** The allocator picks the **cheapest fitting class across all "
                  f"providers** (no validation gate, no provider pin). For 4B GRPO (needs ≥35 GB) the "
-                 f"eligible pool is the ≥48 GB cards; these runs landed on **{gpu_phrase}** (the "
+                 f"eligible pool is the ≥48 GB cards; {gpu_which} (the "
                  "per-task GPU rows above are authoritative). Caveat for compute-bound GRPO: the "
                  "allocator minimizes **$/hr, not $/throughput**, so a card with the lowest hourly rate "
                  "is not always the cheapest *job* — a faster card at a higher rate can finish sooner "
@@ -443,7 +457,7 @@ def render_markdown(records: dict) -> str:
 
     lines.append("## Reliability & operability (observed this run)\n")
     lines.append(f"- **Flash** rents a GPU per run; the allocator picks the cheapest fitting class "
-                 f"(≥35 GB for 4B GRPO), which here was **{gpu_phrase}** (per the GPU rows above). On "
+                 f"(≥35 GB for 4B GRPO), {gpu_reliability}. On "
                  "the long-generation math tasks the colocated-vLLM rollout **hung ~13-15 min at step "
                  "boundaries** then self-recovered; a true >25-min freeze trips the **stall watchdog**, "
                  "which **kills the sick host, escalates to the next-larger fitting class, and resumes "

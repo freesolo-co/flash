@@ -951,6 +951,21 @@ def test_render_markdown_gpu_prose_derived_from_records():
     recs = _records_for_md(0.0)  # flash gpu == "A100 PCIe"
     md = assemble.render_markdown(recs)
     assert "A100 PCIe" in md
+    assert "landed on **A100 PCIe**" in md
     assert "$0.139" not in md           # the fabricated A40 number is gone
     assert "A40 is the new default" not in md
+    assert "dedicated A100" not in md   # the hardcoded A100 summary claim is gone too
     assert assemble._flash_gpus_used(recs) == ["A100 PCIe"]
+
+
+def test_render_markdown_no_gpu_recorded_makes_no_hardware_claim():
+    # When NO Flash GPU is recorded (unreachable control plane / missing gpu, tables show "—"),
+    # the prose must NOT assert that runs "landed on" any class (Bugbot follow-up on 9542152).
+    recs = _records_for_md(0.0)
+    for task in assemble.TASKS:
+        recs[task]["flash"]["gpu"] = None
+    assert assemble._flash_gpus_used(recs) == []
+    md = assemble.render_markdown(recs)
+    # No "landed on **...**" hardware assertion anywhere, and the table GPU cells are "—".
+    assert "landed on **" not in md
+    assert "| GPU | — |" in md
