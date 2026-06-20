@@ -7,17 +7,17 @@
   "launched_utc": "2026-06-20T04:21Z",
   "flash": {
     "gsm8k": {
-      "run_id": "flash-1781935796-746b8de9",
+      "run_id": "flash-1781984412-9f17e482",
       "api_url": "http://127.0.0.1:8085",
       "hf_repo": "DavidBShan/flash-bench-gsm8k-4b"
     },
     "reverse-text": {
-      "run_id": "flash-1781935796-617700cb",
+      "run_id": "flash-1781985114-2dd37442",
       "api_url": "http://127.0.0.1:8085",
       "hf_repo": "DavidBShan/autoslm-cli-smoke-grpo (reused)"
     },
     "hendrycks-math": {
-      "run_id": "flash-1781935796-9d515fe0",
+      "run_id": "flash-1781985114-78a99dee",
       "api_url": "http://127.0.0.1:8085",
       "hf_repo": "DavidBShan/autoslm-sdk-smoke-grpo (reused)"
     }
@@ -28,5 +28,5 @@
     "hendrycks-math": "results/tinker_hendrycks-math.json"
   },
   "rerun_utc": "2026-06-20T06:10Z",
-  "note": "re-run with stall fix (heartbeat during eval) + truncation fix (max_tokens 1024)"
+  "note": "TRAINING-ONLY runs (mid-run eval removed; eval is deploy/serving-side). Flash cost = pure GRPO training, matching Tinker (which never had mid-run eval)."
 }

@@ -256,16 +256,16 @@ def render_markdown(records: dict) -> str:
     lines.append(f"# Flash vs Tinker — GRPO benchmark (Qwen3.5-4B, {steps_str} steps)\n")
     lines.append("Same base model, same verifiers environment, same GRPO hyper-parameters "
                  f"(group_size=4, batch_size=4, **max_tokens=1024**, {steps_str} steps) on each side. "
-                 "This run includes the **stall fix** (heartbeat through mid-run eval) and the "
-                 "**truncation fix** (1024 tokens so the boxed answer isn't cut off).\n")
+                 "These are **training-only** runs — mid-run eval was removed, so both stacks do pure "
+                 "GRPO and the $ figures are a clean **cost of training**. Held-out **performance** is "
+                 "measured separately (deploy/serving side) so its eval cost never inflates training.\n")
     lines.append("- **Flash** trains on a rented RunPod **A100 PCIe** (4B GRPO needs ≥35 GB; the "
                  "allocator escalates from the requested RTX 5090). Cost is **measured** (RunPod billed).")
     lines.append("- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is "
                  "**not exposed via API**, so its $ column is an **active-compute** proxy "
-                 "(rollout+train time, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, "
-                 "not a bill).")
-    lines.append(f"- **Performance** = mean group reward over the {steps_str}-step GRPO run "
-                 "(step 1 → final). Flash also reports a native held-out eval (50 examples).\n")
+                 "(per-step wall, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, not a bill).")
+    lines.append("- **Two axes:** (1) **cost of training** — the per-task tables + the cost-of-training "
+                 "summary below; (2) **performance** — the unified held-out eval (one scorer).\n")
 
     # Per-task tables
     for task in TASKS:
@@ -284,7 +284,6 @@ def render_markdown(records: dict) -> str:
         f_pts = len(f.get("reward_history") or [])
         t_pts = len(t.get("reward_history") or [])
         lines.append(f"| reward final (last logged: F={f_pts} / T={t_pts} pts) | {_fmt(f.get('final_reward'))} | {_fmt(t.get('final_reward'))} | |")
-        lines.append(f"| held-out eval | {_fmt(f.get('eval_reward'))} (n={f.get('eval_n')}) | — | |")
         lines.append(f"| **latency** wall total | {_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} | |")
         lines.append(f"| latency setup/queue | {_secs(f.get('setup_s'))} | none (managed) | |")
         lines.append(f"| latency active compute | {_secs(f.get('train_s'))} | {_secs(t.get('train_s'))} | |")
@@ -294,7 +293,7 @@ def render_markdown(records: dict) -> str:
         _paused = t.get("paused_s")
         lines.append(f"| latency capacity-pause | — | {_secs(_paused) if _paused is not None else 'none'} | |")
         lines.append(f"| latency per-step | {_fmt(f.get('per_step_s'), 1, 's')} | {_fmt(t.get('per_step_s'), 1, 's')} | |")
-        lines.append(f"| **cost** | {_fmt(f.get('cost_usd'), 4, ' USD')} | {_fmt(t.get('cost_usd'), 4, ' USD')} | |")
+        lines.append(f"| **cost of training** | {_fmt(f.get('cost_usd'), 4, ' USD')} | {_fmt(t.get('cost_usd'), 4, ' USD')} | |")
         lines.append(f"| cost basis | {f.get('cost_kind')} | {t.get('cost_kind')} | |")
         lines.append("")
 
@@ -345,25 +344,25 @@ def render_markdown(records: dict) -> str:
                      f"at max_tokens={ev.get('max_tokens')}, {int(b.get('truncated_frac', 0) * 100)}% of "
                      "base generations still hit the cap (Qwen3.5-4B is very verbose for this format).\n")
 
-    # Roll-up
-    lines.append("## Summary\n")
-    lines.append("| task | winner (reward) | flash cost | tinker cost (est) | flash wall | tinker wall |")
+    # Roll-up — cost of training is the headline (training-only runs).
+    lines.append("## Cost of training (the headline)\n")
+    lines.append("Pure GRPO, no eval. Flash is **measured** (RunPod); Tinker is an active-compute "
+                 "proxy (its real per-token bill isn't API-exposed).\n")
+    lines.append("| task | Flash $ (measured) | Tinker $ (proxy) | Tinker / Flash | Flash wall | Tinker wall |")
     lines.append("|---|---|---|---|---|---|")
     for task in TASKS:
         f = records[task]["flash"]
         t = records[task]["tinker"]
-        fr, tr = f.get("final_smoothed"), t.get("final_smoothed")
-        if fr is None or tr is None:
-            winner = "—"
-        elif abs(fr - tr) < 0.02:  # within noise at 16 rollouts/step
-            winner = "tie"
-        else:
-            winner = "Flash" if fr > tr else "Tinker"
+        fc, tc = f.get("cost_usd"), t.get("cost_usd")
+        ratio = f"**{tc / fc:.1f}x**" if (fc and tc and fc > 0) else "—"
         lines.append(
-            f"| {task} | {winner} | {_fmt(f.get('cost_usd'), 4, ' USD')} | "
-            f"{_fmt(t.get('cost_usd'), 4, ' USD')} | {_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} |"
+            f"| {task} | {_fmt(fc, 4, ' USD')} | {_fmt(tc, 4, ' USD')} | {ratio} | "
+            f"{_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} |"
         )
-    lines.append("")
+    lines.append("\nFlash trains the same model for a fraction of the Tinker (proxy) cost — a dedicated "
+                 "A100 with colocated-vLLM rollouts finishes GRPO in minutes; the managed backend's "
+                 "per-step latency is several times higher. (Performance — whether either *improves* the "
+                 "model — is the held-out eval above; at this tiny scale neither does.)\n")
 
     lines.append("## Reliability & operability (observed this run)\n")
     lines.append("- **Flash** rents a GPU per run. 4B GRPO needs ≥35 GB → the allocator escalates "
