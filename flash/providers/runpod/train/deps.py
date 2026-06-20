@@ -52,7 +52,7 @@ WORKER_DEPS = [
     # per-arch experiment, kept out of the default deps to avoid a fragile cold-start install.)
     # Liger fused Triton kernels (pure Triton -> JITs on every arch incl. Blackwell): fused
     # linear cross-entropy for SFT (use_liger_kernel) and the chunked GRPO loss
-    # (use_liger_loss) — the big large-vocab (Qwen ~152k) memory/throughput win.
+    # (use_liger_loss) — the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
     "wandb>=0.17",
     "liger-kernel>=0.5",
     # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this,
