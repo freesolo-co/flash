@@ -73,9 +73,11 @@ here) is a published-rate estimate on the token model below.
    steps — because $/hr is fixed while the per-token meter keeps running. This
    tiny 480-rollout matrix is where per-token is most favorable.
 
-Sensitivity: math tasks span ~$0.23→0.34 (Prime Lab) / ~$0.52→0.76 (Tinker)
-between the completion-only and full-sequence-at-cap training meters; the **2.2×
-Tinker/Prime Lab ratio holds regardless**. See `cost.py` / `cost.py --train-full`.
+Sensitivity: math tasks span ~$0.23→0.28 (Prime Lab) / ~$0.52→0.63 (Tinker)
+between the completion-only and full-sequence training meters (whether Prime
+Lab's training line counts only the completion tokens or the full prompt+
+completion sequence); the **2.2× Tinker/Prime Lab ratio holds regardless**.
+Reproduce: `cost.py` (completion-only) vs `cost.py --train-full` (full-sequence).
 
 ## Token model (how the Prime Lab estimate is built)
 

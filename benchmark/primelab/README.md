@@ -53,8 +53,8 @@ prime train metrics <run_id>           # reward curve, parity check vs Flash/Tin
 `cost.py` applies the confirmed rates to the GRPO token volume:
 
 ```bash
-python3 benchmark/primelab/cost.py            # central estimate + at-cap ceiling
-python3 benchmark/primelab/cost.py --train-full --json
+python3 benchmark/primelab/cost.py            # completion-only (central estimate)
+python3 benchmark/primelab/cost.py --train-full --json   # full-sequence upper bound
 ```
 
 Token model and per-task length assumptions are documented at the top of
