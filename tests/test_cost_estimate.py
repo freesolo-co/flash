@@ -50,6 +50,8 @@ def test_subhour_cap_note_renders_minutes_not_zero_hours():
 def test_fmt_duration_units():
     from flash.cost.analytical import _fmt_duration
 
+    assert _fmt_duration(20) == "20s"  # sub-minute -> seconds, never "0m"
+    assert _fmt_duration(59) == "59s"
     assert _fmt_duration(60) == "1m"  # sub-hour -> minutes, never "0h"
     assert _fmt_duration(1800) == "30m"
     assert _fmt_duration(24 * 3600) == "24h"  # whole hours stay clean

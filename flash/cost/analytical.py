@@ -51,9 +51,12 @@ DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
 
 
 def _fmt_duration(seconds: float) -> str:
-    """Human duration for notes: sub-hour caps render in minutes (a 60s cap is ``1m``, not the
-    confusing ``0h`` that ``{s/3600:.0f}h`` would print), whole hours stay clean (``24h``),
-    fractional multi-hour spans show one decimal (``1.5h``)."""
+    """Human duration for notes: sub-minute spans render in seconds (a 20s uncapped train is
+    ``20s``, not the confusing ``0m`` that ``{s/60:.0f}m`` would print), sub-hour caps in
+    minutes (a 60s cap is ``1m``, not ``0h``), whole hours stay clean (``24h``), and fractional
+    multi-hour spans show one decimal (``1.5h``)."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
     if seconds < 3600:
         return f"{seconds / 60:.0f}m"
     hours = seconds / 3600
