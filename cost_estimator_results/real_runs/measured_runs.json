@@ -1,5 +1,5 @@
 {
- "note": "Measured RunPod/Vast training runs (control-plane cost_usd) \u2014 the calibration+validation set for flash.cost. Refresh via the harvester.",
+ "note": "Measured RunPod/Vast training runs (control-plane cost_usd) \u2014 calibration+validation set for flash.cost.",
  "runs": [
   {
    "run_id": "autoslm-1781584479-f8b7ae90",
@@ -952,6 +952,40 @@
    "gpu": "A100 SXM",
    "provider": "vast",
    "hourly_usd": 1.1404623675655352
+  },
+  {
+   "run_id": "autoslm-1781911217-08f7157d",
+   "model": "Qwen/Qwen3.5-2B",
+   "method": "grpo",
+   "steps": 6,
+   "group_size": 8,
+   "batch_size": 64,
+   "completion_len": 1024,
+   "seq_len": 2048,
+   "environment": "freesolo-co/autoslm-bench",
+   "setup_repeats": 1,
+   "cost_usd": 0.450683,
+   "wall_seconds": 954.4,
+   "gpu": "RTX 4090",
+   "provider": "vast",
+   "hourly_usd": 1.76
+  },
+  {
+   "run_id": "autoslm-1781911217-e5c58ee5",
+   "model": "Qwen/Qwen3.5-0.8B",
+   "method": "grpo",
+   "steps": 6,
+   "group_size": 8,
+   "batch_size": 64,
+   "completion_len": 1024,
+   "seq_len": 2048,
+   "environment": "freesolo-co/autoslm-bench",
+   "setup_repeats": 1,
+   "cost_usd": 0.21006,
+   "wall_seconds": 822.2,
+   "gpu": "RTX 5090",
+   "provider": "vast",
+   "hourly_usd": 0.9362962962962962
   }
  ]
 }
