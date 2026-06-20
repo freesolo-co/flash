@@ -63,13 +63,23 @@ def build_report() -> str:
     consts = fit_constants()
     # ``verify_accuracy`` omits any group with zero rows, so "real" is absent when the dataset
     # has no >=500s runs. Fall back to "all"; only a fully empty dataset has neither.
-    real = acc.get("real") or acc.get("all")
+    real_group = "real" if "real" in acc else "all"
+    real = acc.get(real_group)
     if real is None:
         raise SystemExit("no runs in measured_runs.json -- nothing to grade")
+    # Label the money paragraph to match the data actually shown (real subset vs all).
+    if real_group == "real":
+        runs_label = f"{real['n']} real runs (those that actually ran their configured work)"
+    else:
+        runs_label = f"{real['n']} runs (all groups; no ≥500s subset in this dataset)"
+    # Compute dynamic accuracy numbers from the data to avoid prose drifting from the table.
+    rg = acc.get("real_grpo") or acc.get("real") or {}
+    grpo_ape = f"~{rg['median_ape_pct']:.0f}%" if rg else "N/A"
+    grpo_within = f"~{rg['within_33pct'] * 100:.0f}%" if rg else "N/A"
     money = (
         f"**Money outcome — does the estimator break even, gain, or lose?** If the estimate "
         f"is the quote and the measured cost is what we pay the provider, then over the "
-        f"**{real['n']} real runs** (those that actually ran their configured work) the "
+        f"**{runs_label}** the "
         f"equation quotes **${real['sum_estimated_usd']:.2f}** against **${real['sum_measured_usd']:.2f}** "
         f"of real cost — a net of **{real['net_usd']:+.2f} ({real['net_pct']:+.0f}%)**, i.e. "
         f"**{_verdict(real).replace('**', '')}**. The `all` row nets near zero only because "
@@ -89,7 +99,7 @@ grading, the spot/queue rate the provider bills). **There is no output multiplie
 dollar figure is not scaled to hit any target. The numbers below are whatever the equation
 gives.
 
-## Accuracy vs measured cost (n={acc["all"]["n"]} real runs)
+## Accuracy vs measured cost (n={acc["all"]["n"]} runs)
 
 {_acc_table(acc)}
 
@@ -97,8 +107,8 @@ gives.
 
 The net $ is **not forced to zero** -- forcing it (scaling the estimate to hit break-even)
 would be exactly the output hack this equation avoids. The meaningful rows are **`real_*`**
-(runs >= 500s that actually executed their configured work): real GRPO lands at **~23% median
-APE, ~70% of runs within a third** of measured -- accurate for a pre-flight quote. Runs <500s
+(runs >= 500s that actually executed their configured work): real GRPO lands at **{grpo_ape} median
+APE, {grpo_within} of runs within a third** of measured -- accurate for a pre-flight quote. Runs <500s
 over-predict badly because they
 never ran their configured steps (cancelled / step-capped smoke tests -- the tell is that
 predicted train time alone exceeds the whole measured wall), so their measured cost is for
@@ -106,10 +116,11 @@ a different, shorter run than the equation prices: an invalid comparison, not an
 error. The remaining real-run residual is cold-start spread (implied cold-start is a stable
 ~480-520s on long runs) + per-step scatter; it is a central estimate, not a fake-precise point.
 
-## Calibrated physical inputs (realized market $/hr, from {consts["n_runs"]} runs' billing)
+## Calibrated physical inputs (observed billed $/hr reference, from {consts["n_runs"]} runs)
 
-The equation prices at the **realized (spot/queue) rate** providers actually bill, not the
-on-demand list price. Median of the providers' recorded rate per class:
+Observed billed medians per GPU class from `fit_constants()` (for reference — the estimator
+uses `flash.cost.facts.REALIZED_HOURLY_USD`, which may use conservative representative rates
+that differ from these dataset medians):
 
 {json.dumps(consts["realized_hourly_usd"], indent=0).replace('{', '').replace('}', '').strip()}
 

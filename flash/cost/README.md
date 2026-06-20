@@ -30,9 +30,10 @@ you'd measure MFU empirically, **never** a dimensionless correction on the resul
 - **Reward concurrency** — graders run in parallel; the reward wall is
   `completions × per-completion-latency / concurrency`, *not* the serial product (which
   over-counts a heavy LLM-judge by ~100× and saturates the 24 h wall cap).
-- **Realized $/hr** (`facts.REALIZED_HOURLY_USD`) — the median effective rate
+- **Realized $/hr** (`facts.REALIZED_HOURLY_USD`) — a representative effective rate
   (measured cost ÷ measured wall) per GPU class, an empirical observation rather than list
-  ± a fixed discount. Usually below list (the spot discount: RTX 5090 lists $0.99 but bills
+  ± a fixed discount. The table uses conservative per-class values; `fit_constants()` returns
+  the exact dataset medians (useful for re-calibration). Usually below list (the spot discount: RTX 5090 lists $0.99 but bills
   ~$0.87; A100 PCIe lists $1.39 but bills ~$1.04), but it can run *above* list when the
   market is tight (an H100 GRPO run billed ~$10/hr against a $3.29 list). An unobserved
   class falls back to list (an honest estimate until measured).
@@ -55,6 +56,8 @@ python -m flash.cost verify    # grade the equation vs measured cost + env sweep
 | **real** (≥500s) | 43 | 39% | **23%** | 0.78 | 60% |
 | **real GRPO** | 37 | 37% | **22%** | 0.76 | **68%** |
 | real SFT | 6 | 50% | 47% | 1.00 | 17% |
+
+_Static snapshot — see [`accuracy_report.md`](../../cost_estimator_results/real_runs/accuracy_report.md) for current figures (regenerate with `accuracy.py`)._
 
 The meaningful rows are **`real`** — runs ≥500s that actually executed their configured
 work. **Real GRPO is accurate: 22% median APE, ~68% of runs within a third of measured.**

@@ -241,7 +241,9 @@ def estimate_cost(
     hourly = realized_hourly_usd(gpu)  # market (spot/queue) rate runs are billed at
     # The wall cap is ``gpu.max_wall_seconds`` from the spec (default 24h); fall back to the
     # caller's ``wall_cap_s`` (the module default) when the config doesn't pin one.
-    cap_s = float(config.max_wall_seconds) if config.max_wall_seconds is not None else wall_cap_s
+    # Runner enforces max(60, spec.gpu.max_wall_seconds); mirror that floor so near-zero
+    # max_wall_seconds values don't produce near-zero/negative cost estimates.
+    cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
 
     # A multi-seed run is N independent jobs (runner.py: "one allocation per seed"), each of
     # which cold-starts, runs its own steps, and has ``max_wall_seconds`` applied to ITS OWN
