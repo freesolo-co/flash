@@ -303,7 +303,7 @@ def build_accelerate_launch_cmd(
     *,
     worker_module: str = "flash.engine.worker",
     mixed_precision: str = "bf16",
-    use_fsdp: bool = True,
+    use_fsdp: bool = False,
 ) -> list[str]:
     """``accelerate launch`` argv that runs the GRPO trainer across the TRAIN devices.
 
@@ -317,13 +317,15 @@ def build_accelerate_launch_cmd(
     ``--gpu_ids`` pins the child group to the GLOBAL train device indices (so it never touches the
     inference card), and ``--num_processes`` == train_gpus (one rank per train GPU).
 
-    SHIPPED PATH: the worker calls this with ``use_fsdp=False`` (DDP — replicate the policy per
-    rank), because TRL's per-step LoRA-merge weight sync (``merge_adapter()`` ->
-    ``get_delta_weight``) breaks under FSDP param sharding. Every model that runs a multi-trainer
-    ratio (1-9B) fits replicated on one trainer card, so DDP covers all the 2:1/3:1/2:2 ratios; the
-    only model that wouldn't (35B) takes the single-trainer 1:1 path. The ``use_fsdp=True`` branch
-    (FSDP SHARD_GRAD_OP, for a base too big to replicate) is kept for a future TRL patch that gathers
-    LoRA before the merge, but is not currently exercised by the launcher.
+    SHIPPED PATH (the default, ``use_fsdp=False``): DDP — replicate the policy per rank — because
+    TRL's per-step LoRA-merge weight sync (``merge_adapter()`` -> ``get_delta_weight``) breaks under
+    FSDP param sharding. The default matches the only configuration the worker exercises so a future
+    caller (or refactor) can't accidentally reintroduce the unsupported FSDP launcher. Every model
+    that runs a multi-trainer ratio (1-9B) fits replicated on one trainer card, so DDP covers all the
+    2:1/3:1/2:2 ratios; the only model that wouldn't (35B) takes the single-trainer 1:1 path. The
+    ``use_fsdp=True`` branch (FSDP SHARD_GRAD_OP, for a base too big to replicate) is kept for a
+    future TRL patch that gathers LoRA before the merge, but is not currently exercised by the
+    launcher.
     """
     cmd = [
         "accelerate",

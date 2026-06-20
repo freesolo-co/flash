@@ -248,7 +248,8 @@ def test_accelerate_launch_cmd_2to1():
     # 2:1 split (2 trainer GPUs : 1 infer). accelerate launches one rank per TRAIN GPU, pinned to
     # the global train device ids, FSDP-sharded, running the worker module.
     split = select_rollout_split(3, 1)  # total 3, infer 1 -> train_gpus=2
-    cmd = build_accelerate_launch_cmd(split)
+    # FSDP is opt-in (default is the shipped DDP path); pass use_fsdp=True to exercise this branch.
+    cmd = build_accelerate_launch_cmd(split, use_fsdp=True)
     assert cmd[0:2] == ["accelerate", "launch"]
     # FSDP implies multi-GPU; accelerate REJECTS --multi_gpu alongside --use_fsdp, so it must be absent
     assert "--multi_gpu" not in cmd

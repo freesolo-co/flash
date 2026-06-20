@@ -354,7 +354,10 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None, *, train=None
         _split = _ig > 0
         per_param = 6 if _split else 2
         headroom = 96 if _split else 64
-        min_disk = int(est.params_b * per_param) + headroom
+        # ceil (not int/truncate): a fractional param estimate must round the floor UP so we never
+        # under-provision disk by several GB — the exact failure ("No space left on device" mid-
+        # download) this floor exists to prevent.
+        min_disk = math.ceil(est.params_b * per_param) + headroom
     else:
         min_disk = 0
     return ModelInfo(

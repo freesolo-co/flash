@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from flash.catalog import resolve_model
@@ -84,7 +86,9 @@ def test_allow_policy_disaggregated_raises_disk_floor(monkeypatch):
     # a small model that DOES fit colocated keeps the lower single-checkpoint floor (no regression).
     monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 1.2, raising=True)
     small = resolve_model("acme/tiny-1b", "grpo", policy="allow", gpu="RTX 4090")
-    assert small.min_disk_gb == int(1.2 * 2) + 64
+    # ceil (not truncate): a fractional param estimate rounds the disk floor UP so it never
+    # under-provisions (1.2 * 2 = 2.4 -> 3, not 2).
+    assert small.min_disk_gb == math.ceil(1.2 * 2) + 64
 
 
 def test_allow_policy_disaggregated_fits_verdict_still_elevates_disk(monkeypatch):
