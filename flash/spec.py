@@ -37,10 +37,6 @@ def coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
-# Back-compat private alias (the helper was internal before it was shared with the server API).
-_coerce_bool = coerce_bool
-
-
 def _coerce_str_map(value: Any) -> dict[str, str]:
     """Coerce a loosely-typed spec field into a ``dict[str, str]``.
 
@@ -297,7 +293,7 @@ class JobSpec:
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
-            thinking=_coerce_bool(data.get("thinking", False)),
+            thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
         )
 
