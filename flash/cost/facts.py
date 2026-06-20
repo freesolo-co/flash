@@ -189,9 +189,9 @@ def download_weight_gb(model_id: str, params_str: str | None = None) -> float:
 # ===== Reward-grader latency (GRPO) =====
 # A SINGLE average grader latency (s/completion) for every environment -- we don't classify the
 # env from its slug (not generalizable). Real graders span ~0.01s (regex/math) to ~3s (LLM
-# judge / code); we use the heavier ~3s end as the average so the common LLM-judge / code-exec
-# graders aren't under-priced. A run can pin its own via RunConfig.reward_seconds_per_completion.
-AVG_REWARD_SECONDS_PER_COMPLETION = 3.0
+# judge / code); ~1s is a middle-of-the-road average across that range. A run can pin its own
+# via RunConfig.reward_seconds_per_completion.
+AVG_REWARD_SECONDS_PER_COMPLETION = 1.0
 
 
 def reward_seconds_per_completion(override: float | None = None) -> float:
