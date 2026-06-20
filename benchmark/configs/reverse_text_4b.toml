@@ -16,6 +16,7 @@ max_tokens       = 1024
 hf_repo          = "DavidBShan/flash-bench-reverse-text-4b"
 
 [gpu]
-# Cheapest GPU class that fits, across all providers — no validation gate, no provider
-# pin. 4B GRPO (needs >=35 GB) lands on the A40 (48 GB) at ~$0.44/hr.
+# Asks the allocator for the cheapest *available* class that fits (4B GRPO needs >=35 GB),
+# across all providers — no validation gate, no provider pin. The exact card and price are
+# market/availability-driven and vary per run (the recorded benchmark ran on A100 PCIe).
 requested = "cheapest"

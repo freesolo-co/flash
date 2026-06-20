@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import tomllib
 from typing import Any
 
@@ -122,9 +123,12 @@ def _check_gpu_fields(gpu_raw: dict[str, Any]) -> None:
             raise ConfigError(msg)
     unknown = sorted(set(gpu_raw) - set(_GPU_KEYS))
     if unknown:
+        # stderr, not stdout: spec_from_dict runs inside flash/mcp/server.py, which speaks a
+        # one-JSON-object-per-line protocol on stdout — a warning line there corrupts the stream.
         print(
             f"warning: [gpu] unknown key(s) ignored: {', '.join(unknown)} "
-            f"(known: {', '.join(_GPU_KEYS)})"
+            f"(known: {', '.join(_GPU_KEYS)})",
+            file=sys.stderr,
         )
 
 
