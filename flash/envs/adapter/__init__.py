@@ -146,7 +146,10 @@ class VerifiersEnvironment(BaseEnvironment):
         self._parser = getattr(vf_env, "parser", None)
 
     # -- data -------------------------------------------------------------
-    def dataset(self, split: str = "train") -> list[dict]:
+    def dataset(self) -> list[dict]:
+        # Training rows only: the verifiers env's train split. Eval/validation/test are not
+        # served here — mid-run env eval was removed (held-out eval lives on the deploy/serving
+        # side), so there is no split to select (see commit "delete all env-eval support").
         ds = _call_dataset_getter(self._env, "get_dataset", seed=0)
         if ds is None:
             ds = getattr(self._env, "dataset", None)

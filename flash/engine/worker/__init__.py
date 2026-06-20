@@ -710,7 +710,7 @@ def run_sft():
         tok.pad_token = tok.eos_token
 
     # Build SFT text dataset (seeded shuffle for reproducibility)
-    train = ACTIVE_ENV.dataset("train")
+    train = ACTIVE_ENV.dataset()
     rng = random.Random(SEED)
     rng.shuffle(train)
     max_examples = int(
@@ -1324,7 +1324,7 @@ def run_rl():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    train = ACTIVE_ENV.dataset("train")
+    train = ACTIVE_ENV.dataset()
     rng = random.Random(SEED)
     rng.shuffle(train)
     if conversational:

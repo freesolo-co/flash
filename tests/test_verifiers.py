@@ -41,7 +41,7 @@ def test_verifiers_adapter_mapping():
     env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
     assert env.id == "fake/env"
 
-    train = env.dataset("train")
+    train = env.dataset()
     assert train[0]["answer"] == "4"
 
     msgs = env.prompt_messages(train[0])
@@ -308,9 +308,38 @@ def test_dataset_getter_requiring_args_is_called_correctly():
             return rows
 
     env = VerifiersEnvironment(_Env(), "owner/x")
-    train = env.dataset("train")
+    train = env.dataset()
     assert train, "getter with required args must yield rows (not swallowed to empty)"
     assert train[0]["answer"] == "a"
+
+
+def test_dataset_returns_train_split_only_no_split_arg():
+    """``dataset()`` takes no split arg and yields the env's TRAIN rows only.
+
+    Mid-run env eval was removed (held-out eval lives on the deploy/serving side), so the
+    adapter no longer selects eval/validation/test. Guards against (a) re-introducing a
+    silently-ignored ``split`` param that would hand back train data while pretending to
+    serve eval, and (b) accidentally returning the env's ``eval_dataset`` rows. The
+    ``_FakeVfEnv`` carries both ``dataset`` (train) and ``eval_dataset`` rows; only train
+    must come back, and the call takes no positional arg."""
+    import inspect
+
+    from flash.envs.adapter import VerifiersEnvironment
+
+    env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
+
+    # No split parameter on the signature at all (param was dropped, not silently ignored).
+    params = inspect.signature(env.dataset).parameters
+    assert "split" not in params, "dataset() must not carry a (silently-ignored) split param"
+
+    rows = env.dataset()  # no positional split arg accepted
+    answers = [r["answer"] for r in rows]
+    assert answers == ["4"], "must return TRAIN rows only, never the eval_dataset rows"
+    assert "6" not in answers, "eval split rows must not leak into dataset()"
+
+    # Passing a split positionally is now a TypeError (param truly removed, not absorbed).
+    with pytest.raises(TypeError):
+        env.dataset("eval")
 
 
 def test_worker_installs_env_via_prime():
