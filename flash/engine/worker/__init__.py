@@ -1670,6 +1670,15 @@ def _grpo_is_no_op_failure(
 
 
 def run_rl():
+    # Backend dispatch: FLASH_FRAMEWORK=verl runs the verl GRPO+LoRA path (one-step-off
+    # rollout/train OVERLAP — generation of step t+1 overlaps the optimizer of step t — which the
+    # baked TRL/vLLM server-mode path cannot do). The TRL path below is byte-for-byte unchanged.
+    if os.environ.get("FLASH_FRAMEWORK", "trl").strip().lower() == "verl":
+        from flash.engine import verl_runner
+
+        verl_runner.run()  # uploads its own metrics.json + DONE; main() ignores the return value
+        return
+
     from datasets import Dataset
     from transformers import AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
