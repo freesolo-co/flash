@@ -36,8 +36,11 @@ def _steps_from_train(algorithm: str, train: dict[str, Any]) -> int:
     known. For the SFT paths ``max_steps`` bounds the reconstructed count, so an estimate
     can't exceed what actually ran (which would inflate analytical cost).
     """
+    # Distinguish an ABSENT field (None -> fall back to the recipe/SFT default the worker uses)
+    # from an explicit value (incl. a valid-but-falsy 0) -- a truthiness check would silently
+    # treat ``steps=0`` as "missing" and mis-price a malformed payload against a default count.
     steps = train.get("steps")
-    if steps:
+    if steps is not None:
         return int(steps)  # GRPO carries its step count directly; max_steps is SFT-only
 
     # A GRPO run that omits `steps` runs RECIPE.rl.num_steps (the worker falls back to it
@@ -46,18 +49,21 @@ def _steps_from_train(algorithm: str, train: dict[str, Any]) -> int:
     if algorithm == "grpo":
         return int(RECIPE.rl.num_steps)
 
-    # max_steps is the worker's SFT optimizer-step cap -- only build the cap for SFT.
+    # max_steps is the worker's SFT optimizer-step cap -- only build the cap for SFT. An ABSENT
+    # cap (None) means uncapped; an explicit value (incl. 0) is honored, not coerced to "no cap".
     max_steps = train.get("max_steps")
 
     def _cap(n: int) -> int:
-        return min(n, int(max_steps)) if max_steps else n
+        return min(n, int(max_steps)) if max_steps is not None else n
 
-    epochs = int(train.get("epochs") or 1)
+    epochs_raw = train.get("epochs")
+    epochs = int(epochs_raw) if epochs_raw is not None else 1
     # An omitted SFT batch_size reconstructs against the recipe EFFECTIVE batch (the worker
     # sizes grad-accum to hit RECIPE.sft.effective_batch), not a bare per-device batch.
-    batch = int(train.get("batch_size") or RECIPE.sft.effective_batch)
+    batch_raw = train.get("batch_size")
+    batch = int(batch_raw) if batch_raw is not None else RECIPE.sft.effective_batch
     max_examples = train.get("max_examples")
-    if max_examples:
+    if max_examples is not None:
         return _cap(max(1, math.ceil(int(max_examples) / max(1, batch)) * epochs))
     return _cap(100)  # last-resort default when the dataset size isn't pinned in the spec
 

@@ -253,7 +253,11 @@ def estimate_cost(
     raw_train_per_seed = (config.steps / seeds) * sps
 
     # The cap is on TOTAL per-seed wall clock; setup is billed too, so clamp training to fit.
+    # A degenerate cap shorter than setup itself (e.g. a 2-minute cap vs a ~8-minute cold start)
+    # leaves zero training budget AND clamps the billed setup to the cap -- the run is killed at
+    # the wall limit mid-cold-start, so it can't bill more than ``cap_s`` of wall per seed.
     wall_capped = (setup_per_seed + raw_train_per_seed) > cap_s
+    setup_per_seed = min(setup_per_seed, cap_s)
     train_per_seed = max(0.0, cap_s - setup_per_seed) if wall_capped else raw_train_per_seed
 
     setup = setup_per_seed * seeds
