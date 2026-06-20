@@ -15,8 +15,6 @@ the server's parse can read the real param count from the HF API and resolve a d
 
 from __future__ import annotations
 
-import os
-
 from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
 
@@ -150,18 +148,14 @@ def estimate_for_spec(spec) -> CostEstimate:
 def offline_estimate_for_spec(spec) -> CostEstimate:
     """The OFFLINE-consistent estimate -- what ``slm train --cost`` would have quoted.
 
-    Mirrors the CLI's scoped offline guard: forces ``FLASH_SKIP_NET`` over the whole estimate
-    (so any VRAM (re)sizing falls back to the offline heuristic for an unlisted model, never an
-    HF probe) and re-resolves a policy-word GPU offline. The control plane charges THIS amount,
-    so the org is billed exactly what the user was quoted for the same spec (and, paired with
-    the ``min(...)`` guard in ``charge_run_estimate``, never more than that quote).
+    Reproduces the CLI's offline quote WITHOUT mutating the process-wide ``FLASH_SKIP_NET``
+    env: ``estimate_cost`` already forces offline HF sizing (``select_gpu`` passes
+    ``skip_net=True`` to ``required_vram_gb``), and ``offline_gpu=True`` forwards a policy-word
+    GPU so the class is re-picked from that offline VRAM rather than the (possibly HF-sized)
+    parse-time pin. Avoiding the env flip is important on the control plane, where concurrent
+    requests (auth verify, provider pricing, other submits) must not observe a flipped global
+    and unexpectedly skip their own network I/O (PR #3 review). The control plane charges THIS
+    amount, so the org is billed exactly what the user was quoted (and, paired with the
+    ``min(...)`` guard in ``charge_run_estimate``, never more than that quote).
     """
-    prior = os.environ.get("FLASH_SKIP_NET")
-    os.environ["FLASH_SKIP_NET"] = "1"
-    try:
-        return estimate_cost(runconfig_from_spec(spec, offline_gpu=True))
-    finally:
-        if prior is None:
-            os.environ.pop("FLASH_SKIP_NET", None)
-        else:
-            os.environ["FLASH_SKIP_NET"] = prior
+    return estimate_cost(runconfig_from_spec(spec, offline_gpu=True))

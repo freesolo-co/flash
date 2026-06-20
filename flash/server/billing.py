@@ -18,6 +18,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from decimal import ROUND_HALF_UP, Decimal
 
 from flash.cost.spec import estimate_for_spec, offline_estimate_for_spec
 
@@ -45,8 +46,15 @@ class BillingError(Exception):
 
 
 def _cents(usd: float) -> int:
-    """Whole cents for a USD amount (never negative)."""
-    return max(0, round(float(usd) * 100))
+    """Whole cents for a USD amount, round-HALF-UP, never negative.
+
+    Money rounding must be explicit: Python's built-in ``round`` is banker's rounding (ties to
+    even), which would turn e.g. $0.005 into 0 cents and silently undercharge on a half-cent tie
+    (PR #3 review). Convert via ``Decimal`` with ``ROUND_HALF_UP`` so a tie always rounds up to
+    the next cent, then clamp at zero.
+    """
+    cents = Decimal(str(float(usd))).scaleb(2).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return max(0, int(cents))
 
 
 def _http_reason(exc: urllib.error.HTTPError) -> str:

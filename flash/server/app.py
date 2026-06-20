@@ -255,17 +255,22 @@ def create_app():
                 # whose env can't be loaded here to count its dataset). A 400 with the message
                 # tells the user how to fix it, rather than a 500.
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-        db.record_run(spec.run_id, key["id"])
+        # record_run is inside the try so ANY post-charge failure (a locked/full SQLite, the
+        # submit raising) reverses the debit — the org must never be left paying for a run that
+        # didn't start.
         try:
+            db.record_run(spec.run_id, key["id"])
             status = submit_job(spec, dry_run=dry_run, background=True)
         except Exception as exc:
-            db.delete_run(spec.run_id)
+            db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
             # The org was charged above but the run never started — reverse the debit so the
             # user isn't billed for a run that didn't run. Best-effort: a failed refund must
-            # not mask the original submit error (it's logged for an operator to reconcile),
-            # and the reversal is idempotent by run_id so a retried submit re-charges cleanly.
+            # not mask the original error (it's logged for an operator to reconcile), and the
+            # reversal is idempotent by run_id so a retried submit re-charges cleanly.
             if billed:
                 _reverse_charge_best_effort(token=token, run_id=spec.run_id, charge=charge)
+            if isinstance(exc, HTTPException):
+                raise
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return status.to_dict()
 

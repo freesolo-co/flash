@@ -54,6 +54,35 @@ def test_cents_rounds_and_floors_at_zero():
     assert _cents(-5.0) == 0  # never negative
 
 
+def test_cents_rounds_half_up_not_bankers():
+    """Money rounding is round-HALF-UP, not Python's ties-to-even (which would undercharge a
+    half-cent tie, e.g. $0.005 -> 0). PR #3 review."""
+    from flash.server.billing import _cents
+
+    assert _cents(0.005) == 1  # ties-to-even would give 0
+    assert _cents(0.015) == 2  # ties-to-even would give 2 as well, but via half-up here
+    assert _cents(0.025) == 3  # ties-to-even would give 2 -> half-up gives 3
+    assert _cents(1.005) == 101  # classic banker's-rounding trap
+
+
+def test_offline_estimate_does_not_mutate_skip_net_env(monkeypatch):
+    """``offline_estimate_for_spec`` must NOT flip the process-wide ``FLASH_SKIP_NET`` (the
+    control plane is concurrent; a flipped global could make other requests skip network I/O).
+    It relies on ``estimate_cost``'s explicit ``skip_net=True`` instead. PR #3 review."""
+    from flash.cost.spec import offline_estimate_for_spec
+
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+    from flash.schema import spec_from_dict
+
+    # Parse offline once to get a spec, then clear the env and confirm the estimate keeps it clear.
+    monkeypatch.setenv("FLASH_SKIP_NET", "1")
+    spec = spec_from_dict(SPEC, run_id="run-env")
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+
+    offline_estimate_for_spec(spec)
+    assert "FLASH_SKIP_NET" not in __import__("os").environ
+
+
 def test_charge_is_noop_when_offline(monkeypatch):
     from flash.server import billing
 
@@ -390,6 +419,41 @@ def test_submit_failure_after_charge_reverses_the_debit(api, monkeypatch):
     assert run_id
     # A failed submit leaves no run row behind (so a retry re-charges cleanly).
     assert api.get("/v1/runs", headers=_bearer("fslo-user-r")).json()["runs"] == []
+
+
+def test_record_run_failure_after_charge_reverses_the_debit(api, monkeypatch):
+    """If the charge succeeds but ``db.record_run`` then fails (e.g. SQLite locked/full), the
+    org is debited for a run that never started — the reversal must still fire (record_run is
+    inside the same try as submit). PR #3 review."""
+    import flash.server.app as app_mod
+    import flash.server.db as db_mod
+
+    monkeypatch.setattr(
+        "flash.server.billing.charge_run_estimate", lambda *, token, spec: {"amountCents": 42}
+    )
+
+    def failing_record(run_id, key_id):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(db_mod, "record_run", failing_record)
+    # submit_job must NOT be reached if record_run already failed.
+    monkeypatch.setattr(
+        app_mod,
+        "submit_job",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("submit must not run")),
+    )
+
+    reversed_calls = []
+    monkeypatch.setattr(
+        "flash.server.billing.reverse_run_charge",
+        lambda *, token, run_id, charge: reversed_calls.append((run_id, charge)) or {},
+    )
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-rec"))
+    assert res.status_code == 400, res.text
+    assert "database is locked" in res.json()["detail"]
+    assert len(reversed_calls) == 1
+    assert reversed_calls[0][1] == {"amountCents": 42}
 
 
 def test_refund_failure_does_not_mask_submit_error(api, monkeypatch):

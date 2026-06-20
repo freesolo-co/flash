@@ -268,20 +268,34 @@ def cmd_env_list(args) -> int:
 def _cmd_train_cost(args) -> int:
     """`slm train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    Parses the config and prints ``estimate_cost(runconfig_from_spec(spec))``. ``estimate_cost``
-    is offline on its own (it passes ``skip_net=True`` to the VRAM sizing), so no env mutation
-    is needed; for an SFT run with no ``[train].max_examples`` the step count loads the env to
-    count its real train split (see ``cost.spec.count_env_examples``).
+    Estimation must be fully OFFLINE. ``estimate_cost`` already sizes VRAM offline
+    (``skip_net=True``), but ``spec_from_file`` parse-time GPU policy resolution
+    (``resolve_gpu_policy`` -> ``model_required_vram_gb`` -> ``fetch_hf_params_b``) would still
+    probe the HF API for an unlisted ``model_policy = "allow"`` model when ``FLASH_SKIP_NET`` is
+    unset. Scope it on for the WHOLE flow (parse + size), restoring the prior value in
+    ``finally``, so the quote is deterministic AND matches the offline basis the control plane
+    charges at submit (``cost.spec.offline_estimate_for_spec``). A single-shot CLI process makes
+    the env scoping safe (the control plane, which IS concurrent, never mutates the global).
+    For an SFT run with no ``[train].max_examples`` the step count loads the env to count its
+    real train split (see ``cost.spec.count_env_examples``).
     """
     from flash.cost import estimate_cost
 
-    spec = spec_from_file(
-        args.config,
-        run_id=None,
-        overrides=getattr(args, "overrides", None),
-        extra_configs=getattr(args, "extra_configs", None),
-    )
-    print(estimate_cost(_runconfig_from_spec(spec)).breakdown())
+    prior_skip_net = os.environ.get("FLASH_SKIP_NET")
+    os.environ["FLASH_SKIP_NET"] = "1"
+    try:
+        spec = spec_from_file(
+            args.config,
+            run_id=None,
+            overrides=getattr(args, "overrides", None),
+            extra_configs=getattr(args, "extra_configs", None),
+        )
+        print(estimate_cost(_runconfig_from_spec(spec)).breakdown())
+    finally:
+        if prior_skip_net is None:
+            os.environ.pop("FLASH_SKIP_NET", None)
+        else:
+            os.environ["FLASH_SKIP_NET"] = prior_skip_net
     return 0
 
 
