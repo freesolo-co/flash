@@ -318,6 +318,16 @@ class _HBSink:
     def __call__(self, stage, **kw):
         self.calls.append((stage, kw))
 
+    @property
+    def result_calls(self):
+        """Heartbeats carrying an eval result/skip (excludes the throttled progress beats)."""
+        return [(s, k) for s, k in self.calls if not s.endswith("_progress")]
+
+    @property
+    def progress_calls(self):
+        """The per-example liveness beats emitted DURING the eval loop."""
+        return [(s, k) for s, k in self.calls if s.endswith("_progress")]
+
 
 def test_run_eval_happy_path_heartbeats_metrics():
     hb = _HBSink()
@@ -329,14 +339,35 @@ def test_run_eval_happy_path_heartbeats_metrics():
     summary = pe.run_eval(10)
     assert summary is not None
     assert summary.mean_reward == 1.0
-    assert len(hb.calls) == 1
-    stage, kw = hb.calls[0]
+    # Exactly one RESULT heartbeat, preceded by one liveness beat per example (2 here).
+    assert len(hb.result_calls) == 1
+    assert len(hb.progress_calls) == 2
+    assert all(s == "rl_eval_progress" for s, _ in hb.progress_calls)
+    assert [k["eval_progress"] for _, k in hb.progress_calls] == [1, 2]
+    stage, kw = hb.result_calls[0]
     assert stage == "rl_eval"
     assert kw["step"] == 10
     assert kw["eval_reward"] == 1.0
     assert kw["eval_metric_accuracy"] == 1.0
     assert kw["eval_n"] == 2
     assert "eval_skipped" not in kw
+
+
+def test_run_eval_emits_liveness_progress_during_slow_eval():
+    """A slow greedy eval (one HF generate per example) must emit a per-example liveness beat so
+    the control-plane stall watchdog doesn't false-positive and retry on an escalated GPU. The
+    progress beat carries (done, total) under a distinct ``*_progress`` stage the worker throttles."""
+    hb = _HBSink()
+    pe = _periodic(
+        examples=[{"a": 1}, {"a": 1}, {"a": 1}],
+        score_one_builder=lambda engine: lambda ex: EvalRecord(1.0, {}),
+        heartbeat_fn=hb,
+    )
+    pe.run_eval(20)
+    assert [k["eval_progress"] for _, k in hb.progress_calls] == [1, 2, 3]
+    assert all(k["eval_total"] == 3 and k["step"] == 20 for _, k in hb.progress_calls)
+    assert all(s == "rl_eval_progress" for s, _ in hb.progress_calls)
+    assert hb.result_calls[-1][0] == "rl_eval"
 
 
 def test_run_eval_no_model_skips_this_cadence_without_permanent_disable():
@@ -390,7 +421,9 @@ def test_run_eval_per_example_error_counts_zero_not_crash():
     pe = _periodic(examples=[{"a": 1}, {"a": 2}], score_one_builder=builder, heartbeat_fn=hb)
     summary = pe.run_eval(10)
     assert summary.rewards == [1.0, 0.0]
-    assert hb.calls[0][1]["eval_reward"] == pytest.approx(0.5)
+    assert hb.result_calls[0][1]["eval_reward"] == pytest.approx(0.5)
+    # A failed example still advances the liveness beat (the stall watchdog must keep seeing progress).
+    assert len(hb.progress_calls) == 2
 
 
 def test_periodic_eval_accumulates_history_for_metrics_json():
@@ -431,7 +464,7 @@ def test_maybe_run_respects_cadence():
     assert pe.maybe_run(7) is None
     assert hb.calls == []
     assert pe.maybe_run(10) is not None
-    assert len(hb.calls) == 1
+    assert len(hb.result_calls) == 1
 
 
 def test_run_final_evaluates_off_cadence_step():

@@ -32,6 +32,7 @@ emission are unit-tested without a GPU, tokenizer, or vLLM. Only :func:`build_hf
 
 from __future__ import annotations
 
+import contextlib
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -131,6 +132,7 @@ def evaluate_policy(
     pass_threshold: float = 0.5,
     on_error: str = "zero",
     on_warn: Callable[[str], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> EvalSummary:
     """Score every example with ``score_one`` and summarize.
 
@@ -140,6 +142,12 @@ def evaluate_policy(
     A SYSTEMIC failure (every example errors — e.g. generation OOMs each call) raises instead of
     returning ``eval_reward=0``: a flat-zero curve reads as "the model got everything wrong",
     which is misleading when the eval simply couldn't run. The caller turns that into a skip.
+
+    ``on_progress(done, total)`` is called after EACH example. Greedy HF generation runs one
+    prompt at a time, so a 50-example eval over long completions can take 10-15 min with NO other
+    output — long enough that the control plane's stall detector (``stall_after_s``, default
+    1500s) would false-positive a frozen worker and needlessly retry on an escalated GPU. The
+    caller wires this to a throttled heartbeat so a slow-but-progressing eval keeps ``ts`` fresh.
     """
     records: list[EvalRecord] = []
     errors = 0
@@ -155,6 +163,10 @@ def evaluate_policy(
             if on_warn:
                 on_warn(f"mid-run eval: example scored 0 after error: {exc}")
             records.append(EvalRecord(_EVAL_ERROR_REWARD, {}))
+        if on_progress is not None:
+            # progress reporting (a heartbeat commit) must never abort the eval
+            with contextlib.suppress(Exception):
+                on_progress(len(records), len(examples))
     if examples and errors == len(examples):
         raise RuntimeError(
             f"mid-run eval: all {errors} examples failed to generate "
@@ -316,6 +328,13 @@ class PeriodicEval:
                 step=step,
                 pass_threshold=self.pass_threshold,
                 on_warn=self.on_warn,
+                # Keep the heartbeat fresh through a slow greedy eval so the stall watchdog
+                # doesn't false-positive (and retry on a pricier escalated GPU). A distinct
+                # ``*_progress`` stage is throttled in the worker, so this is ~1 commit/60s, not
+                # one per example; the final result heartbeat below stays un-throttled.
+                on_progress=lambda done, total: self.heartbeat_fn(
+                    f"{self.label}_progress", step=step, eval_progress=done, eval_total=total
+                ),
             )
         except Exception as exc:  # eval must never abort training
             self.heartbeat_fn(

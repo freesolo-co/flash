@@ -341,7 +341,10 @@ _HB_LAST_UPLOAD = 0.0
 # The rl_step heartbeat-upload throttle, in seconds (fixed 60s) — keeps GRPO under HF's
 # 128 commits/hour-per-repo limit when concurrent runs share one HF_REPO.
 _HB_MIN_INTERVAL_S = 60.0
-_HB_THROTTLED_STAGES = frozenset({"rl_step"})
+# "rl_step" fires per optimizer step; "rl_eval_progress" fires per eval example during a slow
+# greedy mid-run eval. Both are high-frequency liveness signals — throttle their HF commits to
+# 60s (each call still refreshes heartbeat.json's ts, which is what the stall detector reads).
+_HB_THROTTLED_STAGES = frozenset({"rl_step", "rl_eval_progress"})
 # Terminal transitions the control plane must never miss — always committed.
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 _HB_TERMINAL_ONLY = False
