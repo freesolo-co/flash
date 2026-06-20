@@ -275,11 +275,23 @@ def render_markdown(records: dict) -> str:
         elif flash_native is not None:
             lines.append(f"| Flash-trained | {flash_native:.3f} | Flash's NATIVE on-GPU eval "
                          "(gsm8k-env scorer, NOT the unified scorer — see note) |")
-        lines.append("\nWith the truncation fix (max_tokens=1024) the trained models reach the boxed "
-                     "answer; under the shared scorer the GRPO-trained model improves over base. The "
-                     "Flash-trained row falls back to Flash's own eval because the unified flash eval "
-                     "needs a Qwen3.5-4B LoRA serving (the live one was empty: 0 GPUs/base models); "
-                     "`eval_unified.py` runs the unified flash eval against any configured serving.\n")
+        tr_delta = tr.get("delta_vs_base") if tr else None
+        if tr_delta is not None and tr_delta <= 0.02:
+            verdict = (f"**Key finding:** under the shared scorer the Tinker-trained model shows **no "
+                       f"held-out gain** (Δ{tr_delta:+.3f}, within n={b.get('n')} noise) even though its "
+                       f"in-training reward rose (best 0.69). At this deliberately tiny scale (30 steps, "
+                       f"16 rollouts/step) the rising training reward does NOT translate to held-out "
+                       f"accuracy — exactly what a unified held-out eval is for; the training-reward "
+                       f"curve alone would have implied improvement.")
+        else:
+            verdict = ("Under the shared scorer the GRPO-trained model's held-out accuracy moves as "
+                       "shown above.")
+        lines.append(f"\n{verdict} The Flash-trained row falls back to Flash's own on-GPU eval (a "
+                     "similar but not identical scorer) because a unified Flash eval needs a Qwen3.5-4B "
+                     "LoRA serving — the live one was empty (0 GPUs / 0 base models); `eval_unified.py` "
+                     "runs the unified Flash eval against any configured serving. Truncation note: even "
+                     f"at max_tokens={ev.get('max_tokens')}, {int(b.get('truncated_frac', 0) * 100)}% of "
+                     "base generations still hit the cap (Qwen3.5-4B is very verbose for this format).\n")
 
     # Roll-up
     lines.append("## Summary\n")

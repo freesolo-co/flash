@@ -1,0 +1,20 @@
+{
+  "env_id": "gsm8k",
+  "model": "Qwen/Qwen3.5-4B",
+  "n": 50,
+  "max_tokens": 2048,
+  "scorer": "exact-match on \\boxed{}/last-number (version-independent)",
+  "base": {
+    "n": 50,
+    "correct": 31,
+    "accuracy": 0.62,
+    "truncated_frac": 0.56
+  },
+  "tinker_trained": {
+    "n": 50,
+    "correct": 27,
+    "accuracy": 0.54,
+    "truncated_frac": 0.6,
+    "delta_vs_base": -0.08
+  }
+}
