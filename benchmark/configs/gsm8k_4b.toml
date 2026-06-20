@@ -1,0 +1,22 @@
+# Flash GRPO benchmark: Qwen3.5-4B on GSM8K.
+# Matched to the Tinker side: 30 steps, 4 groups/batch × 4 rollouts = 16 rollouts/step.
+# Budget: ~$3-5 on RunPod RTX 5090 at ~$0.86/hr realised.
+
+model = "Qwen/Qwen3.5-4B"
+algorithm = "grpo"
+
+[environment]
+id = "primeintellect/gsm8k"
+
+[train]
+steps          = 30
+group_size     = 4
+batch_size     = 4
+max_tokens     = 512
+hf_repo        = "DavidBShan/flash-bench-gsm8k-4b"
+eval_examples  = 50
+eval_every_steps = 10
+
+[gpu]
+requested = "RTX 5090"
+provider  = "runpod"

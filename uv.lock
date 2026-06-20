@@ -1062,7 +1062,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'server'" },
     { name = "flash", extras = ["gpu", "server"], marker = "extra == 'all'" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "huggingface-hub", specifier = ">=0.25" },
+    { name = "huggingface-hub", specifier = ">=0.34" },
     { name = "peft", marker = "extra == 'gpu'", specifier = ">=0.19" },
     { name = "runpod-flash" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.10.0" },
