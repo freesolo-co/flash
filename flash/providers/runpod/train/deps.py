@@ -313,7 +313,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         env["RL_STEPS"] = str(spec.train.steps)
     if spec.train.epochs is not None:
         env["SFT_EPOCHS"] = str(spec.train.epochs)
-    # Forward the worker-side knobs the worker / vLLM / mid-run eval actually read. flash is fully
+    # Forward the worker-side knobs the worker / vLLM actually read. flash is fully
     # managed: there are no per-run env tuning knobs — the only per-run config is the spec's
     # structured fields, and the worker hardcodes the vLLM-util / quant / heartbeat defaults.
     for k in (

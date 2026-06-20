@@ -131,10 +131,11 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # it may re-allocate (policy words) or must honor a concrete pin.
     requested_gpu = str(gpu_raw.get("requested") or gpu_raw.get("type") or "auto")
     try:
-        # Parse-time provisional: "cheapest"/"auto" resolve to the cheapest GPU class that
-        # fits (deterministic offline; open models sized from HF metadata); concrete names are
-        # canonicalized. The submit-time allocator re-resolves policy words live across ALL
-        # providers — every fitting class is eligible (no validation gate, no provider pin).
+        # Parse-time provisional: "cheapest"/"auto" resolve via the deterministic RunPod-only
+        # `cheapest_gpu()` helper (offline; open models sized from HF metadata) — Vast and live
+        # offers are NOT considered here, only at submit time; concrete names are canonicalized.
+        # The submit-time allocator re-resolves policy words live across ALL providers — every
+        # fitting class is eligible (no validation gate, no provider pin).
         gpu_type = resolve_gpu_policy(
             requested_gpu,
             model,
