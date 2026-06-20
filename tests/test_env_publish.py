@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import tarfile
 from pathlib import Path
 
@@ -61,7 +62,7 @@ def test_publish_namespaces_and_returns_slug(monkeypatch):
     def fake_push(env_dir, *, name, is_new):
         seen.update(env_dir=env_dir, name=name, is_new=is_new)
         assert (Path(env_dir) / "pyproject.toml").is_file()  # the package was extracted
-        return "freesolo-co/dev-clado-ai-myenv"
+        return "freesolo-co/dev-clado-ai--myenv"
 
     monkeypatch.setattr(envs, "_prime_push", fake_push)
     slug = envs.publish_package(
@@ -70,9 +71,10 @@ def test_publish_namespaces_and_returns_slug(monkeypatch):
         is_new=True,
         key={"email": "dev@clado.ai"},
     )
-    assert slug == "freesolo-co/dev-clado-ai-myenv"
-    # Namespaced per identity so two users can't collide on the same env name.
-    assert seen["name"] == "dev-clado-ai-myenv"
+    assert slug == "freesolo-co/dev-clado-ai--myenv"
+    # Namespaced per identity (joined with the non-colliding "--" boundary) so two users can't
+    # collide on the same env name.
+    assert seen["name"] == "dev-clado-ai--myenv"
     assert seen["is_new"] is True
 
 
@@ -223,16 +225,133 @@ def test_prime_push_publishes_private_and_climbs_conflicts(monkeypatch, tmp_path
 
 
 def test_publish_is_idempotent_on_republish(monkeypatch):
-    # A re-publish passes the name part of the already-namespaced slug (e.g. "dev-clado-ai-myenv");
-    # it must NOT be prefixed again into "dev-clado-ai-dev-clado-ai-myenv" (a brand-new env).
+    # A re-publish passes the name part of the already-namespaced slug (e.g. "dev-clado-ai--myenv");
+    # it must NOT be prefixed again into "dev-clado-ai--dev-clado-ai--myenv" (a brand-new env).
     seen: dict = {}
     monkeypatch.setattr(
         envs, "_prime_push", lambda env_dir, *, name, is_new: seen.update(name=name) or "x/y"
     )
     envs.publish_package(
         package_b64=_pkg_b64(_MINIMAL),
-        name="dev-clado-ai-myenv",
+        name="dev-clado-ai--myenv",
         is_new=False,
         key={"email": "dev@clado.ai"},
     )
-    assert seen["name"] == "dev-clado-ai-myenv"  # not double-prefixed
+    assert seen["name"] == "dev-clado-ai--myenv"  # not double-prefixed
+
+
+# --- resource caps (tar-bomb / unbounded-upload DoS defence) --------------------------------------
+
+
+def _tar_with_members(count: int) -> bytes:
+    """A .tar.gz holding ``count`` tiny regular files (to exercise the member-count cap)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for i in range(count):
+            info = tarfile.TarInfo(f"f{i}.txt")
+            info.size = 1
+            tar.addfile(info, io.BytesIO(b"x"))
+    return buf.getvalue()
+
+
+def test_safe_extract_rejects_too_many_members(tmp_path, monkeypatch):
+    # A tiny archive with a huge member count is an inode/CPU bomb — reject before extractall.
+    monkeypatch.setattr(envs, "_MAX_MEMBERS", 5)
+    with pytest.raises(envs.EnvPublishError, match="too many members"):
+        envs._safe_extract(_tar_with_members(6), tmp_path)
+    assert not any(tmp_path.iterdir())  # nothing was extracted
+    # At the limit it still extracts.
+    envs._safe_extract(_tar_with_members(5), tmp_path)
+
+
+def test_safe_extract_rejects_oversized_uncompressed(tmp_path, monkeypatch):
+    # A small .tar.gz can DECLARE enormous members (a decompression bomb). We sum the declared sizes
+    # and abort before extractall, so we never write the bomb to disk — even though the compressed
+    # bytes are tiny (the body here is sparse/zero, so gzip stays small).
+    monkeypatch.setattr(envs, "_MAX_UNCOMPRESSED_BYTES", 1024)
+    declared = 256 * 1024 * 1024  # 256 MB declared, far over the 1 KB cap
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo("huge.bin")
+        info.size = declared
+        tar.addfile(info, io.BytesIO(b"\0" * declared))
+    # The compressed bomb is a tiny fraction of what it expands to — that's the whole danger.
+    assert len(buf.getvalue()) < declared // 100
+    with pytest.raises(envs.EnvPublishError, match="too large uncompressed"):
+        envs._safe_extract(buf.getvalue(), tmp_path)
+    assert not (tmp_path / "huge.bin").exists()  # the bomb was never written
+
+
+def test_publish_rejects_oversized_upload_before_decode(monkeypatch):
+    # An oversized upload is rejected by length BEFORE we allocate the decoded bytes. We assert that
+    # by making b64decode blow up if it's ever reached — the size guard must fire first (413).
+    monkeypatch.setattr(envs, "_MAX_UPLOAD_BYTES", 64)
+    monkeypatch.setattr(envs, "_prime_push", lambda *a, **k: "x/y")
+
+    def _boom(*a, **k):
+        raise AssertionError("oversized upload must be rejected before base64 decode")
+
+    monkeypatch.setattr(envs.base64, "b64decode", _boom)
+    with pytest.raises(envs.EnvPublishError, match="too large") as ei:
+        envs.publish_package(package_b64="A" * 100_000, name="e", is_new=True, key={})
+    assert ei.value.status == 413
+
+
+def test_publish_ignores_uploaded_metadata_owner(monkeypatch, tmp_path):
+    # SECURITY: the uploaded tarball ships a spoofed .prime/.env-metadata.json claiming a different
+    # owner/name. The published slug must come from prime's OWN metadata (written under the managed
+    # account with the server-derived --name), NOT the client's. _prime_push deletes the preexisting
+    # .prime/ before pushing, so the spoof can never influence the slug.
+    monkeypatch.setenv("PRIME_API_KEY", "pit-x")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/prime")
+    spoof = {
+        "pyproject.toml": "[project]\nname='e'\n",
+        ".prime/.env-metadata.json": '{"owner": "victim", "name": "secret-env"}',
+    }
+
+    captured: dict = {}
+
+    def run(cmd, capture_output=True, text=True, env=None):
+        env_dir = Path(cmd[cmd.index("--path") + 1])
+        captured["had_spoof_metadata"] = (env_dir / ".prime" / ".env-metadata.json").is_file()
+        name = cmd[cmd.index("--name") + 1]
+        # prime writes its OWN metadata under the managed account on a real push.
+        (env_dir / ".prime").mkdir(exist_ok=True)
+        (env_dir / ".prime" / ".env-metadata.json").write_text(
+            json.dumps({"owner": "freesolo-co", "name": name})
+        )
+
+        class _Proc:
+            returncode, stdout, stderr = 0, f"Successfully pushed freesolo-co/{name}\n", ""
+
+        return _Proc()
+
+    monkeypatch.setattr("subprocess.run", run)
+    slug = envs.publish_package(
+        package_b64=_pkg_b64(spoof), name="myenv", is_new=True, key={"email": "dev@clado.ai"}
+    )
+    # The spoofed .prime/ was deleted before push, and the slug is server-derived.
+    assert captured["had_spoof_metadata"] is False
+    assert slug == "freesolo-co/dev-clado-ai--myenv"
+    assert "victim" not in slug
+    assert "secret-env" not in slug
+
+
+def test_republish_by_other_namespace_does_not_hijack(monkeypatch):
+    # SECURITY (prefix hijack): victim B's namespace is "dev-clado-ai" and their env is
+    # "dev-clado-ai--myenv". Attacker A's namespace is just "dev" (a raw-string prefix of B's). A
+    # re-publishes passing B's full name; the server must NOT pass it through as already-namespaced
+    # (which would version B's env) — it must re-namespace under A's OWN "dev--" boundary.
+    seen: dict = {}
+    monkeypatch.setattr(
+        envs, "_prime_push", lambda env_dir, *, name, is_new: seen.update(name=name) or "x/y"
+    )
+    envs.publish_package(
+        package_b64=_pkg_b64(_MINIMAL),
+        name="dev-clado-ai--myenv",  # victim B's slug name part
+        is_new=False,
+        key={"key_prefix": "dev"},  # attacker A: namespace_for -> "dev" (a raw prefix of B's ns)
+    )
+    # A lands under their OWN namespace, not B's — no hijack.
+    assert seen["name"] == "dev--dev-clado-ai--myenv"
+    assert seen["name"] != "dev-clado-ai--myenv"
