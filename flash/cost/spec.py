@@ -9,8 +9,9 @@ the submitted spec WITHOUT that guard — so for a ``model_policy = "allow"`` un
 the server's parse can read the real param count from the HF API and resolve a different
 (e.g. larger) GPU class into ``spec.gpu.type`` than the offline CLI quote showed.
 ``offline_estimate_for_spec`` re-prices the spec on the SAME offline basis the user saw
-(``FLASH_SKIP_NET`` forced over the estimate, and a policy-word GPU re-resolved offline from
-``gpu.requested``), so the amount charged equals the amount quoted for the same spec.
+(a policy-word GPU re-resolved offline from ``gpu.requested``); the control plane bills ``min``
+of that offline quote and the parsed estimate, so the charge equals the quote in the normal
+case and is never higher than it.
 """
 
 from __future__ import annotations
@@ -78,8 +79,12 @@ def spec_steps(spec) -> int:
     epochs = int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
     requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
     batch = sft_realized_batch(requested_batch)  # worker's grad-accum-realized global batch
-    if t.max_examples is not None:
-        examples = int(t.max_examples)
+    # max_examples is a CAP, and 0 (like None) means "no cap" -- the worker trains the FULL env
+    # dataset (engine.worker: `max_examples or 0` then truncate only `if > 0`). Mirror that here,
+    # else `max_examples = 0` would price 1 step and grossly under-charge a full-dataset run.
+    pinned_examples = int(t.max_examples) if t.max_examples else 0
+    if pinned_examples > 0:
+        examples = pinned_examples
     else:
         # No cap: the worker trains the FULL env dataset, so price its real size.
         examples = count_env_examples(spec.environment.id, spec.environment.params)
@@ -154,8 +159,8 @@ def offline_estimate_for_spec(spec) -> CostEstimate:
     GPU so the class is re-picked from that offline VRAM rather than the (possibly HF-sized)
     parse-time pin. Avoiding the env flip is important on the control plane, where concurrent
     requests (auth verify, provider pricing, other submits) must not observe a flipped global
-    and unexpectedly skip their own network I/O (PR #3 review). The control plane charges THIS
-    amount, so the org is billed exactly what the user was quoted (and, paired with the
-    ``min(...)`` guard in ``charge_run_estimate``, never more than that quote).
+    and unexpectedly skip their own network I/O (PR #3 review). The control plane bills the
+    ``min`` of THIS amount and the parsed estimate (``charge_run_estimate``), so the org is
+    charged the quote in the normal case and never more than it.
     """
     return estimate_cost(runconfig_from_spec(spec, offline_gpu=True))

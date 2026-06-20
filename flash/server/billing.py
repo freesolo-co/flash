@@ -127,13 +127,14 @@ def charge_run_estimate(*, token: str, spec) -> dict:
     a no-op ``{}`` when ``FLASH_SKIP_NET`` is set. Raises ``BillingError`` on any non-2xx
     response or when the billing service can't be reached.
 
-    CHARGE == QUOTE (PR #3 review): the user is billed exactly what ``slm train --cost``
+    CHARGE <= QUOTE (PR #3 review): the user is NEVER billed more than ``slm train --cost``
     quoted. The CLI prices the spec fully offline; the control plane parses the SAME spec
     without that guard, so for a ``model_policy = "allow"`` unlisted model the server-resolved
-    GPU/sizing (a live HF probe) could otherwise diverge from the quote. We charge the
-    OFFLINE-consistent estimate and, as a hard ceiling, never bill more than that quote
-    (``min`` of the offline quote and the spec-as-parsed estimate) -- the org can be charged
-    the quoted amount or less, never more.
+    GPU/sizing (a live HF probe) could otherwise diverge from the quote. We bill ``min`` of the
+    OFFLINE-consistent estimate (the quote the user saw) and the spec-as-parsed estimate: in the
+    normal case these are equal so the charge EQUALS the quote, and in the only case they differ
+    (a divergent unlisted/open model) the charge is the smaller of the two -- so it can be lower
+    than the quote but never higher.
     """
     # Offline bypass: no network, no charge (tests / air-gapped). Mirrors auth.
     if os.environ.get("FLASH_SKIP_NET"):

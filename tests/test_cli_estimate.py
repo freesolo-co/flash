@@ -147,6 +147,16 @@ def test_sft_steps_unpinned_counts_the_env_dataset(monkeypatch):
     assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
 
 
+def test_sft_steps_max_examples_zero_means_no_cap(monkeypatch):
+    # max_examples = 0 is "no cap" (the worker trains the FULL dataset: `max_examples or 0` then
+    # truncate only `if > 0`), NOT "0 examples". It must fall through to counting the env dataset,
+    # else a `max_examples = 0` run would price 1 step and be grossly under-charged. PR #3 review.
+    monkeypatch.setattr("flash.cost.spec.count_env_examples", lambda env_id, params=None: 320)
+    spec = _sft_spec(max_examples=0, batch_size=16, epochs=2)
+    assert spec.train.max_examples == 0
+    assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
+
+
 def test_sft_steps_unpinned_raises_when_env_cannot_be_counted(monkeypatch):
     # If the env can't be loaded to count (not installed / offline), pricing fails loudly with
     # guidance instead of guessing a dataset size.
