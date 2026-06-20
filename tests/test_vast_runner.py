@@ -495,6 +495,67 @@ def test_poll_heartbeat_stall(monkeypatch):
     assert "no worker progress" in res.detail
 
 
+def test_poll_setup_grace_before_first_heartbeat(monkeypatch):
+    # Cold start with NO heartbeat yet (e.g. the long weight prefetch on a 70GB+ checkpoint at
+    # Vast's 200 Mbps floor, which can exceed 25 min): must NOT trip the tight stall_after_s — it
+    # waits for the larger setup_grace_s instead, so a healthy slow-setup instance is not destroyed.
+    vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
+    res = vast.poll_vast_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "during setup" in res.detail  # the larger setup budget governed, not the 150s window
+    assert "limit 5000s" in res.detail
+
+
+def test_poll_setup_heartbeat_does_not_tighten(monkeypatch):
+    # A SETUP-stage heartbeat (rl_start is emitted BEFORE the weight prefetch even begins) proves
+    # liveness but must NOT switch to the tight training window — the slow download + vLLM boot
+    # still has to fit setup_grace_s, not the tight stall_after_s.
+    vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
+    frozen = {"stage": "rl_start", "step": None, "ts": 1.0}
+    res = vast.poll_vast_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda: frozen,
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "during setup" in res.detail
+    assert "limit 5000s" in res.detail
+
+
+def test_poll_tight_stall_after_training_heartbeat(monkeypatch):
+    # Once a TRAINING-phase heartbeat (rl_step) arrives, cold-start setup is done and the tight
+    # stall_after_s window applies, not the big setup grace.
+    vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
+    frozen = {"stage": "rl_step", "step": 3, "ts": 1.0}
+    res = vast.poll_vast_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda: frozen,
+        stall_after_s=500.0,
+        setup_grace_s=100000.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "during training" in res.detail
+    assert "limit 500s" in res.detail
+
+
 def test_poll_client_deadline(monkeypatch):
     vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
     res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0, deadline_s=250.0)

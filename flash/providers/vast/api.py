@@ -88,6 +88,15 @@ def search_offers(
         "order": [["dph_total", "asc"]],
         "limit": int(limit),
     }
+    # MULTI-GPU: push the whole-machine predicate (gpu_frac >= 0.99) into the SERVER-side query.
+    # usable_offers re-checks gpu_frac client-side, but without this filter Vast's price-sorted
+    # limit page can fill with cheaper FRACTIONAL multi-GPU offers (e.g. 2-of-8, gpu_frac=0.25 —
+    # the INSTANCE gets 2 GPUs but the CONTAINER only 1, so they're rejected downstream), starving
+    # the page of the whole-machine offers that actually expose all devices and making allocation
+    # report "no usable vast offers" even when a valid whole-machine node exists just past the page.
+    # Single-GPU offers are inherently whole-machine, so this only constrains num_gpus>1.
+    if num_gpus > 1:
+        q["gpu_frac"] = {"gte": 0.99}
     if min_disk_gb:
         q["disk_space"] = {"gte": float(min_disk_gb)}
     if extra_q:

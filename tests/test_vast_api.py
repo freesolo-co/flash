@@ -92,7 +92,10 @@ def test_search_offers_query_shape(monkeypatch):
 
 
 def test_search_offers_multi_gpu_query_shape(monkeypatch):
-    """A disaggregated (multi-GPU) request asks Vast for an instance with EXACTLY that many GPUs."""
+    """A disaggregated (multi-GPU) request asks Vast for an instance with EXACTLY that many GPUs,
+    and pushes the whole-machine predicate (gpu_frac >= 0.99) into the SERVER-side query so the
+    price-sorted page isn't crowded out by cheaper FRACTIONAL multi-GPU offers (which expose only
+    1 GPU to the container and get rejected downstream — falsely reporting no capacity)."""
     from flash.providers.vast import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
@@ -100,6 +103,19 @@ def test_search_offers_multi_gpu_query_shape(monkeypatch):
     vast_api.search_offers(24576, num_gpus=2)
     q = calls[0][2]["q"]
     assert q["num_gpus"] == {"eq": 2}  # exact-match: pay for a 2-GPU machine, not an 8-GPU one
+    assert q["gpu_frac"] == {"gte": 0.99}  # whole-machine only (filtered server-side)
+
+
+def test_search_offers_single_gpu_has_no_gpu_frac_filter(monkeypatch):
+    """Single-GPU offers are inherently whole-machine, so the gpu_frac filter is NOT added (it
+    would needlessly exclude fractional single-GPU offers that expose their one GPU fine)."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    calls = _capture_urlopen(monkeypatch, [{"offers": []}])
+    vast_api.search_offers(24576)  # default num_gpus=1
+    q = calls[0][2]["q"]
+    assert "gpu_frac" not in q
 
 
 def test_request_retries_5xx_and_429_then_succeeds(monkeypatch):
