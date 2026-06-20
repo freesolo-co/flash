@@ -165,7 +165,9 @@ def measured_from_status(
     reward_seconds_per_completion: float | None = None,
 ) -> MeasuredRun:
     remote = status.get("remote") or {}
-    started = remote.get("started_ts") or status.get("created_at", 0.0)
+    started = remote.get("started_ts")
+    if started is None:
+        started = status.get("created_at", 0.0)
     wall = max(0.0, float(status.get("updated_at", 0.0)) - float(started))
     return MeasuredRun(
         run_id=status.get("run_id", "?"),
