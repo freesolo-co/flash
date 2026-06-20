@@ -117,6 +117,41 @@ def main() -> None:
 
     out = {}
     meter = "full-seq" if args.train_full else "completion-only"
+    rows = []
+    for task, t in TASKS.items():
+        pl = estimate(t["prompt_len"], t["completion_len"],
+                      RATE_IN, RATE_OUT, RATE_TRAIN, args.train_full)["cost_total"]
+        tk = estimate(t["prompt_len"], t["completion_len"],
+                      TINKER_IN, TINKER_OUT, TINKER_TRAIN, args.train_full)["cost_total"]
+        flash = REFERENCE[task]["flash"]
+        proxy = REFERENCE[task]["tinker_proxy"]
+        rows.append((task, flash, tk, pl, proxy))
+        out[task] = {
+            "flash_measured_usd": flash,
+            "tinker_per_token_usd": round(tk, 4),
+            "prime_lab_per_token_usd": round(pl, 4),
+            "tinker_over_primelab": round(tk / pl, 2),
+            "tinker_gpu_time_proxy_usd": proxy,
+            "assumptions": t,
+        }
+
+    if args.json:
+        # --json emits ONLY JSON on stdout (no human header/table, no leading blank line)
+        # so the output is directly machine-consumable.
+        print(json.dumps({
+            "model": "Qwen/Qwen3.5-4B",
+            "rates_per_mtok": {
+                "tinker": {"input": TINKER_IN, "output": TINKER_OUT, "training": TINKER_TRAIN},
+                "prime_lab": {"input": RATE_IN, "output": RATE_OUT, "training": RATE_TRAIN},
+            },
+            "config": {"max_steps": MAX_STEPS, "batch_size": BATCH_SIZE,
+                       "group_size": GROUP_SIZE, "max_tokens": MAX_TOKENS,
+                       "rollouts": rollouts()},
+            "train_meter": meter,
+            "tasks": out,
+        }, indent=2))
+        return
+
     print(f"Cost of training  (Qwen3.5-4B, {MAX_STEPS} steps, "
           f"batch {BATCH_SIZE} x group {GROUP_SIZE} = {rollouts()} rollouts, "
           f"train meter: {meter})")
@@ -129,36 +164,9 @@ def main() -> None:
            f"{'Tink/PL':>9}{'[tink_proxy]':>13}")
     print(hdr)
     print("-" * len(hdr))
-    for task, t in TASKS.items():
-        pl = estimate(t["prompt_len"], t["completion_len"],
-                      RATE_IN, RATE_OUT, RATE_TRAIN, args.train_full)["cost_total"]
-        tk = estimate(t["prompt_len"], t["completion_len"],
-                      TINKER_IN, TINKER_OUT, TINKER_TRAIN, args.train_full)["cost_total"]
-        flash = REFERENCE[task]["flash"]
-        proxy = REFERENCE[task]["tinker_proxy"]
+    for task, flash, tk, pl, proxy in rows:
         print(f"{task:<16}{flash:>12.3f}{tk:>12.3f}{pl:>13.3f}"
               f"{tk/pl:>8.2f}x{proxy:>13.3f}")
-        out[task] = {
-            "flash_measured_usd": flash,
-            "tinker_per_token_usd": round(tk, 4),
-            "prime_lab_per_token_usd": round(pl, 4),
-            "tinker_over_primelab": round(tk / pl, 2),
-            "tinker_gpu_time_proxy_usd": proxy,
-            "assumptions": t,
-        }
-    if args.json:
-        print("\n" + json.dumps({
-            "model": "Qwen/Qwen3.5-4B",
-            "rates_per_mtok": {
-                "tinker": {"input": TINKER_IN, "output": TINKER_OUT, "training": TINKER_TRAIN},
-                "prime_lab": {"input": RATE_IN, "output": RATE_OUT, "training": RATE_TRAIN},
-            },
-            "config": {"max_steps": MAX_STEPS, "batch_size": BATCH_SIZE,
-                       "group_size": GROUP_SIZE, "max_tokens": MAX_TOKENS,
-                       "rollouts": rollouts()},
-            "train_meter": meter,
-            "tasks": out,
-        }, indent=2))
 
 
 if __name__ == "__main__":
