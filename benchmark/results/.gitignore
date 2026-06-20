@@ -1,9 +1,0 @@
-# The root .gitignore ignores results/ globally for run artifacts, then un-ignores this
-# subtree (!benchmark/results/) so git descends here and reads THIS file. The benchmark's
-# published results ARE the deliverable, but transient run scratch is not — so ignore
-# everything by default and whitelist only the manifest, per-run JSON, comparison, and
-# this file. Keeps stray artifacts (adapters/scratch) out while tracking the deliverables.
-*
-!*.json
-!*.md
-!.gitignore
