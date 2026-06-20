@@ -128,6 +128,49 @@ def test_reward_fan_out(harness):
         assert r.json()["scores"][0] == pytest.approx(0.5)  # len 50 / 100
 
 
+def test_adapter_evicted_from_backend_is_reloaded_not_failed(harness):
+    # Simulate vLLM LRU-evicting (or a hot-swap gap) the adapter out from under the router: the
+    # router's state still thinks it's loaded, but the backend 400s "not loaded". The router must
+    # reload + retry (self-heal) rather than condemn the backend and 503.
+    with harness.client() as c:
+        _register(c, "run", replicas=1, place=True).raise_for_status()
+        served = next(
+            a for a in c.get("/pool/status").json()["pool"]["adapters"] if a["name"] == "run"
+        )["placements"][0]
+        rec = harness.record(served)
+        loads_before = rec.load_calls.count("run")
+        rec.loaded.discard("run")  # vLLM evicted it; router's registry is now stale
+        r = c.post("/v1/chat/completions", json={"model": "run", "messages": [{"role": "user", "content": "x"}]})
+        r.raise_for_status()  # must succeed, not 503
+        assert rec.load_calls.count("run") == loads_before + 1  # reloaded
+        # backend stayed healthy (a missing adapter is not a backend fault)
+        snap = c.get("/pool/status").json()
+        assert all(b["healthy"] for b in snap["pool"]["backends"])
+
+
+def test_concurrent_generate_and_weight_sync_no_503(harness):
+    # The prefetch race: generate the next batch WHILE syncing weights for the current one. The
+    # hot-swap unload/reload window must not 503 any request (the bug the demo surfaced).
+    import concurrent.futures as cf
+
+    with harness.client() as c:
+        _register(c, "run", replicas=2, place=True).raise_for_status()
+
+        def gen(i):
+            return c.post(
+                "/v1/chat/completions",
+                json={"model": "run", "messages": [{"role": "user", "content": str(i)}]},
+            ).status_code
+
+        def sync(_i):
+            return c.post("/adapters/run/sync", json={"uri": "/lora/run/vX"}).status_code
+
+        with cf.ThreadPoolExecutor(max_workers=8) as pool:
+            jobs = [pool.submit(gen if i % 3 else sync, i) for i in range(30)]
+            codes = [j.result() for j in jobs]
+        assert all(code == 200 for code in codes), codes
+
+
 def test_unknown_model_is_503(harness):
     with harness.client() as c:
         r = c.post("/v1/chat/completions", json={"model": "nope", "messages": []})

@@ -41,8 +41,6 @@ class RouterConfig:
     default_replicas: int = 1
     # Seconds between background health probes; 0 disables the loop (tests, single-shot use).
     health_interval: float = 15.0
-    # Mark a backend unhealthy after this many consecutive generation failures (0 = on first).
-    fail_threshold: int = 1
 
     @classmethod
     def from_env(cls) -> RouterConfig:
@@ -50,7 +48,6 @@ class RouterConfig:
             max_retries=_int("FLASH_POOL_MAX_RETRIES", 2),
             default_replicas=_int("FLASH_POOL_DEFAULT_REPLICAS", 1),
             health_interval=_float("FLASH_POOL_HEALTH_INTERVAL", 15.0),
-            fail_threshold=_int("FLASH_POOL_FAIL_THRESHOLD", 1),
         )
 
 

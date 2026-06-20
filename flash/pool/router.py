@@ -66,7 +66,15 @@ class Router:
 
         tried: set[str] = set()
         last_err: Exception | None = None
-        for _ in range(self.config.max_retries + 1):
+        failovers = 0
+        reloads = 0
+        # An adapter can vanish from a backend between our pick and the request: a concurrent
+        # weight-sync hot-swap (unload+load) or vLLM's own LRU eviction under max_loras pressure.
+        # That surfaces as a 400 "lora not loaded" — it is NOT a backend failure, so we reload the
+        # adapter and retry the SAME backend rather than condemning it. Bound the reloads so a truly
+        # broken adapter can't loop forever.
+        max_reloads = len(self.state.backends) + 2
+        while True:
             # --- pick + reserve a backend atomically ---
             async with self._lock:
                 try:
@@ -115,10 +123,23 @@ class Router:
                 last_err = e
                 async with self._lock:
                     self.state.release(be.id, failed=True)
-                    be_now = self.state.backends.get(be.id)
-                    if be_now is not None and be_now.total_failures % max(1, self.config.fail_threshold) == 0:
+                # Adapter swapped/evicted out from under us -> drop its placement here and retry
+                # (the next pick reloads it). Don't fail over, don't mark the backend unhealthy.
+                if adapter_name is not None and _is_missing_adapter(e) and reloads < max_reloads:
+                    reloads += 1
+                    async with self._lock:
+                        self.state.mark_unloaded(be.id, adapter_name)
+                    continue
+                # Genuine backend trouble: fail over to a different backend. Only a TRANSPORT error
+                # (no HTTP status = connection refused/timeout) condemns the backend as unhealthy;
+                # an HTTP 5xx might be transient, so we just exclude it for this request.
+                async with self._lock:
+                    if e.status is None:
                         self.state.set_health(be.id, False, str(e))
                 tried.add(be.id)
+                failovers += 1
+                if failovers > self.config.max_retries:
+                    break
                 continue
 
         raise NoCapacityError(f"all backends failed for model {model!r}: {last_err}")
@@ -217,6 +238,15 @@ class Router:
 
     async def _reward_health(self, w: RewardWorker) -> bool:
         return await self.gateway.health(Backend(id=w.id, url=w.url, base_model=""))
+
+
+def _is_missing_adapter(e: GatewayError) -> bool:
+    """True when a generation 400 means 'this LoRA isn't loaded here' (a concurrent hot-swap or
+    vLLM LRU eviction) rather than a real backend fault — so the router reloads + retries."""
+    if e.status != 400:
+        return False
+    msg = str(e).lower()
+    return any(s in msg for s in ("lora not loaded", "not found", "does not exist", "not loaded", "no adapter"))
 
 
 def create_pool_app(
