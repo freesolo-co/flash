@@ -8,7 +8,6 @@ the rest of the adapter package (no import cycle); the package ``__init__`` re-e
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 
 # The judge-related kwarg names a reward func may declare, sourced from a JudgeRubric.
@@ -152,9 +151,7 @@ def _invoke_reward(func, available: dict) -> float:
     exception here is a real (weighted) reward func genuinely failing (e.g. a JudgeRubric judge
     raising on an API/rate-limit error, or a parse error on row data). Swallowing it as 0.0
     would silently train/score on an all-zero signal and waste a paid run, so we fail loudly
-    instead. Eval-metric (optional/monitor) funcs are run through ``_run_eval_metric``,
-    which swallows their exceptions — they contribute 0 either way and may exist only for their
-    side effects (mutating shared ``state`` / logging), so a thrown monitor must not fail a run.
+    instead. (Unweighted monitor funcs are skipped entirely by ``scores_breakdown``.)
     """
     try:
         params = inspect.signature(func).parameters
@@ -168,19 +165,6 @@ def _invoke_reward(func, available: dict) -> float:
     if inspect.isawaitable(result):
         result = _run_async(result)
     return float(result or 0.0)
-
-
-def _run_eval_metric(func, available: dict) -> None:
-    """Run a eval-metric monitor/diagnostic reward func, swallowing any exception.
-
-    Per verifiers semantics every reward func RUNS, even weight-0 ones: they may mutate the
-    shared ``state`` (so a later weighted func sees their work) or simply be logged. They never
-    contribute to the reward (weight is 0), so their result is discarded and a failure must NOT
-    fail the run — guard the exception. Weighted funcs go through ``_invoke_reward`` instead,
-    where exceptions propagate.
-    """
-    with contextlib.suppress(Exception):
-        _invoke_reward(func, available)
 
 
 def _substring_answer_score(completion: str, example: dict) -> float:

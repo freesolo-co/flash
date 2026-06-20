@@ -258,23 +258,6 @@ def _validate_spec(spec: JobSpec) -> None:
         spec.environment.id,
         '[environment] id must be a published Prime Hub slug "owner/name"',
     )
-    # A separate eval env ([environment.params] eval_env_id) is also prime-installed on the worker
-    # (worker_hub_env_ids), so it must be a full "owner/name" slug too — else a bare eval id passes
-    # --dry-run but fails `prime env install` after a GPU is provisioned.
-    if "eval_env" in spec.environment.params:
-        # Legacy alias: `eval_env` is no longer mapped (the worker installs only eval_env_id, and
-        # a stray `eval_env` would be forwarded into load_environment). Reject at parse rather than
-        # silently evaluating against the training env.
-        raise ConfigError(
-            "[environment.params] eval_env is no longer supported; use eval_env_id "
-            '(a published Prime Hub slug "owner/name")'
-        )
-    eval_ref = spec.environment.params.get("eval_env_id")
-    if eval_ref:
-        _require_slug(
-            str(eval_ref),
-            '[environment.params] eval_env_id must be a published Prime Hub slug "owner/name"',
-        )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")
     # The per-run HF artifact repo (adapters/checkpoints/code + serving) is required: there

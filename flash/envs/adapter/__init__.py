@@ -34,21 +34,17 @@ Hub conveniences handled here so the *documented* flow (``slm env install owner/
 ``[environment] id = "owner/name"``) works on real Prime Intellect envs:
   * the ``owner/name`` Hub slug is mapped to the bare ``verifiers`` load id;
   * a ``RubricGroup`` (rubrics-of-rubrics) is flattened so the real reward funcs are found;
-    eval-metric monitor funcs still run (for shared-state side effects / logging) with their
-    exceptions guarded, but contribute 0 — only weighted funcs count toward the reward;
+    unweighted (monitor) funcs are skipped — only weighted funcs count toward the reward;
   * a ``JudgeRubric``'s judge client/model/prompt is supplied to reward funcs that declare a
     ``judge``/``judge_client``/``judge_model``/``judge_prompt`` arg, so judge-based rewards run;
   * named per-scorer breakdowns (``scores_breakdown``) expose each reward func's weighted
-    score so the frontend per-scorer view + W&B series survive;
-  * an optional separate **eval** Hub env (``eval_env_id``) + a fixed eval subset
-    (``eval_examples`` / ``eval_seed``) let you train on one env and evaluate on another.
+    score so the frontend per-scorer view + W&B series survive.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
-import random
 
 from flash.envs.adapter.rubric import (  # noqa: F401
     _AVAILABLE_REWARD_KWARGS,
@@ -64,7 +60,6 @@ from flash.envs.adapter.rubric import (  # noqa: F401
     _reward_requires_unavailable_args,
     _rows_to_list,
     _run_async,
-    _run_eval_metric,
     _substring_answer_score,
     _unique_key,
 )
@@ -121,19 +116,9 @@ class VerifiersEnvironment(BaseEnvironment):
         :meth:`record_model_turn` / :meth:`env_reply` / :meth:`rollout_done`).
     """
 
-    def __init__(
-        self,
-        vf_env,
-        env_id: str,
-        eval_vf_env=None,
-        eval_examples: int | None = None,
-        eval_seed: int = 12345,
-    ):
+    def __init__(self, vf_env, env_id: str):
         super().__init__(id=env_id)
         self._env = vf_env
-        self._eval_env = eval_vf_env  # optional separate eval Hub env
-        self._eval_examples = int(eval_examples) if eval_examples else 0
-        self._eval_seed = int(eval_seed)
         self.multi_turn = _is_multi_turn(vf_env)
         self.is_tool_env = _is_tool_env(vf_env)
         # Turn cap for the tool / multi-turn rollout loop (verifiers ToolEnv defaults to 10).
@@ -161,65 +146,11 @@ class VerifiersEnvironment(BaseEnvironment):
         self._parser = getattr(vf_env, "parser", None)
 
     # -- data -------------------------------------------------------------
-    def dataset(self, split: str, limit: int | None = None) -> list[dict]:
-        is_eval = split in {"eval", "validation", "test"}
-        if is_eval:
-            src = self._eval_env or self._env
-            # ``limit`` caps materialization at the source (mid-run eval only needs a small slice);
-            # a getter that ignores ``n`` still returns everything, so _fixed_subset / the caller's
-            # slice remain the backstop. -1 = all rows (the no-cap default).
-            n = limit if (limit is not None and limit > 0) else -1
-            # Resolve the eval source with explicit ``is None`` checks (NOT ``or``): an
-            # empty-but-configured eval split (``[]``) is falsy, so ``or`` would wrongly
-            # fall through to the next source and ultimately to the TRAIN split — evaluating
-            # on training data. Only fall back when the eval source is genuinely *absent*
-            # (None), not merely empty. ``get_eval_dataset``/``eval_dataset`` returning [] is
-            # a deliberate empty eval set and must be honored as such.
-            eval_ds = _call_dataset_getter(src, "get_eval_dataset", seed=self._eval_seed, n=n)
-            if eval_ds is None:
-                eval_ds = getattr(src, "eval_dataset", None)
-            if eval_ds is None:  # no eval split configured at all: use the env's train split
-                eval_ds = _call_dataset_getter(src, "get_dataset", seed=self._eval_seed, n=n)
-                if eval_ds is None:
-                    eval_ds = getattr(src, "dataset", None)
-            rows = _rows_to_list(eval_ds)
-            # An explicit positive ``limit`` means the caller (mid-run eval) wants a RAW pool of up
-            # to ``limit`` rows and does its OWN seeded sampling on top — so don't also apply the
-            # ``[environment.params] eval_examples`` subset here, which would silently shrink the
-            # pool below ``limit`` and starve the caller's sample (it already capped the pool size
-            # via ``limit``). ``_fixed_subset`` still governs the plain ``dataset("eval")`` path
-            # (the "eval on a different env" feature, where the param IS the intended sample size).
-            if limit is not None and limit > 0:
-                return rows
-            return self._fixed_subset(rows)
+    def dataset(self, split: str = "train") -> list[dict]:
         ds = _call_dataset_getter(self._env, "get_dataset", seed=0)
         if ds is None:
             ds = getattr(self._env, "dataset", None)
         return _rows_to_list(ds)
-
-    def has_eval_split(self) -> bool:
-        """True when a DISTINCT held-out eval split exists (a separate eval env, or the env's
-        ``get_eval_dataset``/``eval_dataset``). False means :meth:`dataset` would fall back to
-        train rows — so a caller (mid-run eval) can warn instead of reporting train data as
-        held-out. Best-effort: a getter that raises is treated as no eval split."""
-        if self._eval_env is not None:
-            return True
-        try:
-            if (
-                _call_dataset_getter(self._env, "get_eval_dataset", seed=self._eval_seed)
-                is not None
-            ):
-                return True
-        except Exception:
-            return False
-        return getattr(self._env, "eval_dataset", None) is not None
-
-    def _fixed_subset(self, rows: list[dict]) -> list[dict]:
-        n = self._eval_examples
-        if n <= 0 or n >= len(rows):
-            return rows
-        idx = sorted(random.Random(self._eval_seed).sample(range(len(rows)), n))
-        return [rows[i] for i in idx]
 
     # -- task interface ---------------------------------------------------
     def prompt_messages(self, example: dict) -> list[dict]:
@@ -294,14 +225,9 @@ class VerifiersEnvironment(BaseEnvironment):
 
         Every WEIGHTED rubric func contributes one entry (by ``func.__name__``); the
         ``"total"`` is their sum (== :meth:`reward`). Used to preserve the frontend per-scorer
-        breakdown + W&B series instead of collapsing to a single binary ``correct``.
-
-        Per verifiers semantics EVERY reward func runs, including eval-metric ones — they may
-        mutate the shared ``state`` (so a subsequent weighted func sees their work) or exist
-        only to be logged. Eval-metric funcs run with GUARDED exceptions (a thrown monitor must
-        not fail the run) and contribute 0, so they are not added to the breakdown/total; the
-        order is preserved so a eval-metric func can prepare state for a later weighted one.
-        Weighted funcs propagate exceptions (a thrown weighted reward fails the run).
+        breakdown + W&B series instead of collapsing to a single binary ``correct``. Unweighted
+        (monitor) funcs are skipped — only weighted funcs shape the reward. Weighted funcs
+        propagate exceptions (a thrown weighted reward fails the run).
         """
         breakdown: dict[str, float] = {}
         if not self._reward_pairs:
@@ -311,11 +237,7 @@ class VerifiersEnvironment(BaseEnvironment):
         total = 0.0
         for func, weight in self._reward_pairs:
             if not weight:
-                # Eval-metric monitor/diagnostic func: RUN it (for its side effects on shared
-                # state / logging) with guarded exceptions, but it contributes 0 and is not in
-                # the named breakdown.
-                _run_eval_metric(func, available)
-                continue
+                continue  # unweighted monitor func: contributes nothing to the reward
             name = getattr(func, "__name__", str(func))
             score = float(weight) * _invoke_reward(func, available)
             breakdown[_unique_key(name, breakdown)] = score
@@ -325,43 +247,6 @@ class VerifiersEnvironment(BaseEnvironment):
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(self.scores_breakdown(completion, example, state)["total"])
-
-    def evaluate(self, completion: str, example: dict, state: dict | None = None) -> dict:
-        """One pass over the rubric returning the training ``reward`` AND the env's separate
-        ``metrics`` — each EVAL-METRIC rubric func's raw (unweighted) score, by name.
-
-        Eval-metric funcs are how a verifiers ``environment.py`` expresses an EVALUATION signal
-        distinct from the GRPO reward: an ``exact_match`` / ``accuracy`` monitor added with
-        ``rubric.add_metric(fn, weight=0.0)`` does not shape training (weight 0) but measures
-        quality. :meth:`scores_breakdown`/:meth:`reward` deliberately omit these; mid-run eval
-        wants them, so this method surfaces them WITHOUT a second rubric pass (a ``JudgeRubric``
-        is sampled at most once). Weighted funcs still propagate exceptions (a broken weighted
-        reward fails the run); eval-metric monitors stay guarded (a thrown monitor is skipped,
-        never fails eval). Order is preserved so a monitor can prep shared ``state`` for a later
-        weighted func, exactly as in :meth:`scores_breakdown`.
-
-        Returns ``{"reward": <weighted total>, "metrics": {name: raw_score, ...}}``; an env with
-        no rubric falls back to the substring ``answer_match`` as both reward and (empty) metrics.
-        """
-        if not self._reward_pairs:
-            score = _substring_answer_score(completion, example)
-            return {"reward": score, "metrics": {}}
-        available = self._reward_available(completion, example, state)
-        total = 0.0
-        metrics: dict[str, float] = {}
-        for func, weight in self._reward_pairs:
-            name = getattr(func, "__name__", str(func))
-            if not weight:
-                # Eval-metric = an eval/monitor metric: run it (guarded — a thrown monitor must
-                # not fail eval) and record its RAW score; it never touches the reward total.
-                try:
-                    raw = _invoke_reward(func, available)
-                except Exception:
-                    continue
-                metrics[_unique_key(name, metrics)] = raw
-                continue
-            total += float(weight) * _invoke_reward(func, available)
-        return {"reward": total, "metrics": metrics}
 
     def tools(self) -> list:
         """The underlying ToolEnv's Python tool callables (``[]`` for non-tool envs).
@@ -485,27 +370,12 @@ def _import_vf():
         ) from exc
 
 
-def load_verifiers_environment(
-    env_id: str,
-    eval_env_id: str | None = None,
-    eval_examples: int | None = None,
-    eval_seed: int = 12345,
-    **kwargs,
-) -> VerifiersEnvironment:
+def load_verifiers_environment(env_id: str, **kwargs) -> VerifiersEnvironment:
     """Load an installed / Hub verifiers environment by id and wrap it for Flash.
 
     ``env_id`` may be a Hub slug (``owner/name``); it is mapped to the bare verifiers load id.
-    Pass ``eval_env_id`` to evaluate on a *different* Hub env, with ``eval_examples`` /
-    ``eval_seed`` selecting a fixed eval subset. Remaining ``kwargs`` are forwarded to the train
-    env's ``vf.load_environment``.
+    Remaining ``kwargs`` are forwarded to the env's ``vf.load_environment``.
     """
     vf = _import_vf()
     vf_env = vf.load_environment(vf_load_id(env_id), **_drop_reserved_kwargs(kwargs))
-    eval_vf_env = vf.load_environment(vf_load_id(eval_env_id)) if eval_env_id else None
-    return VerifiersEnvironment(
-        vf_env,
-        env_id,
-        eval_vf_env=eval_vf_env,
-        eval_examples=eval_examples,
-        eval_seed=eval_seed,
-    )
+    return VerifiersEnvironment(vf_env, env_id)

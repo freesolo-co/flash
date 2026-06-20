@@ -102,19 +102,6 @@ def test_bare_environment_id_is_rejected() -> None:
             spec_from_dict(raw)
 
 
-def test_bare_eval_env_id_is_rejected() -> None:
-    # The eval env ([environment.params] eval_env_id) is also prime-installed on the worker, so a
-    # bare eval id must be rejected up front (not fail after a GPU is provisioned).
-    raw = _raw()
-    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "gsm8k"}}
-    with pytest.raises(ConfigError, match=r"eval_env_id must be a published Prime Hub slug"):
-        spec_from_dict(raw)
-    # A full owner/name eval slug is accepted.
-    raw = _raw()
-    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "owner/eval"}}
-    spec_from_dict(raw)  # no raise
-
-
 def test_environment_must_be_a_table() -> None:
     raw = _raw()
     raw["environment"] = "gsm8k"

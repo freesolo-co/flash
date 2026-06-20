@@ -57,121 +57,6 @@ def test_verifiers_adapter_mapping():
     assert env.sft_target({"answer": "4"}) == "4"
 
 
-def test_evaluate_surfaces_eval_metric_metrics_distinct_from_reward():
-    """``evaluate()`` returns the weighted training reward AND each eval-metric rubric func's RAW
-    score by name — so an env expresses an evaluation metric (e.g. accuracy) that differs from a
-    shaped GRPO reward, entirely in the environment's rubric. ``reward()`` stays metric-free."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    def shaped_reward(completion, answer):  # weight 1.0 -> drives training; partial credit
-        return 0.3 if answer in completion[-1]["content"] else 0.0
-
-    def accuracy(completion, answer):  # weight 0.0 -> eval metric only, NOT in the reward
-        return 1.0 if answer in completion[-1]["content"] else 0.0
-
-    class _Env(_FakeVfEnv):
-        def __init__(self):
-            super().__init__()
-            self.rubric = _FakeRubric([shaped_reward, accuracy], [1.0, 0.0])
-
-    env = VerifiersEnvironment(_Env(), "fake/env")
-    ex = {"answer": "4"}
-    out = env.evaluate("the answer is 4", ex)
-    assert out["reward"] == pytest.approx(0.3)  # shaped reward (weighted total)
-    assert out["metrics"] == {"accuracy": 1.0}  # eval-metric metric surfaced, raw + distinct
-    miss = env.evaluate("nope", ex)
-    assert miss["reward"] == 0.0
-    assert miss["metrics"] == {"accuracy": 0.0}
-    # reward()/scores_breakdown() are unchanged: weighted total only, no eval-metric metrics
-    assert env.reward("the answer is 4", ex) == pytest.approx(0.3)
-    assert "accuracy" not in env.scores_breakdown("the answer is 4", ex)
-
-
-def test_eval_split_uses_eval_dataset_not_train():
-    """A populated eval_dataset is returned for the eval split (not the train split)."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
-    eval_rows = env.dataset("eval")
-    assert [r["answer"] for r in eval_rows] == ["6"]  # the eval_dataset, not the train "4"
-
-
-def test_empty_eval_dataset_does_not_fall_back_to_train():
-    """An empty-but-configured eval split ([]) is honored as an empty eval set; it must NOT
-    fall back to the TRAIN split (the `or` -> `is None` fix). Falling back would evaluate on
-    training data."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    class _Env(_FakeVfEnv):
-        def __init__(self):
-            super().__init__()
-            self.eval_dataset = []  # configured but empty -> falsy, must NOT fall through
-
-    env = VerifiersEnvironment(_Env(), "fake/env")
-    assert env.dataset("eval") == []  # honored as empty, NOT the train rows
-    assert env.dataset("train")[0]["answer"] == "4"  # train split still works
-
-
-def test_eval_get_eval_dataset_empty_does_not_fall_back():
-    """An empty list from get_eval_dataset() (not the attr) is likewise honored as empty and
-    must not fall through to get_dataset/train."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    class _Env:
-        rubric = None
-        parser = None
-
-        def __init__(self):
-            self.dataset = [{"prompt": [{"role": "user", "content": "q"}], "answer": "train"}]
-
-        def get_eval_dataset(self, n=-1, seed=0):
-            return []  # explicit empty eval set
-
-    env = VerifiersEnvironment(_Env(), "fake/env")
-    assert env.dataset("eval") == []  # honored, not the "train" row
-
-
-def test_missing_eval_dataset_falls_back_to_train():
-    """When NO eval split is configured at all (genuinely absent / None), the eval split falls
-    back to the env's train split — the only legitimate fallback case."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    class _Env:
-        rubric = None
-        parser = None
-        eval_dataset = None  # genuinely absent
-
-        def __init__(self):
-            self.dataset = [{"prompt": [{"role": "user", "content": "q"}], "answer": "train"}]
-
-    env = VerifiersEnvironment(_Env(), "fake/env")
-    assert [r["answer"] for r in env.dataset("eval")] == ["train"]
-
-
-def test_eval_limit_pool_not_shrunk_by_env_eval_examples():
-    """A positive ``limit`` (mid-run eval materializing a pool to sample itself) must NOT also be
-    shrunk by ``[environment.params] eval_examples`` (`_fixed_subset`). Otherwise an env-params
-    eval_examples smaller than the requested limit would starve the caller's seeded sample with no
-    warning. The plain ``dataset("eval")`` path (no limit) still applies the param subset."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    class _Env:
-        rubric = None
-        parser = None
-        dataset = None
-
-        def __init__(self):
-            self.eval_dataset = [{"answer": str(i)} for i in range(50)]
-
-    # env-params eval_examples=5 (the "eval on a different env" fixed-subset knob)
-    env = VerifiersEnvironment(_Env(), "fake/env", eval_examples=5)
-    # No limit -> param subset applied (5 rows).
-    assert len(env.dataset("eval")) == 5
-    # Explicit positive limit -> caller wants the raw pool; param subset is NOT applied, so the full
-    # 50 rows are available for the caller's own sampling (here 50 < limit, so all rows return).
-    assert len(env.dataset("eval", limit=40)) == 50
-
-
 def test_install_manifest_and_worker_deps():
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["FLASH_ENVS_MANIFEST"] = os.path.join(tmp, "envs.json")
@@ -182,13 +67,6 @@ def test_install_manifest_and_worker_deps():
         # authenticated `prime env install` (see worker_hub_env_ids), not pip.
         assert registry.worker_pip_for_env("owner/env") == ["verifiers"]
         assert registry.worker_hub_env_ids("owner/env") == ["owner/env"]
-        # A separate eval Hub env is also prime-installed.
-        assert registry.worker_hub_env_ids("owner/train", {"eval_env_id": "owner/eval"}) == [
-            "owner/train",
-            "owner/eval",
-        ]
-        # The train env doubling as the eval env is installed once.
-        assert registry.worker_hub_env_ids("owner/x", {"eval_env_id": "owner/x"}) == ["owner/x"]
 
         os.environ.pop("FLASH_ENVS_MANIFEST", None)
         importlib.reload(registry)
@@ -260,8 +138,7 @@ def test_rubric_group_is_flattened_and_eval_metric_skipped():
 def test_reward_from_weighted_func_propagates_exception():
     """A WEIGHTED reward func that raises must PROPAGATE (fail loudly), not be swallowed as
     0.0 — a raise in a weighted func is a real reward failure (e.g. judge API error) that would
-    otherwise train/score on an all-zero signal. (Eval-metric funcs run with guarded exceptions
-    instead — see test_reward_eval_metric_crashing_func_runs_with_guarded_exception.)"""
+    otherwise train/score on an all-zero signal. (Unweighted monitor funcs are skipped.)"""
     from flash.envs.adapter import VerifiersEnvironment
 
     def boom(**kwargs):
@@ -278,63 +155,6 @@ def test_reward_from_weighted_func_propagates_exception():
     env = VerifiersEnvironment(_Env(), "owner/x")
     with pytest.raises(RuntimeError, match="kaboom"):
         env.reward("anything", {"answer": "4"})
-
-
-def test_reward_eval_metric_crashing_func_runs_with_guarded_exception():
-    """Per verifiers semantics a eval-metric monitor func RUNS (it may mutate shared state /
-    be logged), but its exceptions are GUARDED (swallowed) — a thrown monitor must not fail the
-    run — and it contributes 0 to the reward."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    calls = []
-
-    def good(completion, answer, **kwargs):
-        return 1.0 if str(answer) in completion[-1]["content"] else 0.0
-
-    def boom(**kwargs):
-        calls.append("boom")  # observed -> it actually ran
-        raise RuntimeError("kaboom")
-
-    class _Rubric:
-        funcs = (good, boom)
-        weights = (1.0, 0.0)  # boom is eval-metric -> runs, guarded, contributes 0
-
-    class _Env:
-        rubric = _Rubric()
-        parser = None
-
-    env = VerifiersEnvironment(_Env(), "owner/x")
-    # The crashing eval-metric func runs (its exception is swallowed) and contributes nothing.
-    assert env.reward("the answer is 4", {"answer": "4"}) == 1.0
-    assert calls == ["boom"]
-
-
-def test_eval_metric_func_runs_and_can_mutate_shared_state():
-    """A eval-metric func runs BEFORE a later weighted func and may set shared ``state`` the
-    weighted func then reads. It still contributes 0 itself and is absent from the breakdown."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    def monitor(state, **kwargs):  # eval-metric: seeds shared state, returns nothing useful
-        state["seen"] = True
-        return 0.0
-
-    def scored(state, **kwargs):  # weighted: rewards iff the monitor ran first
-        return 1.0 if state.get("seen") else 0.0
-
-    class _Rubric:
-        funcs = (monitor, scored)  # monitor first so it can prepare state
-        weights = (0.0, 1.0)
-
-    class _Env:
-        rubric = _Rubric()
-        parser = None
-
-    env = VerifiersEnvironment(_Env(), "owner/x")
-    state = {}
-    breakdown = env.scores_breakdown("anything", {"answer": "4"}, state)
-    assert breakdown["total"] == 1.0  # weighted func saw the monitor's state mutation
-    assert breakdown == {"scored": 1.0, "total": 1.0}  # eval-metric monitor not in breakdown
-    assert state["seen"] is True
 
 
 def test_scores_breakdown_collision_does_not_clobber_existing_distinct_key():

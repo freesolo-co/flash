@@ -54,13 +54,10 @@ def worker_pip_for_env(env_id: str) -> list[str]:
 def worker_hub_env_ids(env_id: str, params: dict | None = None) -> list[str]:
     """The Prime Hub env ids the worker must ``prime env install`` for this run.
 
-    The training env plus a separate **eval** Hub env (``[environment.params] eval_env_id``)
-    when configured. ``prime env install`` is authenticated by ``PRIME_API_KEY`` and installs
-    public and private envs alike.
+    ``prime env install`` is authenticated by ``PRIME_API_KEY`` and installs public and private
+    envs alike.
     """
-    params = params or {}
-    ids = [env_id, params.get("eval_env_id")]
-    return list(dict.fromkeys(str(i) for i in ids if i))
+    return [env_id]
 
 
 def load_environment(env_id: str, params: dict | None = None) -> Environment:
