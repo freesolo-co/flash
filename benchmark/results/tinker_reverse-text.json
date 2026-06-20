@@ -4,8 +4,8 @@
   "model": "Qwen/Qwen3.5-4B",
   "env_id": "reverse-text",
   "steps": 30,
-  "wall_s": 2354.871974349022,
-  "cost_usd_estimated": 2.2895,
+  "wall_s": 1529.5748959309421,
+  "cost_usd_estimated": 1.4871,
   "cost_note": "estimated (Tinker does not expose cost via API; check your dashboard)",
   "first_train_reward": 0.0,
   "final_train_reward": 0.0,
@@ -41,5 +41,5 @@
     0.0,
     0.0
   ],
-  "log_path": "/tmp/tinker-bench-reverse-text"
+  "log_path": "/tmp/tinker-rerun-reverse-text"
 }
