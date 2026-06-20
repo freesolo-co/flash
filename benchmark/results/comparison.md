@@ -69,7 +69,7 @@ In-training GRPO reward is NOT comparable across stacks (Flash's worker uses ver
 | base Qwen3.5-4B | 0.620 | unified scorer, Tinker sampling |
 | **Tinker-trained** | **0.540** (Δ-0.080 vs base) | unified scorer, Tinker sampling |
 
-**Key finding:** under the shared scorer the Tinker-trained model shows **no held-out gain** (Δ-0.080, within n=50 noise) even though its in-training reward rose. At this deliberately tiny scale (30 steps, 16 rollouts/step) the rising training reward does NOT translate to held-out accuracy — exactly what a unified held-out eval is for; the training-reward curve alone would have implied improvement. The Flash-trained row falls back to Flash's own on-GPU eval (a similar but not identical scorer) because a unified Flash eval needs a Qwen3.5-4B LoRA serving — the live one was empty (0 GPUs / 0 base models); `eval_unified.py` runs the unified Flash eval against any configured serving. Truncation note: even at max_tokens=2048, 56% of base generations still hit the cap (Qwen3.5-4B is very verbose for this format).
+**Key finding:** under the shared scorer the Tinker-trained model's held-out accuracy fell (Δ-0.080 vs base, beyond the ±0.02 noise band); its in-training smoothed reward fell over the run. The Flash-trained row falls back to Flash's own on-GPU eval (a similar but not identical scorer) because a unified Flash eval needs a Qwen3.5-4B LoRA serving — the live one was empty (0 GPUs / 0 base models); `eval_unified.py` runs the unified Flash eval against any configured serving. Truncation note: even at max_tokens=2048, 56% of base generations still hit the cap (Qwen3.5-4B is very verbose for this format).
 
 ## Cost of training (the headline)
 

@@ -43,6 +43,22 @@ _RESULTS = _HERE / "results"
 _MANIFEST = _RESULTS / "runs_manifest.json"
 TASKS = ["gsm8k", "reverse-text", "hendrycks-math"]
 _SMOOTH_K = 5  # mean over last K steps — robust to the high per-step variance at 16 rollouts/step
+# ONE threshold for every "did it move?" verdict (held-out Δ and in-training trend). At 16
+# rollouts/step a swing this small is within noise: |Δ| <= band -> "no change", > +band ->
+# "rose", < -band -> "fell". Keeps the held-out verdict and the training-curve wording honest
+# and mutually consistent (no "rose" text emitted when the curve is actually flat or falling).
+_VERDICT_BAND = 0.02
+
+
+def _trend_word(delta: float | None) -> str:
+    """Direction of a change under the shared ±_VERDICT_BAND noise band ('rose'/'fell'/flat)."""
+    if delta is None:
+        return "is unavailable"
+    if delta > _VERDICT_BAND:
+        return "rose"
+    if delta < -_VERDICT_BAND:
+        return "fell"
+    return "was flat (within noise)"
 
 
 def _smoothed(rh: list, k: int = _SMOOTH_K):
@@ -328,13 +344,27 @@ def render_markdown(records: dict) -> str:
             lines.append(f"| Flash-trained | {flash_native:.3f} | Flash's NATIVE on-GPU eval "
                          "(gsm8k-env scorer, NOT the unified scorer — see note) |")
         tr_delta = tr.get("delta_vs_base") if tr else None
-        if tr_delta is not None and tr_delta <= 0.02:
+        # Single ±_VERDICT_BAND rule for BOTH the held-out delta and the in-training trend, so the
+        # sentence can never say "rose" when the curve is flat/falling. The in-training direction
+        # is taken from THIS run's tinker record (step-1 first_reward -> final_smoothed), not
+        # assumed — gsm8k's smoothed reward actually FALLS (0.69 -> 0.36), so a hard-coded "rose"
+        # was wrong. held_word/train_word are emitted verbatim, keeping every clause consistent.
+        tk = records["gsm8k"]["tinker"]
+        first_r, final_r = tk.get("first_reward"), tk.get("final_smoothed")
+        train_delta = (final_r - first_r) if (first_r is not None and final_r is not None) else None
+        train_word = _trend_word(train_delta)  # "rose" / "fell" / "was flat (within noise)"
+        if tr_delta is not None and abs(tr_delta) <= _VERDICT_BAND:
             verdict = (f"**Key finding:** under the shared scorer the Tinker-trained model shows **no "
-                       f"held-out gain** (Δ{tr_delta:+.3f}, within n={b.get('n')} noise) even though its "
-                       f"in-training reward rose. At this deliberately tiny scale ({steps_str} steps, 16 "
-                       f"rollouts/step) the rising training reward does NOT translate to held-out "
-                       f"accuracy — exactly what a unified held-out eval is for; the training-reward "
-                       f"curve alone would have implied improvement.")
+                       f"significant held-out change** (Δ{tr_delta:+.3f}, within n={b.get('n')} noise); "
+                       f"its in-training smoothed reward {train_word} over the run. At this deliberately "
+                       f"tiny scale ({steps_str} steps, 16 rollouts/step) the in-training reward curve "
+                       f"does NOT track held-out accuracy — exactly what a unified held-out eval is for; "
+                       f"the training-reward curve alone would not have predicted the held-out result.")
+        elif tr_delta is not None:
+            moved = "rose" if tr_delta > 0 else "fell"
+            verdict = (f"**Key finding:** under the shared scorer the Tinker-trained model's held-out "
+                       f"accuracy {moved} (Δ{tr_delta:+.3f} vs base, beyond the ±{_VERDICT_BAND:.2f} "
+                       f"noise band); its in-training smoothed reward {train_word} over the run.")
         else:
             verdict = "Under the shared scorer the GRPO-trained model's held-out accuracy moves as shown."
         lines.append(f"\n{verdict} The Flash-trained row falls back to Flash's own on-GPU eval (a "

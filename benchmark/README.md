@@ -19,7 +19,7 @@ hyper-parameters** on two post-training stacks, and compares them on **cost**,
 | tasks | `gsm8k`, `reverse-text`, `hendrycks-math` (3 tasks × 2 stacks = **6 runs**) |
 | steps | 30 |
 | group size / batch | 4 / 4 (16 rollouts per step) |
-| max tokens | 512 |
+| max tokens | 1024 |
 | LoRA rank | 32 |
 
 The shared **verifiers environment** is the linchpin: Flash is verifiers-only by design
