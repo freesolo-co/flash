@@ -199,6 +199,7 @@ def model_required_vram_gb(
     train=None,
     thinking: bool = False,
     headroom: float = 1.1,
+    skip_net: bool = False,
 ) -> int:
     """Cheapest-sufficient VRAM (GB) for a specific run -- the matrix the allocator and
     ``resolve_gpu_policy`` both size against.
@@ -208,6 +209,11 @@ def model_required_vram_gb(
     (``grpo_min_vram_gb``) stay as HARD floors so we never under-provision a validated
     model; the matrix only ever sizes UP from there. Unlisted open models size from HF
     metadata, falling back to the 24 GB tier when the size can't be read.
+
+    ``skip_net=True`` forces the offline heuristic for an UNLISTED model (no HF probe), the
+    library-safe equivalent of the ``FLASH_SKIP_NET`` env without mutating process-global state
+    -- the cost estimator passes it so estimation never does network I/O. Listed catalog models
+    never touch the network regardless.
     """
 
     # Best-effort knob extraction: this provisional sizing runs at parse time BEFORE the
@@ -312,7 +318,7 @@ def model_required_vram_gb(
             need = max(need, floor_gb)
         return need
     # Unlisted open model: size from HF metadata (GRPO is the heavier phase).
-    params_b = fetch_hf_params_b(model_id)
+    params_b = fetch_hf_params_b(model_id, skip_net=skip_net)
     if params_b is None:
         return 24
     # Open models size against the heavier GRPO phase regardless of the requested algorithm.
@@ -324,9 +330,15 @@ def model_required_vram_gb(
     return need
 
 
-def fetch_hf_params_b(model_id: str) -> float | None:
-    """Total params (billions) from the HF API safetensors metadata (no download)."""
-    if os.environ.get("FLASH_SKIP_NET"):
+def fetch_hf_params_b(model_id: str, *, skip_net: bool = False) -> float | None:
+    """Total params (billions) from the HF API safetensors metadata (no download).
+
+    Network is skipped (returns ``None``) when EITHER the ambient ``FLASH_SKIP_NET`` env is set
+    (the long-standing global switch, honored for every caller) OR an explicit ``skip_net=True``
+    is passed -- the library-safe way for a caller (e.g. the cost estimator) to force the offline
+    heuristic for one call without mutating the process-global env.
+    """
+    if skip_net or os.environ.get("FLASH_SKIP_NET"):
         return None
     try:
         from huggingface_hub import HfApi

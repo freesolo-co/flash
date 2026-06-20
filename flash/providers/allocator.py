@@ -52,6 +52,7 @@ def required_vram_gb(
     *,
     train=None,
     thinking: bool = False,
+    skip_net: bool = False,
 ) -> int:
     """VRAM the full run needs, sized to the run's actual knobs (context length, LoRA
     rank, batch / group size, thinking) via the shared ``model_required_vram_gb`` matrix.
@@ -59,7 +60,9 @@ def required_vram_gb(
     Catalog GRPO floors stay hard floors (never under-provision a validated model); the
     matrix sizes up from there for big contexts/groups and down to a cheaper card for
     small runs. Unlisted open models size from HF metadata, falling back to the 24 GB tier
-    when unreadable (handled inside model_required_vram_gb)."""
+    when unreadable (handled inside model_required_vram_gb). ``skip_net=True`` forces that
+    offline fallback for an unlisted model without touching the ``FLASH_SKIP_NET`` env (the
+    estimator passes it so sizing never does network I/O)."""
     from flash.engine.vram import model_required_vram_gb
 
     return model_required_vram_gb(
@@ -68,6 +71,7 @@ def required_vram_gb(
         train=train,
         thinking=thinking,
         headroom=vram_headroom(),
+        skip_net=skip_net,
     )
 
 

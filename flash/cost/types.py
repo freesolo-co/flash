@@ -60,9 +60,12 @@ class RunConfig:
             raise ValueError(
                 f"steps ({self.steps}) must be a multiple of setup_repeats ({self.setup_repeats})"
             )
-        # A 0/negative cap or knob yields a bogus (negative/zero) quote; reject. A sub-60s but
-        # positive cap is valid (floored at the runner's 60s minimum in ``estimate_cost``).
-        for _name in ("seq_len", "batch_size", "group_size", "completion_len", "lora_rank", "max_wall_seconds"):
+        # A 0/negative positive-only knob yields a bogus (negative/zero) quote; reject. NOTE:
+        # ``max_wall_seconds`` is deliberately NOT here -- the submit/run paths floor it with
+        # ``max(60, int(spec.gpu.max_wall_seconds))`` and so ACCEPT a 0/negative cap, flooring it
+        # to 60s. ``estimate_cost`` mirrors that floor (``cap_s = max(60.0, ...)``), so rejecting a
+        # non-positive cap here would make --estimate unable to price configs the runner accepts.
+        for _name in ("seq_len", "batch_size", "group_size", "completion_len", "lora_rank"):
             _val = getattr(self, _name)
             if _val is not None and _val < 1:
                 raise ValueError(f"{_name} must be >= 1, got {_val}")

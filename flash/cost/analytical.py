@@ -9,7 +9,6 @@ each step into a vLLM rollout (decode-bound) + reward grading + policy/reference
 from __future__ import annotations
 
 import math
-import os
 
 from flash.providers.allocator import required_vram_gb, vram_headroom
 from flash.providers.base import providers_for, unvalidated_allowed
@@ -99,22 +98,19 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
     way submit-time does, so the estimate's GPU pick matches what the allocator would allocate.
 
     The estimator's contract is fully local / no network, but ``required_vram_gb`` can probe the
-    HF API for an UNLISTED model's param count (``engine.vram.fetch_hf_params_b``) unless
-    ``FLASH_SKIP_NET`` is set. Force ``FLASH_SKIP_NET=1`` for the sizing call so estimation never
-    does network I/O by default (the offline path falls back to the 24 GB tier for an unreadable
-    model); restore any pre-existing value afterward so an already-offline caller is unaffected.
+    HF API for an UNLISTED model's param count (``engine.vram.fetch_hf_params_b``). Pass
+    ``skip_net=True`` so estimation never does network I/O (the offline path falls back to the
+    24 GB tier for an unreadable model). This is threaded explicitly through the sizing stack --
+    NOT a mutation of the process-global ``FLASH_SKIP_NET`` env -- so it's thread-safe and never
+    clobbers a concurrent caller's env or HF lookups (PR #3 review).
     """
-    _prev_skip_net = os.environ.get("FLASH_SKIP_NET")
-    os.environ["FLASH_SKIP_NET"] = "1"
-    try:
-        need = required_vram_gb(
-            config.model_id, config.method, train=config.train_knobs(), thinking=config.thinking
-        )
-    finally:
-        if _prev_skip_net is None:
-            os.environ.pop("FLASH_SKIP_NET", None)
-        else:
-            os.environ["FLASH_SKIP_NET"] = _prev_skip_net
+    need = required_vram_gb(
+        config.model_id,
+        config.method,
+        train=config.train_knobs(),
+        thinking=config.thinking,
+        skip_net=True,
+    )
     gpu = pick_gpu(
         need,
         pin=config.gpu,
@@ -145,8 +141,8 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
     if wall_capped:
         per_seed = "" if config.setup_repeats == 1 else "per-seed "
         notes.append(
-            f"train clamped to the {_fmt_duration(cap_s)} {per_seed}wall cap "
-            f"(uncapped: {_fmt_duration(raw_train_s)})"
+            f"training clamped to fit the {_fmt_duration(cap_s)} {per_seed}wall cap "
+            f"(after setup; uncapped: {_fmt_duration(raw_train_s)})"
         )
     return tuple(notes)
 

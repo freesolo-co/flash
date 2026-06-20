@@ -145,12 +145,18 @@ def test_sub_60s_wall_cap_is_floored_to_the_runner_minimum():
     assert e10.total_usd > 0.0
 
 
-def test_nonpositive_max_wall_seconds_is_rejected():
-    # A 0/negative cap would drive estimate_cost to a negative wall and negative total_usd, so
-    # RunConfig rejects it up front (a sub-60s but positive cap is fine -- it's floored above).
-    for bad in (0, -1):
-        with pytest.raises(ValueError, match="max_wall_seconds must be >= 1"):
-            RunConfig(BIG, "grpo", 10, max_wall_seconds=bad)
+def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
+    # A 0/negative max_wall_seconds is ACCEPTED, mirroring the runner: submit/run floor it with
+    # max(60, int(spec.gpu.max_wall_seconds)), so the runner accepts a non-positive cap and runs
+    # it for 60s of wall. RunConfig must NOT reject it (else --estimate can't price configs the
+    # runner accepts), and estimate_cost's cap_s = max(60.0, ...) floor turns it into a 60s wall
+    # with a strictly-positive total_usd -- NOT a negative/zero quote.
+    for cap in (0, -5):
+        cfg = RunConfig(BIG, "grpo", 100_000, max_wall_seconds=cap)  # accepted, no raise
+        assert cfg.max_wall_seconds == cap
+        e = estimate_cost(cfg)
+        assert e.wall_clock_seconds == pytest.approx(60.0)  # floored to the runner's 60s minimum
+        assert e.total_usd > 0.0  # positive, not negative
     # One seed of the same shape caps at exactly one per-seed window.
     one = RunConfig(BIG, "grpo", 100_000, setup_repeats=1, max_wall_seconds=3600)
     assert estimate_cost(one).wall_clock_seconds == pytest.approx(3600.0)
@@ -256,11 +262,12 @@ def test_explicit_grpo_max_length_still_wins():
 
 
 def test_estimate_does_no_network_for_unlisted_model(monkeypatch):
-    # The estimator's contract is fully local. select_gpu() forces FLASH_SKIP_NET around its
-    # sizing call, so even with FLASH_SKIP_NET UNSET an UNLISTED model never constructs the HF
-    # network client: fetch_hf_params_b's FLASH_SKIP_NET guard short-circuits (return None) BEFORE
-    # it imports/instantiates HfApi. Wire HfApi to flip a flag if ever built and assert it stays
-    # untouched, and that the estimate still succeeds via the offline fallback (the 24 GB tier).
+    # The estimator's contract is fully local. select_gpu() threads skip_net=True through the VRAM
+    # sizing stack (required_vram_gb -> model_required_vram_gb -> fetch_hf_params_b), so even with
+    # FLASH_SKIP_NET UNSET an UNLISTED model never constructs the HF network client:
+    # fetch_hf_params_b's skip_net guard short-circuits (return None) BEFORE it imports/instantiates
+    # HfApi. Wire HfApi to flip a flag if ever built and assert it stays untouched, and that the
+    # estimate still succeeds via the offline fallback (the 24 GB tier).
     monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     import huggingface_hub
 
@@ -279,15 +286,44 @@ def test_estimate_does_no_network_for_unlisted_model(monkeypatch):
     assert not built  # the network client was never even constructed
     assert e.required_vram_gb >= 24  # sane offline VRAM estimate (unlisted -> 24 GB tier)
     assert e.total_usd > 0
-    # The forced FLASH_SKIP_NET is transient: it must NOT leak into the ambient environment.
+    # Thread-safety: the offline force is an explicit param, NOT a process-global env mutation, so
+    # FLASH_SKIP_NET must not appear (and was never set) in the ambient environment.
     assert "FLASH_SKIP_NET" not in os.environ
 
 
-def test_estimate_restores_preexisting_flash_skip_net(monkeypatch):
-    # An already-offline caller's FLASH_SKIP_NET value is restored after sizing (not clobbered).
-    monkeypatch.setenv("FLASH_SKIP_NET", "preset")
+def test_estimate_does_not_mutate_caller_flash_skip_net(monkeypatch):
+    # select_gpu sizes offline via an explicit skip_net param threaded through the stack, NOT by
+    # mutating os.environ["FLASH_SKIP_NET"]. A caller's own FLASH_SKIP_NET value must therefore be
+    # left byte-for-byte untouched across estimation (it's never clobbered, since we don't touch
+    # the env at all). Use a sentinel value the code would never write.
+    monkeypatch.setenv("FLASH_SKIP_NET", "caller-sentinel")
     select_gpu(RunConfig(MID, "grpo", 10))
-    assert os.environ["FLASH_SKIP_NET"] == "preset"
+    assert os.environ["FLASH_SKIP_NET"] == "caller-sentinel"
+    # ...and an unlisted-model estimate (the path that would have flipped the env before) leaves
+    # it equally untouched.
+    estimate_cost(RunConfig("some-org/another-unlisted-7b", "grpo", 10))
+    assert os.environ["FLASH_SKIP_NET"] == "caller-sentinel"
+
+
+def test_skip_net_param_bypasses_hf_without_env(monkeypatch):
+    # Unit-level: the threaded skip_net=True bypasses the HF probe for an unlisted model the same
+    # way the FLASH_SKIP_NET env would, but WITHOUT the env being set -- proving the param, not a
+    # global mutation, is what forces offline sizing.
+    from flash.engine.vram import fetch_hf_params_b, model_required_vram_gb
+
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+
+    def _boom(*a, **k):  # any HF construction/lookup is a failure
+        raise AssertionError("hit the HF network despite skip_net=True")
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _boom)
+    # Direct: skip_net short-circuits to None (offline) without constructing HfApi.
+    assert fetch_hf_params_b("some-org/unlisted", skip_net=True) is None
+    # And the sizing matrix falls back to the 24 GB tier for the unreadable unlisted model.
+    assert model_required_vram_gb("some-org/unlisted", "grpo", skip_net=True) == 24
+    assert "FLASH_SKIP_NET" not in os.environ
 
 
 @pytest.mark.parametrize(
