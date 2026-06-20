@@ -41,8 +41,21 @@ def active_compute_s(records: list[dict]) -> float | None:
     sum to the run wall-clock. We prefer it because the rollout phase runs CONCURRENTLY, so
     summing ``rollout:total`` + ``train_step`` exceeds wall-clock (observed "active 39m > wall
     26m"). A managed-backend capacity pause ("running short on capacity, please wait") shows up
-    as ONE step hundreds-to-thousands of seconds long (vs ~20-30s normal); we treat the excess of
-    any ``> _PAUSE_STEP_S`` step over the median as idle pause (unbilled) and subtract it.
+    as ONE step hundreds-to-thousands of seconds long (vs ~20-30s normal).
+
+    Corrected pause rule (keeps ``active <= wall`` and doesn't over-credit a slow-but-real step):
+
+      * The per-step "expected active time" is the median of the NORMAL steps only (those
+        ``<= _PAUSE_STEP_S``). Using the normal-step median — not the overall median — keeps the
+        baseline a real compute step even when MANY steps are pauses (an overall median that is
+        itself a pause would make ``t - med`` go negative and ADD time, breaking the invariant).
+      * For each step over ``_PAUSE_STEP_S`` we exclude ONLY the excess ABOVE that expectation
+        (``t - expected``), and clamp every per-step term to ``>= 0`` (``max(0, ...)``) so a step
+        merely slower than expectation can never subtract more than its own over-run — and a step
+        below expectation never adds time. A slow real step thus keeps its expected-step worth of
+        active compute; only the genuine queue/pause overhang above a normal step is removed.
+      * Finally clamp the total with ``min(active, wall)`` so active compute is ALWAYS <= the
+        summed wall-clock, regardless of the per-step distribution.
 
     Falls back to the ``rollout + train_step`` sum only when no record carries ``time/total``
     (real Tinker metrics always do; the fallback is for older/synthetic records).
@@ -52,9 +65,16 @@ def active_compute_s(records: list[dict]) -> float | None:
     """
     step_times = [r[_STEP_KEY] for r in records if _STEP_KEY in r]
     if step_times:
-        med = sorted(step_times)[len(step_times) // 2]
-        pause = sum(t - med for t in step_times if t > _PAUSE_STEP_S)
-        return sum(step_times) - pause
+        wall = sum(step_times)
+        normal = [t for t in step_times if t <= _PAUSE_STEP_S]
+        # Expected active per-step from NORMAL steps; if every step looks like a pause, fall back
+        # to the overall median so `expected` is still a real step time (never let it exceed t).
+        basis = normal or sorted(step_times)
+        expected = sorted(basis)[len(basis) // 2]
+        # Excess above a normal step for each pause step, clamped non-negative so no term can add
+        # time (the `t - expected` over-credit bug) or over-subtract below the step's own length.
+        pause = sum(max(0.0, t - expected) for t in step_times if t > _PAUSE_STEP_S)
+        return min(wall, wall - pause)  # active is ALWAYS <= summed wall-clock
     roll = train = 0.0
     have_timing = False
     for r in records:

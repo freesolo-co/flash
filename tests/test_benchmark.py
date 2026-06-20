@@ -572,3 +572,234 @@ def test_eval_via_serving_scores_with_shared_scorer(monkeypatch):
     assert res["accuracy"] == pytest.approx(0.5)
     assert res["truncated_frac"] == pytest.approx(0.5)  # the second hit the length cap
     assert res["errors"] == 0
+
+
+# ---------------------------------------------------------------------------
+# NEW ROUND (PR #20, commit 1b278be follow-ups)
+# ---------------------------------------------------------------------------
+
+# (G1) active_compute_s pause heuristic: ALWAYS <= summed wall, and a slow-but-real step
+# is not counted wholesale as a pause.
+
+def _steps(*ts):
+    """metrics.jsonl-shaped records carrying only the per-step wall time (`time/total`)."""
+    return [{"time/total": t} for t in ts]
+
+
+def test_active_compute_never_exceeds_wall_normal_case():
+    # Normal mix with one long pause: active < wall, and == wall minus the pause overhang only.
+    recs = _steps(20.0, 25.0, 22.0, 600.0, 24.0)  # 600s step is a capacity pause
+    wall = 20.0 + 25.0 + 22.0 + 600.0 + 24.0
+    active = tinker_runner.active_compute_s(recs)
+    assert active <= wall                      # invariant
+    # expected per-step = median of the normal (<=300) steps = 24.0; pause overhang = 600-24=576.
+    assert active == pytest.approx(wall - 576.0)
+
+
+def test_active_compute_clamped_when_median_step_exceeds_pause_threshold():
+    # MANY steps over _PAUSE_STEP_S so the OVERALL median is itself a pause. The old
+    # `sum(t - overall_median)` made `t - med` negative for the smaller pause steps and ADDED
+    # time (active > wall). The corrected rule clamps to active <= wall and never adds time.
+    recs = _steps(400.0, 500.0, 600.0, 700.0, 800.0)  # all > 300s
+    wall = sum(t for s in recs for t in [s["time/total"]])
+    active = tinker_runner.active_compute_s(recs)
+    assert active <= wall                      # the core invariant the bug violated
+    assert active >= 0.0
+
+
+def test_active_compute_slow_step_keeps_expected_worth_not_all_pause():
+    # A step at 310s (just over the 300s line) when normal steps are ~25s must NOT be counted
+    # entirely as pause: only its overhang above the expected (normal-median) step is excluded,
+    # so the run keeps one normal-step's worth of active compute for it.
+    recs = _steps(25.0, 25.0, 25.0, 310.0)
+    wall = 25.0 * 3 + 310.0
+    active = tinker_runner.active_compute_s(recs)
+    expected = 25.0                            # median of the normal steps
+    # overhang excluded = 310 - 25 = 285; the slow step still contributes its 25s expected worth.
+    assert active == pytest.approx(wall - (310.0 - expected))
+    assert active > 25.0 * 3                    # strictly more than just the 3 normal steps
+    assert active <= wall
+
+
+def test_active_compute_no_pause_equals_wall():
+    # No step over the threshold -> no pause subtracted -> active == summed wall exactly.
+    recs = _steps(20.0, 30.0, 25.0)
+    assert tinker_runner.active_compute_s(recs) == pytest.approx(75.0)
+
+
+# (G2) Each committed results JSON carries paused_s == wall - active, a basis-stating
+# cost_note, and stays internally consistent (active + paused == wall).
+
+@pytest.mark.parametrize("fname", [
+    "tinker_gsm8k.json", "tinker_reverse-text.json", "tinker_hendrycks-math.json",
+])
+def test_committed_result_has_consistent_paused_and_basis_cost_note(fname):
+    results = pathlib.Path(__file__).resolve().parents[1] / "benchmark" / "results"
+    run = json.loads((results / fname).read_text())
+    # paused_s present and == wall - active (capacity pause), and the three add up exactly.
+    assert "paused_s" in run, f"{fname} missing paused_s"
+    wall, active, paused = run["wall_s"], run["active_compute_s"], run["paused_s"]
+    assert paused == pytest.approx(wall - active)
+    assert active + paused == pytest.approx(wall)
+    assert paused >= 0.0                        # clamp invariant: no negative pause
+    # cost_note states the ACTIVE-COMPUTE basis (not a bare "estimated").
+    note = run["cost_note"].lower()
+    assert "active-compute" in note
+    assert "pause" in note
+    assert "excluded" in note
+
+
+def test_committed_results_paused_matches_comparison_json():
+    # The per-run paused_s must equal what assemble.py recorded in comparison.json.
+    results = pathlib.Path(__file__).resolve().parents[1] / "benchmark" / "results"
+    comp = json.loads((results / "comparison.json").read_text())
+    for task, fname in [
+        ("gsm8k", "tinker_gsm8k.json"),
+        ("reverse-text", "tinker_reverse-text.json"),
+        ("hendrycks-math", "tinker_hendrycks-math.json"),
+    ]:
+        run = json.loads((results / fname).read_text())
+        assert run["paused_s"] == pytest.approx(comp[task]["tinker"]["paused_s"])
+
+
+# (G3) README max-tokens row matches the real configured value (1024).
+
+def test_readme_max_tokens_matches_configs():
+    bench_dir = pathlib.Path(__file__).resolve().parents[1] / "benchmark"
+    readme = (bench_dir / "README.md").read_text()
+    assert "| max tokens | 1024 |" in readme
+    assert "| max tokens | 512 |" not in readme
+    # And it matches the actual default the runner/scripts use.
+    assert tinker_runner.parse_args.__defaults__ is None  # parse_args takes no args
+    import argparse as _ap
+    p = _ap.ArgumentParser()
+    p.add_argument("--max-tokens", type=int, default=1024)
+    assert p.parse_args([]).max_tokens == 1024
+
+
+# (G4) Held-out verdict band is consistent: within ±0.02 -> "no significant" + correct
+# in-training trend word (never "rose" when the curve falls); beyond the band -> rose/fell.
+
+def _records_for_verdict(held_delta, first_reward, final_smoothed, *, base_n=50):
+    """Minimal records dict + writes eval_unified_gsm8k.json so render_markdown emits a verdict."""
+    tinker = {
+        "status": "done", "gpu": "managed (Tinker)", "steps": 30,
+        "first_reward": first_reward, "final_reward": final_smoothed,
+        "final_smoothed": final_smoothed, "best_reward": max(first_reward, final_smoothed),
+        "eval_reward": None, "reward_history": [first_reward, final_smoothed],
+        "cost_usd": 1.0, "cost_kind": "ESTIMATE", "setup_s": None,
+        "train_s": 1800.0, "total_s": 1800.0, "paused_s": 10.0,
+        "per_step_s": 60.0, "train_tok_per_s": None,
+    }
+    flash = dict(tinker, platform="flash", gpu="A100 PCIe", cost_kind="measured",
+                 eval_reward=0.5, eval_n=50)
+    return {t: {"flash": flash, "tinker": tinker} for t in assemble.TASKS}, {
+        "max_tokens": 2048,
+        "base": {"n": base_n, "accuracy": 0.62, "truncated_frac": 0.56},
+        "tinker_trained": {"accuracy": 0.62 + held_delta, "delta_vs_base": held_delta},
+    }
+
+
+def _render_with_eval(tmp_path, monkeypatch, records, eval_json):
+    (tmp_path / "eval_unified_gsm8k.json").write_text(json.dumps(eval_json))
+    monkeypatch.setattr(assemble, "_RESULTS", tmp_path)
+    return assemble.render_markdown(records)
+
+
+def test_verdict_flat_band_reports_no_change_and_true_falling_trend(tmp_path, monkeypatch):
+    # This run's real numbers: held-out Δ = -0.08 (beyond the ±0.02 band -> held-out FELL) and the
+    # in-training smoothed reward falls (0.69 -> 0.36). The verdict must say BOTH fell and must
+    # NEVER claim the in-training reward "rose" (the prior hard-coded bug).
+    records, ev = _records_for_verdict(-0.08, first_reward=0.6875, final_smoothed=0.3625)
+    md = _render_with_eval(tmp_path, monkeypatch, records, ev)
+    finding = md.split("## Summary")[0]
+    assert "in-training smoothed reward fell" in finding           # honest training trend
+    assert "held-out accuracy fell" in finding                     # honest held-out direction
+    assert "rose" not in finding                                   # no false "rose" anywhere
+
+
+def test_verdict_within_band_says_no_significant_change(tmp_path, monkeypatch):
+    # |Δ| <= 0.02 -> "no significant held-out change", and trend word matches the curve.
+    records, ev = _records_for_verdict(0.01, first_reward=0.10, final_smoothed=0.40)  # train rose
+    md = _render_with_eval(tmp_path, monkeypatch, records, ev)
+    assert "no significant held-out change" in md
+    assert "in-training smoothed reward rose" in md          # 0.10 -> 0.40 is a real rise
+    # Small positive held-out delta is NOT called a held-out gain (within noise).
+    assert "held-out accuracy rose" not in md
+
+
+def test_verdict_small_positive_not_called_gain(tmp_path, monkeypatch):
+    # +0.02 sits exactly on the band edge -> still "no significant change", never "rose" held-out.
+    records, ev = _records_for_verdict(0.02, first_reward=0.20, final_smoothed=0.20)  # flat train
+    md = _render_with_eval(tmp_path, monkeypatch, records, ev)
+    assert "no significant held-out change" in md
+    assert "in-training smoothed reward was flat (within noise)" in md
+
+
+def test_verdict_real_positive_gain_says_rose(tmp_path, monkeypatch):
+    # Δ = +0.10 (beyond the band) -> held-out accuracy "rose"; in-training also rose (0.10->0.50).
+    records, ev = _records_for_verdict(0.10, first_reward=0.10, final_smoothed=0.50)
+    md = _render_with_eval(tmp_path, monkeypatch, records, ev)
+    finding = md.split("## Summary")[0]
+    assert "held-out accuracy rose" in finding
+    assert "in-training smoothed reward rose" in finding
+
+
+def test_trend_word_band():
+    assert assemble._trend_word(0.05) == "rose"
+    assert assemble._trend_word(-0.05) == "fell"
+    assert assemble._trend_word(0.0) == "was flat (within noise)"
+    assert assemble._trend_word(0.02) == "was flat (within noise)"   # band edge inclusive
+    assert assemble._trend_word(None) == "is unavailable"
+
+
+# (G5) eval_via_serving forwards the stop sequences into the OpenAI payload.
+
+def test_eval_via_serving_forwards_stop_sequences(monkeypatch):
+    rows = [{"prompt": [{"role": "user", "content": "q"}], "answer": "1"}]
+    captured = {}
+
+    class _Resp:
+        def read(self):
+            return json.dumps(
+                {"choices": [{"message": {"content": r"\boxed{1}"}, "finish_reason": "stop"}]}
+            ).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, *a, **k):
+        captured["body"] = json.loads(req.data.decode())
+        return _Resp()
+
+    monkeypatch.setattr(eval_unified.urllib.request, "urlopen", _fake_urlopen)
+    eval_unified.eval_via_serving(
+        rows, "https://serve.example", "run-x", max_tokens=128,
+        stop=["<|im_end|>", "<|endoftext|>"],
+    )
+    assert captured["body"]["stop"] == ["<|im_end|>", "<|endoftext|>"]
+
+
+def test_eval_via_serving_omits_stop_when_empty(monkeypatch):
+    # An empty/None stop list must not put an empty `stop` in the payload (no-op / server reject).
+    rows = [{"prompt": [{"role": "user", "content": "q"}], "answer": "1"}]
+    captured = {}
+
+    class _Resp:
+        def read(self):
+            return json.dumps(
+                {"choices": [{"message": {"content": "1"}, "finish_reason": "stop"}]}
+            ).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, *a, **k):
+        captured["body"] = json.loads(req.data.decode())
+        return _Resp()
+
+    monkeypatch.setattr(eval_unified.urllib.request, "urlopen", _fake_urlopen)
+    eval_unified.eval_via_serving(rows, "https://serve.example", "run-x", max_tokens=128, stop=[])
+    assert "stop" not in captured["body"]

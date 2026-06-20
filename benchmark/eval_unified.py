@@ -39,16 +39,47 @@ def _load_rows(env_id: str, n: int) -> list[dict]:
     return [ds[i] for i in range(min(n, len(ds)))]
 
 
-def eval_via_serving(rows: list[dict], serve_url: str, model: str, max_tokens: int) -> dict:
-    """Generate from a deployed Flash LoRA via the serving's OpenAI chat endpoint, then score."""
+def _renderer_stop_sequences() -> list[str]:
+    """The SAME stop sequences eval_runner.eval_one passes to the Tinker sampler.
+
+    eval_one builds the BASE_MODEL chat renderer and decodes with
+    ``stop=list(renderer.get_stop_sequences())`` (e.g. the chat turn/EOS delimiters). The Flash
+    serving must terminate on the identical contract, otherwise its generations run past the
+    answer while the Tinker side stops — biasing the cross-stack comparison. We rebuild the same
+    renderer here so both paths share one source of truth for where a generation ends. The
+    tinker_cookbook import is function-local so the (mocked) HTTP test never needs it.
+    """
+    from tinker_cookbook import model_info, renderers
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+    tokenizer = get_tokenizer(BASE_MODEL)
+    rname = model_info.get_recommended_renderer_name(BASE_MODEL)
+    renderer = renderers.get_renderer(rname, tokenizer)
+    return list(renderer.get_stop_sequences())
+
+
+def eval_via_serving(
+    rows: list[dict], serve_url: str, model: str, max_tokens: int,
+    stop: list[str] | None = None,
+) -> dict:
+    """Generate from a deployed Flash LoRA via the serving's OpenAI chat endpoint, then score.
+
+    ``stop`` mirrors the renderer stop sequences eval_one uses for base/Tinker, so the Flash
+    generations terminate under the SAME contract (identical greedy decoding AND stop set). It is
+    forwarded as the OpenAI ``stop`` param only when non-empty (an empty list would be a no-op /
+    rejected by some servers).
+    """
     url = serve_url.rstrip("/") + "/v1/chat/completions"
     correct = truncated = errors = 0
     for i, row in enumerate(rows):
         messages = row["prompt"]  # [system, user] — same prompt the env feeds every stack
-        payload = json.dumps({
+        body = {
             "model": model, "messages": messages,
             "temperature": 0.0, "max_tokens": max_tokens,
-        }).encode()
+        }
+        if stop:
+            body["stop"] = stop  # same generation-termination contract as the Tinker eval
+        payload = json.dumps(body).encode()
         text = ""
         for attempt in range(4):
             try:
@@ -110,8 +141,12 @@ def main() -> None:
 
     if args.flash_serve_url and args.flash_model:
         print("[unified-eval] Flash-trained (Modal serving) ...")
+        # Forward the SAME stop sequences the base/Tinker eval uses, so all three paths share one
+        # generation-termination contract (identical greedy decoding AND stop set).
+        stop = _renderer_stop_sequences()
+        out["stop_sequences"] = stop
         out["flash_trained"] = eval_via_serving(
-            rows, args.flash_serve_url, args.flash_model, args.max_tokens
+            rows, args.flash_serve_url, args.flash_model, args.max_tokens, stop=stop
         )
         print(f"  flash-trained: {out['flash_trained']['accuracy']:.3f}")
 
