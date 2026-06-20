@@ -114,31 +114,39 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     operator-configurable.
     """
     root = dest.resolve()
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
-        total = 0
-        for count, member in enumerate(tar.getmembers(), start=1):
-            if count > _MAX_MEMBERS:
-                raise EnvPublishError(
-                    f"env package has too many members (limit {_MAX_MEMBERS}); refusing to extract a "
-                    f"possible archive bomb"
-                )
-            target = (dest / member.name).resolve()
-            if target != root and root not in target.parents:
-                raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
-            if member.islnk() or member.issym():
-                raise EnvPublishError(f"links are not allowed in env packages: {member.name!r}")
-            if not (member.isreg() or member.isdir()):
-                raise EnvPublishError(
-                    f"only regular files and directories are allowed in env packages, but "
-                    f"{member.name!r} is a special file (device/fifo/etc.)"
-                )
-            total += max(0, member.size)
-            if total > _MAX_UNCOMPRESSED_BYTES:
-                raise EnvPublishError(
-                    f"env package is too large uncompressed (limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)}); "
-                    f"refusing to extract a possible archive bomb"
-                )
-        tar.extractall(dest)
+    # The bytes are an untrusted upload: non-tar / non-gzip / truncated input makes tarfile raise
+    # TarError (incl. ReadError). Convert that to a 400 EnvPublishError so a malformed package is a
+    # client error, not an uncaught 500. Our own EnvPublishError (raised in the loop below) is NOT a
+    # TarError, so it propagates past this handler unchanged.
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+            total = 0
+            for count, member in enumerate(tar.getmembers(), start=1):
+                if count > _MAX_MEMBERS:
+                    raise EnvPublishError(
+                        f"env package has too many members (limit {_MAX_MEMBERS}); refusing to "
+                        f"extract a possible archive bomb"
+                    )
+                target = (dest / member.name).resolve()
+                if target != root and root not in target.parents:
+                    raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
+                if member.islnk() or member.issym():
+                    raise EnvPublishError(f"links are not allowed in env packages: {member.name!r}")
+                if not (member.isreg() or member.isdir()):
+                    raise EnvPublishError(
+                        f"only regular files and directories are allowed in env packages, but "
+                        f"{member.name!r} is a special file (device/fifo/etc.)"
+                    )
+                total += max(0, member.size)
+                if total > _MAX_UNCOMPRESSED_BYTES:
+                    raise EnvPublishError(
+                        f"env package is too large uncompressed (limit "
+                        f"{_human_mb(_MAX_UNCOMPRESSED_BYTES)}); refusing to extract a possible "
+                        f"archive bomb"
+                    )
+            tar.extractall(dest)
+    except tarfile.TarError as exc:
+        raise EnvPublishError(f"env package is not a valid .tar.gz archive: {exc}") from exc
 
 
 def _slug_from(env_dir: Path, output: str, *, pushed_name: str | None = None) -> str | None:

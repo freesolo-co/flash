@@ -148,3 +148,26 @@ def test_push_nonexistent_path(tmp_path, capsys):
     rc = cli.cmd_env_push(argparse.Namespace(path=str(tmp_path / "nope.py")))
     assert rc == 1
     assert "no such path" in capsys.readouterr().err
+
+
+def test_push_excludes_prime_and_cache_dirs(monkeypatch, tmp_path):
+    # A `.prime/` dir (Prime CLI metadata from a prior local push) and tool caches must NOT be
+    # shipped in the upload: they aren't env source, bloat the package, and stale `.prime/`
+    # metadata could confuse server-side slug discovery.
+    env_dir = tmp_path / "my-env"
+    env_dir.mkdir()
+    (env_dir / "pyproject.toml").write_text('[project]\nname = "my-env"\nversion = "0.1.0"\n')
+    (env_dir / "my_env.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / ".prime").mkdir()
+    (env_dir / ".prime" / ".env-metadata.json").write_text('{"owner": "someone-else"}')
+    (env_dir / "__pycache__").mkdir()
+    (env_dir / "__pycache__" / "x.pyc").write_text("junk")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(argparse.Namespace(path=str(env_dir))) == 0
+    names = set(_members(cap["package_b64"]))
+    assert "pyproject.toml" in names
+    assert "my_env.py" in names
+    assert not any(n.startswith(".prime") for n in names)  # metadata stripped
+    assert not any("__pycache__" in n for n in names)

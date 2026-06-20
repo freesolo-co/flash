@@ -175,9 +175,17 @@ def _with_syspath_bootstrap(env_source: str) -> str:
     return "".join(lines[:insert_after]) + bootstrap + "".join(lines[insert_after:])
 
 
+# Tool/cache dirs that aren't part of the environment SOURCE. We never ship them: `.prime/` in
+# particular carries Prime CLI metadata (.env-metadata.json) from a prior local push — shipping it
+# bloats the upload and could let stale client metadata confuse server-side slug discovery (the
+# server also strips it defensively, but don't send it in the first place).
+_TAR_EXCLUDE_DIRS = frozenset({".prime", ".git", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"})
+
+
 def _tar_b64(directory: Path) -> str:
     """Pack a directory's contents into a base64 ``.tar.gz`` (members rooted at the top level)
-    for upload. Packaging is pure file I/O — no `prime` CLI or Prime account needed locally."""
+    for upload, skipping tool/cache dirs (``.prime/``, ``.git/``, ``__pycache__``, ...). Packaging
+    is pure file I/O — no `prime` CLI or Prime account needed locally."""
     import base64
     import io
     import tarfile
@@ -187,7 +195,10 @@ def _tar_b64(directory: Path) -> str:
         # recursive=False: we walk every path ourselves, so letting tar recurse into dirs would
         # add their contents twice.
         for path in sorted(directory.rglob("*")):
-            tar.add(path, arcname=str(path.relative_to(directory)), recursive=False)
+            rel = path.relative_to(directory)
+            if _TAR_EXCLUDE_DIRS.intersection(rel.parts):
+                continue  # skip excluded dirs and everything beneath them
+            tar.add(path, arcname=str(rel), recursive=False)
     return base64.b64encode(buf.getvalue()).decode()
 
 

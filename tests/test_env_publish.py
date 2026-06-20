@@ -254,6 +254,19 @@ def _tar_with_members(count: int) -> bytes:
     return buf.getvalue()
 
 
+def test_safe_extract_rejects_non_tar_input(tmp_path):
+    # A non-tar / non-gzip / truncated upload must surface as a client error (400 EnvPublishError),
+    # not an uncaught tarfile.ReadError bubbling out as a 500.
+    with pytest.raises(envs.EnvPublishError, match=r"valid \.tar\.gz") as ei:
+        envs._safe_extract(b"this is not a tar.gz at all", tmp_path)
+    assert ei.value.status == 400
+    # And the whole publish path turns it into a 400 too (not a 500).
+    with pytest.raises(envs.EnvPublishError, match=r"valid \.tar\.gz"):
+        envs.publish_package(
+            package_b64=base64.b64encode(b"garbage").decode(), name="e", is_new=True, key={}
+        )
+
+
 def test_safe_extract_rejects_too_many_members(tmp_path, monkeypatch):
     # A tiny archive with a huge member count is an inode/CPU bomb — reject before extractall.
     monkeypatch.setattr(envs, "_MAX_MEMBERS", 5)
