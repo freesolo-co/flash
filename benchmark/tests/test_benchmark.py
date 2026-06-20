@@ -19,6 +19,7 @@ sys.path.insert(0, str(_BENCH))
 
 import assemble  # noqa: E402
 import eval_runner  # noqa: E402
+import eval_unified  # noqa: E402
 
 CONFIGS = _BENCH / "configs"
 
@@ -148,3 +149,42 @@ def test_all_three_tasks_share_identical_grpo_knobs():
     knobs = [(c["model"], c["train"]["steps"], c["train"]["group_size"],
               c["train"]["batch_size"], c["train"]["max_tokens"]) for c in cfgs]
     assert len(set(knobs)) == 1, knobs
+
+
+# --------------------------------------------------------------------------- #
+# unified eval: Flash-trained generation via the serving (mocked HTTP)
+# --------------------------------------------------------------------------- #
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._b = json.dumps(payload).encode()
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_eval_via_serving_scores_with_shared_scorer(monkeypatch):
+    """The Flash-serving path posts chat completions and grades the SAME way as base/Tinker:
+    extract the boxed/last-number answer and exact-match the gold. Two rows: one right, one wrong."""
+    rows = [
+        {"prompt": [{"role": "user", "content": "q1"}], "answer": "#### 18"},
+        {"prompt": [{"role": "user", "content": "q2"}], "answer": "5"},
+    ]
+    replies = iter([
+        {"choices": [{"message": {"content": r"reasoning ... \boxed{18}"}, "finish_reason": "stop"}]},
+        {"choices": [{"message": {"content": r"...\boxed{99}"}, "finish_reason": "length"}]},  # wrong + truncated
+    ])
+    monkeypatch.setattr(eval_unified.urllib.request, "urlopen",
+                        lambda *a, **k: _FakeResp(next(replies)))
+    res = eval_unified.eval_via_serving(rows, "https://serve.example", "run-x", max_tokens=256)
+    assert res["n"] == 2
+    assert res["correct"] == 1            # only the first matches gold 18
+    assert res["accuracy"] == pytest.approx(0.5)
+    assert res["truncated_frac"] == pytest.approx(0.5)  # the second hit the length cap
+    assert res["errors"] == 0
