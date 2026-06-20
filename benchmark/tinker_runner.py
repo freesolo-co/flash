@@ -28,19 +28,32 @@ import time
 TINKER_PROXY_USD_PER_HR = 2.00
 
 
+_ROLLOUT_KEY = "time/do_group_rollout_and_filter_constant_reward:total"
+_TRAIN_KEY = "time/train_step"
+
+
 def active_compute_s(records: list[dict]) -> float | None:
     """Sum real per-step work (rollout + train step) from metrics.jsonl records.
 
     Tinker's wall-clock absorbs managed-backend capacity pauses (idle, unbilled) into a
     step's timing; summing rollout + train-step time is the fair active-compute basis used
-    for both latency and the cost proxy. Returns None if neither timing key is present.
+    for both latency and the cost proxy.
+
+    Returns ``None`` ONLY when no record carries either timing key (genuinely no timing
+    data — fall back to wall). When timing rows ARE present but sum to ``0.0`` (e.g. a run
+    that recorded zero work), return ``0.0`` — a real, pause-excluded zero that callers must
+    NOT silently replace with wall. Callers therefore guard with ``is not None``, not truthiness.
     """
     roll = train = 0.0
+    have_timing = False
     for r in records:
-        roll += r.get("time/do_group_rollout_and_filter_constant_reward:total", 0) or 0
-        train += r.get("time/train_step", 0) or 0
-    total = roll + train
-    return total or None
+        if _ROLLOUT_KEY in r or _TRAIN_KEY in r:
+            have_timing = True
+        roll += r.get(_ROLLOUT_KEY, 0) or 0
+        train += r.get(_TRAIN_KEY, 0) or 0
+    if not have_timing:
+        return None
+    return roll + train
 
 
 def parse_args() -> argparse.Namespace:
@@ -181,24 +194,49 @@ async def _run(args: argparse.Namespace) -> dict:
     return {"wall_s": wall}
 
 
-def _read_metrics_jsonl(log_path: str) -> list[dict]:
-    """Read Tinker's metrics.jsonl file from log_path."""
+def select_metrics_file(log_path: str | None) -> str | None:
+    """Deterministically pick the metrics.jsonl for a Tinker run's log dir.
+
+    Single source of truth for BOTH the runner (``_read_metrics_jsonl``) and the
+    assembler (``_tinker_active_compute_s``), so they always parse the SAME file and
+    can never disagree on the active-compute total for a given log dir.
+
+    Selection: prefer a direct ``log_path/metrics.jsonl``; otherwise the
+    deterministically-sorted first of any nested ``**/metrics.jsonl``. Returns ``None``
+    if no metrics file exists.
+    """
+    if not log_path:
+        return None
     import glob
-    # Tinker writes metrics.jsonl directly in log_path
-    candidates = glob.glob(os.path.join(log_path, "**", "metrics.jsonl"), recursive=True)
-    candidates += [os.path.join(log_path, "metrics.jsonl")]
-    for path in candidates:
-        if os.path.exists(path):
-            records = []
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        with contextlib.suppress(json.JSONDecodeError):
-                            records.append(json.loads(line))
-            if records:
-                return records
-    return []
+    direct = os.path.join(log_path, "metrics.jsonl")
+    if os.path.exists(direct):
+        return direct
+    nested = sorted(glob.glob(os.path.join(log_path, "**", "metrics.jsonl"), recursive=True))
+    return nested[0] if nested else None
+
+
+def read_metrics_records(log_path: str | None) -> list[dict]:
+    """Parse the canonically-selected metrics.jsonl (see :func:`select_metrics_file`).
+
+    Shared parser so the runner and assembler read identical records. Returns [] if no
+    file is found or it has no valid JSON lines.
+    """
+    path = select_metrics_file(log_path)
+    if path is None:
+        return []
+    records: list[dict] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                with contextlib.suppress(json.JSONDecodeError):
+                    records.append(json.loads(line))
+    return records
+
+
+def _read_metrics_jsonl(log_path: str) -> list[dict]:
+    """Read Tinker's metrics.jsonl via the shared canonical selector/parser."""
+    return read_metrics_records(log_path)
 
 
 def main() -> None:
@@ -225,11 +263,12 @@ def main() -> None:
 
     # Cost on the SAME basis as assemble.py / comparison.json: active compute (rollout +
     # train step, capacity pauses excluded) x the shared $/hr proxy. Falls back to full wall
-    # only if metrics carry no timing. Emit active/paused so the JSON is self-consistent.
+    # ONLY when active is None (no timing rows at all); a legitimate 0.0 active is kept
+    # (use `is not None`, not truthiness). Emit active/paused so the JSON is self-consistent.
     wall = timing["wall_s"]
     active = active_compute_s(records)
-    basis = active if active else wall
-    paused = (wall - active) if (active and wall > active) else None
+    basis = active if active is not None else wall
+    paused = (wall - active) if (active is not None and wall > active) else None
 
     result = {
         "platform": "tinker",

@@ -44,6 +44,12 @@ _REPO_ROOT = _HERE.parent
 # verifiers' rollout/scoring machinery (no torch/vllm). The system python carries both.
 _DEFAULT_TINKER_PYTHON = os.environ.get("TINKER_PYTHON", "/usr/bin/python3")
 
+# Default verifiers env-id used when --env-id is omitted AND no --flash-config is given.
+# --env-id's argparse default is None (a sentinel for "unset") so we can tell an explicit
+# `--env-id gsm8k` (a hard constraint to validate) apart from "left unset" (derive from the
+# flash config / fall back to this default). Don't make this the argparse default directly.
+_ENV_ID_DEFAULT = "gsm8k"
+
 # Flash config per env-id (each TOML pins the matching [environment] id + 4B GRPO recipe).
 # Lets --env-id pick the right Flash config instead of always running gsm8k.
 _FLASH_CONFIG_BY_ENV = {
@@ -56,6 +62,68 @@ _FLASH_CONFIG_BY_ENV = {
 def _tinker_result_path(env_id: str) -> pathlib.Path:
     """Per-env Tinker result path so concurrent / sequential runs don't collide."""
     return pathlib.Path(tempfile.gettempdir()) / f"tinker_bench_result_{env_id}.json"
+
+
+def _flash_config_env_id(toml_path: str) -> str | None:
+    """Read ``[environment].id`` from a Flash TOML config (stdlib tomllib).
+
+    This is the env the FLASH side actually trains; the Tinker side trains ``--env-id``.
+    Returned so the two can be validated as the same task before a head-to-head.
+    """
+    import tomllib
+    with open(toml_path, "rb") as f:
+        cfg = tomllib.load(f)
+    env = cfg.get("environment")
+    if isinstance(env, dict):
+        return env.get("id")
+    return None
+
+
+def _env_ids_match(flash_env_id: str, tinker_env_id: str) -> bool:
+    """Whether a Flash ``[environment].id`` and the Tinker ``--env-id`` are the same task.
+
+    Flash configs carry a fully-qualified slug (``primeintellect/gsm8k``) while ``--env-id``
+    is the short verifiers id (``gsm8k``). Match on the full slug OR the slug's last path
+    segment, so ``primeintellect/gsm8k`` == ``gsm8k`` but ``.../reverse-text`` != ``gsm8k``.
+    """
+    return tinker_env_id in (flash_env_id, flash_env_id.rsplit("/", 1)[-1])
+
+
+def _resolve_env_consistency(args: argparse.Namespace) -> None:
+    """Resolve --env-id and guarantee Flash and Tinker train the SAME task.
+
+    Sets ``args.env_id`` to the final resolved id (mutating the None sentinel) and, with
+    --flash-config, cross-checks it against the config's ``[environment].id`` so the
+    'head-to-head on {env_id}' label can't hide a silent task mismatch.
+
+    - No --flash-config: the Flash config is selected FROM --env-id (consistent by
+      construction); just default a None --env-id to ``_ENV_ID_DEFAULT``.
+    - With --flash-config and --env-id OMITTED (None): DERIVE --env-id from the config's
+      ``[environment].id`` (a bare ``--flash-config foo.toml`` just works).
+    - With --flash-config and --env-id given EXPLICITLY: REQUIRE they name the same task,
+      else exit with a clear message (Flash uses the config's env, Tinker uses --env-id).
+    """
+    if not args.flash_config:
+        if args.env_id is None:
+            args.env_id = _ENV_ID_DEFAULT
+        return
+    flash_env_id = _flash_config_env_id(args.flash_config)
+    if not flash_env_id:
+        raise SystemExit(
+            f"--flash-config {args.flash_config!r} has no [environment].id; cannot confirm "
+            "it trains the same task as the Tinker --env-id."
+        )
+    derived = flash_env_id.rsplit("/", 1)[-1]
+    if args.env_id is None:  # omitted -> adopt the flash config's env (single source).
+        args.env_id = derived
+        return
+    if not _env_ids_match(flash_env_id, args.env_id):
+        raise SystemExit(
+            f"--flash-config trains [environment].id={flash_env_id!r} but --env-id="
+            f"{args.env_id!r}: Flash and Tinker would train DIFFERENT tasks, so the "
+            f"'head-to-head on {args.env_id}' comparison would be invalid. Pass a matching "
+            f"--env-id (e.g. {derived!r}) or drop --flash-config to select the config by env."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -275,9 +343,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-tokens", type=int, default=512)
     p.add_argument("--model", default="Qwen/Qwen3.5-4B")
     p.add_argument(
-        "--env-id", default="gsm8k",
+        "--env-id", default=None,
         help="verifiers env id (gsm8k | reverse-text | hendrycks-math). Selects the "
-        "matching Flash config unless --flash-config is given.",
+        "matching Flash config unless --flash-config is given. With --flash-config, must "
+        "name the same task as the config's [environment].id (else it's derived from it). "
+        f"Defaults to {_ENV_ID_DEFAULT!r} when omitted and no --flash-config is given.",
     )
     p.add_argument(
         "--flash-config", default=None,
@@ -291,6 +361,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Guarantee Flash and Tinker train the SAME task before claiming a head-to-head on
+    # {env_id}: with --flash-config, validate (or derive) --env-id against its [environment].id.
+    _resolve_env_consistency(args)
 
     flash_result: list = []
     tinker_result: list = []

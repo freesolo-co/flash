@@ -19,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 import sys
 import urllib.request
@@ -37,6 +36,7 @@ from flash_runner import _flash_api_key as _flash_key  # noqa: E402
 # so the runner, assembler, and committed results all use ONE rate and ONE basis.
 from tinker_runner import TINKER_PROXY_USD_PER_HR as _TINKER_PROXY_USD_PER_HR  # noqa: E402
 from tinker_runner import active_compute_s as _sum_active_compute  # noqa: E402
+from tinker_runner import read_metrics_records as _read_metrics_records  # noqa: E402
 
 _RESULTS = _HERE / "results"
 _MANIFEST = _RESULTS / "runs_manifest.json"
@@ -124,30 +124,24 @@ def _tinker_active_compute_s(log_path: str | None) -> float | None:
     """Active compute (rollout + train step) from a Tinker run's metrics.jsonl.
 
     Tinker's wall-clock includes managed-backend *capacity pauses* (idle, not billed); the
-    active-compute sum is the fair latency/cost basis. The per-record summation is shared
-    with tinker_runner (single source); this wrapper just locates + parses the file, which
-    may live at log_path/metrics.jsonl OR in a nested subdir (so it isn't silently missed).
+    active-compute sum is the fair latency/cost basis. BOTH the file selection/parse
+    (``read_metrics_records``) and the per-record summation (``active_compute_s``) are
+    imported from tinker_runner, so this call site and the runner can never diverge on
+    which file they read or how they sum it. Returns None only when there is genuinely no
+    timing data (matching active_compute_s); 0.0 is a real pause-excluded zero.
     """
     if not log_path:
         return None
-    import glob
-    direct = pathlib.Path(log_path) / "metrics.jsonl"
-    if direct.exists():
-        mp = direct
-    else:
-        nested = sorted(glob.glob(os.path.join(log_path, "**", "metrics.jsonl"), recursive=True))
-        if not nested:
-            return None
-        mp = pathlib.Path(nested[0])
-    records = []
-    for line in mp.read_text().splitlines():
-        if not line.strip():
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return _sum_active_compute(records)
+    return _sum_active_compute(_read_metrics_records(log_path))
+
+
+def _tinker_cost_from_basis(basis: float | None) -> float | None:
+    """Tinker $ proxy from an active-compute basis (seconds). Mirrors tinker_runner's
+    write-time formula EXACTLY so a recomputed cost equals the stored cost_usd_estimated
+    for the same basis. None basis -> None cost (no data)."""
+    if basis is None:
+        return None
+    return round(basis / 3600 * _TINKER_PROXY_USD_PER_HR, 4)
 
 
 def collect_tinker(task: str, rel_path: str) -> dict:
@@ -162,13 +156,35 @@ def collect_tinker(task: str, rel_path: str) -> dict:
     # may log fewer points. Use this single value for both the reported steps and per_step_s
     # so they can't disagree (previously the dict hard-coded len(rh) while dividing by steps).
     steps = d.get("steps") or len(rh)
-    # Prefer the active-compute the runner already recorded (d['active_compute_s']); else
-    # recompute from the run's metrics.jsonl if its log_path is still present.
-    active = d.get("active_compute_s") or _tinker_active_compute_s(d.get("log_path"))
-    # Cost proxy on ACTIVE compute (not wall — wall includes unbilled capacity pauses).
-    basis = active if active else wall
-    cost = round((basis or 0) / 3600 * _TINKER_PROXY_USD_PER_HR, 4) if basis else None
-    paused_s = (wall - active) if (wall and active and wall > active) else None
+
+    # --- Active-compute AND cost reported from ONE consistent source ---------------------
+    # The runner writes active_compute_s and cost_usd_estimated as a matched pair (cost is
+    # derived from whatever basis active-compute used at write time). We MUST keep the
+    # reported active and the reported cost on the SAME basis — never report a recomputed
+    # active next to the wall-based stored cost (or vice-versa). Use `is not None` so a
+    # legitimate 0.0 active-compute is honored, not treated as "missing" and replaced by wall.
+    stored_active = d.get("active_compute_s")
+    if stored_active is not None:
+        # Trust the runner's matched pair: its stored active and stored cost go together.
+        active = stored_active
+        cost = d.get("cost_usd_estimated")
+        if cost is None:  # legacy result without the cost field — derive from this active.
+            cost = _tinker_cost_from_basis(active)
+    else:
+        # No stored active: recompute it from the run's metrics.jsonl (same selector/parser
+        # the runner uses) and derive the cost from THAT recomputed active so the two agree.
+        active = _tinker_active_compute_s(d.get("log_path"))
+        if active is not None:
+            cost = _tinker_cost_from_basis(active)
+        else:
+            # No active anywhere: fall back to the runner's stored (wall-based) cost if it
+            # wrote one, else compute the wall-based proxy ourselves. active stays None.
+            cost = d.get("cost_usd_estimated")
+            if cost is None:
+                cost = _tinker_cost_from_basis(wall)
+    # Latency/per-step basis: active when present (pause excluded), else wall (is not None).
+    basis = active if active is not None else wall
+    paused_s = (wall - active) if (wall is not None and active is not None and wall > active) else None
     return {
         "platform": "tinker",
         "task": task,
@@ -184,10 +200,10 @@ def collect_tinker(task: str, rel_path: str) -> dict:
         "cost_usd": cost,
         "cost_kind": f"ESTIMATE: active-compute x ${_TINKER_PROXY_USD_PER_HR:.2f}/hr proxy (Tinker cost not in API)",
         "setup_s": None,
-        "train_s": active or wall,        # active compute (rollout+train), pause excluded
+        "train_s": basis,                 # active compute (rollout+train), pause excluded; wall iff active is None
         "total_s": wall,                  # full wall, INCLUDING any capacity pause
         "paused_s": paused_s,             # idle time the managed backend paused us
-        "per_step_s": ((active or wall) / steps) if ((active or wall) and steps) else None,
+        "per_step_s": (basis / steps) if (basis is not None and steps) else None,
         "train_tok_per_s": None,
     }
 
