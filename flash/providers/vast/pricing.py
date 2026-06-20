@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 
+from flash._env import flash_skip_net
 from flash._logging import get_logger
 
 logger = get_logger(__name__)
@@ -29,7 +30,7 @@ def live_rates(refresh: bool = False) -> dict[str, float]:
     Offline-safe: FLASH_SKIP_NET (or any fetch failure) returns the static rates.
     """
     static = _static_rates()
-    if os.environ.get("FLASH_SKIP_NET") or not os.environ.get("VAST_API_KEY"):
+    if flash_skip_net() or not os.environ.get("VAST_API_KEY"):
         return static
     try:
         from flash.providers.vast.jobs import usable_offers

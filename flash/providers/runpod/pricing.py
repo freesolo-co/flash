@@ -18,6 +18,7 @@ import os
 import time
 from pathlib import Path
 
+from flash._env import flash_skip_net
 from flash._logging import get_logger
 
 logger = get_logger(__name__)
@@ -72,7 +73,7 @@ def live_rates(refresh: bool = False) -> dict[str, float]:
     Offline-safe: FLASH_SKIP_NET (or any fetch failure) returns the static rates.
     """
     static = _static_rates()
-    if os.environ.get("FLASH_SKIP_NET"):
+    if flash_skip_net():
         return static
     now = time.time()
     if not refresh:

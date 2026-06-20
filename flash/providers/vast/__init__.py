@@ -11,9 +11,9 @@ orchestrator/allocator treat the two interchangeably.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
+from flash._env import flash_skip_net
 from flash.providers.base import GpuClass, JobHandle, PollResult, Provider
 
 
@@ -29,7 +29,7 @@ class VastProvider:
         # substrate (offer search), so FLASH_SKIP_NET (offline/CI) disables Vast
         # entirely; offline allocation then degrades deterministically to RunPod's
         # static catalog.
-        if os.environ.get("FLASH_SKIP_NET"):
+        if flash_skip_net():
             return False
         return load_api_key() is not None
 

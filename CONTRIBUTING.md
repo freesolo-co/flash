@@ -5,7 +5,9 @@ run the checks, and land a change.
 
 ## Setup
 
-Flash uses [`uv`](https://docs.astral.sh/uv/). From the repo root:
+Flash uses [`uv`](https://docs.astral.sh/uv/). The `Makefile` needs **GNU make**
+(macOS's default `/usr/bin/make` is BSD make and won't work — `brew install make`
+then use `gmake`, or use Xcode's; Linux already has GNU make). From the repo root:
 
 ```bash
 make setup        # uv sync --extra server --dev

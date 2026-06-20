@@ -15,6 +15,8 @@ import time
 import urllib.error
 import urllib.request
 
+from flash._env import flash_skip_net
+
 from . import db
 
 # Operators set this to the shared freesolo internal key; a bearer token equal to it
@@ -82,7 +84,7 @@ def _freesolo_verify(token: str) -> bool:
         if cached is not None and cached[1] > now:
             return cached[0]
     # Offline guard: with FLASH_SKIP_NET set we never touch the network; treat as unverified.
-    if os.environ.get("FLASH_SKIP_NET"):
+    if flash_skip_net():
         return False
     base = os.environ.get(FREESOLO_BASE_URL_ENV) or DEFAULT_FREESOLO_BASE_URL
     url = f"{base.rstrip('/')}/api/auth/verify"

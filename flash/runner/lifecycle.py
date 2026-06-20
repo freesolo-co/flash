@@ -15,6 +15,7 @@ import contextlib
 import os
 import time
 
+from flash._env import flash_skip_net
 from flash.spec import JobSpec
 
 
@@ -79,7 +80,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     from flash.providers.runpod.train import submit_train
     from flash.runner import TERMINAL_STATES, _RunCancelled, _spec_with_gpu, _update, get_status
 
-    if os.environ.get("FLASH_SKIP_NET"):
+    if flash_skip_net():
         return submit_train(spec, seed, log=log)
 
     from flash.providers import get_provider

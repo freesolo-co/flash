@@ -47,7 +47,9 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 ## Local commands
 
 Everything runs from the repo root and needs [`uv`](https://docs.astral.sh/uv/).
-A `Makefile` wraps the common tasks — run `make` to list them:
+A `Makefile` wraps the common tasks — run `make` to list them (it uses GNU-make
+features, so on macOS install it with `brew install make` and run `gmake`, or use
+Xcode's; Linux `make` is already GNU make):
 
 ```bash
 make setup        # uv sync --extra server --dev

@@ -2,10 +2,6 @@
 # Everything runs from the repo root and assumes `uv` is installed:
 # https://docs.astral.sh/uv/getting-started/installation/
 
-# Default the test suite to offline mode so nothing reaches provider/network APIs.
-# Override per-invocation (e.g. `make test FLASH_SKIP_NET=0`) when you really mean to.
-export FLASH_SKIP_NET ?= 1
-
 .DEFAULT_GOAL := help
 .PHONY: help setup test test-live lint lint-fix fmt fmt-check typecheck check server cli clean
 
@@ -16,9 +12,16 @@ help: ## List available targets
 setup: ## Install deps (server extra + dev tools) into the uv venv
 	uv sync --extra server --dev
 
+# Offline by default so the CPU suite never reaches provider/network APIs. Scoped to the
+# test recipe ONLY (target-specific export) so non-test targets — `server`, `cli`, … — run
+# online like `uv run flash-server` does. Override per-invocation with `make test FLASH_SKIP_NET=0`
+# to let the suite hit the network (the code reads 1/true/yes/on as offline, 0/false/""/unset as online).
+test: export FLASH_SKIP_NET ?= 1
 test: ## Run the offline CPU test suite (FLASH_SKIP_NET=1)
 	uv run pytest
 
+# Live provider tests must run ONLINE: FLASH_SKIP_NET=0 turns the offline guard off (the code
+# treats 0/false/""/unset as online, 1/true/yes/on as offline), so the `live` marker isn't skipped.
 test-live: ## Run live tests that hit real provider APIs (needs creds)
 	FLASH_LIVE=1 FLASH_SKIP_NET=0 uv run pytest -m live
 
