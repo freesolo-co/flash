@@ -7,6 +7,7 @@ from typing import Any
 
 from flash.catalog import normalize_algorithm
 from flash.engine.recipe import RECIPE
+from flash.providers import PROVIDER_NAMES
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,17 @@ class RunConfig:
     def __post_init__(self) -> None:
         # Normalize/validate the method early so downstream code can trust it.
         object.__setattr__(self, "method", normalize_algorithm(self.method))
+        # Same for the provider: GPU selection (``pick_gpu``) and the allocator expect an exact
+        # substrate ("runpod"/"vast") or the "auto" sentinel. Normalize case/whitespace, treat
+        # empty as "auto", and reject an unknown substrate here (mirrors ``allocator.allocate``'s
+        # guard) -- otherwise a variant like "RunPod"/" vast " filters out every candidate and
+        # surfaces as a confusing "no GPU class fits" instead of a clear provider error.
+        prov = (self.provider or "auto").strip().lower() or "auto"
+        if prov not in ("auto", *PROVIDER_NAMES):
+            raise ValueError(
+                f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})"
+            )
+        object.__setattr__(self, "provider", prov)
         if self.steps < 1:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
         if self.setup_repeats < 1:

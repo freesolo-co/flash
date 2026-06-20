@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 
 from flash.providers.allocator import required_vram_gb, vram_headroom
-from flash.providers.base import unvalidated_allowed
+from flash.providers.base import providers_for, unvalidated_allowed
 
 from .facts import (
     active_params_b,
@@ -268,12 +268,23 @@ def estimate_cost(
     wall = setup + train
     total_usd = wall / 3600.0 * hourly
 
+    # Report the provider implied by the CHOSEN hardware. Under the "auto" sentinel the
+    # selected class may be provisionable on only one substrate (e.g. a Vast-only "H100 NVL"),
+    # in which case the estimate's "chosen hardware" provider is concretely that substrate, not
+    # "auto". A genuinely multi-substrate class stays "auto" (the allocator picks at submit
+    # time); an explicit pin is always kept as-is.
+    provider = config.provider
+    if provider == "auto":
+        provs = providers_for(gpu)
+        if len(provs) == 1:
+            provider = provs[0]
+
     return CostEstimate(
         model_id=config.model_id,
         method=config.method,
         steps=config.steps,
         gpu=gpu,
-        provider=config.provider,
+        provider=provider,
         gpu_vram_gb=gpu_vram_gb(gpu),
         required_vram_gb=need,
         gpu_hourly_usd=hourly,
