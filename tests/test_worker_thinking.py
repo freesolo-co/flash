@@ -124,6 +124,29 @@ def test_grpo_batching_rounds_up_to_divisible():
         )
 
 
+def test_grpo_batching_flags_inflated_effective_batch():
+    # A multi-trainer (DDP) split whose target completion batch isn't a multiple of the trainer world
+    # size gets rounded UP, so the run optimizes MORE prompts/step than [train].batch_size requested.
+    # That must be FLAGGED (effective_matches_target=False) so a rollout-topology benchmark doesn't
+    # silently compare splits at different effective batches. (codex re-review: the 3:1 example —
+    # batch=64, group=8, per_device=8 targets 512 completions but rounds to 528 -> 66 prompts.)
+    import flash.engine.worker as ne
+
+    importlib.reload(ne)
+    b = ne.compute_grpo_batching(64, 8, 8, num_processes=3)
+    assert b["unique_prompts_per_step"] == 66  # inflated from the requested 64
+    assert b["target_prompts_per_step"] == 64
+    assert b["effective_matches_target"] is False
+    # A split whose target IS divisible by the world size matches exactly (no false alarm).
+    b2 = ne.compute_grpo_batching(64, 8, 8, num_processes=2)
+    assert b2["unique_prompts_per_step"] == 64
+    assert b2["effective_matches_target"] is True
+    # Single-process (colocate / 1:1) is always exact.
+    b3 = ne.compute_grpo_batching(64, 8, 2, num_processes=1)
+    assert b3["unique_prompts_per_step"] == 64
+    assert b3["effective_matches_target"] is True
+
+
 def test_grpo_batching_caps_per_device_at_target():
     # A small prompts_per_step must not be overshot by an oversized per-device completion
     # micro-batch: the global completion batch is capped at prompts_per_step * group_size,

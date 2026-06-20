@@ -1125,6 +1125,15 @@ def compute_grpo_batching(
         "unique_prompts_per_step": unique_prompts_per_step,
         # TRL requires the global completion batch be divisible by num_generations.
         "divisible_by_group": (generations_per_step % group_size == 0),
+        # Whether the run actually optimizes the REQUESTED prompts/step. The ceil + group-divisibility
+        # rounding above can only RAISE the effective batch: on a multi-trainer split whose target
+        # completion batch (prompts_per_step * group_size) isn't a multiple of the global micro-batch
+        # (per_device * nproc), the run trains MORE prompts/step than [train].batch_size requested
+        # (e.g. a 3:1 split with batch=64/group=8/per_device=8 targets 512 completions but rounds to
+        # 528 -> 66 prompts). The caller surfaces this so a benchmark doesn't silently compare splits
+        # at DIFFERENT effective batches. False only when the rounding inflated the batch.
+        "effective_matches_target": (unique_prompts_per_step == prompts_per_step),
+        "target_prompts_per_step": prompts_per_step,
     }
 
 
@@ -1192,12 +1201,6 @@ def make_reward_heartbeat_callback():
             self.reward_history = []
 
         def on_log(self, args, state, control, logs=None, **kwargs):
-            # In a disaggregated multi-trainer (DDP) group EVERY rank runs this callback; the
-            # heartbeat commits heartbeat.json to the SAME HF path, so N ranks would race /
-            # duplicate-commit. Only rank 0 (world-process-zero) emits — single-process and
-            # train_gpus==1 paths are always rank 0, so their behavior is unchanged.
-            if not getattr(state, "is_world_process_zero", True):
-                return
             if not logs:
                 return
             r = logs.get("reward")
@@ -1207,7 +1210,17 @@ def make_reward_heartbeat_callback():
                 r = float(r)
             except (TypeError, ValueError):
                 return
+            # Record the reward metric on EVERY rank: in a disaggregated multi-trainer (DDP) group
+            # the post-train no-op guard (run_rl) checks reward_history on each rank BEFORE the
+            # is_main_rank() return, so a non-zero rank with an empty history would wrongly raise
+            # "GRPO scored no reward" and crash the accelerate child group even though rank 0 trained
+            # fine. Keeping the local history non-empty on all ranks keeps that guard accurate.
             self.reward_history.append(r)
+            # Only rank 0 (world-process-zero) UPLOADS the heartbeat: it commits heartbeat.json to
+            # the SAME HF path, so N ranks would race / duplicate-commit. Single-process and
+            # train_gpus==1 paths are always rank 0, so their behavior is unchanged.
+            if not getattr(state, "is_world_process_zero", True):
+                return
             step = int(getattr(state, "global_step", len(self.reward_history)))
             heartbeat("rl_step", step=step, reward=r, reward_last=self.reward_history[-8:])
 
@@ -1973,6 +1986,19 @@ def run_rl():
     )
     if not batching["divisible_by_group"]:
         print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
+    if not batching["effective_matches_target"]:
+        # A multi-trainer (DDP) split whose target completion batch isn't a multiple of the trainer
+        # world size gets rounded UP, so this run optimizes MORE prompts/step than [train].batch_size
+        # asked for. Surface it loudly: a rollout-topology BENCHMARK that compares this split's
+        # throughput against another must know the effective batch differs, or it compares apples to
+        # oranges. (The value is also recorded in metrics notes below for the benchmark to read.)
+        print(
+            f"WARN: [train].batch_size={prompts_per_step} prompts/step is not divisible by the "
+            f"trainer world size ({_grpo_nproc}); the effective batch was rounded UP to "
+            f"{batching['unique_prompts_per_step']} prompts/step. This run does NOT honor the exact "
+            f"requested batch — benchmark ratios across splits will compare different effective "
+            f"batches. Choose a batch_size divisible by the trainer GPU count to compare cleanly."
+        )
     print(
         f"[rl] GRPO batching: per_device={batching['per_device_train_batch_size']} "
         f"grad_accum={batching['gradient_accumulation_steps']} "
@@ -2640,6 +2666,12 @@ def run_rl():
             "thinking": THINKING,
             "max_completion_len": _max_completion,
             "prompts_per_step": batching["unique_prompts_per_step"],
+            # The REQUESTED [train].batch_size and whether the effective batch matches it. On a
+            # multi-trainer split the effective batch can be rounded UP (see compute_grpo_batching);
+            # the benchmark reads these to drop / label any split that didn't run the exact batch so
+            # rollout-topology ratios compare like-for-like.
+            "requested_prompts_per_step": batching["target_prompts_per_step"],
+            "effective_batch_matches_target": batching["effective_matches_target"],
             "generations_per_step": batching["generations_per_step"],
             "group_size": group_size,
             "per_device_train_batch_size": batching["per_device_train_batch_size"],

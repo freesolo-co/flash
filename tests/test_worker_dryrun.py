@@ -75,6 +75,45 @@ def test_reward_heartbeat_callback_accumulates_history():
             sys.modules["transformers"] = saved
 
 
+def test_reward_heartbeat_accumulates_on_nonzero_ddp_rank(monkeypatch):
+    """codex re-review (worker:1200, P1): in a multi-trainer disaggregated (DDP) run EVERY rank runs
+    this callback, and the post-train no-op guard checks reward_history on each rank BEFORE the
+    is_main_rank() return. So a NON-world-process-zero rank must STILL append to reward_history
+    (otherwise it sees an empty history and raises 'GRPO scored no reward', crashing the accelerate
+    child group even though rank 0 trained). Only the heartbeat UPLOAD is rank-0-gated."""
+    saved = sys.modules.get("transformers")
+    tfm = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    tfm.TrainerCallback = TrainerCallback
+    sys.modules["transformers"] = tfm
+    try:
+        os.environ["HF_REPO"] = ""
+        import flash.engine.worker as ne
+
+        uploads = []
+        monkeypatch.setattr(ne, "heartbeat", lambda *a, **k: uploads.append((a, k)))
+        cb = ne.make_reward_heartbeat_callback()
+
+        class _State:
+            global_step = 1
+            is_world_process_zero = False  # a non-zero DDP trainer rank
+
+        cb.on_log(None, _State(), None, logs={"reward": 0.5})
+        cb.on_log(None, _State(), None, logs={"reward": 0.7})
+        # History IS recorded on the non-zero rank (so the no-op guard stays accurate)...
+        assert cb.reward_history == [0.5, 0.7]
+        # ...but the heartbeat upload is suppressed (only rank 0 commits to the shared HF path).
+        assert uploads == []
+    finally:
+        if saved is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = saved
+
+
 def test_heartbeat_concurrent_writes_stay_atomic(monkeypatch):
     """Regression: heartbeat() is called concurrently from the trainer reward callback and
     the checkpoint-upload daemon during GRPO. It must serialize + write heartbeat.json

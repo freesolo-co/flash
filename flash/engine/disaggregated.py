@@ -8,10 +8,11 @@ overlap (one-step-off async overlap, verl HybridEngine / TRL AsyncGRPOTrainer, i
 verl ref (3D-HybridEngine / flexible device mapping + async rollout):
 https://github.com/verl-project/verl
 
-The command/env builders here are PURE (no torch, no subprocess) so the launch contract is
-unit-testable on CPU; only :func:`launch_vllm_server` / :func:`wait_for_server_health` /
-:func:`detect_total_gpus` touch the system. The device split itself lives in
-:mod:`flash.engine.rollout_bench` (``select_rollout_split``).
+The command/env builders here avoid torch (no CUDA context before the trainer pins its devices) so
+the launch contract is unit-testable on CPU; only :func:`launch_vllm_server` /
+:func:`wait_for_server_health` / :func:`detect_total_gpus` / :func:`sm120_vllm_backend` touch the
+system — and those use a CUDA-FREE ``nvidia-smi`` probe, never torch.cuda. The device split itself
+lives in :mod:`flash.engine.rollout_bench` (``select_rollout_split``).
 
 TRL 1.6 server-mode contract (verified against trl/scripts/vllm_serve.py + trl/generation/
 vllm_client.py): the trainer's ``VLLMClient`` waits for the server (``vllm_server_timeout``),
@@ -142,6 +143,39 @@ def detect_total_gpus(env: dict | None = None) -> int:
 def _cvd(devices: tuple[int, ...]) -> str:
     """CUDA_VISIBLE_DEVICES string from GLOBAL physical device indices."""
     return ",".join(str(d) for d in devices)
+
+
+def sm120_vllm_backend(env: dict | None = None) -> str | None:
+    """FLASHINFER if this node is consumer Blackwell (sm120 / RTX 5090) and no backend is pinned.
+
+    The DISAGGREGATED rollout server is launched from the DDP launcher process, which must NOT create
+    a CUDA context before forking the server (and the colocate ``force_vllm_backend_for_sm120`` torch
+    probe would do exactly that). So probe the compute capability with a CUDA-FREE ``nvidia-smi``
+    query — the same approach :func:`detect_total_gpus` uses — and return the backend the *server*
+    env should set. On sm120 hosts vLLM's default flash-attn PTX needs a newer driver JIT than many
+    5090 RunPod hosts have; when the JIT fails the rollout silently produces NO completions (the
+    empty-rollout failure the colocate path already guards against), so the server must pin FLASHINFER
+    (Blackwell-native, no flash-attn PTX) before launch. Returns None off sm120, if a backend is
+    already pinned, or if the probe is unavailable (best-effort)."""
+    env = env if env is not None else os.environ
+    if (env.get("VLLM_ATTENTION_BACKEND") or "").strip():
+        return None  # operator / caller override wins
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        caps = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        # compute_cap is reported as "<major>.<minor>" (e.g. "12.0" for sm120). Any sm120 card on
+        # the node triggers the pin — the inference devices are the FIRST GPUs and a node is a single
+        # homogeneous GPU class, so a 5090 anywhere means the server runs on a 5090.
+        if any(c.split(".", 1)[0] == "12" for c in caps):
+            return "FLASHINFER"
+    except Exception:
+        pass
+    return None
 
 
 def trainer_cuda_visible_devices(split: RolloutSplit) -> str:
@@ -384,6 +418,15 @@ def server_subprocess_env(base_env: dict, split: RolloutSplit) -> dict:
     # otherwise be preserved and reintroduce the exact NVML corruption this guard prevents — the
     # same reason the group-port line above overwrites rather than setdefaults.
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    # RTX 5090 / sm120: pin a PTX-independent vLLM attention backend (FLASHINFER) in the SERVER env
+    # before launch — mirrors the colocate path's force_vllm_backend_for_sm120(), but via a CUDA-free
+    # nvidia-smi probe so the DDP launcher never creates a CUDA context before forking the server.
+    # Without this, a 5090 split can boot a paid rollout server whose default flash-attn PTX JIT fails
+    # -> empty completions / crash. No-op off sm120 or if a backend is already pinned (sm120_vllm_backend
+    # checks env first, honoring an operator override).
+    _sm120_backend = sm120_vllm_backend(env)
+    if _sm120_backend:
+        env["VLLM_ATTENTION_BACKEND"] = _sm120_backend
     return env
 
 

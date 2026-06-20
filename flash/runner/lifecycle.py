@@ -356,8 +356,17 @@ def _submit_seed_supervised(
         is_capacity = res.failure == "no_capacity"
         ncand = len(alloc.candidates) if alloc is not None else 0
         if is_capacity:
-            # More than the just-starved class must remain in the (already exclusion-filtered) pool.
-            can_retry = infra_shaped and chosen is not None and ncand > 1
+            # More than the just-starved class must remain in the (already exclusion-filtered) pool
+            # for an automatic (cheapest/auto) request. A CONCRETE pin (pinned_gpu set) yields a
+            # single-class candidate list (ncand == 1) by design, but the allocator treats a pin as a
+            # PREFERENCE: once the starved pin is in exclude_gpu_classes, the next allocate() finds no
+            # offer for it and ESCALATES to the cheapest larger fitting class ("one spot larger, and
+            # so on") instead of raising. So allow the retry for a pin even at ncand == 1 — the next
+            # allocate() either returns the escalated class or raises UnsupportedGpuError (terminating
+            # cleanly) when nothing >= need is left, rather than failing a pinned 5090 run that other
+            # fitting classes could have served. Without a pin, ncand <= 1 still means the market is
+            # fully throttled, so we stop.
+            can_retry = infra_shaped and chosen is not None and (ncand > 1 or pinned_gpu is not None)
         else:
             can_retry = infra_shaped and crash_retries < max_retries
         print(

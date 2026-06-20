@@ -12,6 +12,7 @@ from flash.engine.disaggregated import (
     detect_total_gpus,
     is_main_rank,
     server_subprocess_env,
+    sm120_vllm_backend,
     trainer_cuda_visible_devices,
     trainer_only_mode,
 )
@@ -129,6 +130,73 @@ def test_server_env_honours_valid_group_port_override(monkeypatch):
     monkeypatch.setenv("FLASH_VLLM_GROUP_PORT", "51999")
     env = server_subprocess_env({"FLASH_VLLM_GROUP_PORT": "51999"}, select_rollout_split(2, 1))
     assert env["FLASH_VLLM_GROUP_PORT"] == "51999"
+
+
+def _fake_nvidia_smi_cap(caps: list[str]):
+    """A subprocess.run stub that mimics `nvidia-smi --query-gpu=compute_cap` for the given caps."""
+
+    class _Out:
+        stdout = "\n".join(caps)
+
+    def _run(cmd, *a, **k):
+        return _Out()
+
+    return _run
+
+
+def test_sm120_backend_returns_flashinfer_on_blackwell(monkeypatch):
+    # A 5090 (compute_cap 12.0) must get FLASHINFER so the disaggregated server doesn't boot the
+    # flash-attn PTX backend that silently produces empty rollouts on consumer Blackwell hosts.
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setattr(_d.subprocess, "run", _fake_nvidia_smi_cap(["12.0"]))
+    assert sm120_vllm_backend({}) == "FLASHINFER"
+
+
+def test_sm120_backend_none_off_blackwell(monkeypatch):
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setattr(_d.subprocess, "run", _fake_nvidia_smi_cap(["9.0"]))  # Hopper
+    assert sm120_vllm_backend({}) is None
+
+
+def test_sm120_backend_honours_operator_override(monkeypatch):
+    # If a backend is already pinned (operator or caller), never overwrite it — even on a 5090.
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.setattr(_d.subprocess, "run", _fake_nvidia_smi_cap(["12.0"]))
+    assert sm120_vllm_backend({"VLLM_ATTENTION_BACKEND": "TRITON_ATTN"}) is None
+
+
+def test_sm120_backend_best_effort_when_probe_fails(monkeypatch):
+    import flash.engine.disaggregated as _d
+
+    def _boom(*a, **k):
+        raise FileNotFoundError("nvidia-smi missing")
+
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setattr(_d.subprocess, "run", _boom)
+    assert sm120_vllm_backend({}) is None
+
+
+def test_server_env_pins_flashinfer_on_sm120(monkeypatch):
+    # The disaggregated server env must carry FLASHINFER on a 5090 (CUDA-free probe), mirroring the
+    # colocate path's force_vllm_backend_for_sm120 but without creating a CUDA context in the launcher.
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.setattr(_d.subprocess, "run", _fake_nvidia_smi_cap(["12.0", "12.0"]))
+    env = server_subprocess_env({}, select_rollout_split(2, 1))
+    assert env["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
+
+
+def test_server_env_no_backend_off_sm120(monkeypatch):
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.setattr(_d.subprocess, "run", _fake_nvidia_smi_cap(["8.0"]))  # Ampere
+    env = server_subprocess_env({}, select_rollout_split(2, 1))
+    assert "VLLM_ATTENTION_BACKEND" not in env
 
 
 def test_detect_total_gpus_prefers_explicit_env():

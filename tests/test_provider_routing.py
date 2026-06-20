@@ -422,6 +422,51 @@ def test_attach_no_capacity_walks_instead_of_failing(orch, monkeypatch):
     assert out.cost_usd == 0.4
 
 
+def test_pinned_class_no_capacity_escalates_instead_of_failing(orch, monkeypatch):
+    """codex re-review (lifecycle.py:360): a CONCRETE gpu.type pin yields a single-class candidate
+    list (ncand == 1), so the old ncand>1 capacity-retry gate failed a pinned RTX 5090 run the
+    instant RunPod had no free workers — even though the allocator treats a pin as a PREFERENCE and
+    would ESCALATE to a larger fitting class once the starved pin is excluded. The retry must now
+    fire for a pin so the existing escalation fallback can run."""
+    from flash.providers import allocator, get_provider
+    from flash.providers.base import PollResult
+
+    allocate_calls = []
+
+    def fake_allocate(model, algorithm, **kw):
+        allocate_calls.append(frozenset(kw.get("exclude_gpu_classes", frozenset())))
+        # First allocation: the pinned RTX 5090 (single candidate, ncand == 1).
+        if not kw.get("exclude_gpu_classes"):
+            return _alloc(provider="runpod", gpu="RTX 5090", rate=0.69)
+        # Second allocation: the pin is now excluded, so the allocator escalated to a larger class.
+        return _alloc(provider="runpod", gpu="RTX A5000", rate=0.27)
+
+    monkeypatch.setattr(allocator, "allocate", fake_allocate)
+
+    submitted = []
+
+    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        submitted.append(run_spec.gpu.type)
+        if run_spec.gpu.type == "RTX 5090":
+            # Throttled / stuck IN_QUEUE — no worker assigned.
+            return PollResult(False, failure="no_capacity", detail="no worker assigned; throttled")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(get_provider("runpod"), "submit_run", fake_submit)
+
+    spec = _spec(type="RTX 5090", requested="RTX 5090")
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+
+    # The pinned run did NOT terminally fail: it escalated to the larger fitting class and succeeded.
+    assert metrics["train_tokens"] == 4096
+    assert submitted == ["RTX 5090", "RTX A5000"]
+    # The second allocation excluded the starved pin so the allocator could escalate.
+    assert allocate_calls[0] == frozenset()
+    assert allocate_calls[1] == frozenset({("runpod", "RTX 5090")})
+
+
 # ---------------------------------------------------------------------------
 # config: provider fields
 # ---------------------------------------------------------------------------
