@@ -49,14 +49,17 @@ def gpu_hourly_usd(name: str) -> float:
 
 
 # Realized (spot/queue) $/hr a class is actually billed at -- a conservative single per-class
-# value, below the on-demand list (the spot/queue discount: RTX 5090 lists $0.99 but bills
-# ~$0.87, A100 PCIe lists $1.39 but bills ~$1.04). Deliberately not method-specific: pricing GRPO
-# at its full pricier-instance rate would over-quote the total. A class WITHOUT a clean observed
-# rate falls back to its list price (no rate invented). H100 is intentionally omitted: the only
-# H100 sample on record was a single 0.8B GRPO run that billed ~$10/hr against a $3.29 list (an
-# anomalous surge/tight-market Vast offer, ~3x list, on a model that wouldn't even pick an H100) --
-# one outlier isn't a stable realized rate, so H100 falls back to list ($3.29) until a clean
-# multi-run rate is measured.
+# value, the spot/queue discount below the on-demand list (RTX 5090 lists $0.99 but bills ~$0.87,
+# A100 PCIe lists $1.39 but bills ~$1.04). ``realized_hourly_usd`` CLAMPS each entry to the
+# registry list price, so the "never above list" invariant holds by construction -- a stale or
+# tight-market sample that crept above list (e.g. RTX A5000's $0.304 vs its $0.27 list) can never
+# over-quote that class, and new entries are future-proofed the same way. Deliberately not
+# method-specific: pricing GRPO at its full pricier-instance rate would over-quote the total. A
+# class WITHOUT a clean observed rate falls back to its list price (no rate invented). H100 is
+# intentionally omitted: the only H100 sample on record was a single 0.8B GRPO run that billed
+# ~$10/hr against a $3.29 list (an anomalous surge/tight-market Vast offer, on a model that
+# wouldn't even pick an H100) -- one outlier isn't a stable realized rate, so H100 falls back to
+# list ($3.29) until a clean multi-run rate is measured.
 REALIZED_HOURLY_USD: dict[str, float] = {
     "RTX 3090": 0.239,
     "RTX 4090": 0.426,
@@ -69,8 +72,12 @@ REALIZED_HOURLY_USD: dict[str, float] = {
 
 
 def realized_hourly_usd(name: str) -> float:
-    """Market (spot/queue) $/hr a class is billed at; list price if not yet observed."""
-    return REALIZED_HOURLY_USD.get(name, gpu_hourly_usd(name))
+    """Market (spot/queue) $/hr a class is billed at; list price if not yet observed.
+
+    Clamped to the on-demand list price so a realized entry can never over-quote vs list
+    (conservative: the estimator never quotes above the on-demand rate)."""
+    list_price = gpu_hourly_usd(name)
+    return min(REALIZED_HOURLY_USD.get(name, list_price), list_price)
 
 
 def gpu_vram_gb(name: str) -> int:

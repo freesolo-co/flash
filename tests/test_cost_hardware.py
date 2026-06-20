@@ -8,8 +8,40 @@ from __future__ import annotations
 
 import pytest
 
-from flash.cost.facts import GPU_COMPUTE_TFLOPS, gpu_hourly_usd, gpu_tflops, gpu_vram_gb, pick_gpu
+from flash.cost.facts import (
+    GPU_COMPUTE_TFLOPS,
+    REALIZED_HOURLY_USD,
+    gpu_hourly_usd,
+    gpu_tflops,
+    gpu_vram_gb,
+    pick_gpu,
+    realized_hourly_usd,
+)
 from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+
+
+def test_realized_rate_never_exceeds_list_for_any_class():
+    # The realized (spot/queue) rate is conservative: clamped to the on-demand list so the
+    # estimator can never over-quote a class vs its list price. Holds for EVERY registry class,
+    # by construction -- including the historically-over-list RTX A5000 ($0.304 raw vs $0.27 list).
+    for name in GPU_INFO:
+        assert realized_hourly_usd(name) <= gpu_hourly_usd(name), name
+    assert realized_hourly_usd("RTX A5000") <= gpu_hourly_usd("RTX A5000")
+
+
+def test_over_list_realized_entry_is_clamped_to_list():
+    # The raw RTX A5000 table entry sits above its list price; realized_hourly_usd clamps it down
+    # to list (and a genuinely-discounted entry like the RTX 5090 still reports its discount).
+    assert REALIZED_HOURLY_USD["RTX A5000"] > gpu_hourly_usd("RTX A5000")  # raw entry is over list
+    assert realized_hourly_usd("RTX A5000") == gpu_hourly_usd("RTX A5000")  # clamped to list
+    assert realized_hourly_usd("RTX 5090") == REALIZED_HOURLY_USD["RTX 5090"]  # below list -> unchanged
+    assert realized_hourly_usd("RTX 5090") < gpu_hourly_usd("RTX 5090")
+
+
+def test_realized_rate_falls_back_to_list_when_unobserved():
+    # A class without an observed realized rate reports its list price (no rate invented).
+    assert "L40S" not in REALIZED_HOURLY_USD
+    assert realized_hourly_usd("L40S") == gpu_hourly_usd("L40S")
 
 
 def test_compute_table_only_lists_real_classes():

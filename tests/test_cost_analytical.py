@@ -7,6 +7,8 @@ bounds runaway runs) plus end-to-end arithmetic consistency.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from flash.cost import RunConfig, estimate_cost
@@ -207,6 +209,85 @@ def test_invalid_config_rejected():
         RunConfig(MID, "sft", 0)
     with pytest.raises(ValueError, match="unsupported algorithm"):
         RunConfig(MID, "ppo", 100)
+
+
+def test_omitted_grpo_max_length_sizes_like_the_real_allocator():
+    # When GRPO max_length (seq_len) is omitted, the engine context length must MIRROR the worker:
+    # the allocator sizes an unset [train].max_length to max(1024, max_prompt_len + completion)
+    # (flash/engine/vram.py:243, worker/__init__.py:1478), NOT bare max_prompt_len -- otherwise the
+    # estimate under-sizes VRAM by the completion budget and can pick/price an undersized GPU.
+    from flash.engine.recipe import RECIPE
+    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+
+    cfg = RunConfig(MID, "grpo", 100)  # max_length / seq_len omitted
+    worker_len = max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len)
+    assert cfg.normalized().seq_len == worker_len  # mirrors the worker exactly
+    assert cfg.train_knobs()["max_length"] == worker_len  # forwarded as [train].max_length
+    # GPU sizing matches the allocator's own omitted-max_length default (same engine length).
+    _, need = select_gpu(cfg)
+    real = alloc_required_vram_gb(MID, "grpo", train={}, thinking=False)
+    assert need == real
+    # ...and is >= what the OLD bare-max_prompt_len default would have produced (never under-sizes).
+    old = alloc_required_vram_gb(MID, "grpo", train={"max_length": RECIPE.rl.max_prompt_len}, thinking=False)
+    assert need >= old
+
+
+def test_omitted_grpo_max_length_mirrors_worker_with_thinking():
+    # The thinking completion budget (larger) feeds the same worker-mirrored default.
+    from flash.engine.recipe import RECIPE
+
+    cfg = RunConfig(MID, "grpo", 100, thinking=True)
+    worker_len = max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len_thinking)
+    assert cfg.normalized().seq_len == worker_len
+    assert worker_len > max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len)
+
+
+def test_explicit_grpo_max_length_still_wins():
+    # An explicitly pinned seq_len (engine length) is honored verbatim, not overridden by the
+    # worker-mirrored default, and matches the allocator at that same pinned max_length.
+    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+
+    cfg = RunConfig(MID, "grpo", 100, seq_len=8192)
+    assert cfg.normalized().seq_len == 8192
+    assert cfg.train_knobs()["max_length"] == 8192
+    _, need = select_gpu(cfg)
+    real = alloc_required_vram_gb(MID, "grpo", train={"max_length": 8192}, thinking=False)
+    assert need == real
+
+
+def test_estimate_does_no_network_for_unlisted_model(monkeypatch):
+    # The estimator's contract is fully local. select_gpu() forces FLASH_SKIP_NET around its
+    # sizing call, so even with FLASH_SKIP_NET UNSET an UNLISTED model never constructs the HF
+    # network client: fetch_hf_params_b's FLASH_SKIP_NET guard short-circuits (return None) BEFORE
+    # it imports/instantiates HfApi. Wire HfApi to flip a flag if ever built and assert it stays
+    # untouched, and that the estimate still succeeds via the offline fallback (the 24 GB tier).
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+    import huggingface_hub
+
+    built = []
+
+    class _NoNetHfApi:  # pragma: no cover - must never be constructed/called
+        def __init__(self, *a, **k):
+            built.append(True)
+            raise AssertionError("estimator constructed the HF network client (HfApi)")
+
+        def model_info(self, *a, **k):
+            raise AssertionError("estimator hit the HF network (model_info)")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _NoNetHfApi)
+    e = estimate_cost(RunConfig("some-org/totally-unlisted-7b", "grpo", 50))
+    assert not built  # the network client was never even constructed
+    assert e.required_vram_gb >= 24  # sane offline VRAM estimate (unlisted -> 24 GB tier)
+    assert e.total_usd > 0
+    # The forced FLASH_SKIP_NET is transient: it must NOT leak into the ambient environment.
+    assert "FLASH_SKIP_NET" not in os.environ
+
+
+def test_estimate_restores_preexisting_flash_skip_net(monkeypatch):
+    # An already-offline caller's FLASH_SKIP_NET value is restored after sizing (not clobbered).
+    monkeypatch.setenv("FLASH_SKIP_NET", "preset")
+    select_gpu(RunConfig(MID, "grpo", 10))
+    assert os.environ["FLASH_SKIP_NET"] == "preset"
 
 
 @pytest.mark.parametrize(

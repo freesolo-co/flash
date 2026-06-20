@@ -9,6 +9,7 @@ each step into a vLLM rollout (decode-bound) + reward grading + policy/reference
 from __future__ import annotations
 
 import math
+import os
 
 from flash.providers.allocator import required_vram_gb, vram_headroom
 from flash.providers.base import providers_for, unvalidated_allowed
@@ -96,10 +97,24 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
 
     Sizes VRAM via the real allocator and resolves a tri-state ``allow_unvalidated`` the same
     way submit-time does, so the estimate's GPU pick matches what the allocator would allocate.
+
+    The estimator's contract is fully local / no network, but ``required_vram_gb`` can probe the
+    HF API for an UNLISTED model's param count (``engine.vram.fetch_hf_params_b``) unless
+    ``FLASH_SKIP_NET`` is set. Force ``FLASH_SKIP_NET=1`` for the sizing call so estimation never
+    does network I/O by default (the offline path falls back to the 24 GB tier for an unreadable
+    model); restore any pre-existing value afterward so an already-offline caller is unaffected.
     """
-    need = required_vram_gb(
-        config.model_id, config.method, train=config.train_knobs(), thinking=config.thinking
-    )
+    _prev_skip_net = os.environ.get("FLASH_SKIP_NET")
+    os.environ["FLASH_SKIP_NET"] = "1"
+    try:
+        need = required_vram_gb(
+            config.model_id, config.method, train=config.train_knobs(), thinking=config.thinking
+        )
+    finally:
+        if _prev_skip_net is None:
+            os.environ.pop("FLASH_SKIP_NET", None)
+        else:
+            os.environ["FLASH_SKIP_NET"] = _prev_skip_net
     gpu = pick_gpu(
         need,
         pin=config.gpu,

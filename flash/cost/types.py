@@ -21,7 +21,10 @@ class RunConfig:
     # seed, so this is the seed count.
     setup_repeats: int = 1
 
-    seq_len: int | None = None  # SFT max_seq_len / GRPO max_prompt_len
+    # Engine context length, forwarded as ``[train].max_length`` (NOT prompt length). SFT:
+    # max_seq_len. GRPO: the vLLM engine length; an explicit value is honored, and when unset the
+    # GRPO default mirrors the worker's ``max(1024, max_prompt_len + completion)`` (see ``normalized``).
+    seq_len: int | None = None
     completion_len: int | None = None  # GRPO only (max_tokens)
     batch_size: int | None = None  # SFT effective batch / GRPO prompts_per_step
     group_size: int | None = None  # GRPO completions per prompt (G)
@@ -72,7 +75,6 @@ class RunConfig:
         """A copy with every ``None`` knob filled from the recipe for this method."""
         lora = self.lora_rank if self.lora_rank is not None else RECIPE.lora.rank
         if self.is_grpo:
-            seq = self.seq_len if self.seq_len is not None else RECIPE.rl.max_prompt_len
             comp = self.completion_len
             if comp is None:
                 comp = (
@@ -80,6 +82,16 @@ class RunConfig:
                     if self.thinking
                     else RECIPE.rl.max_completion_len
                 )
+            # seq_len is forwarded as [train].max_length (engine context length). An explicit pin
+            # wins; otherwise mirror what run_rl()/the allocator size an unset max_length to for
+            # GRPO -- max(1024, max_prompt_len + completion) (flash/engine/vram.py:243,
+            # worker/__init__.py:1478) -- not bare max_prompt_len, which under-sizes the engine
+            # (and thus VRAM/the chosen GPU) by the completion budget.
+            seq = (
+                self.seq_len
+                if self.seq_len is not None
+                else max(1024, RECIPE.rl.max_prompt_len + int(comp))
+            )
             batch = self.batch_size if self.batch_size is not None else RECIPE.rl.prompts_per_step
             group = self.group_size if self.group_size is not None else RECIPE.rl.group_size
         else:
