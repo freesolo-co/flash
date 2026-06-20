@@ -271,11 +271,52 @@ def _install_chalk(uv, py):
     print(f"[verl][chalk] installed {spec} (applied via _patch_verl_chalk)", flush=True)
 
 
-def _build_dataset(model_path: str, n_rows: int, prompt_tokens: int):
-    """Synthetic GRPO dataset: ~prompt_tokens-long chat prompts + a simple rule reward.
-    Throughput (gen n*resp + train) dominates s/step, so a simple reward is fine for the bench."""
+_REVERSE_SYS = "Reverse the text character-by-character. Put your answer in <reversed_text> tags."
+
+
+def _reverse_text_rows(n_rows: int) -> list[dict]:
+    """Reverse-text TASK rows — the SAME task as the Prime Intellect ``reverse-text`` verifiers env
+    (what the tinker side trains on): a random string to reverse, ground_truth = the reversed string,
+    answer expected in ``<reversed_text>`` tags. Self-contained (no env install on the verl worker)
+    so ``FLASH_VERL_ENV=reverse-text`` gives an apples-to-apples training-cost comparison vs tinker."""
+    import random
+
+    rng = random.Random(0)  # fixed seed: reproducible dataset across runs
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    rows = []
+    for i in range(n_rows):
+        words = [
+            "".join(rng.choice(letters) for _ in range(rng.randint(3, 7)))
+            for _ in range(rng.randint(4, 9))
+        ]
+        text = " ".join(words)
+        rows.append(
+            {
+                "data_source": "reverse_text",
+                "prompt": [
+                    {"role": "system", "content": _REVERSE_SYS},
+                    {"role": "user", "content": text},
+                ],
+                "ability": "reverse",
+                "reward_model": {"style": "rule", "ground_truth": text[::-1]},
+                "extra_info": {"index": i, "split": "train"},
+            }
+        )
+    return rows
+
+
+def _build_dataset(model_path: str, n_rows: int, prompt_tokens: int, env: str = ""):
+    """GRPO dataset. Default = synthetic throughput rows; ``env='reverse-text'`` = the reverse-text
+    task (matched to the tinker reverse-text env). Throughput (gen n*resp + train) dominates s/step."""
     os.makedirs(WORKDIR, exist_ok=True)
     import pandas as pd  # baked image has pandas; if not, the sidecar does
+
+    if env == "reverse-text":
+        df = pd.DataFrame(_reverse_text_rows(n_rows))
+        df.to_parquet(f"{WORKDIR}/train.parquet")
+        df.head(max(8, n_rows // 8)).to_parquet(f"{WORKDIR}/val.parquet")
+        print(f"[verl] dataset: {n_rows} reverse-text rows -> {WORKDIR}/train.parquet", flush=True)
+        return
 
     # Build prompts COMFORTABLY UNDER max_prompt_length (~prompt_tokens). English ≈ 1.3 tok/word, so
     # target ~0.55*prompt_tokens/1.3 words to stay well within the limit (avoids all-rows-filtered ->
@@ -303,14 +344,32 @@ def _build_dataset(model_path: str, n_rows: int, prompt_tokens: int):
     )
 
 
-def _write_reward():
-    """A trivial length-aware reward (verl custom_reward_function contract). Throughput bench
-    doesn't depend on the reward signal; this just exercises the scoring path."""
-    src = (
-        "def compute_score(data_source, solution_str, ground_truth, extra_info=None):\n"
-        "    n = len(solution_str or '')\n"
-        "    return 1.0 if n > 0 else 0.0\n"
-    )
+def _write_reward(env: str = ""):
+    """Write the verl custom_reward_function. Default = trivial length reward (throughput bench).
+    ``env='reverse-text'`` = a real reverse-text reward: extract ``<reversed_text>`` and score the
+    character-level correctness of the reversal (matches the tinker reverse-text env's signal)."""
+    if env == "reverse-text":
+        src = (
+            "import re\n"
+            "def compute_score(data_source, solution_str, ground_truth, extra_info=None):\n"
+            "    s = solution_str or ''\n"
+            "    m = re.search(r'<reversed_text>(.*?)</reversed_text>', s, re.DOTALL)\n"
+            "    ans = (m.group(1).strip() if m else s.strip())\n"
+            "    gt = (ground_truth or '').strip()\n"
+            "    if not gt:\n"
+            "        return 0.0\n"
+            "    # character-level correctness (smooth signal) + a small format bonus for the tags\n"
+            "    correct = sum(1 for a, b in zip(ans, gt) if a == b)\n"
+            "    ratio = correct / max(len(gt), len(ans), 1)\n"
+            "    fmt = 0.1 if m else 0.0\n"
+            "    return min(1.0, 0.9 * ratio + fmt)\n"
+        )
+    else:
+        src = (
+            "def compute_score(data_source, solution_str, ground_truth, extra_info=None):\n"
+            "    n = len(solution_str or '')\n"
+            "    return 1.0 if n > 0 else 0.0\n"
+        )
     with open(f"{WORKDIR}/verl_reward.py", "w") as f:
         f.write(src)
 
@@ -757,8 +816,9 @@ def run():
         flush=True,
     )
 
-    _build_dataset(model_path, n_rows=max(64, train_bs * 4), prompt_tokens=prompt_len)
-    _write_reward()
+    bench_env = os.environ.get("FLASH_VERL_ENV", "").strip().lower()
+    _build_dataset(model_path, n_rows=max(64, train_bs * 4), prompt_tokens=prompt_len, env=bench_env)
+    _write_reward(env=bench_env)
 
     cmd = _build_cmd(
         model_path,
