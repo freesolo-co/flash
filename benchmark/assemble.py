@@ -9,8 +9,9 @@ Comparison axes (per task, flash vs tinker):
   - PERFORMANCE: mean group reward at step 1 -> final (the GRPO training signal), plus
     flash's native held-out eval reward where available.
   - LATENCY:     total wall-clock, setup/queue time, and per-step time.
-  - COST:        flash = measured RunPod $ (billed); tinker = wall-clock proxy
-                 (Tinker does not expose per-run cost via API — labelled as an estimate).
+  - COST:        flash = measured RunPod $ (billed); tinker = active-compute proxy
+                 (rollout+train time, capacity pauses excluded, x a $/hr GPU rate; Tinker
+                 does not expose per-run cost via API — labelled as an estimate, not a bill).
 
 Usage:
     uv run python benchmark/assemble.py
@@ -19,11 +20,25 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
 import pathlib
+import sys
 import urllib.request
 
 _HERE = pathlib.Path(__file__).parent
+# Ensure sibling benchmark modules import whether run as a script or imported as a module.
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+# Single canonical Flash-key resolver (FLASH_PLANE_KEY -> FREESOLO_API_KEY -> ~/.flash).
+# Imported from flash_runner so poll and assemble can never drift on key resolution.
+from flash_runner import _flash_api_key as _flash_key  # noqa: E402
+
+# Shared Tinker cost proxy + active-compute basis, imported from the producer (tinker_runner)
+# so the runner, assembler, and committed results all use ONE rate and ONE basis.
+from tinker_runner import TINKER_PROXY_USD_PER_HR as _TINKER_PROXY_USD_PER_HR  # noqa: E402
+from tinker_runner import active_compute_s as _sum_active_compute  # noqa: E402
+from tinker_runner import read_metrics_records as _read_metrics_records  # noqa: E402
+
 _RESULTS = _HERE / "results"
 _MANIFEST = _RESULTS / "runs_manifest.json"
 TASKS = ["gsm8k", "reverse-text", "hendrycks-math"]
@@ -40,20 +55,6 @@ def _smoothed(rh: list, k: int = _SMOOTH_K):
 
 def _best(rh: list):
     return max(rh) if rh else None
-
-# Representative on-demand price for the GPU class Tinker is likely serving a 4B on.
-# Tinker is managed and does NOT expose per-run cost; this is an explicit wall-clock proxy
-# so the two columns are at least order-of-magnitude comparable. Flash cost is MEASURED.
-_TINKER_PROXY_USD_PER_HR = 2.00
-
-
-def _flash_key() -> str:
-    key = os.environ.get("FLASH_PLANE_KEY") or os.environ.get("FREESOLO_API_KEY", "")
-    if not key:
-        cfg = pathlib.Path.home() / ".flash" / "config.json"
-        if cfg.exists():
-            key = json.loads(cfg.read_text()).get("api_key", "")
-    return key
 
 
 def _get(api_url: str, path: str, key: str) -> dict:
@@ -84,6 +85,13 @@ def collect_flash(task: str, entry: dict, key: str) -> dict:
     eh = notes.get("eval_history", []) or []
     remote = status.get("remote") or {}
 
+    # Authoritative configured/run step count from the worker (notes['steps']). The reward
+    # history can log fewer points than steps (cadence) or reset on resume, so len(rh) is
+    # NOT the step count — use it only as a fallback when the worker didn't record steps.
+    steps = notes.get("steps")
+    if steps is None:
+        steps = len(rh)
+
     setup_s = m.get("setup_seconds")
     train_s = m.get("wall_seconds")
     total_s = (setup_s or 0) + (train_s or 0) if (setup_s or train_s) else None
@@ -95,7 +103,7 @@ def collect_flash(task: str, entry: dict, key: str) -> dict:
         "run_id": entry["run_id"],
         "gpu": m.get("allocated_gpu") or remote.get("allocated_gpu"),
         "provider": notes.get("provider") or remote.get("provider"),
-        "steps": len(rh),
+        "steps": steps,
         "first_reward": rh[0] if rh else None,
         "final_reward": rh[-1] if rh else None,
         "final_smoothed": _smoothed(rh),
@@ -108,44 +116,33 @@ def collect_flash(task: str, entry: dict, key: str) -> dict:
         "setup_s": setup_s,
         "train_s": train_s,
         "total_s": total_s,
-        "per_step_s": (train_s / len(rh)) if (train_s and rh) else None,
+        "per_step_s": (train_s / steps) if (train_s and steps) else None,
         "train_tok_per_s": notes.get("train_throughput_toks_per_s") or m.get("train_throughput_toks_per_s"),
     }
 
 
-_PAUSE_STEP_S = 300.0  # a step longer than this is a managed-backend capacity pause, not compute
+def _tinker_active_compute_s(log_path: str | None) -> float | None:
+    """Active compute (rollout + train step) from a Tinker run's metrics.jsonl.
 
-
-def _tinker_pause_s(log_path: str | None) -> float | None:
-    """Detect managed-backend *capacity pause* time from metrics.jsonl.
-
-    Each row's ``time/total`` is that step's wall time (steps run sequentially, so they sum to
-    the run wall). A normal GRPO step is tens of seconds; a backend pause ("running short on
-    capacity, please wait") shows up as ONE step hundreds-to-thousands of seconds long. We treat
-    the excess of any >``_PAUSE_STEP_S`` step over the median step as idle pause (not billed
-    compute). NB: do NOT sum the concurrent ``rollout:total`` field — overlapping rollouts make
-    it exceed wall-clock.
+    Tinker's wall-clock includes managed-backend *capacity pauses* (idle, not billed); the
+    active-compute sum is the fair latency/cost basis. BOTH the file selection/parse
+    (``read_metrics_records``) and the per-record summation (``active_compute_s``) are
+    imported from tinker_runner, so this call site and the runner can never diverge on
+    which file they read or how they sum it. Returns None only when there is genuinely no
+    timing data (matching active_compute_s); 0.0 is a real pause-excluded zero.
     """
     if not log_path:
         return None
-    mp = pathlib.Path(log_path) / "metrics.jsonl"
-    if not mp.exists():
+    return _sum_active_compute(_read_metrics_records(log_path))
+
+
+def _tinker_cost_from_basis(basis: float | None) -> float | None:
+    """Tinker $ proxy from an active-compute basis (seconds). Mirrors tinker_runner's
+    write-time formula EXACTLY so a recomputed cost equals the stored cost_usd_estimated
+    for the same basis. None basis -> None cost (no data)."""
+    if basis is None:
         return None
-    times = []
-    for line in mp.read_text().splitlines():
-        if not line.strip():
-            continue
-        try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if "time/total" in r:
-            times.append(r["time/total"])
-    if not times:
-        return None
-    med = sorted(times)[len(times) // 2]
-    pause = sum(t - med for t in times if t > _PAUSE_STEP_S)
-    return pause or None
+    return round(basis / 3600 * _TINKER_PROXY_USD_PER_HR, 4)
 
 
 def collect_tinker(task: str, rel_path: str) -> dict:
@@ -156,18 +153,47 @@ def collect_tinker(task: str, rel_path: str) -> dict:
     d = json.loads(p.read_text())
     rh = d.get("reward_history", []) or []
     wall = d.get("wall_s")
+    # Authoritative configured step count from the runner (d['steps']); the reward history
+    # may log fewer points. Use this single value for both the reported steps and per_step_s
+    # so they can't disagree (previously the dict hard-coded len(rh) while dividing by steps).
     steps = d.get("steps") or len(rh)
-    paused_s = _tinker_pause_s(d.get("log_path"))
-    # Active compute = wall minus any backend capacity pause (idle, not billed). Cost proxy is
-    # on active compute; latency reports both wall and the pause split.
-    active = (wall - paused_s) if (wall and paused_s) else wall
-    cost = round((active or 0) / 3600 * _TINKER_PROXY_USD_PER_HR, 4) if active else None
+
+    # --- Active-compute AND cost reported from ONE consistent source ---------------------
+    # The runner writes active_compute_s and cost_usd_estimated as a matched pair (cost is
+    # derived from whatever basis active-compute used at write time). We MUST keep the
+    # reported active and the reported cost on the SAME basis — never report a recomputed
+    # active next to the wall-based stored cost (or vice-versa). Use `is not None` so a
+    # legitimate 0.0 active-compute is honored, not treated as "missing" and replaced by wall.
+    stored_active = d.get("active_compute_s")
+    if stored_active is not None:
+        # Report the stored active, but ALWAYS derive the reported cost from THAT active via
+        # the shared proxy — never trust a stored cost_usd_estimated next to it. A legacy /
+        # hand-edited result can pair an active-compute `train_s` with a stale wall-based cost;
+        # recomputing here guarantees the invariant `reported cost == proxy(reported active)`
+        # holds on the stored-active path too (not only the recomputed-active path below).
+        active = stored_active
+        cost = _tinker_cost_from_basis(active)
+    else:
+        # No stored active: recompute it from the run's metrics.jsonl (same selector/parser
+        # the runner uses) and derive the cost from THAT recomputed active so the two agree.
+        active = _tinker_active_compute_s(d.get("log_path"))
+        if active is not None:
+            cost = _tinker_cost_from_basis(active)
+        else:
+            # No active anywhere: fall back to the runner's stored (wall-based) cost if it
+            # wrote one, else compute the wall-based proxy ourselves. active stays None.
+            cost = d.get("cost_usd_estimated")
+            if cost is None:
+                cost = _tinker_cost_from_basis(wall)
+    # Latency/per-step basis: active when present (pause excluded), else wall (is not None).
+    basis = active if active is not None else wall
+    paused_s = (wall - active) if (wall is not None and active is not None and wall > active) else None
     return {
         "platform": "tinker",
         "task": task,
         "status": d.get("status"),
         "gpu": "managed (Tinker)",
-        "steps": len(rh),
+        "steps": steps,
         "first_reward": rh[0] if rh else None,
         "final_reward": rh[-1] if rh else None,
         "final_smoothed": _smoothed(rh),
@@ -177,10 +203,10 @@ def collect_tinker(task: str, rel_path: str) -> dict:
         "cost_usd": cost,
         "cost_kind": f"ESTIMATE: active-compute x ${_TINKER_PROXY_USD_PER_HR:.2f}/hr proxy (Tinker cost not in API)",
         "setup_s": None,
-        "train_s": active or wall,        # active compute = wall - capacity pause
+        "train_s": basis,                 # active compute (rollout+train), pause excluded; wall iff active is None
         "total_s": wall,                  # full wall, INCLUDING any capacity pause
         "paused_s": paused_s,             # idle time the managed backend paused us
-        "per_step_s": ((active or wall) / steps) if ((active or wall) and steps) else None,
+        "per_step_s": (basis / steps) if (basis is not None and steps) else None,
         "train_tok_per_s": None,
     }
 
@@ -207,20 +233,39 @@ def _delta(f, t):
     return f"{f - t:+.3f}"
 
 
+def _configured_steps(records: dict) -> int | None:
+    """The configured step count, derived from the run records (not hard-coded).
+
+    Tinker's record carries the configured count; Flash now carries notes['steps']. Both
+    are matched, so report the max observed across all records (None if nothing ran).
+    """
+    vals = [
+        r.get("steps")
+        for task in records.values()
+        for r in task.values()
+        if isinstance(r.get("steps"), int)
+    ]
+    return max(vals) if vals else None
+
+
 def render_markdown(records: dict) -> str:
     """records: {task: {'flash': rec, 'tinker': rec}}"""
+    steps = _configured_steps(records)
+    steps_str = str(steps) if steps is not None else "N"
     lines = []
-    lines.append("# Flash vs Tinker — GRPO benchmark (Qwen3.5-4B, 30 steps)\n")
+    lines.append(f"# Flash vs Tinker — GRPO benchmark (Qwen3.5-4B, {steps_str} steps)\n")
     lines.append("Same base model, same verifiers environment, same GRPO hyper-parameters "
-                 "(group_size=4, batch_size=4, **max_tokens=1024**, 30 steps) on each side. This run "
-                 "includes the **stall fix** (heartbeat through mid-run eval) and the **truncation "
-                 "fix** (1024 tokens so the boxed answer isn't cut off).\n")
+                 f"(group_size=4, batch_size=4, **max_tokens=1024**, {steps_str} steps) on each side. "
+                 "This run includes the **stall fix** (heartbeat through mid-run eval) and the "
+                 "**truncation fix** (1024 tokens so the boxed answer isn't cut off).\n")
     lines.append("- **Flash** trains on a rented RunPod **A100 PCIe** (4B GRPO needs ≥35 GB; the "
                  "allocator escalates from the requested RTX 5090). Cost is **measured** (RunPod billed).")
     lines.append("- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is "
-                 "**not exposed via API**, so its $ column is an active-compute proxy (labelled).")
-    lines.append("- **Performance** = the held-out eval below (one shared scorer); in-training reward "
-                 "is per-stack only (different verifiers reward versions).\n")
+                 "**not exposed via API**, so its $ column is an **active-compute** proxy "
+                 "(rollout+train time, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, "
+                 "not a bill).")
+    lines.append(f"- **Performance** = mean group reward over the {steps_str}-step GRPO run "
+                 "(step 1 → final). Flash also reports a native held-out eval (50 examples).\n")
 
     # Per-task tables
     for task in TASKS:
@@ -234,18 +279,26 @@ def render_markdown(records: dict) -> str:
         lines.append(f"| **reward** step 1 | {_fmt(f.get('first_reward'))} | {_fmt(t.get('first_reward'))} | |")
         lines.append(f"| **reward** final (last 5 avg) | {_fmt(f.get('final_smoothed'))} | {_fmt(t.get('final_smoothed'))} | {_delta(f.get('final_smoothed'), t.get('final_smoothed'))} |")
         lines.append(f"| reward best step | {_fmt(f.get('best_reward'))} | {_fmt(t.get('best_reward'))} | {_delta(f.get('best_reward'), t.get('best_reward'))} |")
-        lines.append(f"| reward final (raw step 30) | {_fmt(f.get('final_reward'))} | {_fmt(t.get('final_reward'))} | |")
+        # The "final raw" reward is the LAST LOGGED reward point. Flash logs fewer points than
+        # steps (cadence), so label by logged-points, not a hard-coded step number.
+        f_pts = len(f.get("reward_history") or [])
+        t_pts = len(t.get("reward_history") or [])
+        lines.append(f"| reward final (last logged: F={f_pts} / T={t_pts} pts) | {_fmt(f.get('final_reward'))} | {_fmt(t.get('final_reward'))} | |")
         lines.append(f"| held-out eval | {_fmt(f.get('eval_reward'))} (n={f.get('eval_n')}) | — | |")
         lines.append(f"| **latency** wall total | {_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} | |")
         lines.append(f"| latency setup/queue | {_secs(f.get('setup_s'))} | none (managed) | |")
         lines.append(f"| latency active compute | {_secs(f.get('train_s'))} | {_secs(t.get('train_s'))} | |")
-        lines.append(f"| latency capacity-pause | — | {_secs(t.get('paused_s')) if t.get('paused_s') else 'none'} | |")
+        # paused_s is a real number when present (0.0 = a measured zero pause -> "0m00s");
+        # only a genuinely-absent paused_s (None) renders "none". Guard on `is not None` so a
+        # valid 0.0 isn't shown as "none" by a truthiness check.
+        _paused = t.get("paused_s")
+        lines.append(f"| latency capacity-pause | — | {_secs(_paused) if _paused is not None else 'none'} | |")
         lines.append(f"| latency per-step | {_fmt(f.get('per_step_s'), 1, 's')} | {_fmt(t.get('per_step_s'), 1, 's')} | |")
         lines.append(f"| **cost** | {_fmt(f.get('cost_usd'), 4, ' USD')} | {_fmt(t.get('cost_usd'), 4, ' USD')} | |")
         lines.append(f"| cost basis | {f.get('cost_kind')} | {t.get('cost_kind')} | |")
         lines.append("")
 
-    # Held-out eval (one version-independent scorer) — the valid PERFORMANCE comparison.
+    # Held-out eval (ONE version-independent scorer) — the valid PERFORMANCE comparison.
     eval_path = _RESULTS / "eval_unified_gsm8k.json"
     if eval_path.exists():
         ev = json.loads(eval_path.read_text())
@@ -255,8 +308,8 @@ def render_markdown(records: dict) -> str:
         flash_native = records["gsm8k"]["flash"].get("eval_reward")  # Flash's own on-GPU eval
 
         def _d(rec):  # "Δ+0.080 vs base" suffix
-            d = rec.get("delta_vs_base")
-            return f" (Δ{d:+.3f} vs base)" if d is not None else ""
+            dd = rec.get("delta_vs_base")
+            return f" (Δ{dd:+.3f} vs base)" if dd is not None else ""
 
         lines.append("## Held-out eval — gsm8k (the valid cross-stack performance comparison)\n")
         lines.append("In-training GRPO reward is NOT comparable across stacks (Flash's worker uses "
@@ -279,13 +332,12 @@ def render_markdown(records: dict) -> str:
         if tr_delta is not None and tr_delta <= 0.02:
             verdict = (f"**Key finding:** under the shared scorer the Tinker-trained model shows **no "
                        f"held-out gain** (Δ{tr_delta:+.3f}, within n={b.get('n')} noise) even though its "
-                       f"in-training reward rose (best 0.69). At this deliberately tiny scale (30 steps, "
-                       f"16 rollouts/step) the rising training reward does NOT translate to held-out "
+                       f"in-training reward rose. At this deliberately tiny scale ({steps_str} steps, 16 "
+                       f"rollouts/step) the rising training reward does NOT translate to held-out "
                        f"accuracy — exactly what a unified held-out eval is for; the training-reward "
                        f"curve alone would have implied improvement.")
         else:
-            verdict = ("Under the shared scorer the GRPO-trained model's held-out accuracy moves as "
-                       "shown above.")
+            verdict = "Under the shared scorer the GRPO-trained model's held-out accuracy moves as shown."
         lines.append(f"\n{verdict} The Flash-trained row falls back to Flash's own on-GPU eval (a "
                      "similar but not identical scorer) because a unified Flash eval needs a Qwen3.5-4B "
                      "LoRA serving — the live one was empty (0 GPUs / 0 base models); `eval_unified.py` "
@@ -338,8 +390,9 @@ def render_markdown(records: dict) -> str:
     lines.append("- **Tinker cost is an estimate.** Tinker does not expose per-run cost via API; the $ "
                  "column is active-compute-time x a GPU-rate proxy (pause excluded), not a bill. Flash "
                  "cost is the measured RunPod charge.")
-    lines.append("- **Scale is deliberately small** (30 steps, 16 rollouts/step) to keep spend low, so "
-                 "per-step reward is noisy and 30-step gains are modest by design.\n")
+    lines.append(f"- **Scale is deliberately small** ({steps_str} steps, 16 rollouts/step) to keep "
+                 f"spend low, so per-step reward is noisy and {steps_str}-step gains are modest by "
+                 "design.\n")
     return "\n".join(lines)
 
 

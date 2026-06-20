@@ -13,6 +13,11 @@ hf_cache/
 
 # Run artifacts: adapters (large binaries) live on the HF dataset repo, not in git
 results/
+# ...but the benchmark's committed results ARE the deliverable. Un-ignore that subtree
+# HERE: git won't descend into an ignored dir to read a nested benchmark/results/.gitignore,
+# so the exception must live at the root. benchmark/results/.gitignore then whitelists the
+# specific json/md to track.
+!benchmark/results/
 .flash/
 uv-cache/
 .flash/

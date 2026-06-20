@@ -5,7 +5,7 @@
   "env_id": "gsm8k",
   "steps": 30,
   "wall_s": 1543.020215247292,
-  "cost_usd_estimated": 1.5002,
+  "cost_usd_estimated": 0.8411,
   "cost_note": "estimated (Tinker does not expose cost via API; check your dashboard)",
   "first_train_reward": 0.6875,
   "final_train_reward": 0.25,
@@ -41,5 +41,6 @@
     0.375,
     0.25
   ],
-  "log_path": "/tmp/tinker-rerun-gsm8k"
+  "log_path": "/tmp/tinker-rerun-gsm8k",
+  "active_compute_s": 1513.9582201824524
 }

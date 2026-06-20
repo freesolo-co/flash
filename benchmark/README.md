@@ -28,14 +28,22 @@ so both train against the byte-identical task definition + reward function.
 
 ## The three comparison axes
 
-- **Performance** — mean group reward across the GRPO run (step 1 → final). Flash also
-  emits a native held-out eval (50 examples) on the GPU worker; Tinker's training reward
-  is the directly-comparable signal (same env reward on both sides).
+- **Performance** — mean group reward across the GRPO run (step 1 → final). **In-training
+  reward is NOT directly comparable across stacks**: the two sides install different
+  `verifiers` versions (Flash ~0.1.14 continuous/partial-credit vs Tinker 0.1.9, the
+  recipe's pin) and present/truncate the task differently at matched `max_tokens`, so the
+  reward scales and definitions differ. For an apples-to-apples performance number, use the
+  **held-out eval** (one version-independent scorer, generous tokens — see
+  `results/comparison.md`); the in-training curves show learning *direction* per stack, not
+  a cross-stack ranking. Flash also emits a native held-out eval (50 examples) on the GPU
+  worker.
 - **Latency** — total wall-clock per run, the setup/queue component (Flash rents a GPU:
   queue + boot + model download), and per-step time.
 - **Cost** — Flash is the **measured** RunPod bill (`metrics.json:cost_usd`). Tinker is
   managed and **does not expose per-run cost via API**, so its $ column is an explicit
-  wall-clock proxy (clearly labelled in the output, never presented as measured).
+  **active-compute** proxy — rollout+train time with managed-backend capacity pauses
+  excluded, times a $/hr GPU rate (clearly labelled in the output, never presented as
+  measured).
 
 ## Layout
 

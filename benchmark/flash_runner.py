@@ -12,17 +12,35 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
+import sys
 import time
-import urllib.error
 import urllib.request
 from typing import Any
 
-
 POLL_INTERVAL = 60  # seconds between CP3 polls
 _CONFIG_DIR = pathlib.Path(__file__).parent / "configs"
-# Path to slm CLI inside the benchmark worktree's own venv.
-_SLM = str(pathlib.Path(__file__).parents[1] / ".venv" / "bin" / "slm")
+
+
+def _slm_cmd() -> list[str]:
+    """Resolve the `slm` CLI robustly instead of hard-coding a venv path.
+
+    Order: ``SLM_BIN`` override → ``slm`` on PATH → the repo's own
+    ``.venv/bin/slm`` → ``<this-python> -m flash`` as a last resort. Lets the
+    benchmark run whether the CLI is on PATH, in a sibling venv, or invoked via
+    ``uv run python benchmark/bench.py`` (the documented entrypoint).
+    """
+    override = os.environ.get("SLM_BIN")
+    if override:
+        return [override]
+    on_path = shutil.which("slm")
+    if on_path:
+        return [on_path]
+    venv_slm = pathlib.Path(__file__).parents[1] / ".venv" / "bin" / "slm"
+    if venv_slm.exists():
+        return [str(venv_slm)]
+    return [sys.executable, "-m", "flash"]
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +56,10 @@ def _flash_api_url() -> str:
 
 
 def _flash_api_key() -> str:
-    key = os.environ.get("FREESOLO_API_KEY", "")
+    # FLASH_PLANE_KEY first (the documented local-control-plane key, as honored by
+    # assemble.py), then FREESOLO_API_KEY, then ~/.flash/config.json. This is the single
+    # canonical Flash-key resolver; assemble.py imports it so poll and assemble agree.
+    key = os.environ.get("FLASH_PLANE_KEY") or os.environ.get("FREESOLO_API_KEY", "")
     if not key:
         cfg_path = pathlib.Path.home() / ".flash" / "config.json"
         if cfg_path.exists():
@@ -60,13 +81,27 @@ def _cp3_get(path: str) -> Any:
 # Submit + poll
 # ---------------------------------------------------------------------------
 
-def submit(toml_path: str) -> str:
-    """Submit the GRPO job and return the run_id."""
+def submit(toml_path: str, overrides: list[str] | None = None) -> str:
+    """Submit the GRPO job and return the run_id.
+
+    ``overrides`` are ``key=value`` dotted config overrides passed through to
+    ``slm train --set`` (e.g. ``train.steps=30``, ``environment.id=owner/name``) so the
+    benchmark's shared ``--steps``/``--env-id`` flags actually reach the Flash side.
+    """
+    set_args: list[str] = []
+    for ov in overrides or []:
+        set_args += ["--set", ov]
     result = subprocess.run(
-        [_SLM, "train", toml_path, "--background"],
+        [*_slm_cmd(), "train", toml_path, *set_args, "--background"],
         capture_output=True, text=True,
     )
     output = result.stdout + result.stderr
+    # Fail fast on a nonzero exit code: a failed `slm train` may still print a stray
+    # `flash-...` token, and polling a run that was never submitted would hang/mislead.
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"`slm train` exited with code {result.returncode}:\n{output}"
+        )
     # slm prints: "submitted run <run_id>"
     m = re.search(r"(flash-\d+-[0-9a-f]+)", output)
     if not m:
@@ -100,11 +135,15 @@ def _read_metrics(artifacts_dir: str) -> dict:
     return json.loads(p.read_text())
 
 
-def run(toml_path: str | None = None) -> dict:
-    """Full flash benchmark run. Returns a BenchResult dict."""
+def run(toml_path: str | None = None, overrides: list[str] | None = None) -> dict:
+    """Full flash benchmark run. Returns a BenchResult dict.
+
+    ``overrides`` are forwarded to ``slm train --set`` (see :func:`submit`) so the
+    orchestrator can apply the shared ``--steps``/``--env-id`` to the Flash run.
+    """
     toml_path = toml_path or str(_CONFIG_DIR / "gsm8k_4b.toml")
     t0 = time.monotonic()
-    run_id = submit(toml_path)
+    run_id = submit(toml_path, overrides=overrides)
     status = poll_until_done(run_id)
     wall = time.monotonic() - t0
 
@@ -123,6 +162,13 @@ def run(toml_path: str | None = None) -> dict:
     reward_history: list[float] = notes.get("reward_history", [])
     eval_history: list[dict] = notes.get("eval_history", [])
 
+    # Authoritative configured step count: the worker writes notes['steps']. The reward
+    # history can be shorter (logging cadence) or longer/reset (checkpoint resume), so
+    # len(reward_history) is NOT the trained-step count. Fall back to it only if absent.
+    steps = notes.get("steps")
+    if steps is None:
+        steps = len(reward_history)
+
     first_reward = reward_history[0] if reward_history else None
     final_reward = reward_history[-1] if reward_history else None
     final_eval = (
@@ -137,7 +183,7 @@ def run(toml_path: str | None = None) -> dict:
         "setup_s": m.get("setup_seconds"),
         "cost_usd": m.get("cost_usd") or status.get("cost_usd"),
         "gpu": m.get("allocated_gpu"),
-        "steps": len(reward_history),
+        "steps": steps,
         "first_train_reward": first_reward,
         "final_train_reward": final_reward,
         "final_eval_reward": final_eval,

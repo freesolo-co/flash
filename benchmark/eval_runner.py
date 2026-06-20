@@ -27,6 +27,16 @@ import re
 BASE_MODEL = "Qwen/Qwen3.5-4B"
 
 
+def _normalize(s: str) -> str:
+    """Canonicalize a numeric answer the SAME way for both prediction and gold.
+
+    Drops thousands separators, currency/percent symbols, surrounding whitespace, and a
+    trailing period, so exact-match isn't defeated by cosmetic differences (e.g. the gold
+    keeping a trailing "." or a "%" the prediction stripped).
+    """
+    return s.replace(",", "").replace("$", "").replace("%", "").strip().rstrip(".")
+
+
 def extract_answer(text: str) -> str:
     """Version-independent answer extraction: last \\boxed{...} else last number."""
     boxed = re.findall(r"\\boxed\{([^{}]*)\}", text)
@@ -34,14 +44,14 @@ def extract_answer(text: str) -> str:
     if not cand:
         nums = re.findall(r"-?\d[\d,]*(?:\.\d+)?", text)
         cand = nums[-1] if nums else ""
-    return cand.replace(",", "").replace("$", "").replace("%", "").strip().rstrip(".")
+    return _normalize(cand)
 
 
 def gold_answer(row: dict) -> str:
     a = str(row.get("answer", ""))
     if "####" in a:
         a = a.split("####")[-1]
-    return a.replace(",", "").replace("$", "").strip()
+    return _normalize(a)
 
 
 def eval_one(env_rows: list, *, base_model=None, sampler_path=None, n=50, max_tokens=1024) -> dict:

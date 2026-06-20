@@ -7,7 +7,7 @@
       "run_id": "flash-1781935796-746b8de9",
       "gpu": "A100 PCIe",
       "provider": "runpod",
-      "steps": 15,
+      "steps": 30,
       "first_reward": 1,
       "final_reward": 1,
       "final_smoothed": 0.9333333373069763,
@@ -36,7 +36,7 @@
       "setup_s": 12.19794774055481,
       "train_s": 1358.441510438919,
       "total_s": 1370.6394581794739,
-      "per_step_s": 90.5627673625946,
+      "per_step_s": 45.2813836812973,
       "train_tok_per_s": 271.3697992642249
     },
     "tinker": {
@@ -82,13 +82,13 @@
         0.375,
         0.25
       ],
-      "cost_usd": 0.8572,
+      "cost_usd": 0.8411,
       "cost_kind": "ESTIMATE: active-compute x $2.00/hr proxy (Tinker cost not in API)",
       "setup_s": null,
-      "train_s": 1543.020215247292,
+      "train_s": 1513.9582201824524,
       "total_s": 1543.020215247292,
-      "paused_s": null,
-      "per_step_s": 51.43400717490974,
+      "paused_s": 29.06199506483972,
+      "per_step_s": 50.46527400608174,
       "train_tok_per_s": null
     }
   },
@@ -100,7 +100,7 @@
       "run_id": "flash-1781935796-617700cb",
       "gpu": "A100 PCIe",
       "provider": "runpod",
-      "steps": 15,
+      "steps": 30,
       "first_reward": 0.41918787360191345,
       "final_reward": 0.43097159266471863,
       "final_smoothed": 0.37453253865242003,
@@ -129,7 +129,7 @@
       "setup_s": 47.63165640830994,
       "train_s": 884.6081557273865,
       "total_s": 932.2398121356964,
-      "per_step_s": 58.97387704849243,
+      "per_step_s": 29.486938524246217,
       "train_tok_per_s": 416.72688366396363
     },
     "tinker": {
@@ -175,13 +175,13 @@
         0.0,
         0.0
       ],
-      "cost_usd": 0.8498,
+      "cost_usd": 0.8405,
       "cost_kind": "ESTIMATE: active-compute x $2.00/hr proxy (Tinker cost not in API)",
       "setup_s": null,
-      "train_s": 1529.5748959309421,
+      "train_s": 1512.904495372437,
       "total_s": 1529.5748959309421,
-      "paused_s": null,
-      "per_step_s": 50.98582986436474,
+      "paused_s": 16.670400558505207,
+      "per_step_s": 50.4301498457479,
       "train_tok_per_s": null
     }
   },
@@ -193,7 +193,7 @@
       "run_id": "flash-1781935796-9d515fe0",
       "gpu": "A100 PCIe",
       "provider": "runpod",
-      "steps": 15,
+      "steps": 30,
       "first_reward": 0.6666666865348816,
       "final_reward": 0.9166666865348816,
       "final_smoothed": 0.7166666746139526,
@@ -222,7 +222,7 @@
       "setup_s": 12.275755167007446,
       "train_s": 1756.1867587566376,
       "total_s": 1768.462513923645,
-      "per_step_s": 117.07911725044251,
+      "per_step_s": 58.539558625221254,
       "train_tok_per_s": 209.90933803702825
     },
     "tinker": {
@@ -268,13 +268,13 @@
         0.375,
         0.1875
       ],
-      "cost_usd": 0.8427,
+      "cost_usd": 0.8272,
       "cost_kind": "ESTIMATE: active-compute x $2.00/hr proxy (Tinker cost not in API)",
       "setup_s": null,
-      "train_s": 1516.9200548059307,
+      "train_s": 1489.0257329707965,
       "total_s": 1516.9200548059307,
-      "paused_s": null,
-      "per_step_s": 50.564001826864356,
+      "paused_s": 27.89432183513418,
+      "per_step_s": 49.63419109902655,
       "train_tok_per_s": null
     }
   }

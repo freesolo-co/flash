@@ -14,10 +14,55 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import pathlib
 import time
+
+# Single shared Tinker cost proxy for the WHOLE benchmark (runner + assembler + results).
+# Tinker is managed and does NOT expose per-run cost via API; this is an explicit, labelled
+# proxy so the $ column is order-of-magnitude comparable to Flash's MEASURED cost. The
+# basis is ACTIVE compute (rollout + train step), excluding managed-backend capacity pauses,
+# matching assemble.py / results/comparison.json. assemble.py imports this constant.
+TINKER_PROXY_USD_PER_HR = 2.00
+
+
+_STEP_KEY = "time/total"  # per-step WALL time (sequential) — sums to the run wall-clock
+_ROLLOUT_KEY = "time/do_group_rollout_and_filter_constant_reward:total"
+_TRAIN_KEY = "time/train_step"
+_PAUSE_STEP_S = 300.0     # a step longer than this is a managed-backend capacity pause
+
+
+def active_compute_s(records: list[dict]) -> float | None:
+    """Active compute (wall minus managed-backend capacity pauses) from metrics.jsonl records.
+
+    Each record's ``time/total`` is that step's WALL time; steps run sequentially, so the times
+    sum to the run wall-clock. We prefer it because the rollout phase runs CONCURRENTLY, so
+    summing ``rollout:total`` + ``train_step`` exceeds wall-clock (observed "active 39m > wall
+    26m"). A managed-backend capacity pause ("running short on capacity, please wait") shows up
+    as ONE step hundreds-to-thousands of seconds long (vs ~20-30s normal); we treat the excess of
+    any ``> _PAUSE_STEP_S`` step over the median as idle pause (unbilled) and subtract it.
+
+    Falls back to the ``rollout + train_step`` sum only when no record carries ``time/total``
+    (real Tinker metrics always do; the fallback is for older/synthetic records).
+
+    Returns ``None`` ONLY when no record carries any timing key (genuinely no timing data — fall
+    back to wall). A real ``0.0`` is honored (callers guard with ``is not None``, not truthiness).
+    """
+    step_times = [r[_STEP_KEY] for r in records if _STEP_KEY in r]
+    if step_times:
+        med = sorted(step_times)[len(step_times) // 2]
+        pause = sum(t - med for t in step_times if t > _PAUSE_STEP_S)
+        return sum(step_times) - pause
+    roll = train = 0.0
+    have_timing = False
+    for r in records:
+        if _ROLLOUT_KEY in r or _TRAIN_KEY in r:
+            have_timing = True
+        roll += r.get(_ROLLOUT_KEY, 0) or 0
+        train += r.get(_TRAIN_KEY, 0) or 0
+    return (roll + train) if have_timing else None
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,10 +88,10 @@ def _patch_dataset_builder_for_verifiers_skew() -> None:
     only used as a rollout-group label downstream (it does not feed the reward), so we
     default it to the env id when absent. Mirrors the original builder otherwise.
     """
-    from tinker_cookbook.recipes.verifiers_rl import verifiers_env as _ve
     import verifiers as vf
+    from tinker_cookbook.recipes.verifiers_rl import verifiers_env as _ve
 
-    async def _call(self):  # noqa: ANN001
+    async def _call(self):
         env = _ve.get_vf_env()
         if env is None:
             env = vf.load_environment(self.vf_env_id, **self.vf_env_args)
@@ -95,7 +140,7 @@ def _patch_rollout_for_verifiers(model_name: str, group_size: int) -> None:
 
     cache: dict = {"client": None, "renderer": None, "tokenizer": None}
 
-    async def _custom(env_group_builder, policy, strategy=None):  # noqa: ANN001
+    async def _custom(env_group_builder, policy, strategy=None):
         if cache["tokenizer"] is None:
             cache["tokenizer"] = get_tokenizer(model_name)
             rname = model_info.get_recommended_renderer_name(model_name)
@@ -158,26 +203,65 @@ async def _run(args: argparse.Namespace) -> dict:
     return {"wall_s": wall}
 
 
-def _read_metrics_jsonl(log_path: str) -> list[dict]:
-    """Read Tinker's metrics.jsonl file from log_path."""
+def _parse_metrics_jsonl(path: str) -> list[dict]:
+    """Parse one metrics.jsonl into a list of records (skip blank / non-JSON lines).
+
+    Returns ``[]`` if the file is empty or has no parseable JSON lines. Single parser so
+    the file selector and the public reader judge "has records" the same way.
+    """
+    records: list[dict] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                with contextlib.suppress(json.JSONDecodeError):
+                    records.append(json.loads(line))
+    return records
+
+
+def select_metrics_file(log_path: str | None) -> str | None:
+    """Deterministically pick the metrics.jsonl for a Tinker run's log dir.
+
+    Single source of truth for BOTH the runner (``_read_metrics_jsonl``) and the
+    assembler (``_tinker_active_compute_s``), so they always parse the SAME file and
+    can never disagree on the active-compute total for a given log dir.
+
+    Selection: prefer a direct ``log_path/metrics.jsonl`` **only when it actually has
+    parseable records** — an empty/unparseable direct file must NOT shadow a nested
+    ``**/metrics.jsonl`` that holds the real timing data. Otherwise fall through to the
+    deterministically-sorted first nested file that has records. Returns ``None`` when no
+    metrics file with records exists (caller degrades to [] / no active-compute, no crash).
+    """
+    if not log_path:
+        return None
     import glob
-    # Tinker writes metrics.jsonl directly in log_path
-    candidates = glob.glob(os.path.join(log_path, "**", "metrics.jsonl"), recursive=True)
-    candidates += [os.path.join(log_path, "metrics.jsonl")]
-    for path in candidates:
-        if os.path.exists(path):
-            records = []
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
-            if records:
-                return records
-    return []
+    direct = os.path.join(log_path, "metrics.jsonl")
+    if os.path.exists(direct) and _parse_metrics_jsonl(direct):
+        return direct
+    nested = sorted(glob.glob(os.path.join(log_path, "**", "metrics.jsonl"), recursive=True))
+    for cand in nested:
+        if cand != direct and _parse_metrics_jsonl(cand):
+            return cand
+    # Nothing with records anywhere: surface the direct file if it exists (so an empty run
+    # still names its file) else None. Either way read_metrics_records returns [] gracefully.
+    return direct if os.path.exists(direct) else None
+
+
+def read_metrics_records(log_path: str | None) -> list[dict]:
+    """Parse the canonically-selected metrics.jsonl (see :func:`select_metrics_file`).
+
+    Shared parser so the runner and assembler read identical records. Returns [] if no
+    file is found or it has no valid JSON lines.
+    """
+    path = select_metrics_file(log_path)
+    if path is None:
+        return []
+    return _parse_metrics_jsonl(path)
+
+
+def _read_metrics_jsonl(log_path: str) -> list[dict]:
+    """Read Tinker's metrics.jsonl via the shared canonical selector/parser."""
+    return read_metrics_records(log_path)
 
 
 def main() -> None:
@@ -202,17 +286,36 @@ def main() -> None:
 
     reward_history = [r for r in (_reward_of(rec) for rec in records) if r is not None]
 
+    # Cost on the SAME basis as assemble.py / comparison.json: active compute (rollout +
+    # train step, capacity pauses excluded) x the shared $/hr proxy. Falls back to full wall
+    # ONLY when active is None (no timing rows at all); a legitimate 0.0 active is kept
+    # (use `is not None`, not truthiness). Emit active/paused so the JSON is self-consistent.
+    wall = timing["wall_s"]
+    active = active_compute_s(records)
+    basis = active if active is not None else wall
+    paused = (wall - active) if (active is not None and wall > active) else None
+
     result = {
         "platform": "tinker",
         "status": "done",
         "model": args.model,
         "env_id": args.env_id,
         "steps": args.steps,
-        "wall_s": timing["wall_s"],
-        # Tinker does not expose billing via API; compute from time × list price.
-        # H100 SXM at ~$3.50/hr is a representative Tinker training GPU.
-        "cost_usd_estimated": round(timing["wall_s"] / 3600 * 3.50, 4),
-        "cost_note": "estimated (Tinker does not expose cost via API; check your dashboard)",
+        "wall_s": wall,
+        "active_compute_s": active,
+        "paused_s": paused,
+        # Tinker does not expose billing via API; this is a labelled proxy, NOT a bill.
+        # `basis` is active-compute (rollout+train) when present, else wall; a legitimate 0.0
+        # basis (zero active compute) is a REAL value -> emit a 0.0 cost, never None. Guard on
+        # `is not None`, not truthiness, so 0.0 isn't dropped as "missing" (matches the module
+        # contract on active_compute_s; only a genuinely-None basis yields a None cost).
+        "cost_usd_estimated": (
+            round(basis / 3600 * TINKER_PROXY_USD_PER_HR, 4) if basis is not None else None
+        ),
+        "cost_note": (
+            f"estimated: active-compute x ${TINKER_PROXY_USD_PER_HR:.2f}/hr proxy "
+            "(pause excluded; Tinker cost not in API - check your dashboard)"
+        ),
         "first_train_reward": reward_history[0] if reward_history else None,
         "final_train_reward": reward_history[-1] if reward_history else None,
         "reward_history": reward_history,

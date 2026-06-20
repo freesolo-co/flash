@@ -5,7 +5,7 @@
   "env_id": "hendrycks-math",
   "steps": 30,
   "wall_s": 1516.9200548059307,
-  "cost_usd_estimated": 1.4748,
+  "cost_usd_estimated": 0.8272,
   "cost_note": "estimated (Tinker does not expose cost via API; check your dashboard)",
   "first_train_reward": 0.125,
   "final_train_reward": 0.1875,
@@ -41,5 +41,6 @@
     0.375,
     0.1875
   ],
-  "log_path": "/tmp/tinker-rerun-hendrycks-math"
+  "log_path": "/tmp/tinker-rerun-hendrycks-math",
+  "active_compute_s": 1489.0257329707965
 }
