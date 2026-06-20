@@ -189,7 +189,12 @@ def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> 
         raise EnvPublishError("env package is not valid base64") from exc
     if not tar_bytes:
         raise EnvPublishError("empty env package")
-    hub_name = f"{namespace_for(key)}-{_sanitize_name(name)}"
+    ns = namespace_for(key)
+    clean = _sanitize_name(name)
+    # Idempotent namespacing: a re-publish passes the name part of the already-namespaced slug
+    # ("<ns>-<name>", e.g. extracted from a config's [environment] id), so don't prefix it a second
+    # time into "<ns>-<ns>-<name>" — that would mint a NEW env instead of versioning the existing one.
+    hub_name = clean if clean == ns or clean.startswith(f"{ns}-") else f"{ns}-{clean}"
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)

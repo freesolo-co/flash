@@ -220,3 +220,19 @@ def test_prime_push_publishes_private_and_climbs_conflicts(monkeypatch, tmp_path
     assert "--auto-bump" in calls[1]
     assert calls[0][calls[0].index("--visibility") + 1] == "PRIVATE"
     assert calls[0][calls[0].index("--name") + 1] == "ns-env"
+
+
+def test_publish_is_idempotent_on_republish(monkeypatch):
+    # A re-publish passes the name part of the already-namespaced slug (e.g. "dev-clado-ai-myenv");
+    # it must NOT be prefixed again into "dev-clado-ai-dev-clado-ai-myenv" (a brand-new env).
+    seen: dict = {}
+    monkeypatch.setattr(
+        envs, "_prime_push", lambda env_dir, *, name, is_new: seen.update(name=name) or "x/y"
+    )
+    envs.publish_package(
+        package_b64=_pkg_b64(_MINIMAL),
+        name="dev-clado-ai-myenv",
+        is_new=False,
+        key={"email": "dev@clado.ai"},
+    )
+    assert seen["name"] == "dev-clado-ai-myenv"  # not double-prefixed
