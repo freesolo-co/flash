@@ -1,0 +1,18 @@
+{
+  "model": "Qwen/Qwen3.5-4B",
+  "steps": 30,
+  "group_size": 4,
+  "batch_size": 4,
+  "max_tokens": 512,
+  "launched_utc": "2026-06-20T04:21Z",
+  "flash": {
+    "gsm8k":          {"run_id": "flash-1781931136-29ad2400", "api_url": "http://127.0.0.1:8085", "hf_repo": "DavidBShan/flash-bench-gsm8k-4b", "note": "re-run on own plane; original flash-1781927427-8511772b orphaned on shared CP3 at step 25"},
+    "reverse-text":   {"run_id": "flash-1781929264-14e0889f", "api_url": "http://127.0.0.1:8085", "hf_repo": "DavidBShan/autoslm-cli-smoke-grpo (reused; HF create-cap)"},
+    "hendrycks-math": {"run_id": "flash-1781929264-6d2eb57c", "api_url": "http://127.0.0.1:8085", "hf_repo": "DavidBShan/autoslm-sdk-smoke-grpo (reused; HF create-cap)"}
+  },
+  "tinker": {
+    "gsm8k":          "results/tinker_gsm8k.json",
+    "reverse-text":   "results/tinker_reverse-text.json",
+    "hendrycks-math": "results/tinker_hendrycks-math.json"
+  }
+}

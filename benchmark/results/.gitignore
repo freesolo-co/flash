@@ -1,0 +1,5 @@
+# The root .gitignore ignores results/ globally, but the benchmark's published
+# results ARE the deliverable. Track the manifest, per-run JSON, and comparison.
+!*.json
+!*.md
+!.gitignore
