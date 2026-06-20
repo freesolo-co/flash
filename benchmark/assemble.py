@@ -75,7 +75,7 @@ def collect_flash(task: str, entry: dict, key: str) -> dict:
     """Pull one flash run's status + local metrics into a normalized record."""
     try:
         status = _get(entry["api_url"], f"/v1/runs/{entry['run_id']}", key)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return {"platform": "flash", "task": task, "status": f"unreachable: {exc}"}
 
     m = _read_flash_metrics(status.get("artifacts_dir"))
@@ -203,20 +203,22 @@ def render_markdown(records: dict) -> str:
     lines = []
     lines.append("# Flash vs Tinker — GRPO benchmark (Qwen3.5-4B, 30 steps)\n")
     lines.append("Same base model, same verifiers environment, same GRPO hyper-parameters "
-                 "(group_size=4, batch_size=4, max_tokens=512, 30 steps) on each side.\n")
+                 "(group_size=4, batch_size=4, **max_tokens=1024**, 30 steps) on each side. This run "
+                 "includes the **stall fix** (heartbeat through mid-run eval) and the **truncation "
+                 "fix** (1024 tokens so the boxed answer isn't cut off).\n")
     lines.append("- **Flash** trains on a rented RunPod **A100 PCIe** (4B GRPO needs ≥35 GB; the "
                  "allocator escalates from the requested RTX 5090). Cost is **measured** (RunPod billed).")
     lines.append("- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is "
-                 "**not exposed via API**, so its $ column is a wall-clock proxy (labelled).")
-    lines.append("- **Performance** = mean group reward over the 30-step GRPO run (step 1 → final). "
-                 "Flash also reports a native held-out eval (50 examples).\n")
+                 "**not exposed via API**, so its $ column is an active-compute proxy (labelled).")
+    lines.append("- **Performance** = the held-out eval below (one shared scorer); in-training reward "
+                 "is per-stack only (different verifiers reward versions).\n")
 
     # Per-task tables
     for task in TASKS:
         f = records[task]["flash"]
         t = records[task]["tinker"]
         lines.append(f"## {task}\n")
-        lines.append("| metric | Flash | Tinker | Δ (Flash − Tinker) |")
+        lines.append("| metric | Flash | Tinker | Δ (Flash - Tinker) |")
         lines.append("|---|---|---|---|")
         lines.append(f"| status | {f.get('status')} | {t.get('status')} | |")
         lines.append(f"| GPU | {f.get('gpu') or '—'} | {t.get('gpu')} | |")
@@ -234,25 +236,41 @@ def render_markdown(records: dict) -> str:
         lines.append(f"| cost basis | {f.get('cost_kind')} | {t.get('cost_kind')} | |")
         lines.append("")
 
-    # Held-out eval (clean, version-independent scorer) — the valid performance comparison
-    eval_path = _RESULTS / "eval_tinker_gsm8k.json"
+    # Held-out eval (one version-independent scorer) — the valid PERFORMANCE comparison.
+    eval_path = _RESULTS / "eval_unified_gsm8k.json"
     if eval_path.exists():
         ev = json.loads(eval_path.read_text())
-        b, tr = ev["base"], ev["trained"]
-        lines.append("## Held-out eval — gsm8k (clean cross-version scorer)\n")
-        lines.append("In-training GRPO reward is NOT comparable across stacks (different verifiers "
-                     "versions + task presentation; at matched 512 max_tokens the model's verbose "
-                     "answer is cut off before `\\boxed{}`). This eval removes those confounds: "
-                     f"greedy decode, max_tokens={ev['max_tokens']}, one exact-match scorer on "
-                     f"{b['n']} held-out examples.\n")
-        lines.append("| model | gsm8k accuracy | answer-truncated frac |")
+        b = ev.get("base", {})
+        tr = ev.get("tinker_trained", {})
+        ft = ev.get("flash_trained")  # present only if the Flash serving eval ran
+        flash_native = records["gsm8k"]["flash"].get("eval_reward")  # Flash's own on-GPU eval
+
+        def _d(rec):  # "Δ+0.080 vs base" suffix
+            d = rec.get("delta_vs_base")
+            return f" (Δ{d:+.3f} vs base)" if d is not None else ""
+
+        lines.append("## Held-out eval — gsm8k (the valid cross-stack performance comparison)\n")
+        lines.append("In-training GRPO reward is NOT comparable across stacks (Flash's worker uses "
+                     "verifiers ~0.1.14, Tinker pins 0.1.9 — different rewards + task presentation). "
+                     "This eval applies ONE version-independent exact-match scorer to every model, "
+                     f"identical greedy decoding, max_tokens={ev.get('max_tokens')}, on "
+                     f"{b.get('n')} held-out examples.\n")
+        lines.append("| model | gsm8k accuracy | how generated / scored |")
         lines.append("|---|---|---|")
-        lines.append(f"| base Qwen3.5-4B | {b['accuracy']:.3f} | {b.get('truncated_frac', 0):.2f} |")
-        lines.append(f"| Tinker-trained (30 GRPO steps) | {tr['accuracy']:.3f} | {tr.get('truncated_frac', 0):.2f} |")
-        lines.append(f"| **Δ (trained − base)** | **{ev['delta']:+.3f}** | |")
-        lines.append("\nTinker GRPO improved held-out accuracy AND cut answer truncation — the model "
-                     "learned to reach the answer sooner. (Flash-trained not re-served under the same "
-                     "scorer; Flash's native on-GPU eval is in the per-task tables above.)\n")
+        if b:
+            lines.append(f"| base Qwen3.5-4B | {b['accuracy']:.3f} | unified scorer, Tinker sampling |")
+        if tr:
+            lines.append(f"| **Tinker-trained** | **{tr['accuracy']:.3f}**{_d(tr)} | unified scorer, Tinker sampling |")
+        if ft:
+            lines.append(f"| **Flash-trained** | **{ft['accuracy']:.3f}**{_d(ft)} | unified scorer, Flash serving |")
+        elif flash_native is not None:
+            lines.append(f"| Flash-trained | {flash_native:.3f} | Flash's NATIVE on-GPU eval "
+                         "(gsm8k-env scorer, NOT the unified scorer — see note) |")
+        lines.append("\nWith the truncation fix (max_tokens=1024) the trained models reach the boxed "
+                     "answer; under the shared scorer the GRPO-trained model improves over base. The "
+                     "Flash-trained row falls back to Flash's own eval because the unified flash eval "
+                     "needs a Qwen3.5-4B LoRA serving (the live one was empty: 0 GPUs/base models); "
+                     "`eval_unified.py` runs the unified flash eval against any configured serving.\n")
 
     # Roll-up
     lines.append("## Summary\n")
@@ -297,7 +315,7 @@ def render_markdown(records: dict) -> str:
                  "truncate differently. Use the **held-out eval** (one scorer, generous tokens) for "
                  "performance, and **cost/latency** (measured) for the clean cross-stack comparison.")
     lines.append("- **Tinker cost is an estimate.** Tinker does not expose per-run cost via API; the $ "
-                 "column is active-compute-time × a GPU-rate proxy (pause excluded), not a bill. Flash "
+                 "column is active-compute-time x a GPU-rate proxy (pause excluded), not a bill. Flash "
                  "cost is the measured RunPod charge.")
     lines.append("- **Scale is deliberately small** (30 steps, 16 rollouts/step) to keep spend low, so "
                  "per-step reward is noisy and 30-step gains are modest by design.\n")

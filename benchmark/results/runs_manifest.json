@@ -3,16 +3,30 @@
   "steps": 30,
   "group_size": 4,
   "batch_size": 4,
-  "max_tokens": 512,
+  "max_tokens": 1024,
   "launched_utc": "2026-06-20T04:21Z",
   "flash": {
-    "gsm8k":          {"run_id": "flash-1781931136-29ad2400", "api_url": "http://127.0.0.1:8085", "hf_repo": "DavidBShan/flash-bench-gsm8k-4b", "note": "re-run on own plane; original flash-1781927427-8511772b orphaned on shared CP3 at step 25"},
-    "reverse-text":   {"run_id": "flash-1781929264-14e0889f", "api_url": "http://127.0.0.1:8085", "hf_repo": "DavidBShan/autoslm-cli-smoke-grpo (reused; HF create-cap)"},
-    "hendrycks-math": {"run_id": "flash-1781929264-6d2eb57c", "api_url": "http://127.0.0.1:8085", "hf_repo": "DavidBShan/autoslm-sdk-smoke-grpo (reused; HF create-cap)"}
+    "gsm8k": {
+      "run_id": "flash-1781935796-746b8de9",
+      "api_url": "http://127.0.0.1:8085",
+      "hf_repo": "DavidBShan/flash-bench-gsm8k-4b"
+    },
+    "reverse-text": {
+      "run_id": "flash-1781935796-617700cb",
+      "api_url": "http://127.0.0.1:8085",
+      "hf_repo": "DavidBShan/autoslm-cli-smoke-grpo (reused)"
+    },
+    "hendrycks-math": {
+      "run_id": "flash-1781935796-9d515fe0",
+      "api_url": "http://127.0.0.1:8085",
+      "hf_repo": "DavidBShan/autoslm-sdk-smoke-grpo (reused)"
+    }
   },
   "tinker": {
-    "gsm8k":          "results/tinker_gsm8k.json",
-    "reverse-text":   "results/tinker_reverse-text.json",
+    "gsm8k": "results/tinker_gsm8k.json",
+    "reverse-text": "results/tinker_reverse-text.json",
     "hendrycks-math": "results/tinker_hendrycks-math.json"
-  }
+  },
+  "rerun_utc": "2026-06-20T06:10Z",
+  "note": "re-run with stall fix (heartbeat during eval) + truncation fix (max_tokens 1024)"
 }
