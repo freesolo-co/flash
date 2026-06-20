@@ -41,7 +41,8 @@ GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref f
 
 # Model-FLOPs utilization: fraction of peak the run actually sustains. Physical throughput
 # constants, JOINTLY calibrated (with cold-start below) against the measured wall clock of
-# 56 real RunPod/Vast runs by minimizing median cost APE -- the way you'd measure MFU
+# the real RunPod/Vast runs (cost_estimator_results/real_runs/measured_runs.json) by
+# minimizing median cost APE -- the way you'd measure MFU
 # empirically, not a correction on the output. LoRA + small batches underutilize the card,
 # so these sit well below dense-pretraining MFU.
 MFU_TRAIN = 0.35  # GRPO policy/reference update (processes the rollout batch)
@@ -58,7 +59,7 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 REWARD_CONCURRENCY = 16.0
 
 # --- cold-start overhead (seconds), post-allocation: container boot + deps + model
-# download (+ vLLM init for GRPO). Jointly calibrated against the 56 runs' measured wall.
+# download (+ vLLM init for GRPO). Jointly calibrated against those runs' measured wall.
 # NOTE: the per-run implied cold-start spans ~470-840s (1.8x), so this term is the dominant
 # source of the irreducible per-run error -- a short, cold-start-bound run cannot be priced
 # tighter than that spread, whatever the constant. We fit the central value, not the noise.

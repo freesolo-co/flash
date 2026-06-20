@@ -176,7 +176,7 @@ def fit_constants(path: Path | str | None = None) -> dict:
     realized $/hr per GPU class (median of the providers' billed rate, derived as measured
     cost / measured wall). This is an *input* the hardcoded constants should track -- a price
     calibration, not a correction applied to the output. Use it to refresh
-    ``hardware.REALIZED_HOURLY_USD`` as new runs land. (MFU/reward-concurrency are calibrated
+    ``facts.REALIZED_HOURLY_USD`` as new runs land. (MFU/reward-concurrency are calibrated
     separately against the same dataset, not returned here.)
     """
     runs = _load_runs(path)

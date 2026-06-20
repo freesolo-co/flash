@@ -61,7 +61,11 @@ def build_report() -> str:
     acc = verify_accuracy()
     sweep = environment_cost_sweep()
     consts = fit_constants()
-    real = acc["real"]
+    # ``verify_accuracy`` omits any group with zero rows, so "real" is absent when the dataset
+    # has no >=500s runs. Fall back to "all"; only a fully empty dataset has neither.
+    real = acc.get("real") or acc.get("all")
+    if real is None:
+        raise SystemExit("no runs in measured_runs.json -- nothing to grade")
     money = (
         f"**Money outcome — does the estimator break even, gain, or lose?** If the estimate "
         f"is the quote and the measured cost is what we pay the provider, then over the "

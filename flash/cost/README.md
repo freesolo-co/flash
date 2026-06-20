@@ -30,7 +30,7 @@ you'd measure MFU empirically, **never** a dimensionless correction on the resul
 - **Reward concurrency** — graders run in parallel; the reward wall is
   `completions × per-completion-latency / concurrency`, *not* the serial product (which
   over-counts a heavy LLM-judge by ~100× and saturates the 24 h wall cap).
-- **Realized $/hr** (`hardware.REALIZED_HOURLY_USD`) — the median effective rate
+- **Realized $/hr** (`facts.REALIZED_HOURLY_USD`) — the median effective rate
   (measured cost ÷ measured wall) per GPU class, an empirical observation rather than list
   ± a fixed discount. Usually below list (the spot discount: RTX 5090 lists $0.99 but bills
   ~$0.87; A100 PCIe lists $1.39 but bills ~$1.04), but it can run *above* list when the
