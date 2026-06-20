@@ -7,8 +7,13 @@ Adds **Prime Lab** to the Flash-vs-Tinker cost-of-training benchmark. Same model
 | stack | what it is | how it bills | our $ basis |
 |---|---|---|---|
 | **Flash** | managed LoRA on rented GPUs | RunPod GPU-time | **measured** (billed) |
-| **Tinker** | managed fine-tuning API | not API-exposed | proxy (active-compute × $2/hr) |
-| **Prime Lab** | Prime Intellect Hosted Training | **per token** (in/out/train) | **published-rate estimate** (rates confirmed live; run is billing-gated) |
+| **Tinker** | managed fine-tuning API | **per token** ($0.22/$0.67/$0.67 /Mtok) | published rate card × token model |
+| **Prime Lab** | Prime Intellect Hosted Training | **per token** ($0.10/$0.30/$0.30 /Mtok) | published rate (confirmed live) × token model |
+
+Tinker and Prime Lab both bill **per token**, so they compare apples-to-apples:
+Tinker's Qwen3.5-4B card is a flat **~2.2×** Prime Lab's → ~2.2× the cost on
+every task. (The earlier Flash-vs-Tinker run priced Tinker with a GPU-time proxy,
+which overstated it; see `../results/primelab_pricing.md`.)
 
 Prime Lab is the disaggregated-async-RL hosted product (`prime train`): a shared
 Trainer + Inference + a dedicated Orchestrator, billed **per token** on three

@@ -41,10 +41,21 @@ from __future__ import annotations
 import argparse
 import json
 
-# Confirmed-live Prime Lab rates for Qwen/Qwen3.5-4B ($ per 1,000,000 tokens).
+# Per-token rates for Qwen/Qwen3.5-4B ($ per 1,000,000 tokens).
+# Prime Lab: confirmed live from `prime train models` (June 2026).
+# Tinker:    published rate card at https://thinkingmachines.ai/tinker (prefill /
+#            sample / train) -- Tinker ALSO bills per token, so the apples-to-
+#            apples comparison is per-token vs per-token (NOT vs the GPU-time
+#            proxy the original Flash-vs-Tinker run used). Tinker's card is a flat
+#            ~2.2x Prime Lab across all three meters, so Tinker/PrimeLab ~= 2.2x
+#            on every task regardless of the token-length assumptions below.
 RATE_IN = 0.10
 RATE_OUT = 0.30
 RATE_TRAIN = 0.30
+
+TINKER_IN = 0.22
+TINKER_OUT = 0.67
+TINKER_TRAIN = 0.67
 
 # Benchmark matrix (identical to the Flash/Tinker runs).
 MAX_STEPS = 30
@@ -61,11 +72,13 @@ TASKS = {
     "reverse-text":   {"prompt_len": 96,  "completion_len": 96},
 }
 
-# Measured Flash (RunPod billed) and Tinker (active-compute proxy) $ for context.
+# Flash = measured (RunPod billed). tinker_proxy = the original active-compute x
+# $2/hr GPU-TIME proxy (kept only to show how much it overstated Tinker vs its
+# real per-token card).
 REFERENCE = {
-    "gsm8k":          {"flash": 0.1636, "tinker": 0.8411},
-    "reverse-text":   {"flash": 0.0651, "tinker": 0.8405},
-    "hendrycks-math": {"flash": 0.2137, "tinker": 0.8272},
+    "gsm8k":          {"flash": 0.1636, "tinker_proxy": 0.8411},
+    "reverse-text":   {"flash": 0.0651, "tinker_proxy": 0.8405},
+    "hendrycks-math": {"flash": 0.2137, "tinker_proxy": 0.8272},
 }
 
 
@@ -73,14 +86,16 @@ def rollouts() -> int:
     return MAX_STEPS * BATCH_SIZE * GROUP_SIZE
 
 
-def estimate(prompt_len: int, completion_len: int, train_full: bool = False) -> dict:
+def estimate(prompt_len: int, completion_len: int,
+             r_in: float, r_out: float, r_train: float,
+             train_full: bool = False) -> dict:
     r = rollouts()
     input_tok = prompt_len * r
     output_tok = completion_len * r
     train_tok = (prompt_len + completion_len) * r if train_full else completion_len * r
-    cost_in = input_tok / 1e6 * RATE_IN
-    cost_out = output_tok / 1e6 * RATE_OUT
-    cost_train = train_tok / 1e6 * RATE_TRAIN
+    cost_in = input_tok / 1e6 * r_in
+    cost_out = output_tok / 1e6 * r_out
+    cost_train = train_tok / 1e6 * r_train
     return {
         "input_tok": input_tok,
         "output_tok": output_tok,
@@ -101,38 +116,47 @@ def main() -> None:
     args = ap.parse_args()
 
     out = {}
-    print(f"Prime Lab cost-of-training estimate  (Qwen3.5-4B, {MAX_STEPS} steps, "
-          f"batch {BATCH_SIZE} x group {GROUP_SIZE} = {rollouts()} rollouts)")
-    print(f"rates per 1M tok:  in ${RATE_IN}  out ${RATE_OUT}  train ${RATE_TRAIN}"
-          f"   (train meter: {'full-seq' if args.train_full else 'completion-only'})\n")
-    hdr = f"{'task':<16}{'central $':>11}{'@cap $':>10}{'Flash $':>10}{'Tinker $':>10}{'PL/Flash':>10}{'Tinker/PL':>11}"
+    meter = "full-seq" if args.train_full else "completion-only"
+    print(f"Cost of training  (Qwen3.5-4B, {MAX_STEPS} steps, "
+          f"batch {BATCH_SIZE} x group {GROUP_SIZE} = {rollouts()} rollouts, "
+          f"train meter: {meter})")
+    print(f"per-token rates /1M:  Tinker {TINKER_IN}/{TINKER_OUT}/{TINKER_TRAIN}"
+          f"   PrimeLab {RATE_IN}/{RATE_OUT}/{RATE_TRAIN}   (in/out/train)\n")
+    print("Apples-to-apples: both Tinker and Prime Lab bill PER TOKEN. Flash is a")
+    print("measured GPU-rental bill (different model). tinker_proxy below is the OLD")
+    print("GPU-time proxy ($2/hr) -- shown only to flag how much it overstated Tinker.\n")
+    hdr = (f"{'task':<16}{'Flash(meas)':>12}{'Tinker/tok':>12}{'PrimeLab/tok':>13}"
+           f"{'Tink/PL':>9}{'[tink_proxy]':>13}")
     print(hdr)
     print("-" * len(hdr))
     for task, t in TASKS.items():
-        central = estimate(t["prompt_len"], t["completion_len"], args.train_full)
-        at_cap = estimate(t["prompt_len"], MAX_TOKENS, args.train_full)
+        pl = estimate(t["prompt_len"], t["completion_len"],
+                      RATE_IN, RATE_OUT, RATE_TRAIN, args.train_full)["cost_total"]
+        tk = estimate(t["prompt_len"], t["completion_len"],
+                      TINKER_IN, TINKER_OUT, TINKER_TRAIN, args.train_full)["cost_total"]
         flash = REFERENCE[task]["flash"]
-        tinker = REFERENCE[task]["tinker"]
-        pl = central["cost_total"]
-        print(f"{task:<16}{pl:>11.4f}{at_cap['cost_total']:>10.4f}"
-              f"{flash:>10.4f}{tinker:>10.4f}{pl/flash:>9.2f}x{tinker/pl:>10.2f}x")
+        proxy = REFERENCE[task]["tinker_proxy"]
+        print(f"{task:<16}{flash:>12.3f}{tk:>12.3f}{pl:>13.3f}"
+              f"{tk/pl:>8.2f}x{proxy:>13.3f}")
         out[task] = {
-            "prime_lab_central_usd": round(pl, 4),
-            "prime_lab_at_cap_usd": round(at_cap["cost_total"], 4),
             "flash_measured_usd": flash,
-            "tinker_proxy_usd": tinker,
-            "breakdown_central": {k: round(v, 5) if "cost" in k else v
-                                   for k, v in central.items()},
+            "tinker_per_token_usd": round(tk, 4),
+            "prime_lab_per_token_usd": round(pl, 4),
+            "tinker_over_primelab": round(tk / pl, 2),
+            "tinker_gpu_time_proxy_usd": proxy,
             "assumptions": t,
         }
     if args.json:
         print("\n" + json.dumps({
             "model": "Qwen/Qwen3.5-4B",
-            "rates_per_mtok": {"input": RATE_IN, "output": RATE_OUT, "training": RATE_TRAIN},
+            "rates_per_mtok": {
+                "tinker": {"input": TINKER_IN, "output": TINKER_OUT, "training": TINKER_TRAIN},
+                "prime_lab": {"input": RATE_IN, "output": RATE_OUT, "training": RATE_TRAIN},
+            },
             "config": {"max_steps": MAX_STEPS, "batch_size": BATCH_SIZE,
                        "group_size": GROUP_SIZE, "max_tokens": MAX_TOKENS,
                        "rollouts": rollouts()},
-            "train_meter": "full-seq" if args.train_full else "completion-only",
+            "train_meter": meter,
             "tasks": out,
         }, indent=2))
 

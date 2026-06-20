@@ -10,58 +10,72 @@ stack: **Prime Lab** (Prime Intellect Hosted Training, `prime train`). Same
 | stack | architecture | meter | what you pay for |
 |---|---|---|---|
 | **Flash** | dedicated rented GPU, **colocated** vLLM rollouts + trainer | GPU-**hours** | wall-clock × $/hr (incl. setup/idle) |
-| **Tinker** | managed backend | not exposed | (proxy: active-compute × $2/hr) |
-| **Prime Lab** | **disaggregated** async RL — shared Trainer + Inference, dedicated Orchestrator | **tokens** | tokens that actually move the model |
+| **Tinker** | managed backend | **tokens** (prefill / sample / train) | tokens processed |
+| **Prime Lab** | **disaggregated** async RL — shared Trainer + Inference, dedicated Orchestrator | **tokens** (input / output / train) | tokens that actually move the model |
 
-The interesting axis is **time vs tokens**: Flash's cost scales with how long a
-GPU is held; Prime Lab's scales with how many tokens the run touches. They cross.
+Tinker and Prime Lab share a billing model (per token) → compare them directly.
+Flash is the odd one out (GPU-hours), so **time vs tokens** is the axis between
+Flash and the two per-token stacks: Flash's cost scales with how long a GPU is
+held; the per-token cost scales with how many tokens the run touches. They cross.
 
-## Prime Lab rates (confirmed live)
+> The original Flash-vs-Tinker run used a Tinker **GPU-time proxy** (~$2/hr ×
+> active compute) because we couldn't read Tinker's bill via API. That proxy
+> badly overstates Tinker's real **per-token** cost on small runs; this doc uses
+> Tinker's published per-token card instead, so Tinker and Prime Lab are
+> apples-to-apples.
 
-From `prime train models` for `Qwen/Qwen3.5-4B` (June 2026) — identical to the
-banner `prime train` prints at launch:
+## Per-token rate cards (Qwen3.5-4B, $ / 1M tokens)
 
-| meter | $ / 1M tokens |
-|---|---|
-| inference input | $0.10 |
-| inference output | $0.30 |
-| training | $0.30 |
+**Both Tinker and Prime Lab bill per token** — so the fair comparison is
+per-token vs per-token, not against a GPU-time proxy.
 
-## Cost of training (headline)
+| meter | Tinker | Prime Lab | Tinker / Prime Lab |
+|---|---|---|---|
+| input (prefill) | $0.22 | $0.10 | 2.2× |
+| output (sample) | $0.67 | $0.30 | 2.23× |
+| training | $0.67 | $0.30 | 2.23× |
 
-Flash = **measured** (RunPod billed). Tinker = active-compute **proxy**
-(per-step wall × $2/hr; its real per-run $ is not API-exposed). Prime Lab =
-**published-rate estimate** — the rates above × the GRPO token volume (central
-token model below). Prime Lab's real bill **is** API-exposed via
-`prime train usage <run_id>`; our live run was billing-gated (wallet $0), so the
-column is an estimate, not a charge.
+Prime Lab rates: confirmed live from `prime train models` (June 2026; identical
+to the banner `prime train` prints at launch). Tinker rates: published card at
+<https://thinkingmachines.ai/tinker>.
 
-| task | Flash $ (measured) | Tinker $ (proxy) | **Prime Lab $ (est.)** | Tinker / Flash | Tinker / Prime Lab | Prime Lab / Flash |
-|---|---|---|---|---|---|---|
-| gsm8k | **$0.164** | ~$0.84 | **~$0.23** | 5.1× | **3.6×** | 1.4× |
-| reverse-text | **$0.065** | ~$0.84 | **~$0.03** | 12.9× | **26×** | **0.5×** |
-| hendrycks-math | **$0.214** | ~$0.83 | **~$0.24** | 3.9× | **3.5×** | 1.1× |
+## Cost of training (headline — apples-to-apples per token)
 
-Range (sensitivity): the math tasks span **~$0.23 (central) → ~$0.34 (training
-metered on the full prompt+completion sequence at the cap)**; reverse-text stays
-**~$0.03–0.05** because its completions are short. See `cost.py --train-full`.
+Tinker and Prime Lab are both **per-token, same token volume**, so their $ ride
+on the rate cards above (Tinker is a flat ~2.2× Prime Lab across all three
+meters). Flash is a **measured GPU-rental** bill (different billing model).
+Prime Lab's real bill is API-exposed via `prime train usage <run_id>`; our live
+run was billing-gated (wallet $0), so its column (and Tinker's, also not run
+here) is a published-rate estimate on the token model below.
+
+| task | Flash $ (measured) | **Tinker $ (per-token)** | **Prime Lab $ (per-token)** | Tinker / Prime Lab | Tinker / Flash |
+|---|---|---|---|---|---|
+| gsm8k | **$0.164** | **~$0.52** | **~$0.23** | **2.2×** | 3.2× |
+| reverse-text | **$0.065** | **~$0.072** | **~$0.032** | **2.2×** | 1.1× |
+| hendrycks-math | **$0.214** | **~$0.53** | **~$0.24** | **2.2×** | 2.5× |
 
 ### What this says
 
-1. **Both "pay-for-compute" stacks crush the GPU-time proxy.** Prime Lab's
-   per-token bill is **3.5–26× under Tinker's** estimate and on the same order as
-   Flash. Tinker's number is the outlier because the proxy charges ~25 min of
-   managed GPU time per run regardless of how few tokens a 30-step run touches.
-2. **Prime Lab ≈ Flash for tiny runs, and *cheaper* when generations are short.**
-   reverse-text (short outputs → few tokens) costs Prime Lab **~half** of Flash,
-   which still pays for ~3 min of held A100 plus setup. On the verbose math tasks
-   Prime Lab is ~1.1–1.4× Flash.
-3. **Time vs tokens — the crossover.** Per-token (Prime Lab) wins when a run is
-   short / low-token (no setup, no idle, no GPU held during slow eval). Flat
-   GPU-rental (Flash) wins as token volume climbs — long context, large groups,
-   many steps — because $/hr is fixed while the per-token meter keeps running.
-   At this deliberately small scale (480 rollouts, 30 steps) per-token is at its
-   most favorable; scale up and Flash's flat rate pulls ahead.
+1. **Prime Lab is ~2.2× cheaper than Tinker — flat, on every task.** Because both
+   bill per token over the identical token volume, the ratio collapses to the
+   rate-card ratio (~2.2×) and the token-length assumptions cancel out of it
+   entirely. (They still set the absolute $, not the ratio.)
+2. **Mind the proxy.** The earlier Flash-vs-Tinker run priced Tinker with a
+   GPU-**time** proxy (~$0.84 = ~25 min × $2/hr). That **overstated Tinker's real
+   per-token cost** badly on cheap runs — e.g. reverse-text's true per-token cost
+   is ~$0.07, not $0.84. Don't compare a per-token stack against a per-hour proxy.
+3. **Flash (measured GPU) is cheapest on the math tasks** (~$0.16–0.21 vs Prime
+   Lab ~$0.23–0.24 vs Tinker ~$0.52–0.53). On short reverse-text Flash ≈ Tinker
+   per-token, and Prime Lab is the cheapest (~$0.03).
+4. **Time vs tokens — the crossover (Flash vs the per-token stacks).** Per-token
+   wins short / low-token runs (no setup, no idle, no GPU held). Flat GPU-rental
+   (Flash) pulls ahead as token volume climbs — long context, large groups, many
+   steps — because $/hr is fixed while the per-token meter keeps running. This
+   tiny 480-rollout matrix is where per-token is most favorable.
+
+Sensitivity: math tasks span ~$0.23→0.34 (Prime Lab) / ~$0.52→0.76 (Tinker)
+between the completion-only and full-sequence-at-cap training meters; the **2.2×
+Tinker/Prime Lab ratio holds regardless**. See `cost.py` / `cost.py --train-full`.
 
 ## Token model (how the Prime Lab estimate is built)
 
