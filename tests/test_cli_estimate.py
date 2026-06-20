@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import types
 
 from flash.cli.main.commands import _runconfig_from_spec, _spec_steps, cmd_train
@@ -177,3 +178,91 @@ def test_cmd_train_estimate_prints_breakdown_without_submitting(tmp_path, monkey
     assert "TOTAL" in out
     assert "$" in out
     assert "RTX 5090" in out
+
+
+# --- --estimate is network-free even for an unlisted (open-model-policy) model ---------------
+# An UNLISTED model under model_policy="allow" parses via resolve_model -> check_fit and sizes via
+# resolve_gpu_policy -> model_required_vram_gb; both reach engine.vram.fetch_hf_params_b, which probes
+# the Hugging Face API (constructs HfApi) UNLESS FLASH_SKIP_NET is set. cmd_train's --estimate branch
+# forces FLASH_SKIP_NET on for the whole flow (parse + size), so estimation never does network I/O
+# even when the user hasn't set it. We detect the network probe by recording HfApi construction:
+# fetch_hf_params_b builds HfApi only AFTER its skip-net short-circuit AND swallows exceptions
+# internally, so a side-effect FLAG (not a raise) is the reliable detector.
+_UNLISTED_ESTIMATE_TOML = (
+    'model = "acme/unlisted-7b"\n'
+    'model_policy = "allow"\n'
+    'algorithm = "grpo"\n'
+    "[environment]\n"
+    'id = "primeintellect/gsm8k"\n'
+    "[train]\n"
+    "steps = 50\n"
+    'hf_repo = "owner/runs"\n'
+    "[gpu]\n"
+    'type = "auto"\n'  # policy word -> also exercises resolve_gpu_policy's sizing probe
+)
+
+
+def _record_hfapi(monkeypatch) -> list[int]:
+    """Replace huggingface_hub.HfApi with a recorder; returns a list that gains an entry per
+    construction (== one network probe). model_info raises so any caller that DID reach the
+    network falls back as if offline (matching the real best-effort path)."""
+    calls: list[int] = []
+
+    class _Recorder:
+        def __init__(self, *a, **k):
+            calls.append(1)
+
+        def model_info(self, *a, **k):
+            raise RuntimeError("offline (test: no network)")
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Recorder, raising=True)
+    return calls
+
+
+def _estimate_args(cfg) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        config=str(cfg), overrides=[], extra_configs=[], estimate=True, dry_run=False, background=False
+    )
+
+
+def test_estimate_unlisted_model_does_no_network_without_flash_skip_net(tmp_path, monkeypatch, capsys):
+    # Pre-fix this fails: cmd_train parsed the spec BEFORE checking --estimate, so the open-model
+    # spec-parse + GPU sizing each constructed HfApi (network) when FLASH_SKIP_NET was unset.
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+    calls = _record_hfapi(monkeypatch)
+    cfg = tmp_path / "run.toml"
+    cfg.write_text(_UNLISTED_ESTIMATE_TOML)
+
+    rc = cmd_train(_estimate_args(cfg))
+
+    assert rc == 0
+    assert calls == [], "--estimate must not construct HfApi (no network) for an unlisted model"
+    out = capsys.readouterr().out
+    assert "TOTAL" in out
+    assert "$" in out
+    # The estimate still produced a fully-validated spec sized via the offline heuristic.
+    assert "acme/unlisted-7b" in out
+
+
+def test_estimate_restores_preexisting_flash_skip_net(tmp_path, monkeypatch):
+    # The scoped env guard must restore a PRE-EXISTING FLASH_SKIP_NET value afterward (not leave the
+    # forced "1" behind, and not delete a value the caller had set).
+    monkeypatch.setenv("FLASH_SKIP_NET", "preexisting")
+    _record_hfapi(monkeypatch)
+    cfg = tmp_path / "run.toml"
+    cfg.write_text(_UNLISTED_ESTIMATE_TOML)
+
+    assert cmd_train(_estimate_args(cfg)) == 0
+    assert os.environ.get("FLASH_SKIP_NET") == "preexisting"
+
+
+def test_estimate_does_not_set_flash_skip_net_when_unset(tmp_path, monkeypatch):
+    # When FLASH_SKIP_NET was UNSET, the guard must leave it unset afterward (no leak of the forced
+    # value into the rest of the process / a later real run).
+    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+    _record_hfapi(monkeypatch)
+    cfg = tmp_path / "run.toml"
+    cfg.write_text(_UNLISTED_ESTIMATE_TOML)
+
+    assert cmd_train(_estimate_args(cfg)) == 0
+    assert "FLASH_SKIP_NET" not in os.environ

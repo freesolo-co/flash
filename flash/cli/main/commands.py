@@ -351,27 +351,55 @@ def cmd_env_list(args) -> int:
     return 0
 
 
+def _cmd_train_estimate(args) -> int:
+    """`slm train --estimate`: a fully local pre-flight cost estimate (no credentials/server/GPU).
+
+    Estimation must NEVER do network I/O -- even for an UNLISTED model under
+    ``model_policy = "allow"``, whose spec-parse (``resolve_model`` -> ``check_fit``) and GPU sizing
+    (``resolve_gpu_policy`` -> ``model_required_vram_gb``) would otherwise probe the Hugging Face API
+    via ``engine.vram.fetch_hf_params_b`` whenever ``FLASH_SKIP_NET`` is unset. ``fetch_hf_params_b``
+    already short-circuits to its offline heuristic when ``FLASH_SKIP_NET`` is set for ANY caller, so
+    we force it on for the WHOLE estimate flow (parse + size) via a scoped env guard, restoring the
+    prior value in ``finally`` so the real run path (which IS allowed to hit the network for unlisted
+    models per ``model_policy``) is unchanged. The real run does not pass through here.
+    """
+    prior_skip_net = os.environ.get("FLASH_SKIP_NET")
+    os.environ["FLASH_SKIP_NET"] = "1"
+    try:
+        spec = spec_from_file(
+            args.config,
+            run_id=None,
+            overrides=getattr(args, "overrides", None),
+            extra_configs=getattr(args, "extra_configs", None),
+        )
+        from flash.cost import estimate_cost
+
+        print(estimate_cost(_runconfig_from_spec(spec)).breakdown())
+    finally:
+        if prior_skip_net is None:
+            os.environ.pop("FLASH_SKIP_NET", None)
+        else:
+            os.environ["FLASH_SKIP_NET"] = prior_skip_net
+    # SFT with no max_examples trains the full env dataset, whose size isn't readable
+    # locally; the step count assumes a floor, so the estimate is a LOWER BOUND.
+    if spec.algorithm != "grpo" and spec.train.max_examples is None:
+        print(
+            f"  note: SFT max_examples unset -> step count assumes "
+            f"{_SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED} examples; the real env train split is "
+            "usually larger, so this estimate is a FLOOR. Set [train].max_examples to pin it."
+        )
+    return 0
+
+
 def cmd_train(args) -> int:
+    if getattr(args, "estimate", False):
+        return _cmd_train_estimate(args)
     spec = spec_from_file(
         args.config,
         run_id=new_run_id() if args.dry_run else None,
         overrides=getattr(args, "overrides", None),
         extra_configs=getattr(args, "extra_configs", None),
     )
-    if getattr(args, "estimate", False):
-        # Fully local pre-flight cost estimate from the config (no credentials/server/GPU).
-        from flash.cost import estimate_cost
-
-        print(estimate_cost(_runconfig_from_spec(spec)).breakdown())
-        # SFT with no max_examples trains the full env dataset, whose size isn't readable
-        # locally; the step count assumes a floor, so the estimate is a LOWER BOUND.
-        if spec.algorithm != "grpo" and spec.train.max_examples is None:
-            print(
-                f"  note: SFT max_examples unset -> step count assumes "
-                f"{_SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED} examples; the real env train split is "
-                "usually larger, so this estimate is a FLOOR. Set [train].max_examples to pin it."
-            )
-        return 0
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.
         print(
