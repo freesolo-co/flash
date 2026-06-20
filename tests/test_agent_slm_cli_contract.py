@@ -58,7 +58,8 @@ from flash.runner import (
     ],
 )
 def test_agent_required_subcommands_exist(subcommand: str) -> None:
-    """The agent's worker drives `flash train/status/logs/ps/cancel/env install/...`.
+    """The agent's worker drives the CLI's `train/status/logs/ps/cancel/env install/...`
+    subcommands (invoked as `slm`, the deprecated alias of `flash` — see the module docstring).
 
     argparse exits with code 2 and an 'invalid choice' message when a subcommand
     does not exist. We invoke each with `--help`, which exits 0 for a real
