@@ -39,8 +39,11 @@ def make_fake_vllm(
     latency: float = 0.0,
     fail: bool = False,
     completion: str | None = None,
+    choices_pool: list[str] | None = None,
 ):
-    """A fake vLLM OpenAI server. ``latency`` simulates decode time; ``fail`` makes chat 500."""
+    """A fake vLLM OpenAI server. ``latency`` simulates decode time; ``fail`` makes chat 500.
+    ``choices_pool`` (when set) cycles its strings across the ``n`` completions of each request, so a
+    GRPO group gets a deterministic MIX of completions (a real learning signal for training tests)."""
     from fastapi import FastAPI, HTTPException
 
     rec = BackendRecord(base_model=base_model)
@@ -96,9 +99,14 @@ def make_fake_vllm(
             with rec._lock:
                 rec._inflight -= 1
         n = int(body.get("n", 1))
-        text = completion if completion is not None else f"[{model}] ok"
+
+        def _content(i: int) -> str:
+            if choices_pool:
+                return choices_pool[i % len(choices_pool)]
+            return completion if completion is not None else f"[{model}] ok"
+
         choices = [
-            {"index": i, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
+            {"index": i, "message": {"role": "assistant", "content": _content(i)}, "finish_reason": "stop"}
             for i in range(n)
         ]
         return {"object": "chat.completion", "model": model, "choices": choices}
@@ -186,11 +194,13 @@ def build_harness(
     *,
     reward_workers: int = 0,
     reward_latency: float = 0.0,
+    reward_scorer=None,
     max_retries: int = 2,
 ) -> PoolHarness:
     """Start fake backends + reward workers + the router, all on loopback, and register them.
 
-    ``backends`` = list of ``{id, base_model, latency?, fail?, max_loras?, completion?}``.
+    ``backends`` = list of ``{id, base_model, latency?, fail?, max_loras?, completion?, choices_pool?}``.
+    ``reward_scorer`` overrides the default length-based scorer (for real learning-signal tests).
     """
     from flash.pool.config import RouterConfig
     from flash.pool.server import build_app
@@ -200,7 +210,7 @@ def build_harness(
     for b in backends:
         app, rec = make_fake_vllm(
             b["base_model"], latency=b.get("latency", 0.0), fail=b.get("fail", False),
-            completion=b.get("completion"),
+            completion=b.get("completion"), choices_pool=b.get("choices_pool"),
         )
         srv = start_server(app)
         servers.append(srv)
@@ -208,7 +218,9 @@ def build_harness(
 
     reward_handles: dict[str, RunningServer] = {}
     for i in range(reward_workers):
-        srv = start_server(make_fake_reward(reward_id="default", latency=reward_latency))
+        srv = start_server(
+            make_fake_reward(scorer=reward_scorer, reward_id="default", latency=reward_latency)
+        )
         servers.append(srv)
         reward_handles[f"rw{i}"] = srv
 

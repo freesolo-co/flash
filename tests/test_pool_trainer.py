@@ -61,6 +61,21 @@ def test_distributed_grpo_loop_runs_off_gpu():
         h.stop()
 
 
+def test_pool_policy_glue_helpers_import_without_torch():
+    # The worker-entry helpers must import + work without the GPU stack (torch is imported lazily
+    # only inside the policy builder), so the control plane stays torch-free.
+    from flash.engine.pool_policy import batched, prompts_from_env
+
+    assert list(batched([1, 2, 3, 4, 5], 2)) == [[1, 2], [3, 4], [5]]
+
+    class _Env:
+        dataset = ({"prompt": "p1"}, {"question": "p2"}, {"text": "p3"})
+
+    assert prompts_from_env(_Env()) == ["p1", "p2", "p3"]
+    assert prompts_from_env(_Env(), limit=2) == ["p1", "p2"]
+    assert prompts_from_env(object()) == []  # no dataset -> empty, no crash
+
+
 def test_loop_respects_step_cap():
     h = build_harness([{"id": "gpu0", "base_model": "Q"}], reward_workers=1)
     try:

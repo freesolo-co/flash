@@ -78,11 +78,43 @@ def build_lora_policy_update(
         if total is not None:
             total.backward()
             opt.step()
+            policy_update.last_loss = float(total.item())
+        else:
+            policy_update.last_loss = 0.0
         step_dir = os.path.join(out_dir, f"step_{exp.step + 1}")
         model.save_pretrained(step_dir)
         state["uri"] = step_dir
         return step_dir
 
+    def logprob(prompt, completion: str) -> float:
+        """Mean log pi(completion | prompt) under the CURRENT policy (eval probe — for telemetry /
+        verifying the policy actually shifts toward high-reward completions)."""
+        import torch
+
+        ptext = _render(prompt)
+        p_ids = tok(ptext, add_special_tokens=False)["input_ids"]
+        c_ids = tok(completion, add_special_tokens=False)["input_ids"]
+        if not c_ids:
+            return 0.0
+        ids = (p_ids + c_ids)[:max_len]
+        n_c = min(len(c_ids), max(0, len(ids) - len(p_ids)))
+        if n_c == 0:
+            return 0.0
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                input_ids = torch.tensor([ids], device=dev)
+                logits = model(input_ids).logits[0]
+                lp = torch.log_softmax(logits[:-1], dim=-1)
+                tok_lp = lp.gather(-1, input_ids[0, 1:].unsqueeze(-1)).squeeze(-1)
+                return float(tok_lp[-n_c:].mean().item())
+        finally:
+            if was_training:
+                model.train()
+
+    policy_update.last_loss = None  # most recent advantage-weighted loss (for progress/telemetry)
+    policy_update.logprob = logprob  # probe: mean logprob of a completion under the current policy
     return policy_update, (lambda: state["uri"])
 
 
