@@ -14,8 +14,6 @@ group_size       = 4
 batch_size       = 4
 max_tokens       = 1024
 hf_repo          = "DavidBShan/flash-bench-reverse-text-4b"
-eval_examples    = 20
-eval_every_steps = 15
 
 [gpu]
 requested = "RTX 5090"   # escalates to A100 PCIe (>=35 GB) for 4B GRPO

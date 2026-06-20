@@ -146,17 +146,6 @@ class TrainSpec:
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
     stop_sequences: tuple[str, ...] = ()
-    # Periodic mid-run eval cadence (GRPO ONLY; ignored for SFT): every ``eval_every_steps``
-    # optimizer steps, greedily evaluate the policy on the ENVIRONMENT's held-out ``eval_dataset``
-    # with the env's rubric (reward + eval-metric metrics) and record the curve into metrics.json,
-    # so the agent judges the run on held-out eval, not just the training reward. 0/None disables.
-    # The eval queries and grading logic live in the environment, and the completion budget
-    # matches the run's normal ``max_tokens``.
-    eval_every_steps: int | None = None
-    # How many held-out examples each mid-run eval pass scores: a FIXED random sample of this
-    # many rows (seeded, so the same subset every pass -> a comparable curve), instead of the
-    # whole eval split (which can be huge and dominate training). None/0 -> the built-in default (64).
-    eval_examples: int | None = None
 
 
 @dataclass(frozen=True)
@@ -274,8 +263,6 @@ class JobSpec:
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
-                eval_every_steps=_opt_int(train.get("eval_every_steps")),
-                eval_examples=_opt_int(train.get("eval_examples")),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),

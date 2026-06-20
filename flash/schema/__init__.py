@@ -216,14 +216,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
             stop_sequences=_train_stops(train_raw),
-            # minimum=0 so `eval_every_steps = 0` explicitly disables (matches "0/None disables");
-            # negatives are rejected.
-            eval_every_steps=_train_int(train_raw, "eval_every_steps", minimum=0),
-            # How many held-out rows each mid-run eval pass scores (a fixed seeded random sample);
-            # minimum=0 so an explicit `eval_examples = 0` is accepted as the documented "use the
-            # built-in default (64)" no-op (matches TrainSpec/eval_config, which map 0/None -> 64);
-            # negatives are rejected. None -> built-in default (64).
-            eval_examples=_train_int(train_raw, "eval_examples", minimum=0),
             # SFT caps: max_steps caps optimizer steps (cheap pre-flight smoke); max_examples
             # truncates the SFT dataset. minimum=0 so an explicit 0 means "no cap" (matches the
             # TrainSpec "None/0 -> no cap" contract); the worker reads these from [train].
