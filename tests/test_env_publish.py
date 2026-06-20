@@ -268,13 +268,18 @@ def test_safe_extract_rejects_non_tar_input(tmp_path):
 
 
 def test_safe_extract_rejects_too_many_members(tmp_path, monkeypatch):
-    # A tiny archive with a huge member count is an inode/CPU bomb — reject before extractall.
+    # A tiny archive with a huge member count is an inode/CPU bomb. We stream members lazily and
+    # abort the moment the count cap trips — so extraction is BOUNDED by the cap (we don't pre-scan
+    # the whole archive, and we never extract more than the limit before bailing).
     monkeypatch.setattr(envs, "_MAX_MEMBERS", 5)
     with pytest.raises(envs.EnvPublishError, match="too many members"):
-        envs._safe_extract(_tar_with_members(6), tmp_path)
-    assert not any(tmp_path.iterdir())  # nothing was extracted
-    # At the limit it still extracts.
+        envs._safe_extract(_tar_with_members(1000), tmp_path)
+    # Bounded: at most _MAX_MEMBERS were written before the abort (NOT all 1000) — the cap stopped us
+    # early rather than after a full scan.
+    assert len(list(tmp_path.iterdir())) <= 5
+    # At the limit it still extracts cleanly.
     envs._safe_extract(_tar_with_members(5), tmp_path)
+    assert len(list(tmp_path.iterdir())) == 5
 
 
 def test_safe_extract_rejects_oversized_uncompressed(tmp_path, monkeypatch):

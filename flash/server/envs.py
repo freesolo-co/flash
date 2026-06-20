@@ -108,10 +108,12 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     extraction filter alone; the gate here is the contract.
 
     We also bound EXPANSION — a small .tar.gz can decompress to enormous data (a "tar bomb") and
-    exhaust disk/CPU. So we cap the member COUNT and the cumulative UNCOMPRESSED size, summing
-    declared member sizes as we iterate and aborting BEFORE ``extractall`` if either cap is exceeded
-    (the declared sizes in the header are what ``extractall`` would write). Both caps are
-    operator-configurable.
+    exhaust disk/CPU. We do NOT call ``getmembers()``/``extractall()`` (which fully scan and
+    decompress the whole archive up front, before any cap could trip). Instead we STREAM members one
+    at a time — iterating the ``TarFile`` reads one header at a time lazily — accumulating the member
+    COUNT and cumulative UNCOMPRESSED size and aborting the moment either cap is exceeded, so we stop
+    decompressing a bomb early. Each member is validated then extracted inline (its payload read
+    exactly once, in order). Both caps are operator-configurable.
     """
     root = dest.resolve()
     # The bytes are an untrusted upload: non-tar / non-gzip / truncated input makes tarfile raise
@@ -121,7 +123,10 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     try:
         with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
             total = 0
-            for count, member in enumerate(tar.getmembers(), start=1):
+            # enumerate over the TarFile object (NOT getmembers()): it yields one member at a time,
+            # lazily reading a single header per step, so the caps below can trip before the whole
+            # archive is scanned/decompressed.
+            for count, member in enumerate(tar, start=1):
                 if count > _MAX_MEMBERS:
                     raise EnvPublishError(
                         f"env package has too many members (limit {_MAX_MEMBERS}); refusing to "
@@ -144,7 +149,7 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                         f"{_human_mb(_MAX_UNCOMPRESSED_BYTES)}); refusing to extract a possible "
                         f"archive bomb"
                     )
-            tar.extractall(dest)
+                tar.extract(member, dest)  # validated -> extract this member's payload now
     except tarfile.TarError as exc:
         raise EnvPublishError(f"env package is not a valid .tar.gz archive: {exc}") from exc
 
