@@ -1576,7 +1576,11 @@ def run_rl():
     # a per-device cap -> colocate OOM. Best-effort: stays None offline, keeping prior behavior.
     if _params_b is None:
         _params_b = fetch_hf_params_b(model_id)
-    per_device_comps = rl_per_device_comps(_max_completion, use_vllm=use_vllm, params_b=_params_b)
+    from flash.catalog import vocab_size_for
+
+    per_device_comps = rl_per_device_comps(
+        _max_completion, vocab=vocab_size_for(model_id), use_vllm=use_vllm, params_b=_params_b
+    )
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
         print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
