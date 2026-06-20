@@ -54,6 +54,16 @@ DOWNLOAD_RATE_GBPS = 0.4  # effective HF snapshot download (hf_transfer)
 DEFAULT_WALL_CAP_S = 24 * 3600  # spec ``gpu.max_wall_seconds`` default
 
 
+def _fmt_duration(seconds: float) -> str:
+    """Human duration for notes: sub-hour caps render in minutes (a 60s cap is ``1m``, not the
+    confusing ``0h`` that ``{s/3600:.0f}h`` would print), whole hours stay clean (``24h``),
+    fractional multi-hour spans show one decimal (``1.5h``)."""
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    hours = seconds / 3600
+    return f"{hours:.0f}h" if abs(hours - round(hours)) < 1e-9 else f"{hours:.1f}h"
+
+
 def setup_seconds(config: RunConfig) -> float:
     """Cold-start wall time billed before the first optimizer step."""
     s = WORKER_BOOT_S + DEPS_INSTALL_S
@@ -174,8 +184,8 @@ def _notes(
     if wall_capped:
         per_seed = "" if config.setup_repeats == 1 else "per-seed "
         notes.append(
-            f"train clamped to the {cap_s / 3600:.0f}h {per_seed}wall cap "
-            f"(uncapped: {raw_train_s / 3600:.1f}h)"
+            f"train clamped to the {_fmt_duration(cap_s)} {per_seed}wall cap "
+            f"(uncapped: {_fmt_duration(raw_train_s)})"
         )
     return tuple(notes)
 

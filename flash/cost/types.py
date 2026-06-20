@@ -119,8 +119,10 @@ class RunConfig:
     def train_knobs(self) -> dict[str, int]:
         """The knob dict ``engine.vram.model_required_vram_gb`` consumes for VRAM sizing.
 
-        Only an EXPLICIT batch_size is forwarded: the allocator leaves an omitted batch at
-        None (sized as 1), so feeding the recipe effective batch here would over-provision.
+        Only an EXPLICIT batch_size is forwarded: for an omitted batch the allocator
+        (``engine.vram.model_required_vram_gb``) sizes against the worker's per-device SFT
+        micro-batch (``_sft_per_device_bs()`` = 4), so feeding the recipe effective batch (32)
+        here would over-provision; leaving it out lets the allocator apply that same default.
         """
         n = self.normalized()
         knobs: dict[str, int] = {"lora_rank": n.lora_rank}

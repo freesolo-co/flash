@@ -188,26 +188,59 @@ def cmd_gpus(args) -> int:
     return 0
 
 
+# Assumed SFT dataset size (examples) when the config pins no ``train.max_examples``: the
+# worker trains the FULL environment dataset, whose size isn't readable here (``--estimate`` is
+# fully local — no Hub/env load). This stand-in makes the omitted-cap estimate a documented
+# FLOOR rather than a magic optimizer-step constant; cmd_train surfaces the floor caveat. A real
+# env's train split is typically far larger, so a pinned ``max_examples`` always estimates tighter.
+_SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED = 1000
+
+
+def _sft_realized_batch(batch_size: int) -> int:
+    """The SFT global batch the WORKER realizes for a requested ``batch_size``.
+
+    The worker (engine.worker) never trains at the raw requested batch: it fixes the per-device
+    micro-batch at ``_sft_per_device_bs()`` (4) and reaches the target via CEIL grad-accum, so the
+    realized global batch is ``per_device x ceil(target / per_device)`` -- which can EXCEED the
+    request when it isn't a multiple of the micro-batch (e.g. 16/6 -> per_device 4, accum 2 -> 8).
+    Mirror that here so the optimizer-step count matches what actually runs.
+    """
+    from flash.engine.vram import _sft_per_device_bs
+
+    target = max(1, int(batch_size))
+    per_device = max(1, min(_sft_per_device_bs(), target))
+    grad_accum = max(1, -(-target // per_device))  # ceil
+    return per_device * grad_accum
+
+
 def _spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker).
 
-    GRPO carries ``train.steps`` (default recipe num_steps). SFT runs by epochs over a
-    (capped) dataset, so derive steps = ceil(max_examples / batch) x epochs when known.
+    GRPO carries ``train.steps`` (default recipe ``num_steps``) -- ``train.steps`` is a GRPO
+    concept and is NOT consulted for SFT. SFT runs by epochs over a (capped) dataset, so steps =
+    ``epochs x ceil(num_examples / realized_batch)``, capped by ``max_steps``, where ``epochs``
+    defaults to ``RECIPE.sft.num_epochs`` (2), ``realized_batch`` is the worker's grad-accum global
+    batch (``_sft_realized_batch``), and ``num_examples`` is ``max_examples`` if pinned else the
+    documented unpinned floor (``_SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED``).
     """
     from flash.engine.recipe import RECIPE
 
     t = spec.train
-    if t.steps is not None:
-        return max(1, int(t.steps))
     if spec.algorithm == "grpo":
+        if t.steps is not None:
+            return max(1, int(t.steps))
         return RECIPE.rl.num_steps
+    # --- SFT ---
     cap = int(t.max_steps) if t.max_steps else 0  # SFT-only optimizer-step cap (0 = uncapped)
-    epochs = int(t.epochs) if t.epochs is not None else 1
-    batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
-    if t.max_examples is not None:
-        n = max(1, -(-int(t.max_examples) // max(1, batch)) * epochs)
-    else:
-        n = 100  # last-resort default when the dataset size isn't pinned in the config
+    epochs = int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
+    requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
+    batch = _sft_realized_batch(requested_batch)  # worker's grad-accum-realized global batch
+    examples = (
+        int(t.max_examples)
+        if t.max_examples is not None
+        else _SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED
+    )
+    n = max(1, -(-examples // batch) * epochs)  # epochs x ceil(examples / realized_batch)
     return min(n, cap) if cap > 0 else n
 
 
@@ -331,6 +364,14 @@ def cmd_train(args) -> int:
         from flash.cost import estimate_cost
 
         print(estimate_cost(_runconfig_from_spec(spec)).breakdown())
+        # SFT with no max_examples trains the full env dataset, whose size isn't readable
+        # locally; the step count assumes a floor, so the estimate is a LOWER BOUND.
+        if spec.algorithm != "grpo" and spec.train.max_examples is None:
+            print(
+                f"  note: SFT max_examples unset -> step count assumes "
+                f"{_SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED} examples; the real env train split is "
+                "usually larger, so this estimate is a FLOOR. Set [train].max_examples to pin it."
+            )
         return 0
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.

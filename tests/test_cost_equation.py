@@ -33,6 +33,9 @@ def test_prices_at_realized_rate():
     for cls in ("RTX 5090", "A100 PCIe", "RTX 3090"):
         assert realized_hourly_usd(cls) < gpu_hourly_usd(cls)
     assert realized_hourly_usd("A40") == gpu_hourly_usd("A40")  # unobserved -> list
+    # H100 has no clean realized rate (the lone sample was an anomalous ~$10/hr surge run), so it
+    # falls back to its list price -- never the discarded outlier.
+    assert realized_hourly_usd("H100") == gpu_hourly_usd("H100") == 3.29
 
 
 def test_concurrent_reward_keeps_heavy_grpo_off_the_floor():

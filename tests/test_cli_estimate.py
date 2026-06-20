@@ -78,11 +78,79 @@ def test_sft_steps_derived_from_examples():
             "gpu": {"type": "RTX 4090"},
         }
     )
-    assert _spec_steps(spec) == 40  # ceil(320 / 16) * 2 epochs
+    # batch_size 16 is a multiple of the per-device micro-batch (4) so realized == requested:
+    # epochs(2) x ceil(320 / 16) = 40.
+    assert _spec_steps(spec) == 40
     cfg = _runconfig_from_spec(spec)
     assert cfg.method == "sft"
     assert cfg.group_size is None  # SFT carries no completions-per-prompt
     assert cfg.completion_len is None
+
+
+def _sft_spec(**train):
+    raw = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "sft",
+        "environment": {"id": "acme/sft-data"},
+        "train": {"seeds": [0], "hf_repo": "owner/runs", **train},
+        "gpu": {"type": "RTX 4090"},
+    }
+    return spec_from_dict(raw)
+
+
+def _worker_sft_steps(*, examples, requested_batch, epochs, max_steps=0):
+    """Independent re-derivation of the worker's per-seed SFT optimizer-step count (engine.worker:
+    fixed per-device micro-batch 4 + ceil grad-accum -> realized global batch), to pin _spec_steps
+    against what actually runs."""
+    from flash.engine.vram import _sft_per_device_bs
+
+    per_device = max(1, min(_sft_per_device_bs(), requested_batch))
+    grad_accum = max(1, -(-requested_batch // per_device))
+    realized = per_device * grad_accum
+    n = max(1, -(-examples // realized) * epochs)
+    return min(n, max_steps) if max_steps > 0 else n
+
+
+def test_sft_steps_default_epochs_mirror_the_worker():
+    # No [train].epochs -> the worker uses RECIPE.sft.num_epochs (2), NOT 1. The estimate must too.
+    spec = _sft_spec(max_examples=320, batch_size=16)  # epochs omitted
+    assert spec.train.epochs is None
+    assert RECIPE.sft.num_epochs == 2
+    assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
+
+
+def test_sft_steps_use_worker_realized_grad_accum_batch():
+    # batch_size 6 is NOT a multiple of the micro-batch (4): the worker realizes per_device(4) x
+    # grad_accum(ceil(6/4)=2) = 8, so steps = epochs(2) x ceil(320/8) = 80 -- NOT the raw-batch
+    # ceil(320/6)*2 = 108 the old derivation produced.
+    spec = _sft_spec(max_examples=320, batch_size=6, epochs=2)
+    assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=6, epochs=2) == 80
+
+
+def test_sft_ignores_train_steps_for_step_count():
+    # train.steps is a GRPO concept; SFT must derive from epochs/examples/realized-batch and NOT
+    # honor a stray train.steps.
+    spec = _sft_spec(max_examples=320, batch_size=16, epochs=2, steps=9999)
+    assert _spec_steps(spec) == 40
+
+
+def test_sft_steps_unpinned_examples_is_documented_floor_not_100():
+    # No max_examples -> the worker trains the full dataset (size unknown locally). The estimate
+    # uses the documented assumed-examples floor, NOT the old hardcoded 100 optimizer steps.
+    from flash.cli.main.commands import _SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED
+
+    spec = _sft_spec(batch_size=16, epochs=2)  # max_examples omitted
+    assert spec.train.max_examples is None
+    expected = _worker_sft_steps(
+        examples=_SFT_ASSUMED_EXAMPLES_WHEN_UNPINNED, requested_batch=16, epochs=2
+    )
+    assert _spec_steps(spec) == expected
+    assert _spec_steps(spec) != 100
+
+
+def test_sft_max_steps_caps_the_derived_count():
+    spec = _sft_spec(max_examples=10_000, batch_size=16, epochs=2, max_steps=5)
+    assert _spec_steps(spec) == 5
 
 
 def test_cmd_train_estimate_prints_breakdown_without_submitting(tmp_path, monkeypatch, capsys):

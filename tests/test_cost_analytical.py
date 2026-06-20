@@ -60,14 +60,15 @@ def test_grpo_requires_at_least_as_much_vram_as_sft():
 
 def test_omitted_sft_batch_sizes_like_the_real_allocator():
     # When SFT batch_size is omitted, GPU sizing must match the REAL allocator, which
-    # defaults an omitted batch to 1 (model_required_vram_gb) -- NOT the recipe effective
-    # batch (32). The recipe batch is still the right compute-throughput model in
-    # seconds_per_step; it just must not over-provision VRAM relative to the allocator.
+    # defaults an omitted batch to the worker's per-device micro-batch (_sft_per_device_bs() = 4
+    # in model_required_vram_gb) -- NOT the recipe effective batch (32). The recipe batch is still
+    # the right compute-throughput model in seconds_per_step; it just must not over-provision VRAM
+    # relative to the allocator.
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100)  # batch_size omitted
     _, need = select_gpu(cfg)
-    real = alloc_required_vram_gb(MID, "sft", train={}, thinking=False)  # allocator defaults to 1
+    real = alloc_required_vram_gb(MID, "sft", train={}, thinking=False)  # allocator defaults to micro-batch 4
     assert need == real
     # batch_size must NOT be forwarded for sizing when omitted (it would inflate the need).
     assert "batch_size" not in cfg.train_knobs()

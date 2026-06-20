@@ -38,6 +38,24 @@ def test_capped_estimate_flags_in_breakdown():
     assert "CAPPED" in capped.breakdown()
 
 
+def test_subhour_cap_note_renders_minutes_not_zero_hours():
+    # A sub-hour wall cap (floored to 60s) must not print a confusing "0h" in the cap note.
+    capped = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 100_000, max_wall_seconds=60))
+    assert capped.wall_capped
+    cap_note = next(n for n in capped.notes if "wall cap" in n)
+    assert "0h" not in cap_note
+    assert "1m" in cap_note  # 60s -> "1m"
+
+
+def test_fmt_duration_units():
+    from flash.cost.analytical import _fmt_duration
+
+    assert _fmt_duration(60) == "1m"  # sub-hour -> minutes, never "0h"
+    assert _fmt_duration(1800) == "30m"
+    assert _fmt_duration(24 * 3600) == "24h"  # whole hours stay clean
+    assert _fmt_duration(int(1.5 * 3600)) == "1.5h"  # fractional multi-hour -> one decimal
+
+
 def test_provider_is_normalized_and_validated():
     # Case/whitespace variants normalize to the canonical substrate; empty -> "auto".
     assert RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="RunPod").provider == "runpod"

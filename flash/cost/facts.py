@@ -49,9 +49,14 @@ def gpu_hourly_usd(name: str) -> float:
 
 
 # Realized (spot/queue) $/hr a class is actually billed at -- a conservative single per-class
-# value, usually below the on-demand list. Deliberately not method-specific: pricing GRPO at
-# its full pricier-instance rate would over-quote the total. An unobserved class falls back to
-# the list price (no rate invented).
+# value, below the on-demand list (the spot/queue discount: RTX 5090 lists $0.99 but bills
+# ~$0.87, A100 PCIe lists $1.39 but bills ~$1.04). Deliberately not method-specific: pricing GRPO
+# at its full pricier-instance rate would over-quote the total. A class WITHOUT a clean observed
+# rate falls back to its list price (no rate invented). H100 is intentionally omitted: the only
+# H100 sample on record was a single 0.8B GRPO run that billed ~$10/hr against a $3.29 list (an
+# anomalous surge/tight-market Vast offer, ~3x list, on a model that wouldn't even pick an H100) --
+# one outlier isn't a stable realized rate, so H100 falls back to list ($3.29) until a clean
+# multi-run rate is measured.
 REALIZED_HOURLY_USD: dict[str, float] = {
     "RTX 3090": 0.239,
     "RTX 4090": 0.426,
@@ -60,7 +65,6 @@ REALIZED_HOURLY_USD: dict[str, float] = {
     "RTX 6000 Ada": 0.601,
     "A100 PCIe": 1.035,
     "A100 SXM": 1.133,
-    "H100": 10.037,
 }
 
 
