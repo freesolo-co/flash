@@ -27,6 +27,19 @@ _HERE = pathlib.Path(__file__).parent
 _RESULTS = _HERE / "results"
 _MANIFEST = _RESULTS / "runs_manifest.json"
 TASKS = ["gsm8k", "reverse-text", "hendrycks-math"]
+_SMOOTH_K = 5  # mean over last K steps — robust to the high per-step variance at 16 rollouts/step
+
+
+def _smoothed(rh: list, k: int = _SMOOTH_K):
+    """Mean of the last k rewards (robust 'final performance' vs a single noisy step)."""
+    if not rh:
+        return None
+    tail = rh[-k:]
+    return sum(tail) / len(tail)
+
+
+def _best(rh: list):
+    return max(rh) if rh else None
 
 # Representative on-demand price for the GPU class Tinker is likely serving a 4B on.
 # Tinker is managed and does NOT expose per-run cost; this is an explicit wall-clock proxy
@@ -85,6 +98,8 @@ def collect_flash(task: str, entry: dict, key: str) -> dict:
         "steps": len(rh),
         "first_reward": rh[0] if rh else None,
         "final_reward": rh[-1] if rh else None,
+        "final_smoothed": _smoothed(rh),
+        "best_reward": _best(rh),
         "eval_reward": (eh[-1].get("eval_reward") if eh else None),
         "eval_n": (eh[-1].get("eval_n") if eh else None),
         "reward_history": rh,
@@ -98,6 +113,32 @@ def collect_flash(task: str, entry: dict, key: str) -> dict:
     }
 
 
+def _tinker_active_compute_s(log_path: str | None) -> float | None:
+    """Sum the real per-step work (rollout + train step) from metrics.jsonl.
+
+    Tinker's wall-clock includes managed-backend *capacity pauses* (idle, not billed
+    compute), which get absorbed into a checkpoint step's timing. Summing the rollout +
+    train-step times gives the active-compute basis — the fair latency/cost number.
+    """
+    if not log_path:
+        return None
+    mp = pathlib.Path(log_path) / "metrics.jsonl"
+    if not mp.exists():
+        return None
+    roll = train = 0.0
+    for line in mp.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        roll += r.get("time/do_group_rollout_and_filter_constant_reward:total", 0) or 0
+        train += r.get("time/train_step", 0) or 0
+    total = roll + train
+    return total or None
+
+
 def collect_tinker(task: str, rel_path: str) -> dict:
     """Read one tinker run's result JSON into a normalized record."""
     p = _RESULTS / pathlib.Path(rel_path).name
@@ -107,7 +148,11 @@ def collect_tinker(task: str, rel_path: str) -> dict:
     rh = d.get("reward_history", []) or []
     wall = d.get("wall_s")
     steps = d.get("steps") or len(rh)
-    cost = round((wall or 0) / 3600 * _TINKER_PROXY_USD_PER_HR, 4) if wall else None
+    active = _tinker_active_compute_s(d.get("log_path"))
+    # Cost proxy on ACTIVE compute (not wall — wall includes unbilled capacity pauses).
+    basis = active if active else wall
+    cost = round((basis or 0) / 3600 * _TINKER_PROXY_USD_PER_HR, 4) if basis else None
+    paused_s = (wall - active) if (wall and active and wall > active) else None
     return {
         "platform": "tinker",
         "task": task,
@@ -116,14 +161,17 @@ def collect_tinker(task: str, rel_path: str) -> dict:
         "steps": len(rh),
         "first_reward": rh[0] if rh else None,
         "final_reward": rh[-1] if rh else None,
+        "final_smoothed": _smoothed(rh),
+        "best_reward": _best(rh),
         "eval_reward": None,  # tinker held-out eval not run in-loop; training reward is the signal
         "reward_history": rh,
         "cost_usd": cost,
-        "cost_kind": f"ESTIMATE: wall x ${_TINKER_PROXY_USD_PER_HR:.2f}/hr proxy (Tinker cost not in API)",
+        "cost_kind": f"ESTIMATE: active-compute x ${_TINKER_PROXY_USD_PER_HR:.2f}/hr proxy (Tinker cost not in API)",
         "setup_s": None,
-        "train_s": wall,
-        "total_s": wall,
-        "per_step_s": (wall / steps) if (wall and steps) else None,
+        "train_s": active or wall,        # active compute (rollout+train), pause excluded
+        "total_s": wall,                  # full wall, INCLUDING any capacity pause
+        "paused_s": paused_s,             # idle time the managed backend paused us
+        "per_step_s": ((active or wall) / steps) if ((active or wall) and steps) else None,
         "train_tok_per_s": None,
     }
 
@@ -173,11 +221,14 @@ def render_markdown(records: dict) -> str:
         lines.append(f"| status | {f.get('status')} | {t.get('status')} | |")
         lines.append(f"| GPU | {f.get('gpu') or '—'} | {t.get('gpu')} | |")
         lines.append(f"| **reward** step 1 | {_fmt(f.get('first_reward'))} | {_fmt(t.get('first_reward'))} | |")
-        lines.append(f"| **reward** final | {_fmt(f.get('final_reward'))} | {_fmt(t.get('final_reward'))} | {_delta(f.get('final_reward'), t.get('final_reward'))} |")
-        lines.append(f"| reward gain | {_fmt((f.get('final_reward') or 0) - (f.get('first_reward') or 0))} | {_fmt((t.get('final_reward') or 0) - (t.get('first_reward') or 0))} | |")
+        lines.append(f"| **reward** final (last 5 avg) | {_fmt(f.get('final_smoothed'))} | {_fmt(t.get('final_smoothed'))} | {_delta(f.get('final_smoothed'), t.get('final_smoothed'))} |")
+        lines.append(f"| reward best step | {_fmt(f.get('best_reward'))} | {_fmt(t.get('best_reward'))} | {_delta(f.get('best_reward'), t.get('best_reward'))} |")
+        lines.append(f"| reward final (raw step 30) | {_fmt(f.get('final_reward'))} | {_fmt(t.get('final_reward'))} | |")
         lines.append(f"| held-out eval | {_fmt(f.get('eval_reward'))} (n={f.get('eval_n')}) | — | |")
-        lines.append(f"| **latency** total | {_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} | |")
-        lines.append(f"| latency setup/queue | {_secs(f.get('setup_s'))} | — | |")
+        lines.append(f"| **latency** wall total | {_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} | |")
+        lines.append(f"| latency setup/queue | {_secs(f.get('setup_s'))} | none (managed) | |")
+        lines.append(f"| latency active compute | {_secs(f.get('train_s'))} | {_secs(t.get('train_s'))} | |")
+        lines.append(f"| latency capacity-pause | — | {_secs(t.get('paused_s')) if t.get('paused_s') else 'none'} | |")
         lines.append(f"| latency per-step | {_fmt(f.get('per_step_s'), 1, 's')} | {_fmt(t.get('per_step_s'), 1, 's')} | |")
         lines.append(f"| **cost** | {_fmt(f.get('cost_usd'), 4, ' USD')} | {_fmt(t.get('cost_usd'), 4, ' USD')} | |")
         lines.append(f"| cost basis | {f.get('cost_kind')} | {t.get('cost_kind')} | |")
@@ -190,10 +241,10 @@ def render_markdown(records: dict) -> str:
     for task in TASKS:
         f = records[task]["flash"]
         t = records[task]["tinker"]
-        fr, tr = f.get("final_reward"), t.get("final_reward")
+        fr, tr = f.get("final_smoothed"), t.get("final_smoothed")
         if fr is None or tr is None:
             winner = "—"
-        elif abs(fr - tr) < 1e-6:
+        elif abs(fr - tr) < 0.02:  # within noise at 16 rollouts/step
             winner = "tie"
         else:
             winner = "Flash" if fr > tr else "Tinker"
