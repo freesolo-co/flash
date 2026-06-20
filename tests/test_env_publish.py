@@ -136,6 +136,48 @@ def test_safe_extract_rejects_special_members(tmp_path):
         assert not (tmp_path / f"evil-{label}").exists()
 
 
+def test_slug_from_full_metadata(tmp_path):
+    (tmp_path / ".prime").mkdir()
+    (tmp_path / ".prime" / ".env-metadata.json").write_text('{"owner": "freesolo-co", "name": "ns-e"}')
+    assert envs._slug_from(tmp_path, "", pushed_name="ns-e") == "freesolo-co/ns-e"
+
+
+def test_slug_from_owner_only_metadata_uses_pushed_name(tmp_path):
+    # prime recorded the owner but no usable name: reconstruct from the name we pushed under, so a
+    # successful push isn't reported as a failure (regression: clean exit was raising on no slug).
+    (tmp_path / ".prime").mkdir()
+    (tmp_path / ".prime" / ".env-metadata.json").write_text('{"owner": "freesolo-co"}')
+    assert envs._slug_from(tmp_path, "", pushed_name="ns-e") == "freesolo-co/ns-e"
+
+
+def test_slug_from_stdout_phrasings(tmp_path):
+    # No metadata file at all: parse the owner/name from prime's success line, across phrasings.
+    assert envs._slug_from(tmp_path, "Successfully pushed freesolo-co/ns-e v2") == "freesolo-co/ns-e"
+    assert envs._slug_from(tmp_path, "Pushed freesolo-co/ns-e") == "freesolo-co/ns-e"
+    assert envs._slug_from(tmp_path, "Published freesolo-co/ns-e to the Hub") == "freesolo-co/ns-e"
+    # Only the index URL names the owner -> pair with the pushed name.
+    out = "uploaded to https://hub.primeintellect.ai/freesolo-co/simple/"
+    assert envs._slug_from(tmp_path, out, pushed_name="ns-e") == "freesolo-co/ns-e"
+    # Truly nothing -> None (the caller turns that into a 502, not a 400).
+    assert envs._slug_from(tmp_path, "done", pushed_name=None) is None
+
+
+def test_prime_push_success_without_slug_is_502(monkeypatch, tmp_path):
+    # Clean exit but no discoverable owner/name: the env IS published, so this is a server-side
+    # problem (502), NOT a 400 blaming the user's package.
+    monkeypatch.setenv("PRIME_API_KEY", "pit-x")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/prime")
+
+    class _Proc:
+        returncode, stdout, stderr = 0, "all good, no slug here", ""
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Proc())
+    with pytest.raises(envs.EnvPublishError) as ei:
+        envs._prime_push(tmp_path, name="ns-env", is_new=True)
+    assert ei.value.status == 502
+    assert "published" in str(ei.value)
+
+
 def test_prime_push_503_when_control_plane_unconfigured(monkeypatch, tmp_path):
     # No PRIME_API_KEY -> 503 (this is the control plane's misconfiguration, not the user's input).
     monkeypatch.delenv("PRIME_API_KEY", raising=False)

@@ -86,19 +86,36 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
         tar.extractall(dest)
 
 
-def _slug_from(env_dir: Path, output: str) -> str | None:
-    """The published ``owner/name`` slug, from prime's metadata file or its stdout."""
+def _slug_from(env_dir: Path, output: str, *, pushed_name: str | None = None) -> str | None:
+    """The published ``owner/name`` slug, from prime's metadata file or its stdout.
+
+    ``pushed_name`` is the ``--name`` we pushed under: if prime records the env ``owner`` but not a
+    usable ``name`` (or only the stdout names the owner), we can still reconstruct the slug from the
+    name we know we published, so a successful push isn't reported as a failure for lack of a slug.
+    """
     meta = env_dir / ".prime" / ".env-metadata.json"
     if meta.is_file():
         try:
             data = json.loads(meta.read_text())
-            owner, name = data.get("owner"), data.get("name")
+            owner, name = data.get("owner"), data.get("name") or pushed_name
             if owner and name:
                 return f"{owner}/{name}"
         except Exception:
             pass
-    match = re.search(r"[Ss]uccessfully pushed\s+([A-Za-z0-9][\w.-]*/[\w.-]+)", output)
-    return match.group(1) if match else None
+    # prime's success line, across phrasings ("Successfully pushed", "Pushed", "Published ...").
+    match = re.search(
+        r"(?:[Ss]uccessfully\s+)?(?:[Pp]ushed|[Pp]ublished)\s+([A-Za-z0-9][\w.-]*)/([\w.-]+)",
+        output,
+    )
+    if match:
+        return f"{match.group(1)}/{match.group(2)}"
+    # Owner named without an explicit env name (e.g. ".../<owner>/simple/" index URL in output):
+    # pair it with the name we pushed, so a clearly-successful push still yields a usable slug.
+    if pushed_name:
+        owner_match = re.search(r"hub\.primeintellect\.ai/([A-Za-z0-9][\w.-]*)/", output)
+        if owner_match:
+            return f"{owner_match.group(1)}/{pushed_name}"
+    return None
 
 
 def _is_version_conflict(text: str) -> bool:
@@ -137,9 +154,17 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
         last = f"{proc.stdout or ''}{proc.stderr or ''}"
         if proc.returncode == 0:
-            slug = _slug_from(env_dir, last)
+            slug = _slug_from(env_dir, last, pushed_name=name)
             if not slug:
-                raise EnvPublishError("env published but no owner/name id could be determined")
+                # A clean exit but no discoverable owner/name: the env is on the Hub but we can't
+                # name it. This is degenerate (prime writes .prime/.env-metadata.json on a real
+                # success), so surface it as a server-side problem (502) — not a 400 that blames the
+                # user's package for what was actually a successful publish.
+                raise EnvPublishError(
+                    "env published, but the control plane could not determine its owner/name id "
+                    f"from prime's output: {last.strip()[:300]}",
+                    status=502,
+                )
             return slug
         if _is_version_conflict(last):
             auto_bump = True
