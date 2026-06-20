@@ -77,7 +77,7 @@ _TRAIN_COEF = 0.27
 # MEASURED at the default group_size=8: 0.8B GRPO OOMs a 20 GB card; 2B GRPO OOMs a 24 GB card
 # (-> both need 32); 4B GRPO fits 32 (param est ~31 already clears this floor, so it's untouched).
 _VLLM_COLOCATE_FLOOR_GB = 28.0
-_VOCAB_DEFAULT = 152_000  # Qwen3.x tokenizer vocab (drives the fp32-logits GRPO term)
+_VOCAB_DEFAULT = 248_320  # Qwen3.5 tokenizer vocab (drives the fp32-logits GRPO term)
 # Matches the worker's logits budget (6 GB): the per-device fp32 logits are capped to this
 # (rl_per_device_comps spills the rest into grad-accum), so the estimator never reserves above it.
 _LOGITS_BUDGET_GB = 6.0
