@@ -70,15 +70,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["flash"]
-# Ship the PEP 561 marker so downstream type checkers pick up Flash's type hints.
-artifacts = ["flash/py.typed"]
-
-# The measured-run dataset the cost equation is calibrated + graded against lives outside
-# the `flash` package (next to its generator under cost_estimator_results/), so it would be
-# dropped from the wheel. force-include ships a copy inside the package so `flash.cost
-# verify` / verify_accuracy() work in an installed wheel, not just a source checkout.
-[tool.hatch.build.targets.wheel.force-include]
-"cost_estimator_results/real_runs/measured_runs.json" = "flash/cost/_data/measured_runs.json"
+# Ship the PEP 561 marker (type hints) + the measured-run dataset the cost equation grades against.
+artifacts = ["flash/py.typed", "flash/cost/_data/measured_runs.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

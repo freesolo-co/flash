@@ -18,10 +18,8 @@ class RunConfig:
     method: str  # "sft" | "grpo"
     steps: int
 
-    # Number of cold-start setups the bill covers. A single run cold-starts once
-    # (=1); a multi-seed run reprovisions and bills setup once PER SEED (runner.py
-    # runs each seed as its own job), so the reconstruction sets this to the seed
-    # count to charge the repeated boot/deps/download/vLLM-init the measured cost paid.
+    # Cold-start setups the bill covers. A multi-seed run reprovisions per seed (each seed is
+    # its own job in runner.py), so set this to the seed count to charge the repeated boot.
     setup_repeats: int = 1
 
     seq_len: int | None = None  # SFT max_seq_len / GRPO max_prompt_len
@@ -30,33 +28,22 @@ class RunConfig:
     group_size: int | None = None  # GRPO completions per prompt (G)
     lora_rank: int | None = None
     thinking: bool = False
-    # GRPO only: seconds to score one completion through the verifiers reward function.
-    # None -> inferred from the environment (rewards.py); a slow reward (code-exec,
-    # LLM judge) can dominate the step.
+    # GRPO only: seconds to score one completion. None -> inferred from the environment.
     reward_seconds_per_completion: float | None = None
 
     gpu: str | None = None  # pin a class; else cheapest fitting
-    # Whether the run permits unvalidated GPU classes (spec ``gpu.allow_unvalidated``).
-    # The allocator widens its candidate pool when this is set, so the cheapest fitting
-    # class -- and thus the priced $/hr -- can be an unvalidated one. Mirror it here so a
-    # preflight estimate matches the allocator's pick for such specs. TRI-STATE, exactly
-    # like the spec field and the submit-time allocator arg: ``None`` means "unspecified"
-    # and is resolved at selection time via ``providers.base.unvalidated_allowed`` (the SAME
-    # managed default the runner applies). A missing spec value must NOT be coerced to
-    # ``False`` here, or the estimate would silently disagree with the allocator's pick.
+    # Tri-state, mirroring the spec/allocator: None means "unspecified" and is resolved at
+    # selection time via ``providers.base.unvalidated_allowed`` (the managed default). Don't
+    # coerce a missing value to False, or the estimate would disagree with the allocator's pick.
     allow_unvalidated: bool | None = None
-    # Per-run total wall-clock cap in seconds (spec ``gpu.max_wall_seconds``; default 24h).
-    # The runner applies this PER SEED (each seed is its own job), so the estimator clamps
-    # each seed's setup+train to it. ``None`` -> the estimator's default cap.
+    # Per-run wall-clock cap in seconds (spec ``gpu.max_wall_seconds``; default 24h), applied
+    # per seed. None -> the estimator's default cap.
     max_wall_seconds: int | None = None
     provider: str = "auto"
-    # Verifiers environment slug (owner/name). Descriptive only -- the dataset/reward
-    # source doesn't drive GPU-time cost -- but carried so a run is fully specified.
-    environment: str | None = None
+    environment: str | None = None  # verifiers env slug (owner/name); descriptive only
     label: str | None = None
 
     def __post_init__(self) -> None:
-        # Normalize/validate the method early so downstream code can trust it.
         object.__setattr__(self, "method", normalize_algorithm(self.method))
         # Same for the provider: GPU selection (``pick_gpu``) and the allocator expect an exact
         # substrate ("runpod"/"vast") or the "auto" sentinel. Normalize case/whitespace, treat
@@ -73,19 +60,13 @@ class RunConfig:
             raise ValueError(f"steps must be >= 1, got {self.steps}")
         if self.setup_repeats < 1:
             raise ValueError(f"setup_repeats must be >= 1, got {self.setup_repeats}")
-        # ``setup_repeats`` is the seed count, and ``estimate_cost`` divides ``steps`` evenly
-        # across seeds (each seed is a separate job running its OWN share of the steps -- the
-        # reconstruction in ``runconfig_from_status`` always builds steps = per_seed x seeds).
-        # A non-divisible (steps, setup_repeats) would price fractional steps per seed, which
-        # can't happen in a real run and skews per-seed wall-cap behavior, so reject it.
+        # ``estimate_cost`` divides steps evenly across seeds, so a non-divisible split would
+        # price fractional steps per seed (impossible in a real run) and skew per-seed capping.
         if self.steps % self.setup_repeats != 0:
             raise ValueError(
                 f"steps ({self.steps}) must be a multiple of setup_repeats "
                 f"({self.setup_repeats}): each seed runs an equal share of the steps"
             )
-        # Explicit run knobs (None -> recipe default) must be positive; a <= 0 value
-        # produces a bogus quote (zero/negative tokens or completions per step). lora_rank
-        # is included to mirror the real parser's ``train.lora_rank < 1`` rejection.
         for _name in ("seq_len", "batch_size", "group_size", "completion_len", "lora_rank"):
             _val = getattr(self, _name)
             if _val is not None and _val < 1:
@@ -94,9 +75,6 @@ class RunConfig:
     @property
     def is_grpo(self) -> bool:
         return self.method == "grpo"
-
-    def display(self) -> str:
-        return self.label or f"{self.model_id} {self.method} x{self.steps}"
 
     def normalized(self) -> RunConfig:
         """A copy with every ``None`` knob filled from the recipe for this method."""
@@ -129,14 +107,10 @@ class RunConfig:
         )
 
     def train_knobs(self) -> dict[str, int]:
-        """The knob dict ``engine.vram.model_required_vram_gb`` consumes (for sizing).
+        """The knob dict ``engine.vram.model_required_vram_gb`` consumes for VRAM sizing.
 
-        Mirrors what the REAL allocator passes: the parsed ``TrainSpec`` leaves an omitted
-        ``batch_size`` as ``None``, and ``model_required_vram_gb`` then defaults it to 1 for
-        SFT VRAM sizing (the activations term scales with batch). So an omitted batch_size is
-        left OUT here -- the recipe effective batch (32) is the right model of compute
-        throughput in ``seconds_per_step``, but feeding it into VRAM sizing over-provisions
-        relative to the allocator. Only an EXPLICIT batch_size is forwarded for sizing.
+        Only an EXPLICIT batch_size is forwarded: the allocator leaves an omitted batch at
+        None (sized as 1), so feeding the recipe effective batch here would over-provision.
         """
         n = self.normalized()
         knobs: dict[str, int] = {"lora_rank": n.lora_rank}
@@ -153,35 +127,28 @@ class RunConfig:
 
 @dataclass(frozen=True)
 class CostEstimate:
-    """A pre-flight training-cost estimate for one run.
+    """A pre-flight training-cost estimate. ``total_usd`` = ``wall_clock_hours * gpu_hourly_usd``."""
 
-    All seconds are wall-clock; ``total_usd`` is the headline figure
-    (``wall_clock_hours * gpu_hourly_usd``).
-    """
-
-    # --- the run this estimate is for (echoed for traceability) ---
+    # the run this estimate is for (echoed for traceability)
     model_id: str
     method: str  # "sft" | "grpo"
     steps: int
 
-    # --- chosen hardware ---
+    # chosen hardware
     gpu: str
     provider: str
     gpu_vram_gb: int
     required_vram_gb: int
     gpu_hourly_usd: float
 
-    # --- timing breakdown (seconds) ---
+    # timing breakdown (seconds)
     setup_seconds: float  # cold start: boot + deps + model download (+ vLLM init for GRPO)
-    seconds_per_step: float  # steady-state per optimizer step
+    seconds_per_step: float
     train_seconds: float  # steps * seconds_per_step (post wall-clock cap)
     wall_clock_seconds: float  # setup + train
-    wall_capped: bool  # True if train_seconds was clamped to the run's wall-clock cap
+    wall_capped: bool
 
-    # --- money: wall-clock hours x market $/hr, first-principles, no output adjustment ---
-    total_usd: float
-
-    # --- free-form notes (assumptions, GRPO rollout split, MoE active params, …) ---
+    total_usd: float  # wall-clock hours x market $/hr, no output adjustment
     notes: tuple[str, ...] = ()
 
     @property
@@ -194,7 +161,7 @@ class CostEstimate:
         return d
 
     def describe(self) -> str:
-        """One-line human summary. The figure is exactly ``$/hr x h`` -- no adjustment."""
+        """One-line human summary; the figure is exactly ``$/hr x h``."""
         cap = " (wall-capped)" if self.wall_capped else ""
         return (
             f"{self.model_id} {self.method.upper()} x{self.steps} steps -> "
@@ -203,7 +170,7 @@ class CostEstimate:
         )
 
     def breakdown(self) -> str:
-        """Multi-line itemized breakdown, suitable for CLI output."""
+        """Multi-line itemized breakdown for CLI output."""
         lines = [
             f"Run        : {self.model_id}  [{self.method.upper()}, {self.steps} steps]",
             f"GPU        : {self.gpu} on {self.provider} "

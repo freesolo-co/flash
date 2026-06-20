@@ -1,17 +1,9 @@
 """The analytical cost model -- the deterministic ground truth.
 
-Total cost = wall-clock hours x GPU $/hr. Wall clock = cold-start setup + steps x
-per-step time. Per-step time is a first-principles FLOPs estimate (compute = a small
-multiple of active-params x tokens, divided by the GPU's peak bf16 throughput times a
-calibrated model-FLOPs-utilization), so the model is transparent and every term is
-named. GRPO splits each step into a vLLM rollout (generation, decode-bound) plus the
-policy/reference update (train-bound) -- which is why GRPO is several times costlier
-than SFT per step. Hardware selection reuses ``flash``'s own VRAM matrix + cheapest-
-fit rule, so the chosen GPU class matches what the allocator would pick.
-
-These constants are calibrated so end-to-end figures land in a realistic band (cents
-for a small SFT smoke; a few-to-tens of dollars for a large GRPO run) rather than to
-any single measured run. ``calibration`` grades this model against the measured runs.
+Total cost = wall-clock hours x GPU $/hr. Wall clock = cold-start setup + steps x per-step
+time, where per-step time is a first-principles FLOPs estimate (a small multiple of
+active-params x tokens, over the GPU's peak bf16 throughput x a calibrated MFU). GRPO splits
+each step into a vLLM rollout (decode-bound) + reward grading + policy/reference update.
 """
 
 from __future__ import annotations
@@ -39,37 +31,27 @@ SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
 
-# Model-FLOPs utilization: fraction of peak the run actually sustains. Physical throughput
-# constants, JOINTLY calibrated (with cold-start below) against the measured wall clock of
-# the real RunPod/Vast runs (cost_estimator_results/real_runs/measured_runs.json) by
-# minimizing median cost APE -- the way you'd measure MFU
-# empirically, not a correction on the output. LoRA + small batches underutilize the card,
-# so these sit well below dense-pretraining MFU.
-MFU_TRAIN = 0.35  # GRPO policy/reference update (processes the rollout batch)
-MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd: less efficient than the GRPO update (smaller effective
-# batch, long supervised sequences) -- the real SFT runs underutilize the card more, a
-# method-specific throughput, not an output adjustment. Centers the SFT bias to ~1.0.
+# Model-FLOPs utilization: fraction of peak the run sustains. Jointly calibrated (with
+# cold-start below) against the measured wall clock of the real runs (_data/measured_runs.json)
+# by minimizing median cost APE. LoRA + small batches sit well below dense-pretraining MFU.
+MFU_TRAIN = 0.35  # GRPO policy/reference update
+MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences -> less efficient)
 MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 
-# Reward grading runs CONCURRENTLY, not one completion at a time: a step's completions are
-# scored in parallel (env workers / batched judge calls), so the reward wall is the serial
-# per-completion latency divided by the effective concurrency -- NOT completions x latency
-# (which over-counts a heavy grader by ~2 orders of magnitude and saturates the wall cap).
-# A physical infra constant (parallel grader slots), calibrated against measured heavy-env runs.
+# Reward grading runs CONCURRENTLY: a step's completions are scored in parallel slots, so the
+# reward wall is ceil(completions / slots) waves x per-completion latency, NOT completions x
+# latency (which over-counts a heavy grader ~100x and saturates the wall cap).
 REWARD_CONCURRENCY = 16.0
 
-# --- cold-start overhead (seconds), post-allocation: container boot + deps + model
-# download (+ vLLM init for GRPO). Jointly calibrated against those runs' measured wall.
-# NOTE: the per-run implied cold-start spans ~470-840s (1.8x), so this term is the dominant
-# source of the irreducible per-run error -- a short, cold-start-bound run cannot be priced
-# tighter than that spread, whatever the constant. We fit the central value, not the noise.
-WORKER_BOOT_S = 180.0  # provision + container start + framework import
-DEPS_INSTALL_S = 120.0  # per-run pip deps not already baked into the image
+# --- cold-start overhead (seconds): container boot + deps + model download (+ vLLM init for
+# GRPO). Jointly calibrated with MFU. The per-run implied cold-start spans ~470-840s, the
+# dominant source of irreducible per-run error -- we fit the central value, not the noise.
+WORKER_BOOT_S = 180.0
+DEPS_INSTALL_S = 120.0
 VLLM_INIT_S = 120.0  # GRPO only: vLLM engine + tokenizer load
 DOWNLOAD_RATE_GBPS = 0.4  # effective HF snapshot download (hf_transfer)
 
-# Default total wall-clock cap (spec ``gpu.max_wall_seconds`` default = 24h).
-DEFAULT_WALL_CAP_S = 24 * 3600
+DEFAULT_WALL_CAP_S = 24 * 3600  # spec ``gpu.max_wall_seconds`` default
 
 
 def setup_seconds(config: RunConfig) -> float:
@@ -92,60 +74,41 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * active * tokens
         return flops / (peak * MFU_SFT_TRAIN)
 
-    # GRPO step = rollout (generate G completions/prompt) + reward (score every
-    # completion through the verifiers env) + policy/reference update.
-    completions = n.batch_size * n.group_size  # prompts_per_step x group_size
+    # GRPO step = rollout (generate G completions/prompt) + reward (score each) + update.
+    completions = n.batch_size * n.group_size
     gen_tokens = completions * n.completion_len
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_TRAIN)
-    # Reward graders run in parallel over REWARD_CONCURRENCY slots, so the wall is the number
-    # of grading WAVES x the per-completion latency: ceil(completions / slots) waves, each of
-    # which takes one full per-completion latency to drain (a partial final wave still occupies
-    # the slots for a whole latency -- a 16-slot grader holding 17 completions needs 2 waves,
-    # not 1.06). This is why dividing by min(completions, slots) -- which models a fraction of a
-    # wave for non-multiples -- undercounts heavy-reward steps with 17-31, 33-47, ... completions;
-    # the wave count rounds up instead. It coincides with the old min()/division at the two
-    # endpoints (completions <= slots => 1 wave = one latency; an exact multiple => completions/
-    # slots waves), so all the real measured configs (4, 16, 128, 256, 512 completions) are
-    # unchanged -- only the fractional-wave configs in between are now priced for the full wave.
+    # ceil() waves: a partial final wave still occupies the slots for a whole latency.
     latency = reward_seconds_per_completion(n.environment, n.reward_seconds_per_completion)
-    reward_waves = math.ceil(completions / REWARD_CONCURRENCY)
-    reward_s = reward_waves * latency
+    reward_s = math.ceil(completions / REWARD_CONCURRENCY) * latency
     return gen_s + reward_s + update_s
 
 
 def _offline_open_model_vram_gb(config: RunConfig) -> int | None:
     """VRAM for an UNLISTED model whose size can't be read from HF (offline/no-creds).
 
-    ``model_required_vram_gb`` sizes unlisted models from HF metadata and, when that's
-    unreadable, returns a flat 24 GB tier -- so offline (``FLASH_SKIP_NET``) every
-    open model lands on a 24 GB card even when its id clearly encodes a big size
-    (``vendor/foo-70B``). ``model_specs`` parses that size, so here we mirror the
-    allocator's OWN open-model branch (GRPO is the heavier phase; same long-context
-    escalation + headroom) but seeded with the parsed param count instead of the
-    fallback. Returns ``None`` (defer to the allocator) when the model is catalog'd or
-    its size IS readable from HF -- so this only ever replaces the flat-24 fallback.
+    Offline (``FLASH_SKIP_NET``), the allocator returns a flat 24 GB tier for any open model
+    even when the id encodes a big size. Here we mirror the allocator's open-model branch
+    (heavier GRPO phase + headroom) seeded with the parsed param count instead. Returns None
+    (defer to the allocator) for a catalog'd model or one whose size IS readable from HF.
     """
     import os
 
     from flash.catalog import MODELS
     from flash.engine.vram import estimate_vram_gb, fetch_hf_params_b, grpo_seq_escalation_gb
 
-    # Only the advertised offline mode (FLASH_SKIP_NET) sizes from the parsed id. A transient
-    # HF/network failure must NOT silently switch strategy: the allocator still uses its flat 24 GB
-    # open-model fallback at submit, so preflight GPU/cost would otherwise diverge from the real run.
+    # Only the advertised offline mode sizes from the parsed id; a transient HF failure must
+    # not silently switch strategy (the allocator still uses its flat-24 fallback at submit).
     if not os.environ.get("FLASH_SKIP_NET"):
         return None
-
     if MODELS.get(config.model_id) is not None:
-        return None  # catalog model: the allocator sizes it from curated facts
+        return None
     if fetch_hf_params_b(config.model_id) is not None:
-        return None  # HF metadata readable: trust the allocator's HF-sized estimate
+        return None
 
-    params_b = total_params_b(config.model_id)  # parsed from the id (e.g. "...-70B")
+    params_b = total_params_b(config.model_id)
     knobs = config.train_knobs()
-    # Mirror model_required_vram_gb's open-model branch: size against the heavier GRPO
-    # phase regardless of the requested algorithm, with the run's actual knobs + headroom.
     est = estimate_vram_gb(
         params_b,
         "grpo",
@@ -165,20 +128,16 @@ def _offline_open_model_vram_gb(config: RunConfig) -> int | None:
 def select_gpu(config: RunConfig, *, pin_must_fit: bool = True) -> tuple[str, int]:
     """(chosen GPU class, required VRAM GB) for the run, offline/deterministic.
 
-    ``pin_must_fit`` is True for a forward estimate (a too-small pin escalates to a fitting
-    class). The calibration grader passes False so a measured run is priced on the card it
-    *actually ran on* even when the offline VRAM heuristic over-estimates and would drop it
-    (see ``pick_gpu``) -- otherwise the measured bill is graded against a different GPU.
+    ``pin_must_fit=False`` (calibration grader) prices a measured run on the card it actually
+    ran on even when the offline VRAM heuristic over-estimates (see ``pick_gpu``).
     """
     need = _offline_open_model_vram_gb(config)
     if need is None:
         need = required_vram_gb(
             config.model_id, config.method, train=config.train_knobs(), thinking=config.thinking
         )
-    # ``allow_unvalidated`` is tri-state. ``None`` means "unspecified", which the submit-time
-    # allocator resolves via ``unvalidated_allowed`` (the managed per-run policy) -- so resolve
-    # it the SAME way here instead of treating None as validated-only, keeping the estimate's
-    # pool in lockstep with whatever the allocator would actually allocate.
+    # ``allow_unvalidated`` is tri-state; resolve a None the same way the submit-time allocator
+    # does (``unvalidated_allowed``) so the estimate's pool matches what would be allocated.
     gpu = pick_gpu(
         need,
         pin=config.gpu,
@@ -215,8 +174,7 @@ def _notes(
             + (f", env {n.environment}" if n.environment else "")
             + ") + policy+reference update"
         )
-    # ``vram_headroom()`` is a sizing MULTIPLIER (e.g. 1.1), so the headroom fraction is it
-    # minus one -- report 10%, not the multiplier itself as 110%.
+    # ``vram_headroom()`` is a multiplier (e.g. 1.1) -> report the fraction (10%), not 110%.
     notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; market (spot/queue) $/hr")
     if wall_capped:
         per_seed = "" if config.setup_repeats == 1 else "per-seed "
@@ -232,33 +190,22 @@ def estimate_cost(
 ) -> CostEstimate:
     """Deterministic pre-flight cost estimate -- the analytical ground truth.
 
-    ``pin_must_fit`` defaults True (forward estimate: a too-small GPU pin escalates). The
-    calibration grader passes False to price a measured run on the card it actually ran on
-    even when the offline VRAM heuristic over-estimates the requirement (see ``select_gpu``
-    / ``pick_gpu``), so the measured bill isn't compared against a different GPU's price.
+    ``pin_must_fit=False`` (calibration grader) prices a measured run on the card it actually
+    ran on, so the measured bill isn't compared against a different GPU's price.
     """
     gpu, need = select_gpu(config, pin_must_fit=pin_must_fit)
     hourly = realized_hourly_usd(gpu)  # market (spot/queue) rate runs are billed at
-    # The wall cap is ``gpu.max_wall_seconds`` from the spec (default 24h); fall back to the
-    # caller's ``wall_cap_s`` (the module default) when the config doesn't pin one.
-    # Runner enforces max(60, spec.gpu.max_wall_seconds); mirror that floor so near-zero
-    # max_wall_seconds values don't produce near-zero/negative cost estimates.
-    cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
+    cap_s = float(config.max_wall_seconds) if config.max_wall_seconds is not None else wall_cap_s
 
-    # A multi-seed run is N independent jobs (runner.py: "one allocation per seed"), each of
-    # which cold-starts, runs its own steps, and has ``max_wall_seconds`` applied to ITS OWN
-    # wall clock. So price one seed (setup + its share of the steps), clamp THAT to the cap,
-    # then multiply by the seed count -- summing per-seed capped wall, not capping the
-    # aggregate once (which under-/over-prices a multi-seed run whose per-seed cap binds).
+    # A multi-seed run is N independent jobs, each cold-starting and capped on its OWN wall.
+    # Price one seed, clamp THAT to the cap, then multiply -- not capping the aggregate once.
     seeds = config.setup_repeats
     setup_per_seed = setup_seconds(config)
     sps = seconds_per_step(config, gpu)
     raw_train_per_seed = (config.steps / seeds) * sps
 
-    # The cap is on TOTAL per-seed wall clock; setup is billed too, so clamp training to fit.
-    # A degenerate cap shorter than setup itself (e.g. a 2-minute cap vs a ~8-minute cold start)
-    # leaves zero training budget AND clamps the billed setup to the cap -- the run is killed at
-    # the wall limit mid-cold-start, so it can't bill more than ``cap_s`` of wall per seed.
+    # The cap is on total per-seed wall; setup is billed too, so clamp training to fit (a cap
+    # shorter than setup leaves zero training budget and clamps the billed setup to the cap).
     wall_capped = (setup_per_seed + raw_train_per_seed) > cap_s
     setup_per_seed = min(setup_per_seed, cap_s)
     train_per_seed = max(0.0, cap_s - setup_per_seed) if wall_capped else raw_train_per_seed

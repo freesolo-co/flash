@@ -33,6 +33,7 @@ from flash.cli.main.commands import (  # noqa: F401
     cmd_deployments,
     cmd_env_init,
     cmd_env_list,
+    cmd_estimate,
     cmd_gpus,
     cmd_lab_setup,
     cmd_login,
@@ -112,6 +113,16 @@ def main(argv: list[str] | None = None) -> int:
 
     gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
     gpus.set_defaults(func=cmd_gpus)
+
+    estimate = sub.add_parser("estimate", help="pre-flight USD cost estimate for a run")
+    estimate.add_argument("--model", required=True)
+    estimate.add_argument("--method", choices=("sft", "grpo"), required=True)
+    estimate.add_argument("--steps", type=int, required=True)
+    estimate.add_argument("--seq-len", type=int, default=None, dest="seq_len")
+    estimate.add_argument("--gpu", default=None, help="pin a GPU class (else cheapest fit)")
+    estimate.add_argument("--environment", default=None, help="verifiers env slug (GRPO reward tier)")
+    estimate.add_argument("--thinking", action="store_true")
+    estimate.set_defaults(func=cmd_estimate)
 
     env = sub.add_parser("env", help="manage verifiers environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)

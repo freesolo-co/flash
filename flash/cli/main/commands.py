@@ -188,6 +188,23 @@ def cmd_gpus(args) -> int:
     return 0
 
 
+def cmd_estimate(args) -> int:
+    """Pre-flight USD cost estimate for a run (local: wall-clock hours x market $/hr)."""
+    from flash.cost import RunConfig, estimate_cost
+
+    cfg = RunConfig(
+        args.model,
+        args.method,
+        args.steps,
+        seq_len=args.seq_len,
+        thinking=args.thinking,
+        gpu=args.gpu,
+        environment=args.environment,
+    )
+    print(estimate_cost(cfg).breakdown())
+    return 0
+
+
 def cmd_env_init(args) -> int:
     mod = args.name.replace("-", "_")
     root = Path("environments") / mod
