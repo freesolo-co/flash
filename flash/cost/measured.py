@@ -49,12 +49,16 @@ def _steps_from_train(algorithm: str, train: dict[str, Any]) -> int:
     if algorithm == "grpo":
         return int(RECIPE.rl.num_steps)
 
-    # max_steps is the worker's SFT optimizer-step cap -- only build the cap for SFT. An ABSENT
-    # cap (None) means uncapped; an explicit value (incl. 0) is honored, not coerced to "no cap".
-    max_steps = train.get("max_steps")
+    # max_steps is the worker's SFT optimizer-step cap -- only build the cap for SFT. Both an
+    # ABSENT cap (None) and an explicit 0 mean uncapped, matching the spec/schema "None/0 -> no
+    # cap" contract and the worker, which only applies the cap when ``max_steps > 0`` (a 0 leaves
+    # the run uncapped). So the cap is active only for a positive value -- treating 0 as a hard
+    # cap of zero would mis-derive a valid SFT run to 0 steps.
+    max_steps_raw = train.get("max_steps")
+    max_steps = int(max_steps_raw) if max_steps_raw is not None else 0
 
     def _cap(n: int) -> int:
-        return min(n, int(max_steps)) if max_steps is not None else n
+        return min(n, max_steps) if max_steps > 0 else n
 
     epochs_raw = train.get("epochs")
     epochs = int(epochs_raw) if epochs_raw is not None else 1

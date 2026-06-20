@@ -101,6 +101,18 @@ def test_sft_steps_cap_respected():
     assert cfg.steps == 8  # min(ceil(512/16)=32, 8)
 
 
+def test_sft_explicit_zero_max_steps_is_no_cap():
+    # max_steps=0 means "no cap" in TrainSpec/schema and the worker (which only applies the cap
+    # when max_steps > 0). A 0 must NOT clamp the reconstructed count to zero steps -- that would
+    # mis-derive a valid SFT run to 0 and mis-grade its measured cost.
+    status = {
+        **SFT_STATUS,
+        "spec": {**SFT_STATUS["spec"], "train": {**SFT_STATUS["spec"]["train"], "max_steps": 0}},
+    }
+    cfg = runconfig_from_status(status)
+    assert cfg.steps == 32  # ceil(512/16)*1 epoch, uncapped (0 == no cap)
+
+
 def test_sft_omitted_batch_uses_recipe_effective_batch():
     # An omitted SFT batch_size reconstructs against the recipe EFFECTIVE batch (32), the
     # value the worker sizes grad-accum to hit -- not a bare per-device default. So a
