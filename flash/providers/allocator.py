@@ -80,15 +80,7 @@ def _runpod_candidates(need: int, pinned_gpu: str | None) -> list[Candidate]:
             continue
         if pinned_gpu and g.name != pinned_gpu:
             continue
-        out.append(
-            Candidate(
-                "runpod",
-                g.name,
-                provider.hourly_rate(g.name),
-                g.vram_gb,
-                "runpod" in g.validated_on,
-            )
-        )
+        out.append(Candidate("runpod", g.name, provider.hourly_rate(g.name), g.vram_gb))
     return out
 
 
@@ -133,11 +125,7 @@ def _vast_candidates(
         if o.gpu in seen:  # offers are price-sorted; keep the cheapest per class
             continue
         seen.add(o.gpu)
-        out.append(
-            Candidate(
-                "vast", o.gpu, o.dph_total, info.vram_gb, "vast" in info.validated_on, offer=o
-            )
-        )
+        out.append(Candidate("vast", o.gpu, o.dph_total, info.vram_gb, offer=o))
     return out, tuple(book)
 
 

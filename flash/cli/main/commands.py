@@ -153,7 +153,7 @@ def cmd_models(args) -> int:
 
 
 def cmd_gpus(args) -> int:
-    """List GPU classes, VRAM, per-provider $/hr and live validation."""
+    """List GPU classes, VRAM, and per-provider $/hr."""
     from flash.providers import available_providers
     from flash.providers.base import GPU_INFO
     from flash.providers.runpod.pricing import live_rates
@@ -173,18 +173,16 @@ def cmd_gpus(args) -> int:
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
-    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}  smoke-tested on")
+    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}")
     for info in sorted(GPU_INFO.values(), key=lambda g: rates.get(g.name, g.hourly_usd)):
         runpod_rate = rates.get(info.name, info.hourly_usd) if info.enum_member else None
-        validated = ",".join(info.validated_on) or "-"
         print(
             f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}"
-            f"{fmt_rate(vast_rates.get(info.name))}  {validated}"
+            f"{fmt_rate(vast_rates.get(info.name))}"
         )
     print(
         '\nTip: omit gpu.type (or set "cheapest") to allocate the cheapest class that fits the\n'
-        "model across all providers. The 'smoke-tested on' column is informational only — every\n"
-        "fitting class is eligible (a concrete gpu.type pins the class)."
+        "model across all providers (a concrete gpu.type pins the class)."
     )
     return 0
 

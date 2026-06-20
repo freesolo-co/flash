@@ -33,16 +33,6 @@ def test_providers_for():
     assert providers_for("RTX Pro 4000") == ("vast",)
 
 
-def test_is_validated_per_provider():
-    from flash.providers.base import is_validated
-
-    assert is_validated("RTX 4090")  # any-provider
-    assert is_validated("RTX 4090", "runpod")
-    assert not is_validated("L4")
-    # RTX 3090 has a RunPod enum member but no live smoke yet
-    assert not is_validated("RTX 3090", "runpod")
-
-
 def test_expanded_gpu_table():
     from flash.providers.base import GPU_INFO, canonical_gpu, get_gpu_info, gpu_short
 

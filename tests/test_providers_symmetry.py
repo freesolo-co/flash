@@ -113,15 +113,6 @@ def test_sweep_orphans_is_part_of_the_protocol():
     assert "sweep_orphans" in dir(Provider)
 
 
-def test_validated_on_is_per_provider():
-    from flash.providers.base import GPU_INFO
-
-    assert GPU_INFO["RTX 3090"].validated_on == ("vast",)
-    assert GPU_INFO["RTX 4090"].validated_on == ("runpod",)
-    assert set(GPU_INFO["RTX 5090"].validated_on) == {"runpod", "vast"}
-    assert GPU_INFO["RTX Pro 4000"].validated_on == ("vast",)
-
-
 @pytest.mark.parametrize("provider", ["runpod", "vast"])
 def test_static_pricing_offline(provider, monkeypatch):
     """Offline, every provider's hourly_rate falls back to the static snapshot."""
@@ -269,7 +260,7 @@ def test_allocation_summary_non_vast_provider(monkeypatch):
     # A non-vast allocation carrying a NON-vast offer object (no offer_id/geolocation):
     # allocation_summary must not touch it.
     sentinel = object()  # would raise AttributeError if treated as a vast offer
-    cand = Candidate("runpod", "RTX A5000", 0.27, 24, True, offer=sentinel)
+    cand = Candidate("runpod", "RTX A5000", 0.27, 24, offer=sentinel)
     alloc = Allocation(
         provider="runpod",
         gpu="RTX A5000",

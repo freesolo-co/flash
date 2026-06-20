@@ -38,7 +38,7 @@ def _offer_obj(offer_id=5, machine_id=2, gpu="RTX 3090", dph=0.25):
 def _alloc(provider="vast", gpu="RTX 3090", rate=0.25, offer=None, provider_offers=()):
     from flash.providers.base import Allocation, Candidate
 
-    cand = Candidate(provider, gpu, rate, 24, True, offer=offer)
+    cand = Candidate(provider, gpu, rate, 24, offer=offer)
     return Allocation(
         provider=provider,
         gpu=gpu,

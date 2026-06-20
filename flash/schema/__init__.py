@@ -105,7 +105,7 @@ _GPU_REMOVED = {
     ),
     "allow_unvalidated": (
         "gpu.allow_unvalidated was removed: there is no validation gate anymore (every fitting "
-        "class is eligible; validated_on is informational only). Remove it."
+        "class is eligible). Remove it."
     ),
 }
 
