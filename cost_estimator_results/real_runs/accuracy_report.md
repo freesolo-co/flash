@@ -6,18 +6,18 @@ grading, the spot/queue rate the provider bills). **There is no output multiplie
 dollar figure is not scaled to hit any target. The numbers below are whatever the equation
 gives.
 
-## Accuracy vs measured cost (n=65 runs)
+## Accuracy vs measured cost (n=66 runs)
 
 | Group | n | median APE | within 33% | Σ cost $ | Σ quote $ | net $ | verdict |
 |---|---:|---:|---:|---:|---:|---:|---|
-| all | 65 | 36% | 46% | $26.95 | $27.59 | +0.64 (+2%) | break-even |
-| sft | 13 | 51% | 15% | $1.59 | $2.45 | +0.86 (+54%) | **GAIN** (over-quote) |
+| all | 66 | 38% | 45% | $27.71 | $28.82 | +1.10 (+4%) | break-even |
+| sft | 14 | 56% | 14% | $2.35 | $3.68 | +1.33 (+56%) | **GAIN** (over-quote) |
 | grpo | 52 | 26% | 54% | $25.36 | $25.14 | -0.22 (-1%) | break-even |
-| real | 48 | 25% | 56% | $24.66 | $19.89 | -4.77 (-19%) | **LOSE** (under-quote) |
-| real_sft | 6 | 47% | 17% | $1.26 | $1.27 | +0.00 (+0%) | break-even |
+| real | 49 | 26% | 55% | $25.42 | $21.12 | -4.30 (-17%) | **LOSE** (under-quote) |
+| real_sft | 7 | 51% | 14% | $2.03 | $2.49 | +0.46 (+23%) | **GAIN** (over-quote) |
 | real_grpo | 42 | 23% | 62% | $23.39 | $18.63 | -4.77 (-20%) | **LOSE** (under-quote) |
 
-**Money outcome — does the estimator break even, gain, or lose?** If the estimate is the quote and the measured cost is what we pay the provider, then over the **48 real runs (those that actually ran their configured work)** the equation quotes **$19.89** against **$24.66** of real cost — a net of **-4.77 (-19%)**, i.e. **LOSE (under-quote)**. The `all` row nets near zero only because cancelled sub-500s smoke tests wildly over-quote and mask the loss — they price a different (shorter) run than they ran, so they are not real revenue. The honest, no-output-multiplier equation is centered on the *median* run, but real cost is right-skewed (a few big rollouts dominate the dollars), so a per-run-accurate quote sits below the *mean* cost: accurate, but it loses money used raw. Breaking even needs either tighter big-rollout accuracy or an explicit margin on top (a business markup, kept separate from the equation — NOT a hidden factor inside it).
+**Money outcome — does the estimator break even, gain, or lose?** If the estimate is the quote and the measured cost is what we pay the provider, then over the **49 real runs (those that actually ran their configured work)** the equation quotes **$21.12** against **$25.42** of real cost — a net of **-4.30 (-17%)**, i.e. **LOSE (under-quote)**. The `all` row nets near zero only because cancelled sub-500s smoke tests wildly over-quote and mask the loss — they price a different (shorter) run than they ran, so they are not real revenue. The honest, no-output-multiplier equation is centered on the *median* run, but real cost is right-skewed (a few big rollouts dominate the dollars), so a per-run-accurate quote sits below the *mean* cost: accurate, but it loses money used raw. Breaking even needs either tighter big-rollout accuracy or an explicit margin on top (a business markup, kept separate from the equation — NOT a hidden factor inside it).
 
 The net $ is **not forced to zero** -- forcing it (scaling the estimate to hit break-even)
 would be exactly the output hack this equation avoids. The meaningful rows are **`real_*`**
@@ -30,13 +30,13 @@ a different, shorter run than the equation prices: an invalid comparison, not an
 error. The remaining real-run residual is cold-start spread (implied cold-start is a stable
 ~480-520s on long runs) + per-step scatter; it is a central estimate, not a fake-precise point.
 
-## Calibrated physical inputs (observed billed $/hr reference, from 64 runs)
+## Calibrated physical inputs (observed billed $/hr reference, from 65 runs)
 
 Observed billed medians per GPU class from `fit_constants()` (for reference — the estimator
 uses `flash.cost.facts.REALIZED_HOURLY_USD`, which may use conservative representative rates
 that differ from these dataset medians):
 
-"A100 PCIe": 1.035,
+"A100 PCIe": 1.069,
 "A100 SXM": 1.133,
 "H100": 10.037,
 "RTX 3090": 0.595,

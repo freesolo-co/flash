@@ -33,8 +33,9 @@ you'd measure MFU empirically, **never** a dimensionless correction on the resul
 - **Realized $/hr** (`facts.REALIZED_HOURLY_USD`) — a representative effective rate
   (measured cost ÷ measured wall) per GPU class, an empirical observation rather than list
   ± a fixed discount. The table uses conservative per-class values; `fit_constants()` returns
-  the exact dataset medians (useful for re-calibration). Usually below list (the spot discount: RTX 5090 lists $0.99 but bills
-  ~$0.87; A100 PCIe lists $1.39 but bills ~$1.04), but it can run *above* list when the
+  the exact dataset medians (useful for re-calibration). Usually below list (the spot discount:
+  RTX 5090 lists $0.99 but bills ~$0.87; A100 PCIe lists $1.39 but bills ~$1.04), but it can
+  run *above* list when the
   market is tight (an H100 GRPO run billed ~$10/hr against a $3.29 list). An unobserved
   class falls back to list (an honest estimate until measured).
 
@@ -48,29 +49,45 @@ python -m flash.cost verify    # grade the equation vs measured cost + env sweep
 ## Accuracy vs measured cost (no hacking, then accuracy)
 
 `verify_accuracy` grades the **raw** equation against the measured RunPod/Vast runs in
-`cost_estimator_results/real_runs/measured_runs.json` (the calibration + validation set):
+`cost_estimator_results/real_runs/measured_runs.json` (the calibration + validation set).
+The last three columns read the estimate as a **quote** and the measured cost as what we
+pay the provider, so `net $ = Σ quote − Σ cost` is the **profit/loss** of pricing at the
+equation (− = under-quote, the conservative side):
 
-| Group | n | mean MAPE | median APE | agg bias | within 33% |
-|---|---:|---:|---:|---:|---:|
-| all | 60 | 107% | 37% | 1.01 | 48% |
-| **real** (≥500s) | 43 | 39% | **23%** | 0.78 | 60% |
-| **real GRPO** | 37 | 37% | **22%** | 0.76 | **68%** |
-| real SFT | 6 | 50% | 47% | 1.00 | 17% |
+| Group | n | median APE | within 33% | Σ cost | Σ quote | net $ | outcome |
+|---|---:|---:|---:|---:|---:|---:|---|
+| all | 66 | 38% | 45% | $27.71 | $28.82 | +1.10 (+4%) | ~break-even\* |
+| **real** (≥500s) | 49 | **26%** | 55% | $25.42 | $21.12 | **−4.30 (−17%)** | **under-quote** |
+| **real GRPO** | 42 | **23%** | **62%** | $23.39 | $18.63 | −4.77 (−20%) | under-quote |
+| real SFT | 7 | 51% | 14% | $2.03 | $2.49 | +0.46 (+23%) | over-quote |
 
 _Static snapshot — see [`accuracy_report.md`](../../cost_estimator_results/real_runs/accuracy_report.md) for current figures (regenerate with `accuracy.py`)._
 
 The meaningful rows are **`real`** — runs ≥500s that actually executed their configured
-work. **Real GRPO is accurate: 22% median APE, ~68% of runs within a third of measured.**
-`agg bias` is **not forced to 1.0** (that would be the output hack this avoids).
+work. **Real GRPO is accurate (23% median APE, 62% within a third) and under-quotes the
+aggregate by ~20%** — i.e. it errs on the conservative side (you don't lose money you didn't
+quote for). `net $` is **not forced to zero** (forcing it would be the output hack this
+avoids); the under-quote is an *emergent* property of honest inputs centered on the median
+run, because real cost is right-skewed (a few big rollouts dominate the dollars).
 
-Two things to read honestly:
-- **Sub-500s "runs" over-predict ~3×** and drag the `all` row down — they were cancelled /
+\*The `all` row only looks break-even because cancelled smoke tests over-quote and mask the
+real under-quote — see below.
+
+Three things to read honestly:
+- **Sub-500s "runs" over-predict ~3×** and inflate the `all` row — they were cancelled /
   step-capped before running their configured steps (the tell: predicted train time alone
   exceeds the whole measured wall), so their cost is for a *different, shorter* run than the
   equation prices. An invalid comparison, not an estimator error.
-- The real-run residual is **cold-start spread** (implied cold-start is a stable ~480–520s
-  on long runs) **+ per-step scatter** — a central estimate, not a fake-precise point. SFT
-  (n=6) is centered (bias ~1.0) but data-limited; more long SFT runs will tighten its spread.
+- The real-GRPO residual is **cold-start spread** (implied cold-start is a stable ~480–520s
+  on long runs) **+ per-step scatter** — a central estimate, not a fake-precise point.
+- **SFT (n=7) over-quotes ~23%** for one structural reason: the equation prices
+  `tokens = batch × seq_len` (full packing), but real datasets have **shorter sequences than
+  the cap** (a measured 9B run used 3.2 M train-tokens against the 5.2 M the cap implies — a
+  1.6× over-estimate, all from packing, *not* MFU: that run's realized MFU was 0.28, right on
+  the constant). Full packing is the correct conservative pre-flight prior — you size for the
+  cap you can't see past — so SFT lands on the safe (over-quote) side; its wide APE is the
+  unknown-sequence-length spread, which only the dataset resolves. SFT is ~8% of the dollars,
+  so the aggregate still under-quotes per the row above.
 
 Refresh the calibration as new runs land: harvest the control plane into `measured_runs.json`,
 re-run `fit_constants` to refresh `REALIZED_HOURLY_USD` (the realized per-class market rates —

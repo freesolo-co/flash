@@ -1105,6 +1105,23 @@
    "gpu": "RTX 3090",
    "provider": "vast",
    "hourly_usd": 0.962962962962963
+  },
+  {
+   "run_id": "autoslm-1781588744-8f321773",
+   "model": "Qwen/Qwen3.5-9B",
+   "method": "sft",
+   "steps": 80,
+   "group_size": null,
+   "batch_size": 16,
+   "completion_len": null,
+   "seq_len": 4096,
+   "environment": "freesolo-co/linkd-search-e7685595",
+   "setup_repeats": 1,
+   "cost_usd": 0.763464,
+   "wall_seconds": 1977.3,
+   "gpu": "A100 PCIe",
+   "provider": "runpod",
+   "hourly_usd": null
   }
  ]
 }
