@@ -104,7 +104,7 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     TYPES — only regular files and directories are allowed. Symlinks/hardlinks are rejected (a link
     could point outside ``dest``), and so are every other special member ``tarfile`` understands
     (device/block/char nodes, FIFOs): there's no legitimate reason an env package contains them, and
-    ``extractall`` would otherwise attempt to materialize them. We don't rely on tarfile's own
+    extracting them would otherwise attempt to materialize them. We don't rely on tarfile's own
     extraction filter alone; the gate here is the contract.
 
     We also bound EXPANSION — a small .tar.gz can decompress to enormous data (a "tar bomb") and
