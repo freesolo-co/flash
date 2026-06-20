@@ -201,9 +201,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"disabled; set thinking = true"
         )
     if thinking and info.thinking == "unknown":
+        # stderr, not stdout: spec_from_dict runs inside flash/mcp/server.py, which speaks a
+        # one-JSON-object-per-line protocol on stdout — a warning line there corrupts the stream.
         print(
             f"warning: open-model policy: cannot verify that {model}'s chat template "
-            f"supports thinking mode; the run proceeds with enable_thinking=true"
+            f"supports thinking mode; the run proceeds with enable_thinking=true",
+            file=sys.stderr,
         )
 
     # worker_env is the lower-level per-run escape hatch ([worker_env] table, string-valued,

@@ -88,7 +88,10 @@ def test_thinking_unknown_capability_warns_but_allows(monkeypatch, capsys):
     monkeypatch.setattr("flash.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
     spec = spec_from_dict(_raw(model="acme/tiny-1b", model_policy="allow", thinking=True))
     assert spec.thinking is True
-    assert "warning" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    # Warning goes to stderr (stdout is reserved for the MCP server's JSON protocol).
+    assert "warning" in captured.err
+    assert "warning" not in captured.out
 
 
 def test_thinking_must_be_boolean():
