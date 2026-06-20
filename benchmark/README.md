@@ -41,7 +41,9 @@ so both train against the byte-identical task definition + reward function.
   queue + boot + model download), and per-step time.
 - **Cost** — Flash is the **measured** RunPod bill (`metrics.json:cost_usd`). Tinker is
   managed and **does not expose per-run cost via API**, so its $ column is an explicit
-  wall-clock proxy (clearly labelled in the output, never presented as measured).
+  **active-compute** proxy — rollout+train time with managed-backend capacity pauses
+  excluded, times a $/hr GPU rate (clearly labelled in the output, never presented as
+  measured).
 
 ## Layout
 

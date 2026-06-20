@@ -9,8 +9,9 @@ Comparison axes (per task, flash vs tinker):
   - PERFORMANCE: mean group reward at step 1 -> final (the GRPO training signal), plus
     flash's native held-out eval reward where available.
   - LATENCY:     total wall-clock, setup/queue time, and per-step time.
-  - COST:        flash = measured RunPod $ (billed); tinker = wall-clock proxy
-                 (Tinker does not expose per-run cost via API — labelled as an estimate).
+  - COST:        flash = measured RunPod $ (billed); tinker = active-compute proxy
+                 (rollout+train time, capacity pauses excluded, x a $/hr GPU rate; Tinker
+                 does not expose per-run cost via API — labelled as an estimate, not a bill).
 
 Usage:
     uv run python benchmark/assemble.py
@@ -165,11 +166,13 @@ def collect_tinker(task: str, rel_path: str) -> dict:
     # legitimate 0.0 active-compute is honored, not treated as "missing" and replaced by wall.
     stored_active = d.get("active_compute_s")
     if stored_active is not None:
-        # Trust the runner's matched pair: its stored active and stored cost go together.
+        # Report the stored active, but ALWAYS derive the reported cost from THAT active via
+        # the shared proxy — never trust a stored cost_usd_estimated next to it. A legacy /
+        # hand-edited result can pair an active-compute `train_s` with a stale wall-based cost;
+        # recomputing here guarantees the invariant `reported cost == proxy(reported active)`
+        # holds on the stored-active path too (not only the recomputed-active path below).
         active = stored_active
-        cost = d.get("cost_usd_estimated")
-        if cost is None:  # legacy result without the cost field — derive from this active.
-            cost = _tinker_cost_from_basis(active)
+        cost = _tinker_cost_from_basis(active)
     else:
         # No stored active: recompute it from the run's metrics.jsonl (same selector/parser
         # the runner uses) and derive the cost from THAT recomputed active so the two agree.
@@ -256,7 +259,9 @@ def render_markdown(records: dict) -> str:
     lines.append("- **Flash** trains on a rented RunPod **A100 PCIe** (4B GRPO needs ≥35 GB; the "
                  "allocator escalates from the requested RTX 5090). Cost is **measured** (RunPod billed).")
     lines.append("- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is "
-                 "**not exposed via API**, so its $ column is a wall-clock proxy (labelled).")
+                 "**not exposed via API**, so its $ column is an **active-compute** proxy "
+                 "(rollout+train time, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, "
+                 "not a bill).")
     lines.append(f"- **Performance** = mean group reward over the {steps_str}-step GRPO run "
                  "(step 1 → final). Flash also reports a native held-out eval (50 examples).\n")
 
@@ -281,7 +286,11 @@ def render_markdown(records: dict) -> str:
         lines.append(f"| **latency** wall total | {_secs(f.get('total_s'))} | {_secs(t.get('total_s'))} | |")
         lines.append(f"| latency setup/queue | {_secs(f.get('setup_s'))} | none (managed) | |")
         lines.append(f"| latency active compute | {_secs(f.get('train_s'))} | {_secs(t.get('train_s'))} | |")
-        lines.append(f"| latency capacity-pause | — | {_secs(t.get('paused_s')) if t.get('paused_s') else 'none'} | |")
+        # paused_s is a real number when present (0.0 = a measured zero pause -> "0m00s");
+        # only a genuinely-absent paused_s (None) renders "none". Guard on `is not None` so a
+        # valid 0.0 isn't shown as "none" by a truthiness check.
+        _paused = t.get("paused_s")
+        lines.append(f"| latency capacity-pause | — | {_secs(_paused) if _paused is not None else 'none'} | |")
         lines.append(f"| latency per-step | {_fmt(f.get('per_step_s'), 1, 's')} | {_fmt(t.get('per_step_s'), 1, 's')} | |")
         lines.append(f"| **cost** | {_fmt(f.get('cost_usd'), 4, ' USD')} | {_fmt(t.get('cost_usd'), 4, ' USD')} | |")
         lines.append(f"| cost basis | {f.get('cost_kind')} | {t.get('cost_kind')} | |")

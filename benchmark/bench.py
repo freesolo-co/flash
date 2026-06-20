@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -260,8 +261,22 @@ def _run_tinker(args: argparse.Namespace, result_box: list) -> None:
     result_file = _tinker_result_path(args.env_id)
     output_path = str(result_file)
 
+    # Resolve TINKER_PYTHON via shutil.which so a bare PATH name (`python3`/`python`) is
+    # accepted, not just an absolute/relative existing path. `which` returns the resolved
+    # path for an existing file OR a name found on PATH, and None only when it resolves to
+    # nothing — so we error solely on a truly-unresolvable interpreter (the old
+    # `pathlib.Path(python).exists()` wrongly skipped `python3`, which has no on-disk path).
+    resolved_python = shutil.which(python)
+    if resolved_python is None:
+        result_box.append({
+            "platform": "tinker",
+            "status": "skipped",
+            "error": f"TINKER_PYTHON not found on PATH or disk: {python}  — set TINKER_PYTHON env var",
+        })
+        return
+
     cmd = [
-        python, runner,
+        resolved_python, runner,
         "--steps", str(args.steps),
         "--groups-per-batch", str(args.groups_per_batch),
         "--group-size", str(args.group_size),
@@ -271,13 +286,6 @@ def _run_tinker(args: argparse.Namespace, result_box: list) -> None:
         "--output", output_path,
         "--log-path", f"/tmp/tinker-bench-{args.env_id}",
     ]
-    if not pathlib.Path(python).exists():
-        result_box.append({
-            "platform": "tinker",
-            "status": "skipped",
-            "error": f"TINKER_PYTHON not found: {python}  — set TINKER_PYTHON env var",
-        })
-        return
 
     # Remove any stale result from a previous run BEFORE launching, so a subprocess that
     # fails without writing can't be mistaken for a fresh success (the file is keyed per

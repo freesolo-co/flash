@@ -3,7 +3,7 @@
 Same base model, same verifiers environment, same GRPO hyper-parameters (group_size=4, batch_size=4, max_tokens=512, 30 steps) on each side.
 
 - **Flash** trains on a rented RunPod **A100 PCIe** (4B GRPO needs ≥35 GB; the allocator escalates from the requested RTX 5090). Cost is **measured** (RunPod billed).
-- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is **not exposed via API**, so its $ column is a wall-clock proxy (labelled).
+- **Tinker** trains on Thinking Machines' **managed** backend. Per-run cost is **not exposed via API**, so its $ column is an **active-compute** proxy (rollout+train time, capacity pauses excluded, x a $2.00/hr GPU rate; labelled, not a bill).
 - **Performance** = mean group reward over the 30-step GRPO run (step 1 → final). Flash also reports a native held-out eval (50 examples).
 
 ## gsm8k

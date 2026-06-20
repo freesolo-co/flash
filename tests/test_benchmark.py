@@ -357,3 +357,178 @@ def test_no_flash_config_is_noop_but_defaults_env(tmp_path):
     args2 = _args()
     bench._resolve_env_consistency(args2)
     assert args2.env_id == bench._ENV_ID_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# Follow-up round: residual 0.0-truthiness, empty-direct metrics, stored-cost
+# consistency, and PATH-relative TINKER_PYTHON resolution.
+# ---------------------------------------------------------------------------
+
+# (G1) A legitimate 0.0 basis must yield a 0.0 estimated cost, never None/dropped.
+def test_runner_zero_basis_keeps_zero_cost_not_none():
+    # Reproduce the runner's write-time cost expression: 0.0 active-compute basis -> $0.0,
+    # never None. The old `... if basis else None` truthiness bug dropped a real 0.0 to None.
+    basis = 0.0
+    cost = (
+        round(basis / 3600 * tinker_runner.TINKER_PROXY_USD_PER_HR, 4)
+        if basis is not None else None
+    )
+    assert cost == 0.0
+    # A genuinely-missing basis (None) still yields None (no data).
+    basis_none = None
+    cost_none = (
+        round(basis_none / 3600 * tinker_runner.TINKER_PROXY_USD_PER_HR, 4)
+        if basis_none is not None else None
+    )
+    assert cost_none is None
+
+
+def test_runner_main_writes_zero_cost_for_zero_active(tmp_path, monkeypatch):
+    # End-to-end through main(): metrics rows present but timing sums to 0.0 -> the written
+    # JSON has active_compute_s == 0.0 AND cost_usd_estimated == 0.0 (not null).
+    log_dir = tmp_path / "logdir"
+    log_dir.mkdir()
+    (log_dir / "metrics.jsonl").write_text(
+        json.dumps({"time/do_group_rollout_and_filter_constant_reward:total": 0.0,
+                    "time/train_step": 0.0, "env/all/reward/total": 0.0}) + "\n"
+    )
+    out = tmp_path / "result.json"
+    argv = ["tinker_runner.py", "--log-path", str(log_dir), "--output", str(out)]
+    monkeypatch.setattr(sys, "argv", argv)
+    # Skip the real training: replace the async _run with a stub so asyncio.run gets a real
+    # (immediately-returning) coroutine and main() proceeds to the metrics/cost path.
+    async def _fake_run(_args):
+        return {"wall_s": 120.0}
+    monkeypatch.setattr(tinker_runner, "_run", _fake_run)
+    tinker_runner.main()
+    written = json.loads(out.read_text())
+    assert written["active_compute_s"] == 0.0
+    assert written["cost_usd_estimated"] == 0.0  # NOT None — a real pause-excluded zero
+
+
+# (G1) paused_s == 0.0 must render as "0m00s", not "none".
+def _records_for_md(paused_s):
+    """Minimal records dict for render_markdown with a tinker paused_s value."""
+    tinker = {
+        "status": "done", "gpu": "managed (Tinker)", "steps": 30,
+        "first_reward": 0.1, "final_reward": 0.1, "final_smoothed": 0.1, "best_reward": 0.2,
+        "eval_reward": None, "reward_history": [0.1] * 30,
+        "cost_usd": 1.0, "cost_kind": "ESTIMATE", "setup_s": None,
+        "train_s": 1800.0, "total_s": 1800.0, "paused_s": paused_s,
+        "per_step_s": 60.0, "train_tok_per_s": None,
+    }
+    flash = dict(tinker, platform="flash", gpu="A100 PCIe", cost_kind="measured")
+    return {t: {"flash": flash, "tinker": tinker} for t in assemble.TASKS}
+
+
+def test_render_paused_zero_shows_0m00s_not_none():
+    md = assemble.render_markdown(_records_for_md(0.0))
+    assert "| latency capacity-pause | — | 0m00s |" in md
+    assert "| latency capacity-pause | — | none |" not in md
+
+
+def test_render_paused_none_shows_none():
+    md = assemble.render_markdown(_records_for_md(None))
+    assert "| latency capacity-pause | — | none |" in md
+
+
+# (G3) select_metrics_file skips an EMPTY direct file and uses the nested one.
+def test_select_metrics_skips_empty_direct_uses_nested(tmp_path):
+    # Direct metrics.jsonl exists but is EMPTY; the real timing lives in a nested file.
+    (tmp_path / "metrics.jsonl").write_text("")  # empty -> must NOT shadow nested
+    nested_dir = tmp_path / "sub"
+    nested_dir.mkdir()
+    (nested_dir / "metrics.jsonl").write_text(
+        json.dumps({"time/do_group_rollout_and_filter_constant_reward:total": 7.0,
+                    "time/train_step": 3.0}) + "\n"
+    )
+    chosen = tinker_runner.select_metrics_file(str(tmp_path))
+    assert chosen == str(nested_dir / "metrics.jsonl")  # fell through to the non-empty nested
+    # Both the reader and assemble see the nested data (10.0), not an empty/0 from direct.
+    assert tinker_runner.active_compute_s(tinker_runner.read_metrics_records(str(tmp_path))) == pytest.approx(10.0)
+    assert assemble._tinker_active_compute_s(str(tmp_path)) == pytest.approx(10.0)
+
+
+def test_select_metrics_unparseable_direct_uses_nested(tmp_path):
+    # Direct file has only blank / non-JSON lines (no parseable records) -> treated as empty.
+    (tmp_path / "metrics.jsonl").write_text("\n   \nnot-json\n")
+    nested_dir = tmp_path / "deep"
+    nested_dir.mkdir()
+    (nested_dir / "metrics.jsonl").write_text(json.dumps({"time/train_step": 4.0}) + "\n")
+    assert tinker_runner.select_metrics_file(str(tmp_path)) == str(nested_dir / "metrics.jsonl")
+
+
+def test_select_metrics_all_empty_degrades_gracefully(tmp_path):
+    # Everything empty: no crash; reader returns [] and active-compute is None (no data).
+    (tmp_path / "metrics.jsonl").write_text("")
+    assert tinker_runner.read_metrics_records(str(tmp_path)) == []
+    assert assemble._tinker_active_compute_s(str(tmp_path)) is None
+    # Truly nothing at all (no file) -> None selection, [] records.
+    empty = tmp_path / "none"
+    empty.mkdir()
+    assert tinker_runner.select_metrics_file(str(empty)) is None
+    assert tinker_runner.read_metrics_records(str(empty)) == []
+
+
+# (G4) Stored-active path: reported cost is recomputed from the stored active, so a stale
+# wall-based cost paired with an active-compute active can't leak through.
+def test_stored_active_recomputes_cost_ignoring_stale_stored_cost(tmp_path, monkeypatch):
+    # JSON stores active=1800s but a STALE wall-based cost (3600s -> $2.00). assemble must
+    # report cost == proxy(1800s) == $1.00, NOT the stored $2.00.
+    _write_tinker_result(
+        tmp_path, wall_s=3600.0, active_compute_s=1800.0,
+        cost_usd_estimated=2.00,  # stale wall-based cost — must be overridden
+        log_path="/nonexistent",
+    )
+    monkeypatch.setattr(assemble, "_RESULTS", tmp_path)
+    rec = assemble.collect_tinker("gsm8k", "results/tinker_gsm8k.json")
+    assert rec["train_s"] == pytest.approx(1800.0)
+    assert rec["cost_usd"] == pytest.approx(1.0)  # from stored active, not stale 2.0
+    # Invariant holds on the stored-active path: reported cost == proxy(reported active).
+    assert rec["cost_usd"] == pytest.approx(assemble._tinker_cost_from_basis(rec["train_s"]))
+    assert rec["cost_usd"] != pytest.approx(2.0)
+
+
+# (G5) TINKER_PYTHON given as a PATH name (python3) is accepted via shutil.which.
+def test_tinker_python_path_name_is_accepted(monkeypatch):
+    # `python3` is a PATH name with no on-disk path; the old pathlib.exists() check wrongly
+    # skipped it. shutil.which resolves it, so _run_tinker must NOT report "skipped".
+    import shutil as _sh
+    assert _sh.which("python3") is not None, "test host needs python3 on PATH"
+    monkeypatch.setenv("TINKER_PYTHON", "python3")
+    # Make subprocess a no-op so we don't actually launch training; capture the resolved argv.
+    captured = {}
+
+    class _FakeProc:
+        returncode = 0
+        stdout = iter(())
+        def wait(self):
+            return 0
+
+    def _fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(bench.subprocess, "Popen", _fake_popen)
+    args = _args(env_id="gsm8k", steps=1, groups_per_batch=4, group_size=4,
+                 max_tokens=512, model="Qwen/Qwen3.5-4B")
+    box: list = []
+    bench._run_tinker(args, box)
+    # Not skipped: a fresh result file is absent so it reports "failed" (subprocess ran),
+    # which proves the interpreter resolved (skipped would mean which() returned None).
+    assert box
+    assert box[0].get("status") != "skipped"
+    # And the launched argv uses the RESOLVED absolute interpreter path, not the bare name.
+    assert captured["cmd"][0] == _sh.which("python3")
+
+
+def test_tinker_python_unresolvable_is_skipped(monkeypatch):
+    # A name that resolves to nothing -> skipped with a clear message (only real failure case).
+    monkeypatch.setenv("TINKER_PYTHON", "definitely-not-a-real-interpreter-xyz")
+    args = _args(env_id="gsm8k", steps=1, groups_per_batch=4, group_size=4,
+                 max_tokens=512, model="Qwen/Qwen3.5-4B")
+    box: list = []
+    bench._run_tinker(args, box)
+    assert box
+    assert box[0]["status"] == "skipped"
+    assert "not found" in box[0]["error"]

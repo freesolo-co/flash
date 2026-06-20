@@ -194,6 +194,22 @@ async def _run(args: argparse.Namespace) -> dict:
     return {"wall_s": wall}
 
 
+def _parse_metrics_jsonl(path: str) -> list[dict]:
+    """Parse one metrics.jsonl into a list of records (skip blank / non-JSON lines).
+
+    Returns ``[]`` if the file is empty or has no parseable JSON lines. Single parser so
+    the file selector and the public reader judge "has records" the same way.
+    """
+    records: list[dict] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                with contextlib.suppress(json.JSONDecodeError):
+                    records.append(json.loads(line))
+    return records
+
+
 def select_metrics_file(log_path: str | None) -> str | None:
     """Deterministically pick the metrics.jsonl for a Tinker run's log dir.
 
@@ -201,18 +217,25 @@ def select_metrics_file(log_path: str | None) -> str | None:
     assembler (``_tinker_active_compute_s``), so they always parse the SAME file and
     can never disagree on the active-compute total for a given log dir.
 
-    Selection: prefer a direct ``log_path/metrics.jsonl``; otherwise the
-    deterministically-sorted first of any nested ``**/metrics.jsonl``. Returns ``None``
-    if no metrics file exists.
+    Selection: prefer a direct ``log_path/metrics.jsonl`` **only when it actually has
+    parseable records** — an empty/unparseable direct file must NOT shadow a nested
+    ``**/metrics.jsonl`` that holds the real timing data. Otherwise fall through to the
+    deterministically-sorted first nested file that has records. Returns ``None`` when no
+    metrics file with records exists (caller degrades to [] / no active-compute, no crash).
     """
     if not log_path:
         return None
     import glob
     direct = os.path.join(log_path, "metrics.jsonl")
-    if os.path.exists(direct):
+    if os.path.exists(direct) and _parse_metrics_jsonl(direct):
         return direct
     nested = sorted(glob.glob(os.path.join(log_path, "**", "metrics.jsonl"), recursive=True))
-    return nested[0] if nested else None
+    for cand in nested:
+        if cand != direct and _parse_metrics_jsonl(cand):
+            return cand
+    # Nothing with records anywhere: surface the direct file if it exists (so an empty run
+    # still names its file) else None. Either way read_metrics_records returns [] gracefully.
+    return direct if os.path.exists(direct) else None
 
 
 def read_metrics_records(log_path: str | None) -> list[dict]:
@@ -224,14 +247,7 @@ def read_metrics_records(log_path: str | None) -> list[dict]:
     path = select_metrics_file(log_path)
     if path is None:
         return []
-    records: list[dict] = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                with contextlib.suppress(json.JSONDecodeError):
-                    records.append(json.loads(line))
-    return records
+    return _parse_metrics_jsonl(path)
 
 
 def _read_metrics_jsonl(log_path: str) -> list[dict]:
@@ -280,7 +296,13 @@ def main() -> None:
         "active_compute_s": active,
         "paused_s": paused,
         # Tinker does not expose billing via API; this is a labelled proxy, NOT a bill.
-        "cost_usd_estimated": round(basis / 3600 * TINKER_PROXY_USD_PER_HR, 4) if basis else None,
+        # `basis` is active-compute (rollout+train) when present, else wall; a legitimate 0.0
+        # basis (zero active compute) is a REAL value -> emit a 0.0 cost, never None. Guard on
+        # `is not None`, not truthiness, so 0.0 isn't dropped as "missing" (matches the module
+        # contract on active_compute_s; only a genuinely-None basis yields a None cost).
+        "cost_usd_estimated": (
+            round(basis / 3600 * TINKER_PROXY_USD_PER_HR, 4) if basis is not None else None
+        ),
         "cost_note": (
             f"estimated: active-compute x ${TINKER_PROXY_USD_PER_HR:.2f}/hr proxy "
             "(pause excluded; Tinker cost not in API - check your dashboard)"
