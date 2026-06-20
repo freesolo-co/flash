@@ -61,23 +61,27 @@ def gpu_hourly_usd(name: str) -> float:
     return info.hourly_usd
 
 
-# Realized (spot/queue) $/hr a class is ACTUALLY billed at -- below the on-demand list
-# price. The cost equation must price at what runs are billed, not the list quote (which
-# over-estimates by the spot discount: e.g. RTX 5090 lists $0.99 but bills ~$0.86, A100
-# PCIe lists $1.39 but bills ~$1.04). A calibrated price INPUT, not an output adjustment:
-# these are the MEDIAN effective rate (measured cost / measured wall) per class over the
-# RunPod/Vast runs in cost_estimator_results/real_runs/measured_runs.json -- regenerate
-# with ``calibration.fit_constants`` and refresh here as new runs land (pinned by tests).
-# A class without measured runs falls back to the list price (no spot discount invented --
-# an honest over-estimate until it's been observed).
+# Realized $/hr a class is ACTUALLY billed at -- the empirical MEDIAN effective rate
+# (measured cost / measured wall) per class over the RunPod/Vast runs in
+# cost_estimator_results/real_runs/measured_runs.json, NOT the static on-demand list
+# snapshot. It is usually below list (the spot/queue discount: RTX 5090 lists $0.99 but
+# bills ~$0.87, A100 PCIe lists $1.39 but bills ~$1.04), but it is NOT guaranteed to be --
+# a class can bill ABOVE its static list when the live market is tight or surge-priced
+# (e.g. RTX A5000 bills ~$0.30 vs a $0.27 list; an H100 GRPO run billed ~$10/hr against a
+# $3.29 list). That's exactly why this is calibrated from observed billing rather than
+# derived from list +/- a fixed discount. A calibrated price INPUT, not an output
+# adjustment -- regenerate with ``calibration.fit_constants`` and refresh here as new runs
+# land (pinned by tests). A class without measured runs falls back to the list price (no
+# rate invented -- an honest estimate until it's been observed).
 REALIZED_HOURLY_USD: dict[str, float] = {
-    "RTX 3090": 0.238,
-    "RTX 4090": 0.412,
-    "RTX 5090": 0.863,
+    "RTX 3090": 0.239,
+    "RTX 4090": 0.426,
+    "RTX 5090": 0.871,
     "RTX A5000": 0.304,
     "RTX 6000 Ada": 0.601,
     "A100 PCIe": 1.035,
     "A100 SXM": 1.133,
+    "H100": 10.037,
 }
 
 

@@ -37,11 +37,17 @@ def test_total_is_exactly_wall_hours_times_rate():
 
 
 def test_prices_at_realized_rate_below_list():
-    """Observed classes are priced at the spot/queue rate, which is below on-demand list."""
+    """Observed classes are priced at the realized rate (usually below list -- the spot
+    discount -- but not always: a surge-priced class can bill ABOVE its static list)."""
     for cls in ("RTX 5090", "A100 PCIe", "RTX 3090"):
         assert realized_hourly_usd(cls) < gpu_hourly_usd(cls)
-    # an unobserved class falls back to the list price (no spot discount invented)
-    assert realized_hourly_usd("H100") == gpu_hourly_usd("H100")
+    # the realized median is an empirical observation, not list +/- a fixed discount, so an
+    # observed class CAN bill above its static list when the market is tight (the H100 GRPO
+    # run billed ~$10/hr against a $3.29 list -- so the equation must price it at ~$10, not
+    # ~$3.29, or it underquotes ~3x).
+    assert realized_hourly_usd("H100") > gpu_hourly_usd("H100")
+    # an unobserved class (no measured runs) falls back to the list price (no rate invented)
+    assert realized_hourly_usd("A40") == gpu_hourly_usd("A40")
 
 
 def test_concurrent_reward_keeps_heavy_grpo_off_the_floor():

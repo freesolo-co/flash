@@ -11,10 +11,12 @@ This module:
 * ``verify_accuracy`` -- grade the raw equation against the measured RunPod/Vast runs in
   ``cost_estimator_results/real_runs/measured_runs.json`` (mean/median APE, aggregate
   bias, fraction within tolerance). The honest scorecard -- not forced to any value.
-* ``fit_constants`` -- re-derive the *physical* constants (realized per-class $/hr, MFU,
-  reward concurrency) from those measured runs, so the values hardcoded in ``analytical``
-  / ``hardware`` are calibrated and regenerable -- the same way you'd measure MFU
-  empirically, NOT a dimensionless fudge on the result.
+* ``fit_constants`` -- re-derive the realized per-class market $/hr (median measured cost /
+  measured wall) from those measured runs, so the rates hardcoded in ``hardware`` are
+  calibrated and regenerable from observed billing -- a price calibration, NOT a
+  dimensionless fudge on the result. (The MFU and reward-concurrency constants in
+  ``analytical`` are calibrated against the same dataset too, but separately -- they are not
+  returned by this function.)
 * ``environment_cost_sweep`` -- price a GRPO run across reward-latency tiers + average.
 
 Real per-run cost has irreducible variance: measured wall = provider queue + container

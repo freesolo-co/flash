@@ -17,21 +17,25 @@ print(e.breakdown())   # GPU pick, setup, per-step, wall clock, TOTAL — no fac
 | Term | What it is |
 |---|---|
 | **wall clock** | cold-start setup + `steps × seconds_per_step` |
-| **seconds_per_step (SFT)** | `6 × active_params × tokens / (peak_bf16 × MFU_train)` |
-| **seconds_per_step (GRPO)** | vLLM rollout (`MFU_decode`) + **concurrent** reward grading + policy/ref update |
+| **seconds_per_step (SFT)** | `6 × active_params × tokens / (peak_bf16 × MFU_SFT_TRAIN)` |
+| **seconds_per_step (GRPO)** | vLLM rollout (`MFU_DECODE`) + **concurrent** reward grading + policy/ref update (`MFU_TRAIN`) |
 | **$/hr** | the **realized (spot/queue) rate** the provider bills, not the on-demand list |
 
 Every constant is a real, measurable quantity — calibrated against measured runs the way
 you'd measure MFU empirically, **never** a dimensionless correction on the result:
 
-- **MFU** (`MFU_train`, `MFU_decode`) — fraction of peak FLOPS the run sustains.
+- **MFU** (`MFU_SFT_TRAIN` for the SFT fwd/bwd, `MFU_TRAIN` for the GRPO policy/ref update,
+  `MFU_DECODE` for the vLLM rollout) — fraction of peak FLOPS the run sustains; the update
+  and the decode have different efficiencies, so they carry separate constants.
 - **Reward concurrency** — graders run in parallel; the reward wall is
   `completions × per-completion-latency / concurrency`, *not* the serial product (which
   over-counts a heavy LLM-judge by ~100× and saturates the 24 h wall cap).
 - **Realized $/hr** (`hardware.REALIZED_HOURLY_USD`) — the median effective rate
-  (measured cost ÷ measured wall) per GPU class. RTX 5090 lists $0.99 but bills ~$0.86;
-  A100 PCIe lists $1.39 but bills ~$1.04. An unobserved class falls back to list (an
-  honest over-estimate until measured).
+  (measured cost ÷ measured wall) per GPU class, an empirical observation rather than list
+  ± a fixed discount. Usually below list (the spot discount: RTX 5090 lists $0.99 but bills
+  ~$0.87; A100 PCIe lists $1.39 but bills ~$1.04), but it can run *above* list when the
+  market is tight (an H100 GRPO run billed ~$10/hr against a $3.29 list). An unobserved
+  class falls back to list (an honest estimate until measured).
 
 ## CLI
 
@@ -47,13 +51,13 @@ python -m flash.cost verify    # grade the equation vs measured cost + env sweep
 
 | Group | n | mean MAPE | median APE | agg bias | within 33% |
 |---|---:|---:|---:|---:|---:|
-| all | 58 | 108% | 34% | 1.17 | 50% |
-| **real** (≥500s) | 41 | 37% | **22%** | 0.90 | 63% |
-| **real GRPO** | 35 | 35% | **22%** | 0.89 | **71%** |
+| all | 60 | 107% | 37% | 1.01 | 48% |
+| **real** (≥500s) | 43 | 39% | **23%** | 0.78 | 60% |
+| **real GRPO** | 37 | 37% | **22%** | 0.76 | **68%** |
 | real SFT | 6 | 50% | 47% | 1.00 | 17% |
 
 The meaningful rows are **`real`** — runs ≥500s that actually executed their configured
-work. **Real GRPO is accurate: 22% median APE, 71% of runs within a third of measured.**
+work. **Real GRPO is accurate: 22% median APE, ~68% of runs within a third of measured.**
 `agg bias` is **not forced to 1.0** (that would be the output hack this avoids).
 
 Two things to read honestly:
@@ -66,8 +70,10 @@ Two things to read honestly:
   (n=6) is centered (bias ~1.0) but data-limited; more long SFT runs will tighten its spread.
 
 Refresh the calibration as new runs land: harvest the control plane into `measured_runs.json`,
-re-run `fit_constants` to refresh `REALIZED_HOURLY_USD` + the MFU/concurrency constants, and
-re-`verify`. The realized rates and the accuracy scorecard are pinned by tests.
+re-run `fit_constants` to refresh `REALIZED_HOURLY_USD` (the realized per-class market rates —
+that is all `fit_constants` returns; the MFU/concurrency constants in `analytical` are
+re-calibrated against the same dataset separately), and re-`verify`. The realized rates and
+the accuracy scorecard are pinned by tests.
 
 ## Tests
 
