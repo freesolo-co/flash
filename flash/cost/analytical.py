@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 
 from flash.providers.allocator import required_vram_gb, vram_headroom
-from flash.providers.base import providers_for, unvalidated_allowed
+from flash.providers.base import providers_for
 
 from .facts import (
     active_params_b,
@@ -94,8 +94,9 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
 def select_gpu(config: RunConfig) -> tuple[str, int]:
     """(chosen GPU class, required VRAM GB) for the run, offline/deterministic.
 
-    Sizes VRAM via the real allocator and resolves a tri-state ``allow_unvalidated`` the same
-    way submit-time does, so the estimate's GPU pick matches what the allocator would allocate.
+    Sizes VRAM via the real allocator, then picks the cheapest fitting class -- matching the
+    allocator, which always picks the cheapest fitting class across all providers. There is no
+    validation gate: every fitting class is eligible (validated or not).
 
     The estimator's contract is fully local / no network, but ``required_vram_gb`` can probe the
     HF API for an UNLISTED model's param count (``engine.vram.fetch_hf_params_b``). Pass
@@ -111,12 +112,7 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
         thinking=config.thinking,
         skip_net=True,
     )
-    gpu = pick_gpu(
-        need,
-        pin=config.gpu,
-        provider=config.provider,
-        allow_unvalidated=unvalidated_allowed(config.allow_unvalidated),
-    )
+    gpu = pick_gpu(need, pin=config.gpu, provider=config.provider)
     return gpu, need
 
 

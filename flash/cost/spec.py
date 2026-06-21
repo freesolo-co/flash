@@ -1,17 +1,9 @@
 """Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / step count / estimate.
 
-Shared by the CLI (``slm train --cost``) and the control plane (which charges the estimate
-to the user's org at submit), so both price the SAME work the run will bill for.
-
-The CHARGE-vs-QUOTE invariant (PR #3 review): ``slm train --cost`` resolves the spec fully
-OFFLINE (the CLI threads an explicit ``skip_net=True`` through parse + sizing), but the control
-plane parses the submitted spec WITHOUT that flag — so for a ``model_policy = "allow"`` unlisted
-model, the server's parse can read the real param count from the HF API and resolve a different
-(e.g. larger) GPU class into ``spec.gpu.type`` than the offline CLI quote showed.
-``offline_estimate_for_spec`` re-prices the spec on the SAME offline basis the user saw
-(a policy-word GPU re-resolved offline from ``gpu.requested``); the control plane bills ``min``
-of that offline quote and the parsed estimate, so the charge equals the quote in the normal
-case and is never higher than it.
+Shared by the CLI (``flash train --cost``) and the control plane (which charges the estimate
+to the user's org at submit), so both price the SAME work the run will bill for. VRAM sizing is
+offline (``estimate_cost`` threads ``skip_net=True``) and GPU selection picks the cheapest
+fitting class with no validation gate -- the same basis whether quoted or charged.
 """
 
 from __future__ import annotations
@@ -98,27 +90,22 @@ def spec_steps(spec) -> int:
     return min(n, cap) if cap > 0 else n
 
 
-def runconfig_from_spec(spec, *, offline_gpu: bool = False) -> RunConfig:
+def runconfig_from_spec(spec) -> RunConfig:
     """Map a parsed training ``JobSpec`` to a cost ``RunConfig``.
 
     Each seed is its own job that re-pays the cold start (runner.py), so scale both the step
     count and the setup repeats by the seed count -- the estimate then prices the same total
     work the run would bill for.
 
-    ``offline_gpu``: when the GPU was a policy word (``auto``/``cheapest``), forward that word
-    (from ``gpu.requested``) instead of the parse-time resolved ``gpu.type``, so the estimator
-    re-picks the class from its own OFFLINE VRAM sizing. This makes the charge match the
-    offline ``--estimate`` quote even when the server resolved ``gpu.type`` from a live HF probe
-    (a concrete user pin is always honored as-is). See ``offline_estimate_for_spec``.
+    GPU pinning is gone: ``spec.gpu.type`` is only the parse-time provisional (and on the server
+    it may be HF-sized, differing from the offline ``--cost`` quote), so the estimate does NOT
+    pin it -- it runs its own offline cheapest-fit (``gpu=None``) over the whole registry,
+    cross-provider (``provider="auto"``), with no validation gate. This is what makes the
+    charge equal the quote: both price the cheapest fitting class for the SAME offline VRAM need.
     """
     t, g = spec.train, spec.gpu
     is_grpo = spec.algorithm == "grpo"
     seeds = max(1, len(t.seeds or (0,)))
-    gpu = g.type
-    if offline_gpu and _requested_is_policy(g):
-        # Re-resolve the cheapest fitting class from the estimator's offline sizing rather
-        # than trusting the (possibly HF-sized) parse-time pin.
-        gpu = (g.requested or "auto").strip().lower()
     return RunConfig(
         model_id=spec.model,
         method=spec.algorithm,
@@ -130,19 +117,11 @@ def runconfig_from_spec(spec, *, offline_gpu: bool = False) -> RunConfig:
         group_size=t.group_size if is_grpo else None,
         lora_rank=t.lora_rank,
         thinking=spec.thinking,
-        gpu=gpu,
-        provider=g.provider,
-        allow_unvalidated=g.allow_unvalidated,
+        gpu=None,
+        provider="auto",
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
     )
-
-
-def _requested_is_policy(gpu_spec) -> bool:
-    """True when the user asked for a policy word (``auto``/``cheapest``), not a concrete pin."""
-    from flash.providers.base import POLICY_NAMES
-
-    return (gpu_spec.requested or "").strip().lower() in POLICY_NAMES
 
 
 def estimate_for_spec(spec) -> CostEstimate:
@@ -151,16 +130,12 @@ def estimate_for_spec(spec) -> CostEstimate:
 
 
 def offline_estimate_for_spec(spec) -> CostEstimate:
-    """The OFFLINE-consistent estimate -- what ``slm train --cost`` would have quoted.
+    """The OFFLINE-consistent estimate -- what ``flash train --cost`` would have quoted.
 
-    Reproduces the CLI's offline quote WITHOUT any process-global state: ``estimate_cost``
-    already forces offline HF sizing (``select_gpu`` passes ``skip_net=True`` to
-    ``required_vram_gb``), and ``offline_gpu=True`` forwards a policy-word GPU so the class is
-    re-picked from that offline VRAM rather than the (possibly HF-sized) parse-time pin. Keeping
-    this purely explicit (no global flag) is important on the control plane, where concurrent
-    requests (auth verify, provider pricing, other submits) must keep doing their own network I/O
-    unaffected (PR #3 review). The control plane bills the ``min`` of THIS amount and the parsed
-    estimate (``charge_run_estimate``), so the org is charged the quote in the normal case and
-    never more than it.
+    ``estimate_cost`` forces offline HF sizing (``select_gpu`` passes ``skip_net=True`` to
+    ``required_vram_gb``) and picks the cheapest fitting class with no validation gate, exactly
+    like the parse-time provisional. With GPU pinning gone there is no quote-vs-parse divergence,
+    so this is identical to ``estimate_for_spec``; kept as a named seam for ``charge_run_estimate``
+    (the control plane bills the ``min`` of this and the parsed estimate, never more than quoted).
     """
-    return estimate_cost(runconfig_from_spec(spec, offline_gpu=True))
+    return estimate_cost(runconfig_from_spec(spec))

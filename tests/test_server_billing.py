@@ -92,7 +92,8 @@ def test_offline_estimate_does_no_hf_network_for_unlisted_model(monkeypatch):
         "train": {"steps": 5, "seeds": [0], "hf_repo": "org/runs"},
         "gpu": {"type": "cheapest"},
     }
-    # Server-style parse leaves gpu.requested = "cheapest"; offline_estimate re-sizes it offline.
+    # Server-style parse (gpu.type is just the provisional cheapest); offline_estimate sizes it
+    # offline via the threaded skip_net=True.
     spec = spec_from_dict(raw, run_id="run-env", skip_net=True)
     est = offline_estimate_for_spec(spec)
     assert est.total_usd > 0
@@ -196,21 +197,19 @@ def test_http_error_detail_falls_back_to_reason():
     assert "Payment Required" in _http_error_detail(empty)
 
 
-def test_charge_uses_offline_estimate_and_never_exceeds_quote(monkeypatch):
-    """CHARGE == QUOTE: for a ``model_policy = "allow"`` unlisted model, the server's parse can
-    size VRAM from a live HF probe and resolve a *larger* GPU than the fully-offline
-    ``--estimate`` quote. The charge must use the OFFLINE-consistent amount the user saw, and
-    in no case bill more than that quote (PR #3 review: estimate differs from submit charge)."""
+def test_charge_equals_quote_for_unlisted_model(monkeypatch):
+    """CHARGE == QUOTE for a ``model_policy = "allow"`` unlisted model. The server's parse can
+    HF-size ``spec.gpu.type`` larger than the offline ``--cost`` quote, but the estimate does NOT
+    pin ``spec.gpu.type`` -- it does its own offline cheapest-fit -- so the charged amount equals
+    the quote regardless of the parse-time probe (PR #3 review: estimate differs from charge)."""
     import flash.engine.vram as vram
     from flash.cost.spec import estimate_for_spec, offline_estimate_for_spec
     from flash.server import billing
 
-    # Simulate the HF probe: an online probe (skip_net=False) -> 14B (a bigger card); the offline
-    # path (skip_net=True, what the quote/charge uses) -> heuristic fallback (None).
+    # An online HF probe (skip_net=False) -> 14B (would size a bigger provisional gpu.type); the
+    # offline path (skip_net=True, what the estimate uses) -> heuristic fallback (None).
     def fake_fetch(model_id, *, skip_net=False):
-        if skip_net:
-            return None
-        return 14.0
+        return None if skip_net else 14.0
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", fake_fetch)
 
@@ -226,10 +225,10 @@ def test_charge_uses_offline_estimate_and_never_exceeds_quote(monkeypatch):
     }
     spec = spec_from_dict(raw, run_id="run-div")  # server-style parse: network ON
 
-    online = estimate_for_spec(spec)
-    offline = offline_estimate_for_spec(spec)
-    # Precondition: the two genuinely diverge (else the test proves nothing).
-    assert online.total_usd > offline.total_usd
+    # The estimate ignores the (HF-sized) provisional pin and sizes offline, so the parsed and
+    # offline estimates are identical -- there is no quote-vs-charge divergence to begin with.
+    assert estimate_for_spec(spec).total_usd == offline_estimate_for_spec(spec).total_usd
+    quote = offline_estimate_for_spec(spec)
 
     captured = {}
 
@@ -251,10 +250,9 @@ def test_charge_uses_offline_estimate_and_never_exceeds_quote(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     billing.charge_run_estimate(token="fslo-user-9", spec=spec)
 
-    # Charged the offline quote, and strictly less than the (larger) online amount.
-    assert captured["body"]["costCents"] == billing._cents(offline.total_usd)
-    assert captured["body"]["costCents"] <= billing._cents(online.total_usd)
-    assert captured["body"]["gpu"] == offline.gpu
+    # Charged exactly the offline quote the user saw.
+    assert captured["body"]["costCents"] == billing._cents(quote.total_usd)
+    assert captured["body"]["gpu"] == quote.gpu
 
 
 def test_reverse_run_charge_posts_reversal(monkeypatch):

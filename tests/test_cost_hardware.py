@@ -69,23 +69,25 @@ def test_unknown_gpu_lookup_raises():
         gpu_vram_gb("Tesla T4")
 
 
-def test_pick_gpu_cheapest_validated_fit():
-    # Cheapest validated class with >= 12 GB is the RTX A5000 ($0.27, 24 GB).
-    assert pick_gpu(12) == "RTX A5000"
-    # 25 GB excludes the 24 GB cards -> cheapest validated >= 25 is the RTX 5090 (32 GB).
-    assert pick_gpu(25) == "RTX 5090"
-    # 40 GB needs the big-VRAM tier -> cheapest validated is the A100 PCIe ($1.39, 80 GB).
-    assert pick_gpu(40) == "A100 PCIe"
+def test_pick_gpu_cheapest_fit_no_validation_gate():
+    # No validation gate: every fitting class is eligible, so the estimate picks the truly
+    # cheapest card. The unvalidated RTX 2000 Ada ($0.24, 16 GB) is the cheapest >= 12 GB.
+    assert pick_gpu(12) == "RTX 2000 Ada"
+    # 24 GB excludes the 16 GB cards -> cheapest >= 24 is the RTX A5000 ($0.27, 24 GB).
+    assert pick_gpu(24) == "RTX A5000"
+    # 40 GB needs the big-VRAM tier -> cheapest >= 40 is the A40 ($0.44, 48 GB).
+    assert pick_gpu(40) == "A40"
 
 
 def test_pick_gpu_result_actually_fits_and_is_cheapest():
     for need in (8, 16, 24, 33, 48, 80):
         gpu = pick_gpu(need)
         assert gpu_vram_gb(gpu) >= need
+        # No validation gate: nothing fitting may be cheaper than the chosen class.
         cheaper_fits = [
             g
             for g in GPU_INFO.values()
-            if g.validated and g.vram_gb >= need and g.hourly_usd < gpu_hourly_usd(gpu)
+            if g.vram_gb >= need and g.hourly_usd < gpu_hourly_usd(gpu)
         ]
         assert not cheaper_fits, f"{cheaper_fits} cheaper than {gpu} for {need} GB"
 
@@ -94,12 +96,14 @@ def test_pick_gpu_pin_honored_only_when_it_fits():
     # A pin that fits is honored even if a cheaper class also fits.
     assert pick_gpu(12, pin="RTX 5090") == "RTX 5090"
     # A pin too small to fit escalates to the cheapest fitting class (allocator behavior).
-    assert pick_gpu(40, pin="RTX 4090") == "A100 PCIe"
+    assert pick_gpu(40, pin="RTX 4090") == "A40"
 
 
-def test_pick_gpu_allow_unvalidated_widens_pool():
-    # The unvalidated RTX 2000 Ada ($0.24, 16 GB) undercuts the validated A5000 ($0.27).
-    assert pick_gpu(12, allow_unvalidated=True) == "RTX 2000 Ada"
+def test_pick_gpu_includes_unvalidated_classes():
+    # There is no validation gate (it was removed with GPU pinning): the cheapest fitting
+    # class wins even when it's unvalidated. The RTX 2000 Ada ($0.24, 16 GB) undercuts the
+    # validated A5000 ($0.27, 24 GB) at 12 GB, so it is the default pick.
+    assert pick_gpu(12) == "RTX 2000 Ada"
 
 
 def test_pick_gpu_impossible_raises():
@@ -126,61 +130,35 @@ def test_pick_gpu_unknown_pin_raises_not_silent_fallback():
 def test_pick_gpu_policy_pin_falls_through_to_auto_select(policy_pin):
     # gpu.type can be a POLICY sentinel ("auto"/"cheapest"/empty/None), not a GPU name.
     # canonical_gpu would raise on those, so they must fall through to cheapest-fit selection
-    # (the allocator picks the class), NOT crash with UnsupportedGpuError. Cheapest validated
-    # class with >= 12 GB is the RTX A5000.
-    assert pick_gpu(12, pin=policy_pin) == "RTX A5000"
+    # (the allocator picks the class), NOT crash with UnsupportedGpuError. Cheapest class with
+    # >= 12 GB (no validation gate) is the RTX 2000 Ada.
+    assert pick_gpu(12, pin=policy_pin) == "RTX 2000 Ada"
 
 
-def test_pick_gpu_provider_pin_restricts_to_validated_on():
-    # RTX A5000 (24 GB, runpod-only) is the cheapest auto pick at 24 GB, but a Vast pin
-    # must exclude it -- pricing a runpod-only class @vast would underquote.
-    assert "vast" not in GPU_INFO["RTX A5000"].validated_on
-    chosen = pick_gpu(24, provider="vast")
-    assert chosen != "RTX A5000"
-    assert "vast" in GPU_INFO[chosen].validated_on
-    # With provider auto (default), the runpod-only A5000 is back in the pool.
-    assert pick_gpu(24, provider="auto") == "RTX A5000"
+def test_pick_gpu_provider_pin_restricts_to_provisionable():
+    # The only per-provider filter is PROVISIONABILITY (providers_for) -- there is no validation
+    # gate. A provider pin only ever returns a class that provider can actually provision.
+    for prov in ("runpod", "vast"):
+        assert prov in providers_for(pick_gpu(24, provider=prov))
 
 
-def test_pick_gpu_provider_pin_holds_under_allow_unvalidated():
-    # allow_unvalidated relaxes the validation-status gate, NOT the per-provider
-    # PROVISIONABILITY filter: a class the pinned provider can't *provision* must never be
-    # quoted, even unvalidated. Mirrors allocator.allocate (it walks one provider's
-    # gpu_classes()), so a runpod pin never prices a Vast-only class and vice versa.
-    # Provisionability is providers_for() (enum_member / vast_name), NOT validated_on.
-    runpod_pick = pick_gpu(24, provider="runpod", allow_unvalidated=True)
-    assert "runpod" in providers_for(runpod_pick)
-    vast_pick = pick_gpu(24, provider="vast", allow_unvalidated=True)
-    assert "vast" in providers_for(vast_pick)
-    # Without a provider pin, allow_unvalidated still widens across the whole registry.
-    assert pick_gpu(12, allow_unvalidated=True) == "RTX 2000 Ada"
-
-
-def test_pick_gpu_provider_filter_is_provisionability_not_validation():
-    # The per-provider filter is PROVISIONABILITY (providers_for), not validation status,
-    # matching the allocator (it walks gpu_classes(), gated separately by validated_on).
-    # A Vast-only class (no enum_member) is never quoted on a runpod pin, even unvalidated.
+def test_pick_gpu_provider_filter_excludes_other_providers_only_class():
+    # A class only the OTHER provider can provision must be excluded under a provider pin.
+    # Provisionability is providers_for() (enum_member for runpod, vast_name for vast); pricing
+    # a Vast-only class on a runpod pin would misquote the run.
     vast_only = [n for n, g in GPU_INFO.items() if g.vast_name and not g.enum_member]
     assert vast_only, "expected at least one Vast-only class in the registry"
     for need in (16, 24, 48, 80):
         try:
-            runpod_pick = pick_gpu(need, provider="runpod", allow_unvalidated=True)
+            runpod_pick = pick_gpu(need, provider="runpod")
         except ValueError:
             continue  # nothing runpod-provisionable fits this tier; fine
         assert "runpod" in providers_for(runpod_pick)
         assert runpod_pick not in vast_only
 
-    # And the inverse of the old bug: an unvalidated-but-provisionable class IS now in the
-    # pinned provider's pool under allow_unvalidated. The RTX 3090 is runpod-provisionable
-    # (enum_member set) yet validated only on Vast -- the allocator prices it on a runpod
-    # pin with allow_unvalidated=True, so the estimator must consider it too. With the old
-    # validated_on-based filter it would have been silently excluded.
-    g3090 = GPU_INFO["RTX 3090"]
-    assert g3090.enum_member  # runpod-provisionable
-    assert "runpod" not in g3090.validated_on  # but not runpod-validated
-    runpod_pool = [
-        n
-        for n, g in GPU_INFO.items()
-        if g.vram_gb >= 24 and "runpod" in providers_for(n)
-    ]
-    assert "RTX 3090" in runpod_pool
+
+def test_pick_gpu_auto_spans_all_providers():
+    # Without a provider pin, selection spans the whole registry: the cheapest fitting class
+    # overall, regardless of which provider(s) can run it or whether it's validated.
+    assert pick_gpu(24, provider="auto") == "RTX A5000"
+    assert pick_gpu(12) == "RTX 2000 Ada"

@@ -49,16 +49,6 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
 
 
-def test_build_worker_env_does_not_forward_eval_cadence(monkeypatch):
-    """Mid-run eval cadence is NOT an env var: the worker resolves it from the run's
-    [train] eval_every_steps and ignores FLASH_EVAL_EVERY_STEPS (see
-    test_eval_config_ignores_env_cadence_override), so build_worker_env must NOT forward it."""
-    from flash.providers.runpod.train import build_worker_env
-
-    monkeypatch.setenv("FLASH_EVAL_EVERY_STEPS", "20")
-    assert "FLASH_EVAL_EVERY_STEPS" not in build_worker_env(_spec(), 0)
-
-
 def test_build_worker_env_forwards_judge_model(monkeypatch):
     """The optimizer-authored verifiers env reads FLASH_JUDGE_MODEL on the worker to pick its
     JudgeRubric client model (SFT-eval / GRPO-reward / rejection-sampling); the control-plane

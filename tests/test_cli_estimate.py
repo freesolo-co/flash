@@ -42,7 +42,8 @@ def _spec(**overrides):
 
 
 def test_runconfig_from_grpo_spec_maps_fields():
-    cfg = _runconfig_from_spec(_spec())
+    spec = _spec()
+    cfg = _runconfig_from_spec(spec)
     assert cfg.model_id == "Qwen/Qwen3.5-9B"
     assert cfg.method == "grpo"
     assert cfg.steps == 50
@@ -50,7 +51,10 @@ def test_runconfig_from_grpo_spec_maps_fields():
     assert cfg.group_size == 8
     assert cfg.completion_len == 512  # GRPO max_tokens
     assert cfg.seq_len == 2048
-    assert cfg.gpu == "RTX 5090"
+    # GPU pinning is gone: the estimate doesn't pin the spec's provisional class -- it does its
+    # own offline cheapest-fit, so cfg.gpu is None.
+    assert cfg.gpu is None
+    assert spec.gpu.type  # the spec still carries a provisional class (just not used as a pin)
     assert cfg.environment == "primeintellect/gsm8k"
 
 
@@ -199,7 +203,7 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     assert rc == 0
     assert "TOTAL" in out
     assert "$" in out
-    assert "RTX 5090" in out
+    assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
 
 
 def test_cmd_train_cost_is_offline_for_unlisted_open_model(tmp_path, capsys, monkeypatch):

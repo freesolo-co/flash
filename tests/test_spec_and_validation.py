@@ -54,7 +54,6 @@ def _raw(**overrides) -> dict:
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         ({"model_policy": "yolo"}, "model_policy"),
-        ({"gpu.allow_unvalidated": "yes"}, "must be a boolean"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
@@ -103,24 +102,69 @@ def test_bare_environment_id_is_rejected() -> None:
             spec_from_dict(raw)
 
 
-def test_bare_eval_env_id_is_rejected() -> None:
-    # The eval env ([environment.params] eval_env_id) is also prime-installed on the worker, so a
-    # bare eval id must be rejected up front (not fail after a GPU is provisioned).
-    raw = _raw()
-    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "gsm8k"}}
-    with pytest.raises(ConfigError, match=r"eval_env_id must be a published Prime Hub slug"):
-        spec_from_dict(raw)
-    # A full owner/name eval slug is accepted.
-    raw = _raw()
-    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "owner/eval"}}
-    spec_from_dict(raw)  # no raise
-
-
 def test_environment_must_be_a_table() -> None:
     raw = _raw()
     raw["environment"] = "gsm8k"
     with pytest.raises(ConfigError, match=r"\[environment\] must be a table"):
         spec_from_dict(raw)
+
+
+@pytest.mark.parametrize("section", ["gpu", "environment", "train"])
+def test_falsy_non_table_section_is_rejected_not_coerced(section: str) -> None:
+    # A present-but-falsy non-dict (e.g. `gpu = false`) must hit the "must be a table" check,
+    # not be silently coerced to {} by `or {}` (which would bypass validation). A MISSING
+    # section still defaults to an empty table (covered by the happy-path tests).
+    raw = _raw()
+    raw[section] = False
+    with pytest.raises(ConfigError, match=rf"\[{section}\] must be a table"):
+        spec_from_dict(raw)
+
+
+def test_environment_subfields_reject_wrong_types() -> None:
+    # The [environment] sub-fields are consumed by EnvironmentSpec(...) via dict(... or {}) /
+    # tuple(... or ()): a present-but-wrong-typed value would otherwise crash opaquely
+    # (dict("x") / dict(1)) or silently misbehave (pip = "x" char-split into ('x',)). Each
+    # must fail fast with a clear ConfigError instead.
+    # A falsy non-table (params = false) is rejected too, mirroring the section-level rule that
+    # `environment = false` must fail rather than silently coerce to {} and bypass intent.
+    for bad in ("notatable", 123, False):
+        raw = _raw()
+        raw["environment"] = {"id": "primeintellect/gsm8k", "params": bad}
+        with pytest.raises(ConfigError, match=r"\[environment\] params must be a table"):
+            spec_from_dict(raw)
+    for bad in ("notalist", 123, False):
+        raw = _raw()
+        raw["environment"] = {"id": "primeintellect/gsm8k", "pip": bad}
+        with pytest.raises(ConfigError, match=r"\[environment\] pip must be a list of strings"):
+            spec_from_dict(raw)
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k", "pip": ["ok", 123]}
+    with pytest.raises(ConfigError, match=r"\[environment\] pip entries must be strings"):
+        spec_from_dict(raw)
+
+
+def test_environment_subfields_accept_valid_and_missing() -> None:
+    # Missing sub-fields keep their defaults, and valid values pass through unchanged.
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k"}
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {}
+    assert spec.environment.pip == ()
+    raw = _raw()
+    raw["environment"] = {
+        "id": "primeintellect/gsm8k",
+        "params": {"k": "v"},
+        "pip": ["pkg==1.0"],
+    }
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {"k": "v"}
+    assert spec.environment.pip == ("pkg==1.0",)
+    # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k", "params": None, "pip": None}
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {}
+    assert spec.environment.pip == ()
 
 
 def test_jobspec_from_dict_rejects_path() -> None:

@@ -160,51 +160,26 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
     assert estimate_cost(one).wall_clock_seconds == pytest.approx(3600.0)
 
 
-def test_allow_unvalidated_widens_gpu_selection():
-    # When the spec permits unvalidated classes, GPU selection mirrors the allocator's
-    # widened pool: an unvalidated class can be picked when it's the cheapest that fits.
-    from flash.cost.facts import pick_gpu
+def test_select_gpu_picks_cheapest_including_unvalidated():
+    # No validation gate (it was removed with GPU pinning): select_gpu picks the cheapest fitting
+    # class -- validated or not -- the same way the allocator does, so the estimate prices the
+    # truly cheapest card. It defers to pick_gpu's no-gate cheapest-fit, and no fitting class is
+    # cheaper than the one chosen.
+    from flash.cost.facts import gpu_hourly_usd, pick_gpu
+    from flash.providers.base import GPU_INFO
 
-    cfg_strict = RunConfig(MID, "sft", 100, allow_unvalidated=False)
-    cfg_open = RunConfig(MID, "sft", 100, allow_unvalidated=True)
-    strict_gpu, need = select_gpu(cfg_strict)
-    open_gpu = select_gpu(cfg_open)[0]
-    # Selection routes the allow_unvalidated flag through to pick_gpu: the open pick equals
-    # pick_gpu(need, allow_unvalidated=True) and the strict pick equals the validated-only pool.
-    assert open_gpu == pick_gpu(need, allow_unvalidated=True)
-    assert strict_gpu == pick_gpu(need, allow_unvalidated=False)
-
-
-def test_unspecified_allow_unvalidated_resolves_like_submit_time(monkeypatch):
-    # ``allow_unvalidated`` is tri-state: an UNSPECIFIED value (None, the default and what a
-    # spec with no gpu.allow_unvalidated key reconstructs to) is resolved by select_gpu via the
-    # SAME helper the submit-time allocator uses (providers.base.unvalidated_allowed), so the
-    # estimate prices against exactly the pool a run actually allocates. Flash is fully managed
-    # now -- ``unvalidated_allowed`` honors the per-run flag only, with NO global env override --
-    # so an unspecified (None) flag resolves to the validated-only pool regardless of any
-    # FLASH_GPU_ALLOW_UNVALIDATED in the environment.
-    from flash.cost.facts import pick_gpu
-    from flash.providers.base import unvalidated_allowed
-
-    cfg_unspecified = RunConfig(MID, "sft", 100)  # allow_unvalidated defaults to None
-    assert cfg_unspecified.allow_unvalidated is None
-    need = select_gpu(RunConfig(MID, "sft", 100, allow_unvalidated=False))[1]
-
-    # None resolves through unvalidated_allowed -> validated-only (managed default), and an
-    # ambient FLASH_GPU_ALLOW_UNVALIDATED does NOT widen it (no global env override anymore).
-    assert unvalidated_allowed(None) is False
-    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
-    assert select_gpu(cfg_unspecified)[0] == pick_gpu(need, allow_unvalidated=False)
-
-    monkeypatch.setenv("FLASH_GPU_ALLOW_UNVALIDATED", "1")
-    assert unvalidated_allowed(None) is False
-    assert select_gpu(cfg_unspecified)[0] == pick_gpu(need, allow_unvalidated=False)
+    gpu, need = select_gpu(RunConfig(MID, "sft", 100))
+    assert gpu == pick_gpu(need)
+    cheaper = [g for g in GPU_INFO.values() if g.vram_gb >= need and g.hourly_usd < gpu_hourly_usd(gpu)]
+    assert not cheaper, f"{cheaper} cheaper than {gpu} for {need} GB"
 
 
 def test_qlora_model_fits_a_smaller_card_than_bf16_would():
-    # Qwen3.5-9B is 4-bit QLoRA; its GRPO still fits a 32 GB 5090, not an 80 GB A100.
+    # Qwen3.5-9B is 4-bit QLoRA; its GRPO requirement fits a 32 GB card, not the 80 GB an A100
+    # would need in bf16. (The CHOSEN class is the cheapest fitting one across the whole
+    # registry, which may have MORE VRAM if it's cheaper -- it's the requirement that shrinks.)
     e = estimate_cost(RunConfig(BIG, "grpo", 100))
-    assert e.gpu_vram_gb <= 32
+    assert e.required_vram_gb <= 32
     assert any("qlora" in n.lower() for n in e.notes)
 
 
