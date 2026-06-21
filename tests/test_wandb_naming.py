@@ -1,6 +1,6 @@
 """[wandb] project / run_name config -> typed JobSpec.wandb the worker honors. No network.
 
-`slm train cfg.toml --set wandb.project=… --set wandb.run_name=…` (or a `[wandb]` table) lets a
+`flash train cfg.toml --set wandb.project=… --set wandb.run_name=…` (or a `[wandb]` table) lets a
 run land in its own W&B project / run name instead of the hardcoded `flash` /
 `flash-<phase>-<run_id>-seed<N>` defaults. The naming is first-class spec config (round-tripped in
 the job-spec JSON the worker reads), NOT environment variables; the WANDB_API_KEY secret stays env.

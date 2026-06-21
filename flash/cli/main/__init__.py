@@ -1,7 +1,7 @@
 """CLI for the managed Flash service.
 
 Every run-lifecycle command is a thin HTTP call to the Flash control plane —
-users authenticate with their freesolo API key (`slm login` verifies it against
+users authenticate with their freesolo API key (`flash login` verifies it against
 the freesolo backend), never with provider credentials. Config parsing/validation
 and `--dry-run` stay fully local.
 """
@@ -65,8 +65,8 @@ logger = get_logger("flash.cli.main")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="slm", description="Managed LoRA post-training")
-    parser.add_argument("-V", "--version", action="version", version=f"slm {__version__}")
+    parser = argparse.ArgumentParser(prog="flash", description="Managed LoRA post-training")
+    parser.add_argument("-V", "--version", action="version", version=f"flash {__version__}")
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     chat.set_defaults(func=cmd_chat)
 
     # The control plane is operator-only and run as a separate one-off service via the
-    # `flash-server` console script (flash.server.__main__:main), not a `slm` subcommand.
+    # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
 
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))

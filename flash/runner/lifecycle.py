@@ -416,7 +416,7 @@ def _run_job_inner(spec: JobSpec, log_path: str, upload_code) -> None:
     from flash.runner import _run_seed_loop, _RunCancelled, _update, get_status
 
     try:
-        # Ship the slm package to the run's HF repo (the per-run [train] hf_repo) so the GPU
+        # Ship the flash package to the run's HF repo (the per-run [train] hf_repo) so the GPU
         # worker — which fetches code/** from that same repo — can run it.
         upload_code(spec.train.hf_repo)
         with open(log_path, "a") as log:

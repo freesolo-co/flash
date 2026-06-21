@@ -66,7 +66,7 @@ class RunStatus:
     artifacts_dir: str | None = None
     deployment: dict | None = None
     # Durable job handle {endpoint_id, endpoint_name, job_id} — lets any process
-    # reattach to / cancel the remote job (see `slm attach`).
+    # reattach to / cancel the remote job (see `flash attach`).
     remote: dict | None = None
     # Index of the next seed to run for a multi-seed job, set while the remote handle
     # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds
@@ -249,7 +249,7 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
 
 
 def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> None:
-    # The read-check-write below must be atomic: a concurrent `slm cancel` (also via
+    # The read-check-write below must be atomic: a concurrent `flash cancel` (also via
     # _update) landing between the get_status read and the _save_status write could
     # otherwise be clobbered by this stale background update, resurrecting a cancelled
     # run. The control plane is single-instance with per-run threads, so a process-wide
