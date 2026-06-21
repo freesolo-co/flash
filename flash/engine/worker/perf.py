@@ -48,6 +48,33 @@ def _flash_attn_available() -> bool:
         return False
 
 
+def model_supports_flex_attn(model_id: str) -> bool:
+    """True when this model's transformers architecture supports ``attn_implementation='flex_attention'``.
+
+    FlexAttention is the OTHER boundary-correct packing backend (it builds a block-diagonal document
+    mask from position_ids), so it enables 'bfd' packing on GPUs where FlashAttention-2 is absent —
+    e.g. the RTX 5090 (sm120). MEASURED: ~1.7x SFT throughput at equal VRAM vs no-packing on a
+    Llama-arch 0.5B (5090). But support is PER-ARCHITECTURE: standard decoders (Llama / Qwen2 /
+    Qwen3) set ``_supports_flex_attn=True``, while the Qwen3.5/3.6 hybrid-GDN multimodal class
+    (``Qwen3_5ForConditionalGeneration``) does NOT (transformers ValueError; HF issue #34809). So
+    this gates flex packing to the arches that actually support it. Best-effort: reads the config
+    only (no instantiate, no weights); returns False on any error / offline so packing stays off.
+    """
+    try:
+        import transformers
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        for arch in getattr(cfg, "architectures", None) or []:
+            cls = getattr(transformers, arch, None)
+            if cls is not None and getattr(cls, "_supports_flex_attn", False):
+                return True
+        return False
+    except Exception as e:
+        print(f"[attn] flex-support probe failed for {model_id} ({e}); leaving packing off")
+        return False
+
+
 def optimal_attn_impl() -> str | None:
     """Best ``attn_implementation`` for the live GPU (None = leave transformers' default)."""
     try:
