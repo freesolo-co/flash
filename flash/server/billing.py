@@ -8,14 +8,13 @@ starts unpaid. Tests stub the network boundary directly."""
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from decimal import ROUND_HALF_UP, Decimal
 
 from flash.cost.spec import estimate_for_spec
 
-from .auth import DEFAULT_FREESOLO_BASE_URL, FREESOLO_BASE_URL_ENV
+from .auth import freesolo_base_url
 
 # A charge does more than a verify; allow a bit more than auth's 5s but stay bounded.
 _CHARGE_TIMEOUT_S = 10.0
@@ -72,8 +71,7 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
     Raises ``BillingError`` (the route's status + a clean detail) on a non-2xx, and ``503``
     when the service is unreachable -- the same translation the charge and its reversal share.
     """
-    base = os.environ.get(FREESOLO_BASE_URL_ENV) or DEFAULT_FREESOLO_BASE_URL
-    url = f"{base.rstrip('/')}{path}"
+    url = f"{freesolo_base_url()}{path}"
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),

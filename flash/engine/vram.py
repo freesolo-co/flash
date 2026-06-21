@@ -61,6 +61,24 @@ def _sft_per_device_bs() -> int:
     ``SFT_PER_DEVICE_BS=1`` operator env to a too-small GPU that then OOMs at the default
     micro-batch 4 (the asymmetry the env-knobs cleanup removed everywhere else)."""
     return _SFT_PER_DEVICE_BS_DEFAULT
+
+
+def sft_grad_accum(batch_size: int) -> tuple[int, int]:
+    """(per-device micro-batch, grad-accum steps) the worker realizes for a requested GLOBAL
+    ``batch_size``: per_device capped at the micro-batch default, grad-accum CEIL'd so the
+    realized global batch is never BELOW the request (e.g. 16/6 -> 4 x ceil(16/4)=4)."""
+    target = max(1, int(batch_size))
+    per_device = max(1, min(_sft_per_device_bs(), target))
+    grad_accum = max(1, -(-target // per_device))  # ceil
+    return per_device, grad_accum
+
+
+def sft_realized_batch(batch_size: int) -> int:
+    """The realized SFT global batch (per_device x grad_accum) for a requested ``batch_size``."""
+    per_device, grad_accum = sft_grad_accum(batch_size)
+    return per_device * grad_accum
+
+
 # Colocated-GRPO vLLM KV pool: grows with the engine's max context (seq) and model
 # width, but vLLM bounds the pool to a fraction of the card and PAGES rather than OOMs,
 # so it's capped (_KV_CAP) instead of growing without bound at long context.

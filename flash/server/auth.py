@@ -67,6 +67,12 @@ def _prune_verify_cache_locked(now: float) -> None:
             del _verify_cache[tok]
 
 
+def freesolo_base_url() -> str:
+    """The freesolo backend base URL (``FREESOLO_BASE_URL`` env, else the default), trailing
+    slash trimmed. Shared by auth verify and the billing client."""
+    return (os.environ.get(FREESOLO_BASE_URL_ENV) or DEFAULT_FREESOLO_BASE_URL).rstrip("/")
+
+
 def _freesolo_verify(token: str) -> bool:
     """Verify a token against the freesolo backend (cached, short TTL, network errors = False).
 
@@ -80,8 +86,7 @@ def _freesolo_verify(token: str) -> bool:
         cached = _verify_cache.get(token)
         if cached is not None and cached[1] > now:
             return cached[0]
-    base = os.environ.get(FREESOLO_BASE_URL_ENV) or DEFAULT_FREESOLO_BASE_URL
-    url = f"{base.rstrip('/')}/api/auth/verify"
+    url = f"{freesolo_base_url()}/api/auth/verify"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=_VERIFY_TIMEOUT_S) as resp:

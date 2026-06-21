@@ -9,18 +9,6 @@ from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
 
 
-def sft_realized_batch(batch_size: int) -> int:
-    """The SFT global batch the worker realizes for ``batch_size``: per-device micro-batch (4) x
-    ceil grad-accum -- which can EXCEED the request when not a multiple of 4. Mirror it so the
-    step count matches the run."""
-    from flash.engine.vram import _sft_per_device_bs
-
-    target = max(1, int(batch_size))
-    per_device = max(1, min(_sft_per_device_bs(), target))
-    grad_accum = max(1, -(-target // per_device))  # ceil
-    return per_device * grad_accum
-
-
 def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
     """Training rows in ``env_id``'s dataset (the worker's train split), or ``None`` if it can't
     be loaded. Best-effort -- prices an uncapped SFT run on the real dataset size, not a guess."""
@@ -40,6 +28,7 @@ def spec_steps(spec) -> int:
     (else recipe default). SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by
     ``max_steps``, where ``num_examples`` is ``max_examples`` if pinned else the real env size."""
     from flash.engine.recipe import RECIPE
+    from flash.engine.vram import sft_realized_batch
 
     t = spec.train
     if spec.algorithm == "grpo":
