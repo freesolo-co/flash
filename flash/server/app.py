@@ -13,6 +13,7 @@ to their persisted RunPod job handles.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -44,6 +45,22 @@ _DEPLOYABLE_STATES = {"done", "deployed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 _log = logging.getLogger("flash.server")
+
+
+async def _reconcile_cost_loop() -> None:
+    """Background loop: periodically pull realized provider cost (COGS) for finished runs and
+    report it to the freesolo backend for estimator accuracy. The provider billing calls are
+    blocking urllib, so each sweep is offloaded to a thread; failures are swallowed and retried
+    next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled)."""
+    from flash.server.reconcile import reconcile_once
+
+    interval = float(os.environ.get("FLASH_RECONCILE_INTERVAL_S", "3600"))
+    while True:
+        await asyncio.sleep(interval)
+        with contextlib.suppress(Exception):
+            reported = await asyncio.to_thread(reconcile_once)
+            if reported:
+                _log.info("reconciled realized cost for %d run(s)", reported)
 
 
 def _reverse_charge_best_effort(*, token: str, run_id: str, charge: dict) -> None:
@@ -164,10 +181,20 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app):
         from flash.providers.preflight import check_run_preflight
+        from flash.server.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
-        yield
+        # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
+        # internal key is configured. First (and only) asyncio task in the server.
+        cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
+        try:
+            yield
+        finally:
+            if cost_task is not None:
+                cost_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cost_task
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
 
