@@ -129,8 +129,11 @@ for exp in c.experience_stream(prompt_batches, n=8, prefetch=2):
   wall-clock — proving it's overlapped), and the full `GRPOPoolLoop`. The fake backend implements
   vLLM's real dynamic-LoRA + OpenAI surface, so the router/client exercise the production code path.
   See `examples/rollout_pool_demo.py` for a runnable demo.
-- **Live step**: renting the real GPU fleet, launching vLLM, and the torch policy update in
-  `pool_policy.py` are the operator/GPU-validation step (as with the disaggregated and verl paths).
+- **Live multi-GPU run (done)**: validated end-to-end on a real **4× RTX 3090** box — two real
+  `vllm serve --enable-lora` servers behind the router + two real concurrent LoRA trainers pushing
+  real adapters through it (generation load-balanced 6/6 across both GPUs, both LoRAs co-resident on
+  both GPUs, per-step weight-sync hot-swap to vLLM, version 1→3). See
+  [`rollout-pool-live-run.md`](rollout-pool-live-run.md).
 
 ## Relationship to the other rollout paths
 
