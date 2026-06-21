@@ -216,6 +216,12 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.6-35B-A3B",
         display_name="Qwen3.6 35B-A3B (MoE)",
         params="35B total / ~3B active (MoE)",
+        # TOTAL parameters (billions). For an MoE checkpoint the cost model's size term is the
+        # TOTAL count, not the ~3B active: download_weight_gb (2 bytes/param) and the VRAM/disk
+        # terms size the FULL checkpoint that lands on the GPU (all experts are materialized; the
+        # comments below already cite "~70 GB bf16" == 35 * 2). The display string's leading total
+        # figure is 35, matching the dense siblings' convention (params "4.7B" -> params_b=4.7).
+        params_b=35.0,
         algos=("sft", "grpo"),
         min_vram_gb=48,
         grpo_min_vram_gb=80,
