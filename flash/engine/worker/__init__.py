@@ -751,17 +751,15 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     # SDK [train] knobs override the recipe default.
+    from flash.engine.vram import sft_grad_accum
+
     _t = JOB_SPEC.train if JOB_SPEC else None
-    per_device_bs = 4
-    # batch_size is the GLOBAL/effective batch: grad-accum is sized to reach it. Cap the
-    # per-device micro-batch at the target (so a target < per_device doesn't overshoot) and
-    # use CEIL division so the realized global batch is never BELOW the requested one (floor
-    # would undershoot when target isn't a multiple of per_device, e.g. 16/6 -> 12).
+    # batch_size is the GLOBAL/effective batch; sft_grad_accum sizes the per-device micro-batch +
+    # grad-accum to realize it (shared with the cost estimator's step count, see engine.vram).
     effective_batch = (
         _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
     )
-    per_device_bs = max(1, min(per_device_bs, effective_batch))
-    grad_accum = max(1, -(-effective_batch // per_device_bs))
+    per_device_bs, grad_accum = sft_grad_accum(effective_batch)
     sft_lr = _t.learning_rate if _t and _t.learning_rate is not None else RECIPE.sft.learning_rate
     sft_max_len = (
         _t.max_length

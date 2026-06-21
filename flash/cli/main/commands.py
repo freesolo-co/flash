@@ -26,6 +26,7 @@ from flash.client import (
 )
 from flash.client.config import load_credentials
 from flash.client.specs import spec_payload
+from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
 
@@ -262,12 +263,30 @@ def cmd_env_list(args) -> int:
     return 0
 
 
+def _cmd_train_cost(args) -> int:
+    """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
+
+    Catalog-only and deterministic; an uncapped SFT run loads the env to count its train split."""
+    from flash.cost import estimate_cost
+
+    spec = spec_from_file(
+        args.config,
+        run_id=None,
+        overrides=args.overrides,
+        extra_configs=args.extra_configs,
+    )
+    print(estimate_cost(runconfig_from_spec(spec)).breakdown())
+    return 0
+
+
 def cmd_train(args) -> int:
+    if getattr(args, "cost", False):
+        return _cmd_train_cost(args)
     spec = spec_from_file(
         args.config,
         run_id=new_run_id() if args.dry_run else None,
-        overrides=getattr(args, "overrides", None),
-        extra_configs=getattr(args, "extra_configs", None),
+        overrides=args.overrides,
+        extra_configs=args.extra_configs,
     )
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.
