@@ -100,7 +100,7 @@ def test_preflight_always_requires_shared_hf_and_prime(clean_env, monkeypatch):
     assert "PRIME_API_KEY" in msg
 
 
-# -- client preflight (`slm <cmd>` without a key fails with a login hint) --------------
+# -- client preflight (`flash <cmd>` without a key fails with a login hint) --------------
 
 
 def test_client_requires_login(monkeypatch, tmp_path):
@@ -115,7 +115,7 @@ def test_client_requires_login(monkeypatch, tmp_path):
         from flash.client import ClientError
         from flash.client.http import client_from_config
 
-        with pytest.raises(ClientError, match="slm login"):
+        with pytest.raises(ClientError, match="flash login"):
             client_from_config()
         client = client_from_config(require_key=False)
         assert client.api_key is None

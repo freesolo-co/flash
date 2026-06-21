@@ -1,6 +1,6 @@
 """In-process CLI coverage: every read/manage command against a fake ApiClient.
 
-`slm login`/`slm train` subprocess flows live in test_cli_managed.py; these tests
+`flash login`/`flash train` subprocess flows live in test_cli_managed.py; these tests
 drive main() directly so the table rendering, exit codes, and client wiring of
 the remaining commands are covered without a server.
 """
