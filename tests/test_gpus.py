@@ -62,7 +62,6 @@ def test_cheapest_gpu_policy(monkeypatch):
     from flash.providers import base as gpus
     from flash.providers.runpod import pricing
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")  # static rates only
     # No validation gate: the cheapest enum class that fits each VRAM tier wins on static rates.
     assert gpus.cheapest_gpu(16) == "RTX 2000 Ada"
     assert gpus.cheapest_gpu(24) == "RTX A5000"  # cheapest >=24G enum class
@@ -81,7 +80,6 @@ def test_cheapest_gpu_policy(monkeypatch):
 def test_provisional_gpu_cheapest_for_model(monkeypatch):
     from flash.providers.base import provisional_gpu
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     # GPU pinning is gone: provisional_gpu always returns the cheapest fitting class for the
     # model. 0.8B GRPO -> cheapest >=24G (A5000). 9B GRPO needs the 32G tier, where A40
     # (48G @ $0.44) is cheaper than RTX 5090 (32G @ $0.99).
@@ -92,7 +90,6 @@ def test_provisional_gpu_cheapest_for_model(monkeypatch):
 def test_config_cheapest_policy_no_gate(monkeypatch):
     from flash.schema import spec_from_dict
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",

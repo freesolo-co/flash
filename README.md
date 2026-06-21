@@ -42,14 +42,14 @@ allocator picks the cheapest GPU class that fits the run across both providers.
   plane (run operator-side via the separate `flash-server` command)
 - `flash/mcp/` — stdio MCP bridge for coding agents
 - `Dockerfile` — the control-plane image (used by the repo docker-compose)
-- `tests/` — pytest suite (CPU-only with `FLASH_SKIP_NET=1`)
+- `tests/` — pytest suite (CPU-only; offline-by-default via `tests/conftest.py`)
 
 ## Local commands
 
 ```bash
 cd flash
 uv sync --extra server
-FLASH_SKIP_NET=1 uv run pytest          # CPU tests (no GPU/network)
+uv run pytest                           # CPU tests (offline-by-default, no GPU/network)
 uv run ruff check . && uv run ruff format .
 uv run flash --help
 uv run flash-server                      # control plane (operator-side, run once)

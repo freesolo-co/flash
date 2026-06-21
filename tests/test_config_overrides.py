@@ -23,10 +23,9 @@ def _write(tmp, name, text):
     return p
 
 
-def test_set_overrides_scalar_and_list(monkeypatch):
+def test_set_overrides_scalar_and_list():
     from flash.schema import spec_from_file
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     with tempfile.TemporaryDirectory() as tmp:
         cfg = _write(tmp, "c.toml", BASE)
         spec = spec_from_file(
@@ -39,10 +38,9 @@ def test_set_overrides_scalar_and_list(monkeypatch):
         assert spec.gpu.type == "A40"
 
 
-def test_composed_config_deep_merge(monkeypatch):
+def test_composed_config_deep_merge():
     from flash.schema import spec_from_file
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     with tempfile.TemporaryDirectory() as tmp:
         base = _write(tmp, "base.toml", BASE)
         override = _write(tmp, "prod.toml", '[train]\nsteps = 250\n[gpu]\ntype = "RTX 4090"\n')

@@ -30,7 +30,6 @@ def test_required_vram_catalog_and_open(monkeypatch):
 def test_no_validation_gate_picks_cheapest_fitting(monkeypatch):
     from flash.providers import allocator
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     # There is no validation gate: the cheapest fitting class wins even if it's a class
     # Flash hasn't smoke-tested (previously the gate forced the cheapest VALIDATED class,
     # RTX A5000 @ $0.27, for 0.8B GRPO). Offline only RunPod is available.
@@ -39,11 +38,11 @@ def test_no_validation_gate_picks_cheapest_fitting(monkeypatch):
     assert a.hourly_usd <= 0.27  # at least as cheap as the previously-validated A5000 floor
 
 
-def test_skip_net_matches_static_cheapest(monkeypatch):
+def test_offline_allocates_static_cheapest(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import cheapest_gpu
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")  # real available_providers: runpod only
+    # No live pricing/offers (RunPod-only, static rates): allocation matches cheapest_gpu.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert a.gpu == cheapest_gpu(24)
@@ -53,7 +52,6 @@ def test_nothing_fits_names_constraint(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 4096)
     with pytest.raises(UnsupportedGpuError, match="4096 GB"):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
@@ -147,7 +145,6 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
     """The core anti-OOM invariant: the GPU the allocator picks ALWAYS has >= the matrix's
     required VRAM, across a sweep of model x algo x seq x group x batch. If this ever fails,
     auto-allocation could provision a too-small card and OOM a paid worker."""
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     from flash.providers.allocator import allocate, required_vram_gb
     from flash.providers.base import get_gpu_info
 

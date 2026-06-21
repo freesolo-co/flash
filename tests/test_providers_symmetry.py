@@ -116,7 +116,6 @@ def test_sweep_orphans_is_part_of_the_protocol():
 @pytest.mark.parametrize("provider", ["runpod", "vast"])
 def test_static_pricing_offline(provider, monkeypatch):
     """Offline, every provider's hourly_rate falls back to the static snapshot."""
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     pricing = importlib.import_module(f"flash.providers.{provider}.pricing")
     rate = pricing.hourly_rate("RTX 5090")
     assert rate == pytest.approx(0.99)  # the static GpuClass.hourly_usd snapshot
@@ -126,7 +125,6 @@ def test_runpod_live_pricing_mock(monkeypatch):
     """Live RunPod rates override the static snapshot (mocked SDK)."""
     from flash.providers.runpod import pricing
 
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     monkeypatch.setattr(pricing, "_fetch_live_rates", lambda: {"RTX 5090": 1.23})
     monkeypatch.setattr(pricing, "_CACHE_PATH", __import__("pathlib").Path("/nonexistent/x.json"))
     pricing._MEM.update(ts=0.0, rates={})
@@ -137,7 +135,6 @@ def test_vast_live_pricing_from_offers_mock(monkeypatch):
     """Vast's hourly_rate is the cheapest live offer for the class (mocked offers)."""
     from flash.providers.vast import jobs, pricing
 
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     monkeypatch.setenv("VAST_API_KEY", "vk")
 
     def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):

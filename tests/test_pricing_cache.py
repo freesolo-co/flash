@@ -7,18 +7,19 @@ import json
 
 
 def _fresh_pricing(monkeypatch, tmp_path):
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     import flash.providers.runpod.pricing as pricing
 
     pricing = importlib.reload(pricing)
     monkeypatch.setattr(pricing, "_CACHE_PATH", tmp_path / "rates.json")
+    # Offline by default (the reload drops the conftest stub): an empty live fetch -> static.
+    # Tests that exercise the live path override this.
+    monkeypatch.setattr(pricing, "_fetch_live_rates", lambda: {})
     pricing._MEM.update(ts=0.0, rates={})
     return pricing
 
 
-def test_skip_net_returns_static_rates(monkeypatch, tmp_path) -> None:
+def test_offline_returns_static_rates(monkeypatch, tmp_path) -> None:
     pricing = _fresh_pricing(monkeypatch, tmp_path)
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     rates = pricing.live_rates()
     assert rates["RTX 4090"] > 0
     assert pricing.hourly_rate("RTX 4090") == rates["RTX 4090"]
