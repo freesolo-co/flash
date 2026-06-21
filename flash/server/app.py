@@ -157,7 +157,7 @@ def create_app():
         if key is None:
             raise HTTPException(
                 status_code=401,
-                detail="invalid or missing API key; log in with `slm login` using your "
+                detail="invalid or missing API key; log in with `flash login` using your "
                 "freesolo API key",
             )
         return key
@@ -194,7 +194,7 @@ def create_app():
             raise HTTPException(
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
-                "publish the environment to the Prime Hub (`slm env push`), then reference it "
+                "publish the environment to the Prime Hub (`flash env push`), then reference it "
                 'by its Hub id (`[environment] id = "owner/name"`)',
             )
         try:
@@ -330,7 +330,7 @@ def create_app():
                 raise HTTPException(
                     status_code=502,
                     detail=f"could not delete the serving endpoint for {run_id}; it may still "
-                    "be running — retry `slm undeploy`",
+                    "be running — retry `flash undeploy`",
                 )
             return {"run_id": run_id, "deleted_endpoints": deleted}
 
@@ -366,7 +366,7 @@ def create_app():
         if deployment.get("state") in (None, "undeployed", "dry_run"):
             raise HTTPException(
                 status_code=409,
-                detail=f"run {run_id} has no active deployment; `slm deploy {run_id}` first",
+                detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
             )
         # Legacy run with no artifact repo (mirrors the /deploy guard): a run that never had a
         # [train].hf_repo was never registered with freesolo serving, so reject early with a

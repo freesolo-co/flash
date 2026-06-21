@@ -1,7 +1,7 @@
-"""`slm env push` packages a bare verifiers module and publishes it to the Prime Hub.
+"""`flash env push` packages a bare verifiers module and publishes it to the Prime Hub.
 
 The freesolo training agent emits a single `environment.py`, while `prime env push` requires an
-environment directory with a `pyproject.toml`. `slm env push` bridges that: pointed at a `.py`
+environment directory with a `pyproject.toml`. `flash env push` bridges that: pointed at a `.py`
 module it wraps it in a Prime-compatible package, pointed at a real env dir it pushes as-is, and
 it climbs past version conflicts on re-publish.
 """
