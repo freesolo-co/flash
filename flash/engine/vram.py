@@ -203,7 +203,6 @@ def model_required_vram_gb(
     train=None,
     thinking: bool = False,
     headroom: float = 1.1,
-    skip_net: bool = False,
 ) -> int:
     """Cheapest-sufficient VRAM (GB) for a specific run -- the matrix the allocator and
     ``provisional_gpu`` both size against.
@@ -213,10 +212,6 @@ def model_required_vram_gb(
     (``grpo_min_vram_gb``) stay as HARD floors so we never under-provision a validated
     model; the matrix only ever sizes UP from there. Unlisted open models size from HF
     metadata, falling back to the 24 GB tier when the size can't be read.
-
-    ``skip_net=True`` forces the offline heuristic for an UNLISTED model (no HF probe), threaded
-    explicitly through the sizing stack (no process-global state) -- the cost estimator passes it
-    so estimation never does network I/O. Listed catalog models never touch the network regardless.
     """
 
     # Best-effort knob extraction: this provisional sizing runs at parse time BEFORE the
@@ -330,7 +325,7 @@ def model_required_vram_gb(
             need = max(need, floor_gb)
         return need
     # Unlisted open model: size from HF metadata (GRPO is the heavier phase).
-    params_b = fetch_hf_params_b(model_id, skip_net=skip_net)
+    params_b = fetch_hf_params_b(model_id)
     if params_b is None:
         return 24
     # Open models size against the heavier GRPO phase regardless of the requested algorithm.
@@ -342,19 +337,12 @@ def model_required_vram_gb(
     return need
 
 
-def fetch_hf_params_b(model_id: str, *, skip_net: bool = False) -> float | None:
+def fetch_hf_params_b(model_id: str) -> float | None:
     """Total params (billions) from the HF API safetensors metadata (no download).
 
     Best-effort: returns ``None`` when the size can't be read (no network / no HF metadata),
     so callers fall back to the offline heuristic rather than failing.
-
-    ``skip_net=True`` forces the offline path (returns ``None`` without any HF probe) -- the
-    library-safe way for a caller (e.g. the cost estimator / ``flash train --cost``) to size an
-    unlisted model with ZERO network I/O for one call, threaded explicitly through the sizing
-    stack rather than via any process-global state.
     """
-    if skip_net:
-        return None
     try:
         from huggingface_hub import HfApi
 
@@ -377,17 +365,11 @@ def check_fit(
     gpu: str,
     quant: str = "bf16",
     params_b: float | None = None,
-    *,
-    skip_net: bool = False,
 ) -> VramEstimate:
-    """Estimate whether ``model_id`` plausibly trains on ``gpu``; never raises.
-
-    ``skip_net=True`` sizes an unlisted model offline (no HF probe -> ``unknown`` verdict),
-    threaded explicitly so ``flash train --cost`` resolves the spec with zero network I/O.
-    """
+    """Estimate whether ``model_id`` plausibly trains on ``gpu``; never raises."""
     gpu_gb = GPU_VRAM_GB.get(gpu, 32)
     if params_b is None:
-        params_b = fetch_hf_params_b(model_id, skip_net=skip_net)
+        params_b = fetch_hf_params_b(model_id)
     if params_b is None:
         return VramEstimate(None, algorithm, quant, None, gpu, gpu_gb, "unknown")
     est = estimate_vram_gb(params_b, algorithm, quant)

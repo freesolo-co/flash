@@ -341,7 +341,6 @@ def provisional_gpu(
     *,
     train=None,
     thinking: bool = False,
-    skip_net: bool = False,
 ) -> str:
     """The cheapest GPU class whose VRAM covers the model -- a parse-time provisional.
 
@@ -350,9 +349,6 @@ def provisional_gpu(
     The submit-time allocator (``flash.providers.allocator``) ALWAYS re-resolves the cheapest
     fitting class live across all providers; this is the RunPod-static, offline-deterministic
     equivalent the schema uses for sizing/display.
-
-    ``skip_net=True`` sizes an unlisted model offline (no HF probe), threaded explicitly so
-    ``flash train --cost`` resolves the GPU class with zero network I/O.
     """
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
@@ -364,7 +360,6 @@ def provisional_gpu(
         train=train,
         thinking=thinking,
         headroom=vram_headroom(),
-        skip_net=skip_net,
     )
     return cheapest_gpu(min_vram)
 

@@ -97,19 +97,14 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
     allocator, which always picks the cheapest fitting class across all providers. There is no
     validation gate: every fitting class is eligible (validated or not).
 
-    The estimator's contract is fully local / no network, but ``required_vram_gb`` can probe the
-    HF API for an UNLISTED model's param count (``engine.vram.fetch_hf_params_b``). Pass
-    ``skip_net=True`` so estimation never does network I/O (the offline path falls back to the
-    24 GB tier for an unreadable model). This is threaded explicitly through the sizing stack --
-    not via any process-global state -- so it's thread-safe and never clobbers a concurrent
-    caller's HF lookups (PR #3 review).
+    Catalog models size from their curated stats (``params_b`` / ``min_vram_gb``) with no
+    network I/O, so estimation is fully local and deterministic.
     """
     need = required_vram_gb(
         config.model_id,
         config.method,
         train=config.train_knobs(),
         thinking=config.thinking,
-        skip_net=True,
     )
     gpu = pick_gpu(need, pin=config.gpu, provider=config.provider)
     return gpu, need

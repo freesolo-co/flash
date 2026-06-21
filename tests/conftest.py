@@ -30,11 +30,8 @@ def _offline(monkeypatch, tmp_path):
     runpod_pricing._MEM.update(ts=0.0, rates={})
 
     # HF param probe -> offline: sizing for an unlisted model falls back to the heuristic
-    # (24 GB tier) instead of hitting the Hugging Face API. Accept the optional ``skip_net``
-    # keyword (the cost path threads it explicitly) so the stub matches the real signature.
+    # (24 GB tier) instead of hitting the Hugging Face API.
     import flash.engine.vram as vram
 
-    monkeypatch.setattr(
-        vram, "fetch_hf_params_b", lambda model_id, *, skip_net=False: None, raising=False
-    )
+    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda model_id: None, raising=False)
     return

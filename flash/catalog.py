@@ -186,17 +186,12 @@ def resolve_model(
     algorithm: str,
     policy: str = "catalog",
     gpu: str | None = None,
-    *,
-    skip_net: bool = False,
 ) -> ModelInfo:
     """Resolve a model under the configured policy.
 
     ``catalog`` (default): the model must be a curated catalog entry.
     ``allow``: any HF model is accepted; a coarse VRAM-fit estimate (HF safetensors
     metadata, no download) blocks only provably-impossible fits and warns on tight ones.
-
-    ``skip_net=True`` sizes an unlisted "allow" model offline (no HF probe), threaded explicitly
-    so ``flash train --cost`` parses the spec with zero network I/O. Catalog models never probe.
     """
     algo = normalize_algorithm(algorithm)
     if model_id in MODELS:
@@ -204,20 +199,17 @@ def resolve_model(
     if policy != "allow":
         # Reuse get_model's error (includes the open-model hint).
         return get_model(model_id)
-    return _resolve_open_model(model_id, algo, gpu, skip_net=skip_net)
+    return _resolve_open_model(model_id, algo, gpu)
 
 
-def _resolve_open_model(
-    model_id: str, algo: str, gpu: str | None, *, skip_net: bool = False
-) -> ModelInfo:
+def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
     """Synthesize a ModelInfo for the open-model "allow" policy from a coarse VRAM-fit
     estimate (HF safetensors metadata, no download). Blocks provably-impossible fits and
     warns on tight ones. Isolates the engine.vram dependency + disk-floor heuristic from
-    the curated-catalog path in resolve_model. ``skip_net=True`` forces the offline (no-HF-probe)
-    sizing for the cost estimator's parse."""
+    the curated-catalog path in resolve_model."""
     from flash.engine.vram import check_fit
 
-    est = check_fit(model_id, algo, gpu or DEFAULT_GPU, skip_net=skip_net)
+    est = check_fit(model_id, algo, gpu or DEFAULT_GPU)
     if est.verdict == "too_big":
         raise ValueError(
             f"{model_id} does not fit the requested GPU: {est.describe()}. "

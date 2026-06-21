@@ -1,9 +1,9 @@
 """Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / step count / estimate.
 
 Shared by the CLI (``flash train --cost``) and the control plane (which charges the estimate
-to the user's org at submit), so both price the SAME work the run will bill for. VRAM sizing is
-offline (``estimate_cost`` threads ``skip_net=True``) and GPU selection picks the cheapest
-fitting class with no validation gate -- the same basis whether quoted or charged.
+to the user's org at submit), so both price the SAME work the run will bill for. Catalog models
+size from their curated stats (no network) and GPU selection picks the cheapest fitting class
+with no validation gate -- the same basis whether quoted or charged.
 """
 
 from __future__ import annotations
@@ -132,10 +132,10 @@ def estimate_for_spec(spec) -> CostEstimate:
 def offline_estimate_for_spec(spec) -> CostEstimate:
     """The OFFLINE-consistent estimate -- what ``flash train --cost`` would have quoted.
 
-    ``estimate_cost`` forces offline HF sizing (``select_gpu`` passes ``skip_net=True`` to
-    ``required_vram_gb``) and picks the cheapest fitting class with no validation gate, exactly
-    like the parse-time provisional. With GPU pinning gone there is no quote-vs-parse divergence,
-    so this is identical to ``estimate_for_spec``; kept as a named seam for ``charge_run_estimate``
-    (the control plane bills the ``min`` of this and the parsed estimate, never more than quoted).
+    Catalog models size from their curated stats (no network) and selection picks the cheapest
+    fitting class with no validation gate, exactly like the parse-time provisional. With GPU
+    pinning gone there is no quote-vs-parse divergence, so this is identical to
+    ``estimate_for_spec``; kept as a named seam for ``charge_run_estimate`` (the control plane
+    bills the ``min`` of this and the parsed estimate, never more than quoted).
     """
     return estimate_cost(runconfig_from_spec(spec))

@@ -266,15 +266,8 @@ def cmd_env_list(args) -> int:
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    Estimation must be fully OFFLINE. ``estimate_cost`` already sizes VRAM offline
-    (``skip_net=True``), but ``spec_from_file`` parse-time GPU policy resolution
-    (``resolve_gpu_policy`` -> ``model_required_vram_gb`` -> ``fetch_hf_params_b``) and the
-    open-model ``resolve_model`` -> ``check_fit`` fit-estimate would still probe the HF API for an
-    unlisted ``model_policy = "allow"`` model. Thread ``skip_net=True`` through the parse so BOTH
-    sizing paths take the offline heuristic (no network I/O) -- the quote is deterministic AND
-    matches the offline basis the control plane charges at submit
-    (``cost.spec.offline_estimate_for_spec``). This is an EXPLICIT param threaded through the
-    sizing stack, not any process-global state, so it never affects a concurrent caller. For an
+    Catalog-only and fully local: catalog models size from their curated stats with no network,
+    so the quote is deterministic and matches what the control plane charges at submit. For an
     SFT run with no ``[train].max_examples`` the step count loads the env to count its real train
     split (see ``cost.spec.count_env_examples``).
     """
@@ -283,9 +276,8 @@ def _cmd_train_cost(args) -> int:
     spec = spec_from_file(
         args.config,
         run_id=None,
-        overrides=getattr(args, "overrides", None),
-        extra_configs=getattr(args, "extra_configs", None),
-        skip_net=True,  # offline parse+size: NO HF probe for an unlisted open model
+        overrides=args.overrides,
+        extra_configs=args.extra_configs,
     )
     print(estimate_cost(_runconfig_from_spec(spec)).breakdown())
     return 0
@@ -297,8 +289,8 @@ def cmd_train(args) -> int:
     spec = spec_from_file(
         args.config,
         run_id=new_run_id() if args.dry_run else None,
-        overrides=getattr(args, "overrides", None),
-        extra_configs=getattr(args, "extra_configs", None),
+        overrides=args.overrides,
+        extra_configs=args.extra_configs,
     )
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.
