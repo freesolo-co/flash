@@ -18,6 +18,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -303,11 +304,15 @@ def poll_job(
     """
 
     say = make_say(log)
-    # Operator override for the throttle grace (seconds); ignored if unset/unparseable.
+    # Operator override for the throttle grace (seconds); accepted only when it parses to a
+    # finite positive number. A bogus/NaN/inf/<=0 value must NOT silently disable the
+    # fast-fail (e.g. `time - throttled_since > nan` is always False), so we ignore it.
     _throttle_env = os.environ.get("FLASH_THROTTLE_GRACE_S")
     if _throttle_env:
         with contextlib.suppress(ValueError):
-            throttled_grace_s = float(_throttle_env)
+            _parsed = float(_throttle_env)
+            if math.isfinite(_parsed) and _parsed > 0:
+                throttled_grace_s = _parsed
     poll_errors = PollErrorTracker(say, interval_s)
 
     start = time.time()
