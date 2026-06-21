@@ -270,9 +270,10 @@ def _quiet_stdout(active: bool):
     """Route stdout to stderr while ``active``.
 
     Config parsing / model resolution can ``print`` advisory policy warnings to stdout
-    (open-model VRAM fit, thinking/allow-policy notes). When the command's stdout must be
-    strict JSON (``flash plan --json``, ``flash train --dry-run``), that would corrupt the
-    payload — so capture those prints onto stderr and keep stdout clean.
+    (open-model VRAM fit, allow-policy notes). When the command's stdout must be strict JSON
+    (``flash plan --json``, ``flash train --dry-run``), that would corrupt the payload — so
+    capture those prints onto stderr and keep stdout clean. (The thinking-length warning already
+    goes to stderr via ``file=sys.stderr``, so it isn't the reason for this redirect.)
     """
     if active:
         with contextlib.redirect_stdout(sys.stderr):
