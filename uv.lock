@@ -124,10 +124,10 @@ wheels = [
 
 [package.optional-dependencies]
 speedups = [
-    { name = "aiodns", marker = "(sys_platform != 'android' and sys_platform != 'ios') or (sys_platform == 'android' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server') or (sys_platform == 'ios' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server')" },
-    { name = "backports-zstd", marker = "(platform_python_implementation == 'CPython' and sys_platform != 'android' and sys_platform != 'ios') or (platform_python_implementation != 'CPython' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server') or (sys_platform == 'android' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server') or (sys_platform == 'ios' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server')" },
-    { name = "brotli", marker = "(platform_python_implementation == 'CPython' and sys_platform != 'android' and sys_platform != 'ios') or (platform_python_implementation != 'CPython' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server') or (sys_platform == 'android' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server') or (sys_platform == 'ios' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server')" },
-    { name = "brotlicffi", marker = "platform_python_implementation != 'CPython' or (extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server')" },
+    { name = "aiodns", marker = "sys_platform != 'android' and sys_platform != 'ios'" },
+    { name = "backports-zstd", marker = "platform_python_implementation == 'CPython' and sys_platform != 'android' and sys_platform != 'ios'" },
+    { name = "brotli", marker = "platform_python_implementation == 'CPython' and sys_platform != 'android' and sys_platform != 'ios'" },
+    { name = "brotlicffi", marker = "platform_python_implementation != 'CPython'" },
 ]
 
 [[package]]
@@ -984,7 +984,7 @@ wheels = [
 [package.optional-dependencies]
 all = [
     { name = "email-validator" },
-    { name = "fastapi-cli", extra = ["standard"] },
+    { name = "fastapi-cli", extra = ["standard"], marker = "extra == 'extra-5-flash-server'" },
     { name = "httpx" },
     { name = "itsdangerous" },
     { name = "jinja2" },
@@ -992,7 +992,7 @@ all = [
     { name = "pydantic-settings" },
     { name = "python-multipart" },
     { name = "pyyaml" },
-    { name = "uvicorn", extra = ["standard"] },
+    { name = "uvicorn", extra = ["standard"], marker = "extra == 'extra-5-flash-server'" },
 ]
 standard = [
     { name = "email-validator" },
@@ -1013,7 +1013,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "rich-toolkit" },
     { name = "typer" },
-    { name = "uvicorn", extra = ["standard"] },
+    { name = "uvicorn", extra = ["standard"], marker = "extra == 'extra-5-flash-gpu' or extra == 'extra-5-flash-server'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6e/58/74797ae9e4610cfa0c6b34c8309096d3b20bb29be3b8b5fbf1004d10fa5f/fastapi_cli-0.0.24.tar.gz", hash = "sha256:1afc9c9e21d7ebc8a3ca5e31790cd8d837742be7e4f8b9236e99cb3451f0de00", size = 19043, upload-time = "2026-02-24T10:45:10.476Z" }
 wheels = [
@@ -1023,7 +1023,7 @@ wheels = [
 [package.optional-dependencies]
 standard = [
     { name = "fastapi-cloud-cli" },
-    { name = "uvicorn", extra = ["standard"] },
+    { name = "uvicorn", extra = ["standard"], marker = "extra == 'extra-5-flash-gpu' or extra == 'extra-5-flash-server'" },
 ]
 
 [[package]]
@@ -1034,12 +1034,12 @@ dependencies = [
     { name = "detect-installer" },
     { name = "fastar" },
     { name = "httpx" },
-    { name = "pydantic", extra = ["email"] },
+    { name = "pydantic", extra = ["email"], marker = "extra == 'extra-5-flash-gpu' or extra == 'extra-5-flash-server'" },
     { name = "rich-toolkit" },
     { name = "rignore" },
     { name = "sentry-sdk" },
     { name = "typer" },
-    { name = "uvicorn", extra = ["standard"] },
+    { name = "uvicorn", extra = ["standard"], marker = "extra == 'extra-5-flash-gpu' or extra == 'extra-5-flash-server'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ad/bf/97d19633c6ec6fb0ef59df474b9705ea992f7b4f879208d0007ac6d25ab6/fastapi_cloud_cli-0.20.0.tar.gz", hash = "sha256:9681c46adcd299024d0775658bd5d88992fd35c4ad42b1f045c6df913390ba37", size = 85904, upload-time = "2026-06-11T17:41:02.814Z" }
 wheels = [
@@ -1112,64 +1112,68 @@ wheels = [
 name = "flash"
 version = "0.2.0"
 source = { editable = "." }
-dependencies = [
-    { name = "datasets", version = "4.6.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-server'" },
-    { name = "datasets", version = "5.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "httpx" },
-    { name = "huggingface-hub" },
-    { name = "runpod-flash" },
-    { name = "verifiers", version = "0.1.10", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "verifiers", version = "0.1.14", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-server'" },
-]
 
 [package.optional-dependencies]
 gpu = [
     { name = "accelerate" },
     { name = "bitsandbytes" },
+    { name = "datasets", version = "5.0.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "huggingface-hub" },
     { name = "peft" },
     { name = "torch" },
     { name = "transformers" },
     { name = "trl" },
+    { name = "verifiers", version = "0.1.10", source = { registry = "https://pypi.org/simple" } },
     { name = "vllm" },
 ]
 server = [
     { name = "fastapi" },
+    { name = "httpx" },
+    { name = "huggingface-hub" },
     { name = "prime" },
+    { name = "runpod-flash" },
     { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "datasets", version = "4.6.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-server'" },
+    { name = "datasets", version = "5.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "verifiers", version = "0.1.10", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "verifiers", version = "0.1.14", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-server'" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'gpu'", specifier = ">=1.4" },
     { name = "bitsandbytes", marker = "extra == 'gpu'", specifier = ">=0.49" },
-    { name = "datasets", specifier = ">=2.19" },
+    { name = "datasets", marker = "extra == 'gpu'", specifier = ">=2.19" },
     { name = "fastapi", marker = "extra == 'server'" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "huggingface-hub", specifier = ">=0.34" },
+    { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
+    { name = "huggingface-hub", marker = "extra == 'gpu'", specifier = ">=0.34" },
+    { name = "huggingface-hub", marker = "extra == 'server'", specifier = ">=0.34" },
     { name = "peft", marker = "extra == 'gpu'", specifier = ">=0.19" },
     { name = "prime", marker = "extra == 'server'", specifier = ">=0.6.3" },
-    { name = "runpod-flash" },
+    { name = "runpod-flash", marker = "extra == 'server'" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.10.0" },
     { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.11" },
     { name = "trl", marker = "extra == 'gpu'", specifier = ">=1.6,<1.7" },
     { name = "uvicorn", marker = "extra == 'server'" },
-    { name = "verifiers", specifier = ">=0.1.10" },
+    { name = "verifiers", marker = "extra == 'gpu'", specifier = ">=0.1.10" },
     { name = "vllm", marker = "extra == 'gpu'", specifier = "==0.19.1" },
 ]
 provides-extras = ["gpu", "server"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "datasets", specifier = ">=2.19" },
     { name = "mypy", specifier = ">=1.13.0" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.6" },
+    { name = "verifiers", specifier = ">=0.1.10" },
 ]
 
 [[package]]
@@ -3302,7 +3306,7 @@ name = "pynacl"
 version = "1.6.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server')" },
+    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d9/9a/4019b524b03a13438637b11538c82781a5eda427394380381af8f04f467a/pynacl-1.6.2.tar.gz", hash = "sha256:018494d6d696ae03c7e656e5e74cdfd8ea1326962cc401bcf018f1ed8436811c", size = 3511692, upload-time = "2026-01-01T17:48:10.851Z" }
 wheels = [
@@ -3796,14 +3800,14 @@ name = "runpod"
 version = "1.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "aiohttp", extra = ["speedups"] },
+    { name = "aiohttp", extra = ["speedups"], marker = "extra == 'extra-5-flash-server'" },
     { name = "aiohttp-retry" },
     { name = "backoff" },
     { name = "boto3" },
     { name = "click" },
     { name = "colorama" },
     { name = "cryptography" },
-    { name = "fastapi", extra = ["all"] },
+    { name = "fastapi", extra = ["all"], marker = "extra == 'extra-5-flash-server'" },
     { name = "filelock" },
     { name = "inquirerpy" },
     { name = "paramiko" },
@@ -4440,8 +4444,8 @@ name = "uvicorn"
 version = "0.49.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "h11" },
+    { name = "click", marker = "sys_platform != 'emscripten' or extra == 'extra-5-flash-gpu' or extra == 'extra-5-flash-server'" },
+    { name = "h11", marker = "sys_platform != 'emscripten' or extra == 'extra-5-flash-gpu' or extra == 'extra-5-flash-server'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c4/1f/fa18009dea8469069cca78a4e877a008ab78f08b064bfc9ab891579077ff/uvicorn-0.49.0.tar.gz", hash = "sha256:ebf4271aa580d9de97f93192d4595176df6e91f9aae919ca73e4fc07df1e66a3", size = 91284, upload-time = "2026-06-03T22:01:30.448Z" }
 wheels = [
@@ -4450,11 +4454,11 @@ wheels = [
 
 [package.optional-dependencies]
 standard = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "httptools" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "uvloop", marker = "(platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32') or (platform_python_implementation == 'PyPy' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server') or (sys_platform == 'cygwin' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server') or (sys_platform == 'win32' and extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server')" },
+    { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'" },
     { name = "watchfiles" },
     { name = "websockets" },
 ]
@@ -4495,26 +4499,26 @@ resolution-markers = [
     "sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-5-flash-gpu' and extra != 'extra-5-flash-server'",
 ]
 dependencies = [
-    { name = "datasets", version = "5.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "gepa", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "jinja2", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "math-verify", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "mcp", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "msgpack", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "nest-asyncio", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "numpy", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "openai", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "openai-agents", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "prime-sandboxes", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "prime-tunnel", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "pydantic", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "pyzmq", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "requests", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "rich", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "tenacity", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "textual", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "datasets", version = "5.0.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "gepa" },
+    { name = "jinja2" },
+    { name = "math-verify" },
+    { name = "mcp" },
+    { name = "msgpack" },
+    { name = "nest-asyncio" },
+    { name = "numpy" },
+    { name = "openai" },
+    { name = "openai-agents" },
+    { name = "prime-sandboxes" },
+    { name = "prime-tunnel" },
+    { name = "pydantic" },
+    { name = "pyzmq" },
+    { name = "requests" },
+    { name = "rich" },
+    { name = "tenacity" },
+    { name = "textual" },
     { name = "typing-extensions", marker = "(python_full_version < '3.12' and extra == 'extra-5-flash-gpu') or (python_full_version < '3.12' and extra != 'extra-5-flash-server') or (extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server')" },
-    { name = "wget", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "wget" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/80/ec/84a7f94715a18e22a065219dc55dae6c73cba9bfaa982dd04c74f152332c/verifiers-0.1.10.tar.gz", hash = "sha256:18efb20c453cd6f2427cd994b38f17695c6604c32c46585ca9899bd4e7f29ce9", size = 296591, upload-time = "2026-02-11T00:33:00.731Z" }
 wheels = [

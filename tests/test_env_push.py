@@ -1,9 +1,12 @@
-"""`slm env push` packages a local verifiers env and uploads it to the MANAGED Environments Hub.
+"""`flash env push` packages a local verifiers env and uploads it to the MANAGED Environments Hub.
 
 The control plane publishes it under FreeSolo's Prime account, so the user needs no Prime
-account or local `prime` CLI. These tests cover the client side — packaging + upload. The
-server-side publish (prime, per-identity namespacing, conflict-climbing) lives in
-test_env_publish.py.
+account or local `prime` CLI. The freesolo training agent emits a single `environment.py` while
+the Hub requires an environment directory with a `pyproject.toml`; `flash env push` bridges that:
+pointed at a `.py` module it wraps it in a Prime-compatible package, pointed at a real env dir it
+uploads as-is, and the server climbs past version conflicts on re-publish. These tests cover the
+client side — packaging + upload. The server-side publish (prime, per-identity namespacing,
+conflict-climbing) lives in test_env_publish.py.
 """
 
 from __future__ import annotations

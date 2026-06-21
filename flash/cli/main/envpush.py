@@ -1,6 +1,6 @@
-"""Environment publish/install machinery for the `slm env` subcommands.
+"""Environment publish/install machinery for the `flash env` subcommands.
 
-`slm env install` records a published Prime Hub env locally; `slm env push` packages a
+`flash env install` records a published Prime Hub env locally; `flash env push` packages a
 local verifiers env and publishes it (always PRIVATE) to the Prime Environments Hub.
 """
 
@@ -38,7 +38,7 @@ def cmd_env_install(args) -> int:
             file=sys.stderr,
         )
         return 1
-    # `slm env install` is a LOCAL-client convenience: it installs the env into the client's
+    # `flash env install` is a LOCAL-client convenience: it installs the env into the client's
     # interpreter and records it in ~/.flash/envs.json for local authoring/dry-run. The
     # managed worker does NOT reinstall from this record — it installs Hub envs itself via an
     # authenticated `prime env install` on the GPU box. A Hub slug `owner/name` maps to the pip
@@ -59,7 +59,7 @@ def cmd_env_install(args) -> int:
         )
         installer = (
             # `uv pip install` outside an active venv errors with "No virtual environment
-            # found"; --python targets the CLI's own interpreter so a global/pipx `slm`
+            # found"; --python targets the CLI's own interpreter so a global/pipx `flash`
             # install still records the env.
             ["uv", "pip", "install", "--python", sys.executable]
             if shutil.which("uv")
@@ -78,7 +78,7 @@ def cmd_env_install(args) -> int:
 
 
 # A verifiers env packaged for the Prime Hub is a pyproject + an importable module exposing
-# load_environment(). When `slm env push` is pointed at a bare module (a single `.py`, as the
+# load_environment(). When `flash env push` is pointed at a bare module (a single `.py`, as the
 # freesolo training agent emits, or a dir without a pyproject), we wrap it in this layout so the
 # push Just Works instead of erroring on "pyproject.toml not found".
 _ENV_PUSH_PYPROJECT = """\
@@ -292,7 +292,7 @@ def cmd_env_push(args) -> int:
         if len(modules) != 1:
             print(
                 f"{src} has no pyproject.toml and {'no' if not modules else 'multiple'} "
-                "top-level .py module(s); point `slm env push` at the env's .py file or add a "
+                "top-level .py module(s); point `flash env push` at the env's .py file or add a "
                 "pyproject.toml.",
                 file=sys.stderr,
             )
@@ -310,7 +310,7 @@ def cmd_env_push(args) -> int:
     # A Python package name can't start with a digit, so prefix one (e.g. "2026-task").
     if module[:1].isdigit():
         module = f"env_{module}"
-    with tempfile.TemporaryDirectory(prefix="slm-env-push-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
         (pkg / module).mkdir()
         (pkg / module / "__init__.py").write_text(_with_syspath_bootstrap(module_source))
