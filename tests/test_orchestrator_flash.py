@@ -38,8 +38,8 @@ def test_run_job_persists_flash_metrics(monkeypatch):
                 "notes": {},
             }
 
-        # Stub the per-seed submit/poll path (the network-only seam) so the run completes
-        # without provisioning a GPU.
+        # Stub the per-seed submit/poll path (the seam that used to be the in-process
+        # offline shortcut) so the run completes without provisioning a GPU.
         # _run_seed_loop resolves it via `from flash.runner import _submit_seed_supervised`.
         monkeypatch.setattr(runner, "_submit_seed_supervised", fake_submit)
 

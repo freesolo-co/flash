@@ -168,17 +168,6 @@ class TrainSpec:
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
     stop_sequences: tuple[str, ...] = ()
-    # Periodic mid-run eval cadence (GRPO ONLY; ignored for SFT): every ``eval_every_steps``
-    # optimizer steps, greedily evaluate the policy on the ENVIRONMENT's held-out ``eval_dataset``
-    # with the env's rubric (reward + eval-metric metrics) and record the curve into metrics.json,
-    # so the agent judges the run on held-out eval, not just the training reward. 0/None disables.
-    # The eval queries and grading logic live in the environment, and the completion budget
-    # matches the run's normal ``max_tokens``.
-    eval_every_steps: int | None = None
-    # How many held-out examples each mid-run eval pass scores: a FIXED random sample of this
-    # many rows (seeded, so the same subset every pass -> a comparable curve), instead of the
-    # whole eval split (which can be huge and dominate training). None/0 -> the built-in default (64).
-    eval_examples: int | None = None
     # Disaggregated (async) GRPO rollout: number of GPUs in the node dedicated to the vLLM rollout
     # server, the rest train (see engine.rollout_bench.select_rollout_split). 0 = colocate (the
     # current single-GPU TRL path). >0 requires a multi-GPU node ([gpu] count = train + inference).
@@ -187,23 +176,16 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
+    # The parse-time provisional GPU class (cheapest that fits the model). GPU pinning is gone:
+    # the submit-time allocator always re-picks the cheapest fitting class across ALL providers,
+    # so a config's gpu.type does NOT pin — ``type`` is just the offline sizing/display default
+    # and the carrier the runner overwrites with the actually-allocated class.
     type: str = DEFAULT_GPU
     # Number of GPUs in the node (= trainer GPUs + [train].inference_gpus). 1 = single-GPU
     # (colocate, the default). >1 provisions a multi-GPU node (Vast: an offer with num_gpus==count;
     # RunPod Flash: gpu_count on the endpoint) for the disaggregated async GRPO path
     # (see engine.rollout_bench / engine.disaggregated). All GPUs are the same `type`.
     count: int = 1
-    # GPU substrate: "auto" (cheapest across providers at submit time), "runpod", or
-    # "vast" (verified datacenters only).
-    provider: str = "auto"
-    # The raw user gpu.type input ("cheapest"/"auto" or a concrete class), always set
-    # by config parsing. The runner re-allocates the class at submit time iff
-    # this is a policy word — ``type`` is then just the parse-time provisional; a
-    # concrete ``requested`` pins the class and the allocator only picks the provider.
-    requested: str = ""
-    # Whether to allow GPU classes Flash hasn't validated. Set only by the [gpu]
-    # allow_unvalidated TOML field; None leaves it disallowed.
-    allow_unvalidated: bool | None = None
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
@@ -305,16 +287,11 @@ class JobSpec:
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
-                eval_every_steps=_opt_int(train.get("eval_every_steps")),
-                eval_examples=_opt_int(train.get("eval_examples")),
                 inference_gpus=_opt_int(train.get("inference_gpus")) or 0,
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),
                 count=_req_int(gpu.get("count"), default=1),
-                provider=gpu.get("provider", "auto"),
-                requested=gpu.get("requested", ""),
-                allow_unvalidated=gpu.get("allow_unvalidated"),
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 2)),

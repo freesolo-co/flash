@@ -1,8 +1,8 @@
 """Offline-by-default test harness.
 
-There is no offline env flag; instead this autouse fixture stubs the network boundaries the
-production code would otherwise reach, so the whole suite stays hermetic (no real RunPod /
-Vast / Hugging Face calls) without any env switch. A test that exercises one of
+There is no "skip the network" env flag; instead this autouse fixture stubs the network
+boundaries the production code would otherwise reach, so the whole suite stays hermetic (no
+real RunPod / Vast / Hugging Face calls) without any env switch. A test that exercises one of
 these boundaries monkeypatches it itself — applied after this fixture, so the test's patch
 wins. (The freesolo auth verify isn't stubbed here because tests that touch it either patch
 ``_freesolo_verify`` or ``urllib.request.urlopen`` directly; a global ``urlopen`` stub would

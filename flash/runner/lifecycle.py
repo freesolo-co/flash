@@ -64,10 +64,8 @@ def _submit_seed_supervised(
 
     Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
     live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
-    fresh per attempt because offers are a live market. A policy ``gpu.requested``
-    ("cheapest"/"auto") lets the allocator pick the class; a concrete ``gpu.requested``
-    pins the class (the allocator then only picks the provider); ``gpu.provider`` pins
-    the substrate.
+    fresh per attempt because offers are a live market. There is no GPU pin, no validation
+    gate, and no provider pin — the cheapest fitting class always wins.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF
     checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
@@ -84,7 +82,7 @@ def _submit_seed_supervised(
     """
     from flash.providers import get_provider
     from flash.providers.allocator import allocate, allocation_summary
-    from flash.providers.base import POLICY_NAMES, PollResult
+    from flash.providers.base import PollResult
     from flash.runner import TERMINAL_STATES, _RunCancelled, _spec_with_gpu, _update, get_status
 
     last_handle: dict = {}
@@ -121,10 +119,6 @@ def _submit_seed_supervised(
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
     bad_machines: set[int] = set()
-    # Re-allocate freely for policy requests ("cheapest"/"auto"); honor a concrete
-    # user pin by passing it through as the only candidate class.
-    requested = (spec.gpu.requested or "").strip().lower()
-    pinned_gpu = None if requested in POLICY_NAMES else spec.gpu.type
     # Index into the ranked candidate list. It advances only after an attempt that
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
@@ -209,10 +203,7 @@ def _submit_seed_supervised(
             alloc = allocate(
                 spec.model,
                 spec.algorithm,
-                gpu=pinned_gpu,
-                provider=spec.gpu.provider,
                 disk_gb=spec.gpu.disk_gb,
-                allow_unvalidated=spec.gpu.allow_unvalidated,
                 exclude_machine_ids=frozenset(bad_machines),
                 # Drop (provider, class) pairs that already failed no_capacity this run so the live
                 # re-ranking can't re-select a starved pair at the new gpu_walk_offset (provider-
@@ -246,8 +237,8 @@ def _submit_seed_supervised(
             # Walk down the ranked candidates by the walk offset (clamped to the last): the
             # first attempt takes the cheapest; each retry that provisioned a class and lost
             # it to an infra failure steps to the next-cheapest, so a capacity-starved class
-            # can't burn the whole budget. A concrete pin yields a single candidate, so the
-            # clamp keeps a pinned run on its class.
+            # can't burn the whole budget. When only one class fits, the clamp keeps every
+            # retry on it.
             chosen = alloc.candidates[min(gpu_walk_offset, len(alloc.candidates) - 1)]
             print(allocation_summary(alloc), file=log, flush=True)
             if chosen.gpu != alloc.gpu:
@@ -350,16 +341,11 @@ def _submit_seed_supervised(
         ncand = len(alloc.candidates) if alloc is not None else 0
         if is_capacity:
             # More than the just-starved class must remain in the (already exclusion-filtered) pool
-            # for an automatic (cheapest/auto) request. A CONCRETE pin (pinned_gpu set) yields a
-            # single-class candidate list (ncand == 1) by design, but the allocator treats a pin as a
-            # PREFERENCE: once the starved pin is in exclude_gpu_classes, the next allocate() finds no
-            # offer for it and ESCALATES to the cheapest larger fitting class ("one spot larger, and
-            # so on") instead of raising. So allow the retry for a pin even at ncand == 1 — the next
-            # allocate() either returns the escalated class or raises UnsupportedGpuError (terminating
-            # cleanly) when nothing >= need is left, rather than failing a pinned 5090 run that other
-            # fitting classes could have served. Without a pin, ncand <= 1 still means the market is
-            # fully throttled, so we stop.
-            can_retry = infra_shaped and chosen is not None and (ncand > 1 or pinned_gpu is not None)
+            # to retry: allocation is fully automatic (cheapest fitting class across providers), so
+            # ncand <= 1 means the only fitting class is the one that's throttled and the market is
+            # fully starved — stop. With another class still available, exclude the starved one and
+            # walk to the next-cheapest.
+            can_retry = infra_shaped and chosen is not None and ncand > 1
         else:
             can_retry = infra_shaped and crash_retries < max_retries
         print(
