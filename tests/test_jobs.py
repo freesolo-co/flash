@@ -301,7 +301,6 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    monkeypatch.delenv("FLASH_THROTTLE_GRACE_S", raising=False)  # use the explicit param, not a stray env
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
     monkeypatch.setattr(
         runpod_api,
@@ -335,7 +334,6 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    monkeypatch.delenv("FLASH_THROTTLE_GRACE_S", raising=False)  # use the explicit param, not a stray env
     statuses = iter(
         [
             {"status": "IN_QUEUE"},  # probe 1: throttled -> arm throttled_since
@@ -373,50 +371,23 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     assert res.metrics == {"acc": 1.0}
 
 
-def test_poll_job_throttle_grace_env_override_and_validation(monkeypatch):
-    # FLASH_THROTTLE_GRACE_S overrides the param when it parses to a finite positive number;
-    # a bogus/nan/<=0 value is IGNORED and must NOT silently disable the throttle fast-fail.
-    import itertools
-
-    from flash.providers.runpod import api as runpod_api
+def test_stall_kwargs_throttle_grace_env_override_and_validation(monkeypatch):
+    # The FLASH_THROTTLE_GRACE_S operator override lives in stall_kwargs() (the prod config
+    # source), NOT in poll_job — so poll_job stays a pure function of its args and its tests are
+    # hermetic. stall_kwargs() adds throttled_grace_s only when the env parses to a finite
+    # positive number; a bogus/nan/inf/<=0 value is ignored so it can't silently disable the
+    # throttle fast-fail (leaving poll_job's own default to apply instead).
     from flash.providers.runpod import jobs
 
-    def run(env_val):
-        if env_val is None:
-            monkeypatch.delenv("FLASH_THROTTLE_GRACE_S", raising=False)
-        else:
-            monkeypatch.setenv("FLASH_THROTTLE_GRACE_S", env_val)
-        monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
-        monkeypatch.setattr(
-            runpod_api,
-            "endpoint_health",
-            lambda eid: {"workers": {"throttled": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}},
-        )
-        monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
-        clock = itertools.count(start=0, step=100.0)
-        monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
-        return jobs.poll_job(
-            jobs.JobHandle("ep", "name", "job"),
-            interval_s=0,
-            heartbeat_reader=lambda: None,
-            stall_after_s=150.0,
-            setup_grace_s=100000.0,  # huge: isolate the throttle path
-            unhealthy_grace_s=100000.0,
-            throttled_grace_s=300.0,  # param default the env may override
-        )
+    monkeypatch.delenv("FLASH_THROTTLE_GRACE_S", raising=False)
+    assert "throttled_grace_s" not in jobs.stall_kwargs()  # unset -> poll_job default applies
 
-    # Each bogus value is ignored -> the 300s param still trips the throttle fast-fail well
-    # before the huge setup_grace_s (a non-finite/<=0 grace would never trip -> setup-stall instead).
-    for bogus in ("nan", "-5", "0", "inf", "not-a-number"):
-        res = run(bogus)
-        assert res.failure == "stalled", bogus
-        assert "throttled" in res.detail, bogus
-    # A valid override is honored: a 200000s grace (> the 100000s setup_grace here) means the
-    # throttle path does NOT trip at the 300s param; the run hits setup_grace first instead, so
-    # the failure detail is the no-progress setup stall, NOT the throttle message.
-    res = run("200000")
-    assert res.failure == "stalled"
-    assert "throttled" not in res.detail
+    for bogus in ("nan", "inf", "-inf", "-5", "0", "not-a-number", ""):
+        monkeypatch.setenv("FLASH_THROTTLE_GRACE_S", bogus)
+        assert "throttled_grace_s" not in jobs.stall_kwargs(), bogus
+
+    monkeypatch.setenv("FLASH_THROTTLE_GRACE_S", "120")
+    assert jobs.stall_kwargs()["throttled_grace_s"] == 120.0
 
 
 def test_poll_job_no_reader_keeps_tight_window(monkeypatch):

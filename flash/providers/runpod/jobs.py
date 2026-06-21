@@ -74,8 +74,20 @@ def stall_kwargs() -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
     run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
     window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat.
+
+    ``throttled_grace_s`` is added only when the operator override ``FLASH_THROTTLE_GRACE_S`` is
+    set to a finite positive number (a bogus/NaN/inf/<=0 value is ignored so it can't silently
+    disable the throttle fast-fail); otherwise ``poll_job``'s own default applies. Keeping the
+    env read here — not in ``poll_job`` — leaves ``poll_job`` a pure function of its args.
     """
-    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0}
+    kwargs: dict = {"stall_after_s": 1500.0, "setup_grace_s": 3000.0}
+    env = os.environ.get("FLASH_THROTTLE_GRACE_S")
+    if env:
+        with contextlib.suppress(ValueError):
+            parsed = float(env)
+            if math.isfinite(parsed) and parsed > 0:
+                kwargs["throttled_grace_s"] = parsed
+    return kwargs
 
 
 def volume_endpoint_kwargs(spec) -> dict:
@@ -300,19 +312,12 @@ def poll_job(
 
     ``throttled_grace_s`` bounds how long we wait on a worker stuck THROTTLED (no RunPod
     capacity for the pinned GPU class) before returning a retryable stall so the runner
-    walks to the next-best GPU. Operators can override it via ``FLASH_THROTTLE_GRACE_S``.
+    walks to the next-best GPU. The production caller sources it (incl. the
+    ``FLASH_THROTTLE_GRACE_S`` operator override) via ``stall_kwargs()``; ``poll_job`` itself
+    reads no environment, so its behaviour is a pure function of its arguments.
     """
 
     say = make_say(log)
-    # Operator override for the throttle grace (seconds); accepted only when it parses to a
-    # finite positive number. A bogus/NaN/inf/<=0 value must NOT silently disable the
-    # fast-fail (e.g. `time - throttled_since > nan` is always False), so we ignore it.
-    _throttle_env = os.environ.get("FLASH_THROTTLE_GRACE_S")
-    if _throttle_env:
-        with contextlib.suppress(ValueError):
-            _parsed = float(_throttle_env)
-            if math.isfinite(_parsed) and _parsed > 0:
-                throttled_grace_s = _parsed
     poll_errors = PollErrorTracker(say, interval_s)
 
     start = time.time()
