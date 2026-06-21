@@ -205,7 +205,7 @@ def main() -> int:
                     )
         except Exception as _e:
             print("wandb setup skipped:", _e)
-        # NB: the Hopper fla fast-path setup lives in engine.worker._ensure_fla_fastpath_on_hopper
+        # NB: the Hopper fla fast-path setup lives in flash.engine.worker._ensure_fla_fastpath_on_hopper
         # (runs in the worker process after all installs, before any model import) — not here, where
         # a later install could pull fla back in. The bootstrap just fetches code and runs the worker.
 
@@ -216,7 +216,7 @@ def main() -> int:
             # a later import crash while the paid instance runs (matches the RunPod path).
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
         # NB: fla's tilelang GDN fast path is ensured on Hopper (sm90) by
-        # engine.worker._ensure_fla_fastpath_on_hopper at worker startup (fla's GDN backward is
+        # flash.engine.worker._ensure_fla_fastpath_on_hopper at worker startup (fla's GDN backward is
         # miscomputed on sm90 with Triton>=3.4, #640; tilelang is the correct backend) — no bootstrap
         # uninstall or env toggle. fla is kept on every arch.
         # Install the run's verifiers environment(s) from the Prime Hub via the
