@@ -159,6 +159,12 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     spec = spec_from_dict(raw)
     assert spec.environment.params == {"k": "v"}
     assert spec.environment.pip == ("pkg==1.0",)
+    # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k", "params": None, "pip": None}
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {}
+    assert spec.environment.pip == ()
 
 
 def test_jobspec_from_dict_rejects_path() -> None:
