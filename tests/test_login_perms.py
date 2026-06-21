@@ -1,4 +1,4 @@
-"""`slm login` verifies the freesolo key, then stores it with private (0600) permissions."""
+"""`flash login` verifies the freesolo key, then stores it with private (0600) permissions."""
 
 from __future__ import annotations
 

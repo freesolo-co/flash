@@ -26,7 +26,7 @@ def cancel_run(run_id: str) -> RunStatus:
     cancelled.
 
     Uses ``terminate_endpoint`` (reconstructs the run's uniquely-named endpoint and deletes it
-    via the RunPod API) so the cancel works **cross-process** — a fresh ``slm cancel`` actually
+    via the RunPod API) so the cancel works **cross-process** — a fresh ``flash cancel`` actually
     stops the GPU worker, instead of leaving it running until the wall cap. Best-effort: any
     teardown error is recorded but still flips the run to ``cancelled``.
     """
@@ -232,7 +232,7 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
     recorded (see ``_run_seed_loop``). A control-plane restart in that handle-less window
     must RESUME from that index rather than fail the run and discard the finished seeds.
     Unlike ``attach_run`` there is no live job to poll — the prior process already tore the
-    seed's endpoint down — so we start a fresh seed loop from the recorded index. The slm
+    seed's endpoint down — so we start a fresh seed loop from the recorded index. The flash
     package was uploaded to HF on the original submit, so the worker can still fetch it; no
     re-upload is needed.
     """

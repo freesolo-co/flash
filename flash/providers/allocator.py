@@ -183,7 +183,7 @@ def allocate(
     if escalated_from is not None:
         order0 = {n: i for i, n in enumerate(PROVIDER_NAMES)}
         _cheapest = sorted(candidates, key=lambda c: (c.hourly_usd, c.vram_gb, order0.get(c.provider, 99)))[0]
-        # WARNING level so it surfaces at default `slm train` verbosity (configure_logging is
+        # WARNING level so it surfaces at default `flash train` verbosity (configure_logging is
         # WARNING) — a silently-escalated pin changes cost/hardware and operators must see it;
         # still routed through the logger (stderr), so machine-readable stdout stays clean.
         logger.warning(

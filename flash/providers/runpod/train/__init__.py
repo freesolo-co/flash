@@ -65,7 +65,7 @@ def upload_code(repo: str | None = None) -> str:
     ``registry.worker_pip_for_env``).
 
     Only the ``flash`` package is uploaded, NOT the client's project tree. Managed runs must
-    reference a published Hub env by ``id`` (``slm env push`` to publish a local env first); the
+    reference a published Hub env by ``id`` (``flash env push`` to publish a local env first); the
     worker pip-installs the env wheel.
     """
     from huggingface_hub import HfApi

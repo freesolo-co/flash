@@ -187,7 +187,7 @@ def _wandb_spec(raw: Any) -> WandbSpec:
     the job-spec JSON the worker reads), NOT environment variables. The worker honors them in
     ``engine.worker.wandb_report_to`` / ``wandb_run_name``, so a run can land in its own W&B
     project under its own run name instead of the hardcoded ``flash`` / ``flash-…`` defaults.
-    Settable in TOML (``[wandb] project = …``) or via ``slm train cfg.toml --set
+    Settable in TOML (``[wandb] project = …``) or via ``flash train cfg.toml --set
     wandb.project=… --set wandb.run_name=…``. The actual W&B credential (WANDB_API_KEY) stays an
     env-var secret — only the naming config lives here."""
     if raw is None:
