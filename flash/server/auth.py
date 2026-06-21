@@ -25,7 +25,7 @@ INTERNAL_KEY_ENV = "FREESOLO_INTERNAL_KEY"
 # the bearer to this control plane. Any non-internal token is verified against the freesolo
 # backend and (on success) resolved to a per-token identity.
 FREESOLO_BASE_URL_ENV = "FREESOLO_BASE_URL"
-DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
+DEFAULT_FREESOLO_BASE_URL = "https://api-dev.freesolo.co"
 _VERIFY_TIMEOUT_S = 5.0
 _VERIFY_CACHE_TTL_S = 300.0  # short TTL so it isn't a backend round-trip per request
 # Negative verdicts get a much SHORTER TTL than positives. The freesolo verify endpoint
@@ -67,6 +67,12 @@ def _prune_verify_cache_locked(now: float) -> None:
             del _verify_cache[tok]
 
 
+def freesolo_base_url() -> str:
+    """The freesolo backend base URL (``FREESOLO_BASE_URL`` env, else the default), trailing
+    slash trimmed. Shared by auth verify and the billing client."""
+    return (os.environ.get(FREESOLO_BASE_URL_ENV) or DEFAULT_FREESOLO_BASE_URL).rstrip("/")
+
+
 def _freesolo_verify(token: str) -> bool:
     """Verify a token against the freesolo backend (cached, short TTL, network errors = False).
 
@@ -80,8 +86,7 @@ def _freesolo_verify(token: str) -> bool:
         cached = _verify_cache.get(token)
         if cached is not None and cached[1] > now:
             return cached[0]
-    base = os.environ.get(FREESOLO_BASE_URL_ENV) or DEFAULT_FREESOLO_BASE_URL
-    url = f"{base.rstrip('/')}/api/auth/verify"
+    url = f"{freesolo_base_url()}/api/auth/verify"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=_VERIFY_TIMEOUT_S) as resp:
