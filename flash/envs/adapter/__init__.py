@@ -30,7 +30,7 @@ verifiers contract (docs):
   * multi-turn: ``env.env_response(messages, state)`` -> env reply messages;
     ``env.is_completed(state)`` -> done flag (both async)
 
-Hub conveniences handled here so the *documented* flow (``slm env install owner/name`` +
+Hub conveniences handled here so the *documented* flow (``flash env install owner/name`` +
 ``[environment] id = "owner/name"``) works on real Prime Intellect envs:
   * the ``owner/name`` Hub slug is mapped to the bare ``verifiers`` load id;
   * a ``RubricGroup`` (rubrics-of-rubrics) is flattened so the real reward funcs are found;
@@ -481,7 +481,7 @@ def _import_vf():
     except ImportError as exc:
         raise ImportError(
             "the 'verifiers' package is required to run Prime Hub environments; "
-            "install it (e.g. `uv pip install verifiers`) or run `slm env install <env>`"
+            "install it (e.g. `uv pip install verifiers`) or run `flash env install <env>`"
         ) from exc
 
 
