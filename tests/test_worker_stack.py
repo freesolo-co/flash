@@ -26,7 +26,9 @@ def test_gdn_fastpath_deps_present_and_kept_on_hopper(monkeypatch):
     assert (
         "git+https://github.com/fla-org/flash-linear-attention" in joined
     )  # complete fla, not the broken PyPI stub
-    assert any(d == "tilelang" for d in WORKER_DEPS)  # correct GDN backend on Triton>=3.4
+    assert any(
+        d.startswith("tilelang==") for d in WORKER_DEPS
+    )  # correct GDN backend on Triton>=3.4, PINNED for reproducibility
     assert any(
         d.startswith("apache-tvm-ffi==0.1.11") for d in WORKER_DEPS
     )  # pin (0.1.12 aborts tilelang import)
@@ -433,49 +435,105 @@ def _hopper_torch():
     return t
 
 
-def test_hopper_fla_fallback_disables_fla_when_stack_unavailable(monkeypatch):
-    """Probe fails (fla absent after install attempt) -> _remove_fla_from_disk IS called so the
-    fla gate flips off and the worker uses the pure-PyTorch delta path (not the broken fla kernel)."""
+class _FakeCompleted:
+    """Minimal stand-in for subprocess.CompletedProcess so _pip can read .returncode."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+
+
+def _patch_hopper_stack(
+    monkeypatch,
+    *,
+    pip_rc: int = 0,
+    find_spec_ok: bool = True,
+    tvm_ffi_version: str | None = "0.1.11",
+):
+    """Wire the perf helper's external touchpoints for the Hopper fast-path tests and return the
+    list that records _remove_fla_from_disk (fla-disable) calls.
+
+    * ``pip_rc`` -> the return code every mocked ``pip install`` reports (non-zero = failed install).
+    * ``find_spec_ok`` -> whether the post-install import probe finds fla/fla.modules/tilelang.
+    * ``tvm_ffi_version`` -> what importlib.metadata.version('apache-tvm-ffi') reports (None=absent).
+    """
+    import importlib.metadata
     import importlib.util
     import subprocess
 
     from flash.engine.worker import perf
 
     monkeypatch.setitem(sys.modules, "torch", _hopper_torch())
-    # No real pip installs from the test (subprocess is imported locally inside the helper, so
-    # patch the real subprocess module, not perf).
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None, raising=True)
-    # fla never becomes importable -> probe `ok` is false (drives the fallback branch).
-    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None, raising=True)
-    # Count + neutralize the disable mechanism (don't touch any real on-disk fla).
-    calls: list[int] = []
+    # subprocess is imported locally inside the helper, so patch the real module. Return a fake
+    # CompletedProcess so _pip can read .returncode (the install-success gate).
     monkeypatch.setattr(
-        perf, "_remove_fla_from_disk", lambda: (calls.append(1), (["/x/fla"], False))[1]
+        subprocess, "run", lambda *a, **k: _FakeCompleted(pip_rc), raising=True
     )
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        (lambda name: object()) if find_spec_ok else (lambda name: None),
+        raising=True,
+    )
+
+    def _fake_version(dist: str) -> str:
+        if dist == "apache-tvm-ffi":
+            if tvm_ffi_version is None:
+                raise importlib.metadata.PackageNotFoundError(dist)
+            return tvm_ffi_version
+        raise importlib.metadata.PackageNotFoundError(dist)
+
+    monkeypatch.setattr(importlib.metadata, "version", _fake_version, raising=True)
+
+    removed: list[int] = []
+    monkeypatch.setattr(
+        perf, "_remove_fla_from_disk", lambda: (removed.append(1), (["/x/fla"], False))[1]
+    )
+    return perf, removed
+
+
+def test_hopper_fla_fallback_disables_fla_when_stack_unavailable(monkeypatch):
+    """Probe fails (fla absent after install attempt) -> _remove_fla_from_disk IS called so the
+    fla gate flips off and the worker uses the pure-PyTorch delta path (not the broken fla kernel)."""
+    perf, removed = _patch_hopper_stack(monkeypatch, find_spec_ok=False)
 
     perf._fix_fla_fastpath_on_hopper()
 
     # The fallback gating actually fired: fla was disabled (the gate, not just a print).
-    assert calls, "fallback must DISABLE fla (call _remove_fla_from_disk) when ok is false"
+    assert removed, "fallback must DISABLE fla (call _remove_fla_from_disk) when ok is false"
+
+
+def test_hopper_fla_fallback_when_install_fails(monkeypatch):
+    """A FAILED pip install (rc!=0) must flip the gate off + disable fla EVEN IF find_spec still
+    succeeds on a stale/partial resident copy — a failed install is not silently treated as healthy
+    (Copilot review on perf.py:~487). Without the rc check, find_spec alone would wrongly keep fla."""
+    perf, removed = _patch_hopper_stack(
+        monkeypatch, pip_rc=1, find_spec_ok=True, tvm_ffi_version="0.1.11"
+    )
+
+    perf._fix_fla_fastpath_on_hopper()
+
+    assert removed, "a failed install (rc!=0) must DISABLE fla even when find_spec passes"
+
+
+def test_hopper_fla_fallback_when_tvm_ffi_pin_did_not_land(monkeypatch):
+    """tilelang's apache-tvm-ffi~=0.1.0 range can keep the BROKEN 0.1.12 (find_spec-importable but
+    aborts `import tilelang`). The gate verifies the RESOLVED tvm-ffi version, so a wrong version
+    disables fla even though every install 'succeeded' and every module imports."""
+    perf, removed = _patch_hopper_stack(
+        monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.12"
+    )
+
+    perf._fix_fla_fastpath_on_hopper()
+
+    assert removed, "wrong resolved apache-tvm-ffi version must DISABLE fla (pin didn't land)"
 
 
 def test_hopper_fla_kept_when_stack_healthy(monkeypatch):
-    """Probe succeeds (fla + fla.modules + tilelang all importable) -> fla is KEPT: the fallback
-    disable must NOT run (we want the fast path engaged, not removed)."""
-    import importlib.util
-    import subprocess
-
-    from flash.engine.worker import perf
-
-    monkeypatch.setitem(sys.modules, "torch", _hopper_torch())
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None, raising=True)
-    # Everything the probe checks is present -> ok is True (no fallback).
-    monkeypatch.setattr(
-        importlib.util, "find_spec", lambda name: object(), raising=True
-    )
-    removed: list[int] = []
-    monkeypatch.setattr(
-        perf, "_remove_fla_from_disk", lambda: (removed.append(1), ([], False))[1]
+    """Success path: every install exits 0, fla + fla.modules + tilelang all import, AND the
+    resolved apache-tvm-ffi is exactly the pin -> fla is KEPT (the fast path is engaged, not
+    removed)."""
+    perf, removed = _patch_hopper_stack(
+        monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.11"
     )
 
     perf._fix_fla_fastpath_on_hopper()
@@ -541,4 +599,34 @@ def test_fla_git_pin_is_consistent_and_pinned():
     assert pm, "perf.py runtime fla reinstall must be pinned to a 40-char commit SHA"
     assert pm.group(1) == deps_sha, (
         f"perf.py fla SHA must match WORKER_DEPS (deps={deps_sha}, perf={pm.group(1)})"
+    )
+
+
+def test_tilelang_pin_is_consistent_and_pinned():
+    """tilelang (the Hopper GDN correctness backend) is PINNED to an exact version (not unversioned)
+    and the SAME pin is used in WORKER_DEPS, Dockerfile.worker, and perf.py's runtime reinstall, so
+    cold-start installs / image rebuilds / runtime reinstalls all resolve the identical backend
+    (Copilot review on deps.py:~70)."""
+    import pathlib
+    import re
+
+    spec = next(d for d in WORKER_DEPS if d.split("==")[0].split(">")[0].strip() == "tilelang")
+    m = re.match(r"tilelang==([0-9][0-9A-Za-z.\-]*)$", spec.strip())
+    assert m, f"tilelang must be pinned to an exact version (tilelang==X.Y.Z), got: {spec!r}"
+    pin = m.group(1)
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile.worker").read_text()
+    dm = re.search(r'"tilelang==([0-9][0-9A-Za-z.\-]*)"', dockerfile)
+    assert dm, "Dockerfile.worker must install a PINNED tilelang==X.Y.Z (not unversioned)"
+    assert dm.group(1) == pin, (
+        f"Dockerfile.worker tilelang pin must match WORKER_DEPS (deps={pin}, dockerfile={dm.group(1)})"
+    )
+
+    perf_src = (root / "flash" / "engine" / "worker" / "perf.py").read_text()
+    # perf.py builds the spec via an f-string `f"tilelang=={TILELANG_PIN}"`, so assert the constant.
+    pm = re.search(r'TILELANG_PIN\s*=\s*"([0-9][0-9A-Za-z.\-]*)"', perf_src)
+    assert pm, "perf.py must define a pinned TILELANG_PIN constant for the runtime reinstall"
+    assert pm.group(1) == pin, (
+        f"perf.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
     )
