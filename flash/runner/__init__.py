@@ -256,6 +256,24 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         _save_status(status)
 
 
+def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
+    """Persist reconciliation results (realized COGS + the reconciled marker) WITHOUT touching
+    the run's state. Unlike ``_update``, which sets ``state`` from its caller, this re-reads the
+    current status under the lock and writes only the two cost columns, so a run that advanced
+    (e.g. to ``deployed``) after the reconcile snapshot was taken keeps its current state — the
+    background reconciliation job must never revert a live deployment while saving cost fields.
+    No-ops if the run vanished. Always allowed: cost is a field-only update on any state."""
+    with _STATUS_LOCK:
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        status.realized_cost_usd = realized_cost_usd
+        status.reconciled_at = reconciled_at
+        status.updated_at = time.time()
+        _save_status(status)
+
+
 def _save_status(status: RunStatus) -> None:
     os.makedirs(RUNS_DIR, exist_ok=True)
     # Write-then-rename: a concurrent reader (poll on /v1/runs or /logs) must
