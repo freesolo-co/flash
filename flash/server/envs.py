@@ -32,7 +32,11 @@ _NS_SEP = "--"
 
 
 def _limit_bytes(env_var: str, default: int) -> int:
-    """An operator-configurable byte cap from ``env_var`` (positive int), else ``default``."""
+    """An operator-configurable positive-int limit from ``env_var``, else ``default``.
+
+    Used for several kinds of caps — byte sizes (``FLASH_ENV_MAX_UPLOAD_BYTES``), a member
+    count (``FLASH_ENV_MAX_MEMBERS``), and a timeout in seconds (``FLASH_ENV_PUSH_TIMEOUT_S``) —
+    so the unit is whatever the caller's ``default`` implies; this only enforces "positive int"."""
     raw = os.environ.get(env_var)
     if raw:
         try:

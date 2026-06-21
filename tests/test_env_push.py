@@ -108,6 +108,25 @@ def test_push_single_py_uses_sibling_config_id_name(monkeypatch, tmp_path):
     assert cap["is_new"] is False
 
 
+def test_push_sibling_config_id_with_dot_yields_valid_module(monkeypatch, tmp_path):
+    # A sibling config Hub slug name is NOT pre-sanitized and may contain a `.` (or other chars
+    # invalid in a Python package dir / `[tool.hatch] packages` entry). The packaged module dir
+    # must still be a valid identifier ([a-z0-9_]) so the wheel build doesn't break.
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "flash_grpo.toml").write_text(
+        'model = "m"\nalgorithm = "grpo"\n[environment]\nid = "owner/my.weird.env"\n'
+    )
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
+    names = set(_members(cap["package_b64"]))
+    # No member path contains a dotted package segment; the module dir is a flat identifier.
+    assert "my_weird_env/__init__.py" in names
+    assert not any("my.weird" in n for n in names)
+
+
 def test_push_single_py_no_sibling_config_uses_file_stem(monkeypatch, tmp_path):
     env_file = tmp_path / "my_task.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")

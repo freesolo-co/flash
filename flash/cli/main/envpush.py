@@ -306,7 +306,12 @@ def cmd_env_push(args) -> int:
         print(f"cannot publish {src}: expected a verifiers .py module or an env directory.")
         return 1
 
-    module = env_name.replace("-", "_")
+    # The module dir name must be a valid Python identifier. `env_name` may be a sibling config's
+    # Hub slug name (`_config_env_name`), which is NOT sanitized and can contain `.`/other chars
+    # invalid in a package dir (and would mismatch `[tool.hatch...] packages = ["<module>"]`,
+    # breaking the build). Normalize through `_push_env_name` (collapses non-[a-z0-9] runs to `-`)
+    # before mapping `-`->`_`, so the module is always [a-z0-9_].
+    module = _push_env_name(env_name).replace("-", "_")
     # A Python package name can't start with a digit, so prefix one (e.g. "2026-task").
     if module[:1].isdigit():
         module = f"env_{module}"
