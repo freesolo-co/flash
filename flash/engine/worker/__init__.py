@@ -57,8 +57,8 @@ from flash.engine.worker.perf import (
     _LIGER_MIN_PARAMS,  # noqa: F401
     _LONG_CONTEXT_TOKENS,  # noqa: F401
     _attn_impl_for_capability,  # noqa: F401
+    _ensure_fla_fastpath_on_hopper,
     _estimate_params,  # noqa: F401
-    _fix_fla_fastpath_on_hopper,
     _flash_attn_available,
     _GpuPeakSampler,
     _liger_default_for_model,  # noqa: F401
@@ -459,9 +459,12 @@ def graded_text(completion: str | None) -> str | None:
     return strip_think(completion) if THINKING else completion
 
 
+
+
 # ---------------------------------------------------------------------------
 # SFT
 # ---------------------------------------------------------------------------
+
 
 
 def force_vllm_backend_for_sm120() -> str | None:
@@ -485,11 +488,10 @@ def force_vllm_backend_for_sm120() -> str | None:
         print("[rl] sm120 vLLM backend probe skipped:", e)
         return None
     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
-    print(
-        "[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
-        "on consumer Blackwell hosts -> empty-rollout failures)"
-    )
+    print("[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
+          "on consumer Blackwell hosts -> empty-rollout failures)")
     return "FLASHINFER"
+
 
 
 def finalize_alloc_conf_for_sleep() -> None:
@@ -527,6 +529,10 @@ def finalize_alloc_conf_for_sleep() -> None:
         print("[alloc] auto-conf skipped:", e)
 
 
+
+
+
+
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
@@ -555,9 +561,7 @@ def wandb_report_to() -> list[str]:
             project = (JOB_SPEC.wandb.project if JOB_SPEC else None) or "flash"
             wandb.init(project=project, name=wandb_run_name())
     except Exception as e:
-        print(
-            f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)"
-        )
+        print(f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)")
         return []
     return ["wandb"]
 
@@ -591,6 +595,9 @@ def wandb_run_info() -> dict:
         }
     except Exception:
         return {}
+
+
+
 
 
 def make_lora(model_id: str | None = None):
@@ -637,6 +644,8 @@ def make_lora(model_id: str | None = None):
             kwargs["exclude_modules"] = exclude
             print(f"[lora] excluding modules for {model_id}: {exclude}")
     return LoraConfig(**kwargs)
+
+
 
 
 def qlora_model_init_kwargs() -> dict:
@@ -1231,7 +1240,9 @@ def _grpo_resume_already_complete(resume_ckpt, target_steps: int, steps_run: int
     return bool(resume_ckpt) and target_steps > 0 and steps_run >= target_steps
 
 
-def _grpo_is_no_op_failure(reward_history, resume_ckpt, target_steps: int, steps_run: int) -> bool:
+def _grpo_is_no_op_failure(
+    reward_history, resume_ckpt, target_steps: int, steps_run: int
+) -> bool:
     """True when a GRPO run trained NOTHING and must fail loudly instead of reporting as done.
 
     An empty ``reward_history`` means the reward callback never fired — the rollout scored nothing
@@ -1283,9 +1294,7 @@ def run_rl():
     _t = JOB_SPEC.train if JOB_SPEC else None
     # batch_size = prompts per optimizer step for GRPO.
     # prompts per optimizer step = the run config's [train].batch_size (recipe default otherwise).
-    prompts_per_step = int(
-        _t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step
-    )
+    prompts_per_step = int(_t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step)
     group_size = int(gcfg.get("group_size") or rl.group_size)
     # temperature: explicit None check, NOT `or` — a configured 0.0 (greedy/deterministic
     # rollouts) must be honored, not fall back to the recipe sampling temperature.
@@ -1443,9 +1452,7 @@ def run_rl():
     )
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
-        print(
-            "WARN: generation batch not divisible by group size; check prompts_per_step/group_size"
-        )
+        print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
     print(
         f"[rl] GRPO batching: per_device={batching['per_device_train_batch_size']} "
         f"grad_accum={batching['gradient_accumulation_steps']} "
@@ -1859,6 +1866,7 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
+
 def main():
     # Idempotency: if DONE was already uploaded, a re-delivered job re-fetches the final
     # metrics from HF and returns them immediately. (The previous behavior — sleeping in
@@ -1866,8 +1874,8 @@ def main():
     try:
         # Idempotency FIRST — before any env-mutating pip install / package removal: a re-delivered
         # job whose DONE already exists must return the persisted metrics and exit WITHOUT running
-        # _fix_fla_fastpath_on_hopper() (mutates the env: pip-installs tilelang/fla) — that wasted a
-        # worker mutating its env on an already-complete run. It is called after the DONE check below.
+        # _ensure_fla_fastpath_on_hopper() (mutates the env: pip-installs tilelang/fla) — that wasted
+        # a worker mutating its env on an already-complete run. It runs after the DONE check below.
         if HF_REPO:
             from huggingface_hub import hf_hub_download
 
@@ -1899,7 +1907,7 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
-        _fix_fla_fastpath_on_hopper()  # Hopper: enable fla+tilelang GDN fast path (see perf.py)
+        _ensure_fla_fastpath_on_hopper()  # Hopper: enable fla+tilelang GDN fast path (see perf.py)
         heartbeat("boot")
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
@@ -1946,3 +1954,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

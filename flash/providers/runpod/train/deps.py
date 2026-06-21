@@ -66,7 +66,7 @@ WORKER_DEPS = [
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
     # fla's gated chunk_bwd is INCORRECT on Hopper (H100) with Triton>=3.4 (fla #640); its
     # ``tilelang`` backend is the correct path there, so we KEEP fla on every arch (the worker's
-    # _fix_fla_fastpath_on_hopper ensures tilelang is live on sm90 before any model import).
+    # _ensure_fla_fastpath_on_hopper ensures tilelang is live on sm90 before any model import).
     # PINNED (like the fla SHA) so cold-start installs / image rebuilds are reproducible and a
     # breaking upstream tilelang can't silently land on the Hopper correctness path. Keep this
     # version in lockstep with Dockerfile.worker + perf.py's runtime reinstall.
@@ -113,7 +113,7 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
     Precedence: FLASH_WORKER_DEPS (explicit list) > the pinned ``WORKER_DEPS``.
 
     fla is kept on ALL arches now (including Hopper): the worker's
-    _fix_fla_fastpath_on_hopper ensures fla's correct ``tilelang`` backend is live on sm90
+    _ensure_fla_fastpath_on_hopper ensures fla's correct ``tilelang`` backend is live on sm90
     before any model import (fla #640's Triton>=3.4 miscompute is a tilelang-backend fix, not a
     reason to drop fla). This makes Hopper GDN training ~4-13x faster + ~2x less memory than the
     pure-PyTorch delta fallback.
@@ -136,7 +136,7 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
             return deps
     deps = list(WORKER_DEPS)
     # fla is kept on ALL arches (incl. Hopper sm90). On Hopper the correctness fix is fla's
-    # tilelang backend (baked into WORKER_DEPS + ensured by _fix_fla_fastpath_on_hopper), NOT
+    # tilelang backend (baked into WORKER_DEPS + ensured by _ensure_fla_fastpath_on_hopper), NOT
     # dropping fla — keeping it gives the ~4-13x faster / ~2x lighter GDN training the pure-PyTorch
     # delta fallback can't. (friendly_gpu retained for signature/back-compat; no longer drops fla.)
     # Additive per-run extras (e.g. an extra pinned wheel for an A/B) without
@@ -274,7 +274,9 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # when sleep is OFF (engine.worker.finalize_alloc_conf_for_sleep). Never set when the
         # operator pinned an alloc conf or RL_VLLM_SLEEP explicitly — their choice is authoritative.
         **(
-            {"FLASH_ALLOC_AUTO": "1"} if (_is_rl and not _sleep_set and not _alloc_override) else {}
+            {"FLASH_ALLOC_AUTO": "1"}
+            if (_is_rl and not _sleep_set and not _alloc_override)
+            else {}
         ),
         # Escape hatch for torch.compile/inductor spikes (Qwen3.5 DeltaNet kernels
         # compile at first forward and can OOM a tight colocate budget).
