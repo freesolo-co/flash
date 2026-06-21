@@ -313,7 +313,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         env["RL_STEPS"] = str(spec.train.steps)
     if spec.train.epochs is not None:
         env["SFT_EPOCHS"] = str(spec.train.epochs)
-    # Forward the worker-side knobs the worker / vLLM / mid-run eval actually read. flash is fully
+    # Forward the worker-side knobs the worker / vLLM actually read. flash is fully
     # managed: there are no per-run env tuning knobs — the only per-run config is the spec's
     # structured fields, and the worker hardcodes the vLLM-util / quant / heartbeat defaults.
     for k in (
@@ -329,10 +329,6 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # [wandb] config (NOT env vars); the run's entity is the API key's default account/team
         # (wandb_report_to does not pass entity=).
         "WANDB_API_KEY",
-        # NB: mid-run GRPO eval cadence is NOT an env var — it comes solely from the run's
-        # [train] eval_every_steps (with eval_examples for the sample size); the worker resolves it
-        # via midrun_eval.eval_config(spec_every=...) and ignores any FLASH_EVAL_EVERY_STEPS env
-        # (see test_eval_config_ignores_env_cadence_override). So there is nothing to forward here.
         # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
         # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
         # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a

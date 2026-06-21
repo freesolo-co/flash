@@ -131,10 +131,8 @@ def cmd_lab_setup(args) -> int:
             'hf_repo = "your-org/your-runs"   # HF dataset repo for adapters/checkpoints\n'
             "steps = 150\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n\n"
-            "# Managed GPU (RTX 4090 or RTX 5090 only).\n"
-            "[gpu]\n"
-            'type = "RTX 5090"\n'
+            "seeds = [0]\n"
+            "# GPU is allocated automatically: the cheapest class that fits, across providers.\n"
         )
     print(
         "created environments/, environments/starter_env.py, configs/, "
@@ -153,7 +151,7 @@ def cmd_models(args) -> int:
 
 
 def cmd_gpus(args) -> int:
-    """List GPU classes, VRAM, per-provider $/hr and live validation."""
+    """List GPU classes, VRAM, and per-provider $/hr."""
     from flash.providers import available_providers
     from flash.providers.base import GPU_INFO
     from flash.providers.runpod.pricing import live_rates
@@ -173,17 +171,17 @@ def cmd_gpus(args) -> int:
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
-    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}  validated_on")
+    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}")
     for info in sorted(GPU_INFO.values(), key=lambda g: rates.get(g.name, g.hourly_usd)):
         runpod_rate = rates.get(info.name, info.hourly_usd) if info.enum_member else None
-        validated = ",".join(info.validated_on) or "- (needs gpu.allow_unvalidated)"
         print(
             f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}"
-            f"{fmt_rate(vast_rates.get(info.name))}  {validated}"
+            f"{fmt_rate(vast_rates.get(info.name))}"
         )
     print(
-        '\nTip: omit gpu.type (or set "cheapest") to allocate the cheapest validated class\n'
-        "across providers that fits the model; gpu.provider pins runpod/vast."
+        "\nTip: GPU allocation is fully automatic — the submit-time allocator always picks the\n"
+        "cheapest class that fits the model across all providers. There is no GPU pin: a concrete\n"
+        'gpu.type in the config is ignored (same as omitting it or setting "cheapest").'
     )
     return 0
 
