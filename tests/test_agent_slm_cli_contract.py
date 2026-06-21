@@ -7,7 +7,7 @@ the flash venv, so we add it to sys.path here (mirroring how the existing
 end-to-end tests import across packages). When that import can't resolve, the
 agent-side assertions are skipped rather than failing the flash suite.
 
-Run: cd flash && FLASH_SKIP_NET=1 .venv/bin/python -m pytest \
+Run: cd flash && .venv/bin/python -m pytest \
         tests/test_agent_slm_cli_contract.py -q
 """
 

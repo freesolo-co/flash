@@ -72,7 +72,6 @@ def test_cheapest_gpu_policy(monkeypatch):
     from flash.providers import base as gpus
     from flash.providers.runpod import pricing
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")  # static rates only
     # RTX A5000 (validated 2026-06-11) is the cheapest 24GB-capable class.
     assert gpus.cheapest_gpu(24) == "RTX A5000"
     assert gpus.cheapest_gpu(32) == "RTX 5090"
@@ -89,7 +88,6 @@ def test_cheapest_gpu_policy(monkeypatch):
 def test_resolve_gpu_policy(monkeypatch):
     from flash.providers.base import resolve_gpu_policy
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
     # small model GRPO -> cheapest validated 24 GB class (A5000); 9B GRPO needs the 32 GB
     # tier (5090). (resolve_gpu_policy sizes for the passed algorithm; 9B SFT is lighter.)
@@ -102,7 +100,6 @@ def test_resolve_gpu_policy(monkeypatch):
 def test_config_cheapest_policy_and_unvalidated_gate(monkeypatch):
     from flash.schema import ConfigError, spec_from_dict
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
