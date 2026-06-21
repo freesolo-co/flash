@@ -514,11 +514,19 @@ def _ensure_fla_fastpath_on_hopper() -> None:
         # as healthy and skip the install, leaving the wrong/uncertain GDN backend in place). Mirror
         # the apache-tvm-ffi handling: check the installed version via _ver and reinstall on mismatch.
         tilelang_ok = True
+        tilelang_reinstalled = False
         if _ver("tilelang") != TILELANG_PIN:
             tilelang_ok = _pip(f"tilelang=={TILELANG_PIN}")
-        # Force the exact tvm-ffi pin last (overriding whatever tilelang's range resolved). If this
-        # install fails we DON'T trust the resident copy — tvm_ffi_ok gates `ok` below.
-        tvm_ffi_ok = _pip(f"apache-tvm-ffi=={TVM_FFI_PIN}")
+            tilelang_reinstalled = True
+        # Only force the tvm-ffi pin when it's actually wrong OR tilelang was just (re)installed
+        # (tilelang's apache-tvm-ffi~=0.1.0 range can have pulled the broken 0.1.12). Skipping the pip
+        # when the exact pin is already resident avoids avoidable cold-start latency and a spurious
+        # disable on a transient network/resolver failure — the ok gate still re-verifies the version.
+        # If this install runs and fails we DON'T trust the resident copy — tvm_ffi_ok gates `ok` below.
+        if _ver("apache-tvm-ffi") != TVM_FFI_PIN or tilelang_reinstalled:
+            tvm_ffi_ok = _pip(f"apache-tvm-ffi=={TVM_FFI_PIN}")
+        else:
+            tvm_ffi_ok = True
         # 2. a COMPLETE fla — the PyPI wheel ships a stub without `fla.modules`. Reinstall from git
         #    when the resident copy is missing the real package (or absent entirely).
         fla_ok = True
@@ -574,7 +582,13 @@ def _ensure_fla_fastpath_on_hopper() -> None:
                 flush=True,
             )
     except Exception as e:  # never let a dep hiccup crash the worker — torch delta still runs
+        # Fail-closed: an unexpected error mid-setup must still leave Hopper on the correct
+        # pure-PyTorch delta path, not a half-configured fla that transformers would engage and
+        # crash on (#640). Best-effort disable fla; never re-raise.
+        with contextlib.suppress(Exception):
+            _remove_fla_from_disk()
         print(
-            f"[hopper] fla fast-path setup skipped ({type(e).__name__}: {e}); pure-PyTorch delta",
+            f"[hopper] fla fast-path setup errored ({type(e).__name__}: {e}); "
+            "disabled fla -> pure-PyTorch delta",
             flush=True,
         )
