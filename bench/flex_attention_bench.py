@@ -59,6 +59,9 @@ def build(model_id: str, attn: str, packing: bool, max_len: int, bsz: int, grad_
     mik = {"dtype": "bfloat16", "device_map": None, "attn_implementation": attn}
     return SFTConfig(
         output_dir="/tmp/flexbench",
+        # The bench reuses this output_dir across multiple configs in one run; without this the
+        # HF/TRL Trainer errors ("output directory exists and is not empty") on the 2nd config.
+        overwrite_output_dir=True,
         per_device_train_batch_size=bsz,
         gradient_accumulation_steps=grad_accum,
         max_length=max_len,

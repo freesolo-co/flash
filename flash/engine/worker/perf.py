@@ -72,8 +72,9 @@ def flex_attn_status(model_id: str) -> str:
             if cls is not None and getattr(cls, "_supports_flex_attn", False):
                 return "supported"
         return "unsupported"
-    except Exception as e:
-        print(f"[attn] flex-support probe failed for {model_id} ({e}); leaving packing off")
+    except Exception:
+        # Pure status helper: the caller (worker / bench) logs the SKIPPED reason exactly once, so
+        # this doesn't double-log — it returns the status and lets the caller decide what to report.
         return "probe_failed"
 
 
