@@ -9,13 +9,13 @@ from __future__ import annotations
 import os
 
 from flash.catalog import DEFAULT_MODEL, MODELS, get_model
-from flash.providers.base import SUPPORTED, canonical_gpu
+from flash.providers.base import KNOWN, canonical_gpu
 
 
 def test_recommended_gpu_is_supported():
-    # Every catalog entry must recommend a GPU Flash actually manages (RTX 4090 / 5090).
+    # Every catalog entry must recommend a GPU Flash actually manages.
     for model_id, info in MODELS.items():
-        assert canonical_gpu(info.recommended_gpu) in SUPPORTED, (
+        assert canonical_gpu(info.recommended_gpu) in KNOWN, (
             f"{model_id} recommends unsupported GPU {info.recommended_gpu!r}"
         )
 

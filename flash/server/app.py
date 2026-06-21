@@ -32,14 +32,15 @@ from flash.runner import (
 )
 from flash.schema import ConfigError, spec_from_dict
 from flash.serve.deploy import chat as serve_chat
-from flash.serve.deploy import deploy_adapter, servable_gpu, undeploy_adapter
-from flash.spec import JobSpec
+from flash.serve.deploy import deploy_adapter, undeploy_adapter
+from flash.spec import JobSpec, coerce_bool
 
 from . import auth, db
 
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
+_SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 
 class _RunLock:
@@ -63,9 +64,12 @@ class _RunLock:
         self._lock.release()
 
 
-# Per-run lock serializing deploy vs undeploy: always-on provisioning is slow and runs
-# OUTSIDE the status lock, so without this the two could interleave — a racing undeploy
-# could leave a billable endpoint unrecorded, or a deploy's rollback could clobber another.
+# Per-run lock serializing deploy vs undeploy: registration with the freesolo serving app
+# is slow and runs OUTSIDE the status lock, so without this the two could interleave —
+# a racing undeploy could leave a stale deployment record (registered with freesolo but
+# unrecorded here, or vice-versa), or a deploy's cleanup of a raced finalize could clobber
+# another. Serving is delegated to freesolo (scales to zero per base model), so there is no
+# billable flash-side endpoint at stake — only the deployment record's consistency.
 # WeakValueDictionary so an entry is dropped once no request holds the lock — the map
 # can't grow unboundedly with one entry per distinct run_id over the server's lifetime.
 _DEPLOY_LOCKS: weakref.WeakValueDictionary[str, _RunLock] = weakref.WeakValueDictionary()
@@ -83,7 +87,7 @@ def _deploy_lock(run_id: str) -> _RunLock:
         return lk
 
 
-def recover_runs(log=None) -> None:
+def recover_runs() -> None:
     """Re-attach to in-flight runs after a server restart (per-run daemon threads)."""
     from flash.runner import _gc_run_endpoints, _update, attach_run, resume_run
 
@@ -135,9 +139,7 @@ def create_app():
     try:
         from fastapi import Depends, FastAPI, Header, HTTPException
     except ImportError as exc:
-        raise RuntimeError(
-            "the control plane needs the server extras: pip install 'flash[server]'"
-        ) from exc
+        raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
@@ -155,7 +157,7 @@ def create_app():
         if key is None:
             raise HTTPException(
                 status_code=401,
-                detail="invalid or missing API key; log in with `slm login` using your "
+                detail="invalid or missing API key; log in with `flash login` using your "
                 "freesolo API key",
             )
         return key
@@ -185,6 +187,31 @@ def create_app():
     def models(_: dict = Depends(require_key)):
         return {"models": public_model_rows()}
 
+    @app.post("/v1/envs")
+    def publish_env(payload: dict, key: dict = Depends(require_key)):
+        # Publish a client-built verifiers env package to the MANAGED Prime account (this control
+        # plane's PRIME_API_KEY), namespaced per identity and PRIVATE — so users never need their
+        # own Prime account. The client just packages local source and uploads it here.
+        from flash.server import envs
+
+        # Default to "" only when the key is missing/None — pass a present-but-falsy
+        # non-string (0, False, []) THROUGH so publish_package's type checks reject it with
+        # the right 400, instead of `or ""` silently coercing it to a valid-looking empty string.
+        _pkg = payload.get("package_b64")
+        _name = payload.get("name")
+        try:
+            slug = envs.publish_package(
+                package_b64="" if _pkg is None else _pkg,
+                name="" if _name is None else _name,
+                # Robust bool parse: JSON `"is_new": "false"`/`"0"` must NOT become True
+                # (plain bool() is truthy for any non-empty string). Defaults True when absent.
+                is_new=coerce_bool(payload.get("is_new", True)),
+                key=key,
+            )
+        except envs.EnvPublishError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {"id": slug}
+
     def _parse_spec(payload: dict, run_id: str) -> JobSpec:
         spec_raw = payload.get("spec") or {}
         env_raw = spec_raw.get("environment") or {}
@@ -192,7 +219,7 @@ def create_app():
             raise HTTPException(
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
-                "publish the environment to the Prime Hub (`slm env push`), then reference it "
+                "publish the environment to the Prime Hub (`flash env push`), then reference it "
                 'by its Hub id (`[environment] id = "owner/name"`)',
             )
         try:
@@ -204,7 +231,7 @@ def create_app():
     def create_run(payload: dict, key: dict = Depends(require_key)):
         spec = _parse_spec(payload, run_id=new_run_id())
         dry_run = bool(payload.get("dry_run", False))
-        db.record_run(spec.run_id, key["id"], kind="train")
+        db.record_run(spec.run_id, key["id"])
         try:
             status = submit_job(spec, dry_run=dry_run, background=True)
         except Exception as exc:
@@ -288,7 +315,6 @@ def create_app():
                     mode=mode,
                     idle_timeout_s=int(payload.get("idle_timeout_s", 300)),
                     dry_run=dry_run,
-                    lora_rank=spec.train.lora_rank,
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                 )
@@ -303,7 +329,7 @@ def create_app():
                 marked = mark_deployed(run_id, dep.to_dict(), expect_state=prev_state)
                 if marked.state != "deployed":
                     with contextlib.suppress(Exception):
-                        undeploy_adapter(run_id, gpu_name=servable_gpu(spec.gpu.type, spec.model))
+                        undeploy_adapter(run_id)
                     raise HTTPException(
                         status_code=409,
                         detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
@@ -316,11 +342,7 @@ def create_app():
         # deploy's provisioning/finalization.
         with _deploy_lock(run_id):
             status = owned_run(run_id, key)
-            spec = JobSpec.from_dict(status.spec)
-            # The deployment record carries the class actually served (an unvalidated
-            # training class falls back to a RunPod-validated class at deploy time).
-            deployed_gpu = (status.deployment or {}).get("gpu") or spec.gpu.type
-            deleted = undeploy_adapter(run_id, gpu_name=deployed_gpu)
+            deleted = undeploy_adapter(run_id)
             # dev mode is scale-to-zero: the serve endpoint is created only on the first
             # chat, so an empty deletion just means it was never warmed — still a clean
             # undeploy. always-on provisions the endpoint at deploy time, so an empty
@@ -333,7 +355,7 @@ def create_app():
                 raise HTTPException(
                     status_code=502,
                     detail=f"could not delete the serving endpoint for {run_id}; it may still "
-                    "be running — retry `slm undeploy`",
+                    "be running — retry `flash undeploy`",
                 )
             return {"run_id": run_id, "deleted_endpoints": deleted}
 
@@ -369,10 +391,11 @@ def create_app():
         if deployment.get("state") in (None, "undeployed", "dry_run"):
             raise HTTPException(
                 status_code=409,
-                detail=f"run {run_id} has no active deployment; `slm deploy {run_id}` first",
+                detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
             )
-        # Legacy run with no artifact repo: reject early with a clear 409 rather than letting
-        # serve_chat's adapter download fail deep as an opaque 502 (mirrors /deploy).
+        # Legacy run with no artifact repo (mirrors the /deploy guard): a run that never had a
+        # [train].hf_repo was never registered with freesolo serving, so reject early with a
+        # clear 409 instead of an opaque downstream inference error.
         if not spec.train.hf_repo:
             raise HTTPException(
                 status_code=409,
@@ -382,19 +405,8 @@ def create_app():
             return serve_chat(
                 run_id=run_id,
                 messages=payload.get("messages") or [],
-                model=spec.model,
-                hf_repo=spec.train.hf_repo,
-                adapter_prefix=adapter_prefix(spec),
-                # Use the class actually deployed (an unvalidated training class falls
-                # back to a RunPod-validated class at deploy time). Recomputing from
-                # spec.gpu.type could pick a different serve endpoint that undeploy and
-                # cancel — which target the recorded deployment GPU — would not delete.
-                gpu_name=deployment.get("gpu") or spec.gpu.type,
                 temperature=float(payload.get("temperature") or 0.0),
                 max_tokens=int(payload.get("max_tokens") or 512),
-                mode=deployment.get("mode", "dev"),
-                idle_timeout_s=int(deployment.get("idle_timeout_s", 300)),
-                lora_rank=spec.train.lora_rank,
                 # a run trained with thinking serves with thinking (per-run parity)
                 thinking=spec.thinking,
             )
@@ -408,7 +420,5 @@ def run_server(host: str = "127.0.0.1", port: int = 8080) -> None:
     try:
         import uvicorn
     except ImportError as exc:
-        raise RuntimeError(
-            "the control plane needs the server extras: pip install 'flash[server]'"
-        ) from exc
+        raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     uvicorn.run(create_app(), host=host, port=port)

@@ -25,11 +25,12 @@ def _str_tuple(value: Any) -> tuple[str, ...]:
     return tuple(s for s in (str(x) for x in value) if s)
 
 
-def _coerce_bool(value: Any) -> bool:
-    """Parse a bool from loosely-typed spec sources (JSON/env/persisted dicts).
+def coerce_bool(value: Any) -> bool:
+    """Parse a bool from loosely-typed sources (JSON request bodies / env / persisted dicts).
 
-    bool(...) on a string is truthy for ANY non-empty string, so "false"/"0" would
-    wrongly become True; treat the usual falsey strings as False.
+    bool(...) on a string is truthy for ANY non-empty string, so "false"/"0"/"no" would
+    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False, so
+    e.g. JSON ``"is_new": "false"`` is parsed as False. An already-bool value passes through.
     """
     if isinstance(value, str):
         return value.strip().lower() not in _FALSE_STRINGS
@@ -46,6 +47,26 @@ def _coerce_str_map(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     return {str(k): str(v) for k, v in value.items()}
+
+
+def _coerce_wandb(value: Any) -> WandbSpec:
+    """Coerce a loosely-typed ``wandb`` spec field into a ``WandbSpec``.
+
+    A malformed/older persisted spec can set ``wandb`` to a non-dict (e.g. a bare string), and
+    ``(value or {}).get(...)`` would crash ``from_dict`` with AttributeError on the worker. Treat
+    a non-dict as empty (default naming), mirroring ``_coerce_str_map``. String-coerce + trim the
+    leaves so a non-string label can't reach the W&B SDK / run-name path; blank -> None (default).
+    """
+    if not isinstance(value, dict):
+        return WandbSpec()
+
+    def _label(v: Any) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    return WandbSpec(project=_label(value.get("project")), run_name=_label(value.get("run_name")))
 
 
 def _opt_int(value: Any) -> int | None:
@@ -126,33 +147,15 @@ class TrainSpec:
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
     stop_sequences: tuple[str, ...] = ()
-    # Periodic mid-run eval cadence (GRPO ONLY; ignored for SFT): every ``eval_every_steps``
-    # optimizer steps, greedily evaluate the policy on the ENVIRONMENT's held-out ``eval_dataset``
-    # with the env's rubric (reward + eval-metric metrics) and record the curve into metrics.json,
-    # so the agent judges the run on held-out eval, not just the training reward. 0/None disables.
-    # The eval queries and grading logic live in the environment, and the completion budget
-    # matches the run's normal ``max_tokens``.
-    eval_every_steps: int | None = None
-    # How many held-out examples each mid-run eval pass scores: a FIXED random sample of this
-    # many rows (seeded, so the same subset every pass -> a comparable curve), instead of the
-    # whole eval split (which can be huge and dominate training). None/0 -> the built-in default (64).
-    eval_examples: int | None = None
 
 
 @dataclass(frozen=True)
 class GpuSpec:
+    # The parse-time provisional GPU class (cheapest that fits the model). GPU pinning is gone:
+    # the submit-time allocator always re-picks the cheapest fitting class across ALL providers,
+    # so a config's gpu.type does NOT pin — ``type`` is just the offline sizing/display default
+    # and the carrier the runner overwrites with the actually-allocated class.
     type: str = DEFAULT_GPU
-    # GPU substrate: "auto" (cheapest across providers at submit time), "runpod", or
-    # "vast" (verified datacenters only).
-    provider: str = "auto"
-    # The raw user gpu.type input ("cheapest"/"auto" or a concrete class), always set
-    # by config parsing. The runner re-allocates the class at submit time iff
-    # this is a policy word — ``type`` is then just the parse-time provisional; a
-    # concrete ``requested`` pins the class and the allocator only picks the provider.
-    requested: str = ""
-    # Whether to allow GPU classes Flash hasn't validated. Set only by the [gpu]
-    # allow_unvalidated TOML field; None leaves it disallowed.
-    allow_unvalidated: bool | None = None
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
@@ -167,6 +170,16 @@ class GpuSpec:
     network_volume: str | None = None
     network_volume_gb: int = 100
     datacenter: str | None = None  # e.g. "EU-RO-1"; required pool pin for the volume
+
+
+@dataclass(frozen=True)
+class WandbSpec:
+    # Optional W&B naming, defined in the [wandb] config table (first-class spec config, NOT
+    # env vars). project/run_name are non-secret labels; the actual WANDB_API_KEY stays an
+    # env-var secret. None -> the worker's defaults ("flash" project, "flash-<phase>-<run_id>-
+    # seedN" run name).
+    project: str | None = None
+    run_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +202,9 @@ class JobSpec:
     # identically by SFT rendering, RL rollouts, and serving (decoding parity). OFF by default
     # (operator preference: training defaults to no-reasoning; set thinking = true to enable).
     thinking: bool = False
+    # Optional W&B run naming from the [wandb] config table. Carried as typed spec config
+    # (round-tripped in the job-spec JSON the worker reads), not as environment variables.
+    wandb: WandbSpec = field(default_factory=WandbSpec)
 
     @property
     def phase(self) -> str:
@@ -241,14 +257,9 @@ class JobSpec:
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
-                eval_every_steps=_opt_int(train.get("eval_every_steps")),
-                eval_examples=_opt_int(train.get("eval_examples")),
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),
-                provider=gpu.get("provider", "auto"),
-                requested=gpu.get("requested", ""),
-                allow_unvalidated=gpu.get("allow_unvalidated"),
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 2)),
@@ -259,7 +270,8 @@ class JobSpec:
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
-            thinking=_coerce_bool(data.get("thinking", False)),
+            thinking=coerce_bool(data.get("thinking", False)),
+            wandb=_coerce_wandb(data.get("wandb")),
         )
 
     @classmethod

@@ -18,6 +18,8 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         # Storage roots are fixed constants now; redirect via monkeypatch (auto-restored).
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
+        # _run_job_inner uploads the run code before the seed loop; stub it (no HF).
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "mock/repo")
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         captured = {}
@@ -36,9 +38,10 @@ def test_run_job_persists_flash_metrics(monkeypatch):
                 "notes": {},
             }
 
-        # _run_job does `from flash.providers.runpod.train import submit_train, upload_code` at call time.
-        monkeypatch.setattr(flash_train, "submit_train", fake_submit)
-        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "mock/repo")
+        # Stub the per-seed submit/poll path (the seam that used to be the in-process
+        # offline shortcut) so the run completes without provisioning a GPU.
+        # _run_seed_loop resolves it via `from flash.runner import _submit_seed_supervised`.
+        monkeypatch.setattr(runner, "_submit_seed_supervised", fake_submit)
 
         spec = JobSpec(
             run_id="flash-run",
@@ -50,7 +53,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         status = runner.submit_job(spec, dry_run=False, background=False)
 
         assert status.state == "done", status.error
-        # 1h on a 4090 at the projected rate (static fallback under FLASH_SKIP_NET)
+        # 1h on a 4090 at the projected rate (static fallback, no live pricing)
         from flash.providers.runpod.pricing import hourly_rate
 
         assert abs(status.cost_usd - hourly_rate("RTX 4090")) < 1e-6, status.cost_usd

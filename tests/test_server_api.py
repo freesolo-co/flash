@@ -1,11 +1,10 @@
 """Control-plane API: freesolo bearer auth, multi-tenant isolation (CPU-only).
 
-User auth is freesolo API keys only (no native key system). Tests run offline
-(FLASH_SKIP_NET=1): the `api` fixture monkeypatches ``auth._freesolo_verify`` to accept
-any token shaped like a freesolo user key, so each distinct token resolves to its own
-run-ownership identity via ``db.ensure_external_key``. All runs are dry-run so nothing
-touches the network; operator env vars are dummies (the startup preflight only checks
-presence).
+User auth is freesolo API keys only (no native key system). Tests run offline: the `api`
+fixture monkeypatches ``auth._freesolo_verify`` to accept any token shaped like a freesolo
+user key, so each distinct token resolves to its own run-ownership identity via
+``db.ensure_external_key``. All runs are dry-run so nothing touches the network; operator
+env vars are dummies (the startup preflight only checks presence).
 """
 
 from __future__ import annotations
@@ -65,8 +64,8 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
-    # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. The real
-    # network verify never runs (FLASH_SKIP_NET is set for the suite anyway).
+    # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
+    # replaces the real network verify.
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     with TestClient(app_mod.create_app()) as client:
@@ -120,7 +119,7 @@ def test_internal_key_rejected_when_unconfigured(api):
 
 
 def test_freesolo_user_key_authenticates(api, monkeypatch):
-    # A user who `slm login`s with a freesolo key sends it as the bearer. With the token
+    # A user who `flash login`s with a freesolo key sends it as the bearer. With the token
     # verified by the backend it authenticates and resolves to a stable per-token identity
     # (its own run-ownership row).
     import flash.server.auth as auth_mod
@@ -175,7 +174,6 @@ def test_freesolo_verify_does_not_cache_network_errors(monkeypatch):
     # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -209,7 +207,6 @@ def test_freesolo_verify_5xx_transient_but_4xx_cached(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -257,7 +254,6 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -314,7 +310,6 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     def boom(*a, **k):
         raise AssertionError("oversized token must not reach the network")
@@ -325,20 +320,23 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
     assert huge not in auth_mod._verify_cache
 
 
-def test_freesolo_user_key_no_network_when_skip_net(api, monkeypatch):
-    # FLASH_SKIP_NET set: _freesolo_verify short-circuits before any network call (urlopen is
-    # patched to blow up to prove it's never called) and authenticate returns None.
+def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch):
+    # When the backend verify can't be reached (the offline test harness makes urlopen fail),
+    # _freesolo_verify returns False and authenticate yields None — an unverifiable key is
+    # never admitted.
+    import urllib.error
+
     import flash.server.auth as auth_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    # Drop the fixture's stub so the real _freesolo_verify (with its SKIP_NET guard) runs.
+    # Drop the fixture's stub so the real _freesolo_verify runs, and make the backend
+    # unreachable (offline): the verify can't be reached.
     importlib.reload(auth_mod)
-
-    def boom(req, timeout=None):
-        raise AssertionError("no network call may happen under FLASH_SKIP_NET")
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(
+        auth_mod.urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("offline")),
+    )
     assert auth_mod.authenticate("Bearer unknown-token") is None
 
 
@@ -350,7 +348,6 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
     # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     calls = {"n": 0}
 
     def fake_urlopen(req, timeout=None):
@@ -385,7 +382,6 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -605,3 +601,100 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
 
     assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint"
     assert runner.get_status("nohandle-1").state == "failed"
+
+
+def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
+    """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
+    plane's PRIME_API_KEY), namespaced per identity — so the user needs no Prime account."""
+    import base64
+    import io
+    import tarfile
+
+    import flash.server.envs as envs_mod
+
+    # Stub the actual `prime env push` so the test doesn't hit Prime; echo the namespaced name.
+    monkeypatch.setattr(
+        envs_mod, "_prime_push", lambda env_dir, *, name, is_new: f"freesolo-co/{name}"
+    )
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in (
+            ("pyproject.toml", b"[project]\nname='e'\n"),
+            ("e/__init__.py", b"x=1\n"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    pkg = base64.b64encode(buf.getvalue()).decode()
+
+    resp = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "MyEnv", "is_new": True, "package_b64": pkg},
+    )
+    assert resp.status_code == 200
+    slug = resp.json()["id"]
+    assert slug.startswith("freesolo-co/")  # published under the managed account
+    assert slug.endswith("-myenv")  # per-identity namespaced + sanitized
+
+    # Unauthenticated requests are rejected.
+    assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
+
+
+def test_publish_env_parses_is_new_robustly(api, monkeypatch):
+    """`is_new` from the JSON body must be parsed as a real bool: the string "false"/"0" is False
+    (a plain bool() would make any non-empty string True), and it defaults to True when absent."""
+    import base64
+    import io
+    import tarfile
+
+    import flash.server.envs as envs_mod
+
+    seen: dict = {}
+
+    def fake_push(env_dir, *, name, is_new):
+        seen["is_new"] = is_new
+        return f"freesolo-co/{name}"
+
+    monkeypatch.setattr(envs_mod, "_prime_push", fake_push)
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for nm, content in (("pyproject.toml", b"[project]\nname='e'\n"), ("e/__init__.py", b"x=1\n")):
+            info = tarfile.TarInfo(nm)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    pkg = base64.b64encode(buf.getvalue()).decode()
+
+    def _publish(body_extra):
+        resp = api.post(
+            "/v1/envs",
+            headers=_bearer(_login()),
+            json={"name": "e", "package_b64": pkg, **body_extra},
+        )
+        assert resp.status_code == 200, resp.text
+        return seen["is_new"]
+
+    # Falsey string forms -> False (the bug: bool("false") was True).
+    assert _publish({"is_new": "false"}) is False
+    assert _publish({"is_new": "0"}) is False
+    assert _publish({"is_new": False}) is False
+    # Truthy forms and absence -> True.
+    assert _publish({"is_new": "true"}) is True
+    assert _publish({"is_new": True}) is True
+    assert _publish({}) is True  # default when absent
+
+
+def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
+    """Regression: a present-but-falsy non-string `name`/`package_b64` (e.g. 0, False, []) must
+    reach publish_package's type check and yield the *type* 400 — not be `or ""`-coerced to an
+    empty string first (which would surface a different/misleading 400)."""
+    # name = 0 -> hits the name type check, not "missing env name".
+    r = api.post("/v1/envs", headers=_bearer(_login()), json={"name": 0, "package_b64": "x"})
+    assert r.status_code == 400, r.text
+    assert "name must be a string" in r.text.lower()
+    # package_b64 = False (valid string name) -> hits the package type check.
+    r2 = api.post("/v1/envs", headers=_bearer(_login()), json={"name": "e", "package_b64": False})
+    assert r2.status_code == 400, r2.text
+    assert "must be a base64 string" in r2.text.lower()
