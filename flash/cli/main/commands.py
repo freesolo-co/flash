@@ -281,6 +281,9 @@ def _cmd_train_cost(args) -> int:
     """
     from flash.cost import estimate_cost
 
+    # Tightly scoped (NOT a global/manual env hack): force offline for parse+size, then restore
+    # the prior value in `finally`. Safe in this single-shot CLI; the concurrent control plane
+    # never flips the global (it uses cost.spec.offline_estimate_for_spec instead).
     prior_skip_net = os.environ.get("FLASH_SKIP_NET")
     os.environ["FLASH_SKIP_NET"] = "1"
     try:
