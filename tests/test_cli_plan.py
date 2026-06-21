@@ -51,13 +51,32 @@ _CLEAN_CONFIG = (
 )
 
 # An open-model ("allow" policy) config: parsing it prints policy warnings to stdout
-# (a thinking-on-unknown-template note). Used to prove --json stdout
+# (a thinking-on-unknown-template note, from flash.schema). Used to prove --json stdout
 # stays pure JSON.
 _OPEN_MODEL_CONFIG = (
     'model = "acme/mystery-2b"\n'
     'algorithm = "grpo"\n'
     'model_policy = "allow"\n'
     "thinking = true\n"
+    "[environment]\n"
+    'id = "owner/env"\n'
+    "[train]\n"
+    'hf_repo = "owner/runs"\n'
+    "steps = 50\n"
+    "[gpu]\n"
+    'type = "RTX 5090"\n'
+    "allow_unvalidated = true\n"
+)
+
+# A second open-model config whose warning comes from the OTHER stdout source: the VRAM-fit
+# estimate in flash.catalog._resolve_open_model. A 6B model on a 32 GB RTX 5090 (GRPO) is a
+# "tight" fit, so resolve_model prints a VRAM-policy warning (no thinking note here —
+# thinking is off — so this isolates the catalog warning path the schema-note config doesn't
+# exercise). Both JSON commands must keep this warning off stdout too.
+_OPEN_MODEL_TIGHT_VRAM_CONFIG = (
+    'model = "acme/bigmystery-6b"\n'
+    'algorithm = "grpo"\n'
+    'model_policy = "allow"\n'
     "[environment]\n"
     'id = "owner/env"\n'
     "[train]\n"
@@ -170,5 +189,36 @@ def test_dry_run_json_pure_despite_policy_warnings(tmp_path: Path, capsys, monke
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert payload["state"] == "dry_run"
+    assert "open-model policy" not in captured.out
+    assert "open-model policy" in captured.err
+
+
+def test_plan_json_pure_despite_vram_fit_warning(tmp_path: Path, capsys, monkeypatch) -> None:
+    # The other stdout-warning source: flash.catalog._resolve_open_model prints a VRAM-fit
+    # warning on a "tight" open-model estimate (here a 6B model on a 32 GB RTX 5090). It must
+    # land on stderr, leaving the --json stdout payload a clean, parseable JSON document.
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 6.0, raising=True)
+    rc = main(["plan", _write(tmp_path, _OPEN_MODEL_TIGHT_VRAM_CONFIG), "--json"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)  # raises if the VRAM warning leaked onto stdout
+    assert payload["state"] == "plan"
+    assert "open-model policy" not in captured.out
+    # the VRAM-fit warning ("tight") went to stderr, not the JSON stdout
+    assert "open-model policy" in captured.err
+    assert "tight" in captured.err
+
+
+def test_dry_run_json_pure_despite_vram_fit_warning(tmp_path: Path, capsys, monkeypatch) -> None:
+    # Same VRAM-fit warning source through `flash train --dry-run` (always JSON): a "tight"
+    # open-model estimate must not corrupt the dry-run JSON the agent parses from stdout.
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 6.0, raising=True)
+    rc = main(["train", _write(tmp_path, _OPEN_MODEL_TIGHT_VRAM_CONFIG), "--dry-run"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["state"] == "dry_run"
+    assert isinstance(payload["run_id"], str)
+    assert payload["run_id"]
     assert "open-model policy" not in captured.out
     assert "open-model policy" in captured.err
