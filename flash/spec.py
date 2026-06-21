@@ -150,13 +150,11 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
+    # The parse-time provisional GPU class (cheapest that fits the model). GPU pinning is gone:
+    # the submit-time allocator always re-picks the cheapest fitting class across ALL providers,
+    # so a config's gpu.type does NOT pin — ``type`` is just the offline sizing/display default
+    # and the carrier the runner overwrites with the actually-allocated class.
     type: str = DEFAULT_GPU
-    # The raw user gpu.type input ("cheapest"/"auto" or a concrete class), always set
-    # by config parsing. The runner re-allocates the class at submit time iff this is a
-    # policy word — ``type`` is then just the parse-time provisional. The allocator always
-    # picks the cheapest fitting class across ALL providers (no validation gate, no
-    # provider pin); a concrete ``requested`` only narrows which class is chosen.
-    requested: str = ""
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
@@ -261,7 +259,6 @@ class JobSpec:
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),
-                requested=gpu.get("requested", ""),
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 2)),

@@ -10,7 +10,7 @@ from flash.catalog import normalize_algorithm, resolve_model
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
-    resolve_gpu_policy,
+    provisional_gpu,
 )
 from flash.schema.fields import (
     ConfigError,
@@ -125,24 +125,12 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
 
-    # Smart allocation is the default: an omitted gpu.type means "the cheapest GPU
-    # (across providers) that fits the model", re-resolved live at submit time. The
-    # original request survives in gpu.requested so the runner knows whether
-    # it may re-allocate (policy words) or must honor a concrete pin.
-    requested_gpu = str(gpu_raw.get("requested") or gpu_raw.get("type") or "auto")
+    # GPU allocation is fully automatic: the submit-time allocator always picks the cheapest
+    # fitting class across ALL providers — there is no GPU pin. Any gpu.type in the config is
+    # ignored. ``provisional_gpu`` computes the offline RunPod-static cheapest-that-fits for
+    # sizing/display only; the live allocator re-resolves it at submit time.
     try:
-        # Parse-time provisional: "cheapest"/"auto" resolve via the deterministic RunPod-only
-        # `cheapest_gpu()` helper (offline; open models sized from HF metadata) — Vast and live
-        # offers are NOT considered here, only at submit time; concrete names are canonicalized.
-        # The submit-time allocator re-resolves policy words live across ALL providers — every
-        # fitting class is eligible (no validation gate, no provider pin).
-        gpu_type = resolve_gpu_policy(
-            requested_gpu,
-            model,
-            algorithm=algorithm,
-            train=train_raw,
-            thinking=thinking,
-        )
+        gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
     try:
@@ -212,7 +200,6 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         ),
         gpu=GpuSpec(
             type=gpu_type,
-            requested=requested_gpu,
             disk_gb=int(gpu_raw.get("disk_gb", 60)),
             max_wall_seconds=int(gpu_raw.get("max_wall_seconds", 24 * 3600)),
             max_retries=int(gpu_raw.get("max_retries", 2)),

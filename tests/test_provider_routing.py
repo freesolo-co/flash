@@ -16,7 +16,7 @@ from flash.spec import JobSpec
 
 
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
-    gpu = {"type": "RTX A5000", "provider": "auto", "requested": "auto", "max_retries": 2}
+    gpu = {"type": "RTX A5000", "max_retries": 2}
     gpu.update(gpu_kw)
     return JobSpec.from_dict(
         {
@@ -218,63 +218,6 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
     assert calls == [0]  # code errors burn no retry budget
 
 
-def test_concrete_requested_pins_class(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.vast import jobs as vast_jobs
-
-    pins = []
-
-    def fake_allocate(model, algorithm, **kw):
-        pins.append(kw["gpu"])
-        offer = _offer_obj()
-        return _alloc(offer=offer, provider_offers=[offer])
-
-    monkeypatch.setattr(allocator, "allocate", fake_allocate)
-    monkeypatch.setattr(
-        vast_jobs,
-        "submit_run_vast",
-        lambda *a, **k: PollResult(True, metrics={"a": 1}),
-    )
-    spec = _spec(type="RTX 3090", requested="RTX 3090")
-    _seed_status(orch, spec)
-    orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert pins == ["RTX 3090"]  # concrete request -> class pinned through allocation
-    pins.clear()
-    spec = _spec(requested="cheapest")
-    _seed_status(orch, spec)
-    orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert pins == [None]  # policy request -> allocator free to re-pick
-
-
-def test_empty_requested_pins_concrete_type(orch, monkeypatch):
-    """An empty gpu.requested (a direct-API spec that skipped config parsing) is treated
-    as a concrete pin of gpu.type: the allocator runs (so failover/pricing still apply)
-    but only to pick the provider for that one class — it never re-picks the class."""
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.vast import jobs as vast_jobs
-
-    pins = []
-
-    def fake_allocate(model, algorithm, **kw):
-        pins.append(kw["gpu"])
-        offer = _offer_obj()
-        return _alloc(offer=offer, provider_offers=[offer])
-
-    monkeypatch.setattr(allocator, "allocate", fake_allocate)
-    monkeypatch.setattr(
-        vast_jobs,
-        "submit_run_vast",
-        lambda *a, **k: PollResult(True, metrics={"a": 1}),
-    )
-    spec = _spec(type="RTX A5000", requested="")  # no routing intent recorded
-    _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert metrics["a"] == 1
-    assert pins == ["RTX A5000"]  # empty requested -> concrete gpu.type pinned through
-
-
 # ---------------------------------------------------------------------------
 # cancel / attach routing
 # ---------------------------------------------------------------------------
@@ -363,7 +306,7 @@ def test_attach_routes_vast_and_destroys(orch, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# config: provider fields
+# config: gpu fields
 # ---------------------------------------------------------------------------
 def test_config_gpu_fields(monkeypatch):
     from flash.schema import spec_from_dict
@@ -375,14 +318,13 @@ def test_config_gpu_fields(monkeypatch):
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "environment": {"id": "owner/env"},
     }
-    # omitted gpu.type -> smart-allocation default (cheapest fitting), original request preserved
+    # GPU pinning is gone: gpu.type is always the cheapest-fitting provisional regardless of
+    # what the config says. Omitted gpu.type -> the deterministic offline cheapest provisional.
     spec = spec_from_dict(dict(base), run_id="x")
-    assert spec.gpu.requested == "auto"
     assert spec.gpu.type == "RTX 2000 Ada"  # deterministic offline cheapest-fitting provisional
-    # round-trip keeps the request word
+    # round-trip preserves the resolved class
     again = JobSpec.from_dict(spec.to_dict())
-    assert again.gpu.requested == "auto"
-    # any known class is accepted with no provider pin or validation gate
+    assert again.gpu.type == "RTX 2000 Ada"
+    # a config gpu.type is IGNORED (no pin) -> still the cheapest provisional, not the named class
     spec = spec_from_dict({**base, "gpu": {"type": "L40S"}}, run_id="x")
-    assert spec.gpu.type == "L40S"
-    assert spec.gpu.requested == "L40S"
+    assert spec.gpu.type == "RTX 2000 Ada"

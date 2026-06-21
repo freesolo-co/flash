@@ -131,10 +131,8 @@ def cmd_lab_setup(args) -> int:
             'hf_repo = "your-org/your-runs"   # HF dataset repo for adapters/checkpoints\n'
             "steps = 150\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n\n"
-            "# Managed GPU (RTX 4090 or RTX 5090 only).\n"
-            "[gpu]\n"
-            'type = "RTX 5090"\n'
+            "seeds = [0]\n"
+            "# GPU is allocated automatically: the cheapest class that fits, across providers.\n"
         )
     print(
         "created environments/, environments/starter_env.py, configs/, "

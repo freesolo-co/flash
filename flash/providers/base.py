@@ -207,10 +207,6 @@ GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
 # eligible for selection — there is no validation gate.
 KNOWN = tuple(GPU_INFO)
 
-# GPU-policy keywords accepted in ``gpu.type`` (resolved to a concrete class at parse
-# time by ``resolve_gpu_policy``; the submit-time allocator re-resolves them live).
-POLICY_NAMES = ("cheapest", "auto")
-
 
 def _alias_keys(name: str) -> set[str]:
     """All accepted spellings of a friendly name (lowercased)."""
@@ -339,28 +335,24 @@ def cheapest_gpu(min_vram_gb: int) -> str:
     return min(pool, key=lambda g: (hourly_rate(g.name), g.vram_gb)).name
 
 
-def resolve_gpu_policy(
-    requested: str,
+def provisional_gpu(
     model_id: str,
     algorithm: str = "sft",
     *,
     train=None,
     thinking: bool = False,
 ) -> str:
-    """Resolve ``gpu.type`` (a concrete class or a policy word) to a friendly name.
+    """The cheapest GPU class whose VRAM covers the model -- a parse-time provisional.
 
-    Parse-time, RunPod-static provisional: "cheapest"/"auto" pick the cheapest RunPod
-    class whose VRAM covers the model; concrete names are canonicalized. The submit-time
-    allocator (``flash.providers.allocator``) re-resolves policy words live across providers.
+    GPU pinning is gone: the submit-time allocator (``flash.providers.allocator``) ALWAYS
+    picks the cheapest fitting class live across all providers. This is the RunPod-static,
+    offline-deterministic equivalent the schema uses for sizing/display; the live allocator
+    re-resolves it at submit time.
     """
-    key = (requested or "").strip().lower()
-    if key not in POLICY_NAMES:
-        return canonical_gpu(requested)
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
 
-    # Honor FLASH_VRAM_HEADROOM here too so parse-time sizing matches the submit-time
-    # allocator exactly (PR #176 review: they previously diverged on the headroom knob).
+    # Honor FLASH_VRAM_HEADROOM so parse-time sizing matches the submit-time allocator exactly.
     min_vram = model_required_vram_gb(
         model_id, algorithm, train=train, thinking=thinking, headroom=vram_headroom()
     )

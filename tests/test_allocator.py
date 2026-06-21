@@ -1,4 +1,4 @@
-"""RunPod allocation: VRAM sizing, cheapest-wins ranking, pins, gates, fallbacks."""
+"""RunPod allocation: VRAM sizing, cheapest-wins ranking, fallbacks (no pins, no gates)."""
 
 from __future__ import annotations
 
@@ -25,31 +25,6 @@ def test_required_vram_catalog_and_open(monkeypatch):
     a = allocator.allocate("Qwen/Qwen3.5-4B", "grpo")
     assert a.min_vram_gb == 35
     assert all(c.vram_gb >= 35 for c in a.candidates)
-
-
-def test_pinned_undersized_gpu_escalates_never_below_need(monkeypatch):
-    """An undersized / unavailable pin must NOT hard-fail: it escalates to the cheapest FITTING
-    class across providers (the pin is a preference, not a hard cap). The matrix ``need`` stays the
-    absolute floor (escalation never drops below it -> no OOM). Only a need that exceeds EVERY GPU
-    across EVERY provider raises (all options exhausted)."""
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
-
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    # Qwen3-4B GRPO at the default engine length (2368 tokens, mirroring run_rl) needs ~35 GB;
-    # pinning a 24 GB RTX 4090 escalates UP to the cheapest fitting class (never provisions an
-    # undersized OOM card, never raises).
-    a = allocator.allocate("Qwen/Qwen3.5-4B", "grpo", gpu="RTX 4090")
-    assert a.min_vram_gb == 35  # the model requirement floor is preserved
-    assert a.gpu != "RTX 4090"  # escalated off the undersized pin to a fitting class
-    # a pin that already fits the 35 GB floor is honored as-is
-    a = allocator.allocate("Qwen/Qwen3.5-4B", "grpo", gpu="A100 PCIe")
-    assert a.gpu == "A100 PCIe"
-    assert a.min_vram_gb == 35
-    # a requirement larger than every available GPU still raises (genuinely unsatisfiable)
-    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 4096)
-    with pytest.raises(UnsupportedGpuError):
-        allocator.allocate("Qwen/Qwen3.5-4B", "grpo", gpu="RTX 4090")
 
 
 def test_no_validation_gate_picks_cheapest_fitting(monkeypatch):
@@ -155,7 +130,7 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
 
 
 def test_vram_headroom_consistent_across_sizing_paths():
-    """resolve_gpu_policy (parse-time) and required_vram_gb (submit-time) must size with the SAME
+    """provisional_gpu (parse-time) and required_vram_gb (submit-time) must size with the SAME
     headroom (a validated constant), so they never disagree (PR #176 review)."""
     from flash.providers import allocator
 

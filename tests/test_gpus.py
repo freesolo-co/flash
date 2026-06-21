@@ -78,16 +78,15 @@ def test_cheapest_gpu_policy(monkeypatch):
     assert set(rates) >= set(gpus.GPU_INFO)
 
 
-def test_resolve_gpu_policy(monkeypatch):
-    from flash.providers.base import resolve_gpu_policy
+def test_provisional_gpu_cheapest_for_model(monkeypatch):
+    from flash.providers.base import provisional_gpu
 
     monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    # No gate: pick the cheapest fitting class. 0.8B GRPO -> cheapest >=24G (A5000). 9B GRPO
-    # needs the 32G tier, where A40 (48G @ $0.44) is cheaper than RTX 5090 (32G @ $0.99).
-    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX A5000"
-    assert resolve_gpu_policy("cheapest", "Qwen/Qwen3.5-9B", algorithm="grpo") == "A40"
-    # concrete names pass through canonicalization
-    assert resolve_gpu_policy("rtx5090", "Qwen/Qwen3.5-4B") == "RTX 5090"
+    # GPU pinning is gone: provisional_gpu always returns the cheapest fitting class for the
+    # model. 0.8B GRPO -> cheapest >=24G (A5000). 9B GRPO needs the 32G tier, where A40
+    # (48G @ $0.44) is cheaper than RTX 5090 (32G @ $0.99).
+    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX A5000"
+    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A40"
 
 
 def test_config_cheapest_policy_no_gate(monkeypatch):
@@ -103,10 +102,11 @@ def test_config_cheapest_policy_no_gate(monkeypatch):
     }
     spec = spec_from_dict(raw, run_id="x")
     assert spec.gpu.type == "RTX 2000 Ada"  # cheapest fitting class for a small model (no gate)
-    # A class Flash hasn't smoke-tested is now accepted with no opt-in (no validation gate).
+    # GPU pinning is gone: a config's gpu.type is IGNORED — the schema always resolves the
+    # cheapest fitting class, no matter what class the config names (no validation gate).
     for klass in ("L4", "L40S", "RTX 3090", "A40"):
         raw["gpu"] = {"type": klass}
-        assert spec_from_dict(raw, run_id="x").gpu.type == klass
+        assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 2000 Ada"
 
 
 def test_flash_gpu_enum_members():
@@ -121,20 +121,6 @@ def test_gpu_short():
 
     assert gpu_short("RTX 5090") == "5090"
     assert gpu_short("rtx_4090") == "4090"
-
-
-def test_config_rejects_unsupported_gpu():
-    from flash.schema import ConfigError, spec_from_dict
-
-    raw = {
-        "model": "Qwen/Qwen3.5-4B",
-        "algorithm": "grpo",
-        "environment": {"id": "primeintellect/gsm8k"},
-        "train": {"steps": 1, "seeds": [0], "hf_repo": "owner/runs"},
-        "gpu": {"type": "Banana GPU 9000"},  # not a known GPU class at all
-    }
-    with pytest.raises(ConfigError):
-        spec_from_dict(raw, run_id="x")
 
 
 def test_config_defaults_gpu_from_model():

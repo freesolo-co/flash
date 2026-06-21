@@ -2,8 +2,8 @@
 
 Asserts the central property of this refactor: RunPod and Vast expose the IDENTICAL
 provider interface behind the IDENTICAL per-provider module layout, the registry hands
-out conforming ``Provider`` objects, and the cross-provider allocator ranks/pins/falls
-back correctly.
+out conforming ``Provider`` objects, and the cross-provider allocator ranks/falls
+back correctly (cheapest fitting class always wins — no pins).
 """
 
 from __future__ import annotations
@@ -196,11 +196,11 @@ def test_allocator_prefers_runpod_on_price_tie(monkeypatch):
 
     _mock_both_available(monkeypatch)
     # Same class at the same price on both providers: runpod wins the tie (registry order).
-    # Pin the class so the tie is between providers, not classes (no gate now, so an
-    # unpinned 0.8B run would otherwise pick the globally-cheapest class).
-    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX A5000", dph=0.27)])
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="RTX A5000")
-    assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
+    # 0.8B SFT's globally-cheapest fitting class is RTX 2000 Ada (16 GB @ $0.24 static);
+    # offer the identical class+price on vast so the tie is genuinely between providers.
+    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 2000 Ada", dph=0.24)])
+    a = allocate("Qwen/Qwen3.5-0.8B", "sft")
+    assert (a.provider, a.gpu) == ("runpod", "RTX 2000 Ada")
 
 
 def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):
@@ -216,39 +216,6 @@ def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):
     # A vast offer-search failure degrades to runpod-only and never raises (no provider pin).
     a = allocate("Qwen/Qwen3.5-0.8B", "sft")
     assert a.provider == "runpod"
-
-
-def test_allocator_gpu_pin_chooses_provider(monkeypatch):
-    """Pinning a vast-only class routes to vast; the class is honored, provider derived."""
-    from flash.providers.allocator import allocate
-
-    _mock_both_available(monkeypatch)
-    _mock_vast_offers(monkeypatch, [_offer(gpu="L40S", dph=0.80)])
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="L40S")
-    assert (a.provider, a.gpu) == ("vast", "L40S")
-
-
-def test_allocator_pinned_larger_gpu_searches_at_pin_size(monkeypatch):
-    """Fix #5: pinning a larger Vast class for a small model searches offers at the
-    PINNED class's VRAM, not the (smaller) model requirement — otherwise the cheapest-N
-    offer window can fill with small cards and never surface the pinned class."""
-    from flash.providers import allocator
-    from flash.providers.base import GPU_INFO
-
-    _mock_both_available(monkeypatch)
-    captured = {}
-
-    def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):
-        captured["min_vram_gb"] = min_vram_gb
-        return [_offer(gpu="A40", dph=0.40)]  # A40 = 48 GB, the pinned class
-
-    from flash.providers.vast import jobs
-
-    monkeypatch.setattr(jobs, "usable_offers", fake_offers)
-    # Qwen3-0.6B needs ~24 GB, but the user pinned the 48 GB A40 -> search at 48
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="A40")
-    assert (a.provider, a.gpu) == ("vast", "A40")
-    assert captured["min_vram_gb"] == GPU_INFO["A40"].vram_gb  # searched at the pin size
 
 
 def test_allocation_summary_non_vast_provider(monkeypatch):
