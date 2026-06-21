@@ -120,6 +120,47 @@ def test_falsy_non_table_section_is_rejected_not_coerced(section: str) -> None:
         spec_from_dict(raw)
 
 
+def test_environment_subfields_reject_wrong_types() -> None:
+    # The [environment] sub-fields are consumed by EnvironmentSpec(...) via dict(... or {}) /
+    # tuple(... or ()): a present-but-wrong-typed value would otherwise crash opaquely
+    # (dict("x") / dict(1)) or silently misbehave (pip = "x" char-split into ('x',)). Each
+    # must fail fast with a clear ConfigError instead.
+    # A falsy non-table (params = false) is rejected too, mirroring the section-level rule that
+    # `environment = false` must fail rather than silently coerce to {} and bypass intent.
+    for bad in ("notatable", 123, False):
+        raw = _raw()
+        raw["environment"] = {"id": "primeintellect/gsm8k", "params": bad}
+        with pytest.raises(ConfigError, match=r"\[environment\] params must be a table"):
+            spec_from_dict(raw)
+    for bad in ("notalist", 123, False):
+        raw = _raw()
+        raw["environment"] = {"id": "primeintellect/gsm8k", "pip": bad}
+        with pytest.raises(ConfigError, match=r"\[environment\] pip must be a list of strings"):
+            spec_from_dict(raw)
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k", "pip": ["ok", 123]}
+    with pytest.raises(ConfigError, match=r"\[environment\] pip entries must be strings"):
+        spec_from_dict(raw)
+
+
+def test_environment_subfields_accept_valid_and_missing() -> None:
+    # Missing sub-fields keep their defaults, and valid values pass through unchanged.
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k"}
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {}
+    assert spec.environment.pip == ()
+    raw = _raw()
+    raw["environment"] = {
+        "id": "primeintellect/gsm8k",
+        "params": {"k": "v"},
+        "pip": ["pkg==1.0"],
+    }
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {"k": "v"}
+    assert spec.environment.pip == ("pkg==1.0",)
+
+
 def test_jobspec_from_dict_rejects_path() -> None:
     # Defense-in-depth: a stale worker payload carrying a local path must be rejected.
     data = {

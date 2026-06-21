@@ -114,6 +114,21 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             "local environment paths are no longer supported — remove `path` and reference a "
             'published Hub `id` ("owner/name")'
         )
+    # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
+    # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
+    # value (false -> {}/()) but a present-but-wrong-typed value otherwise crashes opaquely or
+    # silently misbehaves: ``params = "x"`` -> ``dict("x")`` ValueError, ``params = 1`` ->
+    # ``dict(1)`` TypeError (a 500), and ``pip = "x"`` is char-split into ('x',) (the worker then
+    # tries to install bogus one-char packages). A MISSING sub-field (None) keeps its default;
+    # any PRESENT value must be the right type — a falsy ``params = false`` is rejected too,
+    # mirroring the section-level rule that ``environment = false`` must fail rather than silently
+    # coerce. Mirrors the ``[environment] must be a table`` style; a string is never char-split.
+    if "params" in env_raw and not isinstance(env_raw["params"], dict):
+        raise ConfigError("[environment] params must be a table")
+    if "pip" in env_raw and not isinstance(env_raw["pip"], (list, tuple)):
+        raise ConfigError("[environment] pip must be a list of strings")
+    if "pip" in env_raw and not all(isinstance(p, str) for p in env_raw["pip"]):
+        raise ConfigError("[environment] pip entries must be strings")
     train_raw = raw.get("train")
     if train_raw is None:
         train_raw = {}
