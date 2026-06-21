@@ -38,6 +38,39 @@ MODES = ("dev", "always-on")
 DEFAULT_IDLE_TIMEOUT_S = 300
 
 
+class ServingError(RuntimeError):
+    """The freesolo serving backend (Modal LoRA app) rejected a request or was unreachable.
+
+    Carries the upstream status (when there was an HTTP response) so the API layer can
+    surface a clean ``502 Bad Gateway`` with the real reason instead of letting an
+    ``httpx`` exception escape as an unhandled ``500`` + traceback.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _post_adapter_or_raise(url: str, body: dict) -> httpx.Response:
+    """POST an adapter registration to the serving backend, translating any transport- or
+    status-level failure into a ``ServingError`` that carries the upstream detail."""
+    try:
+        resp = httpx.post(url, json=body, headers=_internal_key_header(), timeout=60.0)
+        resp.raise_for_status()
+        return resp
+    except httpx.HTTPStatusError as exc:
+        detail = (exc.response.text or "").strip()[:500]
+        raise ServingError(
+            f"serving backend returned HTTP {exc.response.status_code} for {url}"
+            + (f": {detail}" if detail else "")
+            + " — the serving backend is unavailable or has no engine for this base model; "
+            "an operator must check the freesolo serving deployment",
+            status_code=exc.response.status_code,
+        ) from exc
+    except httpx.RequestError as exc:
+        raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
+
+
 def serving_base_url() -> str:
     """The freesolo serving base URL (env-overridable, trailing slash stripped)."""
     return (os.environ.get("FREESOLO_SERVING_URL") or DEFAULT_FREESOLO_SERVING_URL).rstrip("/")
@@ -134,13 +167,7 @@ def deploy_adapter(
         "subfolder": subfolder,
         "status": "ready",
     }
-    resp = httpx.post(
-        f"{base}/adapters",
-        json=body,
-        headers=_internal_key_header(),
-        timeout=60.0,
-    )
-    resp.raise_for_status()
+    _post_adapter_or_raise(f"{base}/adapters", body)
     logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
     return dep
 

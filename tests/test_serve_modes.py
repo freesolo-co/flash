@@ -48,6 +48,46 @@ def test_deploy_rejects_unknown_mode():
     assert set(MODES) == {"dev", "always-on"}
 
 
+def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
+    """A non-2xx from the serving backend (e.g. Modal has zero base-model engines) must surface
+    as a ServingError carrying the upstream status + body — NOT a bare httpx exception — so the
+    API layer can return a clean 502 instead of an unhandled 500 + traceback."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(500, text="no base-model engines loaded", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert ei.value.status_code == 500
+    assert "500" in str(ei.value)
+    assert "no base-model engines loaded" in str(ei.value)
+
+
+def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch):
+    """A transport error (serving backend unreachable) is also a ServingError (status_code None)."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+
+    def fake_post(url, *a, **k):
+        raise httpx.ConnectError("connection refused", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", fake_post)
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert ei.value.status_code is None
+    assert "could not reach" in str(ei.value)
+
+
 def test_undeploy_calls_freesolo_delete(monkeypatch):
     """undeploy issues a single DELETE to the serving app keyed by run_id and returns the
     removed id; an unrelated run is unaffected (the serving app keys by adapterId)."""
