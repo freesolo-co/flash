@@ -143,14 +143,17 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
 
 
 def test_select_gpu_picks_cheapest_including_unvalidated():
-    # No validation gate: select_gpu picks the cheapest fitting class (validated or not), and
-    # nothing fitting is cheaper.
-    from flash.cost.facts import gpu_hourly_usd, pick_gpu
+    # No validation gate: select_gpu picks the cheapest fitting class (validated or not) at the
+    # REALIZED (billed) rate, and nothing fitting is cheaper.
+    from flash.cost.facts import pick_gpu, realized_hourly_usd
     from flash.providers.base import GPU_INFO
 
     gpu, need = select_gpu(RunConfig(MID, "sft", 100))
     assert gpu == pick_gpu(need)
-    cheaper = [g for g in GPU_INFO.values() if g.vram_gb >= need and g.hourly_usd < gpu_hourly_usd(gpu)]
+    cheaper = [
+        g for g in GPU_INFO.values()
+        if g.vram_gb >= need and realized_hourly_usd(g.name) < realized_hourly_usd(gpu)
+    ]
     assert not cheaper, f"{cheaper} cheaper than {gpu} for {need} GB"
 
 

@@ -70,12 +70,11 @@ def test_unknown_gpu_lookup_raises():
 
 
 def test_pick_gpu_cheapest_fit_no_validation_gate():
-    # No validation gate: every fitting class is eligible, so the estimate picks the truly
-    # cheapest card. The unvalidated RTX 2000 Ada ($0.24, 16 GB) is the cheapest >= 12 GB.
-    assert pick_gpu(12) == "RTX 2000 Ada"
-    # 24 GB excludes the 16 GB cards -> cheapest >= 24 is the RTX A5000 ($0.27, 24 GB).
-    assert pick_gpu(24) == "RTX A5000"
-    # 40 GB needs the big-VRAM tier -> cheapest >= 40 is the A40 ($0.44, 48 GB).
+    # No validation gate: every fitting class is eligible, ranked by the REALIZED rate it bills
+    # at. The RTX 3090 ($0.239, 24 GB) is the cheapest realized card, so it wins anything <= 24 GB.
+    assert pick_gpu(12) == "RTX 3090"
+    assert pick_gpu(24) == "RTX 3090"
+    # > 24 GB needs the big-VRAM tier -> cheapest realized >= 40 is the A40 ($0.44, 48 GB).
     assert pick_gpu(40) == "A40"
 
 
@@ -83,20 +82,19 @@ def test_pick_gpu_result_actually_fits_and_is_cheapest():
     for need in (8, 16, 24, 33, 48, 80):
         gpu = pick_gpu(need)
         assert gpu_vram_gb(gpu) >= need
-        # No validation gate: nothing fitting may be cheaper than the chosen class.
+        # No validation gate: nothing fitting is cheaper at the REALIZED (billed) rate.
         cheaper_fits = [
             g
             for g in GPU_INFO.values()
-            if g.vram_gb >= need and g.hourly_usd < gpu_hourly_usd(gpu)
+            if g.vram_gb >= need and realized_hourly_usd(g.name) < realized_hourly_usd(gpu)
         ]
         assert not cheaper_fits, f"{cheaper_fits} cheaper than {gpu} for {need} GB"
 
 
 def test_pick_gpu_includes_unvalidated_classes():
-    # There is no validation gate (it was removed with GPU pinning): the cheapest fitting
-    # class wins even when it's unvalidated. The RTX 2000 Ada ($0.24, 16 GB) undercuts the
-    # validated A5000 ($0.27, 24 GB) at 12 GB, so it is the default pick.
-    assert pick_gpu(12) == "RTX 2000 Ada"
+    # No validation gate: the cheapest realized-rate class wins regardless of validation status.
+    # The RTX 3090 ($0.239) is the cheapest realized card and wins at 12 GB.
+    assert pick_gpu(12) == "RTX 3090"
 
 
 def test_pick_gpu_impossible_raises():
@@ -127,7 +125,7 @@ def test_pick_gpu_provider_filter_excludes_other_providers_only_class():
 
 
 def test_pick_gpu_auto_spans_all_providers():
-    # Without a provider pin, selection spans the whole registry: the cheapest fitting class
-    # overall, regardless of which provider(s) can run it or whether it's validated.
-    assert pick_gpu(24, provider="auto") == "RTX A5000"
-    assert pick_gpu(12) == "RTX 2000 Ada"
+    # Without a provider pin, selection spans the whole registry: the cheapest (realized-rate)
+    # fitting class overall, regardless of which provider(s) can run it or whether it's validated.
+    assert pick_gpu(24, provider="auto") == "RTX 3090"
+    assert pick_gpu(12) == "RTX 3090"

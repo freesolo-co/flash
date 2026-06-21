@@ -74,10 +74,10 @@ def gpu_vram_gb(name: str) -> int:
 
 
 def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
-    """Cheapest GPU class that fits ``required_vram_gb`` (ranked by hourly_usd, vram, name).
-
-    No pin and no validation gate -- every fitting class is eligible, like the allocator's
-    cheapest-fit. ``provider`` restricts candidates to what it can provision.
+    """Cheapest GPU class that fits ``required_vram_gb``, ranked by the REALIZED (market) $/hr it
+    is BILLED at (ties: vram, name) -- so selection is consistent with the bill and approximates
+    the allocator, which provisions the cheapest live offer. No pin and no validation gate -- every
+    fitting class is eligible. ``provider`` restricts candidates to what it can provision.
     """
 
     def _selectable(g: GpuClass) -> bool:
@@ -86,7 +86,7 @@ def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
     candidates = [g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)]
     if not candidates:
         raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
-    best = min(candidates, key=lambda g: (g.hourly_usd, g.vram_gb, g.name))
+    best = min(candidates, key=lambda g: (realized_hourly_usd(g.name), g.vram_gb, g.name))
     return best.name
 
 
