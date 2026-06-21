@@ -448,6 +448,8 @@ def _patch_hopper_stack(
     pip_rc: int = 0,
     find_spec_ok: bool = True,
     tvm_ffi_version: str | None = "0.1.11",
+    tilelang_version: str | None = "0.1.11",
+    record_pip: list[str] | None = None,
 ):
     """Wire the perf helper's external touchpoints for the Hopper fast-path tests and return the
     list that records _remove_fla_from_disk (fla-disable) calls.
@@ -455,6 +457,11 @@ def _patch_hopper_stack(
     * ``pip_rc`` -> the return code every mocked ``pip install`` reports (non-zero = failed install).
     * ``find_spec_ok`` -> whether the post-install import probe finds fla/fla.modules/tilelang.
     * ``tvm_ffi_version`` -> what importlib.metadata.version('apache-tvm-ffi') reports (None=absent).
+    * ``tilelang_version`` -> what importlib.metadata.version('tilelang') reports (None=absent). The
+      helper gates the tilelang (re)install AND the final ``ok`` on this exact version, so a value
+      != the pin models a present-but-wrong-version stack.
+    * ``record_pip`` -> if given, every mocked ``pip install`` appends its joined spec args here (so
+      a test can assert WHICH packages were reinstalled).
     """
     import importlib.metadata
     import importlib.util
@@ -463,11 +470,16 @@ def _patch_hopper_stack(
     from flash.engine.worker import perf
 
     monkeypatch.setitem(sys.modules, "torch", _hopper_torch())
+
     # subprocess is imported locally inside the helper, so patch the real module. Return a fake
     # CompletedProcess so _pip can read .returncode (the install-success gate).
-    monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: _FakeCompleted(pip_rc), raising=True
-    )
+    def _fake_run(cmd, *a, **k):
+        if record_pip is not None:
+            # cmd == [sys.executable, "-m", "pip", "install", "-q", *specs]
+            record_pip.append(" ".join(str(c) for c in cmd[5:]))
+        return _FakeCompleted(pip_rc)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run, raising=True)
     monkeypatch.setattr(
         importlib.util,
         "find_spec",
@@ -476,11 +488,10 @@ def _patch_hopper_stack(
     )
 
     def _fake_version(dist: str) -> str:
-        if dist == "apache-tvm-ffi":
-            if tvm_ffi_version is None:
-                raise importlib.metadata.PackageNotFoundError(dist)
-            return tvm_ffi_version
-        raise importlib.metadata.PackageNotFoundError(dist)
+        ver = {"apache-tvm-ffi": tvm_ffi_version, "tilelang": tilelang_version}.get(dist)
+        if ver is None:
+            raise importlib.metadata.PackageNotFoundError(dist)
+        return ver
 
     monkeypatch.setattr(importlib.metadata, "version", _fake_version, raising=True)
 
@@ -539,6 +550,63 @@ def test_hopper_fla_kept_when_stack_healthy(monkeypatch):
     perf._fix_fla_fastpath_on_hopper()
 
     assert not removed, "healthy stack must KEEP fla (no disable on the success path)"
+
+
+def test_hopper_tilelang_present_but_wrong_version_is_reinstalled(monkeypatch):
+    """Regression (Copilot review on perf.py:~511): a DIFFERENT tilelang already resident (a job or
+    the base image carries one) must NOT be treated as healthy. The helper gates on the installed
+    version, so it (re)installs the exact pin; once the pin lands fla is KEPT."""
+    pip_calls: list[str] = []
+    # Resident wrong version first; after the (mocked) reinstall the metadata reports the pin.
+    perf, removed = _patch_hopper_stack(
+        monkeypatch,
+        pip_rc=0,
+        find_spec_ok=True,
+        tvm_ffi_version="0.1.11",
+        tilelang_version="0.1.11",  # post-reinstall resolved version
+        record_pip=pip_calls,
+    )
+    # Make the FIRST _ver('tilelang') read (the install gate) see a stale wrong version, while the
+    # final ok-gate read sees the pin — i.e. the reinstall corrected it.
+    import importlib.metadata as _md
+
+    gate_reads = iter(["0.1.9"])  # first read = stale; later reads -> pin (reinstall corrected it)
+    orig_version = _md.version
+
+    def _versioned(dist: str) -> str:
+        if dist == "tilelang":
+            return next(gate_reads, "0.1.11")
+        return orig_version(dist)
+
+    monkeypatch.setattr(_md, "version", _versioned, raising=True)
+
+    perf._fix_fla_fastpath_on_hopper()
+
+    assert any(c.startswith("tilelang==0.1.11") for c in pip_calls), (
+        f"present-but-wrong tilelang must trigger a pinned reinstall, got pip calls: {pip_calls}"
+    )
+    assert not removed, "after the pin reinstall lands, fla must be KEPT"
+
+
+def test_hopper_tilelang_wrong_version_persists_disables_fla(monkeypatch):
+    """If the resident tilelang is the WRONG version AND the reinstall doesn't land the pin (version
+    still != pin), the final gate must DISABLE fla — the uncertain GDN backend is not trusted."""
+    pip_calls: list[str] = []
+    perf, removed = _patch_hopper_stack(
+        monkeypatch,
+        pip_rc=0,
+        find_spec_ok=True,
+        tvm_ffi_version="0.1.11",
+        tilelang_version="0.1.9",  # wrong version throughout (reinstall didn't correct it)
+        record_pip=pip_calls,
+    )
+
+    perf._fix_fla_fastpath_on_hopper()
+
+    assert any(c.startswith("tilelang==0.1.11") for c in pip_calls), (
+        "wrong resident tilelang must still attempt the pinned reinstall"
+    )
+    assert removed, "tilelang version != pin after install must DISABLE fla (pin didn't land)"
 
 
 def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
