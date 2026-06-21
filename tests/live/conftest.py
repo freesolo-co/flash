@@ -20,6 +20,3 @@ import pytest
 def _require_live_optin():
     if os.environ.get("FLASH_LIVE") != "1":
         pytest.skip("live smoke disabled; set FLASH_LIVE=1 (and provider creds) to run")
-    # The live path must NOT be short-circuited by the offline marker.
-    if os.environ.get("FLASH_SKIP_NET"):
-        pytest.skip("FLASH_SKIP_NET set; live tests need the network")

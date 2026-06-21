@@ -49,9 +49,8 @@ def _get_provider(key: str) -> Provider:
 
 def available_providers() -> tuple[str, ...]:
     """Provider NAMES usable from this control plane right now: a provider is available when it
-    ``is_configured()`` (creds present + net path). RunPod is the always-on default; Vast needs
-    ``VAST_API_KEY`` (and FLASH_SKIP_NET disables both live paths, keeping offline allocation
-    deterministic)."""
+    ``is_configured()`` (creds present). RunPod is the always-on default; Vast needs
+    ``VAST_API_KEY`` (without it, allocation stays on RunPod's static catalog)."""
     return tuple(n for n in PROVIDER_NAMES if get_provider(n).is_configured())
 
 

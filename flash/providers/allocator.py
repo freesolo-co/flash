@@ -10,8 +10,9 @@ cheapest:
 
 Allocation happens at SUBMIT time in the runner (offers are a volatile market);
 the parse-time resolution in schema is a RunPod-static provisional for
-validation/dry-run display. Offline (FLASH_SKIP_NET) the allocator degrades to exactly
-``cheapest_gpu``'s deterministic static-rate answer (RunPod only — Vast is offline-off).
+validation/dry-run display. With no live pricing/offers reachable (no network, or no
+``VAST_API_KEY``) the allocator degrades to exactly ``cheapest_gpu``'s deterministic
+static-rate answer (RunPod only — Vast is off without its key).
 
 Provider-agnostic by construction: it walks the registered providers and asks each for
 its ``gpu_classes()`` + ``hourly_rate()``; the only provider-specific knowledge is that
@@ -145,7 +146,7 @@ def _is_moe_model(model_id: str) -> bool:
     "requires you to execute custom code" error) is reported MoE here — we never run the remote code,
     but we trust the worker will and size for the replica it will run. A genuinely-dense model wrongly
     caught this way is only OVER-provisioned (the worker downgrades dp->tp, needing LESS), never OOM.
-    Other uncertainty (offline / FLASH_SKIP_NET / config unreadable) stays dense/TP — the worker also
+    Other uncertainty (no network / config unreadable) stays dense/TP — the worker also
     downgrades to tp on an unreadable probe, so sharded sizing matches what it actually runs."""
     try:
         from flash.catalog import get_model
@@ -155,10 +156,9 @@ def _is_moe_model(model_id: str) -> bool:
     except Exception:
         pass
     # Open/unlisted model: mirror engine.worker.run_rl's AutoConfig probe so submit sizes a `dp`
-    # rollout as full per-card replicas (no divide) exactly as the worker will run it. Offline
-    # (FLASH_SKIP_NET) we can't probe, so stay on the dense/TP side — consistent with the worker.
-    if os.environ.get("FLASH_SKIP_NET"):
-        return False
+    # rollout as full per-card replicas (no divide) exactly as the worker will run it. Best-effort:
+    # when the probe can't reach HF (no network) the except below stays on the dense/TP side —
+    # consistent with the worker's own unreadable-probe downgrade to tp.
     try:
         from transformers import AutoConfig
 
