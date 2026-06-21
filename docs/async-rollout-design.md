@@ -10,7 +10,7 @@ filled ONLY from measured runs — never estimated. (Real GPU-money spend author
 real runs executed on Vast + RunPod to drive this down.)
 
 What landed + is verified working on real hardware:
-- **Multi-GPU provisioning plumbing**: `[gpu] count` ([spec.py](../flash/spec.py)/[schema.py](../flash/schema.py)
+- **Multi-GPU provisioning plumbing**: `[gpu] count` ([spec.py](../flash/spec.py)/[schema](../flash/schema/__init__.py)
   with cross-field validation); Vast `search_offers(num_gpus=count)` (exact-match) threaded through
   `usable_offers`/`deploy_and_submit`/`submit_run_vast`; RunPod `gpu_count=spec.gpu.count`.
 - **Disaggregated worker mode** ([engine/disaggregated.py](../flash/engine/disaggregated.py) +
@@ -19,7 +19,7 @@ What landed + is verified working on real hardware:
   server torn down in a `finally`. **On a node with 2 real GPUs this reaches `rl_train_start` and
   the weight-sync handshake** (verified on real runs).
 - **Capacity-aware allocation** ([providers/runpod/jobs.py](../flash/providers/runpod/jobs.py)
-  poll `no_capacity` fast-fail at `queue_grace_s`=720s + [runner](../flash/runner.py)
+  poll `no_capacity` fast-fail at `queue_grace_s`=720s + [runner](../flash/runner/__init__.py)
   class-walk): a throttled/capacity-starved class is detected in ~12 min (not the 50-min stall
   grace) and the run walks to the next-cheapest AVAILABLE class — **validated live** (a RunPod
   A100×2 throttle fast-failed at 724s and advanced). No blacklisting (a class may free up).
@@ -42,8 +42,8 @@ The benchmark NUMBERS require a worker container with ≥2 CUDA-usable GPUs. The
   Setting `NVIDIA_VISIBLE_DEVICES=all` alone could not widen a cgroup that only contained 1 device.
   **The fix is twofold and is in the code now:** (1) `usable_offers` requires an EXPLICIT
   `gpu_frac >= 0.99` (whole-machine; a missing/fractional `gpu_frac` is rejected — `flash/providers/
-  vast/jobs.py`), so the rented machine isn't a sliver of a bigger box; and (2) `NVIDIA_VISIBLE_DEVICES
-  =all` is set both in the create-time `env` (`flash/providers/vast/jobs.py`) and baked into the image
+  vast/jobs/__init__.py`), so the rented machine isn't a sliver of a bigger box; and (2) `NVIDIA_VISIBLE_DEVICES
+  =all` is set both in the create-time `env` (`flash/providers/vast/jobs/__init__.py`) and baked into the image
   (`ENV NVIDIA_VISIBLE_DEVICES=all` in `Dockerfile.worker`). On a whole-machine offer the cgroup
   already contains all `k` GPUs and `=all` surfaces them — `nvidia-smi -L` then shows all `k` and the
   disaggregated split works (the 1:1 / 1:2 / 2:2 rows below are measured on these nodes). The earlier
