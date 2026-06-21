@@ -64,6 +64,11 @@ def _raw(**overrides) -> dict:
             "only valid for grpo",
         ),
         ({"gpu.count": 0}, "gpu.count must be >= 1"),
+        # Unknown config sections/keys are rejected (not silently dropped → 16x-cost defaults).
+        # The classic footgun: rollout knobs under a [grpo] table instead of [train].
+        ({"grpo.group_size": 4}, "unknown config section"),
+        ({"sft.epochs": 3}, r"under \[train\]"),
+        ({"train.max_token": 256}, "unknown key"),  # typo of max_tokens
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:

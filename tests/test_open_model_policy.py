@@ -30,7 +30,7 @@ def test_minicpm5_in_catalog():
 
 
 def test_allow_policy_accepts_fitting_model(monkeypatch):
-    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 1.2, raising=True)
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 1.2, raising=True)
     info = resolve_model("acme/tiny-1b", "grpo", policy="allow", gpu="RTX 4090")
     assert info.thinking == "unknown"
     assert "open-model policy" in info.notes
@@ -38,7 +38,7 @@ def test_allow_policy_accepts_fitting_model(monkeypatch):
 
 def test_allow_policy_blocks_provably_too_big(monkeypatch):
     monkeypatch.setattr(
-        "flash.engine.vram.fetch_hf_params_b", lambda model_id: 70.0, raising=True
+        "flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 70.0, raising=True
     )
     with pytest.raises(ValueError, match="does not fit"):
         resolve_model("acme/huge-70b", "sft", policy="allow", gpu="RTX 4090")
@@ -111,7 +111,7 @@ def test_allow_policy_disaggregated_fits_verdict_still_elevates_disk(monkeypatch
 
 def test_allow_policy_unknown_size_warns_but_allows(monkeypatch, capsys):
     monkeypatch.setattr(
-        "flash.engine.vram.fetch_hf_params_b", lambda model_id: None, raising=True
+        "flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: None, raising=True
     )
     info = resolve_model("acme/mystery", "sft", policy="allow", gpu="RTX 5090")
     assert info.id == "acme/mystery"
@@ -151,7 +151,7 @@ def test_spec_model_policy_default_catalog():
 
 
 def test_spec_model_policy_allow_roundtrip(monkeypatch):
-    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 1.0, raising=True)
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 1.0, raising=True)
     spec = spec_from_dict(_raw(model="acme/tiny-1b", model_policy="allow"))
     assert spec.model_policy == "allow"
     spec2 = spec.from_dict(spec.to_dict())

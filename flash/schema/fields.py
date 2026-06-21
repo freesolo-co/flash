@@ -222,9 +222,15 @@ def _wandb_spec(raw: Any) -> WandbSpec:
         )
     values: dict[str, str] = {}
     for key in _WANDB_KEYS:
-        if key not in raw:
+        val = raw.get(key)
+        # Absent OR null means "unset". A serialized JobSpec round-trips unset wandb fields as
+        # null (``asdict`` emits ``{"project": null, "run_name": null}``), so re-parsing a spec —
+        # which is exactly what the control plane does on submit, ``spec_from_dict(spec.to_dict())``
+        # — must accept null without demanding a value, or every run that omits ``[wandb]`` is
+        # rejected. Only an explicitly-set value is validated: a bare ""/whitespace is a real
+        # config mistake worth flagging.
+        if val is None:
             continue
-        val = raw[key]
         if not isinstance(val, str) or not val.strip():
             raise ConfigError(f"[wandb] {key} must be a non-empty string")
         values[key] = val.strip()
