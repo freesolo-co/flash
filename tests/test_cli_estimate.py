@@ -237,7 +237,7 @@ def test_cmd_train_cost_is_offline_for_unlisted_open_model(tmp_path, capsys, mon
         "steps = 10\n"
         'hf_repo = "owner/runs"\n'
         "[gpu]\n"
-        'type = "cheapest"\n'  # policy word -> parse-time GPU resolution probes HF unless guarded
+        'type = "cheapest"\n'  # policy word -> GPU resolved from the (offline) VRAM sizing
     )
     args = types.SimpleNamespace(
         config=str(cfg), overrides=[], extra_configs=[], cost=True, dry_run=False, background=False

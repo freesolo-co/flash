@@ -266,7 +266,7 @@ def cmd_env_list(args) -> int:
 
 
 def _cmd_train_cost(args) -> int:
-    """`slm train --cost`: print the pre-flight USD cost for the config and exit (no submit).
+    """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
     Estimation must be fully OFFLINE. ``estimate_cost`` already sizes VRAM offline
     (``skip_net=True``), but ``spec_from_file`` parse-time GPU policy resolution

@@ -34,7 +34,7 @@ from flash.runner import (
 from flash.schema import ConfigError, spec_from_dict
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import deploy_adapter, undeploy_adapter
-from flash.spec import JobSpec
+from flash.spec import JobSpec, coerce_bool
 
 from . import auth, db
 
@@ -211,6 +211,31 @@ def create_app():
     @app.get("/v1/models")
     def models(_: dict = Depends(require_key)):
         return {"models": public_model_rows()}
+
+    @app.post("/v1/envs")
+    def publish_env(payload: dict, key: dict = Depends(require_key)):
+        # Publish a client-built verifiers env package to the MANAGED Prime account (this control
+        # plane's PRIME_API_KEY), namespaced per identity and PRIVATE — so users never need their
+        # own Prime account. The client just packages local source and uploads it here.
+        from flash.server import envs
+
+        # Default to "" only when the key is missing/None — pass a present-but-falsy
+        # non-string (0, False, []) THROUGH so publish_package's type checks reject it with
+        # the right 400, instead of `or ""` silently coercing it to a valid-looking empty string.
+        _pkg = payload.get("package_b64")
+        _name = payload.get("name")
+        try:
+            slug = envs.publish_package(
+                package_b64="" if _pkg is None else _pkg,
+                name="" if _name is None else _name,
+                # Robust bool parse: JSON `"is_new": "false"`/`"0"` must NOT become True
+                # (plain bool() is truthy for any non-empty string). Defaults True when absent.
+                is_new=coerce_bool(payload.get("is_new", True)),
+                key=key,
+            )
+        except envs.EnvPublishError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {"id": slug}
 
     def _parse_spec(payload: dict, run_id: str) -> JobSpec:
         spec_raw = payload.get("spec") or {}
