@@ -59,14 +59,21 @@ def _post_adapter_or_raise(url: str, body: dict) -> httpx.Response:
         resp.raise_for_status()
         return resp
     except httpx.HTTPStatusError as exc:
-        detail = (exc.response.text or "").strip()[:500]
-        raise ServingError(
-            f"serving backend returned HTTP {exc.response.status_code} for {url}"
-            + (f": {detail}" if detail else "")
-            + " — the serving backend is unavailable or has no engine for this base model; "
-            "an operator must check the freesolo serving deployment",
-            status_code=exc.response.status_code,
-        ) from exc
+        # raise_for_status() always carries a response, but a hand-built HTTPStatusError may
+        # not — guard so error translation can never itself raise.
+        resp = exc.response
+        status = resp.status_code if resp is not None else None
+        detail = ((resp.text if resp is not None else "") or "").strip()[:500]
+        msg = f"serving backend error for {url}"
+        if status is not None:
+            msg += f" (HTTP {status})"
+        if detail:
+            msg += f": {detail}"
+        msg += (
+            " — the serving backend is unavailable or has no engine for this base model; "
+            "an operator must check the freesolo serving deployment"
+        )
+        raise ServingError(msg, status_code=status) from exc
     except httpx.RequestError as exc:
         raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
 
