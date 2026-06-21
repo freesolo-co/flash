@@ -204,20 +204,25 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
 
 def test_cmd_train_cost_is_offline_for_unlisted_open_model(tmp_path, capsys, monkeypatch):
     """``--cost`` must be fully OFFLINE even for an unlisted ``model_policy = "allow"`` model:
-    parse-time GPU policy resolution would otherwise probe HF. The CLI scopes FLASH_SKIP_NET
-    over the whole parse, so ``fetch_hf_params_b`` is only ever called with skip_net set, and
-    the quote is deterministic + matches what the control plane charges. PR #3 review."""
-    import os
-
+    BOTH parse-time sizing paths -- GPU policy resolution (``resolve_gpu_policy`` ->
+    ``model_required_vram_gb``) and the open-model fit estimate (``resolve_model`` ->
+    ``check_fit``) -- would otherwise probe HF via ``fetch_hf_params_b``. The CLI threads an
+    EXPLICIT ``skip_net=True`` through the parse (there is no global offline env switch), so
+    ``fetch_hf_params_b`` is only ever reached with ``skip_net=True`` and the quote stays
+    deterministic + matches what the control plane charges. PR #3 review."""
     import flash.engine.vram as vram
 
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+    # Any HF probe NOT carrying the explicit skip_net=True is a network leak -> fail loudly.
+    # (Deliberately consults NO env: offline-ness must come purely from the threaded param.)
+    seen_skip_net: list[bool] = []
 
-    # Any HF probe NOT under skip_net is a network leak -> fail loudly.
     def guarded_fetch(model_id, *, skip_net=False):
-        # Only ever called offline; returning None drops to the heuristic param-count fallback.
-        if not (skip_net or os.environ.get("FLASH_SKIP_NET")):
-            raise AssertionError("--cost leaked a network HF probe (FLASH_SKIP_NET not scoped)")
+        seen_skip_net.append(skip_net)
+        if not skip_net:
+            raise AssertionError(
+                "--cost leaked a network HF probe (skip_net not threaded through the parse)"
+            )
+        # Implicit None: drops to the heuristic param-count fallback (the offline behavior).
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", guarded_fetch)
 
@@ -240,6 +245,7 @@ def test_cmd_train_cost_is_offline_for_unlisted_open_model(tmp_path, capsys, mon
     rc = cmd_train(args)
     assert rc == 0
     assert "TOTAL" in capsys.readouterr().out
-    # The scoped guard is restored afterwards (not leaked into the process).
-    assert "FLASH_SKIP_NET" not in os.environ
+    # The probe WAS reached (the unlisted model needs sizing) and EVERY call was offline.
+    assert seen_skip_net  # at least one sizing probe happened
+    assert all(seen_skip_net)  # and every one carried skip_net=True
 

@@ -380,6 +380,7 @@ def resolve_gpu_policy(
     *,
     train=None,
     thinking: bool = False,
+    skip_net: bool = False,
 ) -> str:
     """Resolve ``gpu.type`` (a concrete class or a policy word) to a friendly name.
 
@@ -387,6 +388,9 @@ def resolve_gpu_policy(
     RunPod-validated class whose VRAM covers the model; concrete names are
     canonicalized. The submit-time allocator (``flash.providers.allocator``)
     re-resolves policy words live across providers.
+
+    ``skip_net=True`` sizes an unlisted model offline (no HF probe), threaded explicitly so
+    ``flash train --cost`` resolves the GPU class with zero network I/O.
     """
     key = (requested or "").strip().lower()
     if key not in POLICY_NAMES:
@@ -397,7 +401,12 @@ def resolve_gpu_policy(
     # Honor FLASH_VRAM_HEADROOM here too so parse-time sizing matches the submit-time
     # allocator exactly (PR #176 review: they previously diverged on the headroom knob).
     min_vram = model_required_vram_gb(
-        model_id, algorithm, train=train, thinking=thinking, headroom=vram_headroom()
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        headroom=vram_headroom(),
+        skip_net=skip_net,
     )
     return cheapest_gpu(min_vram, include_unvalidated=unvalidated_allowed(allow_unvalidated))
 

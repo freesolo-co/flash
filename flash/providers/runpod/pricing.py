@@ -69,11 +69,9 @@ def _fetch_live_rates() -> dict[str, float]:
 def live_rates(refresh: bool = False) -> dict[str, float]:
     """Friendly-name -> $/hr. Live (cached ``CACHE_TTL_S``) over the static snapshot.
 
-    Offline-safe: FLASH_SKIP_NET (or any fetch failure) returns the static rates.
+    Offline-safe: any fetch failure (no network / no RunPod key) returns the static rates.
     """
     static = _static_rates()
-    if os.environ.get("FLASH_SKIP_NET"):
-        return static
     now = time.time()
     if not refresh:
         if _MEM["rates"] and now - _MEM["ts"] < CACHE_TTL_S:

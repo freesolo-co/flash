@@ -101,8 +101,8 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
     HF API for an UNLISTED model's param count (``engine.vram.fetch_hf_params_b``). Pass
     ``skip_net=True`` so estimation never does network I/O (the offline path falls back to the
     24 GB tier for an unreadable model). This is threaded explicitly through the sizing stack --
-    NOT a mutation of the process-global ``FLASH_SKIP_NET`` env -- so it's thread-safe and never
-    clobbers a concurrent caller's env or HF lookups (PR #3 review).
+    not via any process-global state -- so it's thread-safe and never clobbers a concurrent
+    caller's HF lookups (PR #3 review).
     """
     need = required_vram_gb(
         config.model_id,

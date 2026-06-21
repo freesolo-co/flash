@@ -7,8 +7,6 @@ bounds runaway runs) plus end-to-end arithmetic consistency.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from flash.cost import RunConfig, estimate_cost
@@ -263,12 +261,11 @@ def test_explicit_grpo_max_length_still_wins():
 
 def test_estimate_does_no_network_for_unlisted_model(monkeypatch):
     # The estimator's contract is fully local. select_gpu() threads skip_net=True through the VRAM
-    # sizing stack (required_vram_gb -> model_required_vram_gb -> fetch_hf_params_b), so even with
-    # FLASH_SKIP_NET UNSET an UNLISTED model never constructs the HF network client:
-    # fetch_hf_params_b's skip_net guard short-circuits (return None) BEFORE it imports/instantiates
-    # HfApi. Wire HfApi to flip a flag if ever built and assert it stays untouched, and that the
-    # estimate still succeeds via the offline fallback (the 24 GB tier).
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+    # sizing stack (required_vram_gb -> model_required_vram_gb -> fetch_hf_params_b), so an UNLISTED
+    # model never constructs the HF network client: fetch_hf_params_b's skip_net guard short-circuits
+    # (return None) BEFORE it imports/instantiates HfApi. Wire HfApi to flip a flag if ever built and
+    # assert it stays untouched, and that the estimate still succeeds via the offline fallback (the
+    # 24 GB tier). (This is purely the explicit param -- there is no global offline env switch.)
     import huggingface_hub
 
     built = []
@@ -286,32 +283,12 @@ def test_estimate_does_no_network_for_unlisted_model(monkeypatch):
     assert not built  # the network client was never even constructed
     assert e.required_vram_gb >= 24  # sane offline VRAM estimate (unlisted -> 24 GB tier)
     assert e.total_usd > 0
-    # Thread-safety: the offline force is an explicit param, NOT a process-global env mutation, so
-    # FLASH_SKIP_NET must not appear (and was never set) in the ambient environment.
-    assert "FLASH_SKIP_NET" not in os.environ
 
 
-def test_estimate_does_not_mutate_caller_flash_skip_net(monkeypatch):
-    # select_gpu sizes offline via an explicit skip_net param threaded through the stack, NOT by
-    # mutating os.environ["FLASH_SKIP_NET"]. A caller's own FLASH_SKIP_NET value must therefore be
-    # left byte-for-byte untouched across estimation (it's never clobbered, since we don't touch
-    # the env at all). Use a sentinel value the code would never write.
-    monkeypatch.setenv("FLASH_SKIP_NET", "caller-sentinel")
-    select_gpu(RunConfig(MID, "grpo", 10))
-    assert os.environ["FLASH_SKIP_NET"] == "caller-sentinel"
-    # ...and an unlisted-model estimate (the path that would have flipped the env before) leaves
-    # it equally untouched.
-    estimate_cost(RunConfig("some-org/another-unlisted-7b", "grpo", 10))
-    assert os.environ["FLASH_SKIP_NET"] == "caller-sentinel"
-
-
-def test_skip_net_param_bypasses_hf_without_env(monkeypatch):
-    # Unit-level: the threaded skip_net=True bypasses the HF probe for an unlisted model the same
-    # way the FLASH_SKIP_NET env would, but WITHOUT the env being set -- proving the param, not a
-    # global mutation, is what forces offline sizing.
+def test_skip_net_param_bypasses_hf(monkeypatch):
+    # Unit-level: the threaded skip_net=True bypasses the HF probe for an unlisted model -- proving
+    # the explicit param (not any global state) is what forces offline sizing.
     from flash.engine.vram import fetch_hf_params_b, model_required_vram_gb
-
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     def _boom(*a, **k):  # any HF construction/lookup is a failure
         raise AssertionError("hit the HF network despite skip_net=True")
@@ -323,7 +300,6 @@ def test_skip_net_param_bypasses_hf_without_env(monkeypatch):
     assert fetch_hf_params_b("some-org/unlisted", skip_net=True) is None
     # And the sizing matrix falls back to the 24 GB tier for the unreadable unlisted model.
     assert model_required_vram_gb("some-org/unlisted", "grpo", skip_net=True) == 24
-    assert "FLASH_SKIP_NET" not in os.environ
 
 
 @pytest.mark.parametrize(

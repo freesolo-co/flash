@@ -214,10 +214,9 @@ def model_required_vram_gb(
     model; the matrix only ever sizes UP from there. Unlisted open models size from HF
     metadata, falling back to the 24 GB tier when the size can't be read.
 
-    ``skip_net=True`` forces the offline heuristic for an UNLISTED model (no HF probe), the
-    library-safe equivalent of the ``FLASH_SKIP_NET`` env without mutating process-global state
-    -- the cost estimator passes it so estimation never does network I/O. Listed catalog models
-    never touch the network regardless.
+    ``skip_net=True`` forces the offline heuristic for an UNLISTED model (no HF probe), threaded
+    explicitly through the sizing stack (no process-global state) -- the cost estimator passes it
+    so estimation never does network I/O. Listed catalog models never touch the network regardless.
     """
 
     # Best-effort knob extraction: this provisional sizing runs at parse time BEFORE the
@@ -346,12 +345,15 @@ def model_required_vram_gb(
 def fetch_hf_params_b(model_id: str, *, skip_net: bool = False) -> float | None:
     """Total params (billions) from the HF API safetensors metadata (no download).
 
-    Network is skipped (returns ``None``) when EITHER the ambient ``FLASH_SKIP_NET`` env is set
-    (the long-standing global switch, honored for every caller) OR an explicit ``skip_net=True``
-    is passed -- the library-safe way for a caller (e.g. the cost estimator) to force the offline
-    heuristic for one call without mutating the process-global env.
+    Best-effort: returns ``None`` when the size can't be read (no network / no HF metadata),
+    so callers fall back to the offline heuristic rather than failing.
+
+    ``skip_net=True`` forces the offline path (returns ``None`` without any HF probe) -- the
+    library-safe way for a caller (e.g. the cost estimator / ``flash train --cost``) to size an
+    unlisted model with ZERO network I/O for one call, threaded explicitly through the sizing
+    stack rather than via any process-global state.
     """
-    if skip_net or os.environ.get("FLASH_SKIP_NET"):
+    if skip_net:
         return None
     try:
         from huggingface_hub import HfApi
@@ -375,11 +377,17 @@ def check_fit(
     gpu: str,
     quant: str = "bf16",
     params_b: float | None = None,
+    *,
+    skip_net: bool = False,
 ) -> VramEstimate:
-    """Estimate whether ``model_id`` plausibly trains on ``gpu``; never raises."""
+    """Estimate whether ``model_id`` plausibly trains on ``gpu``; never raises.
+
+    ``skip_net=True`` sizes an unlisted model offline (no HF probe -> ``unknown`` verdict),
+    threaded explicitly so ``flash train --cost`` resolves the spec with zero network I/O.
+    """
     gpu_gb = GPU_VRAM_GB.get(gpu, 32)
     if params_b is None:
-        params_b = fetch_hf_params_b(model_id)
+        params_b = fetch_hf_params_b(model_id, skip_net=skip_net)
     if params_b is None:
         return VramEstimate(None, algorithm, quant, None, gpu, gpu_gb, "unknown")
     est = estimate_vram_gb(params_b, algorithm, quant)

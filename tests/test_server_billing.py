@@ -1,8 +1,8 @@
 """Estimate-based run billing: the control plane charges the pre-flight estimate at submit.
 
 CPU-only / offline. Two layers are covered:
-  * the billing client ``flash.server.billing.charge_run_estimate`` (FLASH_SKIP_NET no-op,
-    the POST shape, and error translation), and
+  * the billing client ``flash.server.billing.charge_run_estimate`` (the POST shape and error
+    translation; the network boundary is stubbed via ``urllib.request.urlopen``), and
   * the ``POST /v1/runs`` gate (charge fires for a normal user submit, a 402 blocks the run
     and records nothing, and --dry-run / the internal service identity skip billing).
 """
@@ -39,8 +39,11 @@ def _bearer(key: str) -> dict:
 
 
 def _spec(monkeypatch):
-    """Parse SPEC into a JobSpec offline (FLASH_SKIP_NET avoids any HF probe)."""
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
+    """Parse SPEC into a JobSpec offline.
+
+    SPEC is a catalog model on a concrete GPU pin, so the parse never probes HF anyway; the
+    autouse ``_offline`` conftest fixture also stubs ``fetch_hf_params_b`` -- no env switch.
+    """
     from flash.schema import spec_from_dict
 
     return spec_from_dict(SPEC, run_id="run-1")
@@ -65,41 +68,40 @@ def test_cents_rounds_half_up_not_bankers():
     assert _cents(1.005) == 101  # classic banker's-rounding trap
 
 
-def test_offline_estimate_does_not_mutate_skip_net_env(monkeypatch):
-    """``offline_estimate_for_spec`` must NOT flip the process-wide ``FLASH_SKIP_NET`` (the
-    control plane is concurrent; a flipped global could make other requests skip network I/O).
-    It relies on ``estimate_cost``'s explicit ``skip_net=True`` instead. PR #3 review."""
+def test_offline_estimate_does_no_hf_network_for_unlisted_model(monkeypatch):
+    """``offline_estimate_for_spec`` must size an unlisted model with ZERO HF network I/O,
+    achieved by the explicit ``skip_net=True`` ``estimate_cost`` threads through the sizing
+    stack (NOT a process-global switch -- the control plane is concurrent). PR #3 review."""
+    import flash.engine.vram as vram
     from flash.cost.spec import offline_estimate_for_spec
-
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     from flash.schema import spec_from_dict
 
-    # Parse offline once to get a spec, then clear the env and confirm the estimate keeps it clear.
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    spec = spec_from_dict(SPEC, run_id="run-env")
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
+    # Any HF probe NOT carrying skip_net=True is a network leak.
+    def guarded_fetch(model_id, *, skip_net=False):
+        if not skip_net:
+            raise AssertionError("offline estimate leaked an HF probe (skip_net not threaded)")
+        # Implicit None -> the offline heuristic fallback.
 
-    offline_estimate_for_spec(spec)
-    assert "FLASH_SKIP_NET" not in __import__("os").environ
+    monkeypatch.setattr(vram, "fetch_hf_params_b", guarded_fetch)
 
-
-def test_charge_is_noop_when_offline(monkeypatch):
-    from flash.server import billing
-
-    spec = _spec(monkeypatch)  # leaves FLASH_SKIP_NET set
-
-    def explode(*a, **k):
-        raise AssertionError("no network call may happen under FLASH_SKIP_NET")
-
-    monkeypatch.setattr(urllib.request, "urlopen", explode)
-    assert billing.charge_run_estimate(token="tok", spec=spec) == {}
+    raw = {
+        "model": "some-org/unlisted-7b",
+        "model_policy": "allow",
+        "algorithm": "grpo",
+        "environment": {"id": "primeintellect/gsm8k"},
+        "train": {"steps": 5, "seeds": [0], "hf_repo": "org/runs"},
+        "gpu": {"type": "cheapest"},
+    }
+    # Server-style parse leaves gpu.requested = "cheapest"; offline_estimate re-sizes it offline.
+    spec = spec_from_dict(raw, run_id="run-env", skip_net=True)
+    est = offline_estimate_for_spec(spec)
+    assert est.total_usd > 0
 
 
 def test_charge_posts_estimate_and_parses_response(monkeypatch):
     from flash.server import billing
 
     spec = _spec(monkeypatch)
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     captured = {}
 
@@ -139,7 +141,6 @@ def test_charge_raises_billing_error_on_402(monkeypatch):
     from flash.server import billing
 
     spec = _spec(monkeypatch)
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     def fake_urlopen(req, timeout=None):
         body = json.dumps(
@@ -164,7 +165,6 @@ def test_charge_unreachable_raises_503(monkeypatch):
     from flash.server import billing
 
     spec = _spec(monkeypatch)
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     def fake_urlopen(req, timeout=None):
         raise urllib.error.URLError("connection refused")
@@ -201,16 +201,14 @@ def test_charge_uses_offline_estimate_and_never_exceeds_quote(monkeypatch):
     size VRAM from a live HF probe and resolve a *larger* GPU than the fully-offline
     ``--estimate`` quote. The charge must use the OFFLINE-consistent amount the user saw, and
     in no case bill more than that quote (PR #3 review: estimate differs from submit charge)."""
+    import flash.engine.vram as vram
     from flash.cost.spec import estimate_for_spec, offline_estimate_for_spec
     from flash.server import billing
 
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
-
-    # Simulate the HF probe: live -> 14B (a bigger card), offline -> heuristic fallback.
-    import flash.engine.vram as vram
-
+    # Simulate the HF probe: an online probe (skip_net=False) -> 14B (a bigger card); the offline
+    # path (skip_net=True, what the quote/charge uses) -> heuristic fallback (None).
     def fake_fetch(model_id, *, skip_net=False):
-        if skip_net or __import__("os").environ.get("FLASH_SKIP_NET"):
+        if skip_net:
             return None
         return 14.0
 
@@ -259,22 +257,11 @@ def test_charge_uses_offline_estimate_and_never_exceeds_quote(monkeypatch):
     assert captured["body"]["gpu"] == offline.gpu
 
 
-def test_reverse_run_charge_posts_and_is_noop_offline(monkeypatch):
-    """The refund POSTs a reversal for the run; ``FLASH_SKIP_NET`` makes it a no-op (mirrors
-    the charge), and the original charge's amount is forwarded for the backend to match."""
+def test_reverse_run_charge_posts_reversal(monkeypatch):
+    """The refund POSTs a reversal for the run, forwarding the original charge's amount for the
+    backend to match the exact debit."""
     from flash.server import billing
 
-    # Offline no-op.
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-
-    def explode(*a, **k):
-        raise AssertionError("no network under FLASH_SKIP_NET")
-
-    monkeypatch.setattr(urllib.request, "urlopen", explode)
-    assert billing.reverse_run_charge(token="tok", run_id="r1", charge={"amountCents": 50}) == {}
-
-    # Online: POSTs a reversal carrying runId + the original amount.
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     captured = {}
 
     class _Resp:

@@ -15,7 +15,7 @@ socket is opened, but the client's request building, JSON (de)serialisation and
 on either side -- a renamed RunStatus field, a tightened spec validator, a
 changed status code -- fails here.
 
-Runs offline (``FLASH_SKIP_NET=1 uv run pytest``); ``_run_job`` is stubbed so
+Runs offline (``uv run pytest``); ``_run_job`` is stubbed so
 ``create_run`` never provisions a GPU.
 """
 
@@ -99,6 +99,11 @@ def make_client(tmp_path, monkeypatch):
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    # The submit-time org charge (server/billing) talks to the freesolo backend; it has its own
+    # suite (test_server_billing.py). Stub it to a no-op here so this cross-component test stays
+    # focused on the client<->server CONTRACT (and isn't routed through the urllib shim onto a
+    # backend route the in-process app doesn't serve).
+    monkeypatch.setattr("flash.server.billing.charge_run_estimate", lambda *, token, spec: {})
 
     with TestClient(app_mod.create_app()) as test_client:
 

@@ -4,9 +4,9 @@ Shared by the CLI (``slm train --cost``) and the control plane (which charges th
 to the user's org at submit), so both price the SAME work the run will bill for.
 
 The CHARGE-vs-QUOTE invariant (PR #3 review): ``slm train --cost`` resolves the spec fully
-OFFLINE (the CLI scopes ``FLASH_SKIP_NET`` over parse + sizing), but the control plane parses
-the submitted spec WITHOUT that guard — so for a ``model_policy = "allow"`` unlisted model,
-the server's parse can read the real param count from the HF API and resolve a different
+OFFLINE (the CLI threads an explicit ``skip_net=True`` through parse + sizing), but the control
+plane parses the submitted spec WITHOUT that flag — so for a ``model_policy = "allow"`` unlisted
+model, the server's parse can read the real param count from the HF API and resolve a different
 (e.g. larger) GPU class into ``spec.gpu.type`` than the offline CLI quote showed.
 ``offline_estimate_for_spec`` re-prices the spec on the SAME offline basis the user saw
 (a policy-word GPU re-resolved offline from ``gpu.requested``); the control plane bills ``min``
@@ -153,14 +153,14 @@ def estimate_for_spec(spec) -> CostEstimate:
 def offline_estimate_for_spec(spec) -> CostEstimate:
     """The OFFLINE-consistent estimate -- what ``slm train --cost`` would have quoted.
 
-    Reproduces the CLI's offline quote WITHOUT mutating the process-wide ``FLASH_SKIP_NET``
-    env: ``estimate_cost`` already forces offline HF sizing (``select_gpu`` passes
-    ``skip_net=True`` to ``required_vram_gb``), and ``offline_gpu=True`` forwards a policy-word
-    GPU so the class is re-picked from that offline VRAM rather than the (possibly HF-sized)
-    parse-time pin. Avoiding the env flip is important on the control plane, where concurrent
-    requests (auth verify, provider pricing, other submits) must not observe a flipped global
-    and unexpectedly skip their own network I/O (PR #3 review). The control plane bills the
-    ``min`` of THIS amount and the parsed estimate (``charge_run_estimate``), so the org is
-    charged the quote in the normal case and never more than it.
+    Reproduces the CLI's offline quote WITHOUT any process-global state: ``estimate_cost``
+    already forces offline HF sizing (``select_gpu`` passes ``skip_net=True`` to
+    ``required_vram_gb``), and ``offline_gpu=True`` forwards a policy-word GPU so the class is
+    re-picked from that offline VRAM rather than the (possibly HF-sized) parse-time pin. Keeping
+    this purely explicit (no global flag) is important on the control plane, where concurrent
+    requests (auth verify, provider pricing, other submits) must keep doing their own network I/O
+    unaffected (PR #3 review). The control plane bills the ``min`` of THIS amount and the parsed
+    estimate (``charge_run_estimate``), so the org is charged the quote in the normal case and
+    never more than it.
     """
     return estimate_cost(runconfig_from_spec(spec, offline_gpu=True))

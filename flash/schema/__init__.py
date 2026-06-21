@@ -40,6 +40,8 @@ def spec_from_file(
     run_id: str | None = None,
     overrides: list[str] | None = None,
     extra_configs: list[str] | None = None,
+    *,
+    skip_net: bool = False,
 ) -> JobSpec:
     raw = load_toml(path)
     # Composed configs: later files override earlier keys (deep merge).
@@ -48,7 +50,7 @@ def spec_from_file(
     # `--set key=value` dotted overrides (highest precedence).
     for item in overrides or []:
         _apply_override(raw, item)
-    return spec_from_dict(raw, run_id=run_id)
+    return spec_from_dict(raw, run_id=run_id, skip_net=skip_net)
 
 
 def _deep_merge(base: dict, extra: dict) -> dict:
@@ -86,7 +88,9 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
-def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
+def spec_from_dict(
+    raw: dict[str, Any], run_id: str | None = None, *, skip_net: bool = False
+) -> JobSpec:
     try:
         model = raw["model"]
     except KeyError as exc:
@@ -141,6 +145,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             algorithm=algorithm,
             train=train_raw,
             thinking=thinking,
+            skip_net=skip_net,
         )
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
@@ -161,7 +166,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true to use it anyway."
         )
     try:
-        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
+        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type, skip_net=skip_net)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if thinking and info.thinking == "none":
