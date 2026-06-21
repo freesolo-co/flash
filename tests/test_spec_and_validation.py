@@ -296,7 +296,6 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
     from flash.engine import vram
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     assert vram.fetch_hf_params_b("any/model") is None
 
 
