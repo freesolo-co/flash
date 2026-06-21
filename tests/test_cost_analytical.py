@@ -234,49 +234,6 @@ def test_explicit_grpo_max_length_still_wins():
     assert need == real
 
 
-def test_estimate_does_no_network_for_unlisted_model(monkeypatch):
-    # The estimator's contract is fully local. select_gpu() threads skip_net=True through the VRAM
-    # sizing stack (required_vram_gb -> model_required_vram_gb -> fetch_hf_params_b), so an UNLISTED
-    # model never constructs the HF network client: fetch_hf_params_b's skip_net guard short-circuits
-    # (return None) BEFORE it imports/instantiates HfApi. Wire HfApi to flip a flag if ever built and
-    # assert it stays untouched, and that the estimate still succeeds via the offline fallback (the
-    # 24 GB tier). (This is purely the explicit param -- there is no global offline env switch.)
-    import huggingface_hub
-
-    built = []
-
-    class _NoNetHfApi:  # pragma: no cover - must never be constructed/called
-        def __init__(self, *a, **k):
-            built.append(True)
-            raise AssertionError("estimator constructed the HF network client (HfApi)")
-
-        def model_info(self, *a, **k):
-            raise AssertionError("estimator hit the HF network (model_info)")
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _NoNetHfApi)
-    e = estimate_cost(RunConfig("some-org/totally-unlisted-7b", "grpo", 50))
-    assert not built  # the network client was never even constructed
-    assert e.required_vram_gb >= 24  # sane offline VRAM estimate (unlisted -> 24 GB tier)
-    assert e.total_usd > 0
-
-
-def test_skip_net_param_bypasses_hf(monkeypatch):
-    # Unit-level: the threaded skip_net=True bypasses the HF probe for an unlisted model -- proving
-    # the explicit param (not any global state) is what forces offline sizing.
-    from flash.engine.vram import fetch_hf_params_b, model_required_vram_gb
-
-    def _boom(*a, **k):  # any HF construction/lookup is a failure
-        raise AssertionError("hit the HF network despite skip_net=True")
-
-    import huggingface_hub
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _boom)
-    # Direct: skip_net short-circuits to None (offline) without constructing HfApi.
-    assert fetch_hf_params_b("some-org/unlisted", skip_net=True) is None
-    # And the sizing matrix falls back to the 24 GB tier for the unreadable unlisted model.
-    assert model_required_vram_gb("some-org/unlisted", "grpo", skip_net=True) == 24
-
-
 @pytest.mark.parametrize(
     "knob",
     ["seq_len", "batch_size", "group_size", "completion_len", "lora_rank"],

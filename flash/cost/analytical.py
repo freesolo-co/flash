@@ -14,7 +14,6 @@ from flash.providers.allocator import required_vram_gb, vram_headroom
 from flash.providers.base import providers_for
 
 from .facts import (
-    active_params_b,
     download_weight_gb,
     gpu_tflops,
     gpu_vram_gb,
@@ -74,18 +73,18 @@ def setup_seconds(config: RunConfig) -> float:
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
     """Steady-state wall time for one optimizer step on ``gpu``."""
     n = config.normalized()
-    active = active_params_b(n.model_id) * 1e9
+    params = total_params_b(n.model_id) * 1e9
     peak = gpu_tflops(gpu) * 1e12  # FLOP/s
 
     if not n.is_grpo:
-        flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * active * (n.batch_size * n.seq_len)
+        flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * MFU_SFT_TRAIN)
 
     # GRPO step = rollout (G completions/prompt) + concurrent reward grading + policy/ref update.
     completions = n.batch_size * n.group_size
     gen_tokens = completions * n.completion_len
-    gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_DECODE)
-    update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * active * gen_tokens) / (peak * MFU_TRAIN)
+    gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
+    update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_TRAIN)
     latency = reward_seconds_per_completion(n.reward_seconds_per_completion)
     reward_s = math.ceil(completions / REWARD_CONCURRENCY) * latency  # ceil: a partial wave still costs one latency
     return gen_s + reward_s + update_s
@@ -119,9 +118,6 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
 def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: float) -> tuple[str, ...]:
     n = config.normalized()
     notes: list[str] = []
-    total, active = total_params_b(n.model_id), active_params_b(n.model_id)
-    if active < total:
-        notes.append(f"MoE: {active:.0f}B active of {total:.0f}B total params drive compute cost")
     if (quant := model_quant(n.model_id)) != "bf16":
         notes.append(f"{quant}: smaller VRAM footprint -> cheaper GPU class fits")
     if n.is_grpo:

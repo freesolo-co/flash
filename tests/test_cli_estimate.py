@@ -206,30 +206,9 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
 
 
-def test_cmd_train_cost_is_offline_for_unlisted_open_model(tmp_path, capsys, monkeypatch):
-    """``--cost`` must be fully OFFLINE even for an unlisted ``model_policy = "allow"`` model:
-    BOTH parse-time sizing paths -- GPU policy resolution (``resolve_gpu_policy`` ->
-    ``model_required_vram_gb``) and the open-model fit estimate (``resolve_model`` ->
-    ``check_fit``) -- would otherwise probe HF via ``fetch_hf_params_b``. The CLI threads an
-    EXPLICIT ``skip_net=True`` through the parse (there is no global offline env switch), so
-    ``fetch_hf_params_b`` is only ever reached with ``skip_net=True`` and the quote stays
-    deterministic + matches what the control plane charges. PR #3 review."""
-    import flash.engine.vram as vram
-
-    # Any HF probe NOT carrying the explicit skip_net=True is a network leak -> fail loudly.
-    # (Deliberately consults NO env: offline-ness must come purely from the threaded param.)
-    seen_skip_net: list[bool] = []
-
-    def guarded_fetch(model_id, *, skip_net=False):
-        seen_skip_net.append(skip_net)
-        if not skip_net:
-            raise AssertionError(
-                "--cost leaked a network HF probe (skip_net not threaded through the parse)"
-            )
-        # Implicit None: drops to the heuristic param-count fallback (the offline behavior).
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", guarded_fetch)
-
+def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
+    """Cost is catalog-only: ``--cost`` on a non-catalog model errors cleanly (no open-model
+    sizing)."""
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "some-org/unlisted-7b"\n'
@@ -240,16 +219,10 @@ def test_cmd_train_cost_is_offline_for_unlisted_open_model(tmp_path, capsys, mon
         "[train]\n"
         "steps = 10\n"
         'hf_repo = "owner/runs"\n'
-        "[gpu]\n"
-        'type = "cheapest"\n'  # policy word -> GPU resolved from the (offline) VRAM sizing
     )
     args = types.SimpleNamespace(
         config=str(cfg), overrides=[], extra_configs=[], cost=True, dry_run=False, background=False
     )
-    rc = cmd_train(args)
-    assert rc == 0
-    assert "TOTAL" in capsys.readouterr().out
-    # The probe WAS reached (the unlisted model needs sizing) and EVERY call was offline.
-    assert seen_skip_net  # at least one sizing probe happened
-    assert all(seen_skip_net)  # and every one carried skip_net=True
+    with pytest.raises((KeyError, ValueError)):
+        cmd_train(args)
 

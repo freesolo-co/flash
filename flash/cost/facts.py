@@ -3,8 +3,6 @@ selection, model size/quant, and reward-grader latency. Pure tables + accessors.
 
 from __future__ import annotations
 
-import re
-
 from flash.catalog import MODELS
 from flash.providers.base import GPU_INFO, GpuClass, canonical_gpu, providers_for
 
@@ -127,60 +125,29 @@ def pick_gpu(
 
 
 # ===== Model-size facts =====
-_DOWNLOAD_BYTES_PER_PARAM = 2.0
-DEFAULT_PARAMS_B = 4.0  # when a model's size can't be read (open-model policy, offline probe)
-
-
-def _params_str(model_id: str) -> str | None:
+# The managed catalog is five DENSE text models (no MoE), so every parameter is active and a
+# model's size is just the leading "<n>B" of its curated ``params`` string. Cost estimation
+# supports catalog models ONLY -- there is no open-model/unlisted or MoE sizing here.
+def total_params_b(model_id: str) -> float:
+    """Total parameter count (billions) for a catalog model -- the curated ``params_b`` stat."""
     info = MODELS.get(model_id)
-    return info.params if info is not None else None
-
-
-def _params_b_from_str(s: str | None) -> float | None:
-    """Leading param count (billions) from a catalog/id string. Case-insensitive on the size
-    suffix; expands ``NxMB`` MoE to total (Mixtral-8x7B -> 56B); understands an ``M`` suffix."""
-    if not s:
-        return None
-    moe = re.search(r"([0-9]+)\s*[xX]\s*([0-9]+(?:\.[0-9]+)?)\s*[Bb]\b", s)
-    if moe:
-        return float(moe.group(1)) * float(moe.group(2))
-    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*[Bb]\b", s)
-    if m:
-        return float(m.group(1))
-    mil = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*[Mm]\b", s)
-    if mil:
-        return float(mil.group(1)) / 1000.0
-    return None
-
-
-def total_params_b(model_id: str, params_str: str | None = None) -> float:
-    """Total parameter count in billions (the full checkpoint)."""
-    s = params_str if params_str is not None else _params_str(model_id)
-    val = _params_b_from_str(s)
-    if val is None:
-        val = _params_b_from_str(model_id)  # unlisted: parse the id (e.g. "...-35B-A3B")
-    return float(val) if val else DEFAULT_PARAMS_B
-
-
-def active_params_b(model_id: str, params_str: str | None = None) -> float:
-    """Active parameters per token (billions). For MoE, the ``A<n>B`` figure; else == total."""
-    s = params_str if params_str is not None else _params_str(model_id)
-    for hay in (model_id, s or ""):
-        m = re.search(r"[Aa](\d+(?:\.\d+)?)\s*[Bb]\b", hay)
-        if m:
-            return float(m.group(1))
-    return total_params_b(model_id, params_str)
+    if info is None:
+        raise KeyError(
+            f"unknown model {model_id!r}; cost estimation supports catalog models only "
+            f"({', '.join(MODELS)})"
+        )
+    return info.params_b
 
 
 def model_quant(model_id: str) -> str:
-    """Quantization of the curated entry (``"bf16"`` or ``"4bit-qlora"``); bf16 default."""
+    """Quantization of the catalog entry (``"bf16"`` or ``"4bit-qlora"``); bf16 default."""
     info = MODELS.get(model_id)
-    return (getattr(info, "quant", None) or "bf16") if info is not None else "bf16"
+    return (info.quant or "bf16") if info is not None else "bf16"
 
 
-def download_weight_gb(model_id: str, params_str: str | None = None) -> float:
-    """Approximate GB pulled from the HF hub at cold start (full bf16 checkpoint)."""
-    return total_params_b(model_id, params_str) * _DOWNLOAD_BYTES_PER_PARAM
+def download_weight_gb(model_id: str) -> float:
+    """GB pulled from the HF hub at cold start (full bf16 checkpoint, 2 bytes/param)."""
+    return total_params_b(model_id) * 2.0
 
 
 # ===== Reward-grader latency (GRPO) =====

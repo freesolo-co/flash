@@ -68,37 +68,6 @@ def test_cents_rounds_half_up_not_bankers():
     assert _cents(1.005) == 101  # classic banker's-rounding trap
 
 
-def test_offline_estimate_does_no_hf_network_for_unlisted_model(monkeypatch):
-    """``offline_estimate_for_spec`` must size an unlisted model with ZERO HF network I/O,
-    achieved by the explicit ``skip_net=True`` ``estimate_cost`` threads through the sizing
-    stack (NOT a process-global switch -- the control plane is concurrent). PR #3 review."""
-    import flash.engine.vram as vram
-    from flash.cost.spec import offline_estimate_for_spec
-    from flash.schema import spec_from_dict
-
-    # Any HF probe NOT carrying skip_net=True is a network leak.
-    def guarded_fetch(model_id, *, skip_net=False):
-        if not skip_net:
-            raise AssertionError("offline estimate leaked an HF probe (skip_net not threaded)")
-        # Implicit None -> the offline heuristic fallback.
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", guarded_fetch)
-
-    raw = {
-        "model": "some-org/unlisted-7b",
-        "model_policy": "allow",
-        "algorithm": "grpo",
-        "environment": {"id": "primeintellect/gsm8k"},
-        "train": {"steps": 5, "seeds": [0], "hf_repo": "org/runs"},
-        "gpu": {"type": "cheapest"},
-    }
-    # Server-style parse (gpu.type is just the provisional cheapest); offline_estimate sizes it
-    # offline via the threaded skip_net=True.
-    spec = spec_from_dict(raw, run_id="run-env", skip_net=True)
-    est = offline_estimate_for_spec(spec)
-    assert est.total_usd > 0
-
-
 def test_charge_posts_estimate_and_parses_response(monkeypatch):
     from flash.server import billing
 
@@ -195,64 +164,6 @@ def test_http_error_detail_falls_back_to_reason():
         "http://x/api/billing/training-usage", 402, "Payment Required", {}, io.BytesIO(b"{}")
     )
     assert "Payment Required" in _http_error_detail(empty)
-
-
-def test_charge_equals_quote_for_unlisted_model(monkeypatch):
-    """CHARGE == QUOTE for a ``model_policy = "allow"`` unlisted model. The server's parse can
-    HF-size ``spec.gpu.type`` larger than the offline ``--cost`` quote, but the estimate does NOT
-    pin ``spec.gpu.type`` -- it does its own offline cheapest-fit -- so the charged amount equals
-    the quote regardless of the parse-time probe (PR #3 review: estimate differs from charge)."""
-    import flash.engine.vram as vram
-    from flash.cost.spec import estimate_for_spec, offline_estimate_for_spec
-    from flash.server import billing
-
-    # An online HF probe (skip_net=False) -> 14B (would size a bigger provisional gpu.type); the
-    # offline path (skip_net=True, what the estimate uses) -> heuristic fallback (None).
-    def fake_fetch(model_id, *, skip_net=False):
-        return None if skip_net else 14.0
-
-    monkeypatch.setattr(vram, "fetch_hf_params_b", fake_fetch)
-
-    from flash.schema import spec_from_dict
-
-    raw = {
-        "model": "some-org/unlisted-14b",
-        "model_policy": "allow",
-        "algorithm": "sft",
-        "environment": {"id": "primeintellect/gsm8k"},
-        "train": {"steps": 5, "seeds": [0], "hf_repo": "org/runs", "max_examples": 100},
-        "gpu": {"type": "cheapest"},
-    }
-    spec = spec_from_dict(raw, run_id="run-div")  # server-style parse: network ON
-
-    # The estimate ignores the (HF-sized) provisional pin and sizes offline, so the parsed and
-    # offline estimates are identical -- there is no quote-vs-charge divergence to begin with.
-    assert estimate_for_spec(spec).total_usd == offline_estimate_for_spec(spec).total_usd
-    quote = offline_estimate_for_spec(spec)
-
-    captured = {}
-
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return json.dumps({"amountCents": captured.get("cost", 0)}).encode()
-
-    def fake_urlopen(req, timeout=None):
-        captured["body"] = json.loads(req.data)
-        captured["cost"] = captured["body"]["costCents"]
-        return _Resp()
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    billing.charge_run_estimate(token="fslo-user-9", spec=spec)
-
-    # Charged exactly the offline quote the user saw.
-    assert captured["body"]["costCents"] == billing._cents(quote.total_usd)
-    assert captured["body"]["gpu"] == quote.gpu
 
 
 def test_reverse_run_charge_posts_reversal(monkeypatch):
