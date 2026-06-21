@@ -106,6 +106,8 @@ def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
     handle = {"provider": "runpod", "endpoint_id": "ep-1"}
 
     assert reconcile._due(_status(state="done", updated_at=settled, remote=handle), now)
+    # deployed runs have FINISHED training (cost is final) -> still reconciled
+    assert reconcile._due(_status(state="deployed", updated_at=settled, remote=handle), now)
     # not terminal yet
     assert not reconcile._due(_status(state="running", updated_at=settled, remote=handle), now)
     # dry_run spent no GPU
@@ -141,8 +143,8 @@ def test_reconcile_run_reports_and_persists(monkeypatch):
     updates: dict = {}
     monkeypatch.setattr(
         runner,
-        "_update",
-        lambda run_id, state, **kw: updates.update(run_id=run_id, state=state, **kw),
+        "record_realized_cost",
+        lambda run_id, **kw: updates.update(run_id=run_id, **kw),
     )
 
     assert reconcile.reconcile_run(status, now=now) is True
@@ -151,8 +153,10 @@ def test_reconcile_run_reports_and_persists(monkeypatch):
     assert posted["provider"] == "vast"
     assert posted["gpu"] == "RTX 5090"
     assert posted["costBasis"] == "realized"
-    # persisted locally, same terminal state, with the realized figure + a reconcile marker.
-    assert updates["state"] == "done"
+    # persisted locally via the cost-only writer (never touches state) with the realized figure
+    # + a reconcile marker.
+    assert updates["run_id"] == "r-pos"
+    assert "state" not in updates
     assert updates["realized_cost_usd"] == 4.2
     assert updates["reconciled_at"] == now
 
@@ -178,6 +182,48 @@ def test_reconcile_run_skips_zero_and_unreported(monkeypatch):
     )
     monkeypatch.setattr(reconcile, "_report", lambda body: False)
     assert reconcile.reconcile_run(status, now=now) is False
+
+
+def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, monkeypatch):
+    # Regression (HIGH): reconcile_run holds a status SNAPSHOT taken when the run was `done`,
+    # but the run can advance to `deployed` while provider billing is pulled. Persisting must
+    # update ONLY the cost columns and keep the run's CURRENT state -- it must NOT write the
+    # stale `done` back and revert the live deployment (the terminal-sticky CAS wouldn't catch
+    # it, since `deployed` is non-terminal). Exercises the real on-disk record_realized_cost.
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path))
+    now = 1_000_000.0
+    snapshot = _status(
+        run_id="r-adv",
+        state="done",  # state as seen when the reconcile snapshot was taken
+        updated_at=now - 7200,
+        remote={"provider": "runpod", "endpoint_id": "ep-1"},
+    )
+    # The run has since advanced to `deployed` on disk (serving stood up on the finished run).
+    runner._save_status(
+        runner.RunStatus(
+            run_id="r-adv",
+            state="deployed",
+            spec={},
+            created_at=0.0,
+            updated_at=now - 100,
+            remote={"provider": "runpod", "endpoint_id": "ep-1"},
+            deployment={"state": "active"},
+        )
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "realized_cost_for_remote",
+        lambda remote, **kw: realized.RealizedCost(provider="runpod", realized_usd=3.3),
+    )
+    monkeypatch.setattr(reconcile, "_report", lambda body: True)
+
+    assert reconcile.reconcile_run(snapshot, now=now) is True
+    persisted = runner.get_status("r-adv")
+    # Status preserved (NOT reverted to the stale `done`), cost fields written.
+    assert persisted.state == "deployed"
+    assert persisted.deployment == {"state": "active"}
+    assert persisted.realized_cost_usd == 3.3
+    assert persisted.reconciled_at == now
 
 
 def test_reconcile_once_disabled_without_internal_key(monkeypatch):
