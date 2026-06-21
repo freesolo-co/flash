@@ -310,6 +310,7 @@ def poll_job(
     setup_grace_s: float = 3000.0,
     queue_grace_s: float = 720.0,
     unhealthy_grace_s: float = 240.0,
+    throttled_grace_s: float = 300.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
@@ -320,6 +321,10 @@ def poll_job(
     slow cold start isn't misread as a stall; after it we use the tight ``stall_after_s``.
     Needs a ``heartbeat_reader`` to tell the phases apart — without one we keep
     ``stall_after_s`` throughout (no regression).
+
+    ``throttled_grace_s`` bounds how long we wait on a worker stuck THROTTLED (no RunPod
+    capacity for the pinned GPU class) before returning a retryable stall so the runner
+    walks to the next-best GPU.
     """
 
     say = make_say(log)
@@ -332,6 +337,7 @@ def poll_job(
     seen_heartbeat = False
     last_health_probe = 0.0
     unhealthy_since: float | None = None  # first time the worker was seen stuck UNHEALTHY
+    throttled_since: float | None = None  # first time the worker was seen stuck THROTTLED
     # A good probe in THIS IN_QUEUE episode saw a CONFIRMED-empty queue: no usable worker
     # (running/ready/idle) AND none initializing. This (and only this) gates the no_capacity
     # fast-path; it latches across a single probe flake (see the except below).
@@ -422,6 +428,25 @@ def poll_job(
                         )
                 else:
                     unhealthy_since = None  # recovered / usable worker appeared
+                # Fail fast on a worker stuck THROTTLED: RunPod has no capacity for the pinned GPU
+                # class/pool and a throttled worker won't self-recover, so don't burn the full
+                # setup_grace_s (~50 min) waiting on it. Once it has stayed throttled with nothing
+                # usable or (re)initializing for throttled_grace_s, return a (retryable) stall so
+                # the runner's gpu-walk re-provisions on the NEXT-BEST GPU class — the cheapest fit
+                # often has no capacity while the next-best (a few cents/hr more) does.
+                if workers.get("throttled") and not usable and not recovering:
+                    if throttled_since is None:
+                        throttled_since = time.time()
+                    elif time.time() - throttled_since > throttled_grace_s:
+                        return PollResult(
+                            False,
+                            failure="stalled",
+                            detail=f"worker stuck throttled for "
+                            f"{int(time.time() - throttled_since)}s while IN_QUEUE (no RunPod "
+                            f"capacity for the pinned GPU class); retrying on the next-best GPU",
+                        )
+                else:
+                    throttled_since = None  # capacity appeared / usable worker
             except Exception:
                 # Health surfacing is diagnostic only; a probe failure must not stop polling.
                 # The no_capacity fast-path needs a CONFIRMED-empty queue (`capacity_confirmed`),

@@ -138,9 +138,15 @@ def test_poll_job_stall_detection(monkeypatch):
 
 
 def test_poll_job_no_capacity_when_stuck_in_queue(monkeypatch):
-    # A job that can't LEAVE the queue (worker stays throttled / never assigned) is on a
-    # capacity-starved class -> fail FAST with no_capacity (well before setup_grace_s) so the
-    # orchestrator walks to the next-cheapest available class instead of burning the full grace.
+    # A job that can't LEAVE the queue (a CONFIRMED-empty pool: no usable worker and none
+    # initializing) is on a capacity-starved class -> fail FAST with no_capacity (well before
+    # setup_grace_s) so the orchestrator walks to the next-cheapest available class instead of
+    # burning the full grace.
+    # NOTE (merge with dev's THROTTLED fast-fail, #40): a worker reported `throttled` is now owned
+    # by the throttled_grace_s path, which fires FIRST and returns a (retryable) `stalled` so the
+    # runner walks to the next-best GPU. The no_capacity fast-path is for an empty pool that is NOT
+    # throttled (all-zero counters), so this test uses that signal and keeps throttled_grace_s huge
+    # to isolate the no_capacity path.
     import itertools
 
     from flash.providers.runpod import api as runpod_api
@@ -148,7 +154,9 @@ def test_poll_job_no_capacity_when_stuck_in_queue(monkeypatch):
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
     monkeypatch.setattr(
-        runpod_api, "endpoint_health", lambda eid: {"workers": {"throttled": 1}}
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0}},
     )
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     clock = itertools.count(start=0, step=100.0)
@@ -160,6 +168,7 @@ def test_poll_job_no_capacity_when_stuck_in_queue(monkeypatch):
         heartbeat_reader=lambda: None,
         queue_grace_s=600.0,
         setup_grace_s=5000.0,  # MUCH larger: the queue grace must fire first
+        throttled_grace_s=100000.0,  # huge: isolate the no_capacity path from the throttled fast-fail
     )
     assert not res.ok
     assert res.failure == "no_capacity"
@@ -670,6 +679,87 @@ def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
         # trip no_capacity before the worker leaves IN_QUEUE.
         queue_grace_s=100000.0,
         unhealthy_grace_s=240.0,
+    )
+    assert res.ok
+    assert res.metrics == {"acc": 1.0}
+
+
+def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
+    # A worker stuck THROTTLED while IN_QUEUE (RunPod has no capacity for the pinned GPU class)
+    # won't self-recover, so poll_job must fail fast on throttled_grace_s and NOT burn the full
+    # setup_grace_s (~50 min) — returning a retryable stall so the runner walks to the next-best
+    # GPU. Regression guard for the observed "stuck queued for the whole wall-clock" failure.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    # poll_job is a pure function of its args (throttled_grace_s is passed below), so no env setup.
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"throttled": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}},
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        stall_after_s=150.0,
+        setup_grace_s=100000.0,  # huge: only the throttled fast-fail can trip here
+        unhealthy_grace_s=100000.0,  # huge: isolate the throttled path
+        throttled_grace_s=300.0,
+    )
+    assert res.failure == "stalled"  # infra-shaped -> runner retries on the next-best GPU
+    assert "throttled" in res.detail
+
+
+def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
+    # A brief throttle during cold start that then yields a usable worker must NOT trip the
+    # fast-fail (it resets once a usable worker appears) — only a STUCK throttle does.
+    import base64
+    import itertools
+
+    import cloudpickle
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    statuses = iter(
+        [
+            {"status": "IN_QUEUE"},  # probe 1: throttled -> arm throttled_since
+            {"status": "IN_QUEUE"},  # probe 2: usable worker -> reset (no fail)
+            {"status": "IN_PROGRESS"},
+            {
+                "status": "COMPLETED",
+                "output": {
+                    "success": True,
+                    "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode(),
+                },
+            },
+        ]
+    )
+    healths = iter(
+        [
+            {"workers": {"throttled": 1, "running": 0, "ready": 0, "idle": 0, "initializing": 0}},
+            {"workers": {"throttled": 0, "running": 1, "ready": 0, "idle": 0, "initializing": 0}},
+        ]
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(statuses))
+    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: next(healths, {"workers": {}}))
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        stall_after_s=150.0,
+        setup_grace_s=100000.0,
+        throttled_grace_s=300.0,
     )
     assert res.ok
     assert res.metrics == {"acc": 1.0}
