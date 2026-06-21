@@ -72,6 +72,13 @@ class RunStatus:
     # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds
     # after an inter-seed restart instead of failing the run (losing completed work).
     resume_seed_index: int | None = None
+    # Realized provider cost (COGS), pulled from the provider's billing API after the run
+    # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
+    # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the wall x $/hr
+    # PROJECTION); ``reconciled_at`` marks that the realized pull has happened so it isn't
+    # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
+    realized_cost_usd: float | None = None
+    reconciled_at: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

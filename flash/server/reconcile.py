@@ -1,0 +1,130 @@
+"""Daily realized-cost reconciliation: pull what the GPU provider actually billed for each
+finished run and report it to the freesolo backend for ESTIMATOR ACCURACY tracking.
+
+The flash CLI charges each run its pre-flight ESTIMATE at submit; this is the other half --
+the realized provider invoice (RunPod /v1/billing/endpoints, Vast /v0/charges/). The backend's
+training_cost_accuracy view joins the two per run to surface estimated-vs-realized error.
+
+Best-effort and entirely off the run hot path: it runs in a background loop (see the server
+lifespan), never blocks request handling, and any failure is swallowed and retried next cycle.
+Realized cost is reported with the operator INTERNAL key (this is COGS, not a customer charge),
+which also gates the whole feature -- with no FREESOLO_INTERNAL_KEY set, reconciliation is off.
+
+Scope note (v1): cost is attributed from the run's last persisted handle (RunStatus.remote),
+which is exact for the common single-seed run. A multi-seed run keeps only its final seed's
+handle, so its realized cost is currently under-counted -- a known limitation to extend by
+persisting every seed's resource id.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+
+from flash import runner
+from flash.providers.realized import realized_cost_for_remote
+from flash.server.auth import INTERNAL_KEY_ENV, freesolo_base_url
+
+_REPORT_PATH = "/api/billing/training-cost"
+_REPORT_TIMEOUT_S = 10.0
+# Provider billing lags; wait this long after a run goes terminal before pulling (so the
+# invoice has settled) and stop retrying once a run is older than the window.
+_SETTLE_SECONDS = 3600.0  # 1h
+_WINDOW_SECONDS = 7 * 86400.0  # only reconcile runs that finished within the last 7 days
+# States that incur no GPU cost -> never reconciled.
+_FREE_TERMINAL_STATES = frozenset({"dry_run"})
+
+
+def reconcile_enabled() -> bool:
+    """Reconciliation (and its reporting) is on only when the operator internal key is set."""
+    return bool(os.environ.get(INTERNAL_KEY_ENV))
+
+
+def _report(body: dict) -> bool:
+    """POST realized cost to the backend with the internal key (Bearer). Best-effort: returns
+    True on a 2xx, False on any failure (never raises). Mirrors ``billing._post_billing`` but
+    swallows errors -- a metering report must never affect anything."""
+    key = os.environ.get(INTERNAL_KEY_ENV)
+    if not key:
+        return False
+    req = urllib.request.Request(
+        f"{freesolo_base_url()}{_REPORT_PATH}",
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_REPORT_TIMEOUT_S) as resp:
+            resp.read()
+        return True
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def _due(status: runner.RunStatus, now: float) -> bool:
+    """Whether a run should be reconciled this pass: a billable terminal run, not yet reconciled,
+    past the settle delay, still within the window, and carrying a provider handle."""
+    if status.state not in runner.TERMINAL_STATES or status.state in _FREE_TERMINAL_STATES:
+        return False
+    if status.reconciled_at:
+        return False
+    age = now - float(status.updated_at)
+    if age < _SETTLE_SECONDS or age > _WINDOW_SECONDS:
+        return False
+    return bool(status.remote)
+
+
+def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool:
+    """Pull + report realized cost for one run; mark it reconciled on success. Returns True when
+    a positive realized cost was reported. A zero/None result leaves the run unreconciled so a
+    later cycle (within the window) retries once the provider invoice settles."""
+    now = time.time() if now is None else now
+    remote = status.remote or {}
+    start = float(remote.get("started_ts") or status.created_at)
+    end = float(status.updated_at) + _SETTLE_SECONDS
+    realized = realized_cost_for_remote(remote, start=start, end=end)
+    if realized is None or realized.realized_usd <= 0:
+        return False
+
+    body = {
+        "runId": status.run_id,
+        "realizedCostUsd": realized.realized_usd,
+        "provider": realized.provider,
+        "gpu": remote.get("allocated_gpu") or remote.get("gpu"),
+        "costByResource": realized.by_resource,
+        "wallSeconds": realized.wall_seconds,
+        "costBasis": "realized",
+        "source": realized.source,
+    }
+    if not _report(body):
+        return False
+
+    # Persist locally so we don't re-pull/re-report, and so `flash cost` can show realized vs
+    # estimated. Same-state write (terminal-sticky CAS allows field-only updates).
+    with contextlib.suppress(Exception):
+        runner._update(
+            status.run_id,
+            status.state,
+            realized_cost_usd=realized.realized_usd,
+            reconciled_at=now,
+        )
+    return True
+
+
+def reconcile_once(*, now: float | None = None) -> int:
+    """One sweep over local runs: reconcile every due run. Returns how many were reported."""
+    if not reconcile_enabled():
+        return 0
+    now = time.time() if now is None else now
+    reported = 0
+    for status in runner.list_runs():
+        if not _due(status, now):
+            continue
+        with contextlib.suppress(Exception):
+            if reconcile_run(status, now=now):
+                reported += 1
+    return reported
