@@ -1,7 +1,7 @@
-"""Regression test: `slm cancel` must reliably stop the REMOTE Flash worker.
+"""Regression test: `flash cancel` must reliably stop the REMOTE Flash worker.
 
 Bug: ``cancel_run`` called ``stop_endpoint``, which only scales endpoints found in the
-*current process's* in-memory cache. In a fresh ``slm cancel`` invocation that cache is empty,
+*current process's* in-memory cache. In a fresh ``flash cancel`` invocation that cache is empty,
 so the remote RunPod worker kept running (and billing) until the wall-clock cap. Fix:
 ``cancel_run`` uses ``terminate_endpoint`` to look the run's uniquely-named endpoint up in
 runpod_flash's persisted registry and delete it via the RunPod API (cross-process).
@@ -279,7 +279,7 @@ def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
         held["locked"] = ftrain.FLASH_SDK_LOCK.locked()
         raise RuntimeError("short-circuit before the real SDK lookup")
 
-    monkeypatch.setattr(ftrain, "isolate_flash_state", rec_isolate)
+    monkeypatch.setattr(ftrain.endpoints, "isolate_flash_state", rec_isolate)
     out = ftrain.terminate_endpoint("RTX 5090", "flash-1-abcd1234")
     assert held.get("locked") is True, "isolate_flash_state must run while holding FLASH_SDK_LOCK"
     assert ftrain.FLASH_SDK_LOCK.locked() is False, "lock must be released after terminate"

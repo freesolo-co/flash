@@ -1,4 +1,4 @@
-"""`slm version` / `slm --version` surface the package version."""
+"""`flash version` / `flash --version` surface the package version."""
 
 from __future__ import annotations
 
@@ -31,4 +31,4 @@ def test_version_flag():
 def test_version_subcommand():
     proc = _run(["version"])
     assert proc.returncode == 0, proc.stdout
-    assert proc.stdout.strip() == f"slm {__version__}"
+    assert proc.stdout.strip() == f"flash {__version__}"

@@ -1,4 +1,4 @@
-"""RunPod allocation: VRAM sizing, cheapest-wins ranking, pins, gates, fallbacks."""
+"""RunPod allocation: VRAM sizing, cheapest-wins ranking, fallbacks (no pins, no gates)."""
 
 from __future__ import annotations
 
@@ -27,79 +27,22 @@ def test_required_vram_catalog_and_open(monkeypatch):
     assert all(c.vram_gb >= 35 for c in a.candidates)
 
 
-def test_pinned_undersized_gpu_escalates_never_below_need(monkeypatch):
-    """An undersized / unavailable pin must NOT hard-fail: it escalates to the cheapest FITTING
-    class across providers (the pin is a preference, not a hard cap). The matrix ``need`` stays the
-    absolute floor (escalation never drops below it -> no OOM). Only a need that exceeds EVERY GPU
-    across EVERY provider raises (all options exhausted)."""
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
-
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    # Qwen3-4B GRPO at the default engine length (2368 tokens, mirroring run_rl) needs ~35 GB;
-    # pinning a 24 GB RTX 4090 escalates UP to the cheapest fitting class (never provisions an
-    # undersized OOM card, never raises).
-    a = allocator.allocate("Qwen/Qwen3.5-4B", "grpo", gpu="RTX 4090")
-    assert a.min_vram_gb == 35  # the model requirement floor is preserved
-    assert a.gpu != "RTX 4090"  # escalated off the undersized pin to a fitting class
-    # a pin that already fits the 35 GB floor is honored as-is
-    a = allocator.allocate("Qwen/Qwen3.5-4B", "grpo", gpu="A100 PCIe")
-    assert a.gpu == "A100 PCIe"
-    assert a.min_vram_gb == 35
-    # a requirement larger than every available GPU still raises (genuinely unsatisfiable)
-    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 4096)
-    with pytest.raises(UnsupportedGpuError):
-        allocator.allocate("Qwen/Qwen3.5-4B", "grpo", gpu="RTX 4090")
-
-
-def test_validation_gate_and_opt_in(monkeypatch):
+def test_no_validation_gate_picks_cheapest_fitting(monkeypatch):
     from flash.providers import allocator
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
-    # L4 is validated nowhere -> excluded by default...
+    # There is no validation gate: the cheapest fitting class wins even if it's a class
+    # Flash hasn't smoke-tested (previously the gate forced the cheapest VALIDATED class,
+    # RTX A5000 @ $0.27, for 0.8B GRPO). Offline only RunPod is available.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
-    # ...but the explicit opt-in admits cheaper unvalidated classes
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", allow_unvalidated=True)
     assert a.provider == "runpod"
-    assert a.hourly_usd <= 0.27  # an unvalidated class is at least as cheap as the A5000
+    assert a.hourly_usd <= 0.27  # at least as cheap as the previously-validated A5000 floor
 
 
-def test_provider_pin_runpod(monkeypatch):
-    from flash.providers import allocator
-
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="runpod")
-    assert a.provider == "runpod"
-    assert all(c.provider == "runpod" for c in a.candidates)
-
-
-def test_unknown_provider_rejected(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
-
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    # A name not in PROVIDER_NAMES is an "unknown provider".
-    with pytest.raises(UnsupportedGpuError, match="unknown provider"):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="lambda")
-
-
-def test_known_provider_unavailable_offline(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
-
-    # vast is a known provider but offline (FLASH_SKIP_NET) it is not available.
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    with pytest.raises(UnsupportedGpuError, match="not available"):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="vast")
-
-
-def test_skip_net_matches_static_cheapest(monkeypatch):
+def test_offline_allocates_static_cheapest(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import cheapest_gpu
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")  # real available_providers: runpod only
+    # No live pricing/offers (RunPod-only, static rates): allocation matches cheapest_gpu.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert a.gpu == cheapest_gpu(24)
@@ -109,7 +52,6 @@ def test_nothing_fits_names_constraint(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 4096)
     with pytest.raises(UnsupportedGpuError, match="4096 GB"):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
@@ -186,7 +128,7 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
 
 
 def test_vram_headroom_consistent_across_sizing_paths():
-    """resolve_gpu_policy (parse-time) and required_vram_gb (submit-time) must size with the SAME
+    """provisional_gpu (parse-time) and required_vram_gb (submit-time) must size with the SAME
     headroom (a validated constant), so they never disagree (PR #176 review)."""
     from flash.providers import allocator
 
@@ -203,7 +145,6 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
     """The core anti-OOM invariant: the GPU the allocator picks ALWAYS has >= the matrix's
     required VRAM, across a sweep of model x algo x seq x group x batch. If this ever fails,
     auto-allocation could provision a too-small card and OOM a paid worker."""
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     from flash.providers.allocator import allocate, required_vram_gb
     from flash.providers.base import get_gpu_info
 
@@ -218,5 +159,5 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
     ]
     for model, algo, tr in grid:
         need = required_vram_gb(model, algo, train=tr)
-        alloc = allocate(model, algo, provider="runpod", allow_unvalidated=True, train=tr)
+        alloc = allocate(model, algo, train=tr)
         assert get_gpu_info(alloc.gpu).vram_gb >= need, (model, algo, tr, alloc.gpu, need)

@@ -7,6 +7,7 @@ import pytest
 from flash.catalog import resolve_model
 from flash.engine.vram import VramEstimate, check_fit, estimate_vram_gb
 from flash.schema import ConfigError, spec_from_dict
+from tests._helpers.specs import raw_spec as _raw
 
 
 def test_catalog_policy_rejects_unlisted_with_hint():
@@ -77,17 +78,6 @@ def test_grpo_needs_more_than_sft():
 # ---------------------------------------------------------------------------
 # Config schema plumbing
 # ---------------------------------------------------------------------------
-def _raw(model="Qwen/Qwen3.5-0.8B", **kw):
-    d = {
-        "model": model,
-        "algorithm": "sft",
-        "train": {"epochs": 1, "hf_repo": "owner/runs"},
-        "environment": {"id": "owner/env"},  # any verifiers/Hub slug (not loaded here)
-    }
-    d.update(kw)
-    return d
-
-
 def test_spec_model_policy_default_catalog():
     spec = spec_from_dict(_raw())
     assert spec.model_policy == "catalog"
