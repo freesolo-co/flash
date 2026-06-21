@@ -5,7 +5,7 @@ the stable JSON tools that agents need. Requests are newline-delimited JSON:
 {"tool": "list_models", "args": {...}}.
 
 Run-lifecycle tools call the managed Flash control plane with the same stored
-credentials as the CLI (`slm login`); dry-run validation stays local.
+credentials as the CLI (`flash login`); dry-run validation stays local.
 """
 
 from __future__ import annotations

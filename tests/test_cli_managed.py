@@ -95,7 +95,7 @@ def _run(args, home: str, api_url: str):
 def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     home = str(tmp_path)
 
-    # `slm login` verifies the freesolo key against the freesolo backend, then stores it.
+    # `flash login` verifies the freesolo key against the freesolo backend, then stores it.
     proc = _run(["login", "--api-key", "fs-stub-key"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     # The key must never be echoed; only the storage location is printed.
@@ -108,7 +108,7 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     assert cfg_data["api_key"] == "fs-stub-key"
     assert stat.S_IMODE(os.stat(cfg).st_mode) == 0o600
 
-    # `slm train --background` posts the locally-validated spec and prints the handle.
+    # `flash train --background` posts the locally-validated spec and prints the handle.
     toml = tmp_path / "run.toml"
     toml.write_text(
         'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
@@ -120,7 +120,7 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     assert out["run_id"] == "flash-1-stub"
     assert out["spec"]["model"] == "Qwen/Qwen3.5-4B"
 
-    # `slm ps` renders the server's run list.
+    # `flash ps` renders the server's run list.
     proc = _run(["ps"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "flash-1-stub" in proc.stdout
