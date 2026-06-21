@@ -123,13 +123,16 @@ class ApiClient:
     # -- environments ------------------------------------------------------------------
     def publish_env(self, *, name: str, is_new: bool, package_b64: str) -> dict:
         """Upload a packaged verifiers env to the managed Environments Hub (the control plane
-        publishes it under FreeSolo's Prime account); returns ``{"id": "owner/name"}``. The
-        push + Hub build can take a while, so use a generous timeout."""
+        publishes it under FreeSolo's Prime account); returns ``{"id": "owner/name"}``.
+
+        The server may retry `prime env push` up to its own bound (default 8 attempts x 180s =
+        ~24 min worst case, plus extract/build), so the client timeout must comfortably exceed
+        that — otherwise the client gives up while the publish is still running server-side."""
         return self._request(
             "POST",
             "/v1/envs",
             body={"name": name, "is_new": is_new, "package_b64": package_b64},
-            timeout=300.0,
+            timeout=1800.0,
         )
 
     # -- runs --------------------------------------------------------------------------
