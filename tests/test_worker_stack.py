@@ -17,6 +17,26 @@ def test_resolve_worker_deps_default(monkeypatch):
     assert resolve_worker_deps() == WORKER_DEPS
 
 
+def test_gdn_fastpath_deps_present_and_kept_on_hopper(monkeypatch):
+    """The GDN fast-path stack (fla-from-git + tilelang + pinned apache-tvm-ffi) is baked in, and
+    fla is KEPT on Hopper (sm90) — the #640 fix is fla's tilelang backend, not dropping fla."""
+    monkeypatch.delenv("FLASH_WORKER_DEPS", raising=False)
+    monkeypatch.delenv("FLASH_WORKER_EXTRA_DEPS", raising=False)
+    joined = " ".join(WORKER_DEPS)
+    assert (
+        "git+https://github.com/fla-org/flash-linear-attention" in joined
+    )  # complete fla, not the broken PyPI stub
+    assert any(d == "tilelang" for d in WORKER_DEPS)  # correct GDN backend on Triton>=3.4
+    assert any(
+        d.startswith("apache-tvm-ffi==0.1.11") for d in WORKER_DEPS
+    )  # pin (0.1.12 aborts tilelang import)
+    # fla must NOT be dropped on Hopper anymore (it was, pre-fix).
+    deps_h100 = resolve_worker_deps("H100")
+    assert any("flash-linear-attention" in d for d in deps_h100), (
+        "fla must be kept on Hopper for the tilelang fast path"
+    )
+
+
 def test_resolve_worker_deps_explicit_list_wins(monkeypatch):
     # Whitespace-separated; a comma is part of a PEP 440 range, not a delimiter.
     monkeypatch.setenv("FLASH_WORKER_DEPS", "torch==2.99  vllm==9.9.9   transformers>=5.6,<5.11")
@@ -145,15 +165,23 @@ def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
 def test_grpo_no_op_failure_empty_reward_no_resume(monkeypatch):
     """Empty reward_history with no resume = the rollout scored nothing -> fail loudly (no-op run)."""
     worker = _import_worker(monkeypatch)
-    assert worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
+    assert (
+        worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
+    )
 
 
 def test_grpo_no_op_ok_when_rewards_present(monkeypatch):
     """A non-empty reward_history means the reward path ran -> never a no-op failure."""
     worker = _import_worker(monkeypatch)
-    assert worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10) is False
+    assert (
+        worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10)
+        is False
+    )
     # An all-zero history (env returned all-zero rewards) still counts as real training.
-    assert worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0) is False
+    assert (
+        worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0)
+        is False
+    )
 
 
 def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
@@ -161,14 +189,19 @@ def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
     worker = _import_worker(monkeypatch)
     assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=10) is True
     # Empty history is tolerated -> NOT a no-op failure (finalize the completed policy).
-    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12) is False
+    assert (
+        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12)
+        is False
+    )
 
 
 def test_grpo_no_op_failure_resume_did_not_reach_target(monkeypatch):
     """A resume that did NOT reach the target steps with no reward is still a genuine no-op -> fail."""
     worker = _import_worker(monkeypatch)
     assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=3) is False
-    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
+    assert (
+        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
+    )
     # No target steps configured can never count as a complete resume.
     assert worker._grpo_resume_already_complete("ckpt", target_steps=0, steps_run=0) is False
 
@@ -236,6 +269,7 @@ def test_heartbeat_terminal_only_mode(monkeypatch):
     import flash.engine.worker as w
 
     calls = []
+
     def _fake_upload(*a, **k):
         calls.append(a[1])
         return True  # simulate a successful commit so the throttle clock advances
@@ -299,7 +333,9 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w._estimate_params(big) >= 3e9
 
     def fake_cfg(cfg):
-        fake = types.SimpleNamespace(AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg))
+        fake = types.SimpleNamespace(
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg)
+        )
         monkeypatch.setitem(sys.modules, "transformers", fake)
 
     fake_cfg(small)
