@@ -194,10 +194,15 @@ def create_app():
         # own Prime account. The client just packages local source and uploads it here.
         from flash.server import envs
 
+        # Default to "" only when the key is missing/None — pass a present-but-falsy
+        # non-string (0, False, []) THROUGH so publish_package's type checks reject it with
+        # the right 400, instead of `or ""` silently coercing it to a valid-looking empty string.
+        _pkg = payload.get("package_b64")
+        _name = payload.get("name")
         try:
             slug = envs.publish_package(
-                package_b64=payload.get("package_b64") or "",
-                name=payload.get("name") or "",
+                package_b64="" if _pkg is None else _pkg,
+                name="" if _name is None else _name,
                 # Robust bool parse: JSON `"is_new": "false"`/`"0"` must NOT become True
                 # (plain bool() is truthy for any non-empty string). Defaults True when absent.
                 is_new=coerce_bool(payload.get("is_new", True)),

@@ -688,3 +688,17 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
     assert _publish({"is_new": "true"}) is True
     assert _publish({"is_new": True}) is True
     assert _publish({}) is True  # default when absent
+
+
+def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
+    """Regression: a present-but-falsy non-string `name`/`package_b64` (e.g. 0, False, []) must
+    reach publish_package's type check and yield the *type* 400 — not be `or ""`-coerced to an
+    empty string first (which would surface a different/misleading 400)."""
+    # name = 0 -> hits the name type check, not "missing env name".
+    r = api.post("/v1/envs", headers=_bearer(_login()), json={"name": 0, "package_b64": "x"})
+    assert r.status_code == 400, r.text
+    assert "name must be a string" in r.text.lower()
+    # package_b64 = False (valid string name) -> hits the package type check.
+    r2 = api.post("/v1/envs", headers=_bearer(_login()), json={"name": "e", "package_b64": False})
+    assert r2.status_code == 400, r2.text
+    assert "must be a base64 string" in r2.text.lower()
