@@ -475,18 +475,35 @@ def _fix_fla_fastpath_on_hopper() -> None:
         #    when the resident copy is missing the real package (or absent entirely).
         if not (_have("fla") and _have("fla.modules")):
             _remove_fla_from_disk()  # clear any broken stub before the git install
-            _pip("--no-deps", "git+https://github.com/fla-org/flash-linear-attention.git")
+            # Pinned to the same commit as WORKER_DEPS / Dockerfile.worker so a runtime reinstall is
+            # reproducible (the moving default branch could pull a broken/incompatible fla).
+            _pip(
+                "--no-deps",
+                "git+https://github.com/fla-org/flash-linear-attention.git"
+                "@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
+            )
         importlib.invalidate_caches()
         ok = _have("fla") and _have("fla.modules") and _have("tilelang")
-        print(
-            "[hopper] fla GDN fast path "
-            + (
-                "ENABLED (fla+tilelang, fla #640 fixed)"
-                if ok
-                else "unavailable -> pure-PyTorch delta fallback"
-            ),
-            flush=True,
-        )
+        if not ok:
+            # The healthy fla+tilelang stack could not be assembled, so fla's GDN chunk_bwd would
+            # still hit the broken Triton>=3.4 path on Hopper (fla #640) and HARD-RAISE. A print
+            # alone does NOT prevent that: transformers gates GDN on is_fla_available() (a
+            # find_spec('fla') probe), so as long as fla stays importable it gets engaged. PHYSICALLY
+            # remove fla so the probe sees it gone and transformers uses the correct pure-PyTorch
+            # delta rule instead of crashing. _remove_fla_from_disk loops over the real sys.path +
+            # invalidates caches, so find_spec('fla') is None afterwards (the gate flips off).
+            _removed, _still = _remove_fla_from_disk()
+            print(
+                "[hopper] fla GDN fast path unavailable -> DISABLING fla "
+                f"(removed {len(_removed)} copy(ies); still_importable={_still}); "
+                "pure-PyTorch delta fallback",
+                flush=True,
+            )
+        else:
+            print(
+                "[hopper] fla GDN fast path ENABLED (fla+tilelang, fla #640 fixed)",
+                flush=True,
+            )
     except Exception as e:  # never let a dep hiccup crash the worker — torch delta still runs
         print(
             f"[hopper] fla fast-path setup skipped ({type(e).__name__}: {e}); pure-PyTorch delta",

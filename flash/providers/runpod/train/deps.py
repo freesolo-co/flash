@@ -60,7 +60,10 @@ WORKER_DEPS = [
     # A/B, H100 SXM, Qwen3.5 hidden-2560 LoRA: seq4096 435->105 ms/step & 9.9->6.1 GB = 4.2x/1.6x;
     # seq16384 3106->247 ms & 32->17 GB = 12.6x/1.9x; forward loss matches to 1.8e-4). Installed
     # from git: the PyPI ``flash-linear-attention`` wheel is a broken stub missing ``fla.modules``.
-    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git",
+    # PINNED to a specific commit (not the moving default branch) so cold-start installs are
+    # reproducible and a breaking upstream change can't silently land on a run; bump intentionally
+    # after validating. Keep this SHA in lockstep with Dockerfile.worker's fla install.
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
     # fla's gated chunk_bwd is INCORRECT on Hopper (H100) with Triton>=3.4 (fla #640); its
     # ``tilelang`` backend is the correct path there, so we KEEP fla on every arch (the worker's
     # _fix_fla_fastpath_on_hopper ensures tilelang is live on sm90 before any model import).
