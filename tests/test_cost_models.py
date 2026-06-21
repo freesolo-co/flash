@@ -32,5 +32,5 @@ def test_download_weight_gb_is_total_params_bf16():
 def test_unknown_model_is_rejected():
     # Catalog-only: an unknown model raises (ValueError, like catalog.get_model) rather than
     # guessing a size.
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="catalog models only"):
         total_params_b("nobody/never-heard-of-it")
