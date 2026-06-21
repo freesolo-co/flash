@@ -11,7 +11,6 @@ from __future__ import annotations
 import math
 
 from flash.providers.allocator import required_vram_gb, vram_headroom
-from flash.providers.base import providers_for
 
 from .facts import (
     download_weight_gb,
@@ -106,7 +105,7 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
         train=config.train_knobs(),
         thinking=config.thinking,
     )
-    gpu = pick_gpu(need, pin=config.gpu, provider=config.provider)
+    gpu = pick_gpu(need, provider=config.provider)
     return gpu, need
 
 
@@ -156,18 +155,13 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
 
     setup, train = setup_per_seed * seeds, train_per_seed * seeds
     wall = setup + train
-    # Report the provider implied by the chosen card: under "auto" a single-substrate class
-    # resolves to that substrate; a multi-substrate class stays "auto"; an explicit pin is kept.
-    provider = config.provider
-    if provider == "auto" and len(provs := providers_for(gpu)) == 1:
-        provider = provs[0]
 
     return CostEstimate(
         model_id=config.model_id,
         method=config.method,
         steps=config.steps,
         gpu=gpu,
-        provider=provider,
+        provider=config.provider,
         gpu_vram_gb=gpu_vram_gb(gpu),
         required_vram_gb=need,
         gpu_hourly_usd=hourly,

@@ -26,11 +26,9 @@ def test_total_is_exactly_wall_hours_times_rate():
     bit. Assert exact equality (not ``approx``) so any smuggled-in multiplier/scaling — however
     small — fails the test instead of hiding under a tolerance.
     """
-    rate = realized_hourly_usd("RTX 5090")
-    cfg = RunConfig("Qwen/Qwen3.5-9B", "grpo", 50, gpu="RTX 5090")
-    e = estimate_cost(cfg)
-    assert e.total_usd == e.wall_clock_hours * rate
-    assert e.gpu_hourly_usd == rate
+    e = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 50))
+    assert e.total_usd == e.wall_clock_hours * e.gpu_hourly_usd
+    assert e.gpu_hourly_usd == realized_hourly_usd(e.gpu)
 
 
 def test_prices_at_realized_rate():

@@ -115,7 +115,6 @@ def runconfig_from_spec(spec) -> RunConfig:
         group_size=t.group_size if is_grpo else None,
         lora_rank=t.lora_rank,
         thinking=spec.thinking,
-        gpu=None,
         provider="auto",
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,

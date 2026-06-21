@@ -70,29 +70,8 @@ def test_provider_is_normalized_and_validated():
         RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="aws")
 
 
-def test_estimate_reports_concrete_provider_for_single_substrate_pick():
-    from flash.providers.base import providers_for
-
-    # "H100 NVL" is a Vast-only class -- under the "auto" sentinel the estimate's chosen-hardware
-    # provider should resolve to the concrete substrate, not stay "auto".
-    est = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, gpu="H100 NVL"))
-    assert est.gpu == "H100 NVL"
-    assert providers_for("H100 NVL") == ("vast",)
-    assert est.provider == "vast"
-
-
-def test_estimate_provider_invariant_holds_under_auto(est):
-    # Whatever class auto-selection lands on: a single-substrate class is reported as that
-    # substrate; a multi-substrate class stays the "auto" sentinel.
-    from flash.providers.base import providers_for
-
-    provs = providers_for(est.gpu)
-    if len(provs) == 1:
-        assert est.provider == provs[0]
-    else:
-        assert est.provider == "auto"
-
-
-def test_estimate_keeps_explicit_provider_pin():
-    # An explicit substrate pin is never overridden by single-substrate resolution.
+def test_estimate_reports_the_runs_provider():
+    # Provider is reported as configured: the default is the cross-provider "auto", and an
+    # explicit substrate is passed through unchanged.
+    assert estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10)).provider == "auto"
     assert estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="runpod")).provider == "runpod"

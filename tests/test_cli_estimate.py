@@ -51,10 +51,6 @@ def test_runconfig_from_grpo_spec_maps_fields():
     assert cfg.group_size == 8
     assert cfg.completion_len == 512  # GRPO max_tokens
     assert cfg.seq_len == 2048
-    # GPU pinning is gone: the estimate doesn't pin the spec's provisional class -- it does its
-    # own offline cheapest-fit, so cfg.gpu is None.
-    assert cfg.gpu is None
-    assert spec.gpu.type  # the spec still carries a provisional class (just not used as a pin)
     assert cfg.environment == "primeintellect/gsm8k"
 
 

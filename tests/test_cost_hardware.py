@@ -17,7 +17,7 @@ from flash.cost.facts import (
     pick_gpu,
     realized_hourly_usd,
 )
-from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+from flash.providers.base import GPU_INFO, providers_for
 
 
 def test_realized_rate_never_exceeds_list_for_any_class():
@@ -92,13 +92,6 @@ def test_pick_gpu_result_actually_fits_and_is_cheapest():
         assert not cheaper_fits, f"{cheaper_fits} cheaper than {gpu} for {need} GB"
 
 
-def test_pick_gpu_pin_honored_only_when_it_fits():
-    # A pin that fits is honored even if a cheaper class also fits.
-    assert pick_gpu(12, pin="RTX 5090") == "RTX 5090"
-    # A pin too small to fit escalates to the cheapest fitting class (allocator behavior).
-    assert pick_gpu(40, pin="RTX 4090") == "A40"
-
-
 def test_pick_gpu_includes_unvalidated_classes():
     # There is no validation gate (it was removed with GPU pinning): the cheapest fitting
     # class wins even when it's unvalidated. The RTX 2000 Ada ($0.24, 16 GB) undercuts the
@@ -109,30 +102,6 @@ def test_pick_gpu_includes_unvalidated_classes():
 def test_pick_gpu_impossible_raises():
     with pytest.raises(ValueError, match="no GPU class fits"):
         pick_gpu(100_000)
-
-
-def test_pick_gpu_pin_canonicalizes_aliases():
-    # An alias pin (the spelling the allocator accepts) resolves to the canonical class,
-    # not silently to the cheapest auto pick. "5090"/"a5000" are short/alias spellings.
-    assert pick_gpu(12, pin="5090") == "RTX 5090"
-    assert pick_gpu(12, pin="a5000") == "RTX A5000"
-    assert pick_gpu(12, pin="rtx 5090") == "RTX 5090"
-
-
-def test_pick_gpu_unknown_pin_raises_not_silent_fallback():
-    # An unknown pin must raise (mirror the allocator's canonicalization), rather than
-    # silently dropping to the cheapest class and underquoting.
-    with pytest.raises(UnsupportedGpuError):
-        pick_gpu(12, pin="Tesla T4")
-
-
-@pytest.mark.parametrize("policy_pin", ["auto", "cheapest", "AUTO", " cheapest ", "", None])
-def test_pick_gpu_policy_pin_falls_through_to_auto_select(policy_pin):
-    # gpu.type can be a POLICY sentinel ("auto"/"cheapest"/empty/None), not a GPU name.
-    # canonical_gpu would raise on those, so they must fall through to cheapest-fit selection
-    # (the allocator picks the class), NOT crash with UnsupportedGpuError. Cheapest class with
-    # >= 12 GB (no validation gate) is the RTX 2000 Ada.
-    assert pick_gpu(12, pin=policy_pin) == "RTX 2000 Ada"
 
 
 def test_pick_gpu_provider_pin_restricts_to_provisionable():

@@ -33,7 +33,6 @@ class RunConfig:
     # GRPO only: seconds to score one completion. None -> the single average grader latency.
     reward_seconds_per_completion: float | None = None
 
-    gpu: str | None = None  # pin a class; else cheapest fitting (every fitting class is eligible)
     max_wall_seconds: int | None = None  # per-seed wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
     environment: str | None = None  # verifiers env slug; descriptive only

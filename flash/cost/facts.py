@@ -4,11 +4,7 @@ selection, model size/quant, and reward-grader latency. Pure tables + accessors.
 from __future__ import annotations
 
 from flash.catalog import MODELS
-from flash.providers.base import GPU_INFO, GpuClass, canonical_gpu, providers_for
-
-# Policy sentinels that mean "no pin -- pick the cheapest fitting class" (base.POLICY_NAMES
-# is gone with the pinning subsystem; the cost picker only needs these two words).
-_POLICY_GPUS = {"auto", "cheapest"}
+from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 # ===== GPU facts =====
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
@@ -89,35 +85,20 @@ def gpu_vram_gb(name: str) -> int:
     return info.vram_gb
 
 
-def pick_gpu(
-    required_vram_gb: int,
-    *,
-    pin: str | None = None,
-    provider: str | None = None,
-) -> str:
+def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
     """Cheapest GPU class that fits ``required_vram_gb`` -- mirrors ``allocator.allocate``.
 
-    Ranks by (hourly_usd, vram_gb, name). There is NO validation gate: every fitting class is
-    eligible (validated or not), so the estimate considers the truly cheapest card -- matching
-    the allocator, which always picks the cheapest fitting class across all providers. A concrete
-    ``pin`` is canonicalized (unknown raises) and honored only if it fits, else selection
-    escalates to cheapest-fit; policy sentinels (auto/cheapest) auto-select. ``provider``
-    restricts candidates to what it can provision.
+    Ranks by (hourly_usd, vram_gb, name). There is NO GPU pin and NO validation gate: every
+    fitting class is eligible (validated or not), so the estimate considers the truly cheapest
+    card -- matching the allocator, which always picks the cheapest fitting class across all
+    providers. ``provider`` restricts candidates to what it can provision.
     """
 
     def _selectable(g: GpuClass) -> bool:
         # Provisionability filter only -- no validation gate (all fitting classes are eligible).
         return provider in (None, "auto") or provider in providers_for(g.name)
 
-    candidates = [
-        g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)
-    ]
-    pin_key = (pin or "").strip().lower()
-    if pin_key and pin_key not in _POLICY_GPUS:
-        canonical = canonical_gpu(pin)  # raises UnsupportedGpuError for an unknown pin
-        pinned = [g for g in candidates if g.name == canonical]
-        if pinned:
-            candidates = pinned  # honor the pin when it fits; else escalate to cheapest-fit
+    candidates = [g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)]
     if not candidates:
         raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
     best = min(candidates, key=lambda g: (g.hourly_usd, g.vram_gb, g.name))
