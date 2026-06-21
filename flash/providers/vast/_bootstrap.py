@@ -126,7 +126,11 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     # FLASH_UPLOAD_CONSOLE=1 also uploads the console on SUCCESS (not just failure/timeout) so an
     # operator can confirm which optimizations engaged — mirrors run_mode() in runpod/train.py.
     _force_console = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
-        "", "0", "false", "no", "off",
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
     )
     if proc.returncode != 0 or timed_out or _force_console:
         try:
@@ -205,7 +209,7 @@ def main() -> int:
                     )
         except Exception as _e:
             print("wandb setup skipped:", _e)
-        # NB: the Hopper fla guard lives in engine.worker._drop_fla_on_hopper (runs in the worker
+        # NB: the Hopper fla guard lives in engine.worker._fix_fla_fastpath_on_hopper (runs in the worker
         # process after all installs, before any model import) — not here, where a later
         # install could pull fla back in. The bootstrap just fetches code and runs the worker.
 
@@ -215,7 +219,7 @@ def main() -> int:
             # / verifiers extras) must stop NOW with an actionable error, not proceed to
             # a later import crash while the paid instance runs (matches the RunPod path).
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
-        # NB: fla is dropped on Hopper (sm90) automatically by engine.worker._drop_fla_on_hopper at
+        # NB: fla's tilelang GDN fast path is ensured on Hopper (sm90) by engine.worker._fix_fla_fastpath_on_hopper at
         # worker startup (fla's GDN backward is miscomputed on sm90, #640) — no bootstrap uninstall
         # or env toggle. fla only ever runs on the consumer archs where its Triton kernel is correct.
         # Install the run's verifiers environment(s) from the Prime Hub via the
