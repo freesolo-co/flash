@@ -8,8 +8,9 @@ from that key and debits its prepaid balance for the estimate, returning the cha
 
 The charge GATES the run: a non-2xx (e.g. 402 insufficient balance) raises ``BillingError``,
 which ``create_run`` turns into the same status so the user must top up before the run
-consumes GPU. A network/backend outage also blocks (we never run for free). ``FLASH_SKIP_NET``
-disables the call entirely (offline / tests), matching ``auth._freesolo_verify``.
+consumes GPU. A network/backend outage also blocks (we never run for free). Tests stub the
+``charge_run_estimate`` / ``reverse_run_charge`` seam (or the underlying HTTP) so no real
+billing call is made.
 """
 
 from __future__ import annotations
@@ -124,8 +125,7 @@ def charge_run_estimate(*, token: str, spec) -> dict:
     """Compute ``spec``'s estimate and charge it to the submitting user's org.
 
     Returns the backend's charge response (``{amountCents, balanceCents, ...}``) on success;
-    a no-op ``{}`` when ``FLASH_SKIP_NET`` is set. Raises ``BillingError`` on any non-2xx
-    response or when the billing service can't be reached.
+    raises ``BillingError`` on any non-2xx response or when the billing service can't be reached.
 
     CHARGE <= QUOTE (PR #3 review): the user is NEVER billed more than ``slm train --cost``
     quoted. The CLI prices the spec fully offline; the control plane parses the SAME spec
@@ -136,10 +136,6 @@ def charge_run_estimate(*, token: str, spec) -> dict:
     (a divergent unlisted/open model) the charge is the smaller of the two -- so it can be lower
     than the quote but never higher.
     """
-    # Offline bypass: no network, no charge (tests / air-gapped). Mirrors auth.
-    if os.environ.get("FLASH_SKIP_NET"):
-        return {}
-
     # The amount the user saw at --cost time (offline-consistent), and the amount the
     # server's HF-aware parse would imply; charge the smaller so the debit never exceeds the
     # quote even if the two ever diverge for an unlisted/open model.
@@ -170,12 +166,9 @@ def reverse_run_charge(*, token: str, run_id: str, charge: dict | None = None) -
     raises, the org has paid for a run that never started, so the debit must be reversed
     (PR #3 review: "Debit not reversed on submit failure"). Best-effort and idempotent: the
     backend dedupes by ``runId`` (reversing the same run twice is a no-op), so a retried
-    submit can re-charge cleanly. A ``FLASH_SKIP_NET`` no-op mirrors the charge. ``charge`` is
-    the original charge response, forwarded so the backend can match the exact debit when it
-    wants to (otherwise it reverses by ``runId``).
+    submit can re-charge cleanly. ``charge`` is the original charge response, forwarded so the
+    backend can match the exact debit when it wants to (otherwise it reverses by ``runId``).
     """
-    if os.environ.get("FLASH_SKIP_NET"):
-        return {}
     body: dict = {"runId": run_id, "reverse": True}
     if isinstance(charge, dict) and charge.get("amountCents") is not None:
         body["costCents"] = int(charge["amountCents"])

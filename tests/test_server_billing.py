@@ -83,18 +83,6 @@ def test_offline_estimate_does_not_mutate_skip_net_env(monkeypatch):
     assert "FLASH_SKIP_NET" not in __import__("os").environ
 
 
-def test_charge_is_noop_when_offline(monkeypatch):
-    from flash.server import billing
-
-    spec = _spec(monkeypatch)  # leaves FLASH_SKIP_NET set
-
-    def explode(*a, **k):
-        raise AssertionError("no network call may happen under FLASH_SKIP_NET")
-
-    monkeypatch.setattr(urllib.request, "urlopen", explode)
-    assert billing.charge_run_estimate(token="tok", spec=spec) == {}
-
-
 def test_charge_posts_estimate_and_parses_response(monkeypatch):
     from flash.server import billing
 
@@ -259,22 +247,11 @@ def test_charge_uses_offline_estimate_and_never_exceeds_quote(monkeypatch):
     assert captured["body"]["gpu"] == offline.gpu
 
 
-def test_reverse_run_charge_posts_and_is_noop_offline(monkeypatch):
-    """The refund POSTs a reversal for the run; ``FLASH_SKIP_NET`` makes it a no-op (mirrors
-    the charge), and the original charge's amount is forwarded for the backend to match."""
+def test_reverse_run_charge_posts(monkeypatch):
+    """The refund POSTs a reversal for the run, forwarding the original charge's amount for the
+    backend to match."""
     from flash.server import billing
 
-    # Offline no-op.
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-
-    def explode(*a, **k):
-        raise AssertionError("no network under FLASH_SKIP_NET")
-
-    monkeypatch.setattr(urllib.request, "urlopen", explode)
-    assert billing.reverse_run_charge(token="tok", run_id="r1", charge={"amountCents": 50}) == {}
-
-    # Online: POSTs a reversal carrying runId + the original amount.
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     captured = {}
 
     class _Resp:

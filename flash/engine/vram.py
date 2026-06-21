@@ -214,10 +214,9 @@ def model_required_vram_gb(
     model; the matrix only ever sizes UP from there. Unlisted open models size from HF
     metadata, falling back to the 24 GB tier when the size can't be read.
 
-    ``skip_net=True`` forces the offline heuristic for an UNLISTED model (no HF probe), the
-    library-safe equivalent of the ``FLASH_SKIP_NET`` env without mutating process-global state
-    -- the cost estimator passes it so estimation never does network I/O. Listed catalog models
-    never touch the network regardless.
+    ``skip_net=True`` forces the offline heuristic for an UNLISTED model (no HF probe) -- the
+    library-safe offline knob the cost estimator passes so estimation never does network I/O,
+    with no process-global state. Listed catalog models never touch the network regardless.
     """
 
     # Best-effort knob extraction: this provisional sizing runs at parse time BEFORE the
@@ -346,12 +345,12 @@ def model_required_vram_gb(
 def fetch_hf_params_b(model_id: str, *, skip_net: bool = False) -> float | None:
     """Total params (billions) from the HF API safetensors metadata (no download).
 
-    Network is skipped (returns ``None``) when EITHER the ambient ``FLASH_SKIP_NET`` env is set
-    (the long-standing global switch, honored for every caller) OR an explicit ``skip_net=True``
-    is passed -- the library-safe way for a caller (e.g. the cost estimator) to force the offline
-    heuristic for one call without mutating the process-global env.
+    ``skip_net=True`` returns ``None`` without a probe -- the library-safe offline knob the
+    cost estimator passes to size an unlisted model without network I/O. Otherwise best-effort:
+    returns ``None`` when the size can't be read (no network / no HF metadata) so callers fall
+    back to the offline heuristic rather than failing.
     """
-    if skip_net or os.environ.get("FLASH_SKIP_NET"):
+    if skip_net:
         return None
     try:
         from huggingface_hub import HfApi

@@ -15,7 +15,7 @@ socket is opened, but the client's request building, JSON (de)serialisation and
 on either side -- a renamed RunStatus field, a tightened spec validator, a
 changed status code -- fails here.
 
-Runs offline (``FLASH_SKIP_NET=1 uv run pytest``); ``_run_job`` is stubbed so
+Runs offline (``uv run pytest``); ``_run_job`` is stubbed so
 ``create_run`` never provisions a GPU.
 """
 
@@ -99,6 +99,12 @@ def make_client(tmp_path, monkeypatch):
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    # create_run charges the run's estimate before accepting it; stub that boundary so the
+    # client<->server contract tests don't make a real billing POST (billing has its own tests).
+    import flash.server.billing as billing_mod
+
+    monkeypatch.setattr(billing_mod, "charge_run_estimate", lambda **kwargs: {})
+    monkeypatch.setattr(billing_mod, "reverse_run_charge", lambda **kwargs: {})
 
     with TestClient(app_mod.create_app()) as test_client:
 

@@ -238,7 +238,7 @@ def create_app():
         # Charge the run's pre-flight estimate to the submitting user's org BEFORE accepting
         # it, so the run is gated on a sufficient prepaid balance and never starts GPU work
         # for free. Skipped for --dry-run (no run) and the operator's internal service
-        # identity (no user org to bill). FLASH_SKIP_NET disables the call (offline / tests).
+        # identity (no user org to bill). Tests stub the charge seam so no real billing POST.
         billed = not dry_run and key.get("key_prefix") != "internal"
         token = (authorization or "").removeprefix("Bearer ").strip()
         charge: dict = {}

@@ -10,8 +10,9 @@ cheapest:
 
 Allocation happens at SUBMIT time in the runner (offers are a volatile market);
 the parse-time resolution in schema is a RunPod-static provisional for
-validation/dry-run display. Offline (FLASH_SKIP_NET) the allocator degrades to exactly
-``cheapest_gpu``'s deterministic static-rate answer (RunPod only — Vast is offline-off).
+validation/dry-run display. With no live pricing/offers reachable (no network, or no
+``VAST_API_KEY``) the allocator degrades to exactly ``cheapest_gpu``'s deterministic
+static-rate answer (RunPod only — Vast is off without its key).
 
 Provider-agnostic by construction: it walks the registered providers and asks each for
 its ``gpu_classes()`` + ``hourly_rate()``; the only provider-specific knowledge is that
@@ -61,8 +62,8 @@ def required_vram_gb(
     matrix sizes up from there for big contexts/groups and down to a cheaper card for
     small runs. Unlisted open models size from HF metadata, falling back to the 24 GB tier
     when unreadable (handled inside model_required_vram_gb). ``skip_net=True`` forces that
-    offline fallback for an unlisted model without touching the ``FLASH_SKIP_NET`` env (the
-    estimator passes it so sizing never does network I/O)."""
+    offline fallback for an unlisted model (the estimator passes it so sizing never does
+    network I/O)."""
     from flash.engine.vram import model_required_vram_gb
 
     return model_required_vram_gb(

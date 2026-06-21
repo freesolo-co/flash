@@ -97,12 +97,10 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
     Sizes VRAM via the real allocator and resolves a tri-state ``allow_unvalidated`` the same
     way submit-time does, so the estimate's GPU pick matches what the allocator would allocate.
 
-    The estimator's contract is fully local / no network, but ``required_vram_gb`` can probe the
-    HF API for an UNLISTED model's param count (``engine.vram.fetch_hf_params_b``). Pass
-    ``skip_net=True`` so estimation never does network I/O (the offline path falls back to the
-    24 GB tier for an unreadable model). This is threaded explicitly through the sizing stack --
-    NOT a mutation of the process-global ``FLASH_SKIP_NET`` env -- so it's thread-safe and never
-    clobbers a concurrent caller's env or HF lookups (PR #3 review).
+    ``required_vram_gb`` can probe the HF API for an UNLISTED model's param count
+    (``engine.vram.fetch_hf_params_b``); we pass the explicit ``skip_net=True`` param so VRAM
+    sizing never does network I/O (it falls back to the 24 GB tier for an unreadable model). The
+    param threads through the sizing stack — thread-safe, with no process-global state.
     """
     need = required_vram_gb(
         config.model_id,
