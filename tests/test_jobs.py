@@ -1404,3 +1404,68 @@ def test_update_will_not_overwrite_terminal_with_lifecycle_state(monkeypatch):
         orch._update("c", "cancelled", cost_usd=2.0)
         assert orch.get_status("c").state == "cancelled"
         assert orch.get_status("c").cost_usd == 2.0
+
+
+# ---------------------------------------------------------------------------
+# worker_image() gate + build_function_input / deploy_train_endpoint branching
+# (regression for PR #4: `... or WORKER_IMAGE` made the boot-install fallback
+#  unreachable; the baked-vs-fallback choice is now a single shared gate with an
+#  explicit FLASH_WORKER_IMAGE disable sentinel.)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_image_default_is_baked(monkeypatch):
+    """Unset FLASH_WORKER_IMAGE -> the baked WORKER_IMAGE constant (baked path)."""
+    from flash.providers.runpod.train import deps
+
+    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
+    assert deps.worker_image() == deps.WORKER_IMAGE
+    assert deps.worker_image()  # non-empty -> baked path selected
+
+
+def test_worker_image_override(monkeypatch):
+    """A non-sentinel FLASH_WORKER_IMAGE overrides the baked tag (operator hotfix)."""
+    from flash.providers.runpod.train import deps
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/x/flash-worker:hotfix")
+    assert deps.worker_image() == "ghcr.io/x/flash-worker:hotfix"
+
+
+def test_worker_image_whitespace_falls_back_to_default(monkeypatch):
+    from flash.providers.runpod.train import deps
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "   ")
+    assert deps.worker_image() == deps.WORKER_IMAGE
+
+
+@pytest.mark.parametrize("sentinel", ["none", "NONE", "0", "off", "false", "no"])
+def test_worker_image_disable_sentinel_selects_fallback(monkeypatch, sentinel):
+    """A disable sentinel makes the boot-install fallback ACTUALLY reachable (returns "")."""
+    from flash.providers.runpod.train import deps
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", sentinel)
+    assert deps.worker_image() == ""  # empty -> boot-install / live-function fallback
+
+
+def test_build_function_input_baked_returns_payload(monkeypatch):
+    """Baked image set (default) -> the payload is the job input verbatim (client mode)."""
+    from flash.providers.runpod.jobs import build_function_input
+
+    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
+    payload = {"task": "train", "model": "m"}
+    assert build_function_input(payload) is payload
+
+
+def test_build_function_input_fallback_ships_live_function(monkeypatch):
+    """Disable sentinel -> the boot-install fallback: a live-function envelope, NOT the bare
+    payload. Proves the previously-dead branch is now reachable and well-formed."""
+    from flash.providers.runpod.jobs import build_function_input
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "none")
+    out = build_function_input({"task": "train"})
+    assert out != {"task": "train"}
+    assert out["function_name"] == "_train_body"
+    assert out["function_code"]
+    assert out["accelerate_downloads"] is True
+    # GPU-scoped deps are attached for boot-install on first use.
+    assert isinstance(out["dependencies"], list)

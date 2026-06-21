@@ -87,8 +87,9 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 #   * Vast: ALWAYS used (jobs.builders pins the container to WORKER_IMAGE).
 #   * RunPod baked-image submit (jobs.deploy_train_endpoint / build_function_input): the default —
 #     a self-contained serverless worker whose rp_handler runs _train_body. FLASH_WORKER_IMAGE
-#     overrides the tag (e.g. a hotfix); the boot-install fallback is only reachable if BOTH are
-#     cleared (not a normal configuration).
+#     overrides the tag (e.g. a hotfix); setting it to a disable sentinel ("none"/"0"/"off"/"false")
+#     turns the baked image OFF and selects the boot-install/live-function fallback instead (see
+#     ``worker_image()``).
 #   * RunPod Flash live-endpoint (train.endpoints.get_train_endpoint): does NOT use this baked image
 #     by default — RunPod Flash needs its serverless runtime baked in, which WORKER_IMAGE lacks, so
 #     it boot-installs resolve_worker_deps() on Flash's default template instead. It uses an image
@@ -102,6 +103,33 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 WORKER_IMAGE = (
     os.environ.get("FLASH_TRAIN_WORKER_IMAGE") or ""
 ).strip() or "ghcr.io/freesolo-co/flash-worker:cu128"
+
+# Disable sentinels for FLASH_WORKER_IMAGE: any of these (case-insensitive) selects the
+# boot-install / live-function fallback instead of a baked image. Mirrors flash.spec._FALSE_STRINGS
+# so "off"/"none"/"0"/etc. behave consistently with the rest of Flash's loosely-typed env knobs.
+_IMAGE_DISABLE = {"0", "false", "no", "off", "none"}
+
+
+def worker_image() -> str:
+    """The effective baked RunPod-serverless worker image, or ``""`` to boot-install instead.
+
+    Single source of truth for the RunPod-submit baked-image-vs-fallback decision, used by BOTH
+    ``jobs.deploy_train_endpoint`` and ``jobs.build_function_input`` so they branch identically.
+
+    Precedence:
+      * ``FLASH_WORKER_IMAGE`` set to a disable sentinel ("none"/"0"/"off"/"false"/"no") -> ``""``
+        (explicit opt-out: boot-install ``resolve_worker_deps`` on Flash's default template + the
+        live ``_train_body`` function — no baked image).
+      * ``FLASH_WORKER_IMAGE`` set to anything else -> that image (operator override / hotfix tag).
+      * unset/whitespace -> the baked ``WORKER_IMAGE`` default.
+
+    Returning ``""`` is what makes the boot-install fallback actually reachable: ``WORKER_IMAGE`` is
+    a non-empty constant, so the previous ``... or WORKER_IMAGE`` gate could never select it.
+    """
+    override = (os.environ.get("FLASH_WORKER_IMAGE") or "").strip()
+    if override:
+        return "" if override.lower() in _IMAGE_DISABLE else override
+    return WORKER_IMAGE
 
 
 def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
