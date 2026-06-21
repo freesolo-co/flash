@@ -108,7 +108,8 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch):
 
 
 def test_deploy_propagates_serving_error(monkeypatch):
-    """A non-2xx from the serving app surfaces (the server maps it to a 5xx)."""
+    """A non-2xx from the serving app surfaces as a ServingError (the server maps it to a 502)
+    instead of swallowing it or letting a raw httpx error escape as an unhandled 500."""
     import flash.serve.deploy as d
 
     class _Resp:
@@ -118,7 +119,7 @@ def test_deploy_propagates_serving_error(monkeypatch):
             raise d.httpx.HTTPStatusError("boom", request=None, response=None)
 
     monkeypatch.setattr(d.httpx, "post", lambda *a, **k: _Resp())
-    with pytest.raises(d.httpx.HTTPStatusError):
+    with pytest.raises(d.ServingError):
         d.deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", "RTX 5090")
 
 

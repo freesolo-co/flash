@@ -831,20 +831,20 @@ resolution-markers = [
     "sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-5-flash-gpu' and extra != 'extra-5-flash-server'",
 ]
 dependencies = [
-    { name = "dill", version = "0.4.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "filelock" },
+    { name = "dill", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "filelock", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
     { name = "fsspec", version = "2026.4.0", source = { registry = "https://pypi.org/simple" }, extra = ["http"], marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
-    { name = "httpx" },
-    { name = "huggingface-hub" },
-    { name = "multiprocess", version = "0.70.19", source = { registry = "https://pypi.org/simple" } },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "pandas" },
-    { name = "pyarrow" },
-    { name = "pyyaml" },
-    { name = "requests" },
-    { name = "tqdm" },
-    { name = "xxhash" },
+    { name = "httpx", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "huggingface-hub", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "multiprocess", version = "0.70.19", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "numpy", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "packaging", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "pandas", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "pyarrow", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "pyyaml", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "requests", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "tqdm", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "xxhash", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d9/85/ce4f780c32f7e36d71257f1c27e8ba898ebe379cb54f211f5f2013f2c219/datasets-5.0.0.tar.gz", hash = "sha256:83dbbbdb07a33b82192b8c419deb18739b138ee2ce1a322d55ce6b100954ec1a", size = 631708, upload-time = "2026-06-05T13:18:26.124Z" }
 wheels = [
@@ -1127,12 +1127,14 @@ gpu = [
     { name = "vllm" },
 ]
 server = [
+    { name = "datasets", version = "4.6.1", source = { registry = "https://pypi.org/simple" } },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "prime" },
     { name = "runpod-flash" },
     { name = "uvicorn" },
+    { name = "verifiers", version = "0.1.14", source = { registry = "https://pypi.org/simple" } },
 ]
 
 [package.dev-dependencies]
@@ -1151,6 +1153,7 @@ requires-dist = [
     { name = "accelerate", marker = "extra == 'gpu'", specifier = ">=1.4" },
     { name = "bitsandbytes", marker = "extra == 'gpu'", specifier = ">=0.49" },
     { name = "datasets", marker = "extra == 'gpu'", specifier = ">=2.19" },
+    { name = "datasets", marker = "extra == 'server'", specifier = ">=2.19" },
     { name = "fastapi", marker = "extra == 'server'" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
     { name = "huggingface-hub", marker = "extra == 'gpu'", specifier = ">=0.34" },
@@ -1163,6 +1166,7 @@ requires-dist = [
     { name = "trl", marker = "extra == 'gpu'", specifier = ">=1.6,<1.7" },
     { name = "uvicorn", marker = "extra == 'server'" },
     { name = "verifiers", marker = "extra == 'gpu'", specifier = ">=0.1.10" },
+    { name = "verifiers", marker = "extra == 'server'", specifier = ">=0.1.10" },
     { name = "vllm", marker = "extra == 'gpu'", specifier = "==0.19.1" },
 ]
 provides-extras = ["gpu", "server"]
@@ -1290,7 +1294,7 @@ wheels = [
 
 [package.optional-dependencies]
 http = [
-    { name = "aiohttp" },
+    { name = "aiohttp", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
 ]
 
 [[package]]
@@ -2091,7 +2095,7 @@ resolution-markers = [
     "sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-5-flash-gpu' and extra != 'extra-5-flash-server'",
 ]
 dependencies = [
-    { name = "dill", version = "0.4.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "dill", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a2/f2/e783ac7f2aeeed14e9e12801f22529cc7e6b7ab80928d6dcce4e9f00922d/multiprocess-0.70.19.tar.gz", hash = "sha256:952021e0e6c55a4a9fe4cd787895b86e239a40e76802a789d6305398d3975897", size = 2079989, upload-time = "2026-01-19T06:47:39.744Z" }
 wheels = [
@@ -2282,7 +2286,7 @@ name = "nvidia-cudnn-cu12"
 version = "9.10.2.21"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fa/41/e79269ce215c857c935fd86bcfe91a451a584dfc27f1e068f568b9ad1ab7/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:c9132cc3f8958447b4910a1720036d9eff5928cc3179b0a51fb6d167c6cc87d8", size = 705026878, upload-time = "2025-06-06T21:52:51.348Z" },
@@ -2308,7 +2312,7 @@ name = "nvidia-cufft-cu12"
 version = "11.3.3.83"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12" },
+    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/60/bc/7771846d3a0272026c416fbb7e5f4c1f146d6d80704534d0b187dd6f4800/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:848ef7224d6305cdb2a4df928759dca7b1201874787083b6e7550dd6765ce69a", size = 193109211, upload-time = "2025-03-07T01:44:56.873Z" },
@@ -2340,9 +2344,9 @@ name = "nvidia-cusolver-cu12"
 version = "11.7.3.90"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12" },
-    { name = "nvidia-cusparse-cu12" },
-    { name = "nvidia-nvjitlink-cu12" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "nvidia-cusparse-cu12", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/32/f7cd6ce8a7690544d084ea21c26e910a97e077c9b7f07bf5de623ee19981/nvidia_cusolver_cu12-11.7.3.90-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:db9ed69dbef9715071232caa9b69c52ac7de3a95773c2db65bdba85916e4e5c0", size = 267229841, upload-time = "2025-03-07T01:46:54.356Z" },
@@ -2355,7 +2359,7 @@ name = "nvidia-cusparse-cu12"
 version = "12.5.8.93"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12" },
+    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bc/f7/cd777c4109681367721b00a106f491e0d0d15cfa1fd59672ce580ce42a97/nvidia_cusparse_cu12-12.5.8.93-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9b6c161cb130be1a07a27ea6923df8141f3c295852f4b260c65f18f3e0a091dc", size = 288117129, upload-time = "2025-03-07T01:47:40.407Z" },
@@ -4499,26 +4503,26 @@ resolution-markers = [
     "sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-5-flash-gpu' and extra != 'extra-5-flash-server'",
 ]
 dependencies = [
-    { name = "datasets", version = "5.0.0", source = { registry = "https://pypi.org/simple" } },
-    { name = "gepa" },
-    { name = "jinja2" },
-    { name = "math-verify" },
-    { name = "mcp" },
-    { name = "msgpack" },
-    { name = "nest-asyncio" },
-    { name = "numpy" },
-    { name = "openai" },
-    { name = "openai-agents" },
-    { name = "prime-sandboxes" },
-    { name = "prime-tunnel" },
-    { name = "pydantic" },
-    { name = "pyzmq" },
-    { name = "requests" },
-    { name = "rich" },
-    { name = "tenacity" },
-    { name = "textual" },
+    { name = "datasets", version = "5.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "gepa", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "jinja2", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "math-verify", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "mcp", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "msgpack", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "nest-asyncio", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "numpy", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "openai", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "openai-agents", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "prime-sandboxes", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "prime-tunnel", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "pydantic", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "pyzmq", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "requests", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "rich", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "tenacity", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
+    { name = "textual", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
     { name = "typing-extensions", marker = "(python_full_version < '3.12' and extra == 'extra-5-flash-gpu') or (python_full_version < '3.12' and extra != 'extra-5-flash-server') or (extra == 'extra-5-flash-gpu' and extra == 'extra-5-flash-server')" },
-    { name = "wget" },
+    { name = "wget", marker = "extra == 'extra-5-flash-gpu' or extra != 'extra-5-flash-server'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/80/ec/84a7f94715a18e22a065219dc55dae6c73cba9bfaa982dd04c74f152332c/verifiers-0.1.10.tar.gz", hash = "sha256:18efb20c453cd6f2427cd994b38f17695c6604c32c46585ca9899bd4e7f29ce9", size = 296591, upload-time = "2026-02-11T00:33:00.731Z" }
 wheels = [
