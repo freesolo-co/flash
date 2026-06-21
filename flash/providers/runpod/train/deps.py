@@ -67,7 +67,10 @@ WORKER_DEPS = [
     # fla's gated chunk_bwd is INCORRECT on Hopper (H100) with Triton>=3.4 (fla #640); its
     # ``tilelang`` backend is the correct path there, so we KEEP fla on every arch (the worker's
     # _fix_fla_fastpath_on_hopper ensures tilelang is live on sm90 before any model import).
-    "tilelang",
+    # PINNED (like the fla SHA) so cold-start installs / image rebuilds are reproducible and a
+    # breaking upstream tilelang can't silently land on the Hopper correctness path. Keep this
+    # version in lockstep with Dockerfile.worker + perf.py's runtime reinstall.
+    "tilelang==0.1.11",
     "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
     # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
     # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
