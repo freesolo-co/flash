@@ -228,7 +228,7 @@ def _pyproject_name(env_dir: Path) -> str | None:
         data = tomllib.loads((env_dir / "pyproject.toml").read_text())
         name = (data.get("project") or {}).get("name")
         return str(name) if name else None
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
         return None
 
 
