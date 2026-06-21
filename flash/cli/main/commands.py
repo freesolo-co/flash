@@ -179,8 +179,9 @@ def cmd_gpus(args) -> int:
             f"{fmt_rate(vast_rates.get(info.name))}"
         )
     print(
-        '\nTip: omit gpu.type (or set "cheapest") to allocate the cheapest class that fits the\n'
-        "model across all providers (a concrete gpu.type pins the class)."
+        "\nTip: GPU allocation is fully automatic — the submit-time allocator always picks the\n"
+        "cheapest class that fits the model across all providers. There is no GPU pin: a concrete\n"
+        'gpu.type in the config is ignored (same as omitting it or setting "cheapest").'
     )
     return 0
 

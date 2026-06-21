@@ -83,8 +83,10 @@ def _runpod_candidates(need: int) -> list[Candidate]:
 def _vast_candidates(need: int, disk_gb: int, exclude_machine_ids) -> tuple[list[Candidate], tuple]:
     """Vast's fitting classes from the live offer book (cheapest per class).
 
-    Returns (candidates, full_offer_book). A Vast offer-search failure is NEVER fatal: it
-    degrades to RunPod-only (``allocate`` raises only when nothing across any provider fits).
+    Returns (candidates, full_offer_book). A Vast offer-search failure is caught and degrades to
+    the other providers (RunPod): it is non-fatal AS LONG AS another provider can supply a fitting
+    class. If Vast is the only available provider, the empty result means ``allocate`` then raises
+    (nothing across any provider fits) — i.e. it is only fatal when Vast was the sole option.
     """
     from flash.providers.base import GPU_INFO
     from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
