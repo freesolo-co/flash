@@ -34,10 +34,16 @@ def build_lora_policy_update(
     max_len: int = 2048,
     device: str | None = None,
     render_prompt: Callable[[object, object], str] | None = None,
+    target_modules: object = "all-linear",
 ) -> tuple[PolicyUpdate, Callable[[], str]]:
     """Return ``(policy_update, current_uri)``. ``policy_update(exp, advantages)`` runs one optimizer
     step and writes the adapter to ``out_dir/step_<n>``, returning that path; ``current_uri()`` gives
-    the latest adapter dir (the initial, untrained adapter before any step)."""
+    the latest adapter dir (the initial, untrained adapter before any step).
+
+    ``target_modules`` defaults to ``"all-linear"``; pass a language-only list (e.g.
+    ``["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]``) for a *vision*
+    base (Qwen3.5/3.6 are ``*ForConditionalGeneration``) so the saved adapter has no vision-tower
+    LoRA and a vLLM rollout server loads it cleanly."""
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -52,7 +58,7 @@ def build_lora_policy_update(
     peft_cfg = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha or 2 * lora_rank,
-        target_modules="all-linear",
+        target_modules=target_modules,
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, peft_cfg)
