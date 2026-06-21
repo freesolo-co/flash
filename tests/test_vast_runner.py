@@ -556,6 +556,51 @@ def test_poll_tight_stall_after_training_heartbeat(monkeypatch):
     assert "limit 500s" in res.detail
 
 
+def test_poll_none_stage_heartbeat_stays_in_setup_grace(monkeypatch):
+    # A heartbeat with an explicit stage=None (surface_heartbeat returns hb.get("stage"))
+    # ADVANCES the hb key (step/ts move) but its stage is UNKNOWN. It must NOT be mistaken
+    # for a training heartbeat: `None not in _SETUP_HEARTBEAT_STAGES` is True, so the old
+    # `if stage not in _SETUP_HEARTBEAT_STAGES` flipped to the tight window early and could
+    # kill a still-downloading / still-booting instance. Conservatively it must keep the
+    # larger setup_grace_s.
+    vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
+    frozen = {"stage": None, "step": 3, "ts": 1.0}
+    res = vast.poll_vast_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda: frozen,
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "during setup" in res.detail  # NOT "during training" — stayed in setup-grace
+    assert "limit 5000s" in res.detail  # the larger budget governed, not the 150s window
+
+
+def test_poll_missing_stage_heartbeat_stays_in_setup_grace(monkeypatch):
+    # Same hazard via a malformed payload that has NO "stage" key at all (hb.get("stage")
+    # is None). An unknown/missing stage must keep the run in the generous setup-grace
+    # window rather than tightening to stall_after_s mid-setup.
+    vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
+    frozen = {"step": 3, "ts": 1.0}  # no "stage"
+    res = vast.poll_vast_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda: frozen,
+        stall_after_s=150.0,
+        setup_grace_s=5000.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "during setup" in res.detail
+    assert "limit 5000s" in res.detail
+
+
 def test_poll_client_deadline(monkeypatch):
     vast = _wire_poll(monkeypatch, instances=[{"actual_status": "running"}], step=100.0)
     res = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0, deadline_s=250.0)

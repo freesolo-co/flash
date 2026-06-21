@@ -452,10 +452,14 @@ def poll_vast_job(
         if new_key != last_hb_key:
             last_hb_key = new_key
             last_progress = time.time()
-            # Only a TRAINING-phase heartbeat means cold-start setup (model download +
-            # vLLM boot) is done and we can switch to the tight window; setup heartbeats
-            # keep the larger grace budget.
-            if stage not in _SETUP_HEARTBEAT_STAGES:
+            # Only a KNOWN training-phase heartbeat means cold-start setup (model
+            # download + vLLM boot) is done and we can switch to the tight window; setup
+            # heartbeats keep the larger grace budget. A missing/invalid ``stage`` arrives
+            # as None (surface_heartbeat returns hb.get("stage")); ``None not in
+            # _SETUP_HEARTBEAT_STAGES`` is True, so treating it as training would flip out
+            # of setup-grace early and could kill a still-downloading / still-booting
+            # instance. Stay conservative: only an UNAMBIGUOUS non-setup stage leaves grace.
+            if stage is not None and stage not in _SETUP_HEARTBEAT_STAGES:
                 seen_heartbeat = True
         # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s,
         # but only when a heartbeat_reader lets us tell setup from training; without one we
