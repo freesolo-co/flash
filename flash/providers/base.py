@@ -344,17 +344,22 @@ def provisional_gpu(
 ) -> str:
     """The cheapest GPU class whose VRAM covers the model -- a parse-time provisional.
 
-    GPU pinning is gone: the submit-time allocator (``flash.providers.allocator``) ALWAYS
-    picks the cheapest fitting class live across all providers. This is the RunPod-static,
-    offline-deterministic equivalent the schema uses for sizing/display; the live allocator
-    re-resolves it at submit time.
+    GPU pinning is gone and there is no validation gate: this picks the cheapest
+    RunPod-provisionable class whose VRAM covers the model (every fitting class is eligible).
+    The submit-time allocator (``flash.providers.allocator``) ALWAYS re-resolves the cheapest
+    fitting class live across all providers; this is the RunPod-static, offline-deterministic
+    equivalent the schema uses for sizing/display.
     """
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
 
     # Honor FLASH_VRAM_HEADROOM so parse-time sizing matches the submit-time allocator exactly.
     min_vram = model_required_vram_gb(
-        model_id, algorithm, train=train, thinking=thinking, headroom=vram_headroom()
+        model_id,
+        algorithm,
+        train=train,
+        thinking=thinking,
+        headroom=vram_headroom(),
     )
     return cheapest_gpu(min_vram)
 
