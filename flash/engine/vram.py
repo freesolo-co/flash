@@ -338,9 +338,11 @@ def model_required_vram_gb(
 
 
 def fetch_hf_params_b(model_id: str) -> float | None:
-    """Total params (billions) from the HF API safetensors metadata (no download)."""
-    if os.environ.get("FLASH_SKIP_NET"):
-        return None
+    """Total params (billions) from the HF API safetensors metadata (no download).
+
+    Best-effort: returns ``None`` when the size can't be read (no network / no HF metadata),
+    so callers fall back to the offline heuristic rather than failing.
+    """
     try:
         from huggingface_hub import HfApi
 

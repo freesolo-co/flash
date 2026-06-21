@@ -14,7 +14,7 @@ verification or the W&B dashboard link silently break. This test pins the metric
 schema (the keys write_train_meta emits via RunMetrics + the SFT/RL `notes`) against
 the fields those consumers depend on.
 
-Run: cd flash && FLASH_SKIP_NET=1 .venv/bin/python -m pytest \
+Run: cd flash && .venv/bin/python -m pytest \
         tests/test_metrics_schema_agent_contract.py -q
 """
 

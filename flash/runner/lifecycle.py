@@ -72,19 +72,12 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     client polling breakdown, or a platform TIMED_OUT/worker-loss. Sick Vast machines
     are blacklisted for the run; failover naturally crosses providers.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
-    immediately. The offline test/CI marker FLASH_SKIP_NET takes the blocking
-    in-process submit instead (the job poll path is network-only).
+    immediately.
     """
-    from flash.providers.base import PollResult
-    from flash.providers.runpod.train import submit_train
-    from flash.runner import TERMINAL_STATES, _RunCancelled, _spec_with_gpu, _update, get_status
-
-    if os.environ.get("FLASH_SKIP_NET"):
-        return submit_train(spec, seed, log=log)
-
     from flash.providers import get_provider
     from flash.providers.allocator import allocate, allocation_summary
-    from flash.providers.base import POLICY_NAMES
+    from flash.providers.base import POLICY_NAMES, PollResult
+    from flash.runner import TERMINAL_STATES, _RunCancelled, _spec_with_gpu, _update, get_status
 
     last_handle: dict = {}
     # The friendly GPU class the CURRENT attempt provisioned (set right before each submit),
