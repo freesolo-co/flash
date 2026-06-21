@@ -32,8 +32,8 @@ from flash.runner import (
     submit_job,
 )
 from flash.schema import ConfigError, spec_from_dict
+from flash.serve.deploy import ServingError, deploy_adapter, undeploy_adapter
 from flash.serve.deploy import chat as serve_chat
-from flash.serve.deploy import deploy_adapter, undeploy_adapter
 from flash.spec import JobSpec, coerce_bool
 
 from . import auth, db
@@ -366,6 +366,11 @@ def create_app():
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                 )
+            except ServingError as exc:
+                # The serving backend rejected the registration or was unreachable. This is an
+                # upstream/gateway failure, not a flash bug, so surface a clean 502 with the
+                # real reason instead of letting httpx escape as an unhandled 500 + traceback.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
             except Exception as exc:
                 if isinstance(exc, ValueError):
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
