@@ -153,6 +153,15 @@ def test_save_cadence_past_run_length() -> None:
     # an in-range cadence is quiet
     ok = _advise(**{"train.steps": 100, "train.save_every": 25})
     assert "train.save_every" not in _fields(ok)
+    # steps UNSET -> compared against the recipe default (RLConfig.num_steps=150), so a
+    # save_every past the default still flags (was previously skipped entirely).
+    from flash.engine.recipe import RLConfig
+
+    unset = _advise(**{"train.steps": None, "train.save_every": RLConfig.num_steps + 1})
+    assert "train.save_every" in _fields(unset)
+    # ...and a save_every within the default stays quiet
+    unset_ok = _advise(**{"train.steps": None, "train.save_every": RLConfig.num_steps - 1})
+    assert "train.save_every" not in _fields(unset_ok)
 
 
 def test_kitchen_sink_fires_multiple() -> None:

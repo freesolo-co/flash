@@ -136,19 +136,26 @@ def lint_spec(spec: JobSpec, info: ModelInfo) -> list[Advice]:
             )
 
     # 6. Structural: checkpoint cadence past the run length (GRPO is step-driven). The worker
-    #    writes no mid-run checkpoint when save_every exceeds the total step count.
-    if (
-        grpo
-        and t.steps is not None
-        and t.save_every is not None
-        and t.save_every > t.steps
-    ):
-        out.append(
-            Advice(
-                "train.save_every",
-                f"save_every={t.save_every} exceeds steps={t.steps}: no mid-run checkpoint "
-                f"will be written.",
+    #    writes no mid-run checkpoint when save_every exceeds the total step count. When
+    #    train.steps is unset the worker falls back to the recipe default (RLConfig.num_steps),
+    #    so compare against that effective count too — otherwise a steps-unset run silently skips
+    #    this check even when save_every clearly exceeds the run length.
+    if grpo and t.save_every is not None:
+        from flash.engine.recipe import RLConfig
+
+        effective_steps = t.steps if t.steps is not None else RLConfig.num_steps
+        if t.save_every > effective_steps:
+            steps_desc = (
+                f"steps={t.steps}"
+                if t.steps is not None
+                else f"the default {RLConfig.num_steps} steps (train.steps unset)"
             )
-        )
+            out.append(
+                Advice(
+                    "train.save_every",
+                    f"save_every={t.save_every} exceeds {steps_desc}: no mid-run checkpoint "
+                    f"will be written.",
+                )
+            )
 
     return out
