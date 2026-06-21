@@ -58,26 +58,36 @@ def compare(params_b=4.0, batch=8, group=8, resp_len=512, steps=30, reward_laten
     g0, r0, u0 = phase_seconds(params_b, completions, resp_len, reward_latency, MFU_DECODE, A100["tflops"])
     step_colo = g0 + r0 + u0
     dev_run_usd = steps * step_colo * A100["usd_hr"] / 3600.0
-    print(f"  dev per-step: gen {g0:.1f}s + reward {r0:.1f}s (GPU idle) + update {u0:.1f}s = {step_colo:.1f}s "
-          f"| dev $/run (1x A100) = ${dev_run_usd:.3f}")
-    print(f"  {'N runs':>6} | {'dev $ (NxA100)':>16} | {'pool $':>10} | {'pool GPUs':>22} | {'savings':>9}")
+    # PR #4 (disaggregated, per-run): 1 trainer A100 + 1 dedicated inference A40, SYNCHRONOUS server
+    # mode (trainer blocks on gen; reward inline on the trainer) -> wall = gen(A40) + reward + update,
+    # and BOTH GPUs are billed the whole wall (each idle during the other's phases). Reward NOT
+    # off-GPU. This is the disaggregation done PER RUN with DEDICATED inference (no sharing).
+    g_inf, _, _ = phase_seconds(params_b, completions, resp_len, reward_latency, MFU_DECODE, A40["tflops"])
+    pr4_step = g_inf + r0 + u0
+    pr4_run_usd = steps * pr4_step * (A100["usd_hr"] + A40["usd_hr"]) / 3600.0
+    print(f"  dev (colocate)  $/run = ${dev_run_usd:.3f} (1xA100, step {step_colo:.1f}s incl {r0:.1f}s idle reward)")
+    print(f"  PR#4 (disagg)   $/run = ${pr4_run_usd:.3f} (1xA100+1xA40 dedicated, sync, step {pr4_step:.1f}s)")
+    hdr = f"  {'N':>4} | {'dev $':>8} | {'PR#4 $':>8} | {'pool $':>8} | {'pool GPUs':>22} | {'vs dev':>7} | {'vs PR#4':>7}"
+    print(hdr)
     for n in n_runs:
         dec_mfu = batched_decode_mfu(n)
         gN, _, _ = phase_seconds(params_b, completions, resp_len, reward_latency, dec_mfu, A40["tflops"])
-        # dev: N expensive GPUs, each full step
-        dev_usd = n * dev_run_usd
+        dev_usd = n * dev_run_usd                         # N x 1 expensive GPU, full step
+        pr4_usd = n * pr4_run_usd                         # N x (A100+A40) dedicated, synchronous
         # pool: trainers (A100, update only) + shared inference (A40, gen at batched MFU) + CPU reward
-        trainer_wall_s = steps * u0                      # trainer pays only the update on A100
+        trainer_wall_s = steps * u0
         trainer_usd = n * trainer_wall_s * A100["usd_hr"] / 3600.0
-        gen_gpu_seconds = n * steps * gN                 # total rollout demand on inference cards
-        m_infer = max(1, math.ceil(gen_gpu_seconds / max(trainer_wall_s, 1e-9)))  # GPUs to serve it within the wall
+        gen_gpu_seconds = n * steps * gN
+        m_infer = max(1, math.ceil(gen_gpu_seconds / max(trainer_wall_s, 1e-9)))
         infer_usd = m_infer * trainer_wall_s * A40["usd_hr"] / 3600.0
-        reward_gpu = max(1, math.ceil(n / 8))            # one CPU reward box per ~8 runs
+        reward_gpu = max(1, math.ceil(n / 8))
         reward_usd = reward_gpu * trainer_wall_s * CPU_REWARD_USD_HR / 3600.0
         pool_usd = trainer_usd + infer_usd + reward_usd
-        save = (1 - pool_usd / dev_usd) * 100
-        gpus = f"{n}xA100 + {m_infer}xA40 + {reward_gpu}cpu"
-        print(f"  {n:>6} | {f'${dev_usd:.2f}':>16} | {f'${pool_usd:.2f}':>10} | {gpus:>22} | {save:>7.0f}%")
+        s_dev = (1 - pool_usd / dev_usd) * 100
+        s_pr4 = (1 - pool_usd / pr4_usd) * 100
+        gpus = f"{n}xA100+{m_infer}xA40+{reward_gpu}cpu"
+        print(f"  {n:>4} | {f'${dev_usd:.2f}':>8} | {f'${pr4_usd:.2f}':>8} | {f'${pool_usd:.2f}':>8} | "
+              f"{gpus:>22} | {s_dev:>6.0f}% | {s_pr4:>6.0f}%")
 
 
 if __name__ == "__main__":
