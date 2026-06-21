@@ -25,6 +25,4 @@ jobs:
         run: uv run ruff check .
 
       - name: Tests (CPU, offline)
-        env:
-          FLASH_SKIP_NET: "1"
         run: uv run pytest -q

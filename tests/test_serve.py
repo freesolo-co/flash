@@ -145,14 +145,14 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         return _Resp(200)
 
     monkeypatch.setattr(d.httpx, "delete", fake_delete)
-    out = d.undeploy_adapter("flash-7-abcd", gpu_name="RTX 5090")
+    out = d.undeploy_adapter("flash-7-abcd")
     assert out == ["flash-7-abcd"]
     assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
     # A 404 (already gone) returns an empty list, not an error.
     monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
-    assert d.undeploy_adapter("flash-7-abcd", gpu_name="RTX 5090") == []
+    assert d.undeploy_adapter("flash-7-abcd") == []
 
 
 def test_chat_posts_to_freesolo_serving(monkeypatch):
@@ -187,9 +187,6 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
     out = d.chat(
         run_id="flash-7-abcd",
         messages=[{"role": "user", "content": "2+2?"}],
-        model="Qwen/Qwen3.5-0.8B",
-        hf_repo="org/repo",
-        adapter_prefix="sft/flash-7-abcd/seed0",
         temperature=0.0,
         max_tokens=8,
         thinking=True,

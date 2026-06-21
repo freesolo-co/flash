@@ -2,8 +2,8 @@
 
 Asserts the central property of this refactor: RunPod and Vast expose the IDENTICAL
 provider interface behind the IDENTICAL per-provider module layout, the registry hands
-out conforming ``Provider`` objects, and the cross-provider allocator ranks/pins/falls
-back correctly.
+out conforming ``Provider`` objects, and the cross-provider allocator ranks/falls
+back correctly (cheapest fitting class always wins — no pins).
 """
 
 from __future__ import annotations
@@ -113,19 +113,9 @@ def test_sweep_orphans_is_part_of_the_protocol():
     assert "sweep_orphans" in dir(Provider)
 
 
-def test_validated_on_is_per_provider():
-    from flash.providers.base import GPU_INFO
-
-    assert GPU_INFO["RTX 3090"].validated_on == ("vast",)
-    assert GPU_INFO["RTX 4090"].validated_on == ("runpod",)
-    assert set(GPU_INFO["RTX 5090"].validated_on) == {"runpod", "vast"}
-    assert GPU_INFO["RTX Pro 4000"].validated_on == ("vast",)
-
-
 @pytest.mark.parametrize("provider", ["runpod", "vast"])
 def test_static_pricing_offline(provider, monkeypatch):
     """Offline, every provider's hourly_rate falls back to the static snapshot."""
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     pricing = importlib.import_module(f"flash.providers.{provider}.pricing")
     rate = pricing.hourly_rate("RTX 5090")
     assert rate == pytest.approx(0.99)  # the static GpuClass.hourly_usd snapshot
@@ -135,7 +125,6 @@ def test_runpod_live_pricing_mock(monkeypatch):
     """Live RunPod rates override the static snapshot (mocked SDK)."""
     from flash.providers.runpod import pricing
 
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     monkeypatch.setattr(pricing, "_fetch_live_rates", lambda: {"RTX 5090": 1.23})
     monkeypatch.setattr(pricing, "_CACHE_PATH", __import__("pathlib").Path("/nonexistent/x.json"))
     pricing._MEM.update(ts=0.0, rates={})
@@ -146,7 +135,6 @@ def test_vast_live_pricing_from_offers_mock(monkeypatch):
     """Vast's hourly_rate is the cheapest live offer for the class (mocked offers)."""
     from flash.providers.vast import jobs, pricing
 
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     monkeypatch.setenv("VAST_API_KEY", "vk")
 
     def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):
@@ -204,20 +192,12 @@ def test_allocator_prefers_runpod_on_price_tie(monkeypatch):
     from flash.providers.allocator import allocate
 
     _mock_both_available(monkeypatch)
-    # vast RTX A5000 at the same price as runpod's RTX A5000 ($0.27 static): runpod wins
-    # the tie (longest-validated substrate / registry order).
-    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX A5000", dph=0.27)])
+    # Same class at the same price on both providers: runpod wins the tie (registry order).
+    # 0.8B SFT's globally-cheapest fitting class is RTX 2000 Ada (16 GB @ $0.24 static);
+    # offer the identical class+price on vast so the tie is genuinely between providers.
+    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 2000 Ada", dph=0.24)])
     a = allocate("Qwen/Qwen3.5-0.8B", "sft")
-    assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
-
-
-def test_allocator_provider_pin_vast(monkeypatch):
-    from flash.providers.allocator import allocate
-
-    _mock_both_available(monkeypatch)
-    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 3090", dph=0.50)])
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft", provider="vast")
-    assert a.provider == "vast"  # pinned even though a cheaper runpod class exists
+    assert (a.provider, a.gpu) == ("runpod", "RTX 2000 Ada")
 
 
 def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):
@@ -230,45 +210,9 @@ def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):
         raise RuntimeError("vast offer search 500")
 
     monkeypatch.setattr(jobs, "usable_offers", boom)
-    # provider="auto": a vast failure degrades to runpod-only, never raises
+    # A vast offer-search failure degrades to runpod-only and never raises (no provider pin).
     a = allocate("Qwen/Qwen3.5-0.8B", "sft")
     assert a.provider == "runpod"
-    # provider="vast": the same failure is a hard error
-    with pytest.raises(Exception, match="vast offer search failed"):
-        allocate("Qwen/Qwen3.5-0.8B", "sft", provider="vast")
-
-
-def test_allocator_gpu_pin_chooses_provider(monkeypatch):
-    """Pinning a vast-only class routes to vast; the class is honored, provider derived."""
-    from flash.providers.allocator import allocate
-
-    _mock_both_available(monkeypatch)
-    _mock_vast_offers(monkeypatch, [_offer(gpu="L40S", dph=0.80)])
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="L40S", allow_unvalidated=True)
-    assert (a.provider, a.gpu) == ("vast", "L40S")
-
-
-def test_allocator_pinned_larger_gpu_searches_at_pin_size(monkeypatch):
-    """Fix #5: pinning a larger Vast class for a small model searches offers at the
-    PINNED class's VRAM, not the (smaller) model requirement — otherwise the cheapest-N
-    offer window can fill with small cards and never surface the pinned class."""
-    from flash.providers import allocator
-    from flash.providers.base import GPU_INFO
-
-    _mock_both_available(monkeypatch)
-    captured = {}
-
-    def fake_offers(min_vram_gb, disk_gb, exclude_machine_ids=frozenset()):
-        captured["min_vram_gb"] = min_vram_gb
-        return [_offer(gpu="A40", dph=0.40)]  # A40 = 48 GB, the pinned class
-
-    from flash.providers.vast import jobs
-
-    monkeypatch.setattr(jobs, "usable_offers", fake_offers)
-    # Qwen3-0.6B needs ~24 GB, but the user pinned the 48 GB A40 -> search at 48
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", gpu="A40", allow_unvalidated=True)
-    assert (a.provider, a.gpu) == ("vast", "A40")
-    assert captured["min_vram_gb"] == GPU_INFO["A40"].vram_gb  # searched at the pin size
 
 
 def test_allocation_summary_non_vast_provider(monkeypatch):
@@ -280,7 +224,7 @@ def test_allocation_summary_non_vast_provider(monkeypatch):
     # A non-vast allocation carrying a NON-vast offer object (no offer_id/geolocation):
     # allocation_summary must not touch it.
     sentinel = object()  # would raise AttributeError if treated as a vast offer
-    cand = Candidate("runpod", "RTX A5000", 0.27, 24, True, offer=sentinel)
+    cand = Candidate("runpod", "RTX A5000", 0.27, 24, offer=sentinel)
     alloc = Allocation(
         provider="runpod",
         gpu="RTX A5000",
