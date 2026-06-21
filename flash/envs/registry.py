@@ -4,7 +4,7 @@ Verifiers-only: every environment is a Prime Intellect ``verifiers`` env. There 
 built-in task environments and no local-file environment mode (``schema.py`` rejects a
 ``path`` key outright). ``load_environment`` resolves a single source: an installed /
 Prime Hub verifiers env referenced by its slug (``env_id``, ``owner/name``), resolvable
-by ``verifiers`` (installed via ``slm env install owner/name`` and recorded in the
+by ``verifiers`` (installed via ``flash env install owner/name`` and recorded in the
 manifest below).
 """
 
@@ -15,7 +15,7 @@ from pathlib import Path
 from .._fileio import read_json_or_empty, secure_json_write
 from .base import Environment
 
-# Manifest of installed verifiers / Prime Hub environments (written by `slm env install`).
+# Manifest of installed verifiers / Prime Hub environments (written by `flash env install`).
 INSTALLED_MANIFEST = Path.home() / ".flash" / "envs.json"
 
 
@@ -24,7 +24,7 @@ def load_installed_manifest() -> dict:
 
 
 def list_installed_verifiers_envs() -> list[str]:
-    """Names of verifiers/Hub environments installed via `slm env install`."""
+    """Names of verifiers/Hub environments installed via `flash env install`."""
     return sorted(load_installed_manifest())
 
 

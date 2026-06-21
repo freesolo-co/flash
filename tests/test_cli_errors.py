@@ -36,7 +36,7 @@ def test_logged_out_status_is_friendly():
         proc = _run(["status", "does-not-exist"], env=_logged_out_env(tmp))
     assert proc.returncode == 1
     assert proc.stderr.startswith("error:")
-    assert "slm login" in proc.stderr
+    assert "flash login" in proc.stderr
     # No raw traceback on stderr.
     assert "Traceback (most recent call last)" not in proc.stderr
 
@@ -75,7 +75,7 @@ def test_train_without_login_fails_fast():
     assert proc.returncode == 1, proc.stdout + proc.stderr
     # It must fail *before* contacting anything, with the fix spelled out.
     assert "not logged in" in proc.stderr
-    assert "slm login" in proc.stderr
+    assert "flash login" in proc.stderr
 
 
 def test_missing_env_id_rejected_client_side():

@@ -167,7 +167,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if thinking and info.thinking == "none":
         raise ConfigError(
             f"{model} does not support thinking mode (its chat template has no "
-            f"<think> support); pick a thinking-capable model — `slm models` lists "
+            f"<think> support); pick a thinking-capable model — `flash models` lists "
             f"each model's thinking capability"
         )
     if not thinking and info.thinking == "always":

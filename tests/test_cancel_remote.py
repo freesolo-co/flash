@@ -1,7 +1,7 @@
-"""Regression test: `slm cancel` must reliably stop the REMOTE Flash worker.
+"""Regression test: `flash cancel` must reliably stop the REMOTE Flash worker.
 
 Bug: ``cancel_run`` called ``stop_endpoint``, which only scales endpoints found in the
-*current process's* in-memory cache. In a fresh ``slm cancel`` invocation that cache is empty,
+*current process's* in-memory cache. In a fresh ``flash cancel`` invocation that cache is empty,
 so the remote RunPod worker kept running (and billing) until the wall-clock cap. Fix:
 ``cancel_run`` uses ``terminate_endpoint`` to look the run's uniquely-named endpoint up in
 runpod_flash's persisted registry and delete it via the RunPod API (cross-process).
