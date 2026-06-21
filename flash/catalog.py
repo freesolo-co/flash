@@ -64,6 +64,9 @@ class ModelInfo:
     # the raw tokenizer count). Drives the GRPO fp32-logits memory term and the per-device
     # completion cap. Curated per model below; defaults to the open-model fallback.
     vocab_size: int = _DEFAULT_VOCAB_SIZE
+    # Total parameters in billions — the numeric model size the cost estimator reads directly
+    # (no parsing of the ``params`` display string). Curated per catalog model below.
+    params_b: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,6 +82,7 @@ MODELS: dict[str, ModelInfo] = {
         id="openbmb/MiniCPM5-1B",
         display_name="MiniCPM5 1B",
         params="1.2B dense (Llama arch)",
+        params_b=1.2,
         vocab_size=130_560,
         algos=("sft", "grpo"),
         min_vram_gb=12,
@@ -95,6 +99,7 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.5-0.8B",
         display_name="Qwen3.5 0.8B",
         params="0.9B (text-only fine-tune)",
+        params_b=0.9,
         vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=12,
@@ -106,6 +111,7 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.5-2B",
         display_name="Qwen3.5 2B",
         params="2.3B (text-only fine-tune)",
+        params_b=2.3,
         vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=16,
@@ -116,6 +122,7 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.5-4B",
         display_name="Qwen3.5 4B",
         params="4.7B (text-only fine-tune)",
+        params_b=4.7,
         vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=32,
@@ -128,6 +135,7 @@ MODELS: dict[str, ModelInfo] = {
         id="Qwen/Qwen3.5-9B",
         display_name="Qwen3.5 9B",
         params="9.7B (text-only fine-tune)",
+        params_b=9.7,
         vocab_size=248_320,
         algos=("sft", "grpo"),
         min_vram_gb=16,

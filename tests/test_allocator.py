@@ -15,7 +15,7 @@ def test_required_vram_catalog_and_open(monkeypatch):
     assert required_vram_gb("Qwen/Qwen3.5-0.8B", "grpo") == 24
     assert required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 17  # matrix: 4B SFT seq1k down-routes (rank32 default)
     # open model: sized for GRPO (the heavier phase of the usual SFT+GRPO run) + headroom
-    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m: 4.0)
+    monkeypatch.setattr(vram, "fetch_hf_params_b", lambda m, **k: 4.0)
     est = vram.estimate_vram_gb(4.0, "grpo")
 
     # Default GRPO (no [train].max_length) sizes at the run's REAL engine length, mirroring
