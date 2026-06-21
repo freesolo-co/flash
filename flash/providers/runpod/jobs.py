@@ -18,7 +18,6 @@ import asyncio
 import base64
 import contextlib
 import json
-import math
 import os
 import time
 from dataclasses import dataclass
@@ -74,20 +73,8 @@ def stall_kwargs() -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
     run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
     window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat.
-
-    ``throttled_grace_s`` is added only when the operator override ``FLASH_THROTTLE_GRACE_S`` is
-    set to a finite positive number (a bogus/NaN/inf/<=0 value is ignored so it can't silently
-    disable the throttle fast-fail); otherwise ``poll_job``'s own default applies. Keeping the
-    env read here — not in ``poll_job`` — leaves ``poll_job`` a pure function of its args.
     """
-    kwargs: dict = {"stall_after_s": 1500.0, "setup_grace_s": 3000.0}
-    env = os.environ.get("FLASH_THROTTLE_GRACE_S")
-    if env:
-        with contextlib.suppress(ValueError):
-            parsed = float(env)
-            if math.isfinite(parsed) and parsed > 0:
-                kwargs["throttled_grace_s"] = parsed
-    return kwargs
+    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0}
 
 
 def volume_endpoint_kwargs(spec) -> dict:
@@ -312,9 +299,7 @@ def poll_job(
 
     ``throttled_grace_s`` bounds how long we wait on a worker stuck THROTTLED (no RunPod
     capacity for the pinned GPU class) before returning a retryable stall so the runner
-    walks to the next-best GPU. The production caller sources it (incl. the
-    ``FLASH_THROTTLE_GRACE_S`` operator override) via ``stall_kwargs()``; ``poll_job`` itself
-    reads no environment, so its behaviour is a pure function of its arguments.
+    walks to the next-best GPU.
     """
 
     say = make_say(log)

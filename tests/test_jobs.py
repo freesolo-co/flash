@@ -301,10 +301,7 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    # poll_job is a pure function of its args (the FLASH_THROTTLE_GRACE_S read lives in
-    # stall_kwargs(), not here), but clear it anyway so this test is hermetic regardless of
-    # any ambient value on a dev machine / CI runner — the kwarg below is the only source.
-    monkeypatch.delenv("FLASH_THROTTLE_GRACE_S", raising=False)
+    # poll_job is a pure function of its args (throttled_grace_s is passed below), so no env setup.
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
     monkeypatch.setattr(
         runpod_api,
@@ -338,9 +335,6 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
-    # Hermetic regardless of ambient FLASH_THROTTLE_GRACE_S: poll_job reads no env (the override
-    # lives in stall_kwargs()), and clearing it keeps the passed throttled_grace_s the only source.
-    monkeypatch.delenv("FLASH_THROTTLE_GRACE_S", raising=False)
     statuses = iter(
         [
             {"status": "IN_QUEUE"},  # probe 1: throttled -> arm throttled_since
@@ -376,25 +370,6 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     )
     assert res.ok
     assert res.metrics == {"acc": 1.0}
-
-
-def test_stall_kwargs_throttle_grace_env_override_and_validation(monkeypatch):
-    # The FLASH_THROTTLE_GRACE_S operator override lives in stall_kwargs() (the prod config
-    # source), NOT in poll_job — so poll_job stays a pure function of its args and its tests are
-    # hermetic. stall_kwargs() adds throttled_grace_s only when the env parses to a finite
-    # positive number; a bogus/nan/inf/<=0 value is ignored so it can't silently disable the
-    # throttle fast-fail (leaving poll_job's own default to apply instead).
-    from flash.providers.runpod import jobs
-
-    monkeypatch.delenv("FLASH_THROTTLE_GRACE_S", raising=False)
-    assert "throttled_grace_s" not in jobs.stall_kwargs()  # unset -> poll_job default applies
-
-    for bogus in ("nan", "inf", "-inf", "-5", "0", "not-a-number", ""):
-        monkeypatch.setenv("FLASH_THROTTLE_GRACE_S", bogus)
-        assert "throttled_grace_s" not in jobs.stall_kwargs(), bogus
-
-    monkeypatch.setenv("FLASH_THROTTLE_GRACE_S", "120")
-    assert jobs.stall_kwargs()["throttled_grace_s"] == 120.0
 
 
 def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
