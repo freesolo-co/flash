@@ -89,7 +89,9 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     assert ei.value.status_code == 401
     assert "401" in msg
     assert "FREESOLO_INTERNAL_KEY" in msg  # client/auth hint
-    assert "no engine" not in msg and "operator must check" not in msg  # NOT the 5xx hint
+    # NOT the 5xx operator hint (this is a 4xx client/auth failure):
+    assert "no engine" not in msg
+    assert "operator must check" not in msg
 
 
 def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch):
