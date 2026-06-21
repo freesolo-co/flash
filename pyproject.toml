@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "0.2.1"
+version = "0.2.5"
 description = "Flash — managed LoRA post-training (SFT/GRPO) for verifiers environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.10-3.12 (not 3.13 yet).
@@ -57,7 +57,20 @@ gpu = [
 # 0.6.3 is the verified-working version for the managed publish semantics (--auto-bump / --plain /
 # --visibility). Floor-pin (like the other deps here) so older 0.5.x — which differs in push flags
 # — can't be resolved.
-server = ["fastapi", "uvicorn", "runpod-flash", "httpx>=0.27", "huggingface-hub>=0.34", "prime>=0.6.3"]
+# verifiers + datasets: the control plane CHARGES the run at submit (server/billing.charge_run_estimate),
+# and for an SFT run with no [train].max_examples cap that estimate loads/counts the env's real train
+# split (cost.spec.count_env_examples -> envs.load_environment -> the verifiers adapter), so the server
+# needs the env-loading stack too -- not just the GPU worker.
+server = [
+    "fastapi",
+    "uvicorn",
+    "runpod-flash",
+    "httpx>=0.27",
+    "huggingface-hub>=0.34",
+    "prime>=0.6.3",
+    "datasets>=2.19",
+    "verifiers>=0.1.10",
+]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on SEPARATE machines and are mutually exclusive: `prime` (server) requires a newer
 # `verifiers` than the worker's `trl<1.7` allows, so a combined `gpu+server` install is genuinely

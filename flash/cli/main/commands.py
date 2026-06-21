@@ -27,6 +27,7 @@ from flash.client import (
 )
 from flash.client.config import load_credentials
 from flash.client.specs import spec_payload
+from flash.cost.spec import runconfig_from_spec
 from flash.lint import lint_spec
 from flash.plan import build_plan, render_plan
 from flash.runner import TERMINAL_STATES, new_run_id
@@ -265,6 +266,22 @@ def cmd_env_list(args) -> int:
     return 0
 
 
+def _cmd_train_cost(args) -> int:
+    """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
+
+    Catalog-only and deterministic; an uncapped SFT run loads the env to count its train split."""
+    from flash.cost import estimate_cost
+
+    spec = spec_from_file(
+        args.config,
+        run_id=None,
+        overrides=args.overrides,
+        extra_configs=args.extra_configs,
+    )
+    print(estimate_cost(runconfig_from_spec(spec)).breakdown())
+    return 0
+
+
 @contextlib.contextmanager
 def _quiet_stdout(active: bool):
     """Route stdout to stderr while ``active``.
@@ -323,6 +340,11 @@ def cmd_plan(args) -> int:
 
 
 def cmd_train(args) -> int:
+    if getattr(args, "cost", False):
+        return _cmd_train_cost(args)
+    # NB: each path below re-parses with return_info=True so the config linter reuses the
+    # ModelInfo parsing already resolved (no second HF probe under model_policy="allow") —
+    # so there is deliberately no single top-of-function spec_from_file here.
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.
         # `warnings` carries the config linter's advice so agents reading the dry-run JSON see

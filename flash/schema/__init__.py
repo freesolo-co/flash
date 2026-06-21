@@ -110,6 +110,22 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
+# Recognized config keys. Anything else is a typo or a knob in the wrong place — reject it loudly
+# rather than silently ignoring it and training (expensively) against defaults. The classic trap:
+# putting GRPO knobs under a `[grpo]` table (they belong under `[train]`), which used to be dropped
+# without a peep — a run would then use the default rollout (16x more completions) at 16x the cost.
+_TOP_LEVEL_KEYS = frozenset(
+    {"model", "algorithm", "model_policy", "thinking",
+     "environment", "train", "gpu", "worker_env", "wandb", "run_id"}
+)
+_TRAIN_KEYS = frozenset(
+    {"steps", "epochs", "lora_rank", "lora_alpha", "seeds", "init_from_adapter", "hf_repo",
+     "learning_rate", "batch_size", "max_length", "save_every", "group_size", "temperature",
+     "max_tokens", "kl_penalty_coef", "advantage_clip", "thinking_length_penalty_coef",
+     "stop_sequences", "max_steps", "max_examples"}
+)
+
+
 @overload
 def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = ..., *, return_info: Literal[False] = ...
@@ -121,6 +137,22 @@ def spec_from_dict(
 def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, return_info: bool = False
 ) -> JobSpec | tuple[JobSpec, ModelInfo]:
+    # Reject unknown config SECTIONS (table-valued top-level keys) — the footgun is a `[grpo]`
+    # table holding rollout knobs that actually belong under `[train]`, silently dropped + run at
+    # 16x-cost defaults. We only flag tables, not scalars: callers (e.g. the MCP handler) pass
+    # through harmless scalar control flags like `dry_run`/`background` alongside the spec.
+    unknown = sorted(k for k in set(raw) - _TOP_LEVEL_KEYS if isinstance(raw[k], dict))
+    if unknown:
+        hint = ""
+        if {"grpo", "sft"} & set(unknown):
+            hint = (
+                " — GRPO/SFT knobs (group_size, batch_size, max_tokens, …) belong under [train], "
+                "not a [grpo]/[sft] table"
+            )
+        raise ConfigError(
+            f"unknown config section(s): {', '.join(unknown)} "
+            f"(allowed tables: environment, train, gpu, wandb, worker_env){hint}"
+        )
     try:
         model = raw["model"]
     except KeyError as exc:
@@ -174,6 +206,12 @@ def spec_from_dict(
         train_raw = {}
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
+    unknown_train = sorted(set(train_raw) - _TRAIN_KEYS)
+    if unknown_train:
+        raise ConfigError(
+            f"[train] unknown key(s): {', '.join(unknown_train)} "
+            f"(allowed: {', '.join(sorted(_TRAIN_KEYS))})"
+        )
     gpu_raw = raw.get("gpu")
     if gpu_raw is None:
         gpu_raw = {}
@@ -185,6 +223,8 @@ def spec_from_dict(
     # ignored. ``provisional_gpu`` computes the offline RunPod-static cheapest-that-fits for
     # sizing/display only; the live allocator re-resolves it at submit time.
     try:
+        # No GPU pin / no validation gate: the cheapest fitting class (every class eligible).
+        # The submit-time allocator re-resolves the cheapest fitting class live across providers.
         gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
