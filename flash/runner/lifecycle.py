@@ -62,10 +62,8 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
 
     Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
     live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
-    fresh per attempt because offers are a live market. A policy ``gpu.requested``
-    ("cheapest"/"auto") lets the allocator pick the class; a concrete ``gpu.requested``
-    pins the class (the allocator then only picks the provider); ``gpu.provider`` pins
-    the substrate.
+    fresh per attempt because offers are a live market. There is no GPU pin, no validation
+    gate, and no provider pin — the cheapest fitting class always wins.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF
     checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
@@ -76,7 +74,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     """
     from flash.providers import get_provider
     from flash.providers.allocator import allocate, allocation_summary
-    from flash.providers.base import POLICY_NAMES, PollResult
+    from flash.providers.base import PollResult
     from flash.runner import TERMINAL_STATES, _RunCancelled, _spec_with_gpu, _update, get_status
 
     last_handle: dict = {}
@@ -113,10 +111,6 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
     bad_machines: set[int] = set()
-    # Re-allocate freely for policy requests ("cheapest"/"auto"); honor a concrete
-    # user pin by passing it through as the only candidate class.
-    requested = (spec.gpu.requested or "").strip().lower()
-    pinned_gpu = None if requested in POLICY_NAMES else spec.gpu.type
     # Index into the ranked candidate list. It advances only after an attempt that
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
@@ -178,10 +172,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             alloc = allocate(
                 spec.model,
                 spec.algorithm,
-                gpu=pinned_gpu,
-                provider=spec.gpu.provider,
                 disk_gb=spec.gpu.disk_gb,
-                allow_unvalidated=spec.gpu.allow_unvalidated,
                 exclude_machine_ids=frozenset(bad_machines),
                 # Pass the run's train knobs + thinking so the VRAM estimate reflects THIS job's
                 # max_length / group_size / batch_size / lora_rank (and the seq escalation) instead

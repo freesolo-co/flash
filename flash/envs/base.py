@@ -9,8 +9,8 @@ from typing import Protocol
 class Environment(Protocol):
     id: str
 
-    def dataset(self, split: str) -> list[dict]:
-        """Return the rows for ``split`` (e.g. ``"train"``)."""
+    def dataset(self) -> list[dict]:
+        """Return the training rows (the only split used; eval is on the serving side)."""
 
     def prompt_messages(self, example: dict) -> list[dict]:
         """Chat messages fed to the model for one example."""
@@ -29,7 +29,7 @@ class Environment(Protocol):
 class BaseEnvironment:
     id: str
 
-    def dataset(self, split: str) -> list[dict]:
+    def dataset(self) -> list[dict]:
         raise NotImplementedError
 
     def prompt_messages(self, example: dict) -> list[dict]:
