@@ -356,7 +356,7 @@ def _spec(run_id):
         model="Qwen/Qwen3.5-0.8B",
         algorithm="grpo",
         train=TrainSpec(seeds=(0,), steps=1),
-        gpu=GpuSpec(type="RTX 4090", provider="runpod", max_retries=2),
+        gpu=GpuSpec(type="RTX 4090", max_retries=2),
     )
 
 
@@ -446,7 +446,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(seeds=(0,), steps=1),
-            gpu=GpuSpec(type="cheapest", requested="cheapest", provider="runpod", max_retries=2),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -461,11 +461,14 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         assert gpus_seen[0] == "RTX A5000"  # cheapest validated class with >= 12 GB
 
 
-def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
-    # A concrete pin yields a single candidate, so infra retries stay on that class
-    # (offset clamps) — the walk must not silently move a pinned run to another card.
+def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
+    # The candidate walk steps to the next-cheapest class on each infra retry but CLAMPS at
+    # the last fitting candidate — it must never index past the ranked list. Force a VRAM need
+    # only the two 96 GB classes satisfy: attempt 0 takes the cheaper (WK), attempt 1 walks to
+    # the pricier (Pro 6000), attempt 2's walk offset clamps back onto that same last class.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
@@ -473,6 +476,8 @@ def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
 
         monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+        # Only the 96 GB tier (RTX Pro 6000 WK @ $1.79, RTX Pro 6000 @ $2.09) fits -> two candidates.
+        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 96)
         gpus_seen: list[str] = []
 
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
@@ -488,16 +493,17 @@ def test_supervisor_pinned_gpu_does_not_walk(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
-            run_id="pinned",
+            run_id="clamp",
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(seeds=(0,), steps=1),
-            gpu=GpuSpec(type="RTX 4090", requested="RTX 4090", provider="runpod", max_retries=2),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
-        assert orch.get_status("pinned").state == "done"
-        assert gpus_seen == ["RTX 4090", "RTX 4090", "RTX 4090"]
+        assert orch.get_status("clamp").state == "done"
+        # Walk advances to the last candidate then clamps on it (never out of range).
+        assert gpus_seen == ["RTX Pro 6000 WK", "RTX Pro 6000", "RTX Pro 6000"]
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -543,7 +549,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(seeds=(0,), steps=1),
-            gpu=GpuSpec(type="cheapest", requested="cheapest", provider="runpod", max_retries=2),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
@@ -662,7 +668,7 @@ def test_attach_clears_stale_handle_before_resuming_seeds(monkeypatch):
             model="Qwen/Qwen3.5-0.8B",
             algorithm="grpo",
             train=TrainSpec(seeds=(0, 1), steps=1),
-            gpu=GpuSpec(type="RTX 4090", provider="runpod", max_retries=2),
+            gpu=GpuSpec(type="RTX 4090", max_retries=2),
         )
         orch._save_status(
             orch.RunStatus(
