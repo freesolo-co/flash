@@ -257,11 +257,17 @@ def _assert_safe_build_backend(env_dir: Path) -> None:
     """
     pyproject = env_dir / "pyproject.toml"
     try:
-        data = tomllib.loads(pyproject.read_text())
-    except tomllib.TOMLDecodeError as exc:
-        raise EnvPublishError(f"env package pyproject.toml is not valid TOML: {exc}") from exc
+        text = pyproject.read_text(encoding="utf-8")
+    except UnicodeError as exc:
+        raise EnvPublishError(
+            f"env package pyproject.toml must be valid UTF-8 text: {exc}"
+        ) from exc
     except OSError as exc:
         raise EnvPublishError(f"env package pyproject.toml could not be read: {exc}") from exc
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise EnvPublishError(f"env package pyproject.toml is not valid TOML: {exc}") from exc
     build_system = data.get("build-system")
     if build_system is None:
         return  # no [build-system] -> PEP 518 default (setuptools), which is allowlisted
