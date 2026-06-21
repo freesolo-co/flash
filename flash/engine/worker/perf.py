@@ -506,8 +506,12 @@ def _fix_fla_fastpath_on_hopper() -> None:
         #    on a stale/partial copy from a previous boot.) tilelang pulls apache-tvm-ffi via a
         #    range that allows the broken 0.1.12, so force-reinstall the exact pin AFTER tilelang
         #    and verify the resolved version below.
+        # Enforce the EXACT pin: (re)install when tilelang is absent OR a different version is
+        # resident (a job or the base image may carry another tilelang; _have-only would treat that
+        # as healthy and skip the install, leaving the wrong/uncertain GDN backend in place). Mirror
+        # the apache-tvm-ffi handling: check the installed version via _ver and reinstall on mismatch.
         tilelang_ok = True
-        if not _have("tilelang"):
+        if _ver("tilelang") != TILELANG_PIN:
             tilelang_ok = _pip(f"tilelang=={TILELANG_PIN}")
         # Force the exact tvm-ffi pin last (overriding whatever tilelang's range resolved). If this
         # install fails we DON'T trust the resident copy — tvm_ffi_ok gates `ok` below.
@@ -532,12 +536,14 @@ def _fix_fla_fastpath_on_hopper() -> None:
         # the broken 0.1.12 (which find_spec-imports fine but aborts `import tilelang`); checking the
         # version is the only reliable signal the pin actually landed.
         tvm_ffi_ver = _ver("apache-tvm-ffi")
+        tilelang_ver = _ver("tilelang")
         installs_ok = tilelang_ok and tvm_ffi_ok and fla_ok
         ok = (
             installs_ok
             and _have("fla")
             and _have("fla.modules")
             and _have("tilelang")
+            and tilelang_ver == TILELANG_PIN
             and tvm_ffi_ver == TVM_FFI_PIN
         )
         if not ok:
@@ -552,7 +558,8 @@ def _fix_fla_fastpath_on_hopper() -> None:
             print(
                 "[hopper] fla GDN fast path unavailable -> DISABLING fla "
                 f"(installs_ok={installs_ok} [tilelang={tilelang_ok} tvm_ffi={tvm_ffi_ok} "
-                f"fla={fla_ok}], tvm_ffi_ver={tvm_ffi_ver!r} (want {TVM_FFI_PIN}); "
+                f"fla={fla_ok}], tilelang_ver={tilelang_ver!r} (want {TILELANG_PIN}), "
+                f"tvm_ffi_ver={tvm_ffi_ver!r} (want {TVM_FFI_PIN}); "
                 f"removed {len(_removed)} copy(ies); still_importable={_still}); "
                 "pure-PyTorch delta fallback",
                 flush=True,
@@ -560,7 +567,7 @@ def _fix_fla_fastpath_on_hopper() -> None:
         else:
             print(
                 "[hopper] fla GDN fast path ENABLED (fla+tilelang "
-                f"{TILELANG_PIN}/tvm-ffi {tvm_ffi_ver}, fla #640 fixed)",
+                f"{tilelang_ver}/tvm-ffi {tvm_ffi_ver}, fla #640 fixed)",
                 flush=True,
             )
     except Exception as e:  # never let a dep hiccup crash the worker — torch delta still runs
