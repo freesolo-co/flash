@@ -301,6 +301,10 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
+    # poll_job is a pure function of its args (the FLASH_THROTTLE_GRACE_S read lives in
+    # stall_kwargs(), not here), but clear it anyway so this test is hermetic regardless of
+    # any ambient value on a dev machine / CI runner — the kwarg below is the only source.
+    monkeypatch.delenv("FLASH_THROTTLE_GRACE_S", raising=False)
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
     monkeypatch.setattr(
         runpod_api,
@@ -334,6 +338,9 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs
 
+    # Hermetic regardless of ambient FLASH_THROTTLE_GRACE_S: poll_job reads no env (the override
+    # lives in stall_kwargs()), and clearing it keeps the passed throttled_grace_s the only source.
+    monkeypatch.delenv("FLASH_THROTTLE_GRACE_S", raising=False)
     statuses = iter(
         [
             {"status": "IN_QUEUE"},  # probe 1: throttled -> arm throttled_since
