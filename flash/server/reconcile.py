@@ -37,6 +37,13 @@ _SETTLE_SECONDS = 3600.0  # 1h
 _WINDOW_SECONDS = 7 * 86400.0  # only reconcile runs that finished within the last 7 days
 # States that incur no GPU cost -> never reconciled.
 _FREE_TERMINAL_STATES = frozenset({"dry_run"})
+# States whose training is finished and whose GPU cost is therefore final -> eligible for
+# reconciliation. The terminal billable states plus `deployed`: a deployed run finished
+# training (its training invoice has settled) before serving was stood up on top of it, so
+# its realized training cost is final and must be reconciled like any other finished run.
+# (`deployed` is intentionally NOT in runner.TERMINAL_STATES -- it's a live, undeployable-back
+# state -- so it has to be added explicitly here.) Excludes the free states (e.g. dry_run).
+_RECONCILABLE_STATES = (runner.TERMINAL_STATES | {"deployed"}) - _FREE_TERMINAL_STATES
 
 
 def reconcile_enabled() -> bool:
@@ -66,9 +73,10 @@ def _report(body: dict) -> bool:
 
 
 def _due(status: runner.RunStatus, now: float) -> bool:
-    """Whether a run should be reconciled this pass: a billable terminal run, not yet reconciled,
+    """Whether a run should be reconciled this pass: a billable run whose training is finished
+    (a terminal billable state, or `deployed` -- see _RECONCILABLE_STATES), not yet reconciled,
     past the settle delay, still within the window, and carrying a provider handle."""
-    if status.state not in runner.TERMINAL_STATES or status.state in _FREE_TERMINAL_STATES:
+    if status.state not in _RECONCILABLE_STATES:
         return False
     if status.reconciled_at:
         return False
@@ -104,11 +112,14 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
         return False
 
     # Persist locally so we don't re-pull/re-report, and so `flash cost` can show realized vs
-    # estimated. Same-state write (terminal-sticky CAS allows field-only updates).
+    # estimated. COST-FIELDS-ONLY: record_realized_cost re-reads the run under the lock and writes
+    # only the realized-cost columns, never `state`. The `status` here is an earlier snapshot, so
+    # writing its `state` back could REVERT a run that advanced since (e.g. to `deployed`) -- which
+    # the terminal-sticky CAS does NOT protect against, since `deployed` is non-terminal. Updating
+    # only the cost columns keeps the run's current state intact.
     with contextlib.suppress(Exception):
-        runner._update(
+        runner.record_realized_cost(
             status.run_id,
-            status.state,
             realized_cost_usd=realized.realized_usd,
             reconciled_at=now,
         )
