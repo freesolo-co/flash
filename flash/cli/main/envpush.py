@@ -185,20 +185,38 @@ _TAR_EXCLUDE_DIRS = frozenset({".prime", ".git", "__pycache__", ".venv", ".mypy_
 def _tar_b64(directory: Path) -> str:
     """Pack a directory's contents into a base64 ``.tar.gz`` (members rooted at the top level)
     for upload, skipping tool/cache dirs (``.prime/``, ``.git/``, ``__pycache__``, ...). Packaging
-    is pure file I/O — no `prime` CLI or Prime account needed locally."""
+    is pure file I/O — no `prime` CLI or Prime account needed locally.
+
+    We walk with ``os.walk`` and PRUNE excluded directories in place (``dirs[:] = ...``) so we never
+    descend into them: a plain ``rglob('*')`` would still recurse into (and stat every entry under)
+    huge trees like ``.venv``/``.git`` only to discard them, making the push needlessly slow on a
+    real project. The resulting member SET is identical to the previous filter on
+    ``_TAR_EXCLUDE_DIRS`` (those dirs and everything beneath them are omitted), and the output is
+    deterministic: entries are sorted at each level (parent-before-children walk order). Tar member
+    order doesn't affect correctness — the server extracts in stream order and the content hash is
+    computed from a re-sorted file list — so this is purely a traversal-efficiency fix."""
     import base64
     import io
+    import os
     import tarfile
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # recursive=False: we walk every path ourselves, so letting tar recurse into dirs would
-        # add their contents twice.
-        for path in sorted(directory.rglob("*")):
-            rel = path.relative_to(directory)
-            if _TAR_EXCLUDE_DIRS.intersection(rel.parts):
-                continue  # skip excluded dirs and everything beneath them
-            tar.add(path, arcname=str(rel), recursive=False)
+        for root, dirs, files in os.walk(directory):
+            root_path = Path(root)
+            # Prune excluded directories IN PLACE so os.walk never descends into them (this is the
+            # whole fix — the excluded subtrees are never traversed/statted). Sort the survivors so
+            # traversal order is deterministic.
+            dirs[:] = sorted(d for d in dirs if d not in _TAR_EXCLUDE_DIRS)
+            # Add the surviving directory entries themselves (so empty dirs are preserved, as the old
+            # rglob walk did), then this level's files — both sorted for determinism. recursive=False:
+            # we walk every path ourselves, so letting tar recurse would add contents twice.
+            for name in dirs:
+                child = root_path / name
+                tar.add(child, arcname=str(child.relative_to(directory)), recursive=False)
+            for name in sorted(files):
+                child = root_path / name
+                tar.add(child, arcname=str(child.relative_to(directory)), recursive=False)
     return base64.b64encode(buf.getvalue()).decode()
 
 

@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 from pathlib import Path
 
 _PUSH_MAX_ATTEMPTS = 8
@@ -54,6 +55,33 @@ _MAX_UNCOMPRESSED_BYTES = _limit_bytes(
 )  # 256 MB extracted
 _MAX_MEMBERS = _limit_bytes("FLASH_ENV_MAX_MEMBERS", 5000)
 
+# Per-attempt wall clock for a single `prime env push` subprocess. `prime env push` shells out to a
+# build frontend + several Hub HTTP round-trips, so a network stall / hub outage / CLI deadlock can
+# otherwise block the request handler thread forever. Each retry gets its OWN timeout, and the
+# attempt count is bounded (_PUSH_MAX_ATTEMPTS), so total wall time is bounded too. Operator-
+# overridable for slow links / large uploads. A timeout surfaces as a 504 (gateway-ish timeout).
+_PUSH_TIMEOUT_S = _limit_bytes("FLASH_ENV_PUSH_TIMEOUT_S", 180)
+
+# Allowlisted PEP 517 build backends. `prime env push` BUILDS A WHEEL LOCALLY on this control plane
+# (`uv build --wheel` / `python -m build --wheel`, cwd = the extracted upload), which imports and runs
+# the project's declared ``build-system.build-backend``. An untrusted ``pyproject.toml`` could name an
+# arbitrary backend — or ship one in-tree via ``backend-path`` — giving ARBITRARY CODE EXECUTION on
+# the control plane (with access to PRIME_API_KEY/filesystem) the moment the frontend imports it. So
+# we reject any package whose build backend isn't one of the standard, well-known backends, and reject
+# ``backend-path`` outright (it loads code FROM the untrusted upload). This is the standard set; flash's
+# own client emits ``hatchling.build`` (see cli/main/envpush.py:_ENV_PUSH_PYPROJECT).
+_ALLOWED_BUILD_BACKENDS = frozenset({
+    "hatchling.build",
+    "setuptools.build_meta",
+    "setuptools.build_meta:__legacy__",
+    "flit_core.buildapi",
+    "poetry.core.masonry.api",
+    "pdm.backend",
+    "pdm.pep517.api",
+    "maturin",
+    "scikit_build_core.build",
+})
+
 
 def _human_mb(n: int) -> str:
     return f"{n / (1024 * 1024):.0f} MB"
@@ -61,8 +89,10 @@ def _human_mb(n: int) -> str:
 
 class EnvPublishError(Exception):
     """A managed env publish failed. ``status`` is the HTTP status the route should return:
-    400 for a bad client package, 413 when the upload exceeds a size cap, 503 when the control plane
-    itself isn't configured to publish (no PRIME_API_KEY / `prime` CLI)."""
+    400 for a bad client package, 413 when the upload exceeds a size cap, 502 when `prime env push`
+    fails for a reason retrying can't fix, 503 when the control plane itself isn't configured to
+    publish (no PRIME_API_KEY / `prime` CLI), 504 when `prime env push` times out (hung CLI / hub
+    outage)."""
 
     def __init__(self, message: str, *, status: int = 400):
         super().__init__(message)
@@ -198,14 +228,80 @@ def _is_permanent_push_failure(output: str) -> bool:
     falls back to the bounded retry (safe — at worst we retry a dead-end a few extra times),
     whereas an incomplete *conflict*-marker list would fail-fast a real, resolvable conflict. So
     this never makes a climbable conflict non-retriable; it only short-circuits the obvious
-    dead-ends that would otherwise burn all _PUSH_MAX_ATTEMPTS attempts."""
+    dead-ends that would otherwise burn all _PUSH_MAX_ATTEMPTS attempts.
+
+    The numeric HTTP codes (401/403/404) are matched only as an ACTUAL HTTP status — i.e. preceded by
+    an "http"/"status"/"code" token (``HTTP 401``, ``status: 403``) — not as bare substrings. A
+    conflict rejection embeds a content hash / version (e.g. "Wheel version with content hash a401f3…"
+    or "version 1.404.0 already exists"), and a bare ``"404" in output`` (or even a ``\b``-bounded one)
+    would spuriously flag the digits inside such a hash/version as a permanent failure and fail-fast a
+    resolvable conflict. The textual markers (unauthorized/forbidden/not found/…) already cover the
+    real auth/not-found cases on their own; the HTTP-status match is just a belt-and-suspenders for
+    prime phrasings like "HTTP 404: …"."""
     o = output.lower()
-    markers = (
+    text_markers = (
         "unauthorized", "authentication", "invalid api key", "permission", "forbidden",
-        "401", "403", "404", "not found", "no such",
+        "not found", "no such",
         "build failed", "test failed", "tests failed",
     )
-    return any(m in o for m in markers)
+    if any(m in o for m in text_markers):
+        return True
+    # A real HTTP status code, not digits embedded in a content hash / version string: require an
+    # http/status/code lead-in and a word boundary after the code.
+    return re.search(r"(?:http|status|code)[^\d]{0,4}(?:401|403|404)\b", o) is not None
+
+
+def _assert_safe_build_backend(env_dir: Path) -> None:
+    """Reject an uploaded project whose ``pyproject.toml`` would run UNTRUSTED code at build time.
+
+    `prime env push` builds a wheel locally on this control plane (``uv build --wheel`` /
+    ``python -m build --wheel`` with cwd = the extracted upload — see prime_cli's env push), and a
+    PEP 517 build IMPORTS AND EXECUTES the project's declared ``build-system.build-backend``. With an
+    untrusted ``pyproject.toml`` that's an arbitrary-code-execution surface on the control plane:
+
+      * a custom ``build-backend`` (e.g. an attacker-shipped module) runs on import; and
+      * ``backend-path`` makes the frontend load the backend FROM the upload's own files (an "in-tree
+        backend"), so even a standard-looking ``build-backend`` name can resolve to attacker code.
+
+    So we (a) reject any ``backend-path`` (it loads code from the untrusted upload), and (b) require
+    ``build-backend`` to be one of the standard, well-known backends (``_ALLOWED_BUILD_BACKENDS``). A
+    package with NO ``[build-system]`` is allowed: PEP 518 then defaults to setuptools (an allowlisted
+    backend) — the same as declaring it explicitly. A malformed ``pyproject.toml`` is a client error.
+
+    This bounds the RCE surface to vetted backends; the per-attempt subprocess timeout
+    (``_PUSH_TIMEOUT_S``) separately bounds a HANG but does not, on its own, prevent code execution.
+    """
+    pyproject = env_dir / "pyproject.toml"
+    try:
+        data = tomllib.loads(pyproject.read_text())
+    except tomllib.TOMLDecodeError as exc:
+        raise EnvPublishError(f"env package pyproject.toml is not valid TOML: {exc}") from exc
+    except OSError as exc:
+        raise EnvPublishError(f"env package pyproject.toml could not be read: {exc}") from exc
+    build_system = data.get("build-system")
+    if build_system is None:
+        return  # no [build-system] -> PEP 518 default (setuptools), which is allowlisted
+    if not isinstance(build_system, dict):
+        raise EnvPublishError("env package pyproject.toml has a malformed [build-system] table")
+    # ``backend-path`` points the build frontend at a backend shipped INSIDE the untrusted upload, so
+    # any value at all is an in-tree-backend RCE vector — refuse it outright.
+    if build_system.get("backend-path") is not None:
+        raise EnvPublishError(
+            "env package declares a [build-system] backend-path (an in-tree build backend); this is "
+            "not allowed for managed publishing because it would execute uploaded code on the "
+            "control plane during the wheel build"
+        )
+    backend = build_system.get("build-backend")
+    # Per PEP 518, an absent build-backend ALSO defaults to setuptools — allowed.
+    if backend is None:
+        return
+    if not isinstance(backend, str) or backend not in _ALLOWED_BUILD_BACKENDS:
+        allowed = ", ".join(sorted(_ALLOWED_BUILD_BACKENDS))
+        raise EnvPublishError(
+            f"env package declares an unsupported build-backend {backend!r}; managed publishing "
+            f"builds the wheel on the control plane, so only standard build backends are allowed "
+            f"({allowed})"
+        )
 
 
 def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
@@ -255,7 +351,21 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
     for attempt in range(_PUSH_MAX_ATTEMPTS):
         # is_new starts at the declared version; otherwise (and on every retry) --auto-bump climbs.
         cmd = list(base) if (is_new and attempt == 0) else [*base, "--auto-bump"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        # Bound each attempt: a hung `prime env push` (network stall / hub outage / CLI deadlock)
+        # would otherwise block the request handler thread forever. Each retry gets its own timeout
+        # and the attempt count is bounded, so total wall time stays bounded. A timeout is a 504 (we
+        # don't retry it — the attempt's --auto-bump may already have rewritten pyproject's version,
+        # and a hang isn't a version conflict --auto-bump can resolve).
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, env=env, timeout=_PUSH_TIMEOUT_S
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EnvPublishError(
+                f"`prime env push` timed out after {_PUSH_TIMEOUT_S}s (the Hub may be unreachable "
+                f"or the CLI hung); aborting to keep the control plane responsive",
+                status=504,
+            ) from exc
         last = f"{proc.stdout or ''}{proc.stderr or ''}"
         if proc.returncode == 0:
             slug = _slug_from(env_dir, last, pushed_name=name)
@@ -337,4 +447,8 @@ def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> 
         _safe_extract(tar_bytes, dest)
         if not (dest / "pyproject.toml").is_file():
             raise EnvPublishError("env package is missing a pyproject.toml")
+        # `prime env push` builds a wheel on THIS host, importing the project's build backend, so an
+        # untrusted pyproject.toml is an RCE surface. Reject non-standard/in-tree build backends
+        # before we ever hand the dir to the build frontend.
+        _assert_safe_build_backend(dest)
         return _prime_push(dest, name=hub_name, is_new=is_new)

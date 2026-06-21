@@ -204,7 +204,7 @@ def test_prime_push_publishes_private_and_climbs_conflicts(monkeypatch, tmp_path
         def __init__(self, rc, out="", err=""):
             self.returncode, self.stdout, self.stderr = rc, out, err
 
-    def run(cmd, capture_output=True, text=True, env=None):
+    def run(cmd, capture_output=True, text=True, env=None, timeout=None):
         calls.append(list(cmd))
         if state["left"] > 0:
             state["left"] -= 1
@@ -224,6 +224,121 @@ def test_prime_push_publishes_private_and_climbs_conflicts(monkeypatch, tmp_path
     assert calls[0][calls[0].index("--name") + 1] == "ns-env"
 
 
+def test_prime_push_times_out_is_504_and_bounded(monkeypatch, tmp_path):
+    """A hung `prime env push` (network stall / hub outage / CLI deadlock) must NOT block the request
+    handler forever: each attempt is bounded by a timeout, and a TimeoutExpired surfaces as a 504
+    without burning the remaining retries (a hang isn't a version conflict --auto-bump can fix)."""
+    monkeypatch.setenv("PRIME_API_KEY", "pit-x")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/prime")
+    # Make the timeout tiny so the test is instant and we can assert the bound was passed through.
+    monkeypatch.setattr(envs, "_PUSH_TIMEOUT_S", 7)
+    calls: list[dict] = []
+
+    def run(cmd, capture_output=True, text=True, env=None, timeout=None):
+        calls.append({"cmd": list(cmd), "timeout": timeout})
+        raise envs.subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr("subprocess.run", run)
+    with pytest.raises(envs.EnvPublishError) as ei:
+        envs._prime_push(tmp_path, name="ns-env", is_new=True)
+    assert ei.value.status == 504
+    assert "timed out" in str(ei.value).lower()
+    # Bounded: a hang is not retried (it's not a resolvable version conflict), and the per-attempt
+    # timeout was actually handed to subprocess.run.
+    assert len(calls) == 1
+    assert calls[0]["timeout"] == 7
+
+
+def test_prime_push_passes_timeout_each_attempt(monkeypatch, tmp_path):
+    # Every attempt (including --auto-bump retries) must carry its own timeout, so total wall time
+    # stays bounded by _PUSH_TIMEOUT_S * _PUSH_MAX_ATTEMPTS rather than being unbounded.
+    monkeypatch.setenv("PRIME_API_KEY", "pit-x")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/prime")
+    monkeypatch.setattr(envs, "_PUSH_TIMEOUT_S", 11)
+    timeouts: list = []
+    state = {"left": 2}
+
+    class _Proc:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def run(cmd, capture_output=True, text=True, env=None, timeout=None):
+        timeouts.append(timeout)
+        if state["left"] > 0:
+            state["left"] -= 1
+            return _Proc(1, err="version already exists")
+        return _Proc(0, out="Successfully pushed freesolo-co/ns-env\n")
+
+    monkeypatch.setattr("subprocess.run", run)
+    envs._prime_push(tmp_path, name="ns-env", is_new=True)
+    assert timeouts == [11, 11, 11]  # every attempt got the bound
+
+
+def test_assert_safe_build_backend_allows_standard_and_missing(tmp_path):
+    # The standard, well-known backends are allowed (flash's own client emits hatchling.build).
+    for backend in ("hatchling.build", "setuptools.build_meta", "flit_core.buildapi"):
+        (tmp_path / "pyproject.toml").write_text(
+            f"[build-system]\nrequires = []\nbuild-backend = '{backend}'\n[project]\nname='e'\n"
+        )
+        envs._assert_safe_build_backend(tmp_path)  # no raise
+    # No [build-system] at all -> PEP 518 default (setuptools), allowed.
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='e'\n")
+    envs._assert_safe_build_backend(tmp_path)
+    # [build-system] present but no build-backend key -> also defaults to setuptools, allowed.
+    (tmp_path / "pyproject.toml").write_text("[build-system]\nrequires = ['setuptools']\n")
+    envs._assert_safe_build_backend(tmp_path)
+
+
+def test_assert_safe_build_backend_rejects_custom_backend(tmp_path):
+    # SECURITY (RCE): `prime env push` builds a wheel ON THIS HOST, importing the project's declared
+    # build-backend. A custom backend would execute attacker code on the control plane, so reject it.
+    (tmp_path / "pyproject.toml").write_text(
+        "[build-system]\nrequires = []\nbuild-backend = 'evil_backend'\n[project]\nname='e'\n"
+    )
+    with pytest.raises(envs.EnvPublishError, match="unsupported build-backend"):
+        envs._assert_safe_build_backend(tmp_path)
+
+
+def test_assert_safe_build_backend_rejects_backend_path(tmp_path):
+    # SECURITY (RCE): backend-path makes the build frontend load the backend FROM the upload's own
+    # files (an in-tree backend), so even a standard-looking name resolves to attacker code. Refuse it
+    # outright regardless of the build-backend value.
+    (tmp_path / "pyproject.toml").write_text(
+        "[build-system]\nrequires = []\nbuild-backend = 'hatchling.build'\n"
+        "backend-path = ['.']\n[project]\nname='e'\n"
+    )
+    with pytest.raises(envs.EnvPublishError, match="backend-path"):
+        envs._assert_safe_build_backend(tmp_path)
+
+
+def test_assert_safe_build_backend_rejects_malformed_toml(tmp_path):
+    # A malformed pyproject.toml is a client error (400), not a 500 from an uncaught parse error.
+    (tmp_path / "pyproject.toml").write_text("this is not = valid = toml = [[[")
+    with pytest.raises(envs.EnvPublishError, match="not valid TOML") as ei:
+        envs._assert_safe_build_backend(tmp_path)
+    assert ei.value.status == 400
+
+
+def test_publish_rejects_malicious_build_backend_end_to_end(monkeypatch):
+    # End-to-end: a package whose pyproject names a custom build-backend (an RCE vector via the
+    # control-plane wheel build) is rejected by publish_package BEFORE `prime env push` is ever run.
+    def boom(*a, **k):
+        raise AssertionError("prime env push must NOT run for a package with an unsafe build backend")
+
+    monkeypatch.setattr(envs, "_prime_push", boom)
+    pkg = {
+        "pyproject.toml": (
+            "[build-system]\nrequires = []\nbuild-backend = 'evil_backend'\n"
+            "backend-path = ['.']\n[project]\nname='e'\n"
+        ),
+        "evil_backend.py": "import os\nos.system('touch /tmp/flash_pwned_sentinel')\n",
+    }
+    with pytest.raises(envs.EnvPublishError, match=r"backend-path|unsupported build-backend"):
+        envs.publish_package(
+            package_b64=_pkg_b64(pkg), name="e", is_new=True, key={"email": "dev@clado.ai"}
+        )
+
+
 def test_prime_push_fails_fast_on_permanent_error(monkeypatch, tmp_path):
     """A clearly-permanent failure (auth/not-found/build/test) must NOT burn all retries:
     `--auto-bump` can't fix it, so surface the real error after one attempt."""
@@ -235,7 +350,7 @@ def test_prime_push_fails_fast_on_permanent_error(monkeypatch, tmp_path):
         def __init__(self, rc, out="", err=""):
             self.returncode, self.stdout, self.stderr = rc, out, err
 
-    def run(cmd, capture_output=True, text=True, env=None):
+    def run(cmd, capture_output=True, text=True, env=None, timeout=None):
         calls.append(list(cmd))
         return _Proc(1, err="HTTP 401: Unauthorized — invalid API key")
 
@@ -245,6 +360,52 @@ def test_prime_push_fails_fast_on_permanent_error(monkeypatch, tmp_path):
     assert exc.value.status == 502
     assert "retrying will not help" in str(exc.value).lower()
     assert len(calls) == 1  # failed fast — did NOT climb through all _PUSH_MAX_ATTEMPTS
+
+
+def test_is_permanent_push_failure_ignores_codes_in_hash_or_version():
+    # REGRESSION (Cursor Bugbot, High): bare "401"/"403"/"404" substring matching mis-flagged a
+    # resolvable version/content-hash CONFLICT as permanent (the digits appear inside a content hash
+    # or version), making _prime_push fail-fast instead of climbing with --auto-bump. These must NOT
+    # be treated as permanent failures.
+    assert not envs._is_permanent_push_failure(
+        "Upload failed: Wheel version with content hash a401f3b403c404d already exists"
+    )
+    assert not envs._is_permanent_push_failure("HTTP 400: version 1.404.0 already exists")
+    assert not envs._is_permanent_push_failure("error: version 2.401.3 already exists on the hub")
+    # A REAL HTTP status (with the http/status lead-in) is still permanent...
+    assert envs._is_permanent_push_failure("HTTP 403: Forbidden")
+    assert envs._is_permanent_push_failure("request failed with status 401")
+    # ...and the textual markers are unaffected.
+    assert envs._is_permanent_push_failure("error: unauthorized")
+    assert envs._is_permanent_push_failure("environment not found")
+    assert envs._is_permanent_push_failure("build failed: missing dependency")
+
+
+def test_prime_push_retries_conflict_with_code_digits_in_hash(monkeypatch, tmp_path):
+    # End-to-end of the regression: a conflict rejection whose content hash happens to contain
+    # "404"/"401" must be RETRIED with --auto-bump (climbed past), not fail-fasted as permanent.
+    monkeypatch.setenv("PRIME_API_KEY", "pit-x")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/prime")
+    calls: list[list[str]] = []
+    state = {"left": 1}
+
+    class _Proc:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def run(cmd, capture_output=True, text=True, env=None, timeout=None):
+        calls.append(list(cmd))
+        if state["left"] > 0:
+            state["left"] -= 1
+            # digits 404/401 embedded in a content hash — must NOT be read as a permanent failure.
+            return _Proc(1, err="HTTP 400: content hash f404a401 already exists")
+        return _Proc(0, out="Successfully pushed freesolo-co/ns-env\n")
+
+    monkeypatch.setattr("subprocess.run", run)
+    slug = envs._prime_push(tmp_path, name="ns-env", is_new=True)
+    assert slug == "freesolo-co/ns-env"
+    assert len(calls) == 2  # it climbed past the conflict instead of failing fast
+    assert "--auto-bump" in calls[1]
 
 
 def test_publish_is_idempotent_on_republish(monkeypatch):
@@ -381,7 +542,7 @@ def test_publish_ignores_uploaded_metadata_owner(monkeypatch, tmp_path):
 
     captured: dict = {}
 
-    def run(cmd, capture_output=True, text=True, env=None):
+    def run(cmd, capture_output=True, text=True, env=None, timeout=None):
         env_dir = Path(cmd[cmd.index("--path") + 1])
         captured["had_spoof_metadata"] = (env_dir / ".prime" / ".env-metadata.json").is_file()
         name = cmd[cmd.index("--name") + 1]
@@ -405,6 +566,81 @@ def test_publish_ignores_uploaded_metadata_owner(monkeypatch, tmp_path):
     assert slug == "freesolo-co/dev-clado-ai--myenv"
     assert "victim" not in slug
     assert "secret-env" not in slug
+
+
+# --- client-side packaging: _tar_b64 must PRUNE excluded dirs, not just filter them ----------------
+
+
+def _members_of(b64: str) -> set[str]:
+    raw = base64.b64decode(b64)
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+        return {m.name for m in tar.getmembers() if m.isreg()}
+
+
+def _build_env_tree(root: Path) -> None:
+    """A realistic env tree: real source + sibling files, plus excluded tool/cache dirs (one of them,
+    .venv, holding a file nested several levels deep to represent a huge tree we must NOT walk into)."""
+    (root / "pyproject.toml").write_text("[project]\nname='e'\n")
+    (root / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (root / "utils.py").write_text("X = 1\n")
+    (root / "datasets").mkdir()
+    (root / "datasets" / "train.jsonl").write_text('{"q": 1}\n')
+    # Excluded dirs (must be omitted AND not descended into):
+    deep = root / ".venv" / "lib" / "python3.11" / "site-packages" / "big_pkg"
+    deep.mkdir(parents=True)
+    (deep / "huge.py").write_text("# pretend this is a massive dependency tree\n")
+    (root / ".git").mkdir()
+    (root / ".git" / "objects").mkdir()
+    (root / ".git" / "objects" / "deadbeef").write_text("gitobj\n")
+    (root / "__pycache__").mkdir()
+    (root / "__pycache__" / "environment.cpython-311.pyc").write_text("bytecode\n")
+    (root / ".mypy_cache").mkdir()
+    (root / ".mypy_cache" / "cache.json").write_text("{}\n")
+
+
+def test_tar_b64_excludes_tool_dirs_and_keeps_source(tmp_path):
+    from flash.cli.main.envpush import _tar_b64
+
+    _build_env_tree(tmp_path)
+    members = _members_of(_tar_b64(tmp_path))
+    # Exactly the non-excluded source files, nothing from an excluded dir.
+    assert members == {"pyproject.toml", "environment.py", "utils.py", "datasets/train.jsonl"}
+    # In particular the deep sentinel under .venv is gone, and no excluded dir leaks in.
+    assert not any(
+        part in m.split("/")
+        for m in members
+        for part in (".venv", ".git", "__pycache__", ".mypy_cache", ".prime", ".pytest_cache")
+    )
+
+
+def test_tar_b64_does_not_descend_into_excluded_dirs(tmp_path, monkeypatch):
+    # The CORE of the fix (vs the old rglob): excluded dirs must never be TRAVERSED. We spy on os.walk
+    # and assert no walked root is inside an excluded dir — so we never stat the (potentially huge)
+    # files beneath .venv/.git/etc. A plain rglob('*') would recurse into them and stat every entry.
+    import os as _os
+
+    from flash.cli.main.envpush import _tar_b64
+
+    _build_env_tree(tmp_path)
+    excluded = {".venv", ".git", "__pycache__", ".mypy_cache", ".prime", ".pytest_cache"}
+    walked_roots: list[str] = []
+    real_walk = _os.walk
+
+    def spy_walk(top, *a, **k):
+        for root, dirs, files in real_walk(top, *a, **k):
+            walked_roots.append(root)
+            yield root, dirs, files
+
+    monkeypatch.setattr(_os, "walk", spy_walk)
+    _tar_b64(tmp_path)
+    # No walked root may contain an excluded directory in its path: we pruned before descending.
+    for root in walked_roots:
+        rel_parts = Path(root).relative_to(tmp_path).parts
+        assert not (excluded & set(rel_parts)), f"descended into excluded dir: {root}"
+    # Sanity: we DID walk the real source tree (top level + datasets/).
+    rels = {str(Path(r).relative_to(tmp_path)) for r in walked_roots}
+    assert "." in rels
+    assert "datasets" in rels
 
 
 def test_republish_by_other_namespace_does_not_hijack(monkeypatch):
