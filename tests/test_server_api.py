@@ -601,3 +601,100 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
 
     assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint"
     assert runner.get_status("nohandle-1").state == "failed"
+
+
+def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
+    """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
+    plane's PRIME_API_KEY), namespaced per identity — so the user needs no Prime account."""
+    import base64
+    import io
+    import tarfile
+
+    import flash.server.envs as envs_mod
+
+    # Stub the actual `prime env push` so the test doesn't hit Prime; echo the namespaced name.
+    monkeypatch.setattr(
+        envs_mod, "_prime_push", lambda env_dir, *, name, is_new: f"freesolo-co/{name}"
+    )
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in (
+            ("pyproject.toml", b"[project]\nname='e'\n"),
+            ("e/__init__.py", b"x=1\n"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    pkg = base64.b64encode(buf.getvalue()).decode()
+
+    resp = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "MyEnv", "is_new": True, "package_b64": pkg},
+    )
+    assert resp.status_code == 200
+    slug = resp.json()["id"]
+    assert slug.startswith("freesolo-co/")  # published under the managed account
+    assert slug.endswith("-myenv")  # per-identity namespaced + sanitized
+
+    # Unauthenticated requests are rejected.
+    assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
+
+
+def test_publish_env_parses_is_new_robustly(api, monkeypatch):
+    """`is_new` from the JSON body must be parsed as a real bool: the string "false"/"0" is False
+    (a plain bool() would make any non-empty string True), and it defaults to True when absent."""
+    import base64
+    import io
+    import tarfile
+
+    import flash.server.envs as envs_mod
+
+    seen: dict = {}
+
+    def fake_push(env_dir, *, name, is_new):
+        seen["is_new"] = is_new
+        return f"freesolo-co/{name}"
+
+    monkeypatch.setattr(envs_mod, "_prime_push", fake_push)
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for nm, content in (("pyproject.toml", b"[project]\nname='e'\n"), ("e/__init__.py", b"x=1\n")):
+            info = tarfile.TarInfo(nm)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    pkg = base64.b64encode(buf.getvalue()).decode()
+
+    def _publish(body_extra):
+        resp = api.post(
+            "/v1/envs",
+            headers=_bearer(_login()),
+            json={"name": "e", "package_b64": pkg, **body_extra},
+        )
+        assert resp.status_code == 200, resp.text
+        return seen["is_new"]
+
+    # Falsey string forms -> False (the bug: bool("false") was True).
+    assert _publish({"is_new": "false"}) is False
+    assert _publish({"is_new": "0"}) is False
+    assert _publish({"is_new": False}) is False
+    # Truthy forms and absence -> True.
+    assert _publish({"is_new": "true"}) is True
+    assert _publish({"is_new": True}) is True
+    assert _publish({}) is True  # default when absent
+
+
+def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
+    """Regression: a present-but-falsy non-string `name`/`package_b64` (e.g. 0, False, []) must
+    reach publish_package's type check and yield the *type* 400 — not be `or ""`-coerced to an
+    empty string first (which would surface a different/misleading 400)."""
+    # name = 0 -> hits the name type check, not "missing env name".
+    r = api.post("/v1/envs", headers=_bearer(_login()), json={"name": 0, "package_b64": "x"})
+    assert r.status_code == 400, r.text
+    assert "name must be a string" in r.text.lower()
+    # package_b64 = False (valid string name) -> hits the package type check.
+    r2 = api.post("/v1/envs", headers=_bearer(_login()), json={"name": "e", "package_b64": False})
+    assert r2.status_code == 400, r2.text
+    assert "must be a base64 string" in r2.text.lower()
