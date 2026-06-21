@@ -26,7 +26,7 @@ from flash.client import (
 )
 from flash.client.config import load_credentials
 from flash.client.specs import spec_payload
-from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
+from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
 
@@ -279,7 +279,7 @@ def _cmd_train_cost(args) -> int:
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
-    print(estimate_cost(_runconfig_from_spec(spec)).breakdown())
+    print(estimate_cost(runconfig_from_spec(spec)).breakdown())
     return 0
 
 

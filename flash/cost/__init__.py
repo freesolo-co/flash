@@ -9,7 +9,7 @@ There is **no output multiplier** -- nothing scales the dollar figure to hit a t
 from __future__ import annotations
 
 from .analytical import estimate_cost
-from .spec import estimate_for_spec, offline_estimate_for_spec, runconfig_from_spec
+from .spec import estimate_for_spec, runconfig_from_spec
 from .types import CostEstimate, RunConfig
 
 __all__ = [
@@ -17,6 +17,5 @@ __all__ = [
     "RunConfig",
     "estimate_cost",
     "estimate_for_spec",
-    "offline_estimate_for_spec",
     "runconfig_from_spec",
 ]

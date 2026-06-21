@@ -97,11 +97,9 @@ def runconfig_from_spec(spec) -> RunConfig:
     count and the setup repeats by the seed count -- the estimate then prices the same total
     work the run would bill for.
 
-    GPU pinning is gone: ``spec.gpu.type`` is only the parse-time provisional (and on the server
-    it may be HF-sized, differing from the offline ``--cost`` quote), so the estimate does NOT
-    pin it -- it runs its own offline cheapest-fit (``gpu=None``) over the whole registry,
-    cross-provider (``provider="auto"``), with no validation gate. This is what makes the
-    charge equal the quote: both price the cheapest fitting class for the SAME offline VRAM need.
+    GPU pinning is gone: the estimate doesn't pin ``spec.gpu.type`` -- it runs its own
+    cheapest-fit (``gpu=None``) over the whole registry, cross-provider (``provider="auto"``),
+    with no validation gate.
     """
     t, g = spec.train, spec.gpu
     is_grpo = spec.algorithm == "grpo"
@@ -125,17 +123,5 @@ def runconfig_from_spec(spec) -> RunConfig:
 
 
 def estimate_for_spec(spec) -> CostEstimate:
-    """The pre-flight ``CostEstimate`` for a parsed training ``JobSpec`` (as parsed)."""
-    return estimate_cost(runconfig_from_spec(spec))
-
-
-def offline_estimate_for_spec(spec) -> CostEstimate:
-    """The OFFLINE-consistent estimate -- what ``flash train --cost`` would have quoted.
-
-    Catalog models size from their curated stats (no network) and selection picks the cheapest
-    fitting class with no validation gate, exactly like the parse-time provisional. With GPU
-    pinning gone there is no quote-vs-parse divergence, so this is identical to
-    ``estimate_for_spec``; kept as a named seam for ``charge_run_estimate`` (the control plane
-    bills the ``min`` of this and the parsed estimate, never more than quoted).
-    """
+    """The pre-flight ``CostEstimate`` for a parsed training ``JobSpec``."""
     return estimate_cost(runconfig_from_spec(spec))

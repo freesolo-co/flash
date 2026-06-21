@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from decimal import ROUND_HALF_UP, Decimal
 
-from flash.cost.spec import estimate_for_spec, offline_estimate_for_spec
+from flash.cost.spec import estimate_for_spec
 
 from .auth import DEFAULT_FREESOLO_BASE_URL, FREESOLO_BASE_URL_ENV
 
@@ -127,21 +127,11 @@ def charge_run_estimate(*, token: str, spec) -> dict:
     Returns the backend's charge response (``{amountCents, balanceCents, ...}``) on success.
     Raises ``BillingError`` on any non-2xx response or when the billing service can't be reached.
 
-    CHARGE <= QUOTE (PR #3 review): the user is NEVER billed more than ``slm train --cost``
-    quoted. The CLI prices the spec fully offline; the control plane parses the SAME spec
-    without that guard, so for a ``model_policy = "allow"`` unlisted model the server-resolved
-    GPU/sizing (a live HF probe) could otherwise diverge from the quote. We bill ``min`` of the
-    OFFLINE-consistent estimate (the quote the user saw) and the spec-as-parsed estimate: in the
-    normal case these are equal so the charge EQUALS the quote, and in the only case they differ
-    (a divergent unlisted/open model) the charge is the smaller of the two -- so it can be lower
-    than the quote but never higher.
+    The charge equals the ``flash train --cost`` quote: both price the SAME spec on the same
+    catalog-only, cheapest-fitting basis (no GPU pin, no network), so there is no quote-vs-charge
+    divergence to reconcile.
     """
-    # The amount the user saw at --cost time (offline-consistent), and the amount the
-    # server's HF-aware parse would imply; charge the smaller so the debit never exceeds the
-    # quote even if the two ever diverge for an unlisted/open model.
-    quote = offline_estimate_for_spec(spec)
-    parsed = estimate_for_spec(spec)
-    estimate = quote if quote.total_usd <= parsed.total_usd else parsed
+    estimate = estimate_for_spec(spec)
     body = {
         "runId": spec.run_id,
         "costCents": _cents(estimate.total_usd),
