@@ -434,16 +434,20 @@ def _fix_fla_fastpath_on_hopper() -> None:
     rule — correct but slow + memory-heavy. The real fix is fla's **tilelang** backend, which is
     correct on Triton>=3.4. So on Hopper we ensure the working stack is present rather than
     removing fla:
-      * ``tilelang`` (the correct GDN chunk_bwd backend) + the pinned ``apache-tvm-ffi==0.1.11``
-        (0.1.12 double-registers the TVM-FFI runtime -> ``import tilelang`` aborts), and
+      * the pinned ``tilelang==0.1.11`` (the correct GDN chunk_bwd backend) + the pinned
+        ``apache-tvm-ffi==0.1.11`` (0.1.12 double-registers the TVM-FFI runtime -> ``import
+        tilelang`` aborts; and tilelang's own ``apache-tvm-ffi~=0.1.0`` range would let 0.1.12
+        back in, so the pin is force-installed last and its resolved version is verified), and
       * a COMPLETE ``fla`` (the PyPI ``flash-linear-attention`` wheel is a broken stub missing
         ``fla.modules``; reinstall from git if the resident copy is incomplete).
     Validated A/B (H100 SXM, Qwen3.5 hidden-2560 LoRA, controlled fla on/off): seq4096 435->105
     ms/step & 9.9->6.1 GB (4.2x / 1.6x); seq8192 7.1x; seq16384 3106->247 ms & 32->17 GB (12.6x /
     1.9x). Forward loss matches the torch delta to 1.8e-4 (correct). Runs on BOTH substrates
     (RunPod + Vast exec this module), after all installs and BEFORE any model import. Non-Hopper:
-    no-op (fla's Triton kernel is correct there). Best-effort: any failure leaves the (correct)
-    pure-PyTorch delta rule in place, so a worker never crashes on a dep hiccup.
+    no-op (fla's Triton kernel is correct there). Best-effort + FAIL-CLOSED: a failed install
+    (pip rc!=0), a missing module, or the wrong resolved ``apache-tvm-ffi`` version all flip the
+    gate off and DISABLE fla, leaving the (correct) pure-PyTorch delta rule in place — a worker
+    never crashes on a dep hiccup, and it never silently runs fla's broken Hopper GDN kernel.
     """
     import importlib
     import importlib.util
@@ -463,27 +467,79 @@ def _fix_fla_fastpath_on_hopper() -> None:
         except Exception:
             return False
 
-    def _pip(*args: str) -> None:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *args], check=False)
+    def _ver(dist: str) -> str | None:
+        """Installed version of a distribution (by metadata), or None if absent/unreadable.
+
+        Distinct from _have (a find_spec import probe): the install can silently leave the WRONG
+        version resolved (e.g. tilelang's ``apache-tvm-ffi~=0.1.0`` range happily keeps 0.1.12,
+        which still find_spec-imports but aborts ``import tilelang``), so the gate must check the
+        actual installed version, not just importability.
+        """
+        try:
+            import importlib.metadata as _md
+
+            return _md.version(dist)
+        except Exception:
+            return None
+
+    def _pip(*args: str) -> bool:
+        """Run pip install; return True only if pip exited 0. A failed install (network/build/
+        resolver) must NOT be silently treated as success — the caller gates ``ok`` on this."""
+        try:
+            rc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", *args], check=False
+            ).returncode
+        except Exception:
+            return False
+        return rc == 0
+
+    # The exact apache-tvm-ffi pin the tilelang backend needs (0.1.12 double-registers the TVM-FFI
+    # runtime -> `import tilelang` aborts). Kept as a constant so the install spec and the post-
+    # install version gate below can't drift apart. Keep in lockstep with WORKER_DEPS / Dockerfile.
+    TVM_FFI_PIN = "0.1.11"
+    TILELANG_PIN = "0.1.11"  # pin the GDN backend too (same rationale as the fla SHA pin)
 
     try:
         # 1. tilelang backend (correct GDN chunk_bwd on Triton>=3.4) + the pinned tvm-ffi.
+        #    Track whether each install actually succeeded — a failed pip (rc!=0) must flip the
+        #    gate to the pure-PyTorch fallback rather than be ignored. (_have-only would also pass
+        #    on a stale/partial copy from a previous boot.) tilelang pulls apache-tvm-ffi via a
+        #    range that allows the broken 0.1.12, so force-reinstall the exact pin AFTER tilelang
+        #    and verify the resolved version below.
+        tilelang_ok = True
         if not _have("tilelang"):
-            _pip("tilelang")
-        _pip("apache-tvm-ffi==0.1.11")  # 0.1.12 aborts `import tilelang` (TVM-FFI double-register)
+            tilelang_ok = _pip(f"tilelang=={TILELANG_PIN}")
+        # Force the exact tvm-ffi pin last (overriding whatever tilelang's range resolved). If this
+        # install fails we DON'T trust the resident copy — tvm_ffi_ok gates `ok` below.
+        tvm_ffi_ok = _pip(f"apache-tvm-ffi=={TVM_FFI_PIN}")
         # 2. a COMPLETE fla — the PyPI wheel ships a stub without `fla.modules`. Reinstall from git
         #    when the resident copy is missing the real package (or absent entirely).
+        fla_ok = True
         if not (_have("fla") and _have("fla.modules")):
             _remove_fla_from_disk()  # clear any broken stub before the git install
             # Pinned to the same commit as WORKER_DEPS / Dockerfile.worker so a runtime reinstall is
             # reproducible (the moving default branch could pull a broken/incompatible fla).
-            _pip(
+            fla_ok = _pip(
                 "--no-deps",
                 "git+https://github.com/fla-org/flash-linear-attention.git"
                 "@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
             )
         importlib.invalidate_caches()
-        ok = _have("fla") and _have("fla.modules") and _have("tilelang")
+        # Gate on BOTH (a) every install we ran exiting 0 — a failed pip (network/build/resolver)
+        # must NOT be treated as healthy just because a stale/partial copy still find_spec-imports —
+        # AND (b) the modules importing AND (c) the resolved apache-tvm-ffi being exactly the pin.
+        # (c) matters because tilelang depends on `apache-tvm-ffi~=0.1.0`, so the resolver can keep
+        # the broken 0.1.12 (which find_spec-imports fine but aborts `import tilelang`); checking the
+        # version is the only reliable signal the pin actually landed.
+        tvm_ffi_ver = _ver("apache-tvm-ffi")
+        installs_ok = tilelang_ok and tvm_ffi_ok and fla_ok
+        ok = (
+            installs_ok
+            and _have("fla")
+            and _have("fla.modules")
+            and _have("tilelang")
+            and tvm_ffi_ver == TVM_FFI_PIN
+        )
         if not ok:
             # The healthy fla+tilelang stack could not be assembled, so fla's GDN chunk_bwd would
             # still hit the broken Triton>=3.4 path on Hopper (fla #640) and HARD-RAISE. A print
@@ -495,13 +551,16 @@ def _fix_fla_fastpath_on_hopper() -> None:
             _removed, _still = _remove_fla_from_disk()
             print(
                 "[hopper] fla GDN fast path unavailable -> DISABLING fla "
-                f"(removed {len(_removed)} copy(ies); still_importable={_still}); "
+                f"(installs_ok={installs_ok} [tilelang={tilelang_ok} tvm_ffi={tvm_ffi_ok} "
+                f"fla={fla_ok}], tvm_ffi_ver={tvm_ffi_ver!r} (want {TVM_FFI_PIN}); "
+                f"removed {len(_removed)} copy(ies); still_importable={_still}); "
                 "pure-PyTorch delta fallback",
                 flush=True,
             )
         else:
             print(
-                "[hopper] fla GDN fast path ENABLED (fla+tilelang, fla #640 fixed)",
+                "[hopper] fla GDN fast path ENABLED (fla+tilelang "
+                f"{TILELANG_PIN}/tvm-ffi {tvm_ffi_ver}, fla #640 fixed)",
                 flush=True,
             )
     except Exception as e:  # never let a dep hiccup crash the worker — torch delta still runs
