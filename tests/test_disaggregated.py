@@ -362,3 +362,27 @@ def test_wait_for_server_health_deadline_checked_after_on_wait(monkeypatch):
             on_wait=lambda: None,
             on_wait_every=60.0,
         )
+
+
+def test_launch_vllm_server_closes_parent_log_handle(monkeypatch, tmp_path):
+    """Regression: the parent must close its log file handle after spawning — the child inherits
+    a dup'd fd, so leaving the parent's handle open leaks an fd on every server restart."""
+    import flash.engine.disaggregated as d
+
+    captured = {}
+    real_open = open
+
+    def fake_open(path, mode="r", *a, **k):
+        f = real_open(tmp_path / "vllm.log", "wb")
+        captured["log"] = f
+        return f
+
+    class _FakeProc:
+        pass
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(d.subprocess, "Popen", lambda *a, **k: _FakeProc())
+
+    proc = d.launch_vllm_server(["vllm", "serve"], {}, log_path=str(tmp_path / "vllm.log"))
+    assert isinstance(proc, _FakeProc)
+    assert captured["log"].closed, "parent log handle must be closed after Popen (no fd leak)"

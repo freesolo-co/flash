@@ -513,10 +513,16 @@ def launch_vllm_server(
 ) -> subprocess.Popen:
     """Start the rollout server subprocess, streaming its stdout/stderr to ``log_path`` (so a
     server-side load/OOM is recoverable from the run log on a rented node)."""
-    log = open(log_path, "wb")  # noqa: SIM115 — handle lives with the long-running subprocess
+    log = open(log_path, "wb")  # noqa: SIM115 — fd is dup'd into the child; parent handle closed below
     print(f"[rl][disagg] launching rollout server: {' '.join(cmd)}")
     print(f"[rl][disagg] server CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')} log={log_path}")
-    return subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    finally:
+        # Popen dup'd the fd into the child, so the parent's handle is no longer needed. Close it
+        # so repeated server restarts on a long-lived worker don't leak file descriptors.
+        log.close()
+    return proc
 
 
 def terminate_server(proc: subprocess.Popen | None, *, timeout: float = 15.0) -> None:
