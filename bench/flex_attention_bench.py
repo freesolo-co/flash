@@ -52,20 +52,23 @@ def make_dataset(tok, n: int, seed: int = 0):
     return Dataset.from_list(rows), lengths
 
 
-def build(model_id: str, attn: str, packing: bool, max_len: int, bsz: int, grad_accum: int):
+def build(model_id: str, attn: str, packing: bool, max_len: int, bsz: int, grad_accum: int,
+          steps: int):
     from trl import SFTConfig
 
     mik = {"dtype": "bfloat16", "device_map": None, "attn_implementation": attn}
-    cfg = SFTConfig(
+    return SFTConfig(
         output_dir="/tmp/flexbench",
         per_device_train_batch_size=bsz,
         gradient_accumulation_steps=grad_accum,
         max_length=max_len,
         packing=packing,
         packing_strategy="bfd",
-        # One pass over the SAME dataset for every config: same total content tokens, so the
-        # wall-time difference is exactly the padding-FLOP saving packing buys (minus flex overhead).
+        # `--steps` bounds the run: max_steps overrides num_train_epochs in the HF Trainer, so each
+        # config trains EXACTLY `steps` optimizer steps (cheap + directly comparable). <=0 means
+        # "unbounded" -> fall back to one full epoch over the dataset.
         num_train_epochs=1,
+        max_steps=steps if steps > 0 else -1,
         logging_steps=5,
         report_to=[],
         bf16=True,
@@ -73,7 +76,6 @@ def build(model_id: str, attn: str, packing: bool, max_len: int, bsz: int, grad_
         model_init_kwargs=mik,
         gradient_checkpointing=True,
     )
-    return cfg
 
 
 def correctness_check(model_id: str, attn: str, max_len: int) -> dict:
@@ -93,17 +95,18 @@ def correctness_check(model_id: str, attn: str, max_len: int) -> dict:
     a = torch.randint(0, 1000, (40,))
     b1 = torch.randint(0, 1000, (40,))
     b2 = torch.randint(0, 1000, (40,))
-    # position_ids restart at the boundary (what 'bfd' packing emits); the doc/block mask is derived
-    # from them. We pass a 4D block-diagonal mask so any boundary-aware path uses it.
-    def run(b):
+    # position_ids restart at the boundary (what 'bfd' packing emits) — this is the ONLY boundary
+    # signal we pass. A flex/varlen path derives its block-diagonal document mask from these restarts;
+    # we deliberately do NOT pass an explicit 4D mask, mirroring flash's real packed SFT call.
+    def run(m, b):
         ids = torch.cat([a, b]).unsqueeze(0).cuda()
         pos = torch.cat([torch.arange(40), torch.arange(40)]).unsqueeze(0).cuda()
         with torch.no_grad():
-            out = model(input_ids=ids, position_ids=pos).logits[0, :40]  # segment-A logits
+            out = m(input_ids=ids, position_ids=pos).logits[0, :40]  # segment-A logits
         return out.float().cpu()
 
     try:
-        la, lb = run(b1), run(b2)
+        la, lb = run(model, b1), run(model, b2)
         # If A's logits are identical regardless of B, the boundary is enforced (no leakage).
         max_delta = (la - lb).abs().max().item()
         leaked = max_delta > 1e-2
@@ -123,11 +126,10 @@ def bench_one(model_id, attn, packing, steps, max_len, bsz, grad_accum, n_exampl
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     ds, lengths = make_dataset(tok, n_examples)
-    cfg = build(model_id, attn, packing, max_len, bsz, grad_accum)
+    cfg = build(model_id, attn, packing, max_len, bsz, grad_accum, steps)
 
     timings: list[float] = []
     losses: list[float] = []
-    real_tokens_per_step: list[int] = []
 
     class Timer:
         def __init__(self):
@@ -166,17 +168,24 @@ def bench_one(model_id, attn, packing, steps, max_len, bsz, grad_accum, n_exampl
     wall = time.time() - t0
     peak_gb = torch.cuda.max_memory_allocated() / 1e9
 
-    # THE decision metric: real (non-padding) content tokens processed per second. Every config
-    # runs one epoch over the SAME examples, so `real_tokens` is identical across configs; only the
-    # wall time differs (packing removes padding FLOPs; flex adds per-call overhead). Higher = better.
-    real_tokens = sum(lengths)
+    # THE decision metric: real (non-padding) content tokens processed per second. Count only what
+    # the model ACTUALLY trains on: (a) lengths are CLAMPED to max_len, since SFTConfig(max_length)
+    # truncates longer examples (summing raw lengths would inflate the token count / throughput);
+    # and (b) when --steps bounds the run we don't see the whole dataset, so scale by the examples
+    # actually consumed (steps * bsz * grad_accum, capped at one epoch). Using the MEAN truncated
+    # length keeps this correct regardless of dataloader shuffling. Higher real_tokens_per_s = better.
+    n_steps = len(timings)
+    trunc_lengths = [min(L, max_len) for L in lengths]
+    consumed = min(n_steps * bsz * grad_accum, len(trunc_lengths)) if n_steps else len(trunc_lengths)
+    mean_len = (sum(trunc_lengths) / len(trunc_lengths)) if trunc_lengths else 0.0
+    real_tokens = round(mean_len * consumed)
     warm = timings[2:] if len(timings) > 4 else timings
     step_med = statistics.median(warm) if warm else float("nan")
     train_s = sum(timings) if timings else wall
     return {
         "attn": attn,
         "packing": packing,
-        "steps": len(timings),
+        "steps": n_steps,
         "real_tokens": real_tokens,
         "train_s": round(train_s, 2),
         "real_tokens_per_s": round(real_tokens / train_s) if train_s else None,

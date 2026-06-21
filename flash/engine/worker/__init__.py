@@ -68,13 +68,14 @@ from flash.engine.worker.perf import (
     _remove_fla_from_disk,  # noqa: F401
     _reset_peak_gpu,
     _sdpa_cudnn_ctx,
+    flex_attn_status,
     free_gpu,
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
     liger_on,
     loraplus_optimizer_cls,
-    model_supports_flex_attn,
+    model_supports_flex_attn,  # noqa: F401
     optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
@@ -830,7 +831,11 @@ def run_sft():
     # (5090). flex support is per-arch (Llama/Qwen2/3 yes; Qwen3.5/3.6 hybrid-GDN no — HF #34809),
     # so we only turn flex packing on when the model's arch supports it.
     _fa_ok = _flash_attn_available()
-    _flex_ok = (not _fa_ok) and model_supports_flex_attn(model_id)
+    # When FA2 is absent, flex is the fallback boundary-correct backend — but only if the model's
+    # arch supports it. Capture WHY it's unavailable so the SKIPPED message is accurate (a real arch
+    # limitation vs a possibly-transient config-probe failure), instead of always blaming the arch.
+    _flex_status = "unsupported" if _fa_ok else flex_attn_status(model_id)
+    _flex_ok = _flex_status == "supported"
     if _fa_ok:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
@@ -838,10 +843,17 @@ def run_sft():
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (flex_attention block-diagonal mask)")
     else:
+        # flash-attn is absent on torch 2.10; distinguish the flex fallback reason so the diagnosis
+        # isn't misleading when the config probe merely failed (offline / transient HF error).
+        _flex_reason = (
+            "the model's arch lacks flex_attention support"
+            if _flex_status == "unsupported"
+            else "the flex_attention support probe failed (offline / transient HF error)"
+        )
         print(
-            "[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
-            "2.10 and the model's arch lacks flex_attention support). Bake flash-attn into the "
-            "worker image, or use a flex-capable arch, to enable packing."
+            f"[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
+            f"2.10 and {_flex_reason}). Bake flash-attn into the worker image, or use a flex-capable "
+            f"arch (with a reachable config), to enable packing."
         )
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
