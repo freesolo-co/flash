@@ -65,7 +65,6 @@ def optimal_attn_impl() -> str | None:
     return impl
 
 
-
 # Liger's fused linear cross-entropy is a MEMORY optimization (it never materializes the fp32
 # [B,T,vocab] logits), not a fixed-batch speed win. PR #174 ledger: on a 1B model at fixed batch
 # it is a measured NET LOSS on EVERY arch (min-of-3: A100 0.86x, H100 0.90x, RTX 3090 0.78x,
@@ -142,7 +141,6 @@ def setup_perf_backends() -> None:
         print("[perf] TF32 matmul/cuDNN enabled")
     except Exception as e:
         print("setup_perf_backends skipped:", e)
-
 
 
 def _remove_fla_from_disk() -> tuple[list[str], bool]:
@@ -341,7 +339,6 @@ def _sdpa_cudnn_ctx(attn_impl: str | None):
         return contextlib.nullcontext()
 
 
-
 def gpu_diagnostics() -> dict:
     """Collect CUDA/driver diagnostics to pin down GPU init failures on rented nodes."""
     diag = {}
@@ -428,18 +425,27 @@ def _metric_curve(trainer, key: str) -> list:
         return []
 
 
-def _drop_fla_on_hopper() -> None:
-    """Remove flash-linear-attention when running on a Hopper GPU (sm90, H100).
+def _fix_fla_fastpath_on_hopper() -> None:
+    """Make flash-linear-attention's GatedDeltaNet fast path CORRECT + fast on Hopper (sm90)
+    instead of dropping it.
 
-    fla's gated chunk_bwd Triton kernel is miscomputed on Hopper with Triton>=3.4 and
-    HARD-RAISES (fla #640), so every gated-delta (Qwen3.5/3.6 family) GRPO backward crashes.
-    The worker base image BAKES fla in, and per-run installs (extra_pip / `prime env install`)
-    can pull it back, so the only reliable place to drop it is HERE: in the worker process,
-    after all installs and BEFORE any model import. transformers then uses the correct
-    pure-PyTorch delta rule (2-3x slower but it RUNS). Runs on BOTH substrates (RunPod and
-    Vast both exec this module). importlib caches are invalidated so the later
-    is_fla_available() probe sees it gone. Ampere/Ada/Blackwell keep fla for the speedup.
+    fla's gated chunk_bwd Triton kernel is miscomputed on Hopper with Triton>=3.4 and HARD-RAISES
+    (fla #640). The worker historically DROPPED fla here and fell back to the pure-PyTorch delta
+    rule — correct but slow + memory-heavy. The real fix is fla's **tilelang** backend, which is
+    correct on Triton>=3.4. So on Hopper we ensure the working stack is present rather than
+    removing fla:
+      * ``tilelang`` (the correct GDN chunk_bwd backend) + the pinned ``apache-tvm-ffi==0.1.11``
+        (0.1.12 double-registers the TVM-FFI runtime -> ``import tilelang`` aborts), and
+      * a COMPLETE ``fla`` (the PyPI ``flash-linear-attention`` wheel is a broken stub missing
+        ``fla.modules``; reinstall from git if the resident copy is incomplete).
+    Validated A/B (H100 SXM, Qwen3.5 hidden-2560 LoRA, controlled fla on/off): seq4096 435->105
+    ms/step & 9.9->6.1 GB (4.2x / 1.6x); seq8192 7.1x; seq16384 3106->247 ms & 32->17 GB (12.6x /
+    1.9x). Forward loss matches the torch delta to 1.8e-4 (correct). Runs on BOTH substrates
+    (RunPod + Vast exec this module), after all installs and BEFORE any model import. Non-Hopper:
+    no-op (fla's Triton kernel is correct there). Best-effort: any failure leaves the (correct)
+    pure-PyTorch delta rule in place, so a worker never crashes on a dep hiccup.
     """
+    import importlib
     import importlib.util
     import subprocess
 
@@ -447,21 +453,42 @@ def _drop_fla_on_hopper() -> None:
         import torch
 
         if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
-            return  # not Hopper: fla's Triton kernel is correct here, keep it.
+            return  # not Hopper: fla's Triton kernel is correct here.
     except Exception:
         return
 
-    if importlib.util.find_spec("fla") is None:
-        return
-    # pip first (clears metadata); _remove_fla_from_disk then deletes any package dir pip left
-    # behind (incomplete RECORD / non-pip base-image install / a copy on another sys.path entry).
-    subprocess.run(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "flash-linear-attention"], check=False
-    )
-    removed, still = _remove_fla_from_disk()
-    print(
-        f"[hopper] fla removed {removed or 'nothing'} (still_importable={still}) -> "
-        f"{'WARNING fla remains' if still else 'pure-PyTorch delta rule'} (fla #640)",
-        flush=True,
-    )
+    def _have(mod: str) -> bool:
+        try:
+            return importlib.util.find_spec(mod) is not None
+        except Exception:
+            return False
 
+    def _pip(*args: str) -> None:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *args], check=False)
+
+    try:
+        # 1. tilelang backend (correct GDN chunk_bwd on Triton>=3.4) + the pinned tvm-ffi.
+        if not _have("tilelang"):
+            _pip("tilelang")
+        _pip("apache-tvm-ffi==0.1.11")  # 0.1.12 aborts `import tilelang` (TVM-FFI double-register)
+        # 2. a COMPLETE fla — the PyPI wheel ships a stub without `fla.modules`. Reinstall from git
+        #    when the resident copy is missing the real package (or absent entirely).
+        if not (_have("fla") and _have("fla.modules")):
+            _remove_fla_from_disk()  # clear any broken stub before the git install
+            _pip("--no-deps", "git+https://github.com/fla-org/flash-linear-attention.git")
+        importlib.invalidate_caches()
+        ok = _have("fla") and _have("fla.modules") and _have("tilelang")
+        print(
+            "[hopper] fla GDN fast path "
+            + (
+                "ENABLED (fla+tilelang, fla #640 fixed)"
+                if ok
+                else "unavailable -> pure-PyTorch delta fallback"
+            ),
+            flush=True,
+        )
+    except Exception as e:  # never let a dep hiccup crash the worker — torch delta still runs
+        print(
+            f"[hopper] fla fast-path setup skipped ({type(e).__name__}: {e}); pure-PyTorch delta",
+            flush=True,
+        )

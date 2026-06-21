@@ -50,7 +50,7 @@ def _train_body(input_data: dict) -> dict:
 
     from huggingface_hub import snapshot_download
 
-    # NB: the Hopper fla guard lives in engine.worker._drop_fla_on_hopper (runs in the worker
+    # NB: the Hopper fla guard lives in engine.worker._fix_fla_fastpath_on_hopper (runs in the worker
     # process AFTER all installs, before any model import) — doing it here would be undone by a
     # later extra_pip / `prime env install` that pulls fla back, and depends on a handler redeploy.
 
@@ -61,10 +61,10 @@ def _train_body(input_data: dict) -> dict:
         # not after model download + worker startup with a less actionable error.
         subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
 
-    # NB: fla is dropped on Hopper (sm90) automatically — resolve_worker_deps omits it from the
-    # install list, and engine.worker._drop_fla_on_hopper removes any baked-in copy at worker
-    # startup (fla's GDN backward is miscomputed on sm90, #640). No env toggle: fla only ever runs
-    # on the consumer archs where its Triton kernel is correct.
+    # NB: fla is kept on ALL arches. On Hopper (sm90) fla's GDN backward is miscomputed with
+    # Triton>=3.4 (#640); the fix is fla's tilelang backend, so engine.worker._fix_fla_fastpath_on_hopper
+    # ensures fla+tilelang are live at worker startup (instead of dropping fla). This makes Hopper
+    # GDN training ~4-13x faster + ~2x lighter than the pure-PyTorch delta fallback.
 
     # Install the run's verifiers environment(s) from the Prime Hub via the authenticated
     # `prime` CLI. The public pip index does not serve PRIVATE env wheels, so a plain pip
@@ -146,7 +146,11 @@ def _train_body(input_data: dict) -> dict:
         # on SUCCESS so an operator can verify which optimizations engaged — LoRA+/8-bit-AdamW/
         # Liger/PiSSA/rsLoRA/fla/chalk all log their engagement (or fallback) to the console.
         _force_console = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
-            "", "0", "false", "no", "off",
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
         )
         if proc.returncode != 0 or _force_console:
             try:

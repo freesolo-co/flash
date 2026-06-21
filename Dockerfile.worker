@@ -38,17 +38,22 @@ RUN pip install --no-cache-dir \
     "accelerate>=1.4" \
     "wandb>=0.17" \
     "liger-kernel>=0.5" \
-    "flash-linear-attention==0.5.0" \
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git" \
+    "tilelang" \
+    "apache-tvm-ffi==0.1.11" \
     "hf_transfer" \
     "verifiers>=0.1.10" \
     "prime" \
     "runpod"
-# Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels, which are correct
-# on consumer cards (Ampere/Ada/Blackwell). On Hopper (sm90) fla's GDN chunk_bwd is miscomputed
-# (fla #640) and its cumsum kernels hit a num_warps=8 LinearLayout assertion (fla #734); both fixes
-# are unreleased (post-0.5.0 git main) and #640's backward correctness is unconfirmed, so on Hopper
-# the worker DROPS fla (engine.worker._drop_fla_on_hopper) and transformers uses its native
-# pure-PyTorch delta rule — slower but correct.
+# Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
+# (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
+# miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
+# we bake tilelang + the pinned apache-tvm-ffi==0.1.11 (0.1.12 double-registers TVM-FFI ->
+# `import tilelang` aborts) and KEEP fla on every arch; engine.worker._fix_fla_fastpath_on_hopper
+# ensures the tilelang backend is live on sm90 before any model import. Validated win vs the old
+# pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
+# seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
+# (no fla.modules).
 
 # FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC
