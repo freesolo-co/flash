@@ -45,6 +45,28 @@ trainer fits an ordinary card.)
 - **CPU-tested** (`tests/test_pool_optimizations.py`): the same optimization SET as dev is selected
   per model (Liger/Chalk/FLA-drop/QLoRA/8-bit), overrides honored, every catalog model maps to a GPU,
   and the 35B trainer fits a 48 GB card via QLoRA.
-- **Kernel application is GPU-side** (inside `build_lora_policy_update`) — covered by the live run.
-- The Chalk path requires Qwen3.5/3.6 + the patched vLLM (the `flash-worker` image); Liger / QLoRA /
-  8-bit AdamW / FLA-drop are stack-agnostic and run on any model.
+- **LIVE-proven on a real GPU through the pool** (4× GPU Vast box, public stack): a trainer with
+  `qlora=True, liger=True, optim_8bit=True` ran end-to-end through the router. The log shows:
+  ```
+  OPT liger=True chalk=True qlora=True adamw8=True fla_drop=False
+  bitsandbytes 4-bit (QLoRA) loading active
+  [pool_policy] liger kernels applied
+  [pool_policy] optimizer = PagedAdamW8bit
+  runA step 0/1/2  loss -0.89/-0.62/-0.68  v 1->3   (both runs ok, gen 6/6 across gpu0/gpu1)
+  ```
+  So **QLoRA (4-bit NF4) + Liger + 8-bit paged AdamW** are confirmed applying + training on real
+  hardware via the pool. (Chalk/FLA-drop correctly no-op there — they're Qwen3.5/3.6-only.)
+
+## Live coverage of the Qwen3.5/3.6-specific paths (Chalk, FLA-drop, 35B)
+
+Chalk + FLA-drop + the 35B MoE only apply to **Qwen3.5/3.6**, whose `qwen3_5` arch is served only by
+the **patched vLLM in the `flash-worker` image** — public vLLM 0.23 does *not* register `qwen3_5`
+(verified: a Qwen2.5 rollout boots on the public image, a Qwen3.5 rollout does not). On Vast, the
+`flash-worker:cu128` image (~15–20 GB) pulls **unreliably** (instances repeatedly vanished mid-pull),
+which blocks a live Qwen3.5/35B pool run here. That is an **infrastructure** limit, not a code one:
+
+- the Chalk / FLA-drop / QLoRA calls are **dev's own already-validated helpers** (identical code);
+- the per-model selection is **CPU-tested** and the GPU matrix is built;
+- 35B already trains live on H100 via the **same disaggregated approach** (the verl one-step-off path,
+  freesolo PR #215) — the pool generalizes that fleet-wide. Run a live Qwen3.5/35B pool E2E on a host
+  that has the `flash-worker` image cached (or a pre-pulled/registry-mirrored worker image).
