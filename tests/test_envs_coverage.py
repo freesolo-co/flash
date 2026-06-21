@@ -35,7 +35,7 @@ def test_load_environment_requires_env_id() -> None:
 
 
 def test_env_init_scaffolds_a_loadable_verifiers_env(tmp_path, monkeypatch) -> None:
-    """`slm env init` must scaffold a real verifiers env (a vf.Environment), not a
+    """`flash env init` must scaffold a real verifiers env (a vf.Environment), not a
     BaseEnvironment subclass — so a publish to the Hub actually loads."""
     from argparse import Namespace
 

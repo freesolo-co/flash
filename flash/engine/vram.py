@@ -77,7 +77,10 @@ _TRAIN_COEF = 0.27
 # MEASURED at the default group_size=8: 0.8B GRPO OOMs a 20 GB card; 2B GRPO OOMs a 24 GB card
 # (-> both need 32); 4B GRPO fits 32 (param est ~31 already clears this floor, so it's untouched).
 _VLLM_COLOCATE_FLOOR_GB = 28.0
-_VOCAB_DEFAULT = 152_000  # Qwen3.x tokenizer vocab (drives the fp32-logits GRPO term)
+# Fallback output vocab (lm_head / logits width) for estimate_vram_gb when no model vocab is
+# passed; the model-aware path (model_required_vram_gb) resolves the real per-model value
+# from flash.catalog via vocab_size_for(). Mirrors catalog._DEFAULT_VOCAB_SIZE.
+_VOCAB_DEFAULT = 248_320
 # Matches the worker's logits budget (6 GB): the per-device fp32 logits are capped to this
 # (rl_per_device_comps spills the rest into grad-accum), so the estimator never reserves above it.
 _LOGITS_BUDGET_GB = 6.0
@@ -141,6 +144,7 @@ def estimate_vram_gb(
     group_size: int = 8,
     thinking: bool = False,
     use_vllm: bool = True,
+    vocab: int = _VOCAB_DEFAULT,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU, over the full knob matrix.
 
@@ -180,7 +184,7 @@ def estimate_vram_gb(
         # max_tokens (NOT seq_len) and is capped at the budget. completion defaults to the recipe
         # budget (~min(seq_len, 1024)) when max_tokens is unset.
         completion = max_tokens if max_tokens else min(seq_len, 1024)
-        logits = min(completion * _VOCAB_DEFAULT * 4 / 1e9, _LOGITS_BUDGET_GB)
+        logits = min(completion * vocab * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
         return base + max(rollout, train)
     # SFT: the activation peak is the worker's per-device micro-batch (capped at 4),
@@ -201,7 +205,7 @@ def model_required_vram_gb(
     headroom: float = 1.1,
 ) -> int:
     """Cheapest-sufficient VRAM (GB) for a specific run -- the matrix the allocator and
-    ``resolve_gpu_policy`` both size against.
+    ``provisional_gpu`` both size against.
 
     Catalog models size from their known param count + the run's actual knobs (``train``
     may be a TrainSpec, a dict, or None for recipe defaults). Curated GRPO floors
@@ -252,7 +256,12 @@ def model_required_vram_gb(
     batch_size = _pos_int(_g(train, "batch_size"), _sft_per_device_bs())
 
     def _need(
-        params_b: float, algorithm: str, *, quant: str = "bf16", use_vllm: bool = True
+        params_b: float,
+        algorithm: str,
+        *,
+        quant: str = "bf16",
+        use_vllm: bool = True,
+        vocab: int = _VOCAB_DEFAULT,
     ) -> int:
         # estimate over the run's full knob matrix, then apply the safety headroom. Both the
         # catalog and open-model paths size through here so they stay in sync on the knob set.
@@ -267,12 +276,16 @@ def model_required_vram_gb(
             group_size=group_size,
             thinking=thinking,
             use_vllm=use_vllm,
+            vocab=vocab,
         )
         return math.ceil(est * headroom)
 
-    from flash.catalog import MODELS
+    from flash.catalog import MODELS, vocab_size_for
 
     info = MODELS.get(model_id)
+    # Per-model output vocab (lm_head / logits width) sizes the fp32-logits term; resolved
+    # from the catalog (curated value, else open-model fallback) instead of a hardcoded const.
+    model_vocab = vocab_size_for(model_id)
     is_grpo = (algorithm or "").lower() in ("grpo", "rl")
     if info is not None:
         params_b = params_b_from_str(info.params)
@@ -280,7 +293,7 @@ def model_required_vram_gb(
         # GRPO always runs the rollout on a colocated vLLM engine, so sizing must reserve room for
         # the 2nd (rollout) weight copy on the same card.
         use_vllm = True
-        need = _need(params_b or 4.0, algorithm, quant=quant, use_vllm=use_vllm)
+        need = _need(params_b or 4.0, algorithm, quant=quant, use_vllm=use_vllm, vocab=model_vocab)
         # Hard floor the param-based matrix can't see: a curated GRPO floor.
         floor = 0
         if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
@@ -316,7 +329,7 @@ def model_required_vram_gb(
     if params_b is None:
         return 24
     # Open models size against the heavier GRPO phase regardless of the requested algorithm.
-    need = _need(params_b, "grpo")
+    need = _need(params_b, "grpo", vocab=model_vocab)
     # Same long-context GRPO escalation as the catalog path so a big open model isn't
     # under-provisioned at long context either.
     if is_grpo:
@@ -325,9 +338,11 @@ def model_required_vram_gb(
 
 
 def fetch_hf_params_b(model_id: str) -> float | None:
-    """Total params (billions) from the HF API safetensors metadata (no download)."""
-    if os.environ.get("FLASH_SKIP_NET"):
-        return None
+    """Total params (billions) from the HF API safetensors metadata (no download).
+
+    Best-effort: returns ``None`` when the size can't be read (no network / no HF metadata),
+    so callers fall back to the offline heuristic rather than failing.
+    """
     try:
         from huggingface_hub import HfApi
 

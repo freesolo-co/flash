@@ -13,7 +13,7 @@ Both packages import in the flash venv (the backend schemas are pure pydantic), 
 we add ../backend to sys.path the way the e2e tests import across packages. If the
 backend isn't importable, its half is skipped.
 
-Run: cd flash && FLASH_SKIP_NET=1 .venv/bin/python -m pytest \
+Run: cd flash && .venv/bin/python -m pytest \
         tests/test_backend_jobspec_contract.py -q
 """
 

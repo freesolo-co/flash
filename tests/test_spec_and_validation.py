@@ -4,7 +4,6 @@ estimates, and logging namespace helpers."""
 
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import os
@@ -55,7 +54,6 @@ def _raw(**overrides) -> dict:
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         ({"model_policy": "yolo"}, "model_policy"),
-        ({"gpu.allow_unvalidated": "yes"}, "must be a boolean"),
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
@@ -104,24 +102,69 @@ def test_bare_environment_id_is_rejected() -> None:
             spec_from_dict(raw)
 
 
-def test_bare_eval_env_id_is_rejected() -> None:
-    # The eval env ([environment.params] eval_env_id) is also prime-installed on the worker, so a
-    # bare eval id must be rejected up front (not fail after a GPU is provisioned).
-    raw = _raw()
-    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "gsm8k"}}
-    with pytest.raises(ConfigError, match=r"eval_env_id must be a published Prime Hub slug"):
-        spec_from_dict(raw)
-    # A full owner/name eval slug is accepted.
-    raw = _raw()
-    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "owner/eval"}}
-    spec_from_dict(raw)  # no raise
-
-
 def test_environment_must_be_a_table() -> None:
     raw = _raw()
     raw["environment"] = "gsm8k"
     with pytest.raises(ConfigError, match=r"\[environment\] must be a table"):
         spec_from_dict(raw)
+
+
+@pytest.mark.parametrize("section", ["gpu", "environment", "train"])
+def test_falsy_non_table_section_is_rejected_not_coerced(section: str) -> None:
+    # A present-but-falsy non-dict (e.g. `gpu = false`) must hit the "must be a table" check,
+    # not be silently coerced to {} by `or {}` (which would bypass validation). A MISSING
+    # section still defaults to an empty table (covered by the happy-path tests).
+    raw = _raw()
+    raw[section] = False
+    with pytest.raises(ConfigError, match=rf"\[{section}\] must be a table"):
+        spec_from_dict(raw)
+
+
+def test_environment_subfields_reject_wrong_types() -> None:
+    # The [environment] sub-fields are consumed by EnvironmentSpec(...) via dict(... or {}) /
+    # tuple(... or ()): a present-but-wrong-typed value would otherwise crash opaquely
+    # (dict("x") / dict(1)) or silently misbehave (pip = "x" char-split into ('x',)). Each
+    # must fail fast with a clear ConfigError instead.
+    # A falsy non-table (params = false) is rejected too, mirroring the section-level rule that
+    # `environment = false` must fail rather than silently coerce to {} and bypass intent.
+    for bad in ("notatable", 123, False):
+        raw = _raw()
+        raw["environment"] = {"id": "primeintellect/gsm8k", "params": bad}
+        with pytest.raises(ConfigError, match=r"\[environment\] params must be a table"):
+            spec_from_dict(raw)
+    for bad in ("notalist", 123, False):
+        raw = _raw()
+        raw["environment"] = {"id": "primeintellect/gsm8k", "pip": bad}
+        with pytest.raises(ConfigError, match=r"\[environment\] pip must be a list of strings"):
+            spec_from_dict(raw)
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k", "pip": ["ok", 123]}
+    with pytest.raises(ConfigError, match=r"\[environment\] pip entries must be strings"):
+        spec_from_dict(raw)
+
+
+def test_environment_subfields_accept_valid_and_missing() -> None:
+    # Missing sub-fields keep their defaults, and valid values pass through unchanged.
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k"}
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {}
+    assert spec.environment.pip == ()
+    raw = _raw()
+    raw["environment"] = {
+        "id": "primeintellect/gsm8k",
+        "params": {"k": "v"},
+        "pip": ["pkg==1.0"],
+    }
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {"k": "v"}
+    assert spec.environment.pip == ("pkg==1.0",)
+    # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k", "params": None, "pip": None}
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {}
+    assert spec.environment.pip == ()
 
 
 def test_jobspec_from_dict_rejects_path() -> None:
@@ -184,13 +227,9 @@ def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
 
 
 def _fresh_orchestrator(tmp_path, monkeypatch):
-    import flash.runner as runner
+    from tests._helpers.runner import fresh_runner
 
-    importlib.reload(runner)
-    # Storage roots are fixed constants now; redirect to tmp for isolation.
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-    return runner
+    return fresh_runner(tmp_path, monkeypatch)
 
 
 def test_runs_file_path_rejects_traversal(tmp_path, monkeypatch) -> None:
@@ -263,7 +302,6 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
     from flash.engine import vram
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     assert vram.fetch_hf_params_b("any/model") is None
 
 
@@ -290,3 +328,88 @@ def test_configure_logging_verbosity() -> None:
     assert logging.getLogger("flash").level == logging.INFO
     _logging.configure_logging(verbosity=2)
     assert logging.getLogger("flash").level == logging.DEBUG
+
+
+# ---------------------------------------------------------------------------
+# [worker_env] secret-key policy — [worker_env] is serialized into job_spec_json
+# (persisted + logged), so secret-bearing keys must be rejected at parse time and set
+# as real env vars instead. These cases pin the _is_secret_key heuristic so it doesn't
+# drift into false positives (legit knobs) or false negatives (real secrets).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "HF_TOKEN",  # secret WORD: TOKEN
+        "OPENAI_API_KEY",  # KEY qualified by API
+        "AWS_SECRET_ACCESS_KEY",  # SECRET word + KEY qualified by SECRET/ACCESS
+        "DB_PASSWORD",  # PASSWORD word
+        "PRIME_API_KEY",
+        "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
+        "MY_CREDENTIAL",
+        "AUTH_KEY",  # KEY qualified by AUTH
+        "SSH_KEY",  # KEY qualified by SSH
+        "DEPLOY_KEY",  # KEY qualified by DEPLOY
+        "GITHUB_PAT",  # PAT word (personal access token)
+    ],
+)
+def test_worker_env_rejects_secret_keys(key: str) -> None:
+    with pytest.raises(ConfigError, match="must not contain secret-bearing keys"):
+        spec_from_dict(_raw(worker_env={key: "x"}))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "RL_VLLM_GPU_UTIL",  # plain knob
+        "SFT_PACKING",
+        "RL_VLLM_MAX_BATCHED_TOKENS",  # word TOKENS, not the secret word TOKEN
+        "SORT_KEY",  # bare KEY without a secret qualifier
+        "WANDB_ENTITY",  # account routing, not a secret
+        "FLASH_MLP_KERNEL",
+        "VLLM_ATTENTION_BACKEND",
+    ],
+)
+def test_worker_env_allows_non_secret_keys(key: str) -> None:
+    spec = spec_from_dict(_raw(worker_env={key: "v"}))
+    assert spec.worker_env[key] == "v"
+
+
+@pytest.mark.parametrize("name", ["BAD=KEY", "", "BAD KEY", "X\tY"])
+def test_worker_env_rejects_invalid_env_names(name: str) -> None:
+    # Names subprocess.Popen(env=...) would reject on the worker (empty / '=' / whitespace) must
+    # fail at parse time, not after a worker has been provisioned.
+    with pytest.raises(ConfigError, match="invalid environment variable name"):
+        spec_from_dict(_raw(worker_env={name: "v"}))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Falsey string forms (the bug a plain bool() has: any non-empty string is True).
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+        ("none", False),
+        ("", False),
+        ("  false  ", False),
+        # Truthy string forms.
+        ("true", True),
+        ("1", True),
+        ("yes", True),
+        ("anything-else", True),
+        # Already-typed values pass through bool().
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        (None, False),
+    ],
+)
+def test_coerce_bool(value, expected) -> None:
+    from flash.spec import coerce_bool
+
+    assert coerce_bool(value) is expected

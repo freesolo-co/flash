@@ -3,8 +3,8 @@
 User authentication is freesolo API keys only — there is no native key system. A bearer
 token equal to the operator's shared ``FREESOLO_INTERNAL_KEY`` resolves to the service
 identity; any other token is verified against the freesolo backend and (on success)
-resolved to a per-token user identity. ``FLASH_SKIP_NET`` is the offline bypass that
-disables the network verify (used by tests / air-gapped runs).
+resolved to a per-token user identity. A failed/unreachable verify returns False (the key
+is treated as unverified), so a backend outage never admits an unverified key.
 """
 
 from __future__ import annotations
@@ -21,10 +21,9 @@ from . import db
 # authenticates as the service identity (see db.ensure_internal_key).
 INTERNAL_KEY_ENV = "FREESOLO_INTERNAL_KEY"
 
-# Freesolo USER-key acceptance: a user who `slm login`s with a freesolo API key sends it as
+# Freesolo USER-key acceptance: a user who `flash login`s with a freesolo API key sends it as
 # the bearer to this control plane. Any non-internal token is verified against the freesolo
-# backend and (on success) resolved to a per-token identity. FLASH_SKIP_NET disables the
-# network call entirely (offline bypass).
+# backend and (on success) resolved to a per-token identity.
 FREESOLO_BASE_URL_ENV = "FREESOLO_BASE_URL"
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 _VERIFY_TIMEOUT_S = 5.0
@@ -71,8 +70,8 @@ def _prune_verify_cache_locked(now: float) -> None:
 def _freesolo_verify(token: str) -> bool:
     """Verify a token against the freesolo backend (cached, short TTL, network errors = False).
 
-    Never raises and never makes a network call when FLASH_SKIP_NET is set — a swallowed
-    error or a skipped call is treated as "not authenticated" (returns False), never a 500."""
+    Never raises — a swallowed network/HTTP error is treated as "not authenticated" (returns
+    False), never a 500."""
     # Reject obviously-invalid oversized tokens before they touch the cache or the network.
     if not token or len(token) > _MAX_TOKEN_LEN:
         return False
@@ -81,9 +80,6 @@ def _freesolo_verify(token: str) -> bool:
         cached = _verify_cache.get(token)
         if cached is not None and cached[1] > now:
             return cached[0]
-    # Offline guard: with FLASH_SKIP_NET set we never touch the network; treat as unverified.
-    if os.environ.get("FLASH_SKIP_NET"):
-        return False
     base = os.environ.get(FREESOLO_BASE_URL_ENV) or DEFAULT_FREESOLO_BASE_URL
     url = f"{base.rstrip('/')}/api/auth/verify"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
@@ -120,9 +116,9 @@ def authenticate(authorization: str | None) -> dict | None:
     Freesolo keys are the only user auth. When the operator has configured
     ``FREESOLO_INTERNAL_KEY``, that shared internal key resolves to a single service
     identity. Any other token is verified against the freesolo backend and (on success)
-    resolved to a per-token user identity so a user who ``slm login``s with their freesolo
-    key can drive the control plane. ``FLASH_SKIP_NET`` short-circuits the verify (no
-    network call -> the token is treated as unverified)."""
+    resolved to a per-token user identity so a user who ``flash login``s with their freesolo
+    key can drive the control plane. A token that can't be verified (bad key, or the backend
+    is unreachable) is treated as unverified -> authenticate returns None."""
     if not authorization or not authorization.startswith("Bearer "):
         return None
     token = authorization.removeprefix("Bearer ").strip()
@@ -130,7 +126,6 @@ def authenticate(authorization: str | None) -> dict | None:
     if internal and token == internal:
         return db.lookup_key(token) or db.ensure_internal_key(token)
     # Any non-internal token is a freesolo USER key: verify it against the freesolo backend.
-    # (FLASH_SKIP_NET => no network call, returns False => authenticate returns None.)
     if _freesolo_verify(token):
         # A verified freesolo key gets its own per-token run-ownership identity.
         return db.lookup_key(token) or db.ensure_external_key(token)
