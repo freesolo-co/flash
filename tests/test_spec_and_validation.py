@@ -153,6 +153,49 @@ def test_sft_caps_parse_from_toml() -> None:
         spec_from_dict(_raw(**{"train.max_examples": -5}))
 
 
+def test_spec_from_dict_return_info_default_is_bare_spec() -> None:
+    # The default contract is unchanged: a bare JobSpec (no tuple), so existing callers and the
+    # round-trip below keep working.
+    result = spec_from_dict(_raw(), run_id="ri-default")
+    assert isinstance(result, JobSpec)
+
+
+def test_spec_from_dict_return_info_returns_resolved_modelinfo() -> None:
+    # return_info=True hands back the ModelInfo parsing already resolved, so the CLI can reuse it
+    # instead of calling resolve_model a second time. It must equal a standalone resolution.
+    from flash.catalog import ModelInfo, resolve_model
+
+    spec, info = spec_from_dict(_raw(), run_id="ri-1", return_info=True)
+    assert isinstance(spec, JobSpec)
+    assert isinstance(info, ModelInfo)
+    expected = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
+    assert info == expected
+
+
+def test_spec_from_file_return_info_roundtrips(tmp_path) -> None:
+    from flash.catalog import ModelInfo
+    from flash.schema import spec_from_file
+
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(
+        'model = "Qwen/Qwen3.5-0.8B"\n'
+        'algorithm = "grpo"\n'
+        "[environment]\n"
+        'id = "primeintellect/gsm8k"\n'
+        "[train]\n"
+        'hf_repo = "owner/runs"\n'
+        "steps = 10\n"
+        "[gpu]\n"
+        'type = "RTX 4090"\n'
+    )
+    # default: bare spec; return_info=True: (spec, info)
+    assert isinstance(spec_from_file(str(cfg)), JobSpec)
+    spec, info = spec_from_file(str(cfg), return_info=True)
+    assert isinstance(spec, JobSpec)
+    assert isinstance(info, ModelInfo)
+    assert info.id == spec.model
+
+
 def test_job_spec_json_round_trip() -> None:
     spec = spec_from_dict(_raw(), run_id="rt-1")
     restored = JobSpec.from_json(spec.to_json())

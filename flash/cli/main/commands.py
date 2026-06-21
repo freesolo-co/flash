@@ -283,18 +283,22 @@ def _quiet_stdout(active: bool):
         yield
 
 
-def _spec_advice(spec) -> list:
-    """Lint a parsed spec, resolving its ModelInfo once. Best-effort: advice is a
-    non-blocking nicety, so a model-resolution hiccup must never fail the command. Model
-    resolution can print open-model/thinking policy warnings to stdout, so route them to
-    stderr — callers emitting strict JSON rely on a clean stdout."""
-    try:
-        with contextlib.redirect_stdout(sys.stderr):
-            info = resolve_model(
-                spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type
-            )
-    except ValueError:
-        return []
+def _spec_advice(spec, info=None) -> list:
+    """Lint a parsed spec. Best-effort: advice is a non-blocking nicety, so a model-resolution
+    hiccup must never fail the command.
+
+    ``info`` is the spec's already-resolved ModelInfo when the caller has it (parsing resolves
+    one) — reuse it to avoid a second resolution, which under model_policy="allow" re-probes HF
+    metadata. When not supplied, resolve here (routing any open-model/thinking policy warnings to
+    stderr, since callers emitting strict JSON rely on a clean stdout)."""
+    if info is None:
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                info = resolve_model(
+                    spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type
+                )
+        except ValueError:
+            return []
     return lint_spec(spec, info)
 
 
@@ -304,14 +308,15 @@ def cmd_plan(args) -> int:
     # mode keep stdout strictly machine-readable by routing any policy warnings to stderr.
     as_json = getattr(args, "json", False)
     with _quiet_stdout(as_json):
-        spec = spec_from_file(
+        # spec_from_file already resolves (and validates against) the ModelInfo during parsing;
+        # reuse it instead of calling resolve_model again — a second resolution would re-probe HF
+        # metadata and re-emit the open-model policy warning under model_policy="allow".
+        spec, info = spec_from_file(
             args.config,
             run_id=new_run_id(),
             overrides=getattr(args, "overrides", None),
             extra_configs=getattr(args, "extra_configs", None),
-        )
-        info = resolve_model(
-            spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type
+            return_info=True,
         )
         plan = build_plan(spec, info)
     print(json.dumps(plan, indent=2) if as_json else render_plan(plan))
@@ -326,13 +331,16 @@ def cmd_train(args) -> int:
         # and the advice's model resolution can print policy warnings to stdout, so build the
         # payload under _quiet_stdout to keep the emitted JSON parseable.
         with _quiet_stdout(True):
-            spec = spec_from_file(
+            # Reuse the ModelInfo parsing already resolved so the linter doesn't re-resolve
+            # (a second HF probe under model_policy="allow").
+            spec, info = spec_from_file(
                 args.config,
                 run_id=new_run_id(),
                 overrides=getattr(args, "overrides", None),
                 extra_configs=getattr(args, "extra_configs", None),
+                return_info=True,
             )
-            warnings = [a.to_dict() for a in _spec_advice(spec)]
+            warnings = [a.to_dict() for a in _spec_advice(spec, info)]
         print(
             json.dumps(
                 {
@@ -345,15 +353,16 @@ def cmd_train(args) -> int:
             )
         )
         return 0
-    spec = spec_from_file(
+    spec, info = spec_from_file(
         args.config,
         run_id=None,
         overrides=getattr(args, "overrides", None),
         extra_configs=getattr(args, "extra_configs", None),
+        return_info=True,
     )
     # Surface config advice on a real submit too (non-blocking, to stderr so it never
-    # pollutes the JSON/log stream the agent parses from stdout).
-    for advice in _spec_advice(spec):
+    # pollutes the JSON/log stream the agent parses from stdout). Reuse the resolved info.
+    for advice in _spec_advice(spec, info):
         print(f"warning: {advice.field}: {advice.message}", file=sys.stderr)
     client = client_from_config()
     status = client.create_run(spec_payload(spec))

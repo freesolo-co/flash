@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import tomllib
-from typing import Any
+from typing import Any, Literal, overload
 
-from flash.catalog import normalize_algorithm, resolve_model
+from flash.catalog import ModelInfo, normalize_algorithm, resolve_model
 from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
     POLICY_NAMES,
@@ -35,12 +35,38 @@ def load_toml(path: str) -> dict[str, Any]:
         return tomllib.load(f)
 
 
+@overload
+def spec_from_file(
+    path: str,
+    run_id: str | None = ...,
+    overrides: list[str] | None = ...,
+    extra_configs: list[str] | None = ...,
+    *,
+    return_info: Literal[False] = ...,
+) -> JobSpec: ...
+@overload
+def spec_from_file(
+    path: str,
+    run_id: str | None = ...,
+    overrides: list[str] | None = ...,
+    extra_configs: list[str] | None = ...,
+    *,
+    return_info: Literal[True],
+) -> tuple[JobSpec, ModelInfo]: ...
 def spec_from_file(
     path: str,
     run_id: str | None = None,
     overrides: list[str] | None = None,
     extra_configs: list[str] | None = None,
-) -> JobSpec:
+    *,
+    return_info: bool = False,
+) -> JobSpec | tuple[JobSpec, ModelInfo]:
+    """Parse (and validate) a TOML config into a JobSpec.
+
+    With ``return_info=True`` also returns the ``ModelInfo`` that parsing already resolved, so
+    a caller (the CLI) can reuse it instead of calling ``resolve_model`` a second time — which
+    for ``model_policy="allow"`` would re-probe HF metadata and re-emit the policy warning.
+    """
     raw = load_toml(path)
     # Composed configs: later files override earlier keys (deep merge).
     for extra in extra_configs or []:
@@ -48,6 +74,9 @@ def spec_from_file(
     # `--set key=value` dotted overrides (highest precedence).
     for item in overrides or []:
         _apply_override(raw, item)
+    # Branch so each call passes a literal return_info (matches the typed overloads).
+    if return_info:
+        return spec_from_dict(raw, run_id=run_id, return_info=True)
     return spec_from_dict(raw, run_id=run_id)
 
 
@@ -86,7 +115,17 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
-def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
+@overload
+def spec_from_dict(
+    raw: dict[str, Any], run_id: str | None = ..., *, return_info: Literal[False] = ...
+) -> JobSpec: ...
+@overload
+def spec_from_dict(
+    raw: dict[str, Any], run_id: str | None = ..., *, return_info: Literal[True]
+) -> tuple[JobSpec, ModelInfo]: ...
+def spec_from_dict(
+    raw: dict[str, Any], run_id: str | None = None, *, return_info: bool = False
+) -> JobSpec | tuple[JobSpec, ModelInfo]:
     try:
         model = raw["model"]
     except KeyError as exc:
@@ -249,7 +288,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         wandb=wandb_spec,
     )
     _validate_spec(spec)
-    return spec
+    # ``info`` was resolved above (the same ModelInfo this spec validated against). Hand it back
+    # when asked so the CLI reuses it rather than re-resolving (a second HF probe under "allow").
+    return (spec, info) if return_info else spec
 
 
 def _validate_spec(spec: JobSpec) -> None:

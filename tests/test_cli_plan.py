@@ -222,3 +222,54 @@ def test_dry_run_json_pure_despite_vram_fit_warning(tmp_path: Path, capsys, monk
     assert payload["run_id"]
     assert "open-model policy" not in captured.out
     assert "open-model policy" in captured.err
+
+
+def _count_resolve_model(monkeypatch) -> dict[str, int]:
+    """Wrap resolve_model in every namespace that holds a reference and count the calls.
+
+    Parsing resolves the model once (flash.schema) and the CLI used to resolve it AGAIN; under
+    model_policy="allow" that is a second HF metadata probe + a duplicate policy warning. The
+    counter lets a test assert the CLI now reuses parsing's ModelInfo (a single resolution).
+    """
+    import flash.catalog as catalog
+    import flash.cli.main.commands as cmds
+    import flash.schema as schema
+
+    calls = {"n": 0}
+    real = catalog.resolve_model
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    # schema imports resolve_model into its own namespace; commands references catalog's binding.
+    monkeypatch.setattr(schema, "resolve_model", counting, raising=True)
+    monkeypatch.setattr(cmds, "resolve_model", counting, raising=True)
+    return calls
+
+
+def test_plan_resolves_model_only_once(tmp_path: Path, capsys, monkeypatch) -> None:
+    # cmd_plan reuses the ModelInfo that spec_from_file already resolved (return_info=True)
+    # instead of calling resolve_model a second time. Under the open-model "allow" policy that
+    # also means a single HF probe and a single policy warning — not a duplicated one.
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 2.0, raising=True)
+    calls = _count_resolve_model(monkeypatch)
+    rc = main(["plan", _write(tmp_path, _OPEN_MODEL_CONFIG), "--json"])
+    assert rc == 0
+    assert calls["n"] == 1  # exactly one resolution for the whole command
+    captured = capsys.readouterr()
+    json.loads(captured.out)  # still pure JSON
+    assert captured.err.count("open-model policy") == 1  # warning not duplicated
+
+
+def test_dry_run_resolves_model_only_once(tmp_path: Path, capsys, monkeypatch) -> None:
+    # Same single-resolution guarantee for `flash train --dry-run`: spec_from_file resolves the
+    # ModelInfo and _spec_advice reuses it, so the linter does not re-probe HF.
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 2.0, raising=True)
+    calls = _count_resolve_model(monkeypatch)
+    rc = main(["train", _write(tmp_path, _OPEN_MODEL_CONFIG), "--dry-run"])
+    assert rc == 0
+    assert calls["n"] == 1
+    captured = capsys.readouterr()
+    json.loads(captured.out)
+    assert captured.err.count("open-model policy") == 1
