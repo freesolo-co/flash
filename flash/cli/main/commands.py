@@ -1,7 +1,7 @@
 """CLI command handlers for the managed Flash service.
 
 Every run-lifecycle command is a thin HTTP call to the Flash control plane —
-users authenticate with their freesolo API key (`slm login` verifies it against
+users authenticate with their freesolo API key (`flash login` verifies it against
 the freesolo backend), never with provider credentials. Config parsing/validation
 and `--dry-run` stay fully local.
 """
@@ -47,7 +47,7 @@ _OK_STATES = {"done", "dry_run", "deployed"}
 
 
 def cmd_version(args) -> int:
-    print(f"slm {__version__}")
+    print(f"flash {__version__}")
     return 0
 
 
@@ -68,7 +68,7 @@ def cmd_login(args) -> int:
     path = save_credentials(api_key, api_url=api_url)
     # Never echo the key itself; the stored file is the single source of truth.
     print(f"logged in: freesolo verified your key (saved to {path})")
-    print("you're ready to train — try `slm train <config.toml>`")
+    print("you're ready to train — try `flash train <config.toml>`")
     return 0
 
 
@@ -81,7 +81,7 @@ _STARTER_ENV_PY = '''\
 """Starter local verifiers environment.
 
 Replace the dataset and rubric with your task, then publish it to the Prime Hub with
-`slm env push environments/starter_env.py`. A managed run references the published env by
+`flash env push environments/starter_env.py`. A managed run references the published env by
 its Hub slug: set [environment] id = "owner/name" in the config.
 See https://github.com/PrimeIntellect-ai/verifiers for the full API.
 """
@@ -112,7 +112,7 @@ def cmd_lab_setup(args) -> int:
     Path("environments").mkdir(exist_ok=True)
     Path("configs").mkdir(exist_ok=True)
     Path("configs/endpoints.toml").write_text(
-        "# OpenAI-compatible endpoints returned by `slm deploy` can be stored here.\n"
+        "# OpenAI-compatible endpoints returned by `flash deploy` can be stored here.\n"
     )
     starter_env = Path("environments/starter_env.py")
     if not starter_env.exists():
@@ -123,8 +123,8 @@ def cmd_lab_setup(args) -> int:
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
             "# Environment: a verifiers / Prime Hub env slug. Publish the scaffolded\n"
-            "# environments/starter_env.py with `slm env push environments/starter_env.py`\n"
-            "# (then `slm env install owner/name`) to get the slug, and set it below.\n"
+            "# environments/starter_env.py with `flash env push environments/starter_env.py`\n"
+            "# (then `flash env install owner/name`) to get the slug, and set it below.\n"
             "[environment]\n"
             'id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
             "[train]\n"
@@ -198,7 +198,7 @@ def cmd_env_init(args) -> int:
     (root / f"{mod}.py").write_text(
         f'"""Custom verifiers environment ({args.name}).\n\n'
         "Replace the dataset and rubric with your task, then publish it to the Prime Hub\n"
-        f"with `slm env push environments/{mod}/{mod}.py` and reference it by id\n"
+        f"with `flash env push environments/{mod}/{mod}.py` and reference it by id\n"
         '([environment] id = "owner/name") in your config.\n'
         "See https://github.com/PrimeIntellect-ai/verifiers for the full API.\n"
         '"""\n\n'
@@ -223,7 +223,7 @@ def cmd_env_init(args) -> int:
     (root / "README.md").write_text(f"# {args.name}\n\nCustom verifiers environment for Flash.\n")
     print(f"created {root}")
     print(
-        f"publish it to the Prime Hub with `slm env push environments/{mod}/{mod}.py`, "
+        f"publish it to the Prime Hub with `flash env push environments/{mod}/{mod}.py`, "
         'then reference it by id ([environment] id = "owner/name") in your config.'
     )
     return 0
@@ -240,15 +240,15 @@ def cmd_env_list(args) -> int:
     local = Path("environments")
     if local.is_dir():
         # Both directory envs (environments/<name>/<name>.py) and top-level single-file
-        # modules (environments/<name>.py, e.g. the `slm lab` starter env). These are local
-        # env SOURCES — publish one with `slm env push <path>` to run it on the managed
+        # modules (environments/<name>.py, e.g. the `flash lab` starter env). These are local
+        # env SOURCES — publish one with `flash env push <path>` to run it on the managed
         # service by its Hub id.
         paths: list[str] = []
         for p in local.iterdir():
             if p.name.startswith("__"):
                 continue
             if p.is_dir():
-                # `slm env init` maps a hyphenated dir to an underscored inner module file
+                # `flash env init` maps a hyphenated dir to an underscored inner module file
                 # (my-env/ -> my-env/my_env.py). List that exact path, and only when it
                 # actually exists (an empty/incomplete folder isn't a publishable source).
                 stem = p.name.replace("-", "_")
@@ -258,7 +258,7 @@ def cmd_env_list(args) -> int:
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
         if paths:
-            print("local env sources (publish with `slm env push <path>`):")
+            print("local env sources (publish with `flash env push <path>`):")
             for path in sorted(paths):
                 print(f"  {path}")
     return 0
@@ -294,7 +294,7 @@ def cmd_train(args) -> int:
         print(json.dumps(status, indent=2))
         return 0
     print(
-        f"run {run_id} submitted; following logs (Ctrl-C detaches, `slm attach {run_id}` resumes)",
+        f"run {run_id} submitted; following logs (Ctrl-C detaches, `flash attach {run_id}` resumes)",
         file=sys.stderr,
     )
     return _follow_run(client, run_id)
@@ -394,7 +394,7 @@ def cmd_deploy(args) -> int:
     if dep.get("mode") == "always-on":
         print(
             f"note: always-on keeps a {dep.get('gpu')} warm 24/7 "
-            f"(~${dep.get('est_idle_cost_usd_per_day')}/day). Use `slm undeploy {args.run_id}` "
+            f"(~${dep.get('est_idle_cost_usd_per_day')}/day). Use `flash undeploy {args.run_id}` "
             "to stop billing.",
             file=sys.stderr,
         )

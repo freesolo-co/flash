@@ -119,7 +119,7 @@ def test_internal_key_rejected_when_unconfigured(api):
 
 
 def test_freesolo_user_key_authenticates(api, monkeypatch):
-    # A user who `slm login`s with a freesolo key sends it as the bearer. With the token
+    # A user who `flash login`s with a freesolo key sends it as the bearer. With the token
     # verified by the backend it authenticates and resolves to a stable per-token identity
     # (its own run-ownership row).
     import flash.server.auth as auth_mod

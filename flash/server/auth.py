@@ -21,7 +21,7 @@ from . import db
 # authenticates as the service identity (see db.ensure_internal_key).
 INTERNAL_KEY_ENV = "FREESOLO_INTERNAL_KEY"
 
-# Freesolo USER-key acceptance: a user who `slm login`s with a freesolo API key sends it as
+# Freesolo USER-key acceptance: a user who `flash login`s with a freesolo API key sends it as
 # the bearer to this control plane. Any non-internal token is verified against the freesolo
 # backend and (on success) resolved to a per-token identity.
 FREESOLO_BASE_URL_ENV = "FREESOLO_BASE_URL"
@@ -116,7 +116,7 @@ def authenticate(authorization: str | None) -> dict | None:
     Freesolo keys are the only user auth. When the operator has configured
     ``FREESOLO_INTERNAL_KEY``, that shared internal key resolves to a single service
     identity. Any other token is verified against the freesolo backend and (on success)
-    resolved to a per-token user identity so a user who ``slm login``s with their freesolo
+    resolved to a per-token user identity so a user who ``flash login``s with their freesolo
     key can drive the control plane. A token that can't be verified (bad key, or the backend
     is unreachable) is treated as unverified -> authenticate returns None."""
     if not authorization or not authorization.startswith("Bearer "):

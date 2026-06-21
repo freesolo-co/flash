@@ -3,7 +3,7 @@
 RunPod prices a fixed class catalog; Vast is a live market, so a class's "rate" is the
 cheapest currently-usable offer for it (``usable_offers``). This module gives the
 provider interface a uniform ``hourly_rate(gpu)`` and a ``live_rates()`` map for the
-``slm gpus`` table. Offline-safe: without ``VAST_API_KEY`` (or on any failure) it falls
+``flash gpus`` table. Offline-safe: without ``VAST_API_KEY`` (or on any failure) it falls
 back to the static Vast snapshot carried on ``GpuClass.hourly_usd``.
 """
 
