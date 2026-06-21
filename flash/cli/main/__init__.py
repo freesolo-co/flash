@@ -138,6 +138,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     train.add_argument("--dry-run", action="store_true")
     train.add_argument(
+        "--cost",
+        action="store_true",
+        help="print the pre-flight USD cost for the config and exit (no submit)",
+    )
+    train.add_argument(
         "--background",
         action="store_true",
         help="submit and return immediately instead of following logs",

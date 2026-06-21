@@ -146,6 +146,8 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     # ignored. ``provisional_gpu`` computes the offline RunPod-static cheapest-that-fits for
     # sizing/display only; the live allocator re-resolves it at submit time.
     try:
+        # No GPU pin / no validation gate: the cheapest fitting class (every class eligible).
+        # The submit-time allocator re-resolves the cheapest fitting class live across providers.
         gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
