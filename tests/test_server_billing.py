@@ -1,11 +1,5 @@
-"""Estimate-based run billing: the control plane charges the pre-flight estimate at submit.
-
-CPU-only / offline. Two layers are covered:
-  * the billing client ``flash.server.billing.charge_run_estimate`` (the POST shape and error
-    translation; the network boundary is stubbed via ``urllib.request.urlopen``), and
-  * the ``POST /v1/runs`` gate (charge fires for a normal user submit, a 402 blocks the run
-    and records nothing, and --dry-run / the internal service identity skip billing).
-"""
+"""Estimate-based run billing: the billing client (POST shape + error translation, network
+stubbed) and the ``POST /v1/runs`` charge gate (charge fires, 402 blocks, dry-run/internal skip)."""
 
 from __future__ import annotations
 
@@ -59,7 +53,7 @@ def test_cents_rounds_and_floors_at_zero():
 
 def test_cents_rounds_half_up_not_bankers():
     """Money rounding is round-HALF-UP, not Python's ties-to-even (which would undercharge a
-    half-cent tie, e.g. $0.005 -> 0). PR #3 review."""
+    half-cent tie, e.g. $0.005 -> 0)."""
     from flash.server.billing import _cents
 
     assert _cents(0.005) == 1  # ties-to-even would give 0
@@ -148,7 +142,7 @@ def test_charge_unreachable_raises_503(monkeypatch):
 
 def test_http_error_detail_falls_back_to_reason():
     """When the error body is missing/unparseable, the detail keeps the backend REASON
-    (not a bare ``billing failed (<code>)``) so a 4xx/5xx stays diagnosable (PR #3 review)."""
+    (not a bare ``billing failed (<code>)``) so a 4xx/5xx stays diagnosable."""
     from flash.server.billing import _http_error_detail
 
     # Unparseable body -> reason phrase is preserved in the detail.
@@ -281,10 +275,8 @@ def test_internal_identity_skips_billing(api, monkeypatch):
 
 
 def test_submit_failure_after_charge_reverses_the_debit(api, monkeypatch):
-    """If the charge succeeds but ``submit_job`` then fails, the org is debited for a run that
-    never started — the debit MUST be reversed (PR #3 review: debit not reversed on submit
-    failure). Assert the reversal fires with the run id + the original charge, and that no run
-    row is left behind."""
+    """If the charge succeeds but ``submit_job`` then fails, the debit is reversed (with run id +
+    original charge) and no run row is left behind."""
     import flash.server.app as app_mod
 
     charged = {"amountCents": 777}
@@ -320,7 +312,7 @@ def test_submit_failure_after_charge_reverses_the_debit(api, monkeypatch):
 def test_record_run_failure_after_charge_reverses_the_debit(api, monkeypatch):
     """If the charge succeeds but ``db.record_run`` then fails (e.g. SQLite locked/full), the
     org is debited for a run that never started — the reversal must still fire (record_run is
-    inside the same try as submit). PR #3 review."""
+    inside the same try as submit).."""
     import flash.server.app as app_mod
     import flash.server.db as db_mod
 

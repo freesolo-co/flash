@@ -47,14 +47,8 @@ _log = logging.getLogger("flash.server")
 
 
 def _reverse_charge_best_effort(*, token: str, run_id: str, charge: dict) -> None:
-    """Refund a run's pre-flight charge after its submit failed; never raise.
-
-    Called from ``create_run`` when ``submit_job`` raises AFTER the org was charged: the org
-    paid for a run that never started, so we credit the debit back. Best-effort — the refund's
-    own failure is logged (for an operator to reconcile) but never replaces the original submit
-    error the caller is about to surface. The reversal is idempotent by ``run_id`` (see
-    ``billing.reverse_run_charge``), so a later retried submit can re-charge safely.
-    """
+    """Refund a run's pre-flight charge after its submit failed; never raises (logs on failure
+    so the refund error can't mask the submit error). Idempotent by ``run_id``."""
     try:
         from flash.server.billing import reverse_run_charge
 
@@ -260,10 +254,9 @@ def create_app():
     ):
         spec = _parse_spec(payload, run_id=new_run_id())
         dry_run = bool(payload.get("dry_run", False))
-        # Charge the run's pre-flight estimate to the submitting user's org BEFORE accepting
-        # it, so the run is gated on a sufficient prepaid balance and never starts GPU work
-        # for free. Skipped for --dry-run (no run) and the operator's internal service
-        # identity (no user org to bill). Tests stub charge_run_estimate / the network directly.
+        # Charge the pre-flight estimate to the user's org BEFORE accepting the run, so it's gated
+        # on balance and never starts unpaid. Skipped for --dry-run and the internal service
+        # identity (no user org to bill).
         billed = not dry_run and key.get("key_prefix") != "internal"
         token = (authorization or "").removeprefix("Bearer ").strip()
         charge: dict = {}
@@ -276,22 +269,17 @@ def create_app():
             except _BillingError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
             except ValueError as exc:
-                # The estimate couldn't price the config (e.g. an SFT run with no max_examples
-                # whose env can't be loaded here to count its dataset). A 400 with the message
-                # tells the user how to fix it, rather than a 500.
+                # Unpriceable config (e.g. uncapped SFT whose env can't be counted): 400 with a
+                # fixable message, not a 500.
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-        # record_run is inside the try so ANY post-charge failure (a locked/full SQLite, the
-        # submit raising) reverses the debit — the org must never be left paying for a run that
-        # didn't start.
+        # record_run is inside the try so any post-charge failure (SQLite, submit) reverses the
+        # debit — the org must never pay for a run that didn't start.
         try:
             db.record_run(spec.run_id, key["id"])
             status = submit_job(spec, dry_run=dry_run, background=True)
         except Exception as exc:
             db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
-            # The org was charged above but the run never started — reverse the debit so the
-            # user isn't billed for a run that didn't run. Best-effort: a failed refund must
-            # not mask the original error (it's logged for an operator to reconcile), and the
-            # reversal is idempotent by run_id so a retried submit re-charges cleanly.
+            # The run never started — reverse the charge so the org isn't billed for it.
             if billed:
                 _reverse_charge_best_effort(token=token, run_id=spec.run_id, charge=charge)
             if isinstance(exc, HTTPException):

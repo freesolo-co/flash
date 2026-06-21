@@ -46,18 +46,9 @@ def gpu_hourly_usd(name: str) -> float:
     return info.hourly_usd
 
 
-# Realized (spot/queue) $/hr a class is actually billed at -- a conservative single per-class
-# value, the spot/queue discount below the on-demand list (RTX 5090 lists $0.99 but bills ~$0.87,
-# A100 PCIe lists $1.39 but bills ~$1.04). ``realized_hourly_usd`` CLAMPS each entry to the
-# registry list price, so the "never above list" invariant holds by construction -- a stale or
-# tight-market sample that crept above list (e.g. RTX A5000's $0.304 vs its $0.27 list) can never
-# over-quote that class, and new entries are future-proofed the same way. Deliberately not
-# method-specific: pricing GRPO at its full pricier-instance rate would over-quote the total. A
-# class WITHOUT a clean observed rate falls back to its list price (no rate invented). H100 is
-# intentionally omitted: the only H100 sample on record was a single 0.8B GRPO run that billed
-# ~$10/hr against a $3.29 list (an anomalous surge/tight-market Vast offer, on a model that
-# wouldn't even pick an H100) -- one outlier isn't a stable realized rate, so H100 falls back to
-# list ($3.29) until a clean multi-run rate is measured.
+# Realized (spot/queue) $/hr per class -- the discount below on-demand list (RTX 5090 lists
+# $0.99, bills ~$0.87). ``realized_hourly_usd`` CLAMPS to the list price so it can never
+# over-quote; a class with no clean observed rate falls back to list.
 REALIZED_HOURLY_USD: dict[str, float] = {
     "RTX 3090": 0.239,
     "RTX 4090": 0.426,
@@ -70,10 +61,7 @@ REALIZED_HOURLY_USD: dict[str, float] = {
 
 
 def realized_hourly_usd(name: str) -> float:
-    """Market (spot/queue) $/hr a class is billed at; list price if not yet observed.
-
-    Clamped to the on-demand list price so a realized entry can never over-quote vs list
-    (conservative: the estimator never quotes above the on-demand rate)."""
+    """Market (spot/queue) $/hr, clamped to the list price; the list price when not observed."""
     list_price = gpu_hourly_usd(name)
     return min(REALIZED_HOURLY_USD.get(name, list_price), list_price)
 
@@ -86,16 +74,13 @@ def gpu_vram_gb(name: str) -> int:
 
 
 def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
-    """Cheapest GPU class that fits ``required_vram_gb`` -- mirrors ``allocator.allocate``.
+    """Cheapest GPU class that fits ``required_vram_gb`` (ranked by hourly_usd, vram, name).
 
-    Ranks by (hourly_usd, vram_gb, name). There is NO GPU pin and NO validation gate: every
-    fitting class is eligible (validated or not), so the estimate considers the truly cheapest
-    card -- matching the allocator, which always picks the cheapest fitting class across all
-    providers. ``provider`` restricts candidates to what it can provision.
+    No pin and no validation gate -- every fitting class is eligible, like the allocator's
+    cheapest-fit. ``provider`` restricts candidates to what it can provision.
     """
 
     def _selectable(g: GpuClass) -> bool:
-        # Provisionability filter only -- no validation gate (all fitting classes are eligible).
         return provider in (None, "auto") or provider in providers_for(g.name)
 
     candidates = [g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)]
@@ -105,10 +90,7 @@ def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
     return best.name
 
 
-# ===== Model-size facts =====
-# The managed catalog is five DENSE text models (no MoE), so every parameter is active and a
-# model's size is just the leading "<n>B" of its curated ``params`` string. Cost estimation
-# supports catalog models ONLY -- there is no open-model/unlisted or MoE sizing here.
+# ===== Model-size facts (catalog-only; five dense text models, no MoE/open-model sizing) =====
 def total_params_b(model_id: str) -> float:
     """Total parameter count (billions) for a catalog model -- the curated ``params_b`` stat."""
     info = MODELS.get(model_id)
@@ -132,10 +114,8 @@ def download_weight_gb(model_id: str) -> float:
 
 
 # ===== Reward-grader latency (GRPO) =====
-# A SINGLE average grader latency (s/completion) for every environment -- we don't classify the
-# env from its slug (not generalizable). Real graders span ~0.01s (regex/math) to ~3s (LLM
-# judge / code); ~1s is a middle-of-the-road average across that range. A run can pin its own
-# via RunConfig.reward_seconds_per_completion.
+# A single average grader latency (s/completion) for every env. Graders span ~0.01s (regex/math)
+# to ~3s (LLM judge/code); ~1s is a middle-of-the-road default (a run can override it).
 AVG_REWARD_SECONDS_PER_COMPLETION = 1.0
 
 

@@ -21,9 +21,8 @@ class RunConfig:
     # seed, so this is the seed count.
     setup_repeats: int = 1
 
-    # Engine context length, forwarded as ``[train].max_length`` (NOT prompt length). SFT:
-    # max_seq_len. GRPO: the vLLM engine length; an explicit value is honored, and when unset the
-    # GRPO default mirrors the worker's ``max(1024, max_prompt_len + completion)`` (see ``normalized``).
+    # Engine context length (forwarded as [train].max_length, NOT prompt length). When unset the
+    # GRPO default mirrors the worker's max(1024, max_prompt_len + completion); see normalized().
     seq_len: int | None = None
     completion_len: int | None = None  # GRPO only (max_tokens)
     batch_size: int | None = None  # SFT effective batch / GRPO prompts_per_step
@@ -39,9 +38,8 @@ class RunConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
-        # Normalize the provider like the allocator does (case/whitespace, empty -> "auto") and
-        # reject an unknown substrate up front, else it filters out every candidate downstream
-        # and surfaces as a confusing "no GPU class fits".
+        # Normalize like the allocator (case/whitespace, empty -> "auto") and reject an unknown
+        # substrate up front (else it filters out every candidate -> confusing "no GPU fits").
         prov = (self.provider or "auto").strip().lower() or "auto"
         if prov not in ("auto", *PROVIDER_NAMES):
             raise ValueError(f"unknown provider {self.provider!r} (auto, {', '.join(PROVIDER_NAMES)})")
@@ -56,11 +54,9 @@ class RunConfig:
             raise ValueError(
                 f"steps ({self.steps}) must be a multiple of setup_repeats ({self.setup_repeats})"
             )
-        # A 0/negative positive-only knob yields a bogus (negative/zero) quote; reject. NOTE:
-        # ``max_wall_seconds`` is deliberately NOT here -- the submit/run paths floor it with
-        # ``max(60, int(spec.gpu.max_wall_seconds))`` and so ACCEPT a 0/negative cap, flooring it
-        # to 60s. ``estimate_cost`` mirrors that floor (``cap_s = max(60.0, ...)``), so rejecting a
-        # non-positive cap here would make --cost unable to price configs the runner accepts.
+        # Reject 0/negative positive-only knobs (bogus quote). max_wall_seconds is NOT here: the
+        # runner floors it to max(60, ...) and estimate_cost mirrors that, so a non-positive cap
+        # is accepted (floored to 60s), not rejected.
         for _name in ("seq_len", "batch_size", "group_size", "completion_len", "lora_rank"):
             _val = getattr(self, _name)
             if _val is not None and _val < 1:
@@ -81,11 +77,8 @@ class RunConfig:
                     if self.thinking
                     else RECIPE.rl.max_completion_len
                 )
-            # seq_len is forwarded as [train].max_length (engine context length). An explicit pin
-            # wins; otherwise mirror what run_rl()/the allocator size an unset max_length to for
-            # GRPO -- max(1024, max_prompt_len + completion) (flash/engine/vram.py:243,
-            # worker/__init__.py:1478) -- not bare max_prompt_len, which under-sizes the engine
-            # (and thus VRAM/the chosen GPU) by the completion budget.
+            # Explicit pin wins; else mirror the allocator's GRPO sizing of an unset max_length:
+            # max(1024, max_prompt_len + completion), not bare max_prompt_len (which under-sizes).
             seq = (
                 self.seq_len
                 if self.seq_len is not None
@@ -103,12 +96,9 @@ class RunConfig:
         return replace(self, seq_len=seq, completion_len=comp, batch_size=batch, group_size=group, lora_rank=lora)
 
     def train_knobs(self) -> dict[str, int]:
-        """The knob dict ``engine.vram.model_required_vram_gb`` consumes for VRAM sizing.
-
-        Only an EXPLICIT batch_size is forwarded: the allocator sizes an omitted SFT batch as
-        the worker's per-device micro-batch (4), so feeding the recipe effective batch (32)
-        here would over-provision; leaving it out applies that same default.
-        """
+        """The knob dict ``model_required_vram_gb`` consumes. Only an EXPLICIT batch_size is
+        forwarded -- an omitted SFT batch sizes as the worker's micro-batch (4), not the recipe's
+        effective batch (32), which would over-provision."""
         n = self.normalized()
         knobs: dict[str, int] = {"lora_rank": n.lora_rank}
         if self.batch_size is not None:

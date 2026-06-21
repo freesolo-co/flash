@@ -150,7 +150,7 @@ def test_sft_steps_unpinned_counts_the_env_dataset(monkeypatch):
 def test_sft_steps_max_examples_zero_means_no_cap(monkeypatch):
     # max_examples = 0 is "no cap" (the worker trains the FULL dataset: `max_examples or 0` then
     # truncate only `if > 0`), NOT "0 examples". It must fall through to counting the env dataset,
-    # else a `max_examples = 0` run would price 1 step and be grossly under-charged. PR #3 review.
+    # else a `max_examples = 0` run would price 1 step and be grossly under-charged..
     monkeypatch.setattr("flash.cost.spec.count_env_examples", lambda env_id, params=None: 320)
     spec = _sft_spec(max_examples=0, batch_size=16, epochs=2)
     assert spec.train.max_examples == 0

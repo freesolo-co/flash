@@ -1,10 +1,6 @@
-"""The analytical cost model -- the deterministic ground truth.
-
-Total cost = wall-clock hours x GPU $/hr. Wall clock = cold-start setup + steps x per-step
-time, where per-step time is a first-principles FLOPs estimate (a small multiple of
-active-params x tokens, over the GPU's peak bf16 throughput x a calibrated MFU). GRPO splits
-each step into a vLLM rollout (decode-bound) + reward grading + policy/reference update.
-"""
+"""The analytical cost model: total = wall-clock hours x GPU $/hr, where wall = cold-start
+setup + steps x per-step time (a FLOPs/MFU estimate). GRPO splits each step into a vLLM
+rollout + reward grading + policy/reference update."""
 
 from __future__ import annotations
 
@@ -49,10 +45,7 @@ DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
 
 
 def _fmt_duration(seconds: float) -> str:
-    """Human duration for notes: sub-minute spans render in seconds (a 20s uncapped train is
-    ``20s``, not the confusing ``0m`` that ``{s/60:.0f}m`` would print), sub-hour caps in
-    minutes (a 60s cap is ``1m``, not ``0h``), whole hours stay clean (``24h``), and fractional
-    multi-hour spans show one decimal (``1.5h``)."""
+    """Human duration for notes: seconds < 1m, minutes < 1h, else whole/1-decimal hours."""
     if seconds < 60:
         return f"{seconds:.0f}s"
     if seconds < 3600:
@@ -90,15 +83,8 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
 
 
 def select_gpu(config: RunConfig) -> tuple[str, int]:
-    """(chosen GPU class, required VRAM GB) for the run, offline/deterministic.
-
-    Sizes VRAM via the real allocator, then picks the cheapest fitting class -- matching the
-    allocator, which always picks the cheapest fitting class across all providers. There is no
-    validation gate: every fitting class is eligible (validated or not).
-
-    Catalog models size from their curated stats (``params_b`` / ``min_vram_gb``) with no
-    network I/O, so estimation is fully local and deterministic.
-    """
+    """(chosen GPU class, required VRAM GB): the cheapest fitting class, like the allocator
+    (no pin, no validation gate). Catalog sizing is offline/deterministic."""
     need = required_vram_gb(
         config.model_id,
         config.method,
@@ -137,12 +123,10 @@ def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) 
     """Deterministic pre-flight cost estimate -- the analytical ground truth."""
     gpu, need = select_gpu(config)
     hourly = realized_hourly_usd(gpu)
-    # The runner enforces max(60, max_wall_seconds); mirror that floor so a sub-60s cap isn't
-    # priced below what the run actually bills.
+    # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
     cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
 
-    # A multi-seed run is N independent jobs, each cold-starting and capped on its OWN wall.
-    # Price one seed, clamp THAT to the cap, then multiply -- not capping the aggregate once.
+    # Each seed is its own job (own cold start + own wall cap): price one seed, clamp, x seeds.
     seeds = config.setup_repeats
     setup_per_seed = setup_seconds(config)
     sps = seconds_per_step(config, gpu)

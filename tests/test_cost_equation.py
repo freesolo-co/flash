@@ -18,14 +18,8 @@ def test_no_output_multiplier_field():
 
 
 def test_total_is_exactly_wall_hours_times_rate():
-    """The dollar figure is wall-clock hours x market $/hr -- nothing else, no factor.
-
-    This is the anti-reward-hacking invariant, and it is EXACT by construction: ``total_usd``
-    is computed as ``wall_clock_seconds / 3600 * hourly`` and ``wall_clock_hours`` divides the
-    same seconds by the same 3600, so re-deriving the product reproduces ``total_usd`` to the
-    bit. Assert exact equality (not ``approx``) so any smuggled-in multiplier/scaling — however
-    small — fails the test instead of hiding under a tolerance.
-    """
+    """total_usd is EXACTLY wall-clock hours x $/hr -- no multiplier (assert exact, not approx,
+    so any smuggled-in scaling fails)."""
     e = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 50))
     assert e.total_usd == e.wall_clock_hours * e.gpu_hourly_usd
     assert e.gpu_hourly_usd == realized_hourly_usd(e.gpu)
@@ -37,15 +31,12 @@ def test_prices_at_realized_rate():
     for cls in ("RTX 5090", "A100 PCIe", "RTX 3090"):
         assert realized_hourly_usd(cls) < gpu_hourly_usd(cls)
     assert realized_hourly_usd("A40") == gpu_hourly_usd("A40")  # unobserved -> list
-    # H100 has no clean realized rate (the lone sample was an anomalous ~$10/hr surge run), so it
-    # falls back to its list price -- never the discarded outlier.
-    assert realized_hourly_usd("H100") == gpu_hourly_usd("H100") == 3.29
+    assert realized_hourly_usd("H100") == gpu_hourly_usd("H100") == 3.29  # no clean rate -> list
 
 
 def test_concurrent_reward_keeps_heavy_grpo_off_the_floor():
-    """A heavy reward latency raises cost but must not explode: graders run CONCURRENTLY, so
-    512 completions cost ceil(512/16)=32 waves x latency, not 512 x latency (which a serial
-    model would push past the 24h wall cap)."""
+    """Heavy reward latency raises cost but doesn't explode: graders run concurrently (waves of
+    16), not serially."""
     light = estimate_cost(
         RunConfig("openbmb/MiniCPM5-1B", "grpo", 100, reward_seconds_per_completion=0.05)
     )

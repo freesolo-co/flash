@@ -1,9 +1,5 @@
-"""Cost estimator: the analytical ground-truth model.
-
-No network. Checks the qualitative invariants the model must satisfy (cost scales with
-steps, GRPO costs more than SFT, bigger models cost more per step, the wall-clock cap
-bounds runaway runs) plus end-to-end arithmetic consistency.
-"""
+"""Cost estimator: the analytical ground-truth model. Qualitative invariants (cost scales with
+steps, GRPO > SFT, bigger model costs more, the wall cap bounds runs) + arithmetic consistency."""
 
 from __future__ import annotations
 
@@ -59,19 +55,14 @@ def test_grpo_requires_at_least_as_much_vram_as_sft():
 
 
 def test_omitted_sft_batch_sizes_like_the_real_allocator():
-    # When SFT batch_size is omitted, GPU sizing must match the REAL allocator, which
-    # defaults an omitted batch to the worker's per-device micro-batch (_sft_per_device_bs() = 4
-    # in model_required_vram_gb) -- NOT the recipe effective batch (32). The recipe batch is still
-    # the right compute-throughput model in seconds_per_step; it just must not over-provision VRAM
-    # relative to the allocator.
+    # An omitted SFT batch sizes VRAM like the allocator (micro-batch 4), not the recipe batch (32).
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100)  # batch_size omitted
     _, need = select_gpu(cfg)
-    real = alloc_required_vram_gb(MID, "sft", train={}, thinking=False)  # allocator defaults to micro-batch 4
+    real = alloc_required_vram_gb(MID, "sft", train={}, thinking=False)
     assert need == real
-    # batch_size must NOT be forwarded for sizing when omitted (it would inflate the need).
-    assert "batch_size" not in cfg.train_knobs()
+    assert "batch_size" not in cfg.train_knobs()  # omitted batch isn't forwarded (would inflate)
 
 
 def test_explicit_sft_batch_is_still_forwarded_for_sizing():
@@ -122,10 +113,7 @@ def test_config_max_wall_seconds_overrides_default_cap():
 
 
 def test_wall_cap_is_applied_per_seed_not_to_the_aggregate():
-    # The runner provisions each seed as its own job and applies max_wall_seconds PER SEED.
-    # So a 3-seed run that wall-caps at a per-seed limit bills 3x the per-seed capped wall,
-    # NOT a single aggregate cap. With a 1h per-seed cap on a runaway 3-seed run, total wall
-    # is ~3h (3 capped seeds), not 1h.
+    # The cap is per-seed, so a runaway 3-seed run bills 3x the per-seed cap, not one aggregate cap.
     cfg = RunConfig(BIG, "grpo", 300_000, setup_repeats=3, max_wall_seconds=3600)
     e = estimate_cost(cfg)
     assert e.wall_capped is True
@@ -133,9 +121,7 @@ def test_wall_cap_is_applied_per_seed_not_to_the_aggregate():
 
 
 def test_sub_60s_wall_cap_is_floored_to_the_runner_minimum():
-    # The runner enforces max(60, max_wall_seconds); the estimate must mirror it so a sub-60s
-    # cap isn't priced below what the run actually bills (otherwise a ~$0 estimate). A 10s and a
-    # 30s cap both floor to 60s of (capped) wall, and the dollar figure is strictly positive.
+    # The runner floors the cap to max(60, ...); the estimate mirrors it (else a ~$0 quote).
     e10 = estimate_cost(RunConfig(BIG, "grpo", 100_000, max_wall_seconds=10))
     e30 = estimate_cost(RunConfig(BIG, "grpo", 100_000, max_wall_seconds=30))
     assert e10.wall_clock_seconds == pytest.approx(60.0)
@@ -144,27 +130,21 @@ def test_sub_60s_wall_cap_is_floored_to_the_runner_minimum():
 
 
 def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
-    # A 0/negative max_wall_seconds is ACCEPTED, mirroring the runner: submit/run floor it with
-    # max(60, int(spec.gpu.max_wall_seconds)), so the runner accepts a non-positive cap and runs
-    # it for 60s of wall. RunConfig must NOT reject it (else --cost can't price configs the
-    # runner accepts), and estimate_cost's cap_s = max(60.0, ...) floor turns it into a 60s wall
-    # with a strictly-positive total_usd -- NOT a negative/zero quote.
+    # A 0/negative cap is accepted (the runner floors it to 60s), not rejected -- so --cost can
+    # price configs the runner accepts; estimate_cost mirrors the 60s floor -> positive quote.
     for cap in (0, -5):
-        cfg = RunConfig(BIG, "grpo", 100_000, max_wall_seconds=cap)  # accepted, no raise
+        cfg = RunConfig(BIG, "grpo", 100_000, max_wall_seconds=cap)
         assert cfg.max_wall_seconds == cap
         e = estimate_cost(cfg)
-        assert e.wall_clock_seconds == pytest.approx(60.0)  # floored to the runner's 60s minimum
-        assert e.total_usd > 0.0  # positive, not negative
-    # One seed of the same shape caps at exactly one per-seed window.
+        assert e.wall_clock_seconds == pytest.approx(60.0)
+        assert e.total_usd > 0.0
     one = RunConfig(BIG, "grpo", 100_000, setup_repeats=1, max_wall_seconds=3600)
     assert estimate_cost(one).wall_clock_seconds == pytest.approx(3600.0)
 
 
 def test_select_gpu_picks_cheapest_including_unvalidated():
-    # No validation gate (it was removed with GPU pinning): select_gpu picks the cheapest fitting
-    # class -- validated or not -- the same way the allocator does, so the estimate prices the
-    # truly cheapest card. It defers to pick_gpu's no-gate cheapest-fit, and no fitting class is
-    # cheaper than the one chosen.
+    # No validation gate: select_gpu picks the cheapest fitting class (validated or not), and
+    # nothing fitting is cheaper.
     from flash.cost.facts import gpu_hourly_usd, pick_gpu
     from flash.providers.base import GPU_INFO
 
@@ -175,9 +155,8 @@ def test_select_gpu_picks_cheapest_including_unvalidated():
 
 
 def test_qlora_model_fits_a_smaller_card_than_bf16_would():
-    # Qwen3.5-9B is 4-bit QLoRA; its GRPO requirement fits a 32 GB card, not the 80 GB an A100
-    # would need in bf16. (The CHOSEN class is the cheapest fitting one across the whole
-    # registry, which may have MORE VRAM if it's cheaper -- it's the requirement that shrinks.)
+    # Qwen3.5-9B is QLoRA: its GRPO requirement fits a 32 GB card (the chosen class may be bigger
+    # if cheaper -- it's the requirement that shrinks).
     e = estimate_cost(RunConfig(BIG, "grpo", 100))
     assert e.required_vram_gb <= 32
     assert any("qlora" in n.lower() for n in e.notes)
@@ -191,22 +170,19 @@ def test_invalid_config_rejected():
 
 
 def test_omitted_grpo_max_length_sizes_like_the_real_allocator():
-    # When GRPO max_length (seq_len) is omitted, the engine context length must MIRROR the worker:
-    # the allocator sizes an unset [train].max_length to max(1024, max_prompt_len + completion)
-    # (flash/engine/vram.py:243, worker/__init__.py:1478), NOT bare max_prompt_len -- otherwise the
-    # estimate under-sizes VRAM by the completion budget and can pick/price an undersized GPU.
+    # An omitted GRPO max_length mirrors the worker's max(1024, max_prompt_len + completion), not
+    # bare max_prompt_len -- else the estimate under-sizes VRAM by the completion budget.
     from flash.engine.recipe import RECIPE
     from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "grpo", 100)  # max_length / seq_len omitted
     worker_len = max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len)
-    assert cfg.normalized().seq_len == worker_len  # mirrors the worker exactly
-    assert cfg.train_knobs()["max_length"] == worker_len  # forwarded as [train].max_length
-    # GPU sizing matches the allocator's own omitted-max_length default (same engine length).
+    assert cfg.normalized().seq_len == worker_len
+    assert cfg.train_knobs()["max_length"] == worker_len
     _, need = select_gpu(cfg)
     real = alloc_required_vram_gb(MID, "grpo", train={}, thinking=False)
     assert need == real
-    # ...and is >= what the OLD bare-max_prompt_len default would have produced (never under-sizes).
+    # ...and never under-sizes vs the old bare-max_prompt_len default.
     old = alloc_required_vram_gb(MID, "grpo", train={"max_length": RECIPE.rl.max_prompt_len}, thinking=False)
     assert need >= old
 
@@ -240,8 +216,6 @@ def test_explicit_grpo_max_length_still_wins():
 )
 @pytest.mark.parametrize("bad", [0, -1])
 def test_nonpositive_run_knobs_rejected(knob, bad):
-    # A <= 0 run knob produces a bogus quote (zero/negative tokens or completions),
-    # so it's rejected up front -- consistent with the existing steps >= 1 check and the
-    # real parser's train.lora_rank < 1 rejection.
+    # A <= 0 run knob produces a bogus quote, so it's rejected up front (like steps >= 1).
     with pytest.raises(ValueError, match=f"{knob} must be"):
         RunConfig(MID, "grpo", 100, **{knob: bad})

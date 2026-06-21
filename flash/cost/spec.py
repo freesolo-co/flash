@@ -1,10 +1,7 @@
 """Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / step count / estimate.
 
-Shared by the CLI (``flash train --cost``) and the control plane (which charges the estimate
-to the user's org at submit), so both price the SAME work the run will bill for. Catalog models
-size from their curated stats (no network) and GPU selection picks the cheapest fitting class
-with no validation gate -- the same basis whether quoted or charged.
-"""
+Shared by ``flash train --cost`` and the control plane's submit-time charge, so both price the
+same work on the same catalog-only, cheapest-fit basis."""
 
 from __future__ import annotations
 
@@ -13,14 +10,9 @@ from flash.cost.types import CostEstimate, RunConfig
 
 
 def sft_realized_batch(batch_size: int) -> int:
-    """The SFT global batch the WORKER realizes for a requested ``batch_size``.
-
-    The worker (engine.worker) never trains at the raw requested batch: it fixes the per-device
-    micro-batch at ``_sft_per_device_bs()`` (4) and reaches the target via CEIL grad-accum, so the
-    realized global batch is ``per_device x ceil(target / per_device)`` -- which can EXCEED the
-    request when it isn't a multiple of the micro-batch (e.g. 16/6 -> per_device 4, accum 2 -> 8).
-    Mirror that here so the optimizer-step count matches what actually runs.
-    """
+    """The SFT global batch the worker realizes for ``batch_size``: per-device micro-batch (4) x
+    ceil grad-accum -- which can EXCEED the request when not a multiple of 4. Mirror it so the
+    step count matches the run."""
     from flash.engine.vram import _sft_per_device_bs
 
     target = max(1, int(batch_size))
@@ -30,14 +22,8 @@ def sft_realized_batch(batch_size: int) -> int:
 
 
 def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
-    """Number of training rows in ``env_id``'s dataset, or ``None`` if it can't be loaded.
-
-    Loads the verifiers env (installed via ``slm env install``) and counts its train split --
-    the same ``ACTIVE_ENV.dataset("train")`` the worker trains over -- so an SFT run with no
-    ``[train].max_examples`` cap is priced on the REAL dataset size, not a guess. Best-effort:
-    returns ``None`` on any failure (env not installed, missing deps, load/download error) so
-    the caller can surface a clear message rather than bill a wrong number.
-    """
+    """Training rows in ``env_id``'s dataset (the worker's train split), or ``None`` if it can't
+    be loaded. Best-effort -- prices an uncapped SFT run on the real dataset size, not a guess."""
     if not env_id:
         return None
     try:
@@ -50,15 +36,9 @@ def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
 
 
 def spec_steps(spec) -> int:
-    """Per-seed optimizer steps implied by a train spec (mirrors the worker).
-
-    GRPO carries ``train.steps`` (default recipe ``num_steps``) -- ``train.steps`` is a GRPO
-    concept and is NOT consulted for SFT. SFT runs by epochs over a (capped) dataset, so steps =
-    ``epochs x ceil(num_examples / realized_batch)``, capped by ``max_steps``, where ``epochs``
-    defaults to ``RECIPE.sft.num_epochs`` (2), ``realized_batch`` is the worker's grad-accum global
-    batch (``sft_realized_batch``), and ``num_examples`` is ``max_examples`` if pinned else the
-    REAL env train-split size (``count_env_examples``) -- the full dataset the worker trains over.
-    """
+    """Per-seed optimizer steps implied by a train spec (mirrors the worker). GRPO: ``train.steps``
+    (else recipe default). SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by
+    ``max_steps``, where ``num_examples`` is ``max_examples`` if pinned else the real env size."""
     from flash.engine.recipe import RECIPE
 
     t = spec.train
@@ -70,10 +50,9 @@ def spec_steps(spec) -> int:
     cap = int(t.max_steps) if t.max_steps else 0  # SFT-only optimizer-step cap (0 = uncapped)
     epochs = int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
     requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
-    batch = sft_realized_batch(requested_batch)  # worker's grad-accum-realized global batch
-    # max_examples is a CAP, and 0 (like None) means "no cap" -- the worker trains the FULL env
-    # dataset (engine.worker: `max_examples or 0` then truncate only `if > 0`). Mirror that here,
-    # else `max_examples = 0` would price 1 step and grossly under-charge a full-dataset run.
+    batch = sft_realized_batch(requested_batch)
+    # max_examples is a CAP; 0 (like None) means "no cap" (worker trains the full dataset), so
+    # don't let max_examples=0 price a single step.
     pinned_examples = int(t.max_examples) if t.max_examples else 0
     if pinned_examples > 0:
         examples = pinned_examples
@@ -91,16 +70,9 @@ def spec_steps(spec) -> int:
 
 
 def runconfig_from_spec(spec) -> RunConfig:
-    """Map a parsed training ``JobSpec`` to a cost ``RunConfig``.
-
-    Each seed is its own job that re-pays the cold start (runner.py), so scale both the step
-    count and the setup repeats by the seed count -- the estimate then prices the same total
-    work the run would bill for.
-
-    GPU pinning is gone: the estimate doesn't pin ``spec.gpu.type`` -- it runs its own
-    cheapest-fit (``gpu=None``) over the whole registry, cross-provider (``provider="auto"``),
-    with no validation gate.
-    """
+    """Map a parsed ``JobSpec`` to a cost ``RunConfig``. Each seed is its own job that re-pays the
+    cold start, so steps and setup repeats scale by the seed count. The estimate doesn't pin a
+    GPU -- it does its own cheapest-fit (provider="auto")."""
     t, g = spec.train, spec.gpu
     is_grpo = spec.algorithm == "grpo"
     seeds = max(1, len(t.seeds or (0,)))

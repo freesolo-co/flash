@@ -266,11 +266,7 @@ def cmd_env_list(args) -> int:
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    Catalog-only and fully local: catalog models size from their curated stats with no network,
-    so the quote is deterministic and matches what the control plane charges at submit. For an
-    SFT run with no ``[train].max_examples`` the step count loads the env to count its real train
-    split (see ``cost.spec.count_env_examples``).
-    """
+    Catalog-only and deterministic; an uncapped SFT run loads the env to count its train split."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(
