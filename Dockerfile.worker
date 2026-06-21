@@ -4,7 +4,7 @@
 #
 # This image is the default worker image — Vast always uses it; on RunPod, FLASH_WORKER_IMAGE
 # overrides it and the Flash live-endpoint path boot-installs deps instead. It is referenced by name
-# in providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be published to GHCR and the package set PUBLIC
+# in flash/providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be published to GHCR and the package set PUBLIC
 # (no registry login is configured) — otherwise Vast/RunPod can't pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
 #
@@ -14,7 +14,7 @@
 #
 # Base is torch 2.10 / cu12.8 / cudnn9 (-devel = has nvcc for any source builds); it ships the
 # CUDA 12.8 runtime libs the PyPI wheels link against. The pinned stack mirrors
-# providers/runpod/train/deps.py:WORKER_DEPS.
+# flash/providers/runpod/train/deps.py:WORKER_DEPS.
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -49,12 +49,12 @@ RUN pip install --no-cache-dir \
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
 # miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
 # we bake the pinned tilelang==0.1.11 + apache-tvm-ffi==0.1.11 (0.1.12 double-registers TVM-FFI ->
-# `import tilelang` aborts) and KEEP fla on every arch; engine.worker._ensure_fla_fastpath_on_hopper
+# `import tilelang` aborts) and KEEP fla on every arch; flash.engine.worker._ensure_fla_fastpath_on_hopper
 # ensures the tilelang backend is live on sm90 before any model import. Validated win vs the old
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
 # (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
-# reproducible image builds — keep this SHA in lockstep with providers/runpod/train/deps.py:WORKER_DEPS.
+# reproducible image builds — keep this SHA in lockstep with flash/providers/runpod/train/deps.py:WORKER_DEPS.
 
 # FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC

@@ -50,7 +50,7 @@ def _train_body(input_data: dict) -> dict:
 
     from huggingface_hub import snapshot_download
 
-    # NB: the Hopper fla fast-path setup lives in engine.worker._ensure_fla_fastpath_on_hopper (runs
+    # NB: the Hopper fla fast-path setup lives in flash.engine.worker._ensure_fla_fastpath_on_hopper (runs
     # in the worker process AFTER all installs, before any model import) — doing it here would be
     # undone by a later extra_pip / `prime env install`, and depends on a handler redeploy.
 
@@ -62,7 +62,7 @@ def _train_body(input_data: dict) -> dict:
         subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
 
     # NB: fla is kept on ALL arches. On Hopper (sm90) fla's GDN backward is miscomputed with
-    # Triton>=3.4 (#640); the fix is fla's tilelang backend, so engine.worker._ensure_fla_fastpath_on_hopper
+    # Triton>=3.4 (#640); the fix is fla's tilelang backend, so flash.engine.worker._ensure_fla_fastpath_on_hopper
     # makes fla+tilelang live at worker startup (instead of dropping fla) for ~4-13x faster + ~2x
     # lighter Hopper GDN training than the pure-PyTorch delta fallback.
 

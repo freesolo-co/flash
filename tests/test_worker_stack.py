@@ -500,9 +500,11 @@ def test_hopper_fla_fallback_disables_fla_when_stack_unavailable(monkeypatch):
 def test_hopper_fla_fallback_when_install_fails(monkeypatch):
     """A FAILED pip install (rc!=0) must flip the gate off + disable fla EVEN IF find_spec still
     succeeds on a stale/partial resident copy — a failed install is not silently treated as healthy
-    (Copilot review on perf.py:~487). Without the rc check, find_spec alone would wrongly keep fla."""
+    (Copilot review on perf.py:~487). Without the rc check, find_spec alone would wrongly keep fla.
+    A wrong tvm-ffi version makes the helper ATTEMPT the pinned reinstall (the conditional-install
+    gate), so pip_rc=1 exercises the failed-install path."""
     perf, removed = _patch_hopper_stack(
-        monkeypatch, pip_rc=1, find_spec_ok=True, tvm_ffi_version="0.1.11"
+        monkeypatch, pip_rc=1, find_spec_ok=True, tvm_ffi_version="0.1.12"
     )
 
     perf._ensure_fla_fastpath_on_hopper()
@@ -591,6 +593,55 @@ def test_hopper_tilelang_wrong_version_persists_disables_fla(monkeypatch):
         "wrong resident tilelang must still attempt the pinned reinstall"
     )
     assert removed, "tilelang version != pin after install must DISABLE fla (pin didn't land)"
+
+
+def test_hopper_tvm_ffi_pip_skipped_when_pin_already_present(monkeypatch):
+    """Regression (Copilot review on perf.py:~521): when the EXACT apache-tvm-ffi pin is already
+    resident AND tilelang was NOT (re)installed this invocation, the helper must SKIP the tvm-ffi
+    pip — re-running it unconditionally adds avoidable cold-start latency and could spuriously
+    disable fla on a transient network/resolver hiccup. The ok gate still re-verifies the version,
+    so fla stays KEPT."""
+    pip_calls: list[str] = []
+    perf, removed = _patch_hopper_stack(
+        monkeypatch,
+        pip_rc=0,
+        find_spec_ok=True,
+        tvm_ffi_version="0.1.11",  # exact pin already resident
+        tilelang_version="0.1.11",  # exact pin -> tilelang NOT reinstalled this invocation
+        record_pip=pip_calls,
+    )
+
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert not any("apache-tvm-ffi" in c for c in pip_calls), (
+        "tvm-ffi pin already resident + tilelang not reinstalled must SKIP the tvm-ffi pip, "
+        f"got pip calls: {pip_calls}"
+    )
+    assert not removed, "the pin being resident is the healthy path -> fla must be KEPT"
+
+
+def test_hopper_outer_exception_disables_fla(monkeypatch):
+    """Regression (Copilot review on perf.py:~580): an unexpected error mid-setup (AFTER the Hopper
+    check passes) must FAIL-CLOSED — best-effort disable fla so transformers can't engage the broken
+    Triton GDN path (#640) on a half-configured fla. The outer handler must call _remove_fla_from_disk
+    and never re-raise."""
+    import importlib
+
+    perf, removed = _patch_hopper_stack(
+        monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.11"
+    )
+
+    # Make a call inside the try (after the Hopper guard + installs) blow up. invalidate_caches runs
+    # right before the import-probe gate, so this drives the outer `except`.
+    def _boom() -> None:
+        raise RuntimeError("invalidate_caches exploded")
+
+    monkeypatch.setattr(importlib, "invalidate_caches", _boom, raising=True)
+
+    # Must NOT propagate (the worker keeps running on the pure-PyTorch delta path).
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert removed, "outer exception path must FAIL-CLOSED: disable fla (call _remove_fla_from_disk)"
 
 
 def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
