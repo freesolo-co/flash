@@ -38,6 +38,7 @@ from flash.cli.main.commands import (  # noqa: F401
     cmd_login,
     cmd_logs,
     cmd_models,
+    cmd_plan,
     cmd_ps,
     cmd_status,
     cmd_train,
@@ -143,6 +144,30 @@ def main(argv: list[str] | None = None) -> int:
         help="submit and return immediately instead of following logs",
     )
     train.set_defaults(func=cmd_train)
+
+    plan = sub.add_parser(
+        "plan",
+        help="pre-flight a config: resolved spec, effective knobs, and advice "
+        "(fully local — no GPU/credentials)",
+    )
+    plan.add_argument("config")
+    plan.add_argument(
+        "--config",
+        dest="extra_configs",
+        action="append",
+        default=[],
+        help="additional TOML to deep-merge (config composition); repeatable",
+    )
+    plan.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="key=value",
+        help="override a config value; repeatable",
+    )
+    plan.add_argument("--json", action="store_true", help="emit the plan as JSON (for agents)")
+    plan.set_defaults(func=cmd_plan)
 
     status = sub.add_parser("status", help="show a run's full status JSON")
     status.add_argument("run_id")

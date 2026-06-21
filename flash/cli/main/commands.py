@@ -8,6 +8,7 @@ and `--dry-run` stay fully local.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from flash import __version__
 from flash._logging import get_logger
-from flash.catalog import public_model_rows
+from flash.catalog import public_model_rows, resolve_model
 from flash.client import (
     ApiClient,
     ClientError,
@@ -26,6 +27,8 @@ from flash.client import (
 )
 from flash.client.config import load_credentials
 from flash.client.specs import spec_payload
+from flash.lint import lint_spec
+from flash.plan import build_plan, render_plan
 from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
 
@@ -264,21 +267,94 @@ def cmd_env_list(args) -> int:
     return 0
 
 
+@contextlib.contextmanager
+def _quiet_stdout(active: bool):
+    """Route stdout to stderr while ``active``.
+
+    Config parsing / model resolution can ``print`` advisory policy warnings to stdout
+    (open-model VRAM fit, thinking/allow-policy notes). When the command's stdout must be
+    strict JSON (``flash plan --json``, ``flash train --dry-run``), that would corrupt the
+    payload — so capture those prints onto stderr and keep stdout clean.
+    """
+    if active:
+        with contextlib.redirect_stdout(sys.stderr):
+            yield
+    else:
+        yield
+
+
+def _spec_advice(spec) -> list:
+    """Lint a parsed spec, resolving its ModelInfo once. Best-effort: advice is a
+    non-blocking nicety, so a model-resolution hiccup must never fail the command. Model
+    resolution can print open-model/thinking policy warnings to stdout, so route them to
+    stderr — callers emitting strict JSON rely on a clean stdout."""
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            info = resolve_model(
+                spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type
+            )
+    except ValueError:
+        return []
+    return lint_spec(spec, info)
+
+
+def cmd_plan(args) -> int:
+    # Fully local pre-flight: parse + validate the config (no credentials/server/GPU), resolve
+    # the model, and report the resolved spec, effective knobs, and config advice. In --json
+    # mode keep stdout strictly machine-readable by routing any policy warnings to stderr.
+    as_json = getattr(args, "json", False)
+    with _quiet_stdout(as_json):
+        spec = spec_from_file(
+            args.config,
+            run_id=new_run_id(),
+            overrides=getattr(args, "overrides", None),
+            extra_configs=getattr(args, "extra_configs", None),
+        )
+        info = resolve_model(
+            spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type
+        )
+        plan = build_plan(spec, info)
+    print(json.dumps(plan, indent=2) if as_json else render_plan(plan))
+    return 0
+
+
 def cmd_train(args) -> int:
-    spec = spec_from_file(
-        args.config,
-        run_id=new_run_id() if args.dry_run else None,
-        overrides=getattr(args, "overrides", None),
-        extra_configs=getattr(args, "extra_configs", None),
-    )
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.
+        # `warnings` carries the config linter's advice so agents reading the dry-run JSON see
+        # likely-mistake feedback (an additive key — run_id/state/spec are unchanged). Parsing
+        # and the advice's model resolution can print policy warnings to stdout, so build the
+        # payload under _quiet_stdout to keep the emitted JSON parseable.
+        with _quiet_stdout(True):
+            spec = spec_from_file(
+                args.config,
+                run_id=new_run_id(),
+                overrides=getattr(args, "overrides", None),
+                extra_configs=getattr(args, "extra_configs", None),
+            )
+            warnings = [a.to_dict() for a in _spec_advice(spec)]
         print(
             json.dumps(
-                {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}, indent=2
+                {
+                    "run_id": spec.run_id,
+                    "state": "dry_run",
+                    "spec": spec.to_dict(),
+                    "warnings": warnings,
+                },
+                indent=2,
             )
         )
         return 0
+    spec = spec_from_file(
+        args.config,
+        run_id=None,
+        overrides=getattr(args, "overrides", None),
+        extra_configs=getattr(args, "extra_configs", None),
+    )
+    # Surface config advice on a real submit too (non-blocking, to stderr so it never
+    # pollutes the JSON/log stream the agent parses from stdout).
+    for advice in _spec_advice(spec):
+        print(f"warning: {advice.field}: {advice.message}", file=sys.stderr)
     client = client_from_config()
     status = client.create_run(spec_payload(spec))
     run_id = status["run_id"]

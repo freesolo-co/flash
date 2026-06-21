@@ -10,6 +10,12 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash train <cfg.toml>` / control-plane `POST /runs` — submit a training job;
   one dedicated GPU per run, supervised server-side (stall watchdog, bounded
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
+- `flash plan <cfg.toml>` — pre-flight a config locally (no GPU/credentials): the
+  resolved spec, the effective training knobs (recipe defaults shown where unset),
+  and advisory warnings for common mistakes (e.g. tiny `lora_rank` on a big model,
+  `group_size`/`temperature` too low for a GRPO signal, a short completion budget on
+  a thinking run). `--json` for agents; the same advice rides along in
+  `flash train --dry-run`'s output.
 - `flash deploy` (scale-to-zero or always-on), `flash chat` —
   serving for trained adapters.
 - **Verifiers-only environments.** Every run names a Prime Intellect `verifiers`
