@@ -42,7 +42,7 @@ allocator picks the cheapest GPU class that fits the run across both providers.
   plane (run operator-side via the separate `flash-server` command)
 - `flash/mcp/` — stdio MCP bridge for coding agents
 - `Dockerfile` — the control-plane image (used by the repo docker-compose)
-- `tests/` — pytest suite (CPU-only; offline-by-default via `tests/conftest.py`)
+- `tests/` — pytest suite (CPU-only; offline-by-default, no GPU/network)
 
 ## Local commands
 

@@ -1,6 +1,6 @@
 """Offline-by-default test harness.
 
-There is no skip-the-network env flag anymore; instead this autouse fixture stubs the network
+There is no "skip the network" env flag; instead this autouse fixture stubs the network
 boundaries the production code would otherwise reach, so the whole suite stays hermetic (no
 real RunPod / Vast / Hugging Face calls) without any env switch. A test that exercises one of
 these boundaries monkeypatches it itself — applied after this fixture, so the test's patch
