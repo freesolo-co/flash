@@ -63,8 +63,10 @@ def build(model_id: str, attn: str, packing: bool, max_len: int, bsz: int, grad_
         max_length=max_len,
         packing=packing,
         packing_strategy="bfd",
-        max_steps=10**6,  # we stop manually
-        logging_steps=1,
+        # One pass over the SAME dataset for every config: same total content tokens, so the
+        # wall-time difference is exactly the padding-FLOP saving packing buys (minus flex overhead).
+        num_train_epochs=1,
+        logging_steps=5,
         report_to=[],
         bf16=True,
         dataset_kwargs={"skip_prepare_dataset": False},
@@ -143,8 +145,6 @@ def bench_one(model_id, attn, packing, steps, max_len, bsz, grad_accum, n_exampl
                 last = state.log_history[-1]
                 if "loss" in last:
                     losses.append(last["loss"])
-            if len(timings) >= steps:
-                control.should_training_stop = True
 
     from transformers import TrainerCallback
 
@@ -154,29 +154,35 @@ def bench_one(model_id, attn, packing, steps, max_len, bsz, grad_accum, n_exampl
     })()
     timer = Timer()
 
-    trainer = SFTTrainer(model=model_id, args=cfg, train_dataset=ds, callbacks=[cb])
+    # Mirror flash: LoRA adapters (not full fine-tune) keep optimizer memory tiny. (Attention impl
+    # and packing — what we're measuring — are orthogonal to LoRA.)
+    from peft import LoraConfig
+
+    lora = LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM")
+    trainer = SFTTrainer(model=model_id, args=cfg, train_dataset=ds, callbacks=[cb], peft_config=lora)
     torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
     trainer.train()
     wall = time.time() - t0
     peak_gb = torch.cuda.max_memory_allocated() / 1e9
 
-    # effective (non-padding) tokens processed: packing removes padding, so tokens/s should rise.
-    eff_tokens = sum(lengths)  # the real content tokens; packing fits them in fewer/denser steps
-    warm = timings[3:] if len(timings) > 6 else timings
+    # THE decision metric: real (non-padding) content tokens processed per second. Every config
+    # runs one epoch over the SAME examples, so `real_tokens` is identical across configs; only the
+    # wall time differs (packing removes padding FLOPs; flex adds per-call overhead). Higher = better.
+    real_tokens = sum(lengths)
+    warm = timings[2:] if len(timings) > 4 else timings
     step_med = statistics.median(warm) if warm else float("nan")
-    # tokens/s during steady state: real tokens seen per step / median step time. With packing the
-    # batch holds ~bsz*max_len real tokens; without, ~bsz*max_len minus padding. We report the
-    # measured throughput as (effective tokens across all timed steps) / (sum of those step times).
+    train_s = sum(timings) if timings else wall
     return {
         "attn": attn,
         "packing": packing,
-        "steps_timed": len(timings),
+        "steps": len(timings),
+        "real_tokens": real_tokens,
+        "train_s": round(train_s, 2),
+        "real_tokens_per_s": round(real_tokens / train_s) if train_s else None,
         "median_step_s": round(step_med, 4),
         "peak_vram_gb": round(peak_gb, 2),
         "final_loss": round(losses[-1], 4) if losses else None,
-        "wall_s": round(wall, 1),
-        "_lengths_total": eff_tokens,
     }
 
 
@@ -185,9 +191,9 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--max-len", type=int, default=2048)
-    ap.add_argument("--bsz", type=int, default=1)
-    ap.add_argument("--grad-accum", type=int, default=4)
-    ap.add_argument("--examples", type=int, default=1024)
+    ap.add_argument("--bsz", type=int, default=8)  # >1 so no-packing pays the intra-batch padding tax
+    ap.add_argument("--grad-accum", type=int, default=1)
+    ap.add_argument("--examples", type=int, default=768)
     ap.add_argument("--configs", nargs="+", default=["sdpa-nopack", "flex-pack", "fa2-pack"])
     ap.add_argument("--out", default="bench_results.jsonl")
     args = ap.parse_args()
@@ -218,7 +224,8 @@ def main():
         with open(args.out, "a") as f:
             f.write(json.dumps(rec) + "\n")
         print("  ->", json.dumps({k: rec.get(k) for k in
-              ("median_step_s", "peak_vram_gb", "final_loss", "correctness", "ok", "error")}))
+              ("real_tokens_per_s", "train_s", "steps", "median_step_s", "peak_vram_gb",
+               "final_loss", "ok", "error")}))
         torch.cuda.empty_cache()
 
     print("\n# SUMMARY")
