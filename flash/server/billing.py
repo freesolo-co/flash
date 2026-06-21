@@ -54,7 +54,7 @@ def _cents(usd: float) -> int:
     (PR #3 review). Convert via ``Decimal`` with ``ROUND_HALF_UP`` so a tie always rounds up to
     the next cent, then clamp at zero.
     """
-    cents = Decimal(str(float(usd))).scaleb(2).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    cents = Decimal(str(usd)).scaleb(2).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return max(0, int(cents))
 
 

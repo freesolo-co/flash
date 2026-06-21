@@ -113,7 +113,7 @@ def total_params_b(model_id: str) -> float:
     """Total parameter count (billions) for a catalog model -- the curated ``params_b`` stat."""
     info = MODELS.get(model_id)
     if info is None:
-        raise KeyError(
+        raise ValueError(
             f"unknown model {model_id!r}; cost estimation supports catalog models only "
             f"({', '.join(MODELS)})"
         )
