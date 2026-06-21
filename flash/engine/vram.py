@@ -66,7 +66,8 @@ def _sft_per_device_bs() -> int:
 def sft_grad_accum(batch_size: int) -> tuple[int, int]:
     """(per-device micro-batch, grad-accum steps) the worker realizes for a requested GLOBAL
     ``batch_size``: per_device capped at the micro-batch default, grad-accum CEIL'd so the
-    realized global batch is never BELOW the request (e.g. 16/6 -> 4 x ceil(16/4)=4)."""
+    realized global batch is never BELOW the request (e.g. batch 6 -> per_device 4 x
+    ceil(6/4)=2 grad-accum = realized 8, >= 6)."""
     target = max(1, int(batch_size))
     per_device = max(1, min(_sft_per_device_bs(), target))
     grad_accum = max(1, -(-target // per_device))  # ceil
