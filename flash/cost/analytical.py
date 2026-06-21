@@ -85,6 +85,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
 def select_gpu(config: RunConfig) -> tuple[str, int]:
     """(chosen GPU class, required VRAM GB): the cheapest fitting class, like the allocator
     (no pin, no validation gate). Catalog sizing is offline/deterministic."""
+    total_params_b(config.model_id)  # catalog-only: reject a non-catalog model before any (HF) sizing
     need = required_vram_gb(
         config.model_id,
         config.method,
