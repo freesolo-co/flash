@@ -65,6 +65,7 @@ def optimal_attn_impl() -> str | None:
     return impl
 
 
+
 # Liger's fused linear cross-entropy is a MEMORY optimization (it never materializes the fp32
 # [B,T,vocab] logits), not a fixed-batch speed win. PR #174 ledger: on a 1B model at fixed batch
 # it is a measured NET LOSS on EVERY arch (min-of-3: A100 0.86x, H100 0.90x, RTX 3090 0.78x,
@@ -141,6 +142,7 @@ def setup_perf_backends() -> None:
         print("[perf] TF32 matmul/cuDNN enabled")
     except Exception as e:
         print("setup_perf_backends skipped:", e)
+
 
 
 def _remove_fla_from_disk() -> tuple[list[str], bool]:
@@ -339,6 +341,7 @@ def _sdpa_cudnn_ctx(attn_impl: str | None):
         return contextlib.nullcontext()
 
 
+
 def gpu_diagnostics() -> dict:
     """Collect CUDA/driver diagnostics to pin down GPU init failures on rented nodes."""
     diag = {}
@@ -425,7 +428,7 @@ def _metric_curve(trainer, key: str) -> list:
         return []
 
 
-def _fix_fla_fastpath_on_hopper() -> None:
+def _ensure_fla_fastpath_on_hopper() -> None:
     """Make flash-linear-attention's GatedDeltaNet fast path CORRECT + fast on Hopper (sm90)
     instead of dropping it.
 

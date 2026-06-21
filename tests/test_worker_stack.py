@@ -167,23 +167,15 @@ def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
 def test_grpo_no_op_failure_empty_reward_no_resume(monkeypatch):
     """Empty reward_history with no resume = the rollout scored nothing -> fail loudly (no-op run)."""
     worker = _import_worker(monkeypatch)
-    assert (
-        worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
-    )
+    assert worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
 
 
 def test_grpo_no_op_ok_when_rewards_present(monkeypatch):
     """A non-empty reward_history means the reward path ran -> never a no-op failure."""
     worker = _import_worker(monkeypatch)
-    assert (
-        worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10)
-        is False
-    )
+    assert worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10) is False
     # An all-zero history (env returned all-zero rewards) still counts as real training.
-    assert (
-        worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0)
-        is False
-    )
+    assert worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0) is False
 
 
 def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
@@ -191,19 +183,14 @@ def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
     worker = _import_worker(monkeypatch)
     assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=10) is True
     # Empty history is tolerated -> NOT a no-op failure (finalize the completed policy).
-    assert (
-        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12)
-        is False
-    )
+    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12) is False
 
 
 def test_grpo_no_op_failure_resume_did_not_reach_target(monkeypatch):
     """A resume that did NOT reach the target steps with no reward is still a genuine no-op -> fail."""
     worker = _import_worker(monkeypatch)
     assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=3) is False
-    assert (
-        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
-    )
+    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
     # No target steps configured can never count as a complete resume.
     assert worker._grpo_resume_already_complete("ckpt", target_steps=0, steps_run=0) is False
 
@@ -271,7 +258,6 @@ def test_heartbeat_terminal_only_mode(monkeypatch):
     import flash.engine.worker as w
 
     calls = []
-
     def _fake_upload(*a, **k):
         calls.append(a[1])
         return True  # simulate a successful commit so the throttle clock advances
@@ -335,9 +321,7 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w._estimate_params(big) >= 3e9
 
     def fake_cfg(cfg):
-        fake = types.SimpleNamespace(
-            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg)
-        )
+        fake = types.SimpleNamespace(AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg))
         monkeypatch.setitem(sys.modules, "transformers", fake)
 
     fake_cfg(small)
@@ -507,7 +491,7 @@ def test_hopper_fla_fallback_disables_fla_when_stack_unavailable(monkeypatch):
     fla gate flips off and the worker uses the pure-PyTorch delta path (not the broken fla kernel)."""
     perf, removed = _patch_hopper_stack(monkeypatch, find_spec_ok=False)
 
-    perf._fix_fla_fastpath_on_hopper()
+    perf._ensure_fla_fastpath_on_hopper()
 
     # The fallback gating actually fired: fla was disabled (the gate, not just a print).
     assert removed, "fallback must DISABLE fla (call _remove_fla_from_disk) when ok is false"
@@ -521,7 +505,7 @@ def test_hopper_fla_fallback_when_install_fails(monkeypatch):
         monkeypatch, pip_rc=1, find_spec_ok=True, tvm_ffi_version="0.1.11"
     )
 
-    perf._fix_fla_fastpath_on_hopper()
+    perf._ensure_fla_fastpath_on_hopper()
 
     assert removed, "a failed install (rc!=0) must DISABLE fla even when find_spec passes"
 
@@ -534,7 +518,7 @@ def test_hopper_fla_fallback_when_tvm_ffi_pin_did_not_land(monkeypatch):
         monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.12"
     )
 
-    perf._fix_fla_fastpath_on_hopper()
+    perf._ensure_fla_fastpath_on_hopper()
 
     assert removed, "wrong resolved apache-tvm-ffi version must DISABLE fla (pin didn't land)"
 
@@ -547,7 +531,7 @@ def test_hopper_fla_kept_when_stack_healthy(monkeypatch):
         monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.11"
     )
 
-    perf._fix_fla_fastpath_on_hopper()
+    perf._ensure_fla_fastpath_on_hopper()
 
     assert not removed, "healthy stack must KEEP fla (no disable on the success path)"
 
@@ -580,7 +564,7 @@ def test_hopper_tilelang_present_but_wrong_version_is_reinstalled(monkeypatch):
 
     monkeypatch.setattr(_md, "version", _versioned, raising=True)
 
-    perf._fix_fla_fastpath_on_hopper()
+    perf._ensure_fla_fastpath_on_hopper()
 
     assert any(c.startswith("tilelang==0.1.11") for c in pip_calls), (
         f"present-but-wrong tilelang must trigger a pinned reinstall, got pip calls: {pip_calls}"
@@ -601,7 +585,7 @@ def test_hopper_tilelang_wrong_version_persists_disables_fla(monkeypatch):
         record_pip=pip_calls,
     )
 
-    perf._fix_fla_fastpath_on_hopper()
+    perf._ensure_fla_fastpath_on_hopper()
 
     assert any(c.startswith("tilelang==0.1.11") for c in pip_calls), (
         "wrong resident tilelang must still attempt the pinned reinstall"
@@ -632,7 +616,7 @@ def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
     )
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None, raising=True)
 
-    perf._fix_fla_fastpath_on_hopper()
+    perf._ensure_fla_fastpath_on_hopper()
 
     assert touched == [], "non-Hopper must be a no-op (don't install or disable fla)"
 
@@ -658,7 +642,7 @@ def test_fla_git_pin_is_consistent_and_pinned():
         f"venv agree (deps={deps_sha}, dockerfile={dm.group(1)})"
     )
 
-    # The worker's runtime fla reinstall (perf._fix_fla_fastpath_on_hopper) must use the SAME pin —
+    # The worker's runtime fla reinstall (perf._ensure_fla_fastpath_on_hopper) must use the SAME pin —
     # an unpinned reinstall would pull the moving default branch and defeat reproducibility.
     perf_src = (root / "flash" / "engine" / "worker" / "perf.py").read_text()
     # The URL is built via implicit string concatenation across lines:

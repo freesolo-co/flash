@@ -210,7 +210,7 @@ def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict
 
     ``friendly_gpu`` is threaded into ``resolve_worker_deps`` for GPU-scoped deps parity with the
     endpoint config (deploy_train_endpoint). fla is kept on every arch now; on Hopper (sm90) the
-    worker's _fix_fla_fastpath_on_hopper makes fla correct+fast via its tilelang backend (fla #640),
+    worker's _ensure_fla_fastpath_on_hopper makes fla correct+fast via its tilelang backend (fla #640),
     so there is no longer a per-GPU drop here. (``friendly_gpu`` retained for signature parity.)
     """
     if os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE:
@@ -347,10 +347,7 @@ def poll_job(
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
                 recovering = workers.get("initializing")
-                if (
-                    any(workers.get(k) for k in ("throttled", "unhealthy", "initializing"))
-                    or not usable
-                ):
+                if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
                     say(f"queued; workers: {workers}")
                 # Fail fast on a worker stuck UNHEALTHY: a dead worker / failed image pull won't
                 # self-recover, so don't burn the full setup_grace_s (~50 min) waiting on it — once
