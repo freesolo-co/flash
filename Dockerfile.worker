@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir \
     "accelerate>=1.4" \
     "wandb>=0.17" \
     "liger-kernel>=0.5" \
-    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git" \
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \
     "tilelang" \
     "apache-tvm-ffi==0.1.11" \
     "hf_transfer" \
@@ -53,7 +53,8 @@ RUN pip install --no-cache-dir \
 # ensures the tilelang backend is live on sm90 before any model import. Validated win vs the old
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
-# (no fla.modules).
+# (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
+# reproducible image builds — keep this SHA in lockstep with providers/runpod/train/deps.py:WORKER_DEPS.
 
 # FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC

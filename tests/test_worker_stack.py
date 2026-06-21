@@ -415,3 +415,130 @@ def test_force_vllm_backend_for_sm120(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(9))
     assert worker.force_vllm_backend_for_sm120() is None
     assert "VLLM_ATTENTION_BACKEND" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# Hopper fla GDN fast-path fallback: when the healthy fla+tilelang stack can't be
+# assembled (probe `ok` false), fla must be DISABLED (physically removed) so transformers'
+# is_fla_available() gate flips off and the model uses the correct pure-PyTorch delta rule
+# instead of fla's broken Triton>=3.4 GDN chunk_bwd (fla #640). A print alone is not enough.
+# ---------------------------------------------------------------------------
+def _hopper_torch():
+    """A stub ``torch`` that looks like Hopper (sm90) with CUDA available."""
+    t = types.ModuleType("torch")
+    t.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_capability=lambda *a: (9, 0),
+    )
+    return t
+
+
+def test_hopper_fla_fallback_disables_fla_when_stack_unavailable(monkeypatch):
+    """Probe fails (fla absent after install attempt) -> _remove_fla_from_disk IS called so the
+    fla gate flips off and the worker uses the pure-PyTorch delta path (not the broken fla kernel)."""
+    import importlib.util
+    import subprocess
+
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", _hopper_torch())
+    # No real pip installs from the test (subprocess is imported locally inside the helper, so
+    # patch the real subprocess module, not perf).
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None, raising=True)
+    # fla never becomes importable -> probe `ok` is false (drives the fallback branch).
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None, raising=True)
+    # Count + neutralize the disable mechanism (don't touch any real on-disk fla).
+    calls: list[int] = []
+    monkeypatch.setattr(
+        perf, "_remove_fla_from_disk", lambda: (calls.append(1), (["/x/fla"], False))[1]
+    )
+
+    perf._fix_fla_fastpath_on_hopper()
+
+    # The fallback gating actually fired: fla was disabled (the gate, not just a print).
+    assert calls, "fallback must DISABLE fla (call _remove_fla_from_disk) when ok is false"
+
+
+def test_hopper_fla_kept_when_stack_healthy(monkeypatch):
+    """Probe succeeds (fla + fla.modules + tilelang all importable) -> fla is KEPT: the fallback
+    disable must NOT run (we want the fast path engaged, not removed)."""
+    import importlib.util
+    import subprocess
+
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", _hopper_torch())
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None, raising=True)
+    # Everything the probe checks is present -> ok is True (no fallback).
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name: object(), raising=True
+    )
+    removed: list[int] = []
+    monkeypatch.setattr(
+        perf, "_remove_fla_from_disk", lambda: (removed.append(1), ([], False))[1]
+    )
+
+    perf._fix_fla_fastpath_on_hopper()
+
+    assert not removed, "healthy stack must KEEP fla (no disable on the success path)"
+
+
+def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
+    """On a non-Hopper arch (fla's Triton kernel is correct there) the helper is a no-op — it must
+    NOT touch fla at all (neither install nor disable)."""
+    import importlib.util
+    import subprocess
+
+    from flash.engine.worker import perf
+
+    t = types.ModuleType("torch")
+    t.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_capability=lambda *a: (12, 0),  # Blackwell consumer (sm120) — not Hopper
+    )
+    monkeypatch.setitem(sys.modules, "torch", t)
+    touched: list[str] = []
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: touched.append("pip"), raising=True
+    )
+    monkeypatch.setattr(
+        perf, "_remove_fla_from_disk", lambda: (touched.append("remove"), ([], False))[1]
+    )
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None, raising=True)
+
+    perf._fix_fla_fastpath_on_hopper()
+
+    assert touched == [], "non-Hopper must be a no-op (don't install or disable fla)"
+
+
+def test_fla_git_pin_is_consistent_and_pinned():
+    """The fla git dependency is PINNED to an exact commit (not the moving default branch) and the
+    SAME SHA is used in both WORKER_DEPS and Dockerfile.worker (worker venv == baked image)."""
+    import pathlib
+    import re
+
+    spec = next(d for d in WORKER_DEPS if "flash-linear-attention" in d)
+    m = re.search(r"flash-linear-attention\.git@([0-9a-f]{40})\b", spec)
+    assert m, f"fla dep must be pinned to a 40-char commit SHA, got: {spec!r}"
+    deps_sha = m.group(1)
+
+    # repo root: tests/ -> repo root is the parent.
+    root = pathlib.Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile.worker").read_text()
+    dm = re.search(r"flash-linear-attention\.git@([0-9a-f]{40})\b", dockerfile)
+    assert dm, "Dockerfile.worker fla install must be pinned to a 40-char commit SHA"
+    assert dm.group(1) == deps_sha, (
+        "Dockerfile.worker fla SHA must match WORKER_DEPS so the baked image and the worker "
+        f"venv agree (deps={deps_sha}, dockerfile={dm.group(1)})"
+    )
+
+    # The worker's runtime fla reinstall (perf._fix_fla_fastpath_on_hopper) must use the SAME pin —
+    # an unpinned reinstall would pull the moving default branch and defeat reproducibility.
+    perf_src = (root / "flash" / "engine" / "worker" / "perf.py").read_text()
+    # The URL is built via implicit string concatenation across lines:
+    #   "...flash-linear-attention.git"\n        "@<sha>" — so allow quotes/newline/space between.
+    pm = re.search(r"flash-linear-attention\.git[\"'\s]*@([0-9a-f]{40})\b", perf_src)
+    assert pm, "perf.py runtime fla reinstall must be pinned to a 40-char commit SHA"
+    assert pm.group(1) == deps_sha, (
+        f"perf.py fla SHA must match WORKER_DEPS (deps={deps_sha}, perf={pm.group(1)})"
+    )
