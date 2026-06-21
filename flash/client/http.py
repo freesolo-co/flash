@@ -29,7 +29,7 @@ class ApiError(ClientError):
 # Login is handled by the freesolo backend (not the flash control plane): `flash login`
 # verifies the user's freesolo API key here. The same key authenticates the flash
 # control plane, which accepts freesolo-issued keys.
-DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
+DEFAULT_FREESOLO_BASE_URL = "https://api-dev.freesolo.co"
 FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
 
 
