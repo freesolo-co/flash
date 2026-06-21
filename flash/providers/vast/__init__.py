@@ -11,7 +11,6 @@ orchestrator/allocator treat the two interchangeably.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from flash.providers.base import GpuClass, JobHandle, PollResult, Provider
@@ -25,12 +24,9 @@ class VastProvider:
     def is_configured(self) -> bool:
         from flash.providers.vast.auth import load_api_key
 
-        # Vast needs its operator key AND a live network path: it is a live-market
-        # substrate (offer search), so FLASH_SKIP_NET (offline/CI) disables Vast
-        # entirely; offline allocation then degrades deterministically to RunPod's
-        # static catalog.
-        if os.environ.get("FLASH_SKIP_NET"):
-            return False
+        # Vast is a live-market substrate (offer search): it is available only when its
+        # operator key is present. Without VAST_API_KEY (tests / CI / RunPod-only operators)
+        # allocation degrades deterministically to RunPod's static catalog.
         return load_api_key() is not None
 
     def preflight(self, require_hf: bool = True) -> list[str]:
