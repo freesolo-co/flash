@@ -31,40 +31,20 @@ _PUSH_MAX_ATTEMPTS = 8
 _NS_SEP = "--"
 
 
-def _limit_bytes(env_var: str, default: int) -> int:
-    """An operator-configurable positive-int limit from ``env_var``, else ``default``.
-
-    Used for several kinds of caps — byte sizes (``FLASH_ENV_MAX_UPLOAD_BYTES``), a member
-    count (``FLASH_ENV_MAX_MEMBERS``), and a timeout in seconds (``FLASH_ENV_PUSH_TIMEOUT_S``) —
-    so the unit is whatever the caller's ``default`` implies; this only enforces "positive int"."""
-    raw = os.environ.get(env_var)
-    if raw:
-        try:
-            val = int(raw)
-            if val > 0:
-                return val
-        except ValueError:
-            pass
-    return default
-
-
-# Resource caps on an uploaded env package (DoS / tar-bomb defence). All operator-overridable.
+# Resource caps on an uploaded env package (DoS / tar-bomb defence). Generous for a real verifiers
+# env (source + a modest bundled dataset), yet bound abuse.
 #   * compressed upload: the .tar.gz we base64-decode into memory, rejected BEFORE a full decode.
 #   * uncompressed total: the sum of member sizes a tar-bomb would expand to on disk.
 #   * member count: archive complexity (many tiny members also exhaust inodes/CPU).
-# Defaults are generous for a real verifiers env (source + a modest bundled dataset) yet bound abuse.
-_MAX_UPLOAD_BYTES = _limit_bytes("FLASH_ENV_MAX_UPLOAD_BYTES", 64 * 1024 * 1024)  # 64 MB compressed
-_MAX_UNCOMPRESSED_BYTES = _limit_bytes(
-    "FLASH_ENV_MAX_UNCOMPRESSED_BYTES", 256 * 1024 * 1024
-)  # 256 MB extracted
-_MAX_MEMBERS = _limit_bytes("FLASH_ENV_MAX_MEMBERS", 5000)
+_MAX_UPLOAD_BYTES = 64 * 1024 * 1024  # 64 MB compressed
+_MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024  # 256 MB extracted
+_MAX_MEMBERS = 5000
 
-# Per-attempt wall clock for a single `prime env push` subprocess. `prime env push` shells out to a
-# build frontend + several Hub HTTP round-trips, so a network stall / hub outage / CLI deadlock can
-# otherwise block the request handler thread forever. Each retry gets its OWN timeout, and the
-# attempt count is bounded (_PUSH_MAX_ATTEMPTS), so total wall time is bounded too. Operator-
-# overridable for slow links / large uploads. A timeout surfaces as a 504 (gateway-ish timeout).
-_PUSH_TIMEOUT_S = _limit_bytes("FLASH_ENV_PUSH_TIMEOUT_S", 180)
+# Per-attempt wall clock for a single `prime env push` subprocess: it shells out to a build frontend
+# + several Hub HTTP round-trips, so a network stall / hub outage / CLI deadlock would otherwise
+# block the request handler thread forever. Each retry gets its OWN timeout and the attempt count is
+# bounded (_PUSH_MAX_ATTEMPTS), so total wall time is bounded too. A timeout surfaces as a 504.
+_PUSH_TIMEOUT_S = 180
 
 # Allowlisted PEP 517 build backends. `prime env push` BUILDS A WHEEL LOCALLY on this control plane
 # (`uv build --wheel` / `python -m build --wheel`, cwd = the extracted upload), which imports and runs
@@ -146,7 +126,7 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     at a time — iterating the ``TarFile`` reads one header at a time lazily — accumulating the member
     COUNT and cumulative UNCOMPRESSED size and aborting the moment either cap is exceeded, so we stop
     decompressing a bomb early. Each member is validated then extracted inline (its payload read
-    exactly once, in order). Both caps are operator-configurable.
+    exactly once, in order).
     """
     root = dest.resolve()
     # The bytes are an untrusted upload: non-tar / non-gzip / truncated input makes tarfile raise
@@ -394,8 +374,13 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
                 f"{last.strip()[:500]}",
                 status=502,
             )
-    raise EnvPublishError(f"`prime env push` failed after {_PUSH_MAX_ATTEMPTS} attempts "
-                          f"(version conflict unresolved by --auto-bump): {last.strip()[:500]}")
+    # Retry exhaustion is a server/Hub-side publish failure, not a bad client package — surface it
+    # as 502, not the default 400 that would blame the user's upload.
+    raise EnvPublishError(
+        f"`prime env push` failed after {_PUSH_MAX_ATTEMPTS} attempts "
+        f"(version conflict unresolved by --auto-bump): {last.strip()[:500]}",
+        status=502,
+    )
 
 
 def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> str:

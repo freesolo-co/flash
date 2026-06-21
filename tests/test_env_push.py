@@ -159,7 +159,7 @@ def test_push_reports_server_error(monkeypatch, tmp_path, capsys):
 
     class _C:
         def publish_env(self, **k):
-            raise ClientError("not logged in — run `slm login`")
+            raise ClientError("not logged in — run `flash login`")
 
     monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
     assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 1
