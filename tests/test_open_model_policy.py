@@ -48,7 +48,12 @@ def test_allow_policy_unknown_size_warns_but_allows(monkeypatch, capsys):
     )
     info = resolve_model("acme/mystery", "sft", policy="allow", gpu="RTX 5090")
     assert info.id == "acme/mystery"
-    assert "warning" in capsys.readouterr().out
+    # The open-model warning must go to STDERR, not stdout: spec_from_dict/resolve_model run inside
+    # stdout-JSON protocols (flash/mcp/server.py line-JSON; `flash plan --json`), so a stdout warning
+    # would corrupt the payload.
+    captured = capsys.readouterr()
+    assert "warning" in captured.err
+    assert "warning" not in captured.out
 
 
 # ---------------------------------------------------------------------------

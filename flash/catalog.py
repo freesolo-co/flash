@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -216,7 +217,10 @@ def _resolve_open_model(model_id: str, algo: str, gpu: str | None) -> ModelInfo:
             f"Pick a smaller model or a larger supported GPU."
         )
     if est.verdict in ("tight", "unknown"):
-        print(f"warning: open-model policy: {est.describe()}")
+        # stderr, NOT stdout: spec_from_dict/resolve_model run inside stdout-JSON protocols
+        # (flash/mcp/server.py speaks line-JSON over stdout; `flash plan --json`/`--dry-run`),
+        # so a warning on stdout would corrupt the payload.
+        print(f"warning: open-model policy: {est.describe()}", file=sys.stderr)
     params = f"{est.params_b:.1f}B" if est.params_b else "unknown size"
     # Disk floor for the open model: a bf16 checkpoint is ~2 GB per billion params;
     # add worker-stack headroom so a large model that passes the VRAM check can't
