@@ -69,10 +69,19 @@ def _post_adapter_or_raise(url: str, body: dict) -> httpx.Response:
             msg += f" (HTTP {status})"
         if detail:
             msg += f": {detail}"
-        msg += (
-            " — the serving backend is unavailable or has no engine for this base model; "
-            "an operator must check the freesolo serving deployment"
-        )
+        # Tailor the hint to the upstream status: a 4xx is a client/auth problem with THIS request
+        # (e.g. a missing/invalid FREESOLO_INTERNAL_KEY), not a serving outage; a 5xx (or unknown)
+        # means the backend itself failed / has no engine for the base model.
+        if status is not None and status < 500:
+            msg += (
+                " — the serving backend rejected the request (4xx); check FREESOLO_INTERNAL_KEY "
+                "and the request payload (this is a client/auth error, not a serving outage)"
+            )
+        else:
+            msg += (
+                " — the serving backend is unavailable or has no engine for this base model; "
+                "an operator must check the freesolo serving deployment"
+            )
         raise ServingError(msg, status_code=status) from exc
     except httpx.RequestError as exc:
         raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc

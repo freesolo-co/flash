@@ -67,6 +67,29 @@ def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
     assert ei.value.status_code == 500
     assert "500" in str(ei.value)
     assert "no base-model engines loaded" in str(ei.value)
+    assert "operator must check" in str(ei.value)  # 5xx -> serving-outage / no-engine hint
+
+
+def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
+    """A 4xx (e.g. missing/invalid FREESOLO_INTERNAL_KEY) is a client/auth error with THIS request,
+    not a serving outage — the hint must point at the key/request, NOT claim 'no engine'."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(401, text="invalid internal key", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    msg = str(ei.value)
+    assert ei.value.status_code == 401
+    assert "401" in msg
+    assert "FREESOLO_INTERNAL_KEY" in msg  # client/auth hint
+    assert "no engine" not in msg and "operator must check" not in msg  # NOT the 5xx hint
 
 
 def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch):
