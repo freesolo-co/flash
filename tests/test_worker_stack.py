@@ -733,3 +733,75 @@ def test_tilelang_pin_is_consistent_and_pinned():
     assert pm.group(1) == pin, (
         f"perf.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
     )
+
+
+# ---------------------------------------------------------------------------
+# _remove_fla_from_disk: also strips flash-linear-attention dist metadata so a
+# stale/broken install is fully removed and `pip install <git url>` reinstalls
+# (Copilot PR #32 review on perf.py:~541).
+# ---------------------------------------------------------------------------
+def test_remove_fla_dist_metadata_strips_all_artifact_kinds(tmp_path):
+    """The metadata helper removes every distribution-metadata artifact kind for
+    flash-linear-attention from each scanned site dir (dist-info, egg-info, egg-link, editable .pth)
+    — both the normalized (underscore) and legacy (hyphen) name forms — best-effort per path."""
+    from flash.engine.worker import perf
+
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    distinfo = site / "flash_linear_attention-0.1.dot0.dist-info"
+    distinfo.mkdir()
+    (distinfo / "METADATA").write_text("Name: flash-linear-attention\n")
+    egginfo = site / "flash_linear_attention.egg-info"
+    egginfo.mkdir()
+    egglink = site / "flash-linear-attention.egg-link"
+    egglink.write_text("/somewhere/src\n")
+    editable_pth = site / "__editable__.flash_linear_attention-0.1.dot0.pth"
+    editable_pth.write_text("/somewhere/src\n")
+    # An UNRELATED package's metadata must be left untouched.
+    keep = site / "torch-2.10.dist-info"
+    keep.mkdir()
+
+    removed = perf._remove_fla_dist_metadata({str(site)})
+
+    assert not distinfo.exists(), "dist-info must be removed"
+    assert not egginfo.exists(), "egg-info must be removed"
+    assert not egglink.exists(), "egg-link must be removed"
+    assert not editable_pth.exists(), "editable .pth must be removed"
+    assert keep.exists(), "unrelated package metadata must NOT be touched"
+    assert str(distinfo) in removed
+    assert str(egginfo) in removed
+
+
+def test_remove_fla_from_disk_removes_package_dir_and_dist_info(tmp_path, monkeypatch):
+    """End-to-end: seeding a fake site-packages with BOTH a `fla/` package dir and a
+    `flash_linear_attention-*.dist-info/` and running `_remove_fla_from_disk()` removes BOTH — so
+    pip can no longer see "requirement already satisfied" and skip the runtime git reinstall."""
+    import importlib
+
+    from flash.engine.worker import perf
+
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    # A real importable `fla` package so find_spec('fla') resolves it from our temp path.
+    fla_pkg = site / "fla"
+    fla_pkg.mkdir()
+    (fla_pkg / "__init__.py").write_text("# fake fla\n")
+    dist_info = site / "flash_linear_attention-0.1.dot0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text("Name: flash-linear-attention\nVersion: 0.1.dot0\n")
+
+    # Put our fake site-packages FIRST on sys.path so the spec resolves there, and clear any cached
+    # `fla` import so find_spec re-resolves from disk.
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.delitem(sys.modules, "fla", raising=False)
+    importlib.invalidate_caches()
+
+    removed, still_importable = perf._remove_fla_from_disk()
+
+    assert not fla_pkg.exists(), "the fla/ package dir must be removed"
+    assert not dist_info.exists(), (
+        "the flash_linear_attention*.dist-info metadata must ALSO be removed so pip reinstalls"
+    )
+    assert str(fla_pkg) in removed
+    assert str(dist_info) in removed
+    assert not still_importable, "fla must no longer be importable from disk"

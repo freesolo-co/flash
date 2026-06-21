@@ -145,6 +145,49 @@ def setup_perf_backends() -> None:
 
 
 
+def _remove_fla_dist_metadata(site_dirs: set[str]) -> list[str]:
+    """Delete ``flash-linear-attention``'s distribution metadata from each given site dir.
+
+    The import package is ``fla`` but the *distribution* is ``flash-linear-attention``, so removing
+    only the ``fla/`` dir leaves ``flash_linear_attention*.dist-info`` (plus any ``*.egg-info`` /
+    ``*.egg-link`` / ``__editable__.*.pth`` from a broken or editable install) behind. pip reads
+    that metadata as "requirement already satisfied" and SKIPS the git reinstall — so the package
+    dir never gets laid back down. Glob those metadata artifacts out of every scanned site dir so a
+    subsequent ``pip install <git url>`` actually reinstalls. Best-effort per path; returns removed.
+    """
+    import glob
+    import shutil
+
+    removed: list[str] = []
+    # Match both naming conventions: pip normalizes the dist name to flash_linear_attention, but
+    # legacy/egg tooling can leave the original hyphenated/underscored forms too.
+    patterns = (
+        "flash_linear_attention*.dist-info",
+        "flash-linear-attention*.dist-info",
+        "flash_linear_attention*.egg-info",
+        "flash-linear-attention*.egg-info",
+        "flash_linear_attention*.egg-link",
+        "flash-linear-attention*.egg-link",
+        "__editable__.flash_linear_attention*.pth",
+        "__editable__.flash-linear-attention*.pth",
+        "__editable___flash_linear_attention*.pth",
+    )
+    for site in site_dirs:
+        if not site or not os.path.isdir(site):
+            continue
+        for pat in patterns:
+            for path in glob.glob(os.path.join(site, pat)):
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                    removed.append(path)
+                except Exception as e:
+                    print(f"[fla] could not remove metadata {path}: {e}", flush=True)
+    return removed
+
+
 def _remove_fla_from_disk() -> tuple[list[str], bool]:
     """Physically delete every importable ``fla`` package dir from the worker's REAL sys.path.
 
@@ -152,13 +195,20 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
     the path) and invalidates import caches so transformers' is_fla_available() probe sees it
     gone. ``pip uninstall`` alone is unreliable here — it targets one site-packages but the base
     image bakes ``fla`` into another dir on the path (and can report success while leaving the
-    package dir). Returns ``(removed_dirs, still_importable)``. Used by the Hopper auto-drop.
+    package dir). ALSO removes ``flash-linear-attention``'s distribution metadata
+    (``*.dist-info``/``*.egg-info``/``*.egg-link``/editable ``.pth``) from every site dir it scans,
+    so pip doesn't see "requirement already satisfied" and skip the git reinstall (copilot PR #32).
+    Returns ``(removed_dirs, still_importable)``. Used by the Hopper auto-drop.
     """
     import importlib
     import importlib.util
     import shutil
 
     removed: list[str] = []
+    # Every site-packages root we touch — the PARENT of each removed `fla/` dir holds the matching
+    # dist-info — plus the active sys.path dirs (editable .pth / egg-link can live in any of them,
+    # and metadata may persist after the package dir is already gone). Scan all of them for metadata.
+    site_dirs: set[str] = {p for p in sys.path if p and os.path.isdir(p)}
     for _ in range(6):  # a few passes: removing one copy can reveal another earlier on the path
         importlib.invalidate_caches()
         spec = importlib.util.find_spec("fla")
@@ -171,6 +221,7 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
         progressed = False
         for loc in locs:
             if loc and os.path.isdir(loc) and os.path.basename(loc.rstrip("/")) == "fla":
+                site_dirs.add(os.path.dirname(loc))  # parent site-packages holds the dist-info
                 try:
                     shutil.rmtree(loc)
                     removed.append(loc)
@@ -179,6 +230,8 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
                     print(f"[fla] could not remove {loc}: {e}", flush=True)
         if not progressed:
             break
+    # Strip the leftover distribution metadata so pip can't short-circuit the git reinstall.
+    removed.extend(_remove_fla_dist_metadata(site_dirs))
     importlib.invalidate_caches()
     return removed, importlib.util.find_spec("fla") is not None
 
