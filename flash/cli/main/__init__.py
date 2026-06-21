@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     login.add_argument(
         "--freesolo-url",
         dest="freesolo_url",
-        help="freesolo backend base URL (default: FREESOLO_BASE_URL or https://api.freesolo.co)",
+        help="freesolo backend base URL (default: FREESOLO_BASE_URL or https://api-dev.freesolo.co)",
     )
     login.add_argument(
         "--api-url", help="flash control-plane URL for training calls (default: FLASH_API_URL)"
