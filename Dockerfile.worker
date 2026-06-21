@@ -39,7 +39,7 @@ RUN pip install --no-cache-dir \
     "wandb>=0.17" \
     "liger-kernel>=0.5" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \
-    "tilelang" \
+    "tilelang==0.1.11" \
     "apache-tvm-ffi==0.1.11" \
     "hf_transfer" \
     "verifiers>=0.1.10" \
@@ -48,7 +48,7 @@ RUN pip install --no-cache-dir \
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
 # miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
-# we bake tilelang + the pinned apache-tvm-ffi==0.1.11 (0.1.12 double-registers TVM-FFI ->
+# we bake the pinned tilelang==0.1.11 + apache-tvm-ffi==0.1.11 (0.1.12 double-registers TVM-FFI ->
 # `import tilelang` aborts) and KEEP fla on every arch; engine.worker._fix_fla_fastpath_on_hopper
 # ensures the tilelang backend is live on sm90 before any model import. Validated win vs the old
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
