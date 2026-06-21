@@ -224,6 +224,29 @@ def test_prime_push_publishes_private_and_climbs_conflicts(monkeypatch, tmp_path
     assert calls[0][calls[0].index("--name") + 1] == "ns-env"
 
 
+def test_prime_push_fails_fast_on_permanent_error(monkeypatch, tmp_path):
+    """A clearly-permanent failure (auth/not-found/build/test) must NOT burn all retries:
+    `--auto-bump` can't fix it, so surface the real error after one attempt."""
+    monkeypatch.setenv("PRIME_API_KEY", "pit-x")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/prime")
+    calls: list[list[str]] = []
+
+    class _Proc:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def run(cmd, capture_output=True, text=True, env=None):
+        calls.append(list(cmd))
+        return _Proc(1, err="HTTP 401: Unauthorized — invalid API key")
+
+    monkeypatch.setattr("subprocess.run", run)
+    with pytest.raises(envs.EnvPublishError) as exc:
+        envs._prime_push(tmp_path, name="ns-env", is_new=True)
+    assert exc.value.status == 502
+    assert "retrying will not help" in str(exc.value).lower()
+    assert len(calls) == 1  # failed fast — did NOT climb through all _PUSH_MAX_ATTEMPTS
+
+
 def test_publish_is_idempotent_on_republish(monkeypatch):
     # A re-publish passes the name part of the already-namespaced slug (e.g. "dev-clado-ai--myenv");
     # it must NOT be prefixed again into "dev-clado-ai--dev-clado-ai--myenv" (a brand-new env).

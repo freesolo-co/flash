@@ -190,6 +190,24 @@ def _slug_from(env_dir: Path, output: str, *, pushed_name: str | None = None) ->
     return None
 
 
+def _is_permanent_push_failure(output: str) -> bool:
+    """Does this `prime env push` failure clearly NOT come from a version/content-hash conflict —
+    i.e. one ``--auto-bump`` cannot fix (auth, permissions, not-found, build/test errors)?
+
+    We match PERMANENT classes here, not conflict markers, on purpose: an INCOMPLETE list just
+    falls back to the bounded retry (safe — at worst we retry a dead-end a few extra times),
+    whereas an incomplete *conflict*-marker list would fail-fast a real, resolvable conflict. So
+    this never makes a climbable conflict non-retriable; it only short-circuits the obvious
+    dead-ends that would otherwise burn all _PUSH_MAX_ATTEMPTS attempts."""
+    o = output.lower()
+    markers = (
+        "unauthorized", "authentication", "invalid api key", "permission", "forbidden",
+        "401", "403", "404", "not found", "no such",
+        "build failed", "test failed", "tests failed",
+    )
+    return any(m in o for m in markers)
+
+
 def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
     """`prime env push` the package under the control plane's Prime account (PRIVATE), climbing
     past version conflicts. Returns the published slug. Raises EnvPublishError on failure.
@@ -200,8 +218,11 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
     marker list silently rots — we drive the retry off prime's **exit code** and let ``--auto-bump``
     resolve the version: it rewrites ``pyproject``'s version to the next patch *in place*, so each
     retry climbs to a fresh version until one is free. A brand-new env (``is_new``) publishes at its
-    declared version on the first attempt; a re-publish climbs from the start. The non-retriable
-    failures (no key / no CLI) are pre-checked below, so a bounded climb is safe."""
+    declared version on the first attempt; a re-publish climbs from the start. To avoid burning all
+    attempts on a failure that bumping can't fix, we short-circuit clearly-PERMANENT failures
+    (auth/not-found/build/test — see ``_is_permanent_push_failure``); matching permanent classes
+    (rather than conflict markers) means an incomplete list degrades to a bounded retry instead of
+    fail-fasting a real conflict. The non-retriable basics (no key / no CLI) are pre-checked below."""
     if not os.environ.get("PRIME_API_KEY"):
         raise EnvPublishError(
             "this control plane has no PRIME_API_KEY configured, so it cannot publish to the "
@@ -249,8 +270,18 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
                     status=502,
                 )
             return slug
-    raise EnvPublishError(f"`prime env push` failed after {_PUSH_MAX_ATTEMPTS} attempts: "
-                          f"{last.strip()[:500]}")
+        # Non-zero exit. Only a version/content-hash CONFLICT is worth retrying — `--auto-bump`
+        # climbs to a free version. A clearly-permanent failure (auth, not-found, build/test) will
+        # fail identically no matter how we bump, so fail fast with the real error instead of
+        # burning every attempt (and pointlessly rewriting pyproject's version each time).
+        if _is_permanent_push_failure(last):
+            raise EnvPublishError(
+                "`prime env push` failed and retrying will not help (not a version conflict): "
+                f"{last.strip()[:500]}",
+                status=502,
+            )
+    raise EnvPublishError(f"`prime env push` failed after {_PUSH_MAX_ATTEMPTS} attempts "
+                          f"(version conflict unresolved by --auto-bump): {last.strip()[:500]}")
 
 
 def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> str:
