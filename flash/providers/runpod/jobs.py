@@ -306,10 +306,8 @@ def poll_job(
     # Operator override for the throttle grace (seconds); ignored if unset/unparseable.
     _throttle_env = os.environ.get("FLASH_THROTTLE_GRACE_S")
     if _throttle_env:
-        try:
+        with contextlib.suppress(ValueError):
             throttled_grace_s = float(_throttle_env)
-        except ValueError:
-            pass
     poll_errors = PollErrorTracker(say, interval_s)
 
     start = time.time()
