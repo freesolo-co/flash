@@ -205,7 +205,7 @@ def model_required_vram_gb(
     headroom: float = 1.1,
 ) -> int:
     """Cheapest-sufficient VRAM (GB) for a specific run -- the matrix the allocator and
-    ``resolve_gpu_policy`` both size against.
+    ``provisional_gpu`` both size against.
 
     Catalog models size from their known param count + the run's actual knobs (``train``
     may be a TrainSpec, a dict, or None for recipe defaults). Curated GRPO floors

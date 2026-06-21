@@ -16,7 +16,7 @@ from pathlib import Path
 from flash.cli.main import main
 
 # A config that trips several linter checks: 9B + rank 8, group_size 2, temp 0, thinking with a
-# 320-token budget, GRPO lr 1e-4, eval cadence past the run length.
+# 320-token budget, GRPO lr 1e-4, checkpoint cadence past the run length.
 _BAD_CONFIG = (
     'model = "Qwen/Qwen3.5-9B"\n'
     'algorithm = "grpo"\n'
@@ -31,7 +31,7 @@ _BAD_CONFIG = (
     "temperature = 0\n"
     "max_tokens = 320\n"
     "learning_rate = 1e-4\n"
-    "eval_every_steps = 200\n"
+    "save_every = 200\n"
     "[gpu]\n"
     'type = "RTX 5090"\n'
 )
@@ -65,16 +65,17 @@ _OPEN_MODEL_CONFIG = (
     "steps = 50\n"
     "[gpu]\n"
     'type = "RTX 5090"\n'
-    "allow_unvalidated = true\n"
 )
 
 # A second open-model config whose warning comes from the OTHER stdout source: the VRAM-fit
-# estimate in flash.catalog._resolve_open_model. A 6B model on a 32 GB RTX 5090 (GRPO) is a
-# "tight" fit, so resolve_model prints a VRAM-policy warning (no thinking note here —
-# thinking is off — so this isolates the catalog warning path the schema-note config doesn't
-# exercise). Both JSON commands must keep this warning off stdout too.
+# estimate in flash.catalog._resolve_open_model. GPU is auto-allocated (cheapest fitting class
+# across providers), so the model must be big enough to be a "tight" fit even on the largest
+# class the allocator can pick — an 18B GRPO model lands "tight" on the 96 GB top class. That
+# makes resolve_model print a VRAM-policy warning (thinking is off, so this isolates the catalog
+# warning path the schema-note config doesn't exercise). Both JSON commands must keep it off
+# stdout.
 _OPEN_MODEL_TIGHT_VRAM_CONFIG = (
-    'model = "acme/bigmystery-6b"\n'
+    'model = "acme/bigmystery-18b"\n'
     'algorithm = "grpo"\n'
     'model_policy = "allow"\n'
     "[environment]\n"
@@ -82,9 +83,6 @@ _OPEN_MODEL_TIGHT_VRAM_CONFIG = (
     "[train]\n"
     'hf_repo = "owner/runs"\n'
     "steps = 50\n"
-    "[gpu]\n"
-    'type = "RTX 5090"\n'
-    "allow_unvalidated = true\n"
 )
 
 
@@ -195,9 +193,9 @@ def test_dry_run_json_pure_despite_policy_warnings(tmp_path: Path, capsys, monke
 
 def test_plan_json_pure_despite_vram_fit_warning(tmp_path: Path, capsys, monkeypatch) -> None:
     # The other stdout-warning source: flash.catalog._resolve_open_model prints a VRAM-fit
-    # warning on a "tight" open-model estimate (here a 6B model on a 32 GB RTX 5090). It must
-    # land on stderr, leaving the --json stdout payload a clean, parseable JSON document.
-    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 6.0, raising=True)
+    # warning on a "tight" open-model estimate (here an 18B model, "tight" even on the largest
+    # auto-allocated class). It must land on stderr, leaving the --json stdout a clean JSON doc.
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 18.0, raising=True)
     rc = main(["plan", _write(tmp_path, _OPEN_MODEL_TIGHT_VRAM_CONFIG), "--json"])
     assert rc == 0
     captured = capsys.readouterr()
@@ -212,7 +210,7 @@ def test_plan_json_pure_despite_vram_fit_warning(tmp_path: Path, capsys, monkeyp
 def test_dry_run_json_pure_despite_vram_fit_warning(tmp_path: Path, capsys, monkeypatch) -> None:
     # Same VRAM-fit warning source through `flash train --dry-run` (always JSON): a "tight"
     # open-model estimate must not corrupt the dry-run JSON the agent parses from stdout.
-    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 6.0, raising=True)
+    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id: 18.0, raising=True)
     rc = main(["train", _write(tmp_path, _OPEN_MODEL_TIGHT_VRAM_CONFIG), "--dry-run"])
     assert rc == 0
     captured = capsys.readouterr()

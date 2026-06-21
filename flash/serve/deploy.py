@@ -78,19 +78,16 @@ def servable_gpu(gpu_name: str) -> str:
     """Resolve a friendly GPU class for the deployment record.
 
     Serving is delegated to freesolo (one GPU per base model, chosen there), so this is
-    now informational. We still canonicalize the name and fall back to the cheapest
-    RunPod-validated class big enough when the trained class isn't RunPod-validated, so
-    the recorded ``gpu`` is a sensible, valid class (and junk GPU names still raise)."""
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError, cheapest_gpu
+    now informational. We still canonicalize the name and fall back to the cheapest RunPod
+    class big enough when the trained class isn't a RunPod class, so the recorded ``gpu`` is
+    a sensible, valid class (and junk GPU names still raise)."""
+    from flash.providers.base import GPU_INFO, cheapest_gpu
 
     friendly = canonical_gpu(gpu_name)
     info = GPU_INFO[friendly]
-    if "runpod" in info.validated_on:
+    if info.enum_member:  # a RunPod class — serve it directly
         return friendly
-    try:
-        return cheapest_gpu(info.vram_gb)
-    except UnsupportedGpuError:
-        return cheapest_gpu(info.vram_gb, include_unvalidated=True)
+    return cheapest_gpu(info.vram_gb)  # else the cheapest RunPod class that fits
 
 
 def deploy_adapter(

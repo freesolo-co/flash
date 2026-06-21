@@ -72,7 +72,9 @@ def build_plan(spec: JobSpec, info: ModelInfo) -> dict[str, Any]:
         "thinking": spec.thinking,
         "environment": spec.environment.id,
         "hf_repo": spec.train.hf_repo,
-        "gpu": {"type": spec.gpu.type, "provider": spec.gpu.provider},
+        # GPU allocation is fully automatic at submit time (the cheapest fitting class across all
+        # providers); there is no provider pin on the spec, so report only the parse-time type.
+        "gpu": {"type": spec.gpu.type},
         "seeds": list(spec.train.seeds),
         "effective_knobs": _effective_knobs(spec),
         "warnings": [a.to_dict() for a in lint_spec(spec, info)],
@@ -92,7 +94,7 @@ def render_plan(plan: dict[str, Any]) -> str:
         ("thinking", str(plan["thinking"]).lower()),
         ("environment", plan["environment"]),
         ("hf_repo", plan["hf_repo"]),
-        ("gpu", f"{gpu['type']}  (provider {gpu['provider']})"),
+        ("gpu", f"{gpu['type']}  (allocated automatically — cheapest fitting class)"),
         ("seeds", str(plan["seeds"])),
     ]
     width = max(len(k) for k, _ in rows)

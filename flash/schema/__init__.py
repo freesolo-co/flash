@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
+import sys
 import tomllib
 from typing import Any, Literal, overload
 
 from flash.catalog import ModelInfo, normalize_algorithm, resolve_model
-from flash.providers import PROVIDER_NAMES
 from flash.providers.base import (
-    POLICY_NAMES,
-    SUPPORTED,
     UnsupportedGpuError,
     canonical_gpu,
-    is_validated,
-    providers_for,
-    resolve_gpu_policy,
-    unvalidated_allowed,
+    provisional_gpu,
 )
 from flash.schema.fields import (
     ConfigError,
@@ -142,7 +137,12 @@ def spec_from_dict(
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
 
-    env_raw = raw.get("environment") or {}
+    # ``is None`` (not ``or {}``): a missing section defaults to an empty table, but a present-
+    # but-non-dict value (e.g. ``environment = false``) must reach the "must be a table" check
+    # rather than being silently coerced to ``{}`` and bypassing validation.
+    env_raw = raw.get("environment")
+    if env_raw is None:
+        env_raw = {}
     if not isinstance(env_raw, dict):
         raise ConfigError("[environment] must be a table")
     # Local environment paths are gone: a run names a published Hub env by [environment] id.
@@ -153,52 +153,41 @@ def spec_from_dict(
             "local environment paths are no longer supported — remove `path` and reference a "
             'published Hub `id` ("owner/name")'
         )
-    train_raw = raw.get("train") or {}
-    gpu_raw = raw.get("gpu") or {}
+    # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
+    # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
+    # value (false -> {}/()) but a present-but-wrong-typed value otherwise crashes opaquely or
+    # silently misbehaves: ``params = "x"`` -> ``dict("x")`` ValueError, ``params = 1`` ->
+    # ``dict(1)`` TypeError (a 500), and ``pip = "x"`` is char-split into ('x',) (the worker then
+    # tries to install bogus one-char packages). A MISSING sub-field — absent OR ``None`` (e.g.
+    # JSON ``null``) — keeps its default; any present, NON-None value must be the right type. A
+    # falsy ``params = false`` is still rejected, mirroring the section-level rule that
+    # ``environment = false`` must fail rather than silently coerce. Mirrors the ``must be a
+    # table`` style; a string is never char-split.
+    if env_raw.get("params") is not None and not isinstance(env_raw["params"], dict):
+        raise ConfigError("[environment] params must be a table")
+    if env_raw.get("pip") is not None and not isinstance(env_raw["pip"], (list, tuple)):
+        raise ConfigError("[environment] pip must be a list of strings")
+    if env_raw.get("pip") is not None and not all(isinstance(p, str) for p in env_raw["pip"]):
+        raise ConfigError("[environment] pip entries must be strings")
+    train_raw = raw.get("train")
+    if train_raw is None:
+        train_raw = {}
+    if not isinstance(train_raw, dict):
+        raise ConfigError("[train] must be a table")
+    gpu_raw = raw.get("gpu")
+    if gpu_raw is None:
+        gpu_raw = {}
+    if not isinstance(gpu_raw, dict):
+        raise ConfigError("[gpu] must be a table")
 
-    # Smart allocation is the default: an omitted gpu.type means "the cheapest GPU
-    # (across providers) that fits the model", re-resolved live at submit time. The
-    # original request survives in gpu.requested so the runner knows whether
-    # it may re-allocate (policy words) or must honor a concrete pin.
-    requested_gpu = str(gpu_raw.get("requested") or gpu_raw.get("type") or "auto")
-    provider = str(gpu_raw.get("provider") or "auto").strip().lower()
-    if provider not in ("auto", *PROVIDER_NAMES):
-        allowed = '", "'.join(("auto", *PROVIDER_NAMES))
-        raise ConfigError(f'gpu.provider must be "{allowed}"')
-    allow_unval = gpu_raw.get("allow_unvalidated")
-    if allow_unval is not None and not isinstance(allow_unval, bool):
-        raise ConfigError("gpu.allow_unvalidated must be a boolean")
+    # GPU allocation is fully automatic: the submit-time allocator always picks the cheapest
+    # fitting class across ALL providers — there is no GPU pin. Any gpu.type in the config is
+    # ignored. ``provisional_gpu`` computes the offline RunPod-static cheapest-that-fits for
+    # sizing/display only; the live allocator re-resolves it at submit time.
     try:
-        # Parse-time provisional: "cheapest"/"auto" resolve to the cheapest validated
-        # GPU class that fits (across providers, deterministic offline; open models
-        # sized from HF metadata); concrete names are canonicalized. The submit-time
-        # allocator re-resolves policy words live across providers.
-        gpu_type = resolve_gpu_policy(
-            requested_gpu,
-            model,
-            allow_unvalidated=allow_unval,
-            algorithm=algorithm,
-            train=train_raw,
-            thinking=thinking,
-        )
+        gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
-    pinned = requested_gpu.strip().lower() not in POLICY_NAMES
-    if pinned and provider != "auto" and provider not in providers_for(gpu_type):
-        raise ConfigError(
-            f"gpu type {gpu_type!r} is not available on provider {provider!r} "
-            f"(providers: {', '.join(providers_for(gpu_type))})"
-        )
-    if (
-        pinned
-        and not is_validated(gpu_type, provider if provider != "auto" else None)
-        and not unvalidated_allowed(allow_unval)
-    ):
-        raise ConfigError(
-            f"gpu type {gpu_type!r} has not passed Flash's live validation smoke"
-            f"{' on ' + provider if provider != 'auto' else ''} "
-            f"(validated: {', '.join(SUPPORTED)}). Set gpu.allow_unvalidated = true to use it anyway."
-        )
     try:
         info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
     except ValueError as exc:
@@ -215,9 +204,12 @@ def spec_from_dict(
             f"disabled; set thinking = true"
         )
     if thinking and info.thinking == "unknown":
+        # stderr, not stdout: spec_from_dict runs inside flash/mcp/server.py, which speaks a
+        # one-JSON-object-per-line protocol on stdout — a warning line there corrupts the stream.
         print(
             f"warning: open-model policy: cannot verify that {model}'s chat template "
-            f"supports thinking mode; the run proceeds with enable_thinking=true"
+            f"supports thinking mode; the run proceeds with enable_thinking=true",
+            file=sys.stderr,
         )
 
     # worker_env is the lower-level per-run escape hatch ([worker_env] table, string-valued,
@@ -255,14 +247,6 @@ def spec_from_dict(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
             stop_sequences=_train_stops(train_raw),
-            # minimum=0 so `eval_every_steps = 0` explicitly disables (matches "0/None disables");
-            # negatives are rejected.
-            eval_every_steps=_train_int(train_raw, "eval_every_steps", minimum=0),
-            # How many held-out rows each mid-run eval pass scores (a fixed seeded random sample);
-            # minimum=0 so an explicit `eval_examples = 0` is accepted as the documented "use the
-            # built-in default (64)" no-op (matches TrainSpec/eval_config, which map 0/None -> 64);
-            # negatives are rejected. None -> built-in default (64).
-            eval_examples=_train_int(train_raw, "eval_examples", minimum=0),
             # SFT caps: max_steps caps optimizer steps (cheap pre-flight smoke); max_examples
             # truncates the SFT dataset. minimum=0 so an explicit 0 means "no cap" (matches the
             # TrainSpec "None/0 -> no cap" contract); the worker reads these from [train].
@@ -271,9 +255,6 @@ def spec_from_dict(
         ),
         gpu=GpuSpec(
             type=gpu_type,
-            provider=provider,
-            requested=requested_gpu,
-            allow_unvalidated=allow_unval,
             disk_gb=int(gpu_raw.get("disk_gb", 60)),
             max_wall_seconds=int(gpu_raw.get("max_wall_seconds", 24 * 3600)),
             max_retries=int(gpu_raw.get("max_retries", 2)),
@@ -321,23 +302,6 @@ def _validate_spec(spec: JobSpec) -> None:
         spec.environment.id,
         '[environment] id must be a published Prime Hub slug "owner/name"',
     )
-    # A separate eval env ([environment.params] eval_env_id) is also prime-installed on the worker
-    # (worker_hub_env_ids), so it must be a full "owner/name" slug too — else a bare eval id passes
-    # --dry-run but fails `prime env install` after a GPU is provisioned.
-    if "eval_env" in spec.environment.params:
-        # Legacy alias: `eval_env` is no longer mapped (the worker installs only eval_env_id, and
-        # a stray `eval_env` would be forwarded into load_environment). Reject at parse rather than
-        # silently evaluating against the training env.
-        raise ConfigError(
-            "[environment.params] eval_env is no longer supported; use eval_env_id "
-            '(a published Prime Hub slug "owner/name")'
-        )
-    eval_ref = spec.environment.params.get("eval_env_id")
-    if eval_ref:
-        _require_slug(
-            str(eval_ref),
-            '[environment.params] eval_env_id must be a published Prime Hub slug "owner/name"',
-        )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")
     # The per-run HF artifact repo (adapters/checkpoints/code + serving) is required: there

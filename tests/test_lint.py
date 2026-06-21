@@ -73,7 +73,6 @@ def test_explicit_recipe_defaults_yield_no_advice() -> None:
             "train.learning_rate": 1e-5,
             "train.max_tokens": 320,
             "train.save_every": 5,
-            "train.eval_every_steps": 5,
         },
     )
     assert advice == []
@@ -148,12 +147,12 @@ def test_sft_default_learning_rate_is_quiet() -> None:
     assert "train.learning_rate" not in _fields(advice)
 
 
-def test_eval_and_save_cadence_past_run_length() -> None:
-    advice = _advise(**{"train.steps": 10, "train.eval_every_steps": 999, "train.save_every": 999})
-    assert {"train.eval_every_steps", "train.save_every"} <= _fields(advice)
-    # in-range cadences are quiet
-    ok = _advise(**{"train.steps": 100, "train.eval_every_steps": 20, "train.save_every": 25})
-    assert not ({"train.eval_every_steps", "train.save_every"} & _fields(ok))
+def test_save_cadence_past_run_length() -> None:
+    advice = _advise(**{"train.steps": 10, "train.save_every": 999})
+    assert "train.save_every" in _fields(advice)
+    # an in-range cadence is quiet
+    ok = _advise(**{"train.steps": 100, "train.save_every": 25})
+    assert "train.save_every" not in _fields(ok)
 
 
 def test_kitchen_sink_fires_multiple() -> None:
@@ -169,7 +168,7 @@ def test_kitchen_sink_fires_multiple() -> None:
             "train.temperature": 0,
             "train.max_tokens": 320,
             "train.learning_rate": 1e-4,
-            "train.eval_every_steps": 200,
+            "train.save_every": 200,
         },
     )
     assert {
@@ -178,7 +177,7 @@ def test_kitchen_sink_fires_multiple() -> None:
         "train.temperature",
         "train.max_tokens",
         "train.learning_rate",
-        "train.eval_every_steps",
+        "train.save_every",
     } <= _fields(advice)
 
 

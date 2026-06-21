@@ -32,8 +32,10 @@ def test_set_overrides_scalar_and_list():
             cfg, run_id="x", overrides=["train.steps=7", "gpu.type=RTX 4090", "train.seeds=[0,1,2]"]
         )
         assert spec.train.steps == 7
-        assert spec.gpu.type == "RTX 4090"
         assert spec.train.seeds == (0, 1, 2)
+        # GPU pinning is gone: a gpu.type override is parsed but IGNORED — the schema always
+        # resolves the cheapest fitting class for the model (4B GRPO -> A40), not the override.
+        assert spec.gpu.type == "A40"
 
 
 def test_composed_config_deep_merge():
@@ -43,9 +45,11 @@ def test_composed_config_deep_merge():
         base = _write(tmp, "base.toml", BASE)
         override = _write(tmp, "prod.toml", '[train]\nsteps = 250\n[gpu]\ntype = "RTX 4090"\n')
         spec = spec_from_file(base, run_id="x", extra_configs=[override])
-        assert spec.train.steps == 250
-        assert spec.gpu.type == "RTX 4090"
+        assert spec.train.steps == 250  # deep-merged override of a scalar
         assert spec.environment.id == "primeintellect/gsm8k"  # untouched key preserved
+        # The merged [gpu] type is IGNORED (no pin): the schema resolves the cheapest fitting
+        # class for the model (4B GRPO -> A40), regardless of the composed gpu.type.
+        assert spec.gpu.type == "A40"
 
 
 def test_set_requires_key_value():

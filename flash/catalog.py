@@ -18,10 +18,10 @@ def normalize_algorithm(value: str) -> str:
 
 
 # The default GPU class a run lands on when none is pinned (also the open-model-policy
-# sizing reference and the spec/from_dict fallback). The validated GPU class set
-# (SUPPORTED/is_validated) lives in providers.base; per-provider classes and pricing live
-# under providers/{runpod,vast}. Defined above ModelInfo so it can back the
-# recommended_gpu field default.
+# sizing reference and the spec/from_dict fallback). The managed GPU class set (KNOWN)
+# lives in providers.base; per-provider classes and pricing live under
+# providers/{runpod,vast}. Defined above ModelInfo so it can back the recommended_gpu
+# field default.
 DEFAULT_GPU = "RTX 5090"
 
 # Output vocab (== config.vocab_size, the lm_head / logits width — the PADDED model vocab,

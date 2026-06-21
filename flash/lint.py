@@ -135,23 +135,20 @@ def lint_spec(spec: JobSpec, info: ModelInfo) -> list[Advice]:
                 )
             )
 
-    # 6. Structural: eval / checkpoint cadence past the run length (GRPO is step-driven).
-    if grpo and t.steps is not None:
-        if t.eval_every_steps and t.eval_every_steps > t.steps:
-            out.append(
-                Advice(
-                    "train.eval_every_steps",
-                    f"eval_every_steps={t.eval_every_steps} exceeds steps={t.steps}: mid-run "
-                    f"eval will never run.",
-                )
+    # 6. Structural: checkpoint cadence past the run length (GRPO is step-driven). The worker
+    #    writes no mid-run checkpoint when save_every exceeds the total step count.
+    if (
+        grpo
+        and t.steps is not None
+        and t.save_every is not None
+        and t.save_every > t.steps
+    ):
+        out.append(
+            Advice(
+                "train.save_every",
+                f"save_every={t.save_every} exceeds steps={t.steps}: no mid-run checkpoint "
+                f"will be written.",
             )
-        if t.save_every is not None and t.save_every > t.steps:
-            out.append(
-                Advice(
-                    "train.save_every",
-                    f"save_every={t.save_every} exceeds steps={t.steps}: no mid-run checkpoint "
-                    f"will be written.",
-                )
-            )
+        )
 
     return out
