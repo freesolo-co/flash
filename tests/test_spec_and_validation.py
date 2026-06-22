@@ -378,6 +378,7 @@ def test_configure_logging_verbosity() -> None:
         "AWS_SECRET_ACCESS_KEY",  # SECRET word + KEY qualified by SECRET/ACCESS
         "DB_PASSWORD",  # PASSWORD word
         "PRIME_API_KEY",
+        "WANDB_API_KEY",
         "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
         "MY_CREDENTIAL",
         "AUTH_KEY",  # KEY qualified by AUTH

@@ -211,3 +211,20 @@ def test_report_to_is_best_effort_when_wandb_init_fails(monkeypatch):
     monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(project="p", run_name="r")))
 
     assert worker.wandb_report_to() == []  # degrades to no W&B logging, no crash
+
+
+def test_runtime_secret_reads_only_wandb_from_local_env_file(tmp_path, monkeypatch):
+    from flash.client.runtime_secrets import runtime_secrets_from_local_env
+
+    cfg = tmp_path / "run.toml"
+    cfg.write_text('model = "openbmb/MiniCPM5-1B"\n')
+    (tmp_path / ".env").write_text(
+        "WANDB_API_KEY=wb-from-user-file\n"
+        "RUNPOD_API_KEY=must-not-be-client-supplied\n"
+        "VAST_API_KEY=must-not-be-client-supplied\n"
+    )
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
+
+    assert runtime_secrets_from_local_env(cfg) == {"WANDB_API_KEY": "wb-from-user-file"}
