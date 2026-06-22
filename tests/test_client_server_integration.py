@@ -147,8 +147,9 @@ def test_health_and_identity_roundtrip(make_client) -> None:
     me = client.me()
     # The server resolves the bearer to a per-key identity and the client parses
     # the JSON body back into a dict the CLI prints.
+    assert me["kind"] == "freesolo_api_key"
     assert me["key_prefix"]
-    assert "email" in me
+    assert "email" not in me
 
 
 def test_create_status_list_cancel_lifecycle(make_client) -> None:
