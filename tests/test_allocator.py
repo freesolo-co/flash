@@ -215,9 +215,10 @@ def test_sft_big_vocab_logits_term_present_and_bounded():
 
 
 def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
-    """The worker's SFT per-device cap (sft_per_device) keeps the un-fused [pd, seq, vocab] fp32
-    logits within _LOGITS_BUDGET_GB at every sub-2048 ctx -- the SFT mirror of rl_per_device_comps.
-    The estimator and worker call this SAME helper, so what the allocator reserves == what runs."""
+    """The worker's SFT per-device cap (sft_per_device) keeps the un-fused [pd, seq, vocab] logits
+    within _LOGITS_BUDGET_GB whenever pd CAN be reduced -- the SFT mirror of rl_per_device_comps. At
+    the pd=1 floor the logits are irreducible (a near-2048 big-vocab ctx can exceed the budget); the
+    estimator then reserves that true floor (no clamp), so what's reserved still == what runs."""
     from flash.engine import vram
 
     V = 248_320
@@ -225,7 +226,10 @@ def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
         pd = vram.sft_per_device(4, seq_len=seq, vocab=V, fused=False)
         logits_gb = pd * seq * V * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9
         assert 1 <= pd <= 4
-        assert logits_gb <= vram._LOGITS_BUDGET_GB + 1e-6, (seq, pd, logits_gb)
+        # cap holds logits <= budget unless pd is already floored to 1 (irreducible)
+        assert pd == 1 or logits_gb <= vram._LOGITS_BUDGET_GB + 1e-6, (seq, pd, logits_gb)
+        # the cap is TIGHT: one more micro-batch would breach the budget
+        assert (pd + 1) * seq * V * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9 > vram._LOGITS_BUDGET_GB or pd == 4
     # fused -> no cap, the full micro-batch runs (no needless throughput loss)
     assert vram.sft_per_device(4, seq_len=4096, vocab=V, fused=True) == 4
 
