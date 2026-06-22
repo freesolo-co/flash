@@ -11,8 +11,10 @@ from flash.engine.disaggregated import (
     build_vllm_serve_cmd,
     detect_total_gpus,
     is_main_rank,
+    launch_vllm_server,
     server_subprocess_env,
     sm120_vllm_backend,
+    terminate_server,
     trainer_cuda_visible_devices,
     trainer_only_mode,
 )
@@ -360,3 +362,90 @@ def test_wait_for_server_health_deadline_checked_after_on_wait(monkeypatch):
             on_wait=lambda: None,
             on_wait_every=60.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# launch_vllm_server / terminate_server log-handle lifecycle (FD-leak fix)
+# ---------------------------------------------------------------------------
+
+
+class _FakePopen:
+    """Stand-in for subprocess.Popen that records the inherited stdout fd without spawning."""
+
+    def __init__(self, cmd, *, env=None, stdout=None, stderr=None, **kw):
+        self.cmd = cmd
+        self.stdout = stdout  # the log file handle launch_vllm_server opened
+        self._returncode = None  # None => still running
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self._returncode
+
+    def terminate(self):
+        self.terminated = True
+        self._returncode = 0
+
+    def wait(self, timeout=None):
+        self._returncode = 0
+        return 0
+
+    def kill(self):
+        self.killed = True
+        self._returncode = -9
+
+
+def _patch_fake_popen(monkeypatch):
+    import flash.engine.disaggregated as _d
+
+    monkeypatch.setattr(_d.subprocess, "Popen", _FakePopen)
+
+
+def test_launch_keeps_log_open_then_terminate_closes_it(monkeypatch, tmp_path):
+    # launch_vllm_server opens a log file as the child's stdout. While the child runs the handle
+    # must stay OPEN (the live child keeps writing to it); terminate_server must then CLOSE the
+    # parent's copy so a long-lived worker that launches many servers doesn't leak one fd each.
+    _patch_fake_popen(monkeypatch)
+    log_path = str(tmp_path / "vllm_serve.log")
+    proc = launch_vllm_server(["trl", "vllm-serve"], {"CUDA_VISIBLE_DEVICES": "0"}, log_path=log_path)
+
+    log = proc.stdout
+    assert log is proc._flash_log_handle  # tracked on the Popen for terminate to find
+    assert not log.closed, "log handle was closed while the server is still running"
+
+    terminate_server(proc, timeout=1.0)
+    assert proc.terminated is True
+    assert log.closed, "terminate_server did not close the log handle (fd leak)"
+    assert proc._flash_log_handle is None  # cleared so a double terminate is a no-op
+
+
+def test_terminate_closes_log_even_if_process_already_exited(monkeypatch, tmp_path):
+    # If the server already died on its own, terminate_server still reclaims the log fd (the bug
+    # was that the early `poll() is not None` return skipped the close entirely).
+    _patch_fake_popen(monkeypatch)
+    log_path = str(tmp_path / "vllm_serve.log")
+    proc = launch_vllm_server(["trl", "vllm-serve"], {}, log_path=log_path)
+    proc._returncode = 0  # simulate the child having exited before terminate is called
+
+    terminate_server(proc, timeout=1.0)
+    assert proc.terminated is False  # nothing to terminate
+    assert proc._flash_log_handle.closed if proc._flash_log_handle else True
+    # the handle was closed (and cleared)
+    assert proc._flash_log_handle is None
+
+
+def test_no_fd_leak_across_repeated_launch_terminate_cycles(monkeypatch, tmp_path):
+    # The actual reported failure mode: many launch/terminate cycles in one process must not
+    # accumulate open file descriptors. Track every opened handle and assert all are closed.
+    _patch_fake_popen(monkeypatch)
+    handles = []
+    for i in range(5):
+        proc = launch_vllm_server(["trl", "vllm-serve"], {}, log_path=str(tmp_path / f"s{i}.log"))
+        handles.append(proc._flash_log_handle)
+        terminate_server(proc, timeout=1.0)
+    assert all(h.closed for h in handles), "a log handle leaked across launch/terminate cycles"
+
+
+def test_terminate_server_none_is_safe(monkeypatch):
+    # A None proc (server never launched) must be a no-op, not a crash.
+    terminate_server(None)

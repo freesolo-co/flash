@@ -109,11 +109,17 @@ class BackendGateway:
         except httpx.HTTPError as e:  # transport-level (connect/read/timeout)
             raise GatewayError(f"{label} {url}: {type(e).__name__}: {e}") from e
         if r.status_code >= 400:
-            # vLLM returns 400 "has already been loaded"/"not found" on idempotent re-load/unload;
-            # tolerate those for the control ops so reloads and double-unloads are no-ops.
+            # vLLM returns 400 "has already been loaded" / "not found" (the adapter, in its body) on
+            # an idempotent re-load / double-unload; tolerate THOSE so reloads and double-unloads are
+            # no-ops. But do NOT treat a bare 404 as success: on these endpoints a 404 means the
+            # route itself is missing (wrong backend URL, or a vLLM without the dynamic-LoRA API) —
+            # swallowing it would let the router believe an adapter is loaded and then fail every
+            # generation. Only the message-bearing 400-style cases are benign.
             text = _safe_text(r)
-            if tolerate_already and (
-                "already" in text.lower() or "not found" in text.lower() or r.status_code == 404
+            if (
+                tolerate_already
+                and r.status_code != 404
+                and ("already" in text.lower() or "not found" in text.lower())
             ):
                 return {"ok": True, "note": text[:200]}
             raise GatewayError(f"{label} {url}: HTTP {r.status_code}: {text[:300]}", status=r.status_code)

@@ -125,13 +125,20 @@ def plan_summary(plan: PoolPlan) -> dict:
             for m in plan.members
         ],
         "capacity_per_base_model": per_base,
-        "max_concurrent_adapters": {b: c * _max_loras_for(plan, b) for b, c in per_base.items()},
+        "max_concurrent_adapters": {b: _adapter_capacity_for(plan, b) for b in per_base},
     }
 
 
-def _max_loras_for(plan: PoolPlan, base_model: str) -> int:
-    vals = [m.max_loras for m in plan.members if m.base_model == base_model]
-    return max(vals) if vals else 0
+def _adapter_capacity_for(plan: PoolPlan, base_model: str) -> int:
+    """Concurrent-adapter capacity the fleet can actually host for ``base_model``.
+
+    A base model can appear in several :class:`PoolMember`s with DIFFERENT ``max_loras`` (e.g. a
+    big-VRAM slice that holds more adapters plus a small slice that holds fewer). Each GPU only
+    holds its OWN member's ``max_loras`` adapters, so the true capacity is the sum of
+    ``count * max_loras`` over those members — NOT ``total_count * max(max_loras)``, which would
+    credit the small GPUs with the big slice's slot count and overstate what the fleet can hold.
+    """
+    return sum(m.count * m.max_loras for m in plan.members if m.base_model == base_model)
 
 
 def provision_pool(

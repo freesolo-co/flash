@@ -75,9 +75,33 @@ class PoolPlan:
             PoolMember(
                 base_model=m["base_model"],
                 gpu=m["gpu"],
-                count=int(m.get("count", 1)),
-                max_loras=int(m.get("max_loras", 8)),
+                count=_strict_int(m.get("count", 1), field="count", base_model=m.get("base_model")),
+                max_loras=_strict_int(
+                    m.get("max_loras", 8), field="max_loras", base_model=m.get("base_model")
+                ),
             )
             for m in data.get("pool", [])
         ]
         return cls(members=members)
+
+
+def _strict_int(value: object, *, field: str, base_model: object = None) -> int:
+    """Coerce a TOML scalar to an int WITHOUT silently truncating.
+
+    Plain ``int(...)`` accepts ``2.9`` (-> 2) and ``True`` (-> 1), so a malformed plan would quietly
+    provision a different fleet than intended. We require an exact integer: a bool is rejected
+    (TOML ``true``/``false`` is not a GPU count), and a float is accepted only if it is whole
+    (``2.0`` -> 2) — a fractional value (``2.9``) fails loudly.
+    """
+    where = f" for base_model {base_model!r}" if base_model is not None else ""
+    if isinstance(value, bool):
+        raise ValueError(f"pool {field}{where} must be an integer, got bool {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        raise ValueError(
+            f"pool {field}{where} must be a whole number, got non-integer float {value!r}"
+        )
+    raise ValueError(f"pool {field}{where} must be an integer, got {type(value).__name__} {value!r}")

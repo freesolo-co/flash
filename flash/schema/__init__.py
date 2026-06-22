@@ -7,6 +7,7 @@ import tomllib
 from typing import Any
 
 from flash.catalog import normalize_algorithm, resolve_model
+from flash.engine.rollout_bench import validate_disaggregated_requirement
 from flash.providers.base import (
     UnsupportedGpuError,
     canonical_gpu,
@@ -201,6 +202,24 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         # inference_gpus>0 run sizes per-GPU (a big HF model fits as a split), matching the
         # disaggregated-aware provisional_gpu above instead of rejecting it on the colocate total.
         info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type, train=train_raw)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    # Reject an unfittable disaggregated GRPO topology HERE, the single submit-time chokepoint
+    # every config (CLI, MCP server, runner) flows through, BEFORE the allocator rents a paid
+    # node. The catalog flags (requires_disaggregated / single_trainer_only) come from the
+    # resolved ModelInfo; inference_gpus is the only disaggregated knob a user pins in [train]
+    # (the node's total GPU count is allocator-chosen, not user-set, so gpu_count is unknown at
+    # submit -> pass None and the single-trainer ratio sub-check self-skips; the load-bearing
+    # guard is rejecting a requires_disaggregated model's colocate GRPO, which needs only
+    # inference_gpus). The guard's ValueError surfaces as a ConfigError like the rest of parse.
+    try:
+        validate_disaggregated_requirement(
+            requires_disaggregated=info.requires_disaggregated,
+            algorithm=algorithm,
+            inference_gpus=_train_int(train_raw, "inference_gpus", minimum=0) or 0,
+            single_trainer_only=info.single_trainer_only,
+            gpu_count=None,
+        )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if thinking and info.thinking == "none":
