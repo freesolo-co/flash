@@ -91,6 +91,26 @@ def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
     assert setup_seconds(RunConfig(BIG, "sft", 1)) > setup_seconds(RunConfig(SMALL, "sft", 1))
 
 
+def test_cold_start_calibrated_to_real_short_sft_run():
+    # Calibration anchor: a real fresh-worker run (0.8B SFT, 391 examples -> 26 priced steps at
+    # the recipe batch, RTX 3090 @ $0.239/hr) billed ~$0.047, cold-start-dominated (a fresh worker
+    # spent ~12.5 min in model load). The estimate must land within +-10% of that actual -- earlier
+    # the cold start was under-modeled (~$0.04, ~15% low). 26 = ceil(391 / 32) * 2 epochs.
+    e = estimate_cost(RunConfig(SMALL, "sft", 26))
+    assert e.gpu == "RTX 3090"
+    assert e.gpu_hourly_usd == pytest.approx(0.239, abs=1e-3)
+    assert e.total_usd == pytest.approx(0.047, rel=0.10)
+    # Model load (not boot/deps) is the dominant cold-start term for a short job.
+    assert e.setup_seconds > e.train_seconds  # cold start dominates this short run
+
+
+def test_cold_start_negligible_for_long_runs():
+    # The bigger cold start must NOT regress long runs: when training wall dominates, setup is a
+    # small single-digit fraction of the bill.
+    e = estimate_cost(RunConfig(SMALL, "sft", 5000))
+    assert e.setup_seconds / e.wall_clock_seconds < 0.05
+
+
 def test_wall_clock_cap_bounds_runaway_runs():
     e = estimate_cost(RunConfig(BIG, "grpo", 100_000))
     assert e.wall_capped is True
