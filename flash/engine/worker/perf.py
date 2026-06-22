@@ -365,9 +365,10 @@ def gpu_diagnostics() -> dict:
 
 # Sentinel phrase carried in the RETRIABLE-infra error message. The worker stamps the
 # RetriableInfraError into heartbeat.json (retriable=True); the provider job pollers
-# (runpod/jobs.py, vast/jobs) surface it as an infra-shaped PollResult, so the control plane's
-# retry loop (flash/runner/lifecycle.py) resubmits a MIG/NVML-broken host on a FRESH worker
-# instead of mis-classifying it as a (non-retried) job_failed. Keep the two in lock-step.
+# (flash/providers/runpod/jobs.py, flash/providers/vast/jobs/*) surface it as an infra-shaped
+# PollResult, so the control plane's retry loop (flash/runner/lifecycle.py) resubmits a
+# MIG/NVML-broken host on a FRESH worker instead of mis-classifying it as a (non-retried)
+# job_failed. Keep the two in lock-step.
 RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
 
 
