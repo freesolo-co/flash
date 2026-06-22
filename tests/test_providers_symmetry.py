@@ -225,17 +225,17 @@ def test_allocation_summary_non_vast_provider(monkeypatch):
     # A non-vast allocation carrying a NON-vast offer object (no offer_id/geolocation):
     # allocation_summary must not touch it.
     sentinel = object()  # would raise AttributeError if treated as a vast offer
-    cand = Candidate("runpod", "RTX A5000", 0.27, 24, offer=sentinel)
+    cand = Candidate("runpod", "RTX 3090", 0.46, 24, offer=sentinel)
     alloc = Allocation(
         provider="runpod",
-        gpu="RTX A5000",
-        hourly_usd=0.27,
+        gpu="RTX 3090",
+        hourly_usd=0.46,
         min_vram_gb=24,
         candidates=(cand,),
         offer=sentinel,
     )
     out = allocation_summary(alloc)  # must not raise
-    assert "RTX A5000 on runpod" in out
+    assert "RTX 3090 on runpod" in out
     assert "vast offer" not in out
 
 

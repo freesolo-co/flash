@@ -267,7 +267,8 @@ def cmd_env_list(args) -> int:
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    Catalog-only and deterministic; an uncapped SFT run loads the env to count its train split."""
+    Catalog-only and deterministic; an uncapped SFT run tries to count the env's train split, and
+    falls back to a default example count (with a warning) when the Hub env isn't importable here."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(
