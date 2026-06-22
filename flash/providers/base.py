@@ -448,6 +448,9 @@ class PollResult:
     # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
     failure: str | None = None
     detail: str | None = None
+    # job_preempted only: the GPU CLASS is at fault (a MIG slice), so the retry must re-allocate
+    # OFF it, not just onto a fresh host of the same class. Set from the worker's heartbeat.
+    exclude_class: bool = False
 
 
 # ---------------------------------------------------------------------------
