@@ -100,6 +100,9 @@ _TRAIN_KEYS = frozenset(
      "max_tokens", "kl_penalty_coef", "advantage_clip", "thinking_length_penalty_coef",
      "stop_sequences", "max_steps", "max_examples"}
 )
+# Allowed values for the OPT-IN [gpu] provider pin (mirrors providers.PROVIDER_NAMES); unset keeps
+# cross-provider cheapest-wins allocation.
+_GPU_PROVIDERS = frozenset({"runpod", "vast"})
 
 
 def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
@@ -185,6 +188,22 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
 
+    # [gpu] provider is the one real user knob in the otherwise platform-managed [gpu] table: an
+    # OPT-IN per-run provider pin ("vast" / "runpod") that restricts the submit-time allocator to a
+    # single substrate (for A/B-ing one provider against the full pool). Unset -> cross-provider
+    # cheapest-wins (the default, no behavior change). Validate it here so a typo fails at parse
+    # time rather than as an opaque "provider not available" at submit.
+    gpu_provider = gpu_raw.get("provider")
+    if gpu_provider is not None:
+        if not isinstance(gpu_provider, str):
+            raise ConfigError("[gpu] provider must be a string")
+        gpu_provider = gpu_provider.strip().lower() or None
+    if gpu_provider is not None and gpu_provider not in _GPU_PROVIDERS:
+        raise ConfigError(
+            f"[gpu] provider must be one of {sorted(_GPU_PROVIDERS)} (or unset for "
+            f"cross-provider allocation), got {gpu_raw.get('provider')!r}"
+        )
+
     # GPU allocation is fully automatic: the submit-time allocator always picks the cheapest
     # fitting LIVE-VALIDATED class across ALL providers — there is no GPU pin. A config's gpu.type
     # is not a user knob. ``provisional_gpu`` computes the offline RunPod-static
@@ -268,9 +287,9 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         # GPU allocation, disk sizing, retry budget, and network volumes are all platform-managed:
         # the submit-time allocator picks the cheapest fitting validated GPU across providers, disk
         # is raised to the model's minimum server-side, and the infra knobs are operator defaults.
-        # A user [gpu] table is ignored; gpu_type here is the offline sizing/display provisional,
-        # re-resolved live at submit.
-        gpu=GpuSpec(type=gpu_type),
+        # A user [gpu] table is ignored EXCEPT the opt-in provider pin (validated above); gpu_type
+        # here is the offline sizing/display provisional, re-resolved live at submit.
+        gpu=GpuSpec(type=gpu_type, provider=gpu_provider),
         run_id=run_id or "local",  # server-assigned (new_run_id at create_run); never user-set
         worker_env=worker_env,
         model_policy=model_policy,
