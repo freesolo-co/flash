@@ -30,6 +30,10 @@ def _patch_common(monkeypatch, fake_exit):
     monkeypatch.setattr(worker, "RUN_MODE", "sft")
     monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
+    # main() runs the boot GPU guard first; it now fail-closes (raises) when torch can't be
+    # imported, which is the case in this CPU-only test env. This suite is about hard-exit
+    # semantics, not the guard, so stub it to a no-op.
+    monkeypatch.setattr(worker, "assert_usable_gpu", lambda: None)
 
 
 def test_worker_hard_exits_zero_on_success(monkeypatch):

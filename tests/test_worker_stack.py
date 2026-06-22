@@ -454,12 +454,15 @@ def test_assert_usable_gpu_nvml_probe_failure_raises_retriable(monkeypatch):
 
 def test_retriable_infra_marker_is_an_infra_retry_marker():
     """The worker's marker phrase MUST be in the runner's infra-retry set, or a MIG host would
-    be mis-classified as a non-retried job_failed (the live regression). Lock-step contract."""
-    from flash.engine.worker.perf import RETRIABLE_INFRA_MARKER
+    be mis-classified as a non-retried job_failed (the live regression). Lock-step contract.
 
-    src = (
-        __import__("pathlib")
-        .Path(__import__("flash.runner.lifecycle", fromlist=["__file__"]).__file__)
-        .read_text()
-    )
+    Scope the check to the source of the function that actually owns the ``_infra_markers`` set
+    (``_submit_seed_supervised``) via ``inspect.getsource`` — no filesystem reads, so it survives
+    path/packaging changes and pins the assertion to the real definition site."""
+    import inspect
+
+    from flash.engine.worker.perf import RETRIABLE_INFRA_MARKER
+    from flash.runner.lifecycle import _submit_seed_supervised
+
+    src = inspect.getsource(_submit_seed_supervised)
     assert RETRIABLE_INFRA_MARKER in src
