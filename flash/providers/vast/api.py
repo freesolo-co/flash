@@ -213,3 +213,36 @@ def destroy_instance(instance_id: int) -> bool:
         return True
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Realized billing (COGS) -- what Vast actually charged, for estimator accuracy.
+# ---------------------------------------------------------------------------
+def get_charges(*, start_ts: float, end_ts: float) -> list[dict]:
+    """Realized per-instance charges over [start_ts, end_ts] (unix seconds).
+
+    GET /api/v0/charges/ -> charge entries of {source ("instance-<id>"), amount (USD), items[]
+    (itemized gpu/disk/bwd/bwu), metadata{...}}. This is the true provider invoice -- it
+    captures storage + bandwidth that a wall x dph_total estimate misses. Filtered to instance
+    charges in the window; the caller matches a specific instance by ``source``. Charge history
+    survives instance destruction, so a finished run still reconciles.
+    """
+    import json
+    from urllib.parse import urlencode
+
+    # select_filters is Vast's JSON query param: a date range (unix seconds) + the charge type.
+    # The exact key names are per the billing API docs; verify against a live response on first
+    # run (the v0 detail/charges routes still answer while v0 list is deprecated).
+    select = {
+        "start_date": {"gte": int(start_ts)},
+        "end_date": {"lte": int(end_ts)},
+        "type": "instance",
+    }
+    path = f"/v0/charges/?{urlencode({'select_filters': json.dumps(select)})}"
+    out = request_with_retries(path)
+    if isinstance(out, list):
+        return out
+    if isinstance(out, dict):
+        rows = out.get("charges") or out.get("data")
+        return rows if isinstance(rows, list) else []
+    return []
