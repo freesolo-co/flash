@@ -24,7 +24,7 @@ def test_quant_lookup():
 
 
 def test_download_weight_gb_is_total_params_bf16():
-    # Download is always the full bf16 checkpoint (2 bytes/param), even for QLoRA.
+    # Download is always the full bf16 checkpoint (2 bytes/param).
     nine = "Qwen/Qwen3.5-9B"
     assert download_weight_gb(nine) == pytest.approx(total_params_b(nine) * 2.0)
 
