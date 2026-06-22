@@ -9,6 +9,7 @@ defines the shared ``logger`` the other submodules import.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from flash._logging import get_logger
 from flash.spec import JobSpec, gpus_per_node
@@ -219,6 +220,42 @@ def _chalk_selected(spec=None) -> bool:
 # WORKER_DEPS + Dockerfile.worker. Bump intentionally after validating a new line; an operator can
 # pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z.
 DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.4.12,<0.5.0"
+
+
+def _local_env_wheel() -> Path | None:
+    """Operator escape hatch for unpublished/private reward envs.
+
+    ``FLASH_ENV_WHEEL`` points at a local wheel on the control-plane host. ``upload_code`` stages
+    that wheel into the run-private artifact repo under ``code/wheels``; the submit path then adds
+    the worker-side absolute path to ``extra_pip`` and skips ``prime env install`` for the env. This
+    is intentionally not a spec-level local path mode: it is a deployment override for live
+    validation when Hub publishing/access is broken.
+    """
+    raw = (os.environ.get("FLASH_ENV_WHEEL") or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def local_env_extra_pip() -> list[str]:
+    """Worker pip spec(s) for a staged local verifiers env wheel."""
+    wheel = _local_env_wheel()
+    if wheel is None:
+        return []
+    if not wheel.is_file():
+        raise FileNotFoundError(f"FLASH_ENV_WHEEL does not exist: {wheel}")
+    if wheel.suffix != ".whl":
+        raise ValueError(f"FLASH_ENV_WHEEL must point to a .whl file: {wheel}")
+    return [f"/runcode/code/wheels/{wheel.name}"]
+
+
+def hub_env_ids_for_run(env_id: str, params: dict | None = None) -> list[str]:
+    """Prime Hub env ids to install for a run, unless a staged env wheel replaces Hub."""
+    from flash.envs.registry import worker_hub_env_ids
+
+    if _local_env_wheel() is not None:
+        return []
+    return worker_hub_env_ids(env_id, params)
 
 
 def _split_pip_specs(raw: str) -> list[str]:

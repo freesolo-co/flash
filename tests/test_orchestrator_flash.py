@@ -195,6 +195,49 @@ def test_upload_code_stages_optional_chalk_wheel(monkeypatch, tmp_path):
     ]
 
 
+def test_upload_code_stages_optional_env_wheel(monkeypatch, tmp_path):
+    """An unpublished verifiers env wheel can ride with the run to bypass Prime Hub access."""
+    import sys
+    import types
+
+    wheel = tmp_path / "linkd_profilematch-0.1.1-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    calls = {"wheel": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, repo, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def upload_folder(self, **kw):
+            pass
+
+        def upload_file(self, **kw):
+            calls["wheel"].append(kw)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = _FakeApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    monkeypatch.setenv("FLASH_ENV_WHEEL", str(wheel))
+
+    import flash.providers.runpod.train as flash_train
+
+    flash_train.upload_code("owner/run-artifacts")
+    assert calls["wheel"] == [
+        {
+            "path_or_fileobj": str(wheel),
+            "path_in_repo": "code/wheels/linkd_profilematch-0.1.1-py3-none-any.whl",
+            "repo_id": "owner/run-artifacts",
+            "repo_type": "dataset",
+        }
+    ]
+
+
 def test_run_job_background_swallows_exception(monkeypatch):
     """The daemon-thread entrypoint must NOT let _run_job's exception escape (it would surface as
     an alarming 'Exception in thread' traceback for every failed run); the synchronous _run_job

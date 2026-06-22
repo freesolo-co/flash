@@ -489,8 +489,14 @@ def submit_run(
     ``on_handle(handle_dict)`` is invoked as soon as the job is queued so the
     runner can persist {endpoint_id, job_id} for cross-process reattach.
     """
-    from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
-    from flash.providers.runpod.train import _run_suffix, build_worker_env, chalk_extra_pip
+    from flash.envs.registry import worker_pip_for_env
+    from flash.providers.runpod.train import (
+        _run_suffix,
+        build_worker_env,
+        chalk_extra_pip,
+        hub_env_ids_for_run,
+        local_env_extra_pip,
+    )
 
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
     # Per-attempt endpoint name: a retry must land on a genuinely fresh endpoint —
@@ -508,7 +514,7 @@ def submit_run(
     # extra_pip), so the opt-in chalk spec is appended here to reach default runs.
     extra_pip = (
         list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
-    ) + chalk_extra_pip(spec)
+    ) + local_env_extra_pip() + chalk_extra_pip(spec)
     worker_env = build_worker_env(spec, seed, runtime_secrets=runtime_secrets)
     endpoint_id, name = deploy_train_endpoint(
         spec.gpu.type,
@@ -524,7 +530,7 @@ def submit_run(
         "seed": int(seed),
         "env": worker_env,
         "extra_pip": extra_pip,
-        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
+        "hub_env_ids": hub_env_ids_for_run(spec.environment.id, spec.environment.params),
     }
     try:
         job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload, spec.gpu.type))

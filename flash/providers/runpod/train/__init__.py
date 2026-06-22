@@ -33,6 +33,8 @@ from flash.providers.runpod.train.deps import (  # noqa: F401
     _effective_worker_env,
     build_worker_env,
     chalk_extra_pip,
+    hub_env_ids_for_run,
+    local_env_extra_pip,
     logger,
     resolve_worker_deps,
 )
@@ -118,13 +120,29 @@ def upload_code(repo: str | None = None) -> str:
             repo_id=repo,
             repo_type="dataset",
         )
+    # Private validation path for unpublished/private verifiers envs: stage a local wheel into the
+    # run-private artifact, then the submit path installs /runcode/code/wheels/<wheel>.whl and skips
+    # Prime Hub for the env. This unblocks quality runs when Hub team access/publishing is down.
+    env_wheel = (os.environ.get("FLASH_ENV_WHEEL") or "").strip()
+    if env_wheel:
+        wheel_path = Path(env_wheel).expanduser()
+        if not wheel_path.is_file():
+            raise FileNotFoundError(f"FLASH_ENV_WHEEL does not exist: {wheel_path}")
+        if wheel_path.suffix != ".whl":
+            raise ValueError(f"FLASH_ENV_WHEEL must point to a .whl file: {wheel_path}")
+        api.upload_file(
+            path_or_fileobj=str(wheel_path),
+            path_in_repo=f"code/wheels/{wheel_path.name}",
+            repo_id=repo,
+            repo_type="dataset",
+        )
     return repo
 
 
 def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
     """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
-    from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
+    from flash.envs.registry import worker_pip_for_env
 
     handler = get_train_endpoint(
         spec.gpu.type,
@@ -143,8 +161,9 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         # Vast bootstrap both pip-install it), so it's where the chalk spec must go to reach a
         # default run — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
+        + local_env_extra_pip()
         + chalk_extra_pip(spec),
-        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
+        "hub_env_ids": hub_env_ids_for_run(spec.environment.id, spec.environment.params),
     }
     if log is not None:
         print(

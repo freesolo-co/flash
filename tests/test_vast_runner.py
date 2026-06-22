@@ -197,6 +197,21 @@ def test_build_payload_threads_json_list_extra_pip():
     assert "some-wheel @ https://x/y.whl" in payload["extra_pip"]
 
 
+def test_build_payload_staged_env_wheel_skips_prime_hub(monkeypatch, tmp_path):
+    """FLASH_ENV_WHEEL is installed from the run artifact, so the worker must not hit Hub."""
+    from flash.providers.vast import jobs as vast
+
+    wheel = tmp_path / "linkd_profilematch-0.1.1-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    monkeypatch.setenv("FLASH_ENV_WHEEL", str(wheel))
+
+    payload = vast.build_payload(_spec(), seed=0, attempt=0)
+    assert "/runcode/code/wheels/linkd_profilematch-0.1.1-py3-none-any.whl" in payload[
+        "extra_pip"
+    ]
+    assert payload["hub_env_ids"] == []
+
+
 def test_build_payload_malformed_extra_pip_surfaces_clear_error():
     from flash.providers.vast import jobs as vast
 

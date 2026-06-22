@@ -166,8 +166,13 @@ def build_payload(
 ) -> dict:
     """The bootstrap's input — field-compatible with _train_body's, plus the bits the
     instance can't infer (HF prefix for markers, wall cap, attempt)."""
-    from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
-    from flash.providers.runpod.train import build_worker_env, chalk_extra_pip
+    from flash.envs.registry import worker_pip_for_env
+    from flash.providers.runpod.train import (
+        build_worker_env,
+        chalk_extra_pip,
+        hub_env_ids_for_run,
+        local_env_extra_pip,
+    )
 
     # Per-run additive pip specs for the BAKED-image path (the Vast default + the RunPod baked path):
     # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS only reach the boot-install path, which Vast skips
@@ -188,9 +193,10 @@ def build_payload(
         # The Vast bootstrap pip-installs extra_pip for every job (provider/vast/_bootstrap.py),
         # so the opt-in chalk spec rides along here to reach default runs — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
+        + local_env_extra_pip()
         + chalk_extra_pip(spec)
         + _extra_pip_user,
-        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
+        "hub_env_ids": hub_env_ids_for_run(spec.environment.id, spec.environment.params),
         "hf_prefix": f"{spec.phase}/{spec.run_id}/seed{seed}",
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
         "attempt": int(attempt),

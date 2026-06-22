@@ -342,6 +342,33 @@ def test_chalk_extra_pip_worker_env_overrides_os_env_flag(monkeypatch):
     assert chalk_extra_pip(spec) == []
 
 
+def test_local_env_wheel_extra_pip_skips_prime_hub(monkeypatch, tmp_path):
+    """A staged local env wheel installs through extra_pip and replaces Prime Hub install."""
+    from flash.providers.runpod.train import hub_env_ids_for_run, local_env_extra_pip
+
+    monkeypatch.delenv("FLASH_ENV_WHEEL", raising=False)
+    assert local_env_extra_pip() == []
+    assert hub_env_ids_for_run("owner/env") == ["owner/env"]
+
+    wheel = tmp_path / "linkd_profilematch-0.1.1-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    monkeypatch.setenv("FLASH_ENV_WHEEL", str(wheel))
+    assert local_env_extra_pip() == [
+        "/runcode/code/wheels/linkd_profilematch-0.1.1-py3-none-any.whl"
+    ]
+    assert hub_env_ids_for_run("owner/env") == []
+
+
+def test_local_env_wheel_must_be_wheel(monkeypatch, tmp_path):
+    from flash.providers.runpod.train import local_env_extra_pip
+
+    bad = tmp_path / "linkd_profilematch.zip"
+    bad.write_bytes(b"not a wheel")
+    monkeypatch.setenv("FLASH_ENV_WHEEL", str(bad))
+    with pytest.raises(ValueError, match="FLASH_ENV_WHEEL"):
+        local_env_extra_pip()
+
+
 def test_build_worker_env_drops_reserved_disagg_parallel(monkeypatch):
     """Review fix: FLASH_DISAGG_PARALLEL is topology-owned. The allocator's required_vram_gb()
     sizes the inference card from the SUBMITTER os.environ (tp divides the server footprint by
