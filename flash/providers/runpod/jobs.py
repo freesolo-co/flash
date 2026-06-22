@@ -39,6 +39,7 @@ from flash.providers.runpod.train import (
     min_cuda_for,
     resolve_worker_deps,
 )
+from flash.spec import gpus_per_node
 
 logger = get_logger(__name__)
 
@@ -183,7 +184,11 @@ def deploy_train_endpoint(
         kwargs = dict(
             name=name,
             gpu=flash_gpu(friendly),
-            gpu_count=1,
+            # GPUs per worker (= one trainer card + train.inference_gpus); >1 for disaggregated
+            # async GRPO, else 1. Derived from the rollout topology (gpus_per_node) so the baked-
+            # image deploy path provisions the multi-GPU node a disaggregated run needs — a hardcoded
+            # 1 here would have silently 1-GPU'd this path just like the old getattr(spec.gpu,"count").
+            gpu_count=gpus_per_node(spec),
             min_cuda_version=min_cuda_for(friendly),
             execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
             workers=(0, 1),

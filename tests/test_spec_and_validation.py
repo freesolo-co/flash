@@ -11,7 +11,7 @@ import os
 import pytest
 
 from flash.schema import ConfigError, spec_from_dict
-from flash.spec import JobSpec, load_job_spec_from_env
+from flash.spec import JobSpec, gpus_per_node, load_job_spec_from_env
 
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
@@ -112,6 +112,38 @@ def test_disaggregated_guard_accepts_inference_gpus(monkeypatch) -> None:
     raw["train"] = {"steps": 10, "lora_rank": 8, "seeds": [0], "inference_gpus": 1}
     spec = spec_from_dict(raw)
     assert spec.train.inference_gpus == 1
+
+
+def test_from_dict_inference_gpus_strict_int() -> None:
+    # JobSpec.from_dict parses train.inference_gpus from loosely-typed (JSON/env) sources. It is a
+    # topology knob (0 = colocate, >0 = disaggregated split), so it must be a non-negative integer:
+    # a fractional float (2.9) or a bool must NOT be silently truncated/coerced into a different
+    # rollout split, and a negative is meaningless. A whole-number float (2.0) is a valid 2.
+    def _parse(ig):
+        return JobSpec.from_dict({"model": "m", "algorithm": "grpo", "train": {"inference_gpus": ig}})
+
+    assert _parse(2).train.inference_gpus == 2
+    assert _parse(2.0).train.inference_gpus == 2  # whole float accepted
+    assert _parse(0).train.inference_gpus == 0
+    assert _parse(None).train.inference_gpus == 0  # absent/None -> colocate default
+    for bad in (2.9, -1, True, False):
+        with pytest.raises(ValueError, match="inference_gpus"):
+            _parse(bad)
+
+
+def test_gpus_per_node_derives_from_inference_gpus() -> None:
+    # There is no [gpu].count field; the node size is DERIVED = one trainer card + inference_gpus.
+    # Colocate (inference_gpus=0) -> 1 GPU; disaggregated (inference_gpus=N) -> N+1 (so the RunPod
+    # endpoint gpu_count + worker FLASH_GPU_COUNT actually request multiple GPUs, not a silent 1).
+    def _spec(ig):
+        return JobSpec.from_dict({"model": "m", "algorithm": "grpo", "train": {"inference_gpus": ig}})
+
+    assert gpus_per_node(_spec(0)) == 1  # colocate
+    assert gpus_per_node(_spec(1)) == 2  # 1:1 split (1 trainer + 1 inference)
+    assert gpus_per_node(_spec(2)) == 3  # 1:2 split (1 trainer + 2 inference)
+    # tolerant of a missing/partial spec (never < 1)
+    assert gpus_per_node(object()) == 1
+    assert gpus_per_node(None) == 1
 
 
 def test_disaggregated_guard_skips_sft(monkeypatch) -> None:

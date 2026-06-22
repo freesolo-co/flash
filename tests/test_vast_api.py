@@ -106,16 +106,29 @@ def test_search_offers_multi_gpu_query_shape(monkeypatch):
     assert q["gpu_frac"] == {"gte": 0.99}  # whole-machine only (filtered server-side)
 
 
-@pytest.mark.parametrize("bad", [0, -1, -8])
-def test_search_offers_rejects_non_positive_num_gpus(monkeypatch, bad):
-    """0/negative num_gpus would build an impossible ``num_gpus == N`` predicate that returns no
-    offers, masquerading as 'no capacity'. It must fail loudly (ValueError) instead — and BEFORE any
-    network call (so the misconfig surfaces even without a configured API key)."""
+@pytest.mark.parametrize("bad", [0, -1, -8, 2.9, 0.5, True, False, "2"])
+def test_search_offers_rejects_bad_num_gpus(monkeypatch, bad):
+    """num_gpus builds an exact-match ``num_gpus == N`` predicate, so a 0/negative count returns no
+    offers (masquerading as 'no capacity'), and a silently-truncated float (2.9 -> 2) or coerced
+    bool (True -> 1) / numeric string would query a DIFFERENT fleet size than intended. All must
+    fail loudly (ValueError) — and BEFORE any network call (so the misconfig surfaces even without a
+    configured API key)."""
     from flash.providers.vast import api as vast_api
 
     monkeypatch.delenv("VAST_API_KEY", raising=False)  # guard runs before auth/network
     with pytest.raises(ValueError, match="num_gpus"):
         vast_api.search_offers(24576, num_gpus=bad)
+
+
+def test_search_offers_accepts_whole_number_float_num_gpus(monkeypatch):
+    """A whole-number float (2.0) is a valid count and is accepted as 2 (only FRACTIONAL floats are
+    rejected), so a loosely-typed 2.0 from JSON/env still asks for an exact 2-GPU machine."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "vk-test")
+    calls = _capture_urlopen(monkeypatch, [{"offers": []}])
+    vast_api.search_offers(24576, num_gpus=2.0)
+    assert calls[0][2]["q"]["num_gpus"] == {"eq": 2}
 
 
 def test_search_offers_single_gpu_has_no_gpu_frac_filter(monkeypatch):

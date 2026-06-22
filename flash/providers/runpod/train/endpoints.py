@@ -23,6 +23,7 @@ from flash.providers.runpod.train.deps import (
     logger,
     resolve_worker_deps,
 )
+from flash.spec import gpus_per_node
 
 # The control plane runs each training run in its own thread. All runpod_flash deploy/
 # undeploy work goes through a shared asyncio singleton whose Lock binds to the first event
@@ -334,8 +335,10 @@ def get_train_endpoint(
     kwargs = dict(
         name=name,
         gpu=flash_gpu(friendly),
-        # GPUs per worker (= trainer + inference_gpus); >1 for disaggregated async GRPO, else 1.
-        gpu_count=max(1, int(getattr(getattr(spec, "gpu", None), "count", 1))),
+        # GPUs per worker (= one trainer card + train.inference_gpus); >1 for disaggregated async
+        # GRPO, else 1. Derived from the rollout topology — there is no [gpu].count field, so the
+        # old getattr(spec.gpu, "count", 1) silently always provisioned 1 GPU (breaking the split).
+        gpu_count=gpus_per_node(spec),
         min_cuda_version=min_cuda_for(friendly),
         execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
         workers=(0, 1),  # one dedicated worker per run; scale to zero when idle

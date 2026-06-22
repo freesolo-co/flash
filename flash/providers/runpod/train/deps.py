@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 
 from flash._logging import get_logger
-from flash.spec import JobSpec
+from flash.spec import JobSpec, gpus_per_node
 
 # Literal name (NOT __name__) so the logger stays "flash.providers.runpod.train" after the
 # module split into a package — callers/tests assert that exact name.
@@ -276,10 +276,12 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # Compute substrate, read back by engine.worker for the RunMetrics record. Vast's
         # on-instance bootstrap overrides this to "vast" (it reuses this same env builder).
         "FLASH_ARM": "runpod",
-        # GPUs provisioned on the node (= trainer + inference_gpus). The worker reads this
-        # (engine.disaggregated.detect_total_gpus) to compute the disaggregated rollout split
-        # WITHOUT initializing a torch CUDA context first. 1 = single-GPU (colocate).
-        "FLASH_GPU_COUNT": str(max(1, int(getattr(spec.gpu, "count", 1)))),
+        # GPUs provisioned on the node (= one trainer card + train.inference_gpus). The worker reads
+        # this (engine.disaggregated.detect_total_gpus) to compute the disaggregated rollout split
+        # WITHOUT initializing a torch CUDA context first. 1 = single-GPU (colocate). Derived from
+        # the rollout topology (gpus_per_node) — there is no [gpu].count field, so the old
+        # getattr(spec.gpu, "count", 1) silently pinned every node to 1 GPU.
+        "FLASH_GPU_COUNT": str(gpus_per_node(spec)),
         "BENCH_HF_MODEL": spec.model,
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,

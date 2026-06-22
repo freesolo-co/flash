@@ -49,6 +49,29 @@ def test_build_worker_env_respects_alloc_conf_override(monkeypatch):
     assert env["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:256"
 
 
+@pytest.mark.parametrize(
+    ("inference_gpus", "expected_count"),
+    [(0, "1"), (1, "2"), (2, "3"), (3, "4")],
+)
+def test_build_worker_env_sets_real_gpu_count_for_disaggregated(
+    monkeypatch, inference_gpus, expected_count
+):
+    """FLASH_GPU_COUNT is the node size the worker uses (detect_total_gpus) to compute the rollout
+    split. It is DERIVED from the rollout topology (one trainer card + train.inference_gpus), NOT a
+    [gpu].count field — which doesn't exist, so the old getattr(spec.gpu, "count", 1) silently always
+    emitted "1" and a disaggregated run would never see its extra GPUs. Colocate (inference_gpus=0)
+    -> "1"; a 1:N disaggregated split (inference_gpus=N>0) -> str(N+1)."""
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.6-35B-A3B",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs", inference_gpus=inference_gpus),
+    )
+    assert build_worker_env(spec, 0)["FLASH_GPU_COUNT"] == expected_count
+
+
 def test_build_worker_env_forwards_judge_model(monkeypatch):
     """The optimizer-authored verifiers env reads FLASH_JUDGE_MODEL on the worker to pick its
     JudgeRubric client model (SFT-eval / GRPO-reward / rejection-sampling); the control-plane

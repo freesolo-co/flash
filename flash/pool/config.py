@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from flash.spec import _strict_int as _spec_strict_int
+
 
 def _int(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -86,22 +88,11 @@ class PoolPlan:
 
 
 def _strict_int(value: object, *, field: str, base_model: object = None) -> int:
-    """Coerce a TOML scalar to an int WITHOUT silently truncating.
+    """Coerce a TOML scalar to an int WITHOUT silently truncating (pool-config wording).
 
-    Plain ``int(...)`` accepts ``2.9`` (-> 2) and ``True`` (-> 1), so a malformed plan would quietly
-    provision a different fleet than intended. We require an exact integer: a bool is rejected
-    (TOML ``true``/``false`` is not a GPU count), and a float is accepted only if it is whole
-    (``2.0`` -> 2) — a fractional value (``2.9``) fails loudly.
+    Thin wrapper over the shared strict-int contract in flash.spec so the no-truncation /
+    no-bool / whole-float-only rule lives in exactly one place; this just renders the
+    pool-specific ``pool <field> [for base_model ...]`` message.
     """
     where = f" for base_model {base_model!r}" if base_model is not None else ""
-    if isinstance(value, bool):
-        raise ValueError(f"pool {field}{where} must be an integer, got bool {value!r}")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        if value.is_integer():
-            return int(value)
-        raise ValueError(
-            f"pool {field}{where} must be a whole number, got non-integer float {value!r}"
-        )
-    raise ValueError(f"pool {field}{where} must be an integer, got {type(value).__name__} {value!r}")
+    return _spec_strict_int(value, name=f"pool {field}{where}")
