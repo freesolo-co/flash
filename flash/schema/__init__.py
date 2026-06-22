@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 import tomllib
 from typing import Any
@@ -129,12 +128,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         algorithm = normalize_algorithm(raw.get("algorithm"))
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    # model_policy (curated "catalog" vs any-fitting-HF-model "allow") is an OPERATOR policy, not
-    # a user knob: it is read from the control-plane env (FLASH_MODEL_POLICY, default "catalog"),
-    # never from the submitted config. A user-supplied model_policy is ignored.
-    model_policy = (os.environ.get("FLASH_MODEL_POLICY") or "catalog").lower()
-    if model_policy not in ("catalog", "allow"):
-        raise ConfigError('FLASH_MODEL_POLICY must be "catalog" or "allow"')
+    # model_policy (curated "catalog" vs any-fitting-HF-model "allow") is NOT a user knob: managed
+    # runs always use the curated catalog, so a user-supplied model_policy is ignored. (The "allow"
+    # path still exists in resolve_model for internal use, but a submitted config can't select it.)
+    model_policy = "catalog"
     thinking = raw.get("thinking", False)  # reasoning mode OFF by default (operator preference)
     if not isinstance(thinking, bool):
         raise ConfigError("thinking must be a boolean")
