@@ -72,6 +72,13 @@ class RunStatus:
     # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds
     # after an inter-seed restart instead of failing the run (losing completed work).
     resume_seed_index: int | None = None
+    # Realized provider cost (COGS), pulled from the provider's billing API after the run
+    # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
+    # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the wall x $/hr
+    # PROJECTION); ``reconciled_at`` marks that the realized pull has happened so it isn't
+    # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
+    realized_cost_usd: float | None = None
+    reconciled_at: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -281,6 +288,24 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
             setattr(status, key, value)
         _save_status(status)
         return True
+
+
+def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
+    """Persist reconciliation results (realized COGS + the reconciled marker) WITHOUT touching
+    the run's state. Unlike ``_update``, which sets ``state`` from its caller, this re-reads the
+    current status under the lock and writes only the two cost columns, so a run that advanced
+    (e.g. to ``deployed``) after the reconcile snapshot was taken keeps its current state — the
+    background reconciliation job must never revert a live deployment while saving cost fields.
+    No-ops if the run vanished. Always allowed: cost is a field-only update on any state."""
+    with _STATUS_LOCK:
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        status.realized_cost_usd = realized_cost_usd
+        status.reconciled_at = reconciled_at
+        status.updated_at = time.time()
+        _save_status(status)
 
 
 def _save_status(status: RunStatus) -> None:
