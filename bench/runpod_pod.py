@@ -34,7 +34,7 @@ def _pubkey() -> str:
         with open(p) as f:
             return f.read().strip()
     except FileNotFoundError:
-        raise SystemExit(f"SSH pubkey not found at {p} (set BENCH_SSH_PUBKEY)")
+        raise SystemExit(f"SSH pubkey not found at {p} (set BENCH_SSH_PUBKEY)") from None
 
 
 def _headers() -> dict:
