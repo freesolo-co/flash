@@ -666,6 +666,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     import threading
 
     import flash.providers as providers_mod
+    import flash.providers.runpod.train as runpod_train
     import flash.runner as runner
     import flash.server.db as db_mod
 
@@ -706,6 +707,20 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
 
+    # A malformed spec can't be parsed into a JobSpec, so the good-spec branch's
+    # `_gc_run_endpoints(spec)` is unavailable — yet the aborted attempt may still have
+    # registered its uniquely-named RunPod endpoint before crashing, which the no-op RunPod
+    # `sweep_orphans` won't reap. recover_runs must instead derive the endpoint name from the
+    # RAW persisted status (gpu.type + run_id, no spec parse) and `terminate_endpoint` it.
+    # The malformed path imports it via `from flash.providers.runpod.train import
+    # terminate_endpoint`, so patch the attribute on that module and record the call args.
+    terminated = []
+    monkeypatch.setattr(
+        runpod_train,
+        "terminate_endpoint",
+        lambda gpu_type, run_id=None: terminated.append((gpu_type, run_id)) or [],
+    )
+
     # The orphan sweep must still run after the loop. recover_runs resolves it via a
     # function-local `from flash.providers import configured_providers`, so patch the
     # package attr; record that sweep_orphans fired.
@@ -744,6 +759,17 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     assert bad_status.error, "the failed run must carry an operator-visible error note"
     assert "unrecoverable" in bad_status.error, (
         "the failure note must explain the malformed spec to the operator"
+    )
+
+    # Resource-leak guard: even though the spec couldn't be parsed, the malformed run's RunPod
+    # endpoint must still be torn down — derived from the RAW persisted gpu.type + run_id, not
+    # from a JobSpec — so a crash that registered an endpoint before persisting a handle can't
+    # leak it (RunPod's `sweep_orphans` is a no-op and would never catch it). Best-effort GC
+    # must run for the malformed run AND not have aborted the failed-marking / sweep / resubmit
+    # above (all already asserted), proving it's properly suppressed and ordered.
+    assert ("RTX 5090", "bad-1") in terminated, (
+        "a malformed-spec run's endpoint must be GC'd by reconstructed name (raw gpu.type + "
+        "run_id), since its spec can't be parsed and the RunPod orphan sweep is a no-op"
     )
 
 
