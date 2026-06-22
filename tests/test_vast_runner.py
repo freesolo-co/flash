@@ -166,7 +166,7 @@ def test_bootstrap_fails_without_metrics(monkeypatch):
 
 
 def _bootstrap_with_hub_env(monkeypatch, prime_present):
-    """Drive _bootstrap.main() with one Prime Hub env to install, recording subprocess cmds."""
+    """Drive _bootstrap.main() with one published env to install, recording subprocess cmds."""
     from flash.providers.vast import _bootstrap as vb
 
     cmds: list[list[str]] = []
