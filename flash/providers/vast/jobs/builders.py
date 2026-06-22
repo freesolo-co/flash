@@ -144,7 +144,16 @@ def _parse_extra_pip(raw: str) -> list[str]:
         return items
     import shlex as _shlex
 
-    return [d for d in _shlex.split(raw) if d.strip()]
+    try:
+        toks = _shlex.split(raw)
+    except ValueError as e:
+        # e.g. an unmatched quote — surface the knob, like the JSON branch above, instead of a
+        # low-signal shlex ValueError from deep in the builder.
+        raise ValueError(
+            f"FLASH_EXTRA_PIP could not be tokenized ({e}); "
+            "expected a whitespace-separated string (or a JSON list of strings)"
+        ) from e
+    return [d for d in toks if d.strip()]
 
 
 def build_payload(spec, seed: int, attempt: int) -> dict:

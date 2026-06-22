@@ -140,6 +140,15 @@ def test_parse_extra_pip_malformed_json_raises_clear_error():
         _parse_extra_pip("[bad")
 
 
+def test_parse_extra_pip_malformed_shlex_raises_clear_error():
+    from flash.providers.vast.jobs.builders import _parse_extra_pip
+
+    # The whitespace-split (shlex) branch can also raise (e.g. an unmatched quote) — it must name the
+    # knob too, not surface a bare shlex ValueError.
+    with pytest.raises(ValueError, match="FLASH_EXTRA_PIP"):
+        _parse_extra_pip('torch=="2.6')
+
+
 def test_parse_extra_pip_json_object_rejected():
     from flash.providers.vast.jobs.builders import _parse_extra_pip
 
