@@ -187,3 +187,71 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
         need = required_vram_gb(model, algo, train=tr)
         alloc = allocate(model, algo, train=tr)
         assert get_gpu_info(alloc.gpu).vram_gb >= need, (model, algo, tr, alloc.gpu, need)
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: SFT per-device micro-batch sized by the real vocab (big-vocab OOM guard)
+# ---------------------------------------------------------------------------
+def test_sft_logits_cap_shrinks_per_device_for_big_vocab():
+    """A small, short-context SFT (fused CE OFF) over the ~248k Qwen3.5 vocab must cap the
+    per-device micro-batch so the [per_device, seq, vocab] fp32 logits+grad fit the budget;
+    grad-accum rises so the realized effective batch is never below the request (the OOM the
+    fix addresses: a 0.8B SFT OOM'd a 24 GB card in backward)."""
+    from flash.engine.vram import (
+        _LOGITS_BUDGET_GB,
+        _SFT_LOGITS_BYTES_PER_ELEM,
+        sft_grad_accum,
+        sft_logits_per_device_cap,
+    )
+
+    vocab = 248_320
+    seq = 1024
+    # Fused OFF (small model, short ctx): per_device is vocab-capped below the fixed 4.
+    pd, ga = sft_grad_accum(8, seq_len=seq, vocab=vocab, fused=False)
+    assert pd < 4  # capped below the fixed micro-batch default
+    assert pd * ga >= 8  # realized effective batch never below the request
+    # the capped per-device logits stay within the budget
+    assert pd * seq * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9 <= _LOGITS_BUDGET_GB + 1e-9
+    assert pd == sft_logits_per_device_cap(seq, vocab) or pd == 4
+
+
+def test_sft_logits_cap_no_regression_small_vocab_or_fused():
+    """The cap must NOT shrink the micro-batch for a small-vocab model, nor when the fused CE is
+    on (Liger fuses the logits away) — those keep the fixed per-device 4."""
+    from flash.engine.vram import sft_grad_accum, sft_per_device
+
+    # Small vocab (e.g. ~32k): the [pd, seq, vocab] logits are tiny -> no cap, keep 4.
+    assert sft_per_device(8, seq_len=1024, vocab=32_000, fused=False) == 4
+    # Fused CE on (the worker fuses for >=3B model OR >=2048 ctx): logits never materialize -> 4.
+    assert sft_per_device(8, seq_len=1024, vocab=248_320, fused=True) == 4
+    # Default call (no seq/vocab/fused) is the old fixed behavior, so existing callers are unchanged.
+    assert sft_grad_accum(8) == (4, 2)
+
+
+def test_sft_logits_fused_gate_mirrors_worker():
+    """sft_logits_fused mirrors the worker's liger_on(_memory_mode): fused for a >=3B model OR a
+    >=2048-token context; a small short-context run is NOT fused (so the cap applies there)."""
+    from flash.engine.vram import sft_logits_fused
+
+    assert sft_logits_fused(0.8, 1024) is False  # small + short -> not fused -> cap applies
+    assert sft_logits_fused(4.0, 1024) is True  # >=3B -> fused
+    assert sft_logits_fused(0.8, 2048) is True  # long ctx -> fused
+    assert sft_logits_fused(None, 1024) is False  # unknown size -> memory-safe (cap applies)
+
+
+def test_sft_estimate_includes_capped_logits_term():
+    """The SFT VRAM estimate must include the big-vocab logits term (previously ignored), but
+    bounded by the per-device logits cap so it never over-reserves — and a long context that
+    fuses the CE drops the term entirely."""
+    from flash.engine.vram import _LOGITS_BUDGET_GB
+    from flash.engine.vram import estimate_vram_gb as e
+
+    big = e(0.8, "sft", seq_len=1024, vocab=248_320, batch_size=8)
+    small = e(0.8, "sft", seq_len=1024, vocab=8_000, batch_size=8)
+    assert big > small  # the big-vocab logits term is real and now counted
+    # bounded: the per-device cap keeps the logits term within the budget (plus the activation diff)
+    assert big - small <= _LOGITS_BUDGET_GB + 2.0
+    # >=2048 ctx fuses the CE -> no logits term -> big vocab no longer inflates the estimate
+    fused_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8)
+    fused_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8)
+    assert abs(fused_big - fused_small) < 1e-6
