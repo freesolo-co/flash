@@ -226,6 +226,61 @@ def test_poll_job_stall_detection(monkeypatch):
     assert res.failure == "stalled"
 
 
+def test_poll_job_in_queue_capacity_stall(monkeypatch):
+    # Job sits IN_QUEUE forever (no worker ever accepts it: no RunPod capacity for the pinned
+    # GPU class). RunPod surfaces no THROTTLED/UNHEALTHY worker, so the health-probe fast-fails
+    # never arm -> the queue_grace_s backstop must trip a retryable stall well before the ~50 min
+    # setup_grace_s, so the runner's gpu-walk re-provisions on the next-best class.
+    import itertools
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: {"status": "IN_QUEUE"})
+    # endpoint_health raises (the common real case for a brand-new endpoint with no workers): its
+    # block is swallowed by `except: pass`, so the throttled/unhealthy fast-fails can't arm — the
+    # queue backstop must still trip off the authoritative job status alone.
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: (_ for _ in ()).throw(RuntimeError("no workers yet")),
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    clock = itertools.count(start=0, step=100.0)
+    monkeypatch.setattr(jobs.time, "time", lambda: next(clock))
+    h = jobs.JobHandle("ep", "name", "job")
+    res = jobs.poll_job(
+        h,
+        interval_s=0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=5000.0,  # large cold-start budget must NOT govern a never-scheduled queue job
+        queue_grace_s=900.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "IN_QUEUE" in res.detail
+    assert "next-best GPU" in res.detail
+
+
+def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
+    # A job that leaves IN_QUEUE (a worker picks it up) must clear the queue timer: the later
+    # IN_PROGRESS/COMPLETED path is governed by the heartbeat/setup windows, never by queue_grace_s.
+    import cloudpickle
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    ok = {"success": True, "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode()}
+    # A few IN_QUEUE polls then COMPLETED. Real wall-clock (no fake clock) so elapsed stays far
+    # under queue_grace_s — the timer must clear on leaving IN_QUEUE and never false-stall.
+    seq = iter([{"status": "IN_QUEUE"}] * 5 + [{"status": "COMPLETED", "output": ok}])
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(seq))
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    h = jobs.JobHandle("ep", "name", "job")
+    res = jobs.poll_job(h, interval_s=0, heartbeat_reader=lambda: None, queue_grace_s=900.0)
+    assert res.ok
+
+
 def test_poll_job_setup_grace_before_first_heartbeat(monkeypatch):
     # No heartbeat ever (cold start that never finishes): must NOT trip the tight
     # stall_after_s window — it waits for the larger setup_grace_s instead.
