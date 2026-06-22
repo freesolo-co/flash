@@ -271,8 +271,12 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
 
 
 def test_liger_default_model_size_gate(monkeypatch):
-    """Liger default is OFF for small models (1B-class, measured net loss PR #174) and ON only
-    for models ≥ ~3B where fused-CE's memory win pays off."""
+    """The model-size gate (_liger_default_for_model) drives the memory-mode behaviors — sleep and
+    grad checkpointing: OFF for small models (1B-class, speed mode — measured net loss PR #174) and
+    ON for models ≥ ~3B where the memory headroom pays off. (chalk runs standalone and its FLCE is
+    unconditionally on regardless of size; this ~3B cutoff is the old Liger threshold the memory
+    decisions still share, hence the helper name.) Context-aware: a small model at long context is
+    memory-bound, so memory mode flips ON."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)

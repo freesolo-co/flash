@@ -782,7 +782,7 @@ def run_sft():
     effective_batch = (
         _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
     )
-    # Large-vocab OOM guard: when the fused CE (Liger) is OFF, the SFTTrainer materializes the full
+    # Large-vocab OOM guard: when the fused CE (chalk's FLCE) is OFF, the SFTTrainer materializes the full
     # [per_device, seq, vocab] fp32 logits + grad — at Qwen3.5's ~248k vocab a 0.8B SFT OOM'd a
     # 24 GB card in backward. Cap the per-device micro-batch by the real model vocab + seq so those
     # logits stay within the logits budget; grad-accum rises to keep the effective batch unchanged

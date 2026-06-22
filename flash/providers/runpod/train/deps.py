@@ -347,6 +347,12 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # (one per apply_chalk_kernel_to_qwen35 keyword); FLASH_<K>=0/1 overrides the kernel's
         # default. FLASH_CHALK_SPEC is the install spec install_chalk_kernels points operators at
         # (and is also consumed at submit time to add chalk to the worker's extra_pip).
+        # Default-on gap-fillers (replace Liger's rms_norm/swiglu/FLCE): forwarding these is what
+        # lets an operator/per-run FLASH_<K>=0 actually DISABLE one on the worker — without them a
+        # control-plane override silently no-ops and the kernel stays on regardless of the flag.
+        "FLASH_RMSNORM_KERNEL",
+        "FLASH_SWIGLU_KERNEL",
+        "FLASH_FLCE_KERNEL",
         "FLASH_MLP_KERNEL",
         "FLASH_FP8_BASE",
         "FLASH_TRITON_LORA",
