@@ -625,10 +625,14 @@ def test_deploy_lock_is_usable_and_weakly_cleaned():
     assert "run-xyz" not in dict(app_mod._DEPLOY_LOCKS)
 
 
-def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
-    # A recoverable run with no persisted handle (crash between endpoint
-    # registration and on_handle) must have its reconstructable RunPod endpoint
-    # GC'd before being failed, so it doesn't hold worker quota until manual cleanup.
+def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
+    # A recoverable run with no persisted handle (crash in the submit->on_handle window,
+    # before any worker was provisioned) must NOT be lost on a control-plane restart: its
+    # reconstructable RunPod endpoint is GC'd (so it doesn't hold worker quota), then the run
+    # is RESUBMITTED from scratch — there is no remote work to reattach to, so a fresh job is
+    # the only way to preserve the session.
+    import threading
+
     import flash.runner as runner
     import flash.server.db as db_mod
 
@@ -653,11 +657,141 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-1"}])
     gced = []
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: gced.append(s.run_id))
+    # Capture the resubmit instead of provisioning a real GPU; recover_runs resolves _run_job
+    # via a function-local `from flash.runner import _run_job`, so patching the package attr wins.
+    resubmitted = []
+    done = threading.Event()
+
+    def fake_run_job(s):
+        resubmitted.append(s.run_id)
+        done.set()
+
+    monkeypatch.setattr(runner, "_run_job", fake_run_job)
 
     app_mod.recover_runs()
 
-    assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint"
-    assert runner.get_status("nohandle-1").state == "failed"
+    assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
+    assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint first"
+    assert resubmitted == ["nohandle-1"], "no-handle run must be resubmitted, not failed"
+    # The resubmit GC's the orphaned endpoint and re-runs the job; the run is NOT failed.
+    assert runner.get_status("nohandle-1").state != "failed"
+
+
+def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
+    # Fault isolation: if the FIRST recoverable run's persisted spec is malformed (e.g. a
+    # legacy `environment.path`, which makes JobSpec.from_dict raise), recovery of that one
+    # run must be skipped — it must NOT abort recover_runs() and thereby skip recovery of
+    # every OTHER in-flight run and the orphan sweep that follows. Here run #1 has a bad spec
+    # and run #2 has a valid no-handle spec: assert run #2 is still resubmitted AND the orphan
+    # sweep still runs (the bad spec didn't take down the whole recovery pass).
+    import threading
+
+    import flash.providers as providers_mod
+    import flash.providers.runpod.train as runpod_train
+    import flash.runner as runner
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+
+    # Run #1: a malformed spec — a legacy local `environment.path` makes from_dict raise.
+    bad_spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "environment": {"path": "/legacy/local/env"},
+        "train": {"steps": 1, "seeds": [0]},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "bad-1",
+    }
+    # Run #2: a valid no-handle spec — must still be recovered (resubmitted) despite run #1.
+    good_spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "train": {"steps": 1, "seeds": [0]},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "good-2",
+    }
+    runner._save_status(
+        runner.RunStatus(run_id="bad-1", state="provisioning", spec=bad_spec, remote=None)
+    )
+    runner._save_status(
+        runner.RunStatus(run_id="good-2", state="provisioning", spec=good_spec, remote=None)
+    )
+    # Order matters: the bad run is iterated FIRST, so an unguarded parse would abort here.
+    monkeypatch.setattr(
+        app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}]
+    )
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+
+    # A malformed spec can't be parsed into a JobSpec, so the good-spec branch's
+    # `_gc_run_endpoints(spec)` is unavailable — yet the aborted attempt may still have
+    # registered its uniquely-named RunPod endpoint before crashing, which the no-op RunPod
+    # `sweep_orphans` won't reap. recover_runs must instead derive the endpoint name from the
+    # RAW persisted status (gpu.type + run_id, no spec parse) and `terminate_endpoint` it.
+    # The malformed path imports it via `from flash.providers.runpod.train import
+    # terminate_endpoint`, so patch the attribute on that module and record the call args.
+    terminated = []
+    monkeypatch.setattr(
+        runpod_train,
+        "terminate_endpoint",
+        lambda gpu_type, run_id=None: terminated.append((gpu_type, run_id)) or [],
+    )
+
+    # The orphan sweep must still run after the loop. recover_runs resolves it via a
+    # function-local `from flash.providers import configured_providers`, so patch the
+    # package attr; record that sweep_orphans fired.
+    swept = threading.Event()
+
+    class _FakeProvider:
+        def sweep_orphans(self, active_labels=None):
+            swept.set()
+            return []
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeProvider()])
+
+    resubmitted = []
+    done = threading.Event()
+
+    def fake_run_job(s):
+        resubmitted.append(s.run_id)
+        done.set()
+
+    monkeypatch.setattr(runner, "_run_job", fake_run_job)
+
+    app_mod.recover_runs()
+
+    assert done.wait(timeout=5), "the valid run must still be resubmitted despite a prior bad spec"
+    assert resubmitted == ["good-2"], "only the valid run resubmits; the malformed one is skipped"
+    assert swept.is_set(), "a malformed spec must not abort the orphan sweep that follows the loop"
+
+    # The malformed run must NOT be silently skipped and left recoverable (it would be
+    # retried-then-skipped on every restart forever, invisible to the user). It must be
+    # persisted as terminal `failed` with an operator-visible error note, so it surfaces to
+    # the user AND drops out of the recoverable set (never re-attempted).
+    bad_status = runner.get_status("bad-1")
+    assert bad_status.state == "failed", "an unparseable persisted spec must be marked failed"
+    assert bad_status.state in runner.TERMINAL_STATES, "failed is terminal, so it won't recover again"
+    assert bad_status.state not in app_mod._RECOVERABLE, "the failed run leaves the recoverable set"
+    assert bad_status.error, "the failed run must carry an operator-visible error note"
+    assert "unrecoverable" in bad_status.error, (
+        "the failure note must explain the malformed spec to the operator"
+    )
+
+    # Resource-leak guard: even though the spec couldn't be parsed, the malformed run's RunPod
+    # endpoint must still be torn down — derived from the RAW persisted gpu.type + run_id, not
+    # from a JobSpec — so a crash that registered an endpoint before persisting a handle can't
+    # leak it (RunPod's `sweep_orphans` is a no-op and would never catch it). Best-effort GC
+    # must run for the malformed run AND not have aborted the failed-marking / sweep / resubmit
+    # above (all already asserted), proving it's properly suppressed and ordered.
+    assert ("RTX 5090", "bad-1") in terminated, (
+        "a malformed-spec run's endpoint must be GC'd by reconstructed name (raw gpu.type + "
+        "run_id), since its spec can't be parsed and the RunPod orphan sweep is a no-op"
+    )
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
