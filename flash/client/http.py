@@ -136,8 +136,11 @@ class ApiClient:
         )
 
     # -- runs --------------------------------------------------------------------------
-    def create_run(self, spec: dict) -> dict:
-        return self._request("POST", "/v1/runs", body={"spec": spec})
+    def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
+        body = {"spec": spec}
+        if runtime_secrets:
+            body["runtime_secrets"] = runtime_secrets
+        return self._request("POST", "/v1/runs", body=body)
 
     def list_runs(self) -> list[dict]:
         return self._request("GET", "/v1/runs")["runs"]

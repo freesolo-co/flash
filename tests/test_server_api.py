@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import itertools
+import json
 import os
 import sqlite3
 import time
@@ -441,6 +442,37 @@ def test_run_lifecycle_and_tenant_isolation(api):
     assert api.get("/v1/runs", headers=_bearer(key_b)).json()["runs"] == []
     assert api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key_b)).status_code == 404
     assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key_b)).status_code == 404
+
+
+def test_runtime_secret_validation_and_non_persistence(api):
+    key = _login()
+    bad = api.post(
+        "/v1/runs",
+        json={
+            "spec": SPEC,
+            "dry_run": True,
+            "runtime_secrets": {"RUNPOD_API_KEY": "must-stay-platform-side"},
+        },
+        headers=_bearer(key),
+    )
+    assert bad.status_code == 400
+    assert "unsupported runtime secret" in bad.json()["detail"]
+
+    created = api.post(
+        "/v1/runs",
+        json={
+            "spec": SPEC,
+            "dry_run": True,
+            "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"},
+        },
+        headers=_bearer(key),
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    dumped = json.dumps(body)
+    assert "user-wandb-key" not in dumped
+    assert "runtime_secrets" not in dumped
+    assert "WANDB_API_KEY" not in body["spec"].get("worker_env", {})
 
 
 def test_logs_offset_paging(api):
