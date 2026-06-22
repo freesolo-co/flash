@@ -384,23 +384,23 @@ def poll_job(
         # would otherwise wait the full setup_grace_s (~50 min). Keyed off the authoritative job status
         # so it holds even when the health probe is blind: once IN_QUEUE exceeds queue_grace_s, return a
         # retryable stall so the runner's gpu-walk re-provisions on the next-best (in-capacity) class.
+        now = time.time()
         if status == "IN_QUEUE":
             if queued_since is None:
-                queued_since = time.time()
-            elif time.time() - queued_since > queue_grace_s:
+                queued_since = now
+            elif now - queued_since > queue_grace_s:
                 return PollResult(
                     False,
                     failure="stalled",
-                    detail=f"job stuck IN_QUEUE for {int(time.time() - queued_since)}s with no "
-                    f"worker assigned (no RunPod capacity for the pinned GPU class); retrying on "
-                    f"the next-best GPU",
+                    detail=f"job stuck IN_QUEUE for {int(now - queued_since)}s (no RunPod capacity "
+                    f"for the pinned GPU class); retrying on the next-best GPU",
                 )
         else:
             queued_since = None
         # While queued, surface worker availability (throttled hosts are the common
         # cause of silent multi-minute waits — make them visible in the run log).
-        if status == "IN_QUEUE" and time.time() - last_health_probe > 90:
-            last_health_probe = time.time()
+        if status == "IN_QUEUE" and now - last_health_probe > 90:
+            last_health_probe = now
             try:
                 h = runpod_api.endpoint_health(handle.endpoint_id)
                 workers = h.get("workers") or {}

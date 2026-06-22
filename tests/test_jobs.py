@@ -282,6 +282,9 @@ def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     )
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(seq))
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # The IN_QUEUE phase triggers poll_job's endpoint_health probe on the first loop; stub it so the
+    # test is hermetic (never hits the network even if RUNPOD_API_KEY is set in the environment).
+    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: {"workers": {"ready": 1, "running": 1}})
     h = jobs.JobHandle("ep", "name", "job")
     res = jobs.poll_job(h, interval_s=0, heartbeat_reader=lambda: None, queue_grace_s=900.0)
     assert res.ok
