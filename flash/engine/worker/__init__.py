@@ -76,7 +76,6 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
-    liger_on,
     loraplus_optimizer_cls,
     model_supports_flex_attn,  # noqa: F401
     optimal_attn_impl,
@@ -782,12 +781,14 @@ def run_sft():
     effective_batch = (
         _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
     )
-    # Large-vocab OOM guard: when the fused CE (Liger) is OFF, the SFTTrainer materializes the full
+    # Large-vocab OOM guard: when the fused CE (chalk's FLCE) is OFF, the SFTTrainer materializes the full
     # [per_device, seq, vocab] fp32 logits + grad — at Qwen3.5's ~248k vocab a 0.8B SFT OOM'd a
     # 24 GB card in backward. Cap the per-device micro-batch by the real model vocab + seq so those
     # logits stay within the logits budget; grad-accum rises to keep the effective batch unchanged
-    # (the SFT mirror of rl_per_device_comps' GRPO cap). fused mirrors liger_on(_memory_mode(...))
-    # below, so the cap binds exactly when the worker won't fuse the CE.
+    # (the SFT mirror of rl_per_device_comps' GRPO cap). fused = sft_logits_fused, the CONSERVATIVE
+    # >=3B / >=2048-ctx gate: chalk's FLCE actually fuses every run, but the cap still binds for a
+    # small short-context run (where the allocator doesn't bank on the saving) so it's never OOM if
+    # the fused path is unavailable.
     _sft_params_b = resolve_params_b(model_id)  # catalog stat else HF safetensors (open models)
     _sft_vocab = vocab_size_for(model_id)
     _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len)
@@ -881,11 +882,9 @@ def run_sft():
             f"2.10 and {_flex_reason}). Bake flash-attn into the worker image, or use a flex-capable "
             f"arch (with a reachable config), to enable packing."
         )
-    # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
-    # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
-    if liger_on(_memory_mode(model_id, sft_max_len)):
-        cfg_kwargs["use_liger_kernel"] = True
-        print("[sft] liger fused kernels enabled")
+    # Fused CE/RMSNorm/SwiGLU come from chalk (STANDALONE), NOT Liger: install_chalk_kernels patches
+    # the live model AFTER the trainer builds it, with chalk's FLCE on by default — so the big
+    # large-vocab (Qwen3.5 ~248k) memory/throughput win is preserved without use_liger_kernel.
     _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
     # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen/masked attn.
     # Force the boundary-correct backend whenever packing is on, over the SDPA default which would
@@ -1562,16 +1561,12 @@ def run_rl():
         # colocated GRPO (trainer + vLLM on one GPU) is memory-tight, so this is the right default.
         "optim": fused_optim_name(),
     }
-    # Liger fused GRPO loss: fuses the lm_head + per-token logprob so the fp32
-    # [batch, seq, ~248k vocab] logits never materialize — the documented GRPO OOM driver.
-    # TRL 1.6's GRPOConfig flag is `use_liger_kernel` (NOT `use_liger_loss`, which doesn't
-    # exist in 1.6). DEFAULT ON for the GRPO path regardless of model size: MEASURED that
-    # WITHOUT it even Qwen3.5-0.8B GRPO OOMs a 24 GB (and 32 GB) card because the per-completion
-    # logits over the 248k vocab dominate — the small-scale JIT cost is far cheaper than the OOM.
-    # (This differs from SFT, where Liger is gated by size since 1B-class SFT can be net-negative.)
-    if liger_on(True):
-        grpo_kwargs["use_liger_kernel"] = True
-        print("[rl] liger fused GRPO loss enabled")
+    # Fused GRPO loss comes from chalk's FLCE (STANDALONE), NOT Liger: install_chalk_kernels patches
+    # the live model after the trainer builds it, with chalk's fused-linear-CE on by default. That
+    # fuses the lm_head + per-token logprob so the fp32 [batch, seq, ~248k vocab] logits never
+    # materialize — the documented GRPO OOM driver (MEASURED: without a fused CE even Qwen3.5-0.8B
+    # GRPO OOMs a 24/32 GB card because the per-completion 248k-vocab logits dominate). flash no
+    # longer sets TRL's use_liger_kernel; chalk's FLCE beats Liger's and carries this protection.
     if use_vllm:
         # RTX 5090 / sm120: pin a PTX-independent vLLM attention backend (FLASHINFER) BEFORE TRL
         # builds the colocated engine — else the rollout can silently produce no completions on

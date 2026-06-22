@@ -363,21 +363,13 @@ def test_flex_attn_status_distinguishes_unsupported_from_probe_failure(monkeypat
     assert perf.flex_attn_status("whatever") == "probe_failed"
 
 
-def test_liger_on_requires_default_and_gpu(monkeypatch):
-    """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
-    liger_kernel (both absent in CI), so it's off here too."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
-    assert w.liger_on(False) is False
-    assert w.liger_on(True) is False  # no CUDA / liger_kernel in CI
-
-
 def test_liger_default_model_size_gate(monkeypatch):
-    """Liger default is OFF for small models (1B-class, measured net loss PR #174) and ON only
-    for models ≥ ~3B where fused-CE's memory win pays off."""
+    """The model-size gate (_liger_default_for_model) drives the memory-mode behaviors — sleep and
+    grad checkpointing: OFF for small models (1B-class, speed mode — measured net loss PR #174) and
+    ON for models ≥ ~3B where the memory headroom pays off. (chalk runs standalone and its FLCE is
+    unconditionally on regardless of size; this ~3B cutoff is the old Liger threshold the memory
+    decisions still share, hence the helper name.) Context-aware: a small model at long context is
+    memory-bound, so memory mode flips ON."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)

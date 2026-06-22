@@ -22,7 +22,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1
 
-# build-essential for Triton/Inductor (Liger) + any source builds; git for pip VCS installs.
+# build-essential for Triton/Inductor (chalk kernels) + any source builds; git for pip VCS installs.
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -37,7 +37,7 @@ RUN pip install --no-cache-dir \
     "huggingface_hub>=0.25" \
     "accelerate>=1.4" \
     "wandb>=0.17" \
-    "liger-kernel>=0.5" \
+    "freesolo-chalk>=0.2.0,<0.3.0" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \
     "tilelang==0.1.11" \
     "apache-tvm-ffi==0.1.11" \
@@ -76,7 +76,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" MAX_JOBS=4 \
 # Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
 # Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/
 # bootstrap code + the WORKER_DEPS list above): the core stack, the optimizer/accelerator libs
-# (liger, flash-linear-attention=fla, flash_attn, bitsandbytes, triton), and the HF/env libs. A
+# (freesolo-chalk=chalk, flash-linear-attention=fla, flash_attn, bitsandbytes, triton), and the HF/env libs. A
 # missing or ABI-broken package fails the build HERE instead of silently shipping (the FA wheel in
 # particular can install yet fail to import against this torch). cuDNN comes from the base image.
 # `prime` is a CLI dist (no importable top-level module) and the worker never imports it, so we
@@ -87,7 +87,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" MAX_JOBS=4 \
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
 import torch, transformers, trl, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
-liger_kernel, fla, bitsandbytes, hf_transfer, triton, verifiers, runpod; \
+chalk, fla, bitsandbytes, hf_transfer, triton, verifiers, runpod; \
 import importlib; \
 fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
@@ -95,7 +95,7 @@ cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into t
 ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)'); \
 [print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','datasets','huggingface-hub', \
-'accelerate','wandb','liger-kernel','flash-linear-attention','bitsandbytes', \
+'accelerate','wandb','freesolo-chalk','flash-linear-attention','bitsandbytes', \
 'hf-transfer','verifiers','prime','runpod']]"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py

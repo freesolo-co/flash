@@ -144,7 +144,7 @@ def _train_body(input_data: dict) -> dict:
             proc.wait()
         # Console is uploaded on FAILURE (crash root-cause). FLASH_UPLOAD_CONSOLE=1 also uploads it
         # on SUCCESS so an operator can verify which optimizations engaged — LoRA+/8-bit-AdamW/
-        # Liger/PiSSA/rsLoRA/fla/chalk all log their engagement (or fallback) to the console.
+        # chalk (rms/swiglu/FLCE + gap-fillers)/PiSSA/rsLoRA/fla all log their engagement (or fallback) to the console.
         _force_console = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
             "", "0", "false", "no", "off",
         )
