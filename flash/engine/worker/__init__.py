@@ -970,16 +970,65 @@ def run_sft():
         cfg_kwargs["model_init_kwargs"] = mik
     cfg = TRLSFTConfig(**cfg_kwargs)
 
+    class _FlashSFTTrainer(SFTTrainer):
+        """SFTTrainer variant compatible with fused CE paths that intentionally skip logits.
+
+        chalk FLCE returns the scalar loss with ``outputs.logits is None`` during training so the
+        worker never materializes the [batch, seq, vocab] tensor. TRL's default SFTTrainer computes
+        entropy/token-accuracy from logits after loss computation, which re-breaks the no-logits
+        contract. Use HF Trainer's loss path directly and keep only the token-count accounting.
+        """
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            mode = "train" if self.model.training else "eval"
+            inputs.pop("_prediction_loss_only", None)
+            # If not set, defaults from model config and may warn since cache is incompatible with
+            # gradient checkpointing. Mirrors TRL SFTTrainer.compute_loss.
+            inputs["use_cache"] = False
+            try:
+                (loss, outputs) = super(SFTTrainer, self).compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=True,
+                    num_items_in_batch=num_items_in_batch,
+                )
+            except ValueError as e:
+                if "Image features and image tokens do not match" in str(e) and self.args.max_length is not None:
+                    raise ValueError(
+                        f"The current `max_length` ({self.args.max_length}) is too short and causes "
+                        "image placeholder tokens in `input_ids` to be truncated, while the "
+                        "corresponding image features remain intact. Please increase `max_length` "
+                        "or set it to `None` to disable truncation."
+                    ) from e
+                raise
+
+            if mode == "train":
+                if "attention_mask" in inputs:
+                    num_tokens = self.accelerator.gather_for_metrics(inputs["attention_mask"].sum()).sum().item()
+                elif "position_ids" in inputs:
+                    import torch
+
+                    local_num_tokens = torch.tensor(
+                        inputs["position_ids"].size(1),
+                        device=inputs["position_ids"].device,
+                    )
+                    num_tokens = self.accelerator.gather_for_metrics(local_num_tokens).sum().item()
+                else:
+                    raise ValueError("Expected 'attention_mask' or 'position_ids' in inputs.")
+                self._total_train_tokens += num_tokens
+            self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
+            return (loss, outputs) if return_outputs else loss
+
     # LoRA+ (convergence lever, arXiv 2402.12354; always-on: measured -52% train loss in A/B
     # (gpu-bench)): give the LoRA B matrices a higher LR than A (ratio 16). Reported ~2x fewer steps
     # to target at identical per-step FLOPs. TRL builds the model from a string inside __init__, so
     # the optimizer (which needs the instantiated params) can't be pre-built — override
     # create_optimizer to construct it from self.model once it exists.
     _lp_ratio = 16
-    _SFT = SFTTrainer
+    _SFT = _FlashSFTTrainer
     if _lp_ratio > 1:
 
-        class _SFT(SFTTrainer):  # local LoRA+ subclass
+        class _SFT(_FlashSFTTrainer):  # local LoRA+ subclass
             _loraplus_applied = False  # True only once the LoRA+ grouping actually installs
 
             def create_optimizer(self):
@@ -1067,10 +1116,9 @@ def run_sft():
             f"[sft] warm-start: continuing adapter from train.init_from_adapter="
             f"{(JOB_SPEC.train.init_from_adapter if JOB_SPEC else '')!r} (peft_config=None)"
         )
-    # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
-    # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
-    # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
-    # freesolo-chalk is installed.
+    # Apply chalk's standalone fused-kernel stack on the materialized SFT trainer.model — chalk's
+    # apply patches the LIVE module, so it must run AFTER TRL builds the model. No-op unless at
+    # least one FLASH_* kernel flag/default selects it and freesolo-chalk is installed.
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
 
     _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
@@ -2041,9 +2089,9 @@ def run_rl():
         callbacks=[hb_cb, make_checkpoint_upload_callback()],
         **extra_trainer_kwargs,
     )
-    # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
-    # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
-    # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
+    # Apply chalk's standalone fused-kernel stack on the module GRPOTrainer actually optimizes
+    # (trainer.model) — the fresh-LoRA path only passes the model-id string to TRL, so trainer.model
+    # is the authoritative target.
     # Capture the install report so the engaged kernels land in metrics (active_kernels below).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
     # The trainer (and its colocated vLLM engine + initial checkpoint load) is now built. Activate
@@ -2338,5 +2386,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

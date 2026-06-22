@@ -4,8 +4,8 @@ chalk holds Freesolo's hand-written Triton/CUDA kernels for the Qwen3.5/3.6 laye
 longer uses Liger at all: chalk runs standalone and supplies EVERY fused kernel — its own
 RMSNorm, SwiGLU, and fused-linear-cross-entropy (the layers Liger used to own, which chalk now
 beats or ties on every GPU arch), PLUS the kernels Liger never had: the RoPE the qwen3.5 hybrid
-arch needs (Liger refused it), the LoRA-delta matmul, embedding gather, fused MLP, the QKV
-norm+RoPE attention epilogue, and FP8 frozen-base GEMMs.
+arch needs (Liger refused it), the LoRA-delta matmul, embedding gather, the trainable QK-norm+RoPE
+attention epilogue, and FP8 frozen-base GEMMs.
 
 chalk ships a Liger-style one-call entry point, ``apply_chalk_kernel_to_qwen35(model, ...)``:
 enablement is the call itself (no env flag), each kernel is a boolean keyword, and it NEVER
@@ -16,9 +16,9 @@ path; a no-op off-GPU). flash applies it AUTOMATICALLY after the trainer builds 
 The PRODUCTION kernels are ON BY DEFAULT — chalk replaces Liger for everything: rms_norm, swiglu,
 fused-linear-CE (the FLCE that keeps the ~248k-vocab logits from materializing — flash's
 large-vocab OOM protection now comes from chalk, not Liger), RoPE, the LoRA-delta matmul, and
-embedding gather. Situational kernels stay OPT-IN: the fused MLP (overlaps swiglu, measured
-net-negative on H100), the eval-only QKV epilogue (needs q/k/v out of LoRA targets), and the
-FP8 frozen base (sm_89+ Ada / Hopper / Blackwell). Per-kernel ``FLASH_*`` flags are OVERRIDES: ``FLASH_<K>=0`` disables
+embedding gather. Situational kernels stay OPT-IN: the eval-only QKV epilogue (needs q/k/v out of
+LoRA targets), FP8 frozen-base forward (sm_89+ Ada / Hopper / Blackwell), and FP8 dx backward.
+Per-kernel ``FLASH_*`` flags are OVERRIDES: ``FLASH_<K>=0`` disables
 a default-on kernel, ``FLASH_<K>=1`` enables an opt-in one. If ``freesolo-chalk`` isn't installed
 (e.g. on the control plane) the whole module degrades to a no-op.
 """
@@ -76,8 +76,7 @@ _KERNELS: list[tuple[str, str, bool]] = [
 
 def _flag_on(value: str | None, default_on: bool) -> bool:
     """Resolve one FLASH_* flag value: ON when set truthy, OFF when set falsey, and the DEFAULT
-    when the flag is UNSET *or empty/whitespace* (an empty value reads as unset, not OFF) — so the
-    gap-fillers run by default and FLASH_<K>=0 disables them."""
+    when the flag is UNSET *or empty/whitespace* (an empty value reads as unset, not OFF)."""
     if value is None or not value.strip():
         return default_on
     return value.strip().lower() not in ("0", "false", "no", "off")
@@ -91,7 +90,7 @@ def _kernel_on(flag: str, default_on: bool) -> bool:
 def is_chalk_enabled(env: Mapping[str, str]) -> bool:
     """True if ANY chalk kernel is enabled in ``env`` (so chalk must be installed).
 
-    Resolves every kernel's FLASH_* flag in ``env`` against its default (gap-fillers default-on),
+    Resolves every kernel's FLASH_* flag in ``env`` against its default (production kernels default-on),
     so it is True for a normal run and False only when every otherwise-enabled kernel is explicitly
     set to 0. The single source of truth for "is chalk selected"; ``providers.runpod.train`` uses
     this instead of re-implementing the flag parsing against the ``_KERNELS`` table.
@@ -138,7 +137,7 @@ def install_chalk_kernels(model=None) -> dict:
 
     kwargs = _enabled_kwargs()
     if not any(kwargs.values()):
-        # Every kernel explicitly disabled (FLASH_<K>=0 across the gap-fillers) -> nothing to do.
+        # Every otherwise-default-on kernel explicitly disabled -> nothing to do.
         return {}
 
     try:

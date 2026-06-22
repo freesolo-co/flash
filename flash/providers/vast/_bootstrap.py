@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -86,6 +87,36 @@ def fetch_code(payload: dict) -> None:
         local_dir=CODE_ROOT,
         token=(payload.get("env") or {}).get("HF_TOKEN"),
     )
+
+
+def redact_console(text: str) -> str:
+    text = re.sub(r"(https?://)([^/\s:@]+):([^@\s/]+)@", r"\1***:***@", text)
+    return re.sub(r"\bhf_[A-Za-z0-9_\-]{20,}\b", "hf_***", text)
+
+
+def pip_install(specs: list[str], *, label: str, env: dict | None = None) -> None:
+    if not specs:
+        return
+    print(f"[deps] installing {len(specs)} {label} pip spec(s)", flush=True)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pip", "install", *specs],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    tail: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        safe = redact_console(line)
+        print(safe, end="", flush=True)
+        tail.append(safe)
+        if len(tail) > 240:
+            tail = tail[-240:]
+    rc = proc.wait()
+    if rc != 0:
+        detail = "".join(tail[-120:])[-8000:]
+        raise RuntimeError(f"{label} pip install failed with exit {rc}; tail:\n{detail}")
 
 
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
@@ -178,7 +209,7 @@ def main() -> int:
             import importlib.util
 
             if importlib.util.find_spec("hf_transfer") is None:
-                subprocess.run([sys.executable, "-m", "pip", "install", "hf_transfer"], check=True)
+                pip_install(["hf_transfer"], label="hf_transfer")
             os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         except Exception as _e:
             print("hf_transfer setup skipped (slow downloads):", _e)
@@ -193,28 +224,27 @@ def main() -> int:
             if (_penv.get("WANDB_API_KEY") or os.environ.get("WANDB_API_KEY")) and (
                 importlib.util.find_spec("wandb") is None
             ):
-                _wb = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "wandb>=0.17"], check=False
-                )
-                if _wb.returncode == 0 and importlib.util.find_spec("wandb") is not None:
+                try:
+                    pip_install(["wandb>=0.17"], label="wandb")
+                    _wb_ok = importlib.util.find_spec("wandb") is not None
+                except Exception as _wb_exc:
+                    print(f"[wandb] on-demand wandb install FAILED ({_wb_exc}); W&B logging will be disabled")
+                    _wb_ok = False
+                if _wb_ok:
                     print("[wandb] installed wandb on-demand for W&B logging")
-                else:
-                    print(
-                        f"[wandb] on-demand wandb install FAILED (rc={_wb.returncode}); "
-                        "W&B logging will be disabled"
-                    )
         except Exception as _e:
             print("wandb setup skipped:", _e)
         # NB: the Hopper fla fast-path setup lives in flash.engine.worker._ensure_fla_fastpath_on_hopper
         # (runs in the worker process after all installs, before any model import) — not here, where
         # a later install could pull fla back in. The bootstrap just fetches code and runs the worker.
 
+        fetch_code(payload)
         extra_pip = payload.get("extra_pip") or []
-        if extra_pip:
-            # check=True: a deterministic dependency failure (GRPO / Prime Hub
-            # / verifiers extras) must stop NOW with an actionable error, not proceed to
-            # a later import crash while the paid instance runs (matches the RunPod path).
-            subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
+        # check=True-equivalent: a deterministic dependency failure (GRPO / Prime Hub / verifiers
+        # extras) must stop NOW with an actionable error, not proceed to a later import crash while
+        # the paid instance runs (matches the RunPod path). Fetch code first so a run-private wheel
+        # staged under code/wheels can be installed by absolute path.
+        pip_install(extra_pip, label="extra_pip")
         # NB: fla's tilelang GDN fast path is ensured on Hopper (sm90) by
         # flash.engine.worker._ensure_fla_fastpath_on_hopper at worker startup (fla's GDN backward is
         # miscomputed on sm90 with Triton>=3.4, #640; tilelang is the correct backend) — no bootstrap
@@ -235,7 +265,7 @@ def main() -> int:
             # instance image) — an unconditional install adds latency and a per-run PyPI
             # failure point every run.
             if shutil.which("prime") is None:
-                subprocess.run([sys.executable, "-m", "pip", "install", "prime"], check=True)
+                pip_install(["prime"], label="prime")
             # Resolve the prime binary (located path if present, else the bare name) so the env
             # install runs through the actually-installed CLI.
             prime_bin = shutil.which("prime") or "prime"
@@ -253,7 +283,6 @@ def main() -> int:
                     check=True,
                     env=install_env,
                 )
-        fetch_code(payload)
         env = build_worker_env(payload)
         deadline = time.time() + float(payload.get("max_wall_s") or 24 * 3600)
         phase = payload["phase"]

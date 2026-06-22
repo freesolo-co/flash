@@ -258,11 +258,12 @@ def _install():
 
 def _install_chalk(uv, py):
     """pip-install our custom chalk kernels (freesolo-chalk: hand-written Triton/CUDA Qwen3.5/3.6
-    kernels — fused MLP, RoPE, fused embedding, fused LoRA-delta, FP8 base) into ``py``. The kernels
-    are APPLIED to the verl actor model by _patch_verl_chalk() (a verl-file patch that calls
-    apply_chalk_kernel_to_qwen35 in _build_module) — a sitecustomize get_peft_model wrap was tried
-    first but never fired in verl's Ray trainer actor. Gated by FLASH_VERL_CHALK (default on);
-    FLASH_CHALK_SPEC overrides the pip spec (e.g. a local wheel or git ref)."""
+    kernels — RMSNorm/SwiGLU/FLCE, RoPE, embedding, LoRA-delta, GDN pieces, trainable attention
+    epilogue, FP8 base) into ``py``. The kernels are APPLIED to the verl actor model by
+    _patch_verl_chalk() (a verl-file patch that calls apply_chalk_kernel_to_qwen35 in _build_module)
+    — a sitecustomize get_peft_model wrap was tried first but never fired in verl's Ray trainer actor.
+    Gated by FLASH_VERL_CHALK (default on); FLASH_CHALK_SPEC overrides the pip spec (e.g. a local
+    wheel or git ref)."""
     if os.environ.get("FLASH_VERL_CHALK", "1").strip().lower() not in ("1", "true", "yes"):
         return
     spec = os.environ.get("FLASH_CHALK_SPEC", "").strip() or "freesolo-chalk"
@@ -611,12 +612,13 @@ def _patch_verl_chalk():
     verl applies Liger). This is RELIABLE across Ray trainer actors — the earlier sitecustomize/
     get_peft_model wrap never fired in the actor (console showed no [chalk] lines, use_liger:False).
 
-    chalk's kernels are CLASS-LEVEL installers (fused MLP/RoPE/embedding patch the transformers
-    Qwen3.5 classes; fused LoRA-delta patches the PEFT LoRA Linear class), so applying here — BEFORE
-    verl's later get_peft_model in _build_lora_module — still installs fused_lora_delta for the LoRA
-    layers built afterward. liger="auto" applies Liger too (RoPE forced off so chalk's RoPE installs);
-    fused_linear_cross_entropy=False matches verl's requirement. Gated by FLASH_VERL_CHALK (default
-    on), idempotent, compile-checked + reverted on syntax error. No-op off-GPU / non-Qwen3.5."""
+    chalk's kernels include class-level installers (RoPE/embedding/GDN/attention epilogue patch the
+    transformers Qwen3.5 classes; fused LoRA-delta patches the PEFT LoRA Linear class), so applying
+    here — BEFORE verl's later get_peft_model in _build_lora_module — still installs
+    fused_lora_delta for the LoRA layers built afterward. liger="auto" applies Liger too (RoPE forced
+    off so chalk's RoPE installs); fused_linear_cross_entropy=False matches verl's requirement. Gated
+    by FLASH_VERL_CHALK (default on), idempotent, compile-checked + reverted on syntax error. No-op
+    off-GPU / non-Qwen3.5."""
     if os.environ.get("FLASH_VERL_CHALK", "1").strip().lower() not in ("1", "true", "yes"):
         return
     try:

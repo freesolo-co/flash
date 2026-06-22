@@ -45,6 +45,7 @@ def _train_body(input_data: dict) -> dict:
     import contextlib
     import json
     import os
+    import re
     import shutil
     import subprocess
     import sys
@@ -55,12 +56,33 @@ def _train_body(input_data: dict) -> dict:
     # in the worker process AFTER all installs, before any model import) — doing it here would be
     # undone by a later extra_pip / `prime env install`, and depends on a handler redeploy.
 
-    # Extra pip deps for verifiers / Prime Hub environments (installed per-run).
-    extra_pip = input_data.get("extra_pip") or []
-    if extra_pip:
-        # check=True: a deterministic dependency failure should fail fast here,
-        # not after model download + worker startup with a less actionable error.
-        subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
+    def _redact_console(text: str) -> str:
+        text = re.sub(r"(https?://)([^/\s:@]+):([^@\s/]+)@", r"\1***:***@", text)
+        return re.sub(r"\bhf_[A-Za-z0-9_\-]{20,}\b", "hf_***", text)
+
+    def _pip_install(specs: list[str], *, label: str, env_override: dict[str, str] | None = None) -> None:
+        if not specs:
+            return
+        print(f"[deps] installing {len(specs)} {label} pip spec(s)", flush=True)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pip", "install", *specs],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env_override,
+        )
+        tail: list[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            safe = _redact_console(line)
+            print(safe, end="", flush=True)
+            tail.append(safe)
+            if len(tail) > 240:
+                tail = tail[-240:]
+        rc = proc.wait()
+        if rc != 0:
+            detail = "".join(tail[-120:])[-8000:]
+            raise RuntimeError(f"{label} pip install failed with exit {rc}; tail:\n{detail}")
 
     # NB: fla is kept on ALL arches. On Hopper (sm90) fla's GDN backward is miscomputed with
     # Triton>=3.4 (#640); the fix is fla's tilelang backend, so flash.engine.worker._ensure_fla_fastpath_on_hopper
@@ -83,7 +105,7 @@ def _train_body(input_data: dict) -> dict:
         # the worker image) — an unconditional install adds latency and a per-run PyPI
         # failure point every run.
         if shutil.which("prime") is None:
-            subprocess.run([sys.executable, "-m", "pip", "install", "prime"], check=True)
+            _pip_install(["prime"], label="prime")
         # --with pip: install the env into THIS (the trainer's) python via pip. The default
         # (`--with uv`) installs into prime's own isolated uv env, so the trainer then can't
         # import the env module (ModuleNotFoundError at load_environment). PIP_BREAK_SYSTEM_PACKAGES
@@ -108,6 +130,11 @@ def _train_body(input_data: dict) -> dict:
         token=overrides.get("HF_TOKEN"),
     )
     code_dir = "/runcode/code"
+
+    # Extra pip deps for verifiers / Prime Hub environments (installed per-run). Fetch code first so
+    # a run-private wheel staged under code/wheels can be installed by absolute path.
+    extra_pip = input_data.get("extra_pip") or []
+    _pip_install(extra_pip, label="extra_pip")
 
     env = dict(os.environ)
     env.update(overrides)
@@ -181,7 +208,7 @@ def _train_body(input_data: dict) -> dict:
             proc.wait()
         # Console is uploaded on FAILURE (crash root-cause). FLASH_UPLOAD_CONSOLE=1 also uploads it
         # on SUCCESS so an operator can verify which optimizations engaged — LoRA+/8-bit-AdamW/
-        # chalk (rms/swiglu/FLCE + gap-fillers)/PiSSA/rsLoRA/fla all log their engagement (or fallback) to the console.
+        # chalk (standalone production kernels)/PiSSA/rsLoRA/fla all log their engagement (or fallback) to the console.
         _force_console = env.get("FLASH_UPLOAD_CONSOLE", "").strip().lower() not in (
             "", "0", "false", "no", "off",
         )

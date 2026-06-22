@@ -8,6 +8,7 @@ import types
 import pytest
 
 from flash.providers.runpod.train import (
+    DEFAULT_CHALK_SPEC,
     WORKER_DEPS,
     resolve_worker_deps,
 )
@@ -39,6 +40,23 @@ def test_gdn_fastpath_deps_present_and_kept_on_hopper(monkeypatch):
     assert any("flash-linear-attention" in d for d in deps_h100), (
         "fla must be kept on Hopper for the tilelang fast path"
     )
+
+
+def test_chalk_floor_is_current_and_consistent_with_dockerfile():
+    """The lower bound must force stale baked worker images to upgrade to the FLCE-fixed chalk."""
+    import pathlib
+    import re
+
+    expected = "freesolo-chalk>=0.4.12,<0.5.0"
+    spec = next(d for d in WORKER_DEPS if d.startswith("freesolo-chalk"))
+    assert spec == expected
+    assert expected == DEFAULT_CHALK_SPEC
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile.worker").read_text()
+    dm = re.search(r'"(freesolo-chalk>=[^"]+)"', dockerfile)
+    assert dm, "Dockerfile.worker must install freesolo-chalk with an explicit bounded range"
+    assert dm.group(1) == expected
 
 
 def test_resolve_worker_deps_explicit_list_wins(monkeypatch):

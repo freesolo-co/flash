@@ -150,3 +150,46 @@ def test_upload_code_mirrors_package_purging_stale_remote(monkeypatch):
     # still uploads from the real (symlink-collapsed) package dir, and skips bytecode
     assert up["folder_path"] == os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     assert "*.pyc" in up.get("ignore_patterns", [])
+
+
+def test_upload_code_stages_optional_chalk_wheel(monkeypatch, tmp_path):
+    """An unpublished chalk wheel can ride in the run-private code artifact for live validation."""
+    import sys
+    import types
+
+    wheel = tmp_path / "freesolo_chalk-0.4.12-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    calls = {"wheel": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, repo, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def upload_folder(self, **kw):
+            pass
+
+        def upload_file(self, **kw):
+            calls["wheel"].append(kw)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = _FakeApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    monkeypatch.setenv("FLASH_CHALK_WHEEL", str(wheel))
+
+    import flash.providers.runpod.train as flash_train
+
+    flash_train.upload_code("owner/run-artifacts")
+    assert calls["wheel"] == [
+        {
+            "path_or_fileobj": str(wheel),
+            "path_in_repo": "code/wheels/freesolo_chalk-0.4.12-py3-none-any.whl",
+            "repo_id": "owner/run-artifacts",
+            "repo_type": "dataset",
+        }
+    ]

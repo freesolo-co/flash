@@ -81,9 +81,9 @@ def test_onstart_ships_payload_and_bootstrap(monkeypatch):
     boot_idx = script.index("/root/flash/bootstrap.py\n")  # the run, not the heredoc write
     guard_idx = script.index("base worker dependency install failed")
     assert pip_idx < guard_idx < boot_idx, "guard must sit between base pip and bootstrap run"
-    assert "pip install" not in vast.build_onstart(payload, install_deps=False).replace(
-        "extra_pip", ""
-    )
+    no_deps_script = vast.build_onstart(payload, install_deps=False)
+    assert "uv pip install --python" not in no_deps_script
+    assert ": # deps baked into the image" in no_deps_script
     # verified live: args-mode wrapper resets PATH (OS python is PEP 668-managed)
     assert "PIP_BREAK_SYSTEM_PACKAGES=1" in script
     assert "/opt/conda/bin/python" in script  # prefer the image's torch-equipped env
@@ -258,6 +258,7 @@ def _bootstrap_with_hub_env(monkeypatch, prime_present):
     from flash.providers.vast import _bootstrap as vb
 
     cmds: list[list[str]] = []
+    pip_specs: list[tuple[str, list[str]]] = []
     monkeypatch.setattr(
         vb,
         "load_payload",
@@ -286,30 +287,65 @@ def _bootstrap_with_hub_env(monkeypatch, prime_present):
         vb.subprocess, "run", lambda cmd, *a, **k: (cmds.append(list(cmd)), _Proc())[1]
     )
     monkeypatch.setattr(
+        vb,
+        "pip_install",
+        lambda specs, *, label, env=None: pip_specs.append((label, list(specs))),
+    )
+    monkeypatch.setattr(
         vb.shutil,
         "which",
         lambda name: "/usr/bin/prime" if (prime_present and name == "prime") else None,
     )
-    return vb, cmds
+    return vb, cmds, pip_specs
 
 
 def test_bootstrap_installs_prime_into_worker_python(monkeypatch):
     # When `prime` is already present (baked into the image), don't reinstall it; run the
     # LOCATED prime binary and install the env into THIS python via `--with pip` so the
     # trainer can import the env module at load_environment.
-    vb, cmds = _bootstrap_with_hub_env(monkeypatch, prime_present=True)
+    vb, cmds, pip_specs = _bootstrap_with_hub_env(monkeypatch, prime_present=True)
     assert vb.main() == 0
-    assert not any(c[-1] == "prime" and "install" in c for c in cmds)
+    assert ("prime", ["prime"]) not in pip_specs
     assert ["/usr/bin/prime", "env", "install", "owner/env", "--with", "pip"] in cmds
 
 
 def test_bootstrap_installs_prime_when_missing(monkeypatch):
     # When `prime` isn't already on PATH, the bootstrap installs it and then proceeds to the env
     # install (rather than silently skipping it, which would crash later with ModuleNotFoundError).
-    vb, cmds = _bootstrap_with_hub_env(monkeypatch, prime_present=False)
+    vb, cmds, pip_specs = _bootstrap_with_hub_env(monkeypatch, prime_present=False)
     assert vb.main() == 0
-    assert any(c[-1] == "prime" and "install" in c for c in cmds)
+    assert ("prime", ["prime"]) in pip_specs
     assert ["prime", "env", "install", "owner/env", "--with", "pip"] in cmds
+
+
+def test_bootstrap_fetches_code_before_extra_pip(monkeypatch):
+    from flash.providers.vast import _bootstrap as vb
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        vb,
+        "load_payload",
+        lambda path=vb.PAYLOAD_PATH: {
+            "hf_repo": "org/repo",
+            "job_spec_json": "{}",
+            "phase": "sft",
+            "seed": 0,
+            "env": {},
+            "extra_pip": ["/runcode/code/wheels/freesolo_chalk-0.4.12-py3-none-any.whl"],
+            "hub_env_ids": [],
+            "hf_prefix": "sft/x/seed0",
+            "max_wall_s": 60,
+            "attempt": 0,
+        },
+    )
+    monkeypatch.setattr(vb, "fetch_code", lambda p: order.append("fetch_code"))
+    monkeypatch.setattr(vb, "pip_install", lambda specs, *, label, env=None: order.append(label))
+    monkeypatch.setattr(vb, "run_mode", lambda p, e, m, d: order.append("run_mode") or 0)
+    monkeypatch.setattr(vb, "write_attempt_marker", lambda p, ok, error="": None)
+    monkeypatch.setattr(vb.os.path, "exists", lambda p: "metrics.json" in p)
+
+    assert vb.main() == 0
+    assert order.index("fetch_code") < order.index("extra_pip")
 
 
 # ---------------------------------------------------------------------------

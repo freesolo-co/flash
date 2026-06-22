@@ -1,7 +1,7 @@
 """flash <-> chalk wiring (CPU-safe).
 
 flash applies chalk via chalk's Liger-style ``apply_chalk_kernel_to_qwen35(model, liger=False, ...)``
-on the POST-build pass (chalk patches the live module). These tests verify: the gap-fillers are ON
+on the POST-build pass (chalk patches the live module). These tests verify: production kernels are ON
 by default and map to the right apply kwargs; FLASH_<K>=0 disables a default-on kernel and
 FLASH_<K>=1 enables an opt-in one; the pre-build pass (model=None) is a no-op; the no-op when chalk
 is absent or every kernel is disabled; and that a chalk apply error never aborts training.
@@ -18,15 +18,15 @@ from flash.engine.chalk_kernels import (
 )
 
 # Every FLASH_* kernel flag (so a test can clear leftovers from the environment).
-# Every FLASH_* kernel flag. The first seven are DEFAULT-ON (chalk's standalone stack: rms_norm,
-# swiglu, FLCE + the gap-fillers rope/lora-delta/embedding + the GDN conv+SiLU); the rest are opt-in.
+# Every FLASH_* kernel flag. Production kernels are DEFAULT-ON (chalk standalone: rms_norm, swiglu,
+# FLCE, rope/lora-delta/embedding, GDN pieces, trainable attention epilogue); the rest are opt-in.
 _DEFAULT_ON_FLAGS = tuple(flag for flag, _kw, on in _KERNELS if on)
 # Derived from _KERNELS so adding a new opt-in flag (e.g. FLASH_FP8_DX) can't leave this stale.
 _ALL_FLAGS = tuple(flag for flag, _kw, _on in _KERNELS)
 
 # The apply kwargs flash should pass for a DEFAULT run: chalk runs STANDALONE (replaces Liger) so
-# its own rms_norm/swiglu/FLCE are ON alongside the gap-fillers; only the situational kernels
-# (eval-only attn epilogue / Hopper-only FP8 base) stay off. (The bf16 fused-MLP kernel was removed
+# its own rms_norm/swiglu/FLCE are ON alongside the Qwen3.5-specific production kernels; only the
+# situational kernels (eval-only attn epilogue / FP8) stay off. (The bf16 fused-MLP kernel was removed
 # in freesolo-chalk 0.3.2 — verified net-negative + eval-only; swiglu already fuses its activation.)
 # Derived from _KERNELS (kw -> default_on) so a new opt-in kwarg (e.g. fp8_dx) can't leave this
 # stale: the default apply call must pass every _KERNELS kwarg at its default.
@@ -56,8 +56,7 @@ def _install_fake_chalk(monkeypatch, calls, *, raise_in_apply=False, report=None
 
 
 def test_default_on_applies_gap_fillers(monkeypatch):
-    """Default (no FLASH_* flags), post-build -> apply is called once with liger=False and the
-    gap-fillers ON (rope/fused_lora_delta/fused_embedding), the overlap/situational kernels OFF."""
+    """Default post-build apply runs chalk standalone with production kernels on."""
     _clear_flags(monkeypatch)
     calls = []
     _install_fake_chalk(monkeypatch, calls)
@@ -81,14 +80,14 @@ def test_pre_build_pass_is_noop(monkeypatch):
 
 
 def test_noop_when_chalk_absent(monkeypatch):
-    """Gap-fillers are default-on, but if freesolo-chalk isn't installed -> no-op (returns {})."""
+    """Production kernels are default-on, but absent chalk is still a no-op."""
     _clear_flags(monkeypatch)
     monkeypatch.setitem(sys.modules, "chalk", None)  # force ImportError on `from chalk.transformers ...`
     assert install_chalk_kernels(object()) == {}
 
 
 def test_flag_zero_disables_default_on_kernel(monkeypatch):
-    """FLASH_<K>=0/false disables a default-ON gap-filler; the others stay on."""
+    """FLASH_<K>=0/false disables a default-on production kernel; the others stay on."""
     _clear_flags(monkeypatch)
     monkeypatch.setenv("FLASH_ROPE_KERNEL", "0")
     monkeypatch.setenv("FLASH_EMBED_KERNEL", "false")
@@ -102,7 +101,7 @@ def test_flag_zero_disables_default_on_kernel(monkeypatch):
 
 
 def test_optin_flag_enables_extra_kernel(monkeypatch):
-    """A default-OFF kernel turns on with FLASH_<K>=1, alongside the default-on gap-fillers."""
+    """A default-off kernel turns on with FLASH_<K>=1 alongside the default-on kernels."""
     _clear_flags(monkeypatch)
     monkeypatch.setenv("FLASH_QKV_KERNEL", "1")  # opt in to the attn epilogue
     monkeypatch.setenv("FLASH_FP8_BASE", "1")  # opt in to FP8 frozen base
@@ -112,7 +111,7 @@ def test_optin_flag_enables_extra_kernel(monkeypatch):
     _, kwargs = calls[0]
     assert kwargs["attn_epilogue"] is True
     assert kwargs["fp8_frozen_base"] is True
-    assert kwargs["rope"] is True  # gap-fillers still on
+    assert kwargs["rope"] is True  # default-on kernels still on
 
 
 def test_all_kernels_disabled_is_noop(monkeypatch):
@@ -145,7 +144,7 @@ def test_returns_chalk_report(monkeypatch):
 
 
 def test_is_chalk_enabled(monkeypatch):
-    """is_chalk_enabled is True by default (gap-fillers on) and False only when all are disabled."""
+    """is_chalk_enabled is True by default and False only when all default-on kernels are disabled."""
     _clear_flags(monkeypatch)
     import os
 

@@ -68,6 +68,8 @@ def upload_code(repo: str | None = None) -> str:
     reference a published Hub env by ``id`` (``flash env push`` to publish a local env first); the
     worker pip-installs the env wheel.
     """
+    from pathlib import Path
+
     from huggingface_hub import HfApi
 
     import flash
@@ -100,6 +102,22 @@ def upload_code(repo: str | None = None) -> str:
         # scoped to code/flash (only orphans there are purged; unchanged files are kept).
         delete_patterns=["**"],
     )
+    # Private validation path for unpublished chalk builds: stage a local wheel into the same
+    # run-private code artifact, then set FLASH_CHALK_SPEC=/runcode/code/wheels/<wheel>.whl for the
+    # run. This avoids unauthenticated workers reaching the internal chalk repo before PyPI is cut.
+    chalk_wheel = (os.environ.get("FLASH_CHALK_WHEEL") or "").strip()
+    if chalk_wheel:
+        wheel_path = Path(chalk_wheel).expanduser()
+        if not wheel_path.is_file():
+            raise FileNotFoundError(f"FLASH_CHALK_WHEEL does not exist: {wheel_path}")
+        if wheel_path.suffix != ".whl":
+            raise ValueError(f"FLASH_CHALK_WHEEL must point to a .whl file: {wheel_path}")
+        api.upload_file(
+            path_or_fileobj=str(wheel_path),
+            path_in_repo=f"code/wheels/{wheel_path.name}",
+            repo_id=repo,
+            repo_type="dataset",
+        )
     return repo
 
 

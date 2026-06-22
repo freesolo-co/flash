@@ -58,7 +58,13 @@ WORKER_DEPS = [
     # kernels Liger never had (RoPE / LoRA-delta / embedding). Pure Triton/CUDA, JITs on every arch
     # incl. Blackwell. Baked in (as Liger was) so cold starts don't pip-install it. Keep this spec
     # in lockstep with DEFAULT_CHALK_SPEC below + the freesolo-chalk install in Dockerfile.worker.
-    "freesolo-chalk>=0.3.0,<0.5.0",
+    # FLOOR is >=0.4.12 (NOT >=0.3.0): a loose floor is satisfied by the OLD chalk BAKED into the
+    # worker image, so pip never upgrades it -> the worker runs old chalk whose FLCE forward reads
+    # config.hidden_size (absent on Qwen3.5 VL) and CRASHES every Qwen3.5 SFT. 0.4.11 fixed that, but
+    # still patched the PEFT wrapper and fell back to eager full-logits loss on Qwen3.5 SFT; 0.4.12
+    # patches the unwrapped PEFT base instead. pip-installs-latest-in-range so new versions auto-pick.
+    # Keep the floor at the latest shipped chalk on each release.
+    "freesolo-chalk>=0.4.12,<0.5.0",
     # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this, transformers
     # falls back to a pure-PyTorch delta rule that is dramatically slower + memory-heavier (measured
     # A/B, Vast H100 SXM, Qwen3.5-0.8B LoRA: seq4096 4413->371 ms/step = 11.9x; seq8192 13.7x;
@@ -192,14 +198,13 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 def _chalk_selected(spec=None) -> bool:
     """True if ANY chalk kernel would run on the worker -> chalk must be installed.
 
-    chalk's gap-fillers (RoPE/LoRA/embedding) are ON BY DEFAULT (engine.chalk_kernels), so this
-    is True for a normal run. It is False only when every kernel that would otherwise be enabled is
-    explicitly set to 0 — i.e. the three default-on gap-fillers (ROPE/TRITON_LORA/EMBED) disabled
-    via ``FLASH_<K>=0`` (the default-off opt-in kernels — QKV/MLP/FP8 base — need no flag to stay
-    off, so deselecting chalk does NOT require setting them to 0). Resolved against the EFFECTIVE worker env
-    — the run's ``[worker_env]`` merged over ``os.environ`` so a per-run override is honored (see
-    ``_effective_worker_env``). Delegates to ``chalk_kernels.is_chalk_enabled`` (the single source
-    of truth for the flag/default logic) rather than re-parsing the kernel table here.
+    Chalk's production kernels are ON BY DEFAULT (engine.chalk_kernels), so this is True for a normal
+    run. It is False only when every kernel that would otherwise be enabled is explicitly set to 0 via
+    ``FLASH_<K>=0``; default-off opt-in kernels (eval QKV epilogue / FP8) need no flag to stay off, so
+    deselecting chalk does NOT require setting them to 0. Resolved against the EFFECTIVE worker env —
+    the run's ``[worker_env]`` merged over ``os.environ`` so a per-run override is honored (see
+    ``_effective_worker_env``). Delegates to ``chalk_kernels.is_chalk_enabled`` (the single source of
+    truth for the flag/default logic) rather than re-parsing the kernel table here.
     """
     from flash.engine.chalk_kernels import is_chalk_enabled
 
@@ -208,13 +213,34 @@ def _chalk_selected(spec=None) -> bool:
 
 # Default chalk install spec when FLASH_CHALK_SPEC is unset. VERSION-PINNED (bounded range, like the
 # rest of WORKER_DEPS) so a default run is reproducible and a breaking freesolo-chalk release can't
-# silently land on production jobs — 0.3.x patches are allowed, 0.4 is not. 0.3.0 is the PER-ARCH
-# line (chalk's own RMSNorm/SwiGLU/FLCE/RoPE/LoRA/embedding, replacing Liger, with arch-tuned
-# autotune configs + FLCE chunk_mult dispatched on cuda capability — sm_80+ -> 8, sm_86 -> 4 — so
-# each kernel WINS on speed/memory on every GPU arch). Keep in lockstep with the freesolo-chalk pin
-# in WORKER_DEPS + Dockerfile.worker. Bump intentionally after validating a new line; an operator can
+# silently land on production jobs. The lower bound is deliberately the latest validated shipped
+# chalk: a too-low floor is satisfied by stale baked images, so pip skips the upgrade and workers can
+# run an old FLCE path that crashes Qwen3.5. Keep in lockstep with the freesolo-chalk pin in
+# WORKER_DEPS + Dockerfile.worker. Bump intentionally after validating a new line; an operator can
 # pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z.
-DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.3.0,<0.5.0"
+DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.4.12,<0.5.0"
+
+
+def _split_pip_specs(raw: str) -> list[str]:
+    """Split a whitespace-separated pip-spec list without breaking PEP 508 direct URLs.
+
+    ``shlex.split("pkg @ git+https://...")`` returns ``["pkg", "@", "git+https://..."]``, but
+    ``pip install`` needs that as one argv item. Keep the direct-reference triple together while
+    preserving existing support for simple whitespace-separated package specs.
+    """
+    import shlex
+
+    toks = [d for d in shlex.split(raw) if d.strip()]
+    out: list[str] = []
+    i = 0
+    while i < len(toks):
+        if i + 2 < len(toks) and toks[i + 1] == "@" and "://" in toks[i + 2]:
+            out.append(f"{toks[i]} @ {toks[i + 2]}")
+            i += 3
+        else:
+            out.append(toks[i])
+            i += 1
+    return out
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
@@ -229,8 +255,8 @@ def chalk_extra_pip(spec=None) -> list[str]:
     the run's ``[worker_env]`` merged over ``os.environ`` — so it matches exactly what the worker
     process will see (``build_worker_env``) and a per-run ``[worker_env]`` opt-in installs chalk.
 
-    Chalk's gap-fillers are default-on, so chalk is selected for a normal run even with no FLASH_*
-    flags set. freesolo-chalk is published on PyPI, so it auto-installs by DEFAULT (just like Liger):
+    Chalk's production kernels are default-on, so chalk is selected for a normal run even with no
+    FLASH_* flags set. freesolo-chalk is published on PyPI, so it auto-installs by DEFAULT:
     when chalk is selected and ``FLASH_CHALK_SPEC`` is unset we add the version-pinned
     :data:`DEFAULT_CHALK_SPEC`. Set ``FLASH_CHALK_SPEC`` to override the source (an exact version, a
     git URL, or a wheel/path), or disable every kernel (``FLASH_<K>=0``) to skip the install.
@@ -240,9 +266,7 @@ def chalk_extra_pip(spec=None) -> list[str]:
     # PyPI default (version-pinned for reproducibility) — chalk is published, so a normal run
     # installs + applies it automatically. An explicit FLASH_CHALK_SPEC overrides the source.
     spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
-    import shlex
-
-    return [d for d in shlex.split(spec_str) if d.strip()]
+    return _split_pip_specs(spec_str)
 
 
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
@@ -317,19 +341,23 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         ),
     }
     # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub
-    # env(s), public + private) + optional reward-judge creds: a verifiers env whose rubric
-    # calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
-    # where the reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env
-    # reads (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's
-    # control-plane override so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
-    # back to the env's generated default. Forward any that the operator has set; absent ones are
-    # simply not passed (the env then uses its own default model).
+    # env(s), public + private) + optional reward-judge/live-data creds: a verifiers env whose
+    # rubric calls an LLM judge or a live data source needs those secrets ON THE WORKER, where the
+    # reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env reads
+    # (agents/common/prompt.py) to pick the JudgeRubric client model; LINKD_* are consumed by the
+    # linkd-search live-quality env. Forward operator control-plane overrides so SFT-eval/
+    # GRPO-reward/rejection-sampling judges don't silently fall back to generated defaults, and so
+    # secret values do not need to be serialized into the run's [worker_env] block.
     for key in (
         "HF_TOKEN",
         "PRIME_API_KEY",
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "FLASH_JUDGE_MODEL",
+        "LINKD_MONGO_URL",
+        "LINKD_JUDGE_AUTH",
+        "LINKD_JUDGE_MODEL",
+        "LINKD_JUDGE_BASE_URL",
     ):
         if os.environ.get(key):
             env[key] = os.environ[key]
