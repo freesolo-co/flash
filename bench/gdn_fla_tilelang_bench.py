@@ -62,6 +62,7 @@ def _remove_fla() -> None:
 def _ensure_tilelang() -> None:
     import importlib
     import importlib.metadata as md
+    import importlib.util  # find_spec() below lives in importlib.util, not bare importlib
 
     def ver(d):
         try:
