@@ -179,15 +179,35 @@ def patch_vllm_lm_weight_sync(model_id: str) -> bool:
     try:
         import importlib
 
-        for mod_name, cls_name in (
-            ("vllm.model_executor.models.qwen3_5", "Qwen3_5ForConditionalGeneration"),
-            ("vllm.model_executor.models.qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        # The dense class is REQUIRED for the whole Qwen3.5/3.6 family — if its module/class can't
+        # be imported (vLLM not installed where it should be, or the class renamed in a new vLLM)
+        # we must NOT silently no-op: the run would crash again at the first ``sync_weights()`` with
+        # a far less actionable error. Log loudly for the required one; the MoE class is OPTIONAL
+        # (only some models are MoE, and older vLLM lacks the module) so its absence stays quiet.
+        for mod_name, cls_name, required in (
+            ("vllm.model_executor.models.qwen3_5", "Qwen3_5ForConditionalGeneration", True),
+            ("vllm.model_executor.models.qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration", False),
         ):
             try:
-                cls = getattr(importlib.import_module(mod_name), cls_name, None)
-            except Exception:
-                cls = None
-            if cls is None or getattr(cls.load_weights, "_flash_sync_patched", False):
+                mod = importlib.import_module(mod_name)
+            except Exception as e:
+                mod = None
+                if required:
+                    print(
+                        f"[vllm] WARN patch_vllm_lm_weight_sync: could not import required module "
+                        f"{mod_name} ({e!r}); GRPO weight-sync will NOT be remapped and the run may "
+                        f"crash at the first sync_weights() for this VL checkpoint."
+                    )
+            cls = getattr(mod, cls_name, None) if mod is not None else None
+            if cls is None:
+                if required and mod is not None:
+                    print(
+                        f"[vllm] WARN patch_vllm_lm_weight_sync: module {mod_name} imported but has "
+                        f"no {cls_name} (vLLM API changed?); GRPO weight-sync will NOT be remapped "
+                        f"and the run may crash at the first sync_weights() for this VL checkpoint."
+                    )
+                continue
+            if getattr(cls.load_weights, "_flash_sync_patched", False):
                 continue
             orig_load = cls.load_weights
 
@@ -206,6 +226,215 @@ def patch_vllm_lm_weight_sync(model_id: str) -> bool:
     except Exception as e:
         print("patch_vllm_lm_weight_sync warn:", e)
     return patched_any
+
+
+# --------------------------------------------------------------------------------------------
+# Warm-start (init_from_adapter) SFT-adapter key remap for VL checkpoints.
+#
+# SFT (run_sft) trains the FULL multimodal model: ``SFTTrainer(model=model_id,
+# peft_config=make_lora(...))`` loads ``Qwen3_5ForConditionalGeneration`` whose LM modules live
+# under ``language_model.``, so the SAVED adapter's keys are
+# ``base_model.model.model.language_model.layers.X...``. But warm-started GRPO
+# (``_init_adapter_model``) loads the base via ``AutoModelForCausalLM`` — a TEXT-ONLY module tree
+# whose LoRA targets are named ``base_model.model.model.layers.X...`` (no ``language_model.``
+# infix). ``PeftModel.from_pretrained`` then can't match the SFT keys: peft logs a *warning* about
+# missing adapter keys and SILENTLY keeps the fresh zero-init LoRA, so the SFT is thrown away and
+# GRPO restarts from the base model (observed: linkd-search warm-start reward ~= 0.001).
+#
+# Stripping the ``.language_model.`` infix from the saved adapter keys makes them line up with the
+# ``AutoModelForCausalLM`` trainer (proven workaround: remapped adapters train correctly). We keep
+# the trainer as ``AutoModelForCausalLM`` so the train-time vLLM weight-sync remap
+# (``patch_vllm_lm_weight_sync`` / ``_remap_vl_sync_weights``) stays consistent.
+# --------------------------------------------------------------------------------------------
+
+_LANGUAGE_MODEL_INFIX = ".language_model."
+
+
+def strip_language_model_infix(key: str) -> str:
+    """Strip the FIRST ``.language_model.`` infix from a peft adapter weight key.
+
+    ``base_model.model.model.language_model.layers.0.linear_attn.out_proj.lora_A.default.weight``
+    -> ``base_model.model.model.layers.0.linear_attn.out_proj.lora_A.default.weight``.
+
+    Only the first occurrence is removed (the LM-vs-VL boundary appears once in the path); keys
+    without the infix are returned unchanged.
+    """
+    i = key.find(_LANGUAGE_MODEL_INFIX)
+    if i == -1:
+        return key
+    # Replace ".language_model." with "." (keep one separator dot).
+    return key[:i] + "." + key[i + len(_LANGUAGE_MODEL_INFIX) :]
+
+
+def remap_adapter_keys(keys):
+    """Map an iterable of adapter weight keys -> a dict {old_key: new_key} for keys that change.
+
+    Pure (no I/O); used both by the on-disk rewriter and by tests to assert the post-remap key set
+    matches an ``AutoModelForCausalLM``-named LoRA param set.
+    """
+    out = {}
+    for k in keys:
+        nk = strip_language_model_infix(k)
+        if nk != k:
+            out[k] = nk
+    return out
+
+
+def _rewrite_safetensors_header_keys(path: str, rename) -> int:
+    """Rename tensor keys in a ``.safetensors`` file IN PLACE, editing only the header.
+
+    safetensors layout: 8-byte little-endian header length, then a JSON header mapping
+    ``name -> {dtype, shape, data_offsets}`` (plus an optional ``__metadata__`` entry), then the
+    raw tensor data. ``data_offsets`` are relative to the data section, so a pure key rename leaves
+    every byte of the data section valid — we only rewrite the JSON header and its length prefix.
+
+    ``rename`` is a callable ``old_key -> new_key``. Returns the number of keys renamed. No torch /
+    safetensors dependency (keeps this module CPU-importable on the server venv).
+    """
+    import json
+    import os
+    import shutil
+    import struct
+
+    with open(path, "rb") as f:
+        len_bytes = f.read(8)
+        if len(len_bytes) < 8:
+            raise ValueError(f"{path}: too small to be a safetensors file")
+        (hdr_len,) = struct.unpack("<Q", len_bytes)
+        header_bytes = f.read(hdr_len)
+        if len(header_bytes) < hdr_len:
+            raise ValueError(f"{path}: truncated safetensors header")
+        header = json.loads(header_bytes)
+    data_start = 8 + hdr_len
+
+    new_header = {}
+    renamed = 0
+    for k, v in header.items():
+        if k == "__metadata__":
+            new_header[k] = v
+            continue
+        nk = rename(k)
+        if nk != k:
+            if nk in header or nk in new_header:
+                raise ValueError(
+                    f"{path}: remapped key {nk!r} collides with an existing key; refusing to "
+                    f"overwrite (adapter may already be remapped or malformed)"
+                )
+            renamed += 1
+        new_header[nk] = v
+
+    if renamed == 0:
+        return 0
+
+    # Re-serialize compactly. safetensors does not require any specific key order or padding; the
+    # only constraint is that data_offsets stay consistent with the (unchanged) data section.
+    new_header_bytes = json.dumps(new_header, separators=(",", ":")).encode("utf-8")
+    # Stream the (possibly multi-GB) tensor data straight from the original to a temp file instead
+    # of slurping the whole file into memory; os.replace makes the swap atomic so an interrupted
+    # rewrite can't corrupt the adapter.
+    tmp = path + ".remap.tmp"
+    try:
+        with open(path, "rb") as src, open(tmp, "wb") as out:
+            src.seek(data_start)
+            out.write(struct.pack("<Q", len(new_header_bytes)))
+            out.write(new_header_bytes)
+            shutil.copyfileobj(src, out, 8 * 1024 * 1024)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    os.replace(tmp, path)
+    return renamed
+
+
+def _rewrite_bin_keys(path: str, rename) -> int:
+    """Rename keys in a PyTorch ``.bin`` (pickled ``state_dict``) adapter IN PLACE.
+
+    Used only when the saved adapter is the legacy ``.bin`` format (no ``.safetensors``). Needs
+    torch to (de)serialize; that's fine because this path runs only on the GPU worker.
+    """
+    import torch
+
+    sd = torch.load(path, map_location="cpu", weights_only=True)
+    new_sd = {}
+    renamed = 0
+    for k, v in sd.items():
+        nk = rename(k)
+        if nk != k:
+            if nk in sd or nk in new_sd:
+                raise ValueError(
+                    f"{path}: remapped key {nk!r} collides with an existing key; refusing to "
+                    f"overwrite (adapter may already be remapped or malformed)"
+                )
+            renamed += 1
+        new_sd[nk] = v
+    if renamed == 0:
+        return 0
+    torch.save(new_sd, path)
+    return renamed
+
+
+def remap_vl_adapter_dir(adir: str, model_id: str) -> int:
+    """For a VL warm-start, strip the ``.language_model.`` infix from the downloaded SFT adapter so
+    its keys match the ``AutoModelForCausalLM`` trainer used by ``_init_adapter_model``.
+
+    No-op (returns 0) when ``model_id`` is not a VL checkpoint, or the adapter has no
+    ``.language_model.`` keys (e.g. already remapped, or a text-only SFT). Rewrites whichever weight
+    file exists in ``adir`` (``adapter_model.safetensors`` preferred, else ``adapter_model.bin``).
+    Returns the number of keys renamed. Idempotent: a second call finds nothing to strip.
+    """
+    import os
+
+    if not is_vl_checkpoint(model_id):
+        return 0
+
+    st_path = os.path.join(adir, "adapter_model.safetensors")
+    bin_path = os.path.join(adir, "adapter_model.bin")
+    if os.path.isfile(st_path):
+        n = _rewrite_safetensors_header_keys(st_path, strip_language_model_infix)
+    elif os.path.isfile(bin_path):
+        n = _rewrite_bin_keys(bin_path, strip_language_model_infix)
+    else:
+        print(
+            f"[init-adapter] remap_vl_adapter_dir: no adapter_model.safetensors/.bin in {adir!r}; "
+            "nothing to remap"
+        )
+        return 0
+    if n:
+        print(
+            f"[init-adapter] remapped {n} VL SFT adapter key(s): stripped '.language_model.' infix "
+            f"to match the AutoModelForCausalLM trainer for {model_id}"
+        )
+    else:
+        print(
+            f"[init-adapter] no '.language_model.' adapter keys to remap for {model_id} "
+            "(already remapped or a text-only adapter)"
+        )
+    return n
+
+
+def assert_lora_applied(model, model_id: str) -> int:
+    """After ``PeftModel.from_pretrained``, verify the adapter's LoRA actually loaded (non-empty)
+    so a future key-mismatch regression fails LOUDLY instead of silently training a fresh LoRA.
+
+    Counts the LoRA A/B submodules present on the PeftModel. Raises for ANY warm-start that ended
+    up with ZERO LoRA modules (a key mismatch from any cause; the VL ``.language_model.`` mismatch
+    this remap fixes is the common one). Returns the count.
+    """
+    count = 0
+    for name, _ in model.named_modules():
+        # peft names the per-target adapter submodules ``...lora_A.<adapter>`` / ``...lora_B.*``.
+        if name.endswith("lora_A.default") or name.endswith("lora_B.default"):
+            count += 1
+    if count == 0:
+        raise RuntimeError(
+            f"warm-start adapter for {model_id} loaded ZERO LoRA modules — the SFT adapter was NOT "
+            "applied (key mismatch). GRPO would silently restart from the base model. For Qwen3.5/"
+            "3.6 VL this is usually the '.language_model.' key-mismatch (check remap_vl_adapter_dir "
+            "ran on the adapter); otherwise verify the adapter's keys match the model."
+        )
+    print(f"[init-adapter] verified {count} LoRA submodule(s) applied for {model_id}")
+    return count
 
 
 def model_quant(model_id: str) -> str:
