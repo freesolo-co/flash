@@ -11,6 +11,7 @@ the runner runs jobs in daemon threads inside the same process).
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -35,9 +36,16 @@ CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
 """
 
 
-# Fixed location for the keys/run-ownership SQLite DB (not operator-configurable). Tests
-# point it elsewhere with monkeypatch.setattr(db, "DB_PATH", tmp).
-DB_PATH = str(Path.home() / ".flash" / "server.db")
+def _expanded_abs_path(path: str) -> str:
+    return str(Path(path).expanduser().absolute())
+
+
+# Local control-plane ownership DB. Defaults to ~/.flash/server.db, with the same
+# FLASH_CONTROL_PLANE_STATE_DIR root as runner.RUNS_DIR/RESULTS_DIR for isolated
+# validation/staging servers. Tests can still point it elsewhere via monkeypatch.
+_DEFAULT_STATE_DIR = str(Path.home() / ".flash")
+_STATE_DIR = _expanded_abs_path(os.environ.get("FLASH_CONTROL_PLANE_STATE_DIR", _DEFAULT_STATE_DIR))
+DB_PATH = _expanded_abs_path(os.environ.get("FLASH_DB_PATH", str(Path(_STATE_DIR) / "server.db")))
 
 
 def db_path() -> str:

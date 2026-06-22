@@ -15,13 +15,21 @@ from dataclasses import asdict, dataclass, field
 from flash.catalog import ModelInfo, resolve_model
 from flash.spec import JobSpec
 
-# Fixed local storage roots (not operator-configurable): run-state JSON + result artifacts,
-# both under the ~/.flash state dir (same root as server/db.py's DB_PATH) so a single
-# directory holds all control-plane state — mount one volume at ~/.flash to persist it.
-# Tests redirect them via monkeypatch.setattr(runner, "RUNS_DIR"/"RESULTS_DIR").
-_STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
-RUNS_DIR = os.path.join(_STATE_DIR, "runs")
-RESULTS_DIR = os.path.join(_STATE_DIR, "results")
+
+def _expanded_abs_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+# Local control-plane storage roots: run-state JSON + result artifacts, both under
+# the same state dir as server/db.py by default. Operators can point a validation
+# or staging control plane at its own directory so startup recovery/orphan cleanup
+# cannot see another server's live runs.
+_DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".flash")
+_STATE_DIR = _expanded_abs_path(os.environ.get("FLASH_CONTROL_PLANE_STATE_DIR", _DEFAULT_STATE_DIR))
+RUNS_DIR = _expanded_abs_path(os.environ.get("FLASH_RUNS_DIR", os.path.join(_STATE_DIR, "runs")))
+RESULTS_DIR = _expanded_abs_path(
+    os.environ.get("FLASH_RESULTS_DIR", os.path.join(_STATE_DIR, "results"))
+)
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
 # Terminal states a deploy must NOT overwrite. `done` is terminal but IS deployable
 # (deploying a finished run is the whole point), so it's excluded here; cancelled/failed/
