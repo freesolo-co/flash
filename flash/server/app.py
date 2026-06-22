@@ -33,8 +33,8 @@ from flash.runner import (
     submit_job,
 )
 from flash.schema import ConfigError, spec_from_dict
+from flash.serve.deploy import ServingError, deploy_adapter, undeploy_adapter
 from flash.serve.deploy import chat as serve_chat
-from flash.serve.deploy import deploy_adapter, undeploy_adapter
 from flash.spec import JobSpec, coerce_bool
 
 from . import auth, db
@@ -393,6 +393,11 @@ def create_app():
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                 )
+            except ServingError as exc:
+                # The serving backend rejected the registration or was unreachable. This is an
+                # upstream/gateway failure, not a flash bug, so surface a clean 502 with the
+                # real reason instead of letting httpx escape as an unhandled 500 + traceback.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
             except Exception as exc:
                 if isinstance(exc, ValueError):
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -417,7 +422,13 @@ def create_app():
         # deploy's provisioning/finalization.
         with _deploy_lock(run_id):
             status = owned_run(run_id, key)
-            deleted = undeploy_adapter(run_id)
+            try:
+                deleted = undeploy_adapter(run_id)
+            except ServingError as exc:
+                # A serving-backend failure (unreachable / non-404 error) is an upstream/gateway
+                # problem, not a flash bug — surface a clean 502 with the real reason (mirrors the
+                # deploy handler) instead of letting the ServingError escape as an unhandled 500.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
             # dev mode is scale-to-zero: the serve endpoint is created only on the first
             # chat, so an empty deletion just means it was never warmed — still a clean
             # undeploy. always-on provisions the endpoint at deploy time, so an empty

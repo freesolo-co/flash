@@ -38,6 +38,69 @@ MODES = ("dev", "always-on")
 DEFAULT_IDLE_TIMEOUT_S = 300
 
 
+class ServingError(RuntimeError):
+    """The freesolo serving backend (Modal LoRA app) rejected a request or was unreachable.
+
+    Carries the upstream status (when there was an HTTP response) so the API layer can
+    surface a clean ``502 Bad Gateway`` with the real reason instead of letting an
+    ``httpx`` exception escape as an unhandled ``500`` + traceback.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _post_adapter_or_raise(url: str, body: dict) -> httpx.Response:
+    """POST an adapter registration to the serving backend, translating any transport- or
+    status-level failure into a ``ServingError`` that carries the upstream detail."""
+    try:
+        # follow_redirects: Modal answers a slow request with a 303 to an async-result poll URL
+        # (?__modal_function_call_id=...); without following it httpx raises on the 303 (see chat).
+        resp = httpx.post(
+            url,
+            json=body,
+            headers=_internal_key_header(),
+            timeout=60.0,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        return resp
+    except httpx.HTTPStatusError as exc:
+        raise _serving_status_error(url, exc) from exc
+    except httpx.RequestError as exc:
+        raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
+
+
+def _serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
+    """Build a ``ServingError`` from an upstream HTTP failure, carrying the status and a
+    4xx-vs-5xx-tailored hint (shared by the deploy POST and the undeploy DELETE)."""
+    # raise_for_status() always carries a response, but a hand-built HTTPStatusError may
+    # not — guard so error translation can never itself raise.
+    resp = exc.response
+    status = resp.status_code if resp is not None else None
+    detail = ((resp.text if resp is not None else "") or "").strip()[:500]
+    msg = f"serving backend error for {url}"
+    if status is not None:
+        msg += f" (HTTP {status})"
+    if detail:
+        msg += f": {detail}"
+    # Tailor the hint to the upstream status: a 4xx is a client/auth problem with THIS request
+    # (e.g. a missing/invalid FREESOLO_INTERNAL_KEY), not a serving outage; a 5xx (or unknown)
+    # means the backend itself failed / has no engine for the base model.
+    if status is not None and status < 500:
+        msg += (
+            " — the serving backend rejected the request (4xx); check FREESOLO_INTERNAL_KEY "
+            "and the request payload (this is a client/auth error, not a serving outage)"
+        )
+    else:
+        msg += (
+            " — the serving backend is unavailable or has no engine for this base model; "
+            "an operator must check the freesolo serving deployment"
+        )
+    return ServingError(msg, status_code=status)
+
+
 def serving_base_url() -> str:
     """The freesolo serving base URL (env-overridable, trailing slash stripped)."""
     return (os.environ.get("FREESOLO_SERVING_URL") or DEFAULT_FREESOLO_SERVING_URL).rstrip("/")
@@ -132,15 +195,15 @@ def deploy_adapter(
         "repoId": hf_repo,
         "baseModel": model,
         "subfolder": subfolder,
+        # The trainer always streams the adapter into a *dataset* repo (the worker's
+        # hf_upload_folder uses repo_type="dataset"), so serving must pull from the dataset
+        # namespace. Without this the serving app defaults repoType to "model" and
+        # snapshot_download 404s on the model namespace — deploy returns 200 but the engine
+        # warmup fails, the adapter is silently disabled, and the first chat 404s.
+        "repoType": "dataset",
         "status": "ready",
     }
-    resp = httpx.post(
-        f"{base}/adapters",
-        json=body,
-        headers=_internal_key_header(),
-        timeout=60.0,
-    )
-    resp.raise_for_status()
+    _post_adapter_or_raise(f"{base}/adapters", body)
     logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
     return dep
 
@@ -149,17 +212,30 @@ def undeploy_adapter(run_id: str) -> list[str]:
     """Deregister the run's adapter from the freesolo serving app.
 
     Returns ``[run_id]`` when the adapter was removed (200), ``[]`` when it was already
-    gone (404). Other statuses raise so the caller can surface a transient failure.
+    gone (404). Any other failure — a non-404 HTTP status or a transport error — is
+    translated into a ``ServingError`` (carrying the upstream status), exactly like
+    ``deploy_adapter``, so callers see a stable error surface (the API maps it to a clean
+    502) instead of a raw ``httpx`` exception escaping as an unhandled 500.
     """
     base = serving_base_url()
-    resp = httpx.delete(
-        f"{base}/adapters/{run_id}",
-        headers=_internal_key_header(),
-        timeout=60.0,
-    )
-    if resp.status_code == 404:
-        return []
-    resp.raise_for_status()
+    url = f"{base}/adapters/{run_id}"
+    try:
+        resp = httpx.delete(
+            url,
+            headers=_internal_key_header(),
+            timeout=60.0,
+            # Modal answers a slow request with a 303 to an async-result poll URL; follow it (see chat).
+            follow_redirects=True,
+        )
+        # Undeploy is idempotent: an already-absent adapter (404) is a no-op success, not an
+        # error — handle it before raise_for_status() so it never becomes a ServingError.
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise _serving_status_error(url, exc) from exc
+    except httpx.RequestError as exc:
+        raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
     logger.info("deregistered adapter %s from freesolo serving (%s)", run_id, base)
     return [run_id]
 
@@ -189,7 +265,12 @@ def chat(
         # completions diverge from training behavior even though the caller passes thinking=.
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
     }
-    # Cold starts (scale-from-zero per base model) can take minutes; give it room.
-    resp = httpx.post(f"{base}/v1/chat/completions", json=body, timeout=30 * 60.0)
+    # Cold starts (scale-from-zero per base model) can take minutes. Modal serves a slow ASGI
+    # request by 303-redirecting to an async-result poll URL (?__modal_function_call_id=...), so
+    # the client must follow redirects to retrieve the eventual completion — without this httpx
+    # raises on the 303 and the chat fails mid cold-start. max_redirects is raised because a long
+    # cold start polls across several redirect cycles before the result is ready.
+    with httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client:
+        resp = client.post(f"{base}/v1/chat/completions", json=body)
     resp.raise_for_status()
     return resp.json()

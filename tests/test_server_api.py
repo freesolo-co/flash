@@ -491,6 +491,63 @@ def test_deploy_dry_run(api):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_deploy_serving_error_is_clean_502(api, monkeypatch):
+    """A serving-backend failure during deploy surfaces as a clean 502 with the upstream
+    reason — NOT an unhandled 500 + traceback. This is the main user-facing behavior change
+    of the route: ServingError (raised by deploy_adapter when freesolo serving rejects the
+    registration or is unreachable) is translated to HTTPException(502)."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    # Make the run real-deployable: flip its persisted state to "done" (a finished run with
+    # trained adapter artifacts). Ownership lives in the DB, so this only changes the gate.
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    # The serving backend rejects the registration (e.g. upstream 5xx). deploy_adapter is
+    # imported into the app namespace, so patch it there.
+    def boom(**kwargs):
+        raise ServingError("serving backend unreachable: no engine for base model")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", boom)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key)
+    )
+    assert resp.status_code == 502, resp.text
+    # The 502 carries the upstream reason verbatim, not a generic/unhandled-500 body.
+    assert "serving backend unreachable" in resp.json()["detail"]
+    # The failed deploy left no active deployment record behind.
+    assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
+
+
+def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
+    """An undeploy that hits a serving-backend failure surfaces as a clean 502 (same as deploy),
+    not an unhandled 500: ServingError from undeploy_adapter is translated to HTTPException(502)."""
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+
+    def boom(_run_id):
+        raise ServingError("serving backend unreachable: could not delete endpoint")
+
+    monkeypatch.setattr(app_mod, "undeploy_adapter", boom)
+
+    resp = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+    assert resp.status_code == 502, resp.text
+    assert "serving backend unreachable" in resp.json()["detail"]
+
+
 def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     # A finished run (state="done") MUST be deployable: mark_deployed has to record the
     # deployment and flip to "deployed". But a cancelled/failed run must never be flipped
