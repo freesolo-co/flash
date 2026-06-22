@@ -150,9 +150,9 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="A100 PCIe",
         thinking="hybrid",
-        notes="QLoRA (4-bit NF4 base + bf16 LoRA). GRPO's colocated vLLM rollout loads the "
-        "base 4-bit via bitsandbytes too, so both copies are 4-bit -> fits ~24-32 GB "
-        "instead of 80 GB bf16. ~near-lossless vs bf16 LoRA.",
+        notes="bf16 LoRA. ~19 GB of weights; SFT fits a 48 GB card, while colocated GRPO "
+        "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
+        "(grpo_min_vram_gb floor).",
     ),
 }
 
