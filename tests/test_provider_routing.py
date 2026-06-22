@@ -429,13 +429,14 @@ def test_config_gpu_fields(monkeypatch):
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "environment": {"id": "owner/env"},
     }
-    # GPU pinning is gone: gpu.type is always the cheapest-fitting provisional regardless of
-    # what the config says. Omitted gpu.type -> the deterministic offline cheapest provisional.
+    # GPU pinning is gone: gpu.type is always the cheapest-fitting VALIDATED provisional regardless
+    # of what the config says. Omitted gpu.type -> the deterministic offline cheapest validated
+    # provisional (the unvalidated RTX 2000 Ada is excluded).
     spec = spec_from_dict(dict(base), run_id="x")
-    assert spec.gpu.type == "RTX 2000 Ada"  # deterministic offline cheapest-fitting provisional
+    assert spec.gpu.type == "RTX A5000"  # deterministic offline cheapest-fitting validated provisional
     # round-trip preserves the resolved class
     again = JobSpec.from_dict(spec.to_dict())
-    assert again.gpu.type == "RTX 2000 Ada"
-    # a config gpu.type is IGNORED (no pin) -> still the cheapest provisional, not the named class
+    assert again.gpu.type == "RTX A5000"
+    # a config gpu.type is IGNORED (no pin) -> still the cheapest validated provisional
     spec = spec_from_dict({**base, "gpu": {"type": "L40S"}}, run_id="x")
-    assert spec.gpu.type == "RTX 2000 Ada"
+    assert spec.gpu.type == "RTX A5000"

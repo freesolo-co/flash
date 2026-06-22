@@ -182,12 +182,13 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError("[gpu] must be a table")
 
     # GPU allocation is fully automatic: the submit-time allocator always picks the cheapest
-    # fitting class across ALL providers — there is no GPU pin. Any gpu.type in the config is
-    # ignored. ``provisional_gpu`` computes the offline RunPod-static cheapest-that-fits for
-    # sizing/display only; the live allocator re-resolves it at submit time.
+    # fitting LIVE-VALIDATED class across ALL providers — there is no GPU pin. A config's gpu.type
+    # is not a user knob. ``provisional_gpu`` computes the offline RunPod-static
+    # cheapest-validated-that-fits for sizing/display only; the live allocator re-resolves it at
+    # submit time.
     try:
-        # No GPU pin / no validation gate: the cheapest fitting class (every class eligible).
-        # The submit-time allocator re-resolves the cheapest fitting class live across providers.
+        # No GPU pin: the cheapest fitting VALIDATED class (the pool the deployed control plane
+        # accepts). The submit-time allocator re-resolves it live across providers.
         gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc

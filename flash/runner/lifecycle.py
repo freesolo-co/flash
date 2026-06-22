@@ -316,6 +316,14 @@ def _submit_seed_supervised(
             # (the captured traceback), so this exact phrase only ever marks a dead host -> retry it
             # on a fresh one. Without this, a single ~1-in-200 host death killed the whole run.
             "terminated without a DONE sentinel",
+            # MIG slice / NVML-restricted host: the worker's boot guard (engine.worker.perf
+            # assert_usable_gpu / RetriableInfraError) detected a device the run can never train on
+            # — e.g. RunPod fulfilling a full-GPU request with a MIG partition (nvidia-smi
+            # "[Insufficient Permissions]"), which otherwise NVML-asserts mid-backward and was
+            # mis-classified as a non-retried job_failed. This exact marker phrase is embedded in
+            # that error's message, so a bad host is resubmitted on a fresh worker. Keep this in
+            # lock-step with engine.worker.perf.RETRIABLE_INFRA_MARKER.
+            "RETRIABLE_INFRA_GPU",
         )
         infra_shaped = res.failure in ("stalled", "poll_error", "no_capacity") or any(
             m in (res.detail or "") for m in _infra_markers
