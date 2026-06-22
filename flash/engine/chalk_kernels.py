@@ -49,6 +49,12 @@ log = get_logger(__name__)
 # apply_chalk_kernel_to_qwen35 kwarg. (The bf16 fused-MLP kernel was REMOVED in freesolo-chalk 0.3.2
 # — verified net-negative everywhere and eval-only; its activation fusion is the one swiglu already
 # does. The Hopper/Blackwell base-GEMM lever is the FP8 frozen base below.)
+# LARGER-DIM VERIFIED (freesolo-chalk 0.4.7): the FULL kernel set (rmsnorm/swiglu/FLCE/trainable
+# QK-norm+RoPE/output-gate/GDN conv+SiLU/GDN native-GVA/lora-delta) is correct fwd+bwd (vs fp32
+# oracle, grad rel-err ~1e-3) AND wins speed in the production GRPO regime at the REAL 9B (hidden
+# 4096, MLP inter 12288), 35B-A3B (MoE inter 512) and Qwen3.6 dims + head counts — not just the
+# 0.8B/2B/4B dims everything was benched at. Verified A40(sm86)+A100(sm80); rules out a larger-dim
+# chalk kernel bug as the Qwen3.5-flat root cause. No source/flag change (verification release).
 _KERNELS: list[tuple[str, str, bool]] = [
     ("FLASH_RMSNORM_KERNEL", "rmsnorm", True),
     ("FLASH_SWIGLU_KERNEL", "swiglu", True),
