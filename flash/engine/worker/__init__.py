@@ -649,8 +649,12 @@ def make_lora(model_id: str | None = None):
     # silently breaking serve + warm-start).
     kwargs["init_lora_weights"] = True
     print("[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)")
-    # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
-    kwargs["use_rslora"] = True
+    # Standard LoRA scaling (alpha/r). rsLoRA was removed: it scales by alpha/sqrt(r) (~5.6x larger
+    # for r=32/alpha=64), so with the usual LoRA LR (e.g. 2e-4) the effective update is ~5.6x too
+    # large -> SFT diverges to a degenerate adapter (served model repeats a single token / emits
+    # whitespace) and the adapter is also fragile under vLLM's rsLoRA handling at serve time.
+    # Standard scaling keeps the catalog LRs sane and the saved adapter serve-safe.
+    kwargs["use_rslora"] = False
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
         if exclude:
