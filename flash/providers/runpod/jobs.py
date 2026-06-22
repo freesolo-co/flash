@@ -211,11 +211,10 @@ def deploy_train_endpoint(
 def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict:
     """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`.
 
-    ``friendly_gpu`` is threaded into ``resolve_worker_deps`` so the request-level dependency
-    list is GPU-scoped exactly like the endpoint config (deploy_train_endpoint): on Hopper (sm90)
-    it must drop ``flash-linear-attention`` so the worker uses the pure-PyTorch delta rule instead
-    of fla's #640-buggy GDN Triton kernel. A bare call would reinstall the generic deps and
-    reintroduce that sm90 correctness issue even when the endpoint was configured correctly.
+    ``friendly_gpu`` is threaded into ``resolve_worker_deps`` for GPU-scoped deps parity with the
+    endpoint config (deploy_train_endpoint). fla is kept on every arch now; on Hopper (sm90) the
+    worker's _ensure_fla_fastpath_on_hopper makes fla correct+fast via its tilelang backend (fla #640),
+    so there is no longer a per-GPU drop here. (``friendly_gpu`` retained for signature parity.)
     """
     if os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE:
         # Baked serverless-worker image (client mode): the image's rp_handler reads job["input"]
@@ -223,7 +222,7 @@ def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict
         # {"input": ...}). No live-function source, no boot-install deps.
         return payload
     # Boot-install fallback (Flash default image + live function): ship _train_body's source for the
-    # generic worker to run, plus the GPU-scoped deps to install on first use (drops fla on Hopper).
+    # generic worker to run, plus the GPU-scoped deps to install on first use (fla kept on all archs; tilelang fixes Hopper).
     from runpod_flash.runtime.serialization import serialize_args
     from runpod_flash.stubs.live_serverless import get_function_source
 
