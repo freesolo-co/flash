@@ -15,7 +15,7 @@ import urllib.request
 from typing import Any
 
 from flash.providers._http import RestClient
-from flash.spec import _strict_int
+from flash.spec import strict_int
 
 VAST_BASE = "https://console.vast.ai/api"
 
@@ -75,7 +75,7 @@ def search_offers(
     # it is), and a silently-truncated float (2.9 -> 2) or a coerced bool (True -> 1) would query a
     # different fleet size than intended. Require a strict whole-number >= 1 (rejects bools and
     # fractional floats, accepts 2.0 -> 2); reuse the shared strict-int contract from flash.spec.
-    num_gpus = _strict_int(num_gpus, name="search_offers: num_gpus", minimum=1)
+    num_gpus = strict_int(num_gpus, name="search_offers: num_gpus", minimum=1)
     # Apply Vast's server-side datacenter-only filter (hosting_type==1). usable_offers now rejects
     # community/marketplace hosts unconditionally (run secrets ship to the box), so a mixed search
     # would risk filling the price-sorted limit=64 page with community offers and reporting "no

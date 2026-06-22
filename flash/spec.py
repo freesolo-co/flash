@@ -83,7 +83,7 @@ def _opt_int(value: Any) -> int | None:
     return int(value)
 
 
-def _strict_int(value: Any, *, name: str, minimum: int | None = None) -> int:
+def strict_int(value: Any, *, name: str, minimum: int | None = None) -> int:
     """Coerce a loosely-typed scalar to an int WITHOUT silently truncating.
 
     Plain ``int(...)`` accepts ``2.9`` (-> 2) and ``True`` (-> 1), so a malformed spec from a
@@ -299,7 +299,7 @@ class JobSpec:
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
                 inference_gpus=(
-                    _strict_int(train.get("inference_gpus"), name="train.inference_gpus", minimum=0)
+                    strict_int(train.get("inference_gpus"), name="train.inference_gpus", minimum=0)
                     if train.get("inference_gpus") is not None
                     else 0
                 ),

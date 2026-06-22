@@ -13,7 +13,7 @@ import math
 import os
 from dataclasses import dataclass, field
 
-from flash.spec import _strict_int as _spec_strict_int
+from flash.spec import strict_int as _spec_strict_int
 
 
 def _int(name: str, default: int, minimum: int | None = None) -> int:
