@@ -27,8 +27,9 @@ def spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker). GRPO: ``train.steps``
     (else recipe default). SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by
     ``max_steps``, where ``num_examples`` is ``max_examples`` if pinned else the real env size."""
+    from flash.catalog import MODELS, vocab_size_for
     from flash.engine.recipe import RECIPE
-    from flash.engine.vram import sft_realized_batch
+    from flash.engine.vram import sft_logits_fused, sft_realized_batch
 
     t = spec.train
     if spec.algorithm == "grpo":
@@ -39,7 +40,20 @@ def spec_steps(spec) -> int:
     cap = int(t.max_steps) if t.max_steps else 0  # SFT-only optimizer-step cap (0 = uncapped)
     epochs = int(t.epochs) if t.epochs is not None else RECIPE.sft.num_epochs
     requested_batch = int(t.batch_size) if t.batch_size is not None else RECIPE.sft.effective_batch
-    batch = sft_realized_batch(requested_batch)
+    # Mirror the worker's per-device micro-batch EXACTLY, incl. the big-vocab logits cap: when the
+    # fused CE is OFF the worker vocab-sizes the micro-batch (engine.worker), which (with CEIL'd
+    # grad-accum) can change the realized global batch and thus the step count. Feed the same
+    # seq/vocab/fused so the priced step count matches what actually runs.
+    sft_seq = (
+        int(t.max_length)
+        if t.max_length is not None
+        else (RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
+    )
+    _info = MODELS.get(spec.model)  # non-raising: an open model -> None -> treated as <3B (cap applies)
+    sft_fused = sft_logits_fused(_info.params_b if _info else None, sft_seq)
+    batch = sft_realized_batch(
+        requested_batch, seq_len=sft_seq, vocab=vocab_size_for(spec.model), fused=sft_fused
+    )
     # max_examples is a CAP; 0 (like None) means "no cap" (worker trains the full dataset), so
     # don't let max_examples=0 price a single step.
     pinned_examples = int(t.max_examples) if t.max_examples else 0
