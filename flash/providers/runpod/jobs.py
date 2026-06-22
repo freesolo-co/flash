@@ -335,7 +335,15 @@ def poll_job(
             try:
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:
-                return PollResult(False, failure="job_failed", detail=str(e))
+                # COMPLETED but the output decodes as an error (a handler exception). Consult the
+                # worker flags too: a MIG slice can surface here, and must still retry / walk class.
+                retriable, exclude_class = worker_retry_flags(heartbeat_reader)
+                return PollResult(
+                    False,
+                    failure="job_preempted" if retriable else "job_failed",
+                    detail=str(e),
+                    exclude_class=exclude_class,
+                )
         if status in TERMINAL_FAIL:
             detail = str(st.get("error") or "")[:1500]
             out = st.get("output")
@@ -563,7 +571,11 @@ def worker_retry_flags(heartbeat_reader) -> tuple[bool, bool]:
     hb = heartbeat_reader(force=True)
     if not isinstance(hb, dict):
         return (False, False)
-    return (bool(hb.get("retriable")), bool(hb.get("exclude_class")))
+    retriable = bool(hb.get("retriable"))
+    # exclude_class IMPLIES retriable (a class fault is always retriable): never return it on a
+    # non-retriable failure, so a malformed/stale heartbeat can't trigger class exclusion alone.
+    exclude_class = retriable and bool(hb.get("exclude_class"))
+    return (retriable, exclude_class)
 
 
 def worker_flagged_retriable(heartbeat_reader) -> bool:
