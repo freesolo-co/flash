@@ -181,8 +181,8 @@ def cmd_gpus(args) -> int:
         )
     print(
         "\nTip: GPU allocation is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest class that fits the model across all providers. There is no GPU pin: a concrete\n"
-        'gpu.type in the config is ignored (same as omitting it or setting "cheapest").'
+        "cheapest live-validated class that fits the model across all providers. There is no GPU\n"
+        "knob to set: every run is sized and routed for you."
     )
     return 0
 
