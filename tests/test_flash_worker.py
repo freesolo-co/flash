@@ -389,6 +389,15 @@ def test_runpod_live_function_flag_disables_baked_image(monkeypatch):
     assert jobs._use_baked_worker_image() is False
 
 
+def test_resolve_worker_deps_drops_pypi_chalk_when_staging_wheel(monkeypatch):
+    from flash.providers.runpod.train import resolve_worker_deps
+
+    monkeypatch.delenv("FLASH_CHALK_WHEEL", raising=False)
+    assert any(d.startswith("freesolo-chalk") for d in resolve_worker_deps())
+    monkeypatch.setenv("FLASH_CHALK_WHEEL", "/tmp/freesolo_chalk-0.4.12-py3-none-any.whl")
+    assert not any(d.startswith("freesolo-chalk") for d in resolve_worker_deps())
+
+
 def test_build_worker_env_drops_reserved_disagg_parallel(monkeypatch):
     """Review fix: FLASH_DISAGG_PARALLEL is topology-owned. The allocator's required_vram_gb()
     sizes the inference card from the SUBMITTER os.environ (tp divides the server footprint by

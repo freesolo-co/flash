@@ -162,6 +162,12 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
         if deps:
             return deps
     deps = list(WORKER_DEPS)
+    # Live-function RunPod installs resolve_worker_deps() BEFORE _train_body can fetch the run
+    # artifact. If a local chalk wheel is staged, chalk_extra_pip() installs that wheel after the
+    # fetch and before any model import, so do not also require PyPI to have the same chalk floor at
+    # boot time. This keeps validation of unpublished chalk wheels independent of PyPI release lag.
+    if os.environ.get("FLASH_CHALK_WHEEL"):
+        deps = [d for d in deps if not d.startswith("freesolo-chalk")]
     # fla is kept on ALL arches (incl. Hopper sm90). On Hopper the correctness fix is fla's
     # tilelang backend (baked into WORKER_DEPS + ensured by _ensure_fla_fastpath_on_hopper), NOT
     # dropping fla — keeping it gives the ~4-13x faster / ~2x lighter GDN training the pure-PyTorch
