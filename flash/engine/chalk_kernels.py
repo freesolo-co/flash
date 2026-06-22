@@ -18,7 +18,7 @@ fused-linear-CE (the FLCE that keeps the ~248k-vocab logits from materializing �
 large-vocab OOM protection now comes from chalk, not Liger), RoPE, the LoRA-delta matmul, and
 embedding gather. Situational kernels stay OPT-IN: the fused MLP (overlaps swiglu, measured
 net-negative on H100), the eval-only QKV epilogue (needs q/k/v out of LoRA targets), and the
-Hopper-only FP8 frozen base. Per-kernel ``FLASH_*`` flags are OVERRIDES: ``FLASH_<K>=0`` disables
+FP8 frozen base (sm_89+ Ada / Hopper / Blackwell). Per-kernel ``FLASH_*`` flags are OVERRIDES: ``FLASH_<K>=0`` disables
 a default-on kernel, ``FLASH_<K>=1`` enables an opt-in one. If ``freesolo-chalk`` isn't installed
 (e.g. on the control plane) the whole module degrades to a no-op.
 """
@@ -44,11 +44,12 @@ log = get_logger(__name__)
 #   * fused_lora_delta            — the LoRA-delta matmul on the trainable path (adapters)
 #   * fused_embedding             — the embedding gather
 # Situational kernels stay OPT-IN (default off): the attn epilogue is eval-only (needs q/k/v out of
-# LORA_TARGETS), and the FP8 frozen base is Hopper sm_90+ only. FLASH_<K>=0 turns a default-on kernel
-# OFF; FLASH_<K>=1 turns a default-off one ON. The keyword is exactly chalk's
+# LORA_TARGETS), and the FP8 frozen base needs FP8 hardware: sm_89+ (Ada 4090/L40S/RTX-6000-Ada,
+# Hopper, Blackwell) as of freesolo-chalk 0.4.11 (was sm_90+ only). FLASH_<K>=0 turns a default-on
+# kernel OFF; FLASH_<K>=1 turns a default-off one ON. The keyword is exactly chalk's
 # apply_chalk_kernel_to_qwen35 kwarg. (The bf16 fused-MLP kernel was REMOVED in freesolo-chalk 0.3.2
 # — verified net-negative everywhere and eval-only; its activation fusion is the one swiglu already
-# does. The Hopper/Blackwell base-GEMM lever is the FP8 frozen base below.)
+# does. The Ada/Hopper/Blackwell base-GEMM lever is the FP8 frozen base below.)
 # LARGER-DIM VERIFIED (freesolo-chalk 0.4.7 + 0.4.8): the FULL kernel set (rmsnorm/swiglu/FLCE/
 # trainable QK-norm+RoPE/output-gate/GDN conv+SiLU/GDN native-GVA/lora-delta) is correct fwd+bwd (vs
 # fp32 oracle, grad rel-err ~1e-3) AND wins speed in the production GRPO regime at the REAL 9B (hidden
@@ -68,7 +69,7 @@ _KERNELS: list[tuple[str, str, bool]] = [
     ("FLASH_GDN_KERNEL", "gdn", True),  # chalk-native GDN conv+SiLU (freesolo-chalk 0.4.2) + native-GVA scan pre-op (0.4.5) + post-scan gated-RMSNorm (0.4.9); fla still owns the scan. Full GDN block +13-15% E2E at the production batch/seq regime, VERIFIED H100/A100/A40 + 5090 (0.4.4 arch matrix). Replaces the eager F.silu(F.conv1d) flash runs (causal_conv1d omitted: sdist build fails). 0.4.5: on non-Hopper (sm80/86/120) SKIPS the eager q/k repeat_interleave (lets fla broadcast GVA natively) -> +1.06-1.14x fwd+bwd + ~1.04x less peak mem, VERIFIED A100/A40/5090; gated OFF on Hopper sm90 where fla's tilelang chunk_bwd refuses GVA. 0.4.9: fuses the POST-scan gated-RMSNorm (self.norm = w*rmsnorm(x)*silu(z), the Qwen3_5RMSNormGated) into one row-tiled fwd+bwd Triton kernel replacing BOTH eager AND fla's FusedRMSNormGated -> do_bench vs fla 0.94-1.83x (wins ~11/12 cells) + vs eager 1.03-11.27x, VERIFIED H100 sm90 + A40 sm86 (E2E real-module grads < 8e-3); ~7x MORE accurate than fla (2.8e-3 vs 1.93e-2 vs fp64). Self-test gated, engages only on the standard silu-gated RMSNorm. No new flag (auto-engaged inside install_qwen35_gdn).
     ("FLASH_TRAINABLE_QKV", "trainable_attn_epilogue", True),  # chalk-native TRAINABLE fused QK-norm+partial-RoPE (freesolo-chalk 0.4.3, fwd+bwd). ENGAGES in training with q/k/v in LoRA (the production all-linear case the eval-only attn_epilogue could never hit). Replaces the eager q_norm/k_norm + apply_rotary_pos_emb stack; geomean fwd+bwd H100 2.85x / A100 3.42x / A40 6.32x / 5090 3.18x (0.4.4 arch matrix). 0.4.6: ALSO fuses the post-attention OUTPUT gate (attn_out*sigmoid(gate) before o_proj) into a chalk-native fwd+bwd kernel (independently self-test gated; if only that declines, QK-norm still fuses + gate stays eager) -> +1.47-1.50x fwd+bwd at the production GRPO regime (t=B*L>=4096) + peak-mem win every shape, VERIFIED A40/A100/H100; E2E real-attention grads 6.2e-3. Self-test gated -> eager on any failure. No new flag (auto-gated inside install).
     ("FLASH_QKV_KERNEL", "attn_epilogue", False),  # opt-in (eval-only; needs q/k/v out of LoRA). chalk skips the trainable one when this is on (they patch the same forward).
-    ("FLASH_FP8_BASE", "fp8_frozen_base", False),  # opt-in (Hopper sm_90+ only)
+    ("FLASH_FP8_BASE", "fp8_frozen_base", False),  # opt-in FP8 e4m3 frozen-base GEMM. sm_89+ (Ada 4090/L40S/RTX-6000-Ada, Hopper, Blackwell) as of freesolo-chalk 0.4.11 — gate was sm_90+ only before. LIVE-verified on RTX 4090 (sm_89): fwd GEMM 1.64-1.96x / dx backward 1.34-2.18x / lm_head 1.80x at the production GRPO regime (M=8192), rel ~0.0375 (e4m3 floor, identical to H100), bit-identical fwd (GRPO-safe). Default OFF: flipping default-on still needs a real reward A/B (an SFT-warmstarted Qwen3.5 GRPO with reward variance).
     ("FLASH_FP8_DX", "fp8_dx", False),  # opt-in research lever (only effective WITH FLASH_FP8_BASE; freesolo-chalk 0.4.10). Also runs the frozen-base dx BACKWARD GEMM in FP8 e4m3 (isolated dx 1.23-1.66x H100; full MLP step gate_up 1.11x / down 1.18x, q_proj 0.97x autograd-bound). Near-perfect gradient DIRECTION preservation (dx cosine 0.9997, LoRA-A grad cosine 1.0000 vs exact bf16-dx) but DEFAULT OFF: unlike the frozen FORWARD (fixed-bias e4m3 on a non-updating weight = NF4-QLoRA-safe), the dx error perturbs every adapter gradient -> stays opt-in until a training-reward A/B validates it. Self-test gated inside chalk; suppressed under fp8_free_base.
 ]
 
