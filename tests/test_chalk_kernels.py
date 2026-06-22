@@ -23,6 +23,7 @@ _DEFAULT_ON_FLAGS = (
     "FLASH_TRITON_LORA",
     "FLASH_EMBED_KERNEL",
     "FLASH_GDN_KERNEL",
+    "FLASH_TRAINABLE_QKV",
 )
 _ALL_FLAGS = (
     *_DEFAULT_ON_FLAGS,
@@ -42,6 +43,7 @@ _DEFAULT_KWARGS = {
     "fused_lora_delta": True,
     "fused_embedding": True,
     "gdn": True,
+    "trainable_attn_epilogue": True,
     "attn_epilogue": False,
     "fp8_frozen_base": False,
 }
