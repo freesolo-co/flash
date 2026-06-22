@@ -604,10 +604,14 @@ def test_deploy_lock_is_usable_and_weakly_cleaned():
     assert "run-xyz" not in dict(app_mod._DEPLOY_LOCKS)
 
 
-def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
-    # A recoverable run with no persisted handle (crash between endpoint
-    # registration and on_handle) must have its reconstructable RunPod endpoint
-    # GC'd before being failed, so it doesn't hold worker quota until manual cleanup.
+def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
+    # A recoverable run with no persisted handle (crash in the submit->on_handle window,
+    # before any worker was provisioned) must NOT be lost on a control-plane restart: its
+    # reconstructable RunPod endpoint is GC'd (so it doesn't hold worker quota), then the run
+    # is RESUBMITTED from scratch — there is no remote work to reattach to, so a fresh job is
+    # the only way to preserve the session.
+    import threading
+
     import flash.runner as runner
     import flash.server.db as db_mod
 
@@ -632,11 +636,24 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-1"}])
     gced = []
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: gced.append(s.run_id))
+    # Capture the resubmit instead of provisioning a real GPU; recover_runs resolves _run_job
+    # via a function-local `from flash.runner import _run_job`, so patching the package attr wins.
+    resubmitted = []
+    done = threading.Event()
+
+    def fake_run_job(s):
+        resubmitted.append(s.run_id)
+        done.set()
+
+    monkeypatch.setattr(runner, "_run_job", fake_run_job)
 
     app_mod.recover_runs()
 
-    assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint"
-    assert runner.get_status("nohandle-1").state == "failed"
+    assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
+    assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint first"
+    assert resubmitted == ["nohandle-1"], "no-handle run must be resubmitted, not failed"
+    # The resubmit GC's the orphaned endpoint and re-runs the job; the run is NOT failed.
+    assert runner.get_status("nohandle-1").state != "failed"
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
