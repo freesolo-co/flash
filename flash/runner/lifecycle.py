@@ -61,24 +61,16 @@ def _submit_seed_supervised(
     spec: JobSpec,
     seed: int,
     log,
-    bad_gpu_classes: set[str] | None = None,
-    mig_seen_once: set[str] | None = None,
     *,
     initial_starved: frozenset = frozenset(),
 ) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
-    ``bad_gpu_classes`` is the RUN-level set of GPU classes excluded after one handed back a MIG
-    slice / unusable GPU TWICE (exclude_class). ``mig_seen_once`` tracks classes that MIG'd ONCE so
-    the SECOND occurrence is what excludes them. Both are passed in by the seed loop and SHARED
-    across seeds, so a class found MIG-prone on one seed stays excluded for the rest of the run.
-
     ``initial_starved`` seeds the run-level CAPACITY-STARVED set with ``(provider, gpu)`` tuples the
     caller already knows are starved — used by the recovery path (``attach_run``) when a reattach
     finds the original (provider, class) stuck IN_QUEUE on a ``no_capacity`` failure, so the first
     re-allocation here can't re-pick the just-starved class and the allocator escalates immediately.
-    Unlike ``bad_gpu_classes`` (bare strings, market-wide MIG bans) these are provider-SCOPED: a
-    RunPod IN_QUEUE starvation says nothing about the same class on Vast.
+    These are provider-SCOPED: a RunPod IN_QUEUE starvation says nothing about the same class on Vast.
 
     Each attempt first ALLOCATES the GPU: the cheapest LIVE-VALIDATED class across providers
     (RunPod live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
@@ -131,19 +123,6 @@ def _submit_seed_supervised(
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
     bad_machines: set[int] = set()
-    # GPU CLASSES to walk OFF entirely after the worker flagged one as a class-level fault
-    # (exclude_class — RunPod fulfilled a full-GPU request with a MIG slice, e.g. an "RTX A5000"
-    # that was really a Blackwell MIG partition). Stepping the price walk by one index isn't enough
-    # — the next-cheapest candidate can be the SAME class on another provider — so the whole class
-    # is excluded from re-allocation, walking onto a different validated class (consumer cards like
-    # RTX 4090/5090/3090 can't be MIG-sliced). SHARED across the run's seeds when the loop passes it
-    # in, so a MIG-prone class stays excluded for every subsequent seed.
-    if bad_gpu_classes is None:
-        bad_gpu_classes = set()
-    # Classes that returned a MIG slice ONCE: the second occurrence is what moves them into
-    # bad_gpu_classes (retry the same class once before excluding — a one-off MIG isn't systemic).
-    if mig_seen_once is None:
-        mig_seen_once = set()
     # PROVIDER-SCOPED capacity-starved classes: ``(provider, gpu)`` tuples a submit found stuck
     # IN_QUEUE with no worker (``no_capacity`` — RunPod-only; Vast has no queue). Excluded from
     # re-allocation so the allocator ESCALATES to the next-fitting class (a pin is a PREFERENCE: once
@@ -166,7 +145,7 @@ def _submit_seed_supervised(
             _prov, _gpu = _raw.split(":", 1)
             starved_classes.add((_prov.strip().lower(), _gpu.strip()))
         else:
-            bad_gpu_classes.add(_raw)
+            starved_classes.add(_raw)
     # Index into the ranked candidate list. It advances only after an attempt that
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
@@ -230,12 +209,10 @@ def _submit_seed_supervised(
                 spec.algorithm,
                 disk_gb=spec.gpu.disk_gb,
                 exclude_machine_ids=frozenset(bad_machines),
-                # Walk OFF excluded classes: a MIG / unusable-GPU (RETRIABLE_INFRA_GPU) class is
-                # banned market-wide (bare string), and a capacity-starved (provider, class) is
-                # dropped provider-scoped (tuple) — the allocator then re-allocates to a DIFFERENT
-                # validated class (or ESCALATES a starved pin) instead of re-picking and failing
-                # identically.
-                exclude_gpu_classes=frozenset(bad_gpu_classes) | frozenset(starved_classes),
+                # Walk OFF a capacity-starved (provider, class): it's dropped provider-scoped (tuple)
+                # so the allocator re-allocates to a DIFFERENT validated class (or ESCALATES a starved
+                # pin) instead of re-picking and failing identically.
+                exclude_gpu_classes=frozenset(starved_classes),
                 # Pass the run's train knobs + thinking so the VRAM estimate reflects THIS job's
                 # max_length / group_size / batch_size / lora_rank (and the seq escalation) instead
                 # of the generic defaults — else a long-context / big-group run is sized at seq=1024
@@ -330,36 +307,11 @@ def _submit_seed_supervised(
         # CONCRETE pin (single-candidate list) must retry so the EXCLUSION below lets the allocator
         # escalate the starved pin to a larger fitting class — the old ncand>1 gate is gone.
         infra_shaped = res.failure in ("stalled", "poll_error", "job_preempted", "no_capacity")
-        # A MIG / unusable-GPU failure (worker-flagged exclude_class) MIGHT be a property of the GPU
-        # CLASS or just an unlucky host. Don't over-react on the FIRST one: a retry already lands on
-        # a fresh host (usually a real full GPU), so retry the SAME class once; only when a class
-        # hands back a MIG slice a SECOND time do we treat it as class-systemic and exclude it for
-        # the rest of the run (shared across seeds) — re-allocating OFF it onto a different validated
-        # class (consumer cards can't be MIG-sliced). Avoids a needless price jump on a one-off MIG.
-        mig_failure = res.exclude_class
-        if mig_failure and chosen is not None:
-            if chosen.gpu in mig_seen_once:
-                bad_gpu_classes.add(chosen.gpu)
-                print(
-                    f"retry: excluding GPU class {chosen.gpu!r} for the rest of this run "
-                    "(handed back a MIG slice / unusable GPU TWICE); re-allocating to a different class",
-                    file=log,
-                    flush=True,
-                )
-            else:
-                mig_seen_once.add(chosen.gpu)
-                print(
-                    f"retry: GPU class {chosen.gpu!r} returned a MIG slice / unusable GPU; "
-                    "retrying the SAME class once on a fresh host before excluding it",
-                    file=log,
-                    flush=True,
-                )
         # A capacity-starved class (no_capacity: stuck IN_QUEUE, no worker) is excluded
         # PROVIDER-SCOPED so re-allocation escalates off the starved (provider, class) — to a
         # different validated class, or up from a starved pin to a larger fitting one — while the
-        # SAME class on another provider (which may have capacity) stays selectable. Unlike a MIG
-        # ban this fires on the FIRST occurrence: an IN_QUEUE starvation won't clear on a retry of
-        # the same class, so there's no "retry once" grace.
+        # SAME class on another provider (which may have capacity) stays selectable. It fires on the
+        # FIRST occurrence: an IN_QUEUE starvation won't clear on a retry of the same class.
         starved_failure = res.failure == "no_capacity"
         if starved_failure and chosen is not None:
             starved_classes.add((chosen.provider, chosen.gpu))
@@ -390,10 +342,10 @@ def _submit_seed_supervised(
         # Step to the next-cheapest class only when THIS attempt actually provisioned one
         # and it failed infra-shaped. An allocation/pricing failure (chosen is None) never
         # tried a card, so the next attempt must retry from the cheapest, not walk past it.
-        # A MIG or no_capacity failure already walks the run forward by EXCLUDING the class (the next
+        # A no_capacity failure already walks the run forward by EXCLUDING the class (the next
         # allocation drops it, so candidate[0] is the next class) — advancing the offset too would
         # over-walk and skip the new cheapest, so only the throttle/stall walk bumps the offset.
-        if chosen is not None and not mig_failure and not starved_failure:
+        if chosen is not None and not starved_failure:
             gpu_walk_offset += 1
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones
@@ -436,11 +388,6 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
 
     total_cost = prior_cost
     seeds = spec.train.seeds
-    # Shared across seeds: a GPU class confirmed MIG-prone (MIG'd twice) stays excluded for the
-    # rest of the run, and a class that MIG'd once is remembered so its next MIG excludes it —
-    # instead of re-discovering both seed by seed.
-    bad_gpu_classes: set[str] = set()
-    mig_seen_once: set[str] = set()
     for i in range(start_index, len(seeds)):
         seed = seeds[i]
         # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped
@@ -458,9 +405,7 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
             file=log,
             flush=True,
         )
-        metrics = _submit_seed_supervised(
-            spec, seed, log, bad_gpu_classes=bad_gpu_classes, mig_seen_once=mig_seen_once
-        )
+        metrics = _submit_seed_supervised(spec, seed, log)
         total_cost += _persist_metrics(spec, seed, metrics)
         # A cancel can land while this thread writes metrics — after the supervised
         # late-cancel check. Re-read before the post-seed status writes so a late

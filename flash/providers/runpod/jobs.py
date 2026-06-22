@@ -351,13 +351,12 @@ def poll_job(
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:
                 # COMPLETED but the output decodes as an error (a handler exception). Consult the
-                # worker flags too: a MIG slice can surface here, and must still retry / walk class.
-                retriable, exclude_class = worker_retry_flags(heartbeat_reader)
+                # worker flag too: an infra failure can surface here and must still retry.
+                retriable = worker_flagged_retriable(heartbeat_reader)
                 return PollResult(
                     False,
                     failure="job_preempted" if retriable else "job_failed",
                     detail=str(e),
-                    exclude_class=exclude_class,
                 )
         if status in TERMINAL_FAIL:
             detail = str(st.get("error") or "")[:1500]
@@ -373,13 +372,12 @@ def poll_job(
             # heartbeat read entirely (no worker error there, and it may not even exist yet).
             if status in PLATFORM_TERMINATIONS:
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
-            # A worker FAILED: consult the structured worker flags (one forced heartbeat read).
-            retriable, exclude_class = worker_retry_flags(heartbeat_reader)
+            # A worker FAILED: consult the structured worker flag (one forced heartbeat read).
+            retriable = worker_flagged_retriable(heartbeat_reader)
             return PollResult(
                 False,
                 failure="job_preempted" if retriable else "job_failed",
                 detail=f"[{status}] {detail}",
-                exclude_class=exclude_class,
             )
         # Capacity backstop: bound how long the job may sit IN_QUEUE (no worker has accepted it).
         # The throttled/unhealthy fast-fails below only arm when endpoint_health succeeds AND RunPod
@@ -600,23 +598,13 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
     return read
 
 
-def worker_retry_flags(heartbeat_reader) -> tuple[bool, bool]:
-    """``(retriable, exclude_class)`` from the worker's last heartbeat — the structured
-    worker<->poller contract that replaces failure-detail parsing. ``retriable`` means a
-    RetriableInfraError (retry on a fresh host); ``exclude_class`` means the GPU CLASS is at fault
-    (a MIG slice), so the retry must re-allocate OFF it. Forces a fresh read past the rate limit."""
+def worker_flagged_retriable(heartbeat_reader) -> bool:
+    """True if the worker stamped ``retriable`` (a RetriableInfraError) in its last heartbeat — the
+    structured worker<->poller contract that replaces failure-detail parsing: ``retriable`` means
+    retry on a fresh worker. Forces a fresh read past the rate limit."""
     if heartbeat_reader is None:
-        return (False, False)
+        return False
     hb = heartbeat_reader(force=True)
     if not isinstance(hb, dict):
-        return (False, False)
-    retriable = bool(hb.get("retriable"))
-    # exclude_class IMPLIES retriable (a class fault is always retriable): never return it on a
-    # non-retriable failure, so a malformed/stale heartbeat can't trigger class exclusion alone.
-    exclude_class = retriable and bool(hb.get("exclude_class"))
-    return (retriable, exclude_class)
-
-
-def worker_flagged_retriable(heartbeat_reader) -> bool:
-    """True if the worker stamped ``retriable`` (RetriableInfraError). See ``worker_retry_flags``."""
-    return worker_retry_flags(heartbeat_reader)[0]
+        return False
+    return bool(hb.get("retriable"))

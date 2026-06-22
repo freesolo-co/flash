@@ -30,11 +30,8 @@ def _patch_common(monkeypatch, fake_exit):
     monkeypatch.setattr(worker, "RUN_MODE", "sft")
     monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
-    # main() runs the real boot guards before the handler; this test exercises the hard-exit flow,
-    # not the GPU guard, so stub them out. (assert_usable_gpu now SURFACES a torch import failure
-    # and raises on a missing/uninitialized CUDA device — both true in a torch-less / GPU-less CI
-    # box — so it must be mocked here rather than relied on to silently return.)
-    monkeypatch.setattr(worker, "assert_usable_gpu", lambda: None)
+    # main() runs the real boot steps before the handler; this test exercises the hard-exit flow,
+    # so stub out the Hopper fla fast-path guard and the alloc-conf finalize.
     monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
     monkeypatch.setattr(worker, "finalize_alloc_conf_for_sleep", lambda: None)
 

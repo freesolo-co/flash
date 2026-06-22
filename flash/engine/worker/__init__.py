@@ -74,7 +74,6 @@ from flash.engine.worker.perf import (
     _remove_fla_from_disk,  # noqa: F401
     _reset_peak_gpu,
     _sdpa_cudnn_ctx,
-    assert_usable_gpu,
     flex_attn_status,
     free_gpu,
     fused_optim_name,
@@ -88,16 +87,6 @@ from flash.engine.worker.perf import (
 )
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
-
-# Disable PyTorch's NVML-based CUDA availability check BEFORE any torch/CUDA import. On a
-# MIG slice / permission-restricted host (RunPod has fulfilled full-GPU requests with a MIG
-# partition whose nvidia-smi reads "[Insufficient Permissions]"), the NVML-based check makes
-# the caching allocator HARD-ASSERT mid-backward ("NVML_SUCCESS == r INTERNAL ASSERT FAILED
-# ... CUDACachingAllocator"). Falling back to the non-NVML check lets the dedicated boot guard
-# (assert_usable_gpu) detect the bad host and raise a RETRIABLE infra error instead of crashing
-# opaquely deep in training. setdefault so an explicit operator/launcher value still wins. Read
-# lazily by torch at first CUDA use, so setting it at import (before any torch import) is in time.
-os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "0")
 
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
@@ -1807,7 +1796,7 @@ def run_rl():
             return False
 
         # fp8 KV cache only where the silicon has native fp8 (compute capability >= 8.9: Ada /
-        # Hopper / Blackwell) — ~halves the rollout KV pool. Ampere (A100/A5000/3090, sm80) lacks
+        # Hopper / Blackwell) — ~halves the rollout KV pool. Ampere (A100/A6000/3090) lacks
         # fp8, so it stays fp16 there (forcing it on would error / silently emulate).
         # On the disaggregated DDP LAUNCHER a torch CUDA probe here would bind a context on the first
         # trainer card that lingers while the accelerate child trains on it (VRAM theft / rank-0 OOM
@@ -2199,17 +2188,11 @@ def main():
         # (CUDA_VISIBLE_DEVICES is honored only before the first context). _pin is CUDA-free.
         _pin_trainer_devices_for_disaggregated()
         heartbeat("boot")  # signal liveness before any slow setup (Hopper fla/tilelang install)
-        # Boot guard: a MIG slice / NVML-restricted host (RunPod has fulfilled a full-GPU request
-        # with a MIG partition) makes PyTorch's allocator NVML-assert mid-backward. Detect it now
-        # and raise the RETRIABLE infra error so the control plane resubmits on a fresh worker,
-        # instead of crashing opaquely deep in training as a non-retried job_failed.
-        assert_usable_gpu()
         # Hopper: enable the fla+tilelang GDN FAST PATH (#66 — keep fla via tilelang instead of the
         # lossy _drop_fla). SKIP on the multi-trainer DDP launcher (it trains nothing — re-execs under
         # accelerate; children handle fla rank-local), else the probe binds a CUDA context on rank 0
-        # and OOMs it on a tight split. AFTER the GPU guard so a MIG/unusable host bails RETRIABLE
-        # before the multi-minute tilelang/fla install; before any model import (transformers gates
-        # GDN on is_fla_available() at load).
+        # and OOMs it on a tight split. Before any model import (transformers gates GDN on
+        # is_fla_available() at load).
         if _is_disaggregated_ddp_launcher():
             print("[hopper] disaggregated DDP launcher: skip fla fast-path (children handle it rank-local)")
         else:
@@ -2235,10 +2218,8 @@ def main():
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
-        # Structured retry signal both pollers read: infra failure -> retry on a fresh worker;
-        # exclude_class -> the GPU class is at fault (MIG), so re-allocate OFF it.
+        # Structured retry signal both pollers read: an infra failure -> retry on a fresh worker.
         retriable = isinstance(e, RetriableInfraError)
-        exclude_class = bool(getattr(e, "exclude_class", False))
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
@@ -2249,7 +2230,7 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        hb_flags = {"retriable": retriable, "exclude_class": exclude_class}
+        hb_flags = {"retriable": retriable}
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:

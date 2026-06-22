@@ -16,7 +16,7 @@ from flash.spec import JobSpec
 
 
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
-    gpu = {"type": "RTX A5000", "max_retries": 2}
+    gpu = {"type": "RTX 3090", "max_retries": 2}
     gpu.update(gpu_kw)
     return JobSpec.from_dict(
         {
@@ -142,7 +142,7 @@ def test_failover_crosses_providers_and_blacklists_machine(orch, monkeypatch):
         allocate_calls.append(kw["exclude_machine_ids"])
         if not kw["exclude_machine_ids"]:
             return _alloc(offer=offer, provider_offers=[offer])
-        return _alloc(provider="runpod", gpu="RTX A5000", rate=0.27)
+        return _alloc(provider="runpod", gpu="RTX 3090", rate=0.46)
 
     monkeypatch.setattr(allocator, "allocate", fake_allocate)
 

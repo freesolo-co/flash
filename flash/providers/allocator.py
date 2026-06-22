@@ -198,12 +198,10 @@ def _params_b_for_vram(model_id: str) -> float | None:
 def _is_excluded(provider: str, gpu: str, exclude_gpu_classes: frozenset) -> bool:
     """Whether a (provider, gpu) candidate is excluded by ``exclude_gpu_classes``.
 
-    Two exclusion forms coexist in the same set:
-      - a BARE class string (e.g. ``"A100 SXM"``) excludes the class MARKET-WIDE, on every provider
-        — the MIG-walk form (a class RunPod fulfilled with a MIG slice is bad everywhere).
-      - a ``(provider, gpu)`` TUPLE excludes the class on ONLY that provider — the no_capacity form:
-        a RunPod IN_QUEUE starvation says nothing about the SAME class on Vast, so only RunPod's
-        offer of it is dropped while Vast's survives.
+    Exclusions are provider-SCOPED ``(provider, gpu)`` tuples — the no_capacity form: a RunPod
+    IN_QUEUE starvation says nothing about the SAME class on Vast, so only RunPod's offer of it is
+    dropped while Vast's survives. (A bare class string, if ever passed, is treated as a market-wide
+    ban across every provider.)
     """
     return gpu in exclude_gpu_classes or (provider, gpu) in exclude_gpu_classes
 
@@ -212,16 +210,9 @@ def _runpod_candidates(need: int, exclude_gpu_classes: frozenset) -> list[Candid
     """RunPod's fitting, live-validated classes priced live (static fallback).
 
     Restricted to the validated pool (``g.validated``): the deployed control plane rejects a submit
-    for any non-validated class, so allocating one would only fail at submit time. Any class
-    excluded by ``exclude_gpu_classes`` (bare string = market-wide; ``("runpod", gpu)`` tuple =
-    RunPod-scoped) is dropped — used to walk OFF a MIG-prone class market-wide, or off a
+    for any non-validated class, so allocating one would only fail at submit time. A class excluded
+    by ``exclude_gpu_classes`` (a ``("runpod", gpu)`` tuple) is dropped — used to walk OFF a
     capacity-starved RunPod class while leaving the same class on another provider selectable.
-
-    Classes flagged ``runpod_mig_risk`` are ALSO skipped UP FRONT on RunPod: RunPod has been observed
-    serving these validated *types* (RTX A5000, RTX Pro 6000 WK) as Blackwell MIG slices, which crash
-    training (PyTorch's CUDA allocator NVML-asserts on MIG partitions) and burn the run after the
-    retry budget. The flag is RunPod-specific — these classes stay in the validated pool and remain
-    eligible on Vast (which rents whole boards), so this exclusion does NOT touch ``_vast_candidates``.
     """
     provider = get_provider("runpod")
     return [
@@ -229,7 +220,6 @@ def _runpod_candidates(need: int, exclude_gpu_classes: frozenset) -> list[Candid
         for g in provider.gpu_classes()
         if g.vram_gb >= need
         and g.validated
-        and not g.runpod_mig_risk
         and not _is_excluded("runpod", g.name, exclude_gpu_classes)
     ]
 
@@ -265,8 +255,8 @@ def _vast_candidates(
             continue
         if not GPU_INFO[o.gpu].validated:  # only offer live-validated classes the server accepts
             continue
-        # walked OFF this class (MIG-prone market-wide via a bare string, or this provider's
-        # capacity-starved offer via a ("vast", gpu) tuple) on the infra retry
+        # walked OFF this provider's capacity-starved offer via a ("vast", gpu) tuple on the
+        # no_capacity infra retry
         if _is_excluded("vast", o.gpu, exclude_gpu_classes):
             continue
         seen.add(o.gpu)
@@ -299,12 +289,10 @@ def allocate(
     2000 Ada") would just make the server refuse the run. ``train``/``thinking`` size the
     requirement to the run's actual knobs (context, group, rank, batch) via the matrix.
 
-    ``exclude_gpu_classes`` drops candidates from the pool in TWO forms that coexist in one set:
-    a BARE class string excludes the class MARKET-WIDE (the MIG-walk: a class RunPod fulfilled with a
-    Blackwell MIG slice is bad on every provider, so the retry re-allocates to a DIFFERENT validated
-    class a consumer card can't MIG-slice); a ``(provider, gpu)`` TUPLE excludes the class on ONLY
-    that provider (the no_capacity walk: a RunPod IN_QUEUE starvation says nothing about the SAME
-    class on Vast, so only RunPod's offer of it is dropped while Vast's stays selectable).
+    ``exclude_gpu_classes`` drops candidates from the pool via ``(provider, gpu)`` TUPLES that
+    exclude a class on ONLY that provider (the no_capacity walk: a RunPod IN_QUEUE starvation says
+    nothing about the SAME class on Vast, so only RunPod's offer of it is dropped while Vast's stays
+    selectable). A bare class string, if passed, bans the class market-wide.
     """
     exclude_gpu_classes = frozenset(exclude_gpu_classes)
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
