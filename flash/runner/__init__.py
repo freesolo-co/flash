@@ -155,7 +155,7 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _run_job_background(spec: JobSpec) -> None:
+def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     """Daemon-thread entrypoint for background runs.
 
     ``_run_job`` -> ``_run_job_inner`` persists the terminal state (failed/cancelled) BEFORE the
@@ -171,7 +171,10 @@ def _run_job_background(spec: JobSpec) -> None:
     import logging
 
     try:
-        _run_job(spec)
+        if runtime_secrets:
+            _run_job(spec, runtime_secrets=runtime_secrets)
+        else:
+            _run_job(spec)
     except Exception as e:
         # _run_job -> _run_job_inner normally persists the terminal failure before its re-raise, but a
         # crash before that persist point would leave the run stuck non-terminal. Record `failed` ONLY
@@ -186,7 +189,12 @@ def _run_job_background(spec: JobSpec) -> None:
         logging.getLogger(__name__).warning("background run %s ended in error: %s", spec.run_id, e)
 
 
-def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -> RunStatus:
+def submit_job(
+    spec: JobSpec,
+    dry_run: bool = False,
+    background: bool = False,
+    runtime_secrets: dict[str, str] | None = None,
+) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     across the configured providers (RunPod Flash or Vast); dry-run only records state."""
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
@@ -204,9 +212,16 @@ def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -
         _save_status(status)
         return status
     if background:
-        threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+        threading.Thread(
+            target=_run_job_background,
+            args=(spec, runtime_secrets or {}),
+            daemon=True,
+        ).start()
         return get_status(spec.run_id)
-    _run_job(spec)
+    if runtime_secrets:
+        _run_job(spec, runtime_secrets=runtime_secrets)
+    else:
+        _run_job(spec)
     return get_status(spec.run_id)
 
 
