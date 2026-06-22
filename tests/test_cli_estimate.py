@@ -157,13 +157,36 @@ def test_sft_steps_max_examples_zero_means_no_cap(monkeypatch):
     assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
 
 
-def test_sft_steps_unpinned_raises_when_env_cannot_be_counted(monkeypatch):
-    # If the env can't be loaded to count (not installed / offline), pricing fails loudly with
-    # guidance instead of guessing a dataset size.
+def test_sft_steps_unpinned_falls_back_when_env_cannot_be_counted(monkeypatch, capsys):
+    # A Hub env usually isn't importable in the cost path's venv (`flash env install` puts it in a
+    # separate `prime` env), so counting returns None. Pricing must NOT hard-fail: it falls back to
+    # a representative default example count (with a clear warning) so `flash train --cost` still
+    # produces a quote without pinning [train].max_examples.
+    from flash.cost.spec import DEFAULT_UNCOUNTED_SFT_EXAMPLES
+
     monkeypatch.setattr("flash.cost.spec.count_env_examples", lambda env_id, params=None: None)
     spec = _sft_spec(batch_size=16, epochs=2)
-    with pytest.raises(ValueError, match="max_examples"):
-        _spec_steps(spec)
+    steps = _spec_steps(spec)
+    # epochs(2) x ceil(default / 16), using the same realized batch the worker uses.
+    assert steps == _worker_sft_steps(
+        examples=DEFAULT_UNCOUNTED_SFT_EXAMPLES, requested_batch=16, epochs=2
+    )
+    assert steps > 0
+    warning = capsys.readouterr().err
+    assert "could not count training examples" in warning
+    assert "max_examples" in warning  # the warning still points at the exact-cost knob
+
+
+def test_sft_steps_pinned_examples_skips_the_uncounted_fallback(monkeypatch, capsys):
+    # An explicit [train].max_examples must price exactly that, never touching the env-count
+    # fallback (no warning, no default).
+    monkeypatch.setattr(
+        "flash.cost.spec.count_env_examples",
+        lambda env_id, params=None: (_ for _ in ()).throw(AssertionError("should not count")),
+    )
+    spec = _sft_spec(max_examples=320, batch_size=16, epochs=2)
+    assert _spec_steps(spec) == _worker_sft_steps(examples=320, requested_batch=16, epochs=2) == 40
+    assert "could not count" not in capsys.readouterr().err
 
 
 def test_sft_max_steps_caps_the_derived_count():
