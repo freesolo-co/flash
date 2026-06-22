@@ -54,13 +54,17 @@ class RunpodProvider:
         attempt: int = 0,
         offers: Any = None,
         exclude_machine_ids: Any = frozenset(),
+        runtime_secrets: dict[str, str] | None = None,
     ) -> PollResult:
         # ``offers``/``exclude_machine_ids`` are Vast live-market concerns; RunPod
         # provisions a fresh serverless endpoint and never re-searches a market, so it
         # ignores both (kept in the signature for cross-provider symmetry).
         from flash.providers.runpod.jobs import submit_run
 
-        return submit_run(spec, seed, log=log, on_handle=on_handle, attempt=attempt)
+        kwargs = {"log": log, "on_handle": on_handle, "attempt": attempt}
+        if runtime_secrets:
+            kwargs["runtime_secrets"] = runtime_secrets
+        return submit_run(spec, seed, **kwargs)
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle

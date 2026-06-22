@@ -102,7 +102,12 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
     return f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"
 
 
-def build_payload(spec, seed: int, attempt: int) -> dict:
+def build_payload(
+    spec,
+    seed: int,
+    attempt: int,
+    runtime_secrets: dict[str, str] | None = None,
+) -> dict:
     """The bootstrap's input — field-compatible with _train_body's, plus the bits the
     instance can't infer (HF prefix for markers, wall cap, attempt)."""
     from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
@@ -113,7 +118,7 @@ def build_payload(spec, seed: int, attempt: int) -> dict:
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
-        "env": build_worker_env(spec, seed),
+        "env": build_worker_env(spec, seed, runtime_secrets=runtime_secrets),
         # The Vast bootstrap pip-installs extra_pip for every job (provider/vast/_bootstrap.py),
         # so the opt-in chalk spec rides along here to reach default runs — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
