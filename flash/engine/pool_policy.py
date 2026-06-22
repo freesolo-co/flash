@@ -162,15 +162,17 @@ def build_lora_policy_update(
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     on_gpu = dev == "cuda" or (isinstance(dev, str) and dev.startswith("cuda"))
 
-    # (1) FLA-drop: Qwen3.5/3.6 GDN crashes under Triton>=3.4 fla on Hopper — uninstall fla so the
-    # native delta path runs (dev's _drop_fla_on_hopper, GPU-only; no-op elsewhere).
+    # (1) Hopper GDN safety: Qwen3.5/3.6 GDN crashes under Triton>=3.4 fla on Hopper. The worker
+    # no longer uninstalls fla — it ensures the fla+tilelang GDN fast path instead (the old
+    # _drop_fla_on_hopper was replaced by _ensure_fla_fastpath_on_hopper); call the current function
+    # so the broken import no longer silently no-ops the guard. GPU-only; no-op elsewhere.
     if oc.drop_fla and on_gpu:
         try:
-            from flash.engine.worker.perf import _drop_fla_on_hopper
+            from flash.engine.worker.perf import _ensure_fla_fastpath_on_hopper
 
-            _drop_fla_on_hopper()
+            _ensure_fla_fastpath_on_hopper()
         except Exception as e:  # never abort training on the guard
-            print(f"[pool_policy] drop_fla skipped: {e}", flush=True)
+            print(f"[pool_policy] Hopper fla fast-path setup skipped: {e}", flush=True)
 
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
