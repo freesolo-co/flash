@@ -488,7 +488,7 @@ def test_worker_env_rejects_secret_keys(key: str) -> None:
         "RL_VLLM_MAX_BATCHED_TOKENS",  # word TOKENS, not the secret word TOKEN
         "SORT_KEY",  # bare KEY without a secret qualifier
         "WANDB_ENTITY",  # account routing, not a secret
-        "FLASH_MLP_KERNEL",
+        "FLASH_QKV_KERNEL",
         "VLLM_ATTENTION_BACKEND",
     ],
 )

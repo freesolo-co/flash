@@ -501,6 +501,62 @@ def force_vllm_backend_for_sm120() -> str | None:
     return "FLASHINFER"
 
 
+def patch_trl_colocate_vllm_args(vllm_max_len: int, want_fp8_kv: bool) -> None:
+    """Inject rollout-throughput + fp8-KV knobs into TRL's colocated ``vllm.LLM`` constructor.
+
+    TRL 1.6's colocate path builds its ``vllm.LLM`` engine with a FIXED arg set
+    (``trl/generation/vllm_generation.py``): ``max_num_batched_tokens`` is HARDCODED to 4096 and
+    there is NO passthrough for ``kv_cache_dtype`` — so neither can be set through any GRPOConfig
+    field (the ``vllm_*`` GRPOConfig knobs don't exist in 1.6). We therefore wrap ``vllm.LLM.__init__``
+    to override these for the colocated rollout engine. Idempotent (re-wrapping is guarded).
+
+    Two independent, DEFAULT-PRESERVING levers, each off unless its env flag is set:
+
+    * ``FLASH_ROLLOUT_TUNE`` (#50 knob sweep): raise ``max_num_batched_tokens`` from TRL's profiler-
+      shy 4096 to ``max(8192, vllm_max_len)`` so the prefill of a GRPO group (the same prompt prefix,
+      ``num_generations`` times) isn't chunked into tiny pieces. ``max_num_seqs`` is left to TRL (it sizes
+      it from the per-device completion batch); raising it past that doesn't add concurrent seqs.
+      ``gpu_memory_utilization`` is owned by the GRPOConfig field (0.45) and the sleep-mode gate, so we
+      do NOT touch it here (over-raising it OOMs the colocated trainer).
+    * ``FLASH_FP8_KV`` (#42/#43): set ``kv_cache_dtype="fp8"`` to ~halve the rollout KV pool on sm89+
+      silicon (the caller passes ``want_fp8_kv`` already gated on compute-cap >= 8.9). vLLM's e4m3 KV
+      is near-lossless for decode; ``calculate_kv_scales=True`` is added so per-tensor scales are
+      computed at runtime (avoids the static-scale accuracy cliff). NOTE: vLLM folds FP8 *attention*
+      into this same fp8 KV path on the v1 FLASHINFER/FA backends — there is no separate "fp8 attn"
+      engine flag to set, so fp8-KV IS the fp8-attention lever here.
+
+    No-op (returns) when neither flag is on. Never raises (a missing vllm import / older signature
+    just leaves TRL's defaults — the run still trains)."""
+    tune = os.environ.get("FLASH_ROLLOUT_TUNE", "").strip().lower() in ("1", "true", "yes")
+    if not tune and not want_fp8_kv:
+        return
+    try:
+        import vllm
+    except Exception as e:  # pragma: no cover - vllm always present on the worker
+        print("[rl] rollout-knob patch skipped (vllm import failed):", e)
+        return
+    LLM = vllm.LLM
+    if getattr(LLM.__init__, "_flash_rollout_patched", False):
+        return
+    _orig_init = LLM.__init__
+    _batched = max(8192, int(vllm_max_len)) if tune else None
+
+    def _patched_init(self, *args, **kwargs):
+        if _batched is not None:
+            # Only RAISE it (never shrink a value an operator/TRL set higher).
+            cur = kwargs.get("max_num_batched_tokens")
+            if cur is None or int(cur) < _batched:
+                kwargs["max_num_batched_tokens"] = _batched
+                print(f"[rl] rollout tune: max_num_batched_tokens={_batched} (was {cur})")
+        if want_fp8_kv and not kwargs.get("kv_cache_dtype"):
+            kwargs["kv_cache_dtype"] = "fp8"
+            kwargs.setdefault("calculate_kv_scales", True)
+            print("[rl] fp8 KV cache (kv_cache_dtype=fp8, calculate_kv_scales) on colocated rollout")
+        return _orig_init(self, *args, **kwargs)
+
+    _patched_init._flash_rollout_patched = True  # type: ignore[attr-defined]
+    LLM.__init__ = _patched_init
+
 
 def finalize_alloc_conf_for_sleep() -> None:
     """Sync the CUDA allocator conf with the worker's RESOLVED vLLM sleep default.
@@ -652,6 +708,16 @@ def make_lora(model_id: str | None = None):
     # catalog LR needs to stay sane / the linkd-search re-check / a serve-safety re-check).
     kwargs["use_rslora"] = os.environ.get("FLASH_USE_RSLORA", "1").strip().lower() not in ("0", "false", "no")
     print(f"[lora] use_rslora={kwargs['use_rslora']}")
+    # DoRA (weight-decomposed LoRA): adds a per-output-channel MAGNITUDE vector to the adapter
+    # alongside the usual A/B direction matrices. Unlike PiSSA it does NOT mutate the effective base
+    # (no low-precision base merge), so the saved adapter reconstructs correctly onto the ORIGINAL
+    # base at SERVE and GRPO WARM-START -> serve/warm-start-SAFE and no GRPO importance-ratio
+    # collapse. Quality lever (paper: +1-4.4% over plain LoRA), no inference overhead once merged.
+    # Default-OFF (FLASH_USE_DORA unset/0) so the default recipe is byte-identical; =1 enables it for
+    # the A/B quality test. (Note: DoRA adds a small training-time cost from the per-step weight-norm.)
+    if os.environ.get("FLASH_USE_DORA", "").strip().lower() in ("1", "true", "yes"):
+        kwargs["use_dora"] = True
+        print("[lora] use_dora=True (weight-decomposed LoRA; serve/warm-start-safe magnitude vector)")
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
         if exclude:
@@ -890,7 +956,18 @@ def run_sft():
     mik = {"dtype": "bfloat16", "device_map": None}
     if _attn:
         mik["attn_implementation"] = _attn
-    cfg_kwargs["model_init_kwargs"] = mik
+    # Warm-start: when train.init_from_adapter is set, CONTINUE the prior-stage adapter (SFT->SFT or
+    # GRPO->SFT chain) instead of training a fresh LoRA from the base model. _init_adapter_model loads
+    # the base + the prior adapter as a trainable PeftModel (and asserts the LoRA actually applied, so
+    # a key-mismatch fails loudly rather than silently restarting from base). We then hand TRL the
+    # built PeftModel with peft_config=None (it trains the loaded adapter) and DROP model_init_kwargs
+    # (the model is already materialized; passing model_init_kwargs with a model object errors in TRL).
+    # Without this the SFT stage of a warm-start chain SILENTLY discarded init_from_adapter and trained
+    # from scratch (loss restarted ~14 instead of continuing the prior stage).
+    _sft_init_model, _sft_init_peft = _init_adapter_model(model_id)
+    _sft_warm_started = _sft_init_peft is None  # _init_adapter_model loaded a real adapter
+    if not _sft_warm_started:
+        cfg_kwargs["model_init_kwargs"] = mik
     cfg = TRLSFTConfig(**cfg_kwargs)
 
     # LoRA+ (convergence lever, arXiv 2402.12354; always-on: measured -52% train loss in A/B
@@ -975,14 +1052,21 @@ def run_sft():
 
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
+    # Warm-start (init_from_adapter set): pass the already-built PeftModel + peft_config=None so TRL
+    # continues the loaded adapter; otherwise the string model_id + a fresh make_lora LoRA.
     trainer = _SFT(
-        model=model_id,
+        model=_sft_init_model if _sft_warm_started else model_id,
         args=cfg,
         train_dataset=ds,
-        peft_config=make_lora(model_id),
+        peft_config=None if _sft_warm_started else make_lora(model_id),
         processing_class=tok,
         callbacks=[make_checkpoint_upload_callback()],
     )
+    if _sft_warm_started:
+        print(
+            f"[sft] warm-start: continuing adapter from train.init_from_adapter="
+            f"{(JOB_SPEC.train.init_from_adapter if JOB_SPEC else '')!r} (peft_config=None)"
+        )
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
     # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
     # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
@@ -1805,16 +1889,28 @@ def run_rl():
         # paths (already bound to their own device) take the torch probe. nvidia-smi unavailable ->
         # default to no fp8 (safe: a larger fp16 KV pool, never OOM).
         if _is_disaggregated_ddp_launcher():
-            _want_fp8 = bool(_fp8_native_no_cuda_context())
+            _fp8_native = bool(_fp8_native_no_cuda_context())
         else:
             try:
                 import torch as _torch
 
-                _want_fp8 = _torch.cuda.get_device_capability() >= (8, 9)
+                _fp8_native = _torch.cuda.get_device_capability() >= (8, 9)
             except Exception:
-                _want_fp8 = False
+                _fp8_native = False
+        # fp8 KV is GATED by BOTH the silicon (sm89+) AND the FLASH_FP8_KV flag. TRL 1.6's colocate
+        # path has NO kv_cache_dtype passthrough (the _set_vllm_field below is a dead no-op there: the
+        # field doesn't exist in GRPOConfig 1.6), so fp8 KV is applied by monkeypatching TRL's vllm.LLM
+        # constructor (patch_trl_colocate_vllm_args, installed just below). FLASH_FP8_KV default-OFF
+        # while A/B-validating on linkd; flip the default to "1" once the memory win is confirmed
+        # quality-neutral. (The dead _set_vllm_field call is kept for the day TRL adds the field.)
+        _fp8_flag = os.environ.get("FLASH_FP8_KV", "0").strip().lower() in ("1", "true", "yes")
+        _want_fp8 = _fp8_native and _fp8_flag
         if _want_fp8:
             _set_vllm_field(("vllm_kv_cache_dtype", "kv_cache_dtype"), "fp8", "fp8 KV cache")
+        # TRL 1.6 colocate hardcodes max_num_batched_tokens=4096 + has no kv_cache_dtype passthrough,
+        # so wrap vllm.LLM.__init__ to inject the throughput knob (FLASH_ROLLOUT_TUNE) and fp8 KV
+        # (FLASH_FP8_KV, already sm89-gated via _want_fp8). No-op if neither lever is requested.
+        patch_trl_colocate_vllm_args(vllm_max_len, _want_fp8)
         # PREFIX CACHING: every GRPO group of `num_generations` rollouts shares the SAME prompt
         # prefix, so caching the prompt KV computes it once and reuses it — the dominant rollout win
         # on one GPU. CHUNKED PREFILL interleaves prefill with decode so a long prompt doesn't stall

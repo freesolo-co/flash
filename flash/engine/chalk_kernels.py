@@ -43,10 +43,12 @@ log = get_logger(__name__)
 #   * rope                        — the RoPE Liger REFUSED on the qwen3.5 hybrid arch
 #   * fused_lora_delta            — the LoRA-delta matmul on the trainable path (adapters)
 #   * fused_embedding             — the embedding gather
-# Situational kernels stay OPT-IN (default off): the fused MLP overlaps swiglu (measured
-# net-negative on H100), the attn epilogue is eval-only (needs q/k/v out of LORA_TARGETS), and the
-# FP8 frozen base is Hopper sm_90+ only. FLASH_<K>=0 turns a default-on kernel OFF; FLASH_<K>=1
-# turns a default-off one ON. The keyword is exactly chalk's apply_chalk_kernel_to_qwen35 kwarg.
+# Situational kernels stay OPT-IN (default off): the attn epilogue is eval-only (needs q/k/v out of
+# LORA_TARGETS), and the FP8 frozen base is Hopper sm_90+ only. FLASH_<K>=0 turns a default-on kernel
+# OFF; FLASH_<K>=1 turns a default-off one ON. The keyword is exactly chalk's
+# apply_chalk_kernel_to_qwen35 kwarg. (The bf16 fused-MLP kernel was REMOVED in freesolo-chalk 0.3.2
+# — verified net-negative everywhere and eval-only; its activation fusion is the one swiglu already
+# does. The Hopper/Blackwell base-GEMM lever is the FP8 frozen base below.)
 _KERNELS: list[tuple[str, str, bool]] = [
     ("FLASH_RMSNORM_KERNEL", "rmsnorm", True),
     ("FLASH_SWIGLU_KERNEL", "swiglu", True),
@@ -54,7 +56,6 @@ _KERNELS: list[tuple[str, str, bool]] = [
     ("FLASH_ROPE_KERNEL", "rope", True),
     ("FLASH_TRITON_LORA", "fused_lora_delta", True),
     ("FLASH_EMBED_KERNEL", "fused_embedding", True),
-    ("FLASH_MLP_KERNEL", "fused_mlp", False),  # opt-in (overlaps swiglu; net-negative on H100)
     ("FLASH_QKV_KERNEL", "attn_epilogue", False),  # opt-in (eval-only; needs q/k/v out of LoRA)
     ("FLASH_FP8_BASE", "fp8_frozen_base", False),  # opt-in (Hopper sm_90+ only)
 ]

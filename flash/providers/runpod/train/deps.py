@@ -58,7 +58,7 @@ WORKER_DEPS = [
     # kernels Liger never had (RoPE / LoRA-delta / embedding). Pure Triton/CUDA, JITs on every arch
     # incl. Blackwell. Baked in (as Liger was) so cold starts don't pip-install it. Keep this spec
     # in lockstep with DEFAULT_CHALK_SPEC below + the freesolo-chalk install in Dockerfile.worker.
-    "freesolo-chalk>=0.2.0,<0.3.0",
+    "freesolo-chalk>=0.3.0,<0.5.0",
     # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this, transformers
     # falls back to a pure-PyTorch delta rule that is dramatically slower + memory-heavier (measured
     # A/B, Vast H100 SXM, Qwen3.5-0.8B LoRA: seq4096 4413->371 ms/step = 11.9x; seq8192 13.7x;
@@ -75,6 +75,17 @@ WORKER_DEPS = [
     # installs / image rebuilds are reproducible. Keep in lockstep with Dockerfile.worker + perf.py.
     "tilelang==0.1.11",
     "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
+    # NB on causal_conv1d (#14, INVESTIGATED — deliberately NOT added here): the Qwen3.5/3.6 GDN
+    # layer runs a short depthwise causal conv before the delta rule, and the `causal_conv1d` package
+    # would fuse it (HF auto-detects via is_causal_conv1d_available). BUT: (a) it only gates the small
+    # conv step — the DOMINANT GDN cost (chunk_gated_delta_rule) is gated INDEPENDENTLY on fla and
+    # ALREADY runs on the fla kernel without it, so the win is bounded to the conv (modest); and
+    # (b) causal-conv1d ships SDIST-ONLY on PyPI (no torch2.10/cu128 wheels) -> pip BUILDS FROM SOURCE
+    # at cold-start, which FAILED REPRODUCIBLY on the Vast worker across two GPU classes (RTX 5090 +
+    # A100 SXM) with check=True killing the run. Putting it in WORKER_DEPS would break every cold-start
+    # boot-install run. If revisited, it must be BAKED into Dockerfile.worker (build once at image-build
+    # time with the -devel toolkit) AND the published image rebuild must be VALIDATED to actually
+    # compile it — it is not a safe per-run pip dep. See /tmp/flash_combine_results.md NEW-OPT TESTS.
     # NB: freesolo-chalk is baked into the base deps above (it's REQUIRED now — chalk runs every
     # fused kernel, standalone). The submit path (chalk_extra_pip) ALSO appends the resolved chalk
     # spec to the worker's `extra_pip` so an operator can OVERRIDE the version/source per-run via
@@ -197,11 +208,13 @@ def _chalk_selected(spec=None) -> bool:
 
 # Default chalk install spec when FLASH_CHALK_SPEC is unset. VERSION-PINNED (bounded range, like the
 # rest of WORKER_DEPS) so a default run is reproducible and a breaking freesolo-chalk release can't
-# silently land on production jobs — 0.2.x patches are allowed, 0.3 is not. 0.2.0 is the STANDALONE
-# line (chalk's own RMSNorm/SwiGLU/FLCE, replacing Liger); keep in lockstep with the freesolo-chalk
-# pin in WORKER_DEPS + Dockerfile.worker. Bump intentionally after validating a new line; an operator
-# can pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z (or a git URL before 0.2.0 is on PyPI).
-DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.2.0,<0.3.0"
+# silently land on production jobs — 0.3.x patches are allowed, 0.4 is not. 0.3.0 is the PER-ARCH
+# line (chalk's own RMSNorm/SwiGLU/FLCE/RoPE/LoRA/embedding, replacing Liger, with arch-tuned
+# autotune configs + FLCE chunk_mult dispatched on cuda capability — sm_80+ -> 8, sm_86 -> 4 — so
+# each kernel WINS on speed/memory on every GPU arch). Keep in lockstep with the freesolo-chalk pin
+# in WORKER_DEPS + Dockerfile.worker. Bump intentionally after validating a new line; an operator can
+# pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z.
+DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.3.0,<0.5.0"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
@@ -381,7 +394,6 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "FLASH_RMSNORM_KERNEL",
         "FLASH_SWIGLU_KERNEL",
         "FLASH_FLCE_KERNEL",
-        "FLASH_MLP_KERNEL",
         "FLASH_FP8_BASE",
         "FLASH_TRITON_LORA",
         "FLASH_EMBED_KERNEL",
@@ -390,6 +402,14 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # The chalk install spec itself — install_chalk_kernels warns pointing at it when a
         # FLASH_* flag is set but chalk is absent.
         "FLASH_CHALK_SPEC",
+        # LoRA-init + rollout-knob A/B levers (read on the worker: make_lora / run_rl /
+        # patch_trl_colocate_vllm_args). Forward a control-plane default; a per-run [worker_env]
+        # still wins (merged below). FLASH_USE_DORA (weight-decomposed LoRA, serve/warm-start-safe),
+        # FLASH_ROLLOUT_TUNE (raise TRL's hardcoded max_num_batched_tokens), FLASH_FP8_KV (fp8 KV
+        # cache on sm89+, ~halves the rollout KV pool).
+        "FLASH_USE_DORA",
+        "FLASH_ROLLOUT_TUNE",
+        "FLASH_FP8_KV",
     ):
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:
