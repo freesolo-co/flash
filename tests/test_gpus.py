@@ -82,11 +82,11 @@ def test_provisional_gpu_cheapest_for_model(monkeypatch):
     from flash.providers.base import provisional_gpu
 
     # GPU pinning is gone: provisional_gpu returns the cheapest fitting VALIDATED class for the
-    # model. 0.8B GRPO -> cheapest validated >=24G (A5000). 9B GRPO needs ~28G; the cheapest
-    # VALIDATED class that fits is now the 48G RTX A6000 ($0.49, live-validated 2026-06-22) — cheaper
-    # than the 32G RTX 5090 ($0.99).
+    # model. 0.8B GRPO -> cheapest validated >=24G (A5000). 9B is now bf16 (QLoRA dropped: the
+    # 4-bit vLLM-rollout merge broke GRPO learning), so colocated 9B GRPO needs an 80G-class card
+    # -> cheapest validated is the 80G A100 PCIe.
     assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX A5000"
-    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "RTX A6000"
+    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A100 PCIe"
 
 
 def test_config_cheapest_policy_validated_pool(monkeypatch):
@@ -129,14 +129,14 @@ def test_config_defaults_gpu_from_model():
 
     raw = {
         "model": "Qwen/Qwen3.5-9B",
-        "algorithm": "sft",  # 9B is SFT-only (colocated GRPO does not fit 32 GB bf16)
+        "algorithm": "sft",
         "environment": {"id": "primeintellect/gsm8k"},
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    # 9B 4-bit QLoRA SFT is fused (>=3B) -> ~16 GB; the cheapest validated class is now the 16 GB
-    # RTX 2000 Ada (live-validated 2026-06-22: 9B SFT train smoke passed on it).
-    assert spec.gpu.type == "RTX 2000 Ada"
+    # 9B is bf16 (QLoRA dropped): bf16 SFT needs ~29 GB but the catalog min_vram floor is 48 GB,
+    # so the cheapest validated class is the 48 GB RTX A6000.
+    assert spec.gpu.type == "RTX A6000"
 
 
 def test_build_worker_env():

@@ -152,10 +152,11 @@ def test_required_vram_policy_floors_and_downrouting():
     assert need("Qwen/Qwen3.5-0.8B", "grpo") <= 24
     assert 24 < need("Qwen/Qwen3.5-2B", "grpo") <= 32
     assert need(m4, "sft", train={"max_length": 1024, "lora_rank": 8}) < 32
-    # 9B GRPO is 4-bit QLoRA -> fits a 24-32GB card (was 80 GB bf16).
-    assert need("Qwen/Qwen3.5-9B", "grpo") <= 32  # QLoRA 4-bit: fits a ~24-32GB card
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 8192, "max_tokens": 2048, "group_size": 8}) <= 48  # 4-bit
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 4096, "group_size": 8}) <= 48
+    # 9B GRPO is bf16 (QLoRA dropped: the 4-bit vLLM-rollout merge collapsed the GRPO
+    # importance ratio -> no learning), so colocated GRPO needs an 80GB-class card.
+    assert need("Qwen/Qwen3.5-9B", "grpo") >= 80  # bf16 colocate: 80GB floor
+    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 8192, "max_tokens": 2048, "group_size": 8}) >= 80
+    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 4096, "group_size": 8}) >= 80
     # group size and thinking never DECREASE the requirement
     base = need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 4})
     assert need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 16}) >= base
