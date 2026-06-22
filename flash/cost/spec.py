@@ -27,9 +27,9 @@ def spec_steps(spec) -> int:
     """Per-seed optimizer steps implied by a train spec (mirrors the worker). GRPO: ``train.steps``
     (else recipe default). SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by
     ``max_steps``, where ``num_examples`` is ``max_examples`` if pinned else the real env size."""
-    from flash.catalog import MODELS, vocab_size_for
+    from flash.catalog import vocab_size_for
     from flash.engine.recipe import RECIPE
-    from flash.engine.vram import sft_logits_fused, sft_realized_batch
+    from flash.engine.vram import resolve_params_b, sft_logits_fused, sft_realized_batch
 
     t = spec.train
     if spec.algorithm == "grpo":
@@ -49,8 +49,12 @@ def spec_steps(spec) -> int:
         if t.max_length is not None
         else (RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
     )
-    _info = MODELS.get(spec.model)  # non-raising: an open model -> None -> treated as <3B (cap applies)
-    sft_fused = sft_logits_fused(_info.params_b if _info else None, sft_seq)
+    # Resolve params_b via the shared helper (catalog stat else HF safetensors for an open model) —
+    # the SAME resolution the worker's run_sft uses. The fused-CE decision (and thus the big-vocab
+    # micro-batch cap) hinges on the >=3B threshold, so an uncataloged >=3B model must not be priced
+    # as <3B (which would flip fused off, change the realized batch via the cap, and misprice the
+    # step count). Best-effort: no network -> None -> the prior <3B (cap-on) behavior.
+    sft_fused = sft_logits_fused(resolve_params_b(spec.model), sft_seq)
     batch = sft_realized_batch(
         requested_batch, seq_len=sft_seq, vocab=vocab_size_for(spec.model), fused=sft_fused
     )

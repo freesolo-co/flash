@@ -127,7 +127,7 @@ def test_undeploy_calls_freesolo_delete(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def fake_delete(url, headers=None, timeout=None):
+    def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
         deleted_urls.append(url)
         return _Resp()
 

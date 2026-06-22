@@ -129,11 +129,11 @@ def cmd_lab_setup(args) -> int:
             "[environment]\n"
             'id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
             "[train]\n"
-            'hf_repo = "your-org/your-runs"   # HF dataset repo for adapters/checkpoints\n'
             "steps = 150\n"
             "lora_rank = 32\n"
             "seeds = [0]\n"
-            "# GPU is allocated automatically: the cheapest class that fits, across providers.\n"
+            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
     print(
         "created environments/, environments/starter_env.py, configs/, "
