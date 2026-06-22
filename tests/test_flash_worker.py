@@ -120,7 +120,6 @@ def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
         "FLASH_RMSNORM_KERNEL": "0",
         "FLASH_SWIGLU_KERNEL": "0",
         "FLASH_FLCE_KERNEL": "0",
-        "FLASH_MLP_KERNEL": "1",
         "FLASH_FP8_BASE": "1",
         "FLASH_TRITON_LORA": "1",
         "FLASH_EMBED_KERNEL": "1",
@@ -149,7 +148,6 @@ def _clear_chalk_flags(monkeypatch):
         "FLASH_RMSNORM_KERNEL",
         "FLASH_SWIGLU_KERNEL",
         "FLASH_FLCE_KERNEL",
-        "FLASH_MLP_KERNEL",
         "FLASH_FP8_BASE",
         "FLASH_TRITON_LORA",
         "FLASH_EMBED_KERNEL",
@@ -161,7 +159,7 @@ def _clear_chalk_flags(monkeypatch):
 
 
 # The six default-on gap-filler flags (chalk_kernels._KERNELS): disabling exactly these
-# deselects chalk. QKV/MLP/FP8 base are opt-in (default-off) and need no flag to stay off.
+# deselects chalk. QKV/FP8 base are opt-in (default-off) and need no flag to stay off.
 _DEFAULT_ON_CHALK_FLAGS = (
     "FLASH_RMSNORM_KERNEL",
     "FLASH_SWIGLU_KERNEL",
@@ -189,7 +187,7 @@ def test_chalk_extra_pip_defaults_to_pypi_without_spec(monkeypatch):
     from flash.providers.runpod.train import DEFAULT_CHALK_SPEC, chalk_extra_pip
 
     _clear_chalk_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
+    monkeypatch.setenv("FLASH_QKV_KERNEL", "1")
     assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
     assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk")
     assert "<" in DEFAULT_CHALK_SPEC  # bounded range, not an unpinned floating install

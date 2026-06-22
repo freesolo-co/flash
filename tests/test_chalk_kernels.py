@@ -25,14 +25,14 @@ _DEFAULT_ON_FLAGS = (
 )
 _ALL_FLAGS = (
     *_DEFAULT_ON_FLAGS,
-    "FLASH_MLP_KERNEL",
     "FLASH_QKV_KERNEL",
     "FLASH_FP8_BASE",
 )
 
 # The apply kwargs flash should pass for a DEFAULT run: chalk runs STANDALONE (replaces Liger) so
-# its own rms_norm/swiglu/FLCE are ON alongside the gap-fillers; only the overlap/situational
-# kernels (fused MLP / eval-only attn epilogue / Hopper-only FP8 base) stay off.
+# its own rms_norm/swiglu/FLCE are ON alongside the gap-fillers; only the situational kernels
+# (eval-only attn epilogue / Hopper-only FP8 base) stay off. (The bf16 fused-MLP kernel was removed
+# in freesolo-chalk 0.3.2 — verified net-negative + eval-only; swiglu already fuses its activation.)
 _DEFAULT_KWARGS = {
     "rmsnorm": True,
     "swiglu": True,
@@ -40,7 +40,6 @@ _DEFAULT_KWARGS = {
     "rope": True,
     "fused_lora_delta": True,
     "fused_embedding": True,
-    "fused_mlp": False,
     "attn_epilogue": False,
     "fp8_frozen_base": False,
 }
@@ -117,13 +116,13 @@ def test_flag_zero_disables_default_on_kernel(monkeypatch):
 def test_optin_flag_enables_extra_kernel(monkeypatch):
     """A default-OFF kernel turns on with FLASH_<K>=1, alongside the default-on gap-fillers."""
     _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # opt in to the fused MLP
+    monkeypatch.setenv("FLASH_QKV_KERNEL", "1")  # opt in to the attn epilogue
     monkeypatch.setenv("FLASH_FP8_BASE", "1")  # opt in to FP8 frozen base
     calls = []
     _install_fake_chalk(monkeypatch, calls)
     install_chalk_kernels(object())
     _, kwargs = calls[0]
-    assert kwargs["fused_mlp"] is True
+    assert kwargs["attn_epilogue"] is True
     assert kwargs["fp8_frozen_base"] is True
     assert kwargs["rope"] is True  # gap-fillers still on
 
@@ -166,7 +165,7 @@ def test_is_chalk_enabled(monkeypatch):
     disabled = dict.fromkeys(_DEFAULT_ON_FLAGS, "0")
     assert is_chalk_enabled(disabled) is False
     # a single opt-in flag is enough to need chalk installed
-    assert is_chalk_enabled({**disabled, "FLASH_MLP_KERNEL": "1"}) is True
+    assert is_chalk_enabled({**disabled, "FLASH_QKV_KERNEL": "1"}) is True
 
 
 def test_active_kernels_filters_report():
@@ -176,7 +175,7 @@ def test_active_kernels_filters_report():
         "rope": True,
         "fused_lora_delta": 12,  # a count is "engaged"
         "fused_embedding": False,  # fell back
-        "fused_mlp": {"error": "boom"},  # errored
+        "attn_epilogue": {"error": "boom"},  # errored
     }
     assert active_kernels(rep) == ["fused_lora_delta", "rope"]
     assert active_kernels({}) == []
