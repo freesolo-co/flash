@@ -122,6 +122,42 @@ def _train_body(input_data: dict) -> dict:
     env["SEED"] = str(input_data["seed"])
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
 
+    def _upload_console(mode: str) -> None:
+        """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/seed{n}/
+        console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
+        from both the subprocess-failure path and the missing-metrics crash path: a worker killed
+        without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
+        ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
+        crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
+        console = f"/tmp/console_{mode}.txt"
+        if not os.path.exists(console):
+            return
+        try:
+            from huggingface_hub import HfApi
+
+            spec = json.loads(input_data["job_spec_json"])
+            phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
+            prefix = f"{phase_ns}/{spec['run_id']}/seed{input_data['seed']}"
+            # Read only the last 64 KB (seek from the end) — the console can be very large on long
+            # runs, so f.read()[-64_000:] would pull the whole file into memory just to slice it.
+            tail_bytes = 64_000
+            with open(console, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - tail_bytes))
+                tail = f.read().decode("utf-8", "replace")
+            # utf-8 + replace so a non-ASCII console tail can't raise UnicodeEncodeError under a
+            # minimal-container ASCII locale (LANG=C); the tail itself was decoded utf-8/replace.
+            with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
+                f.write(tail)
+            HfApi(token=env.get("HF_TOKEN")).upload_file(
+                path_or_fileobj=console + ".tail",
+                path_in_repo=f"{prefix}/console_{mode}.txt",
+                repo_id=input_data["hf_repo"],
+                repo_type="dataset",
+            )
+        except Exception as up_err:
+            print("console upload warn:", up_err)
+
     def run_mode(mode: str, check: bool) -> int:
         """Run one worker process, tee its console to a file, and upload the tail to HF as
         console_<mode>.txt on failure — the engine-core root cause of crashes like vLLM
@@ -149,24 +185,7 @@ def _train_body(input_data: dict) -> dict:
             "", "0", "false", "no", "off",
         )
         if proc.returncode != 0 or _force_console:
-            try:
-                from huggingface_hub import HfApi
-
-                spec = json.loads(input_data["job_spec_json"])
-                phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
-                prefix = f"{phase_ns}/{spec['run_id']}/seed{input_data['seed']}"
-                with open(console) as f:
-                    tail = f.read()[-64_000:]
-                with open(console + ".tail", "w") as f:
-                    f.write(tail)
-                HfApi(token=env.get("HF_TOKEN")).upload_file(
-                    path_or_fileobj=console + ".tail",
-                    path_in_repo=f"{prefix}/console_{mode}.txt",
-                    repo_id=input_data["hf_repo"],
-                    repo_type="dataset",
-                )
-            except Exception as up_err:
-                print("console upload warn:", up_err)
+            _upload_console(mode)
         if proc.returncode != 0 and check:
             raise RuntimeError(
                 f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
@@ -189,6 +208,11 @@ def _train_body(input_data: dict) -> dict:
     # cause (full traceback in error_<phase>.txt / console_<phase>.txt in the HF repo).
     if not os.path.exists("/tmp/metrics.json"):
         phase = input_data["phase"]
+        # run_mode skips the console upload when the worker exits 0 (and a hard OOM/segfault kill
+        # may have raced it), so force it here — otherwise this exact "crashed before finishing"
+        # failure is undebuggable: no metrics.json, often no error_<phase>.txt, and the message
+        # below points operators at a console_<phase>.txt that was never uploaded.
+        _upload_console(phase)
         raise RuntimeError(
             f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
             f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF "
