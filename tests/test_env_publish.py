@@ -1,5 +1,5 @@
 """Server-side managed env publishing (`flash.server.envs`): an uploaded package is published to
-FreeSolo's Prime account, namespaced per identity and PRIVATE — so users never need a Prime key.
+FreeSolo's managed environment account, namespaced per identity and PRIVATE.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def test_namespace_distinct_for_placeholder_emails():
     ns1, ns2 = envs.namespace_for(k1), envs.namespace_for(k2)
     assert ns1 != ns2, "external keys with the placeholder email must NOT share a namespace"
     assert "freesolo-user" not in (ns1, ns2)  # the placeholder is never the namespace
-    # Stable: the same key always maps to the same namespace (re-publish -> same Hub env).
+    # Stable: the same key always maps to the same namespace (re-publish -> same env).
     assert envs.namespace_for(dict(k1)) == ns1
 
 

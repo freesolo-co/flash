@@ -102,8 +102,8 @@ PHASE = os.environ.get(
 def _load_active_env():
     """Load the run's verifiers environment from the JobSpec; require an explicit env.
 
-    There is no default/builtin environment (verifiers-only): a run MUST name a verifiers/
-    Prime Hub env id. Failing here (instead of falling back to some default) prevents a paid
+    There is no default/builtin environment (verifiers-only): a run MUST name a published
+    verifiers environment id. Failing here (instead of falling back to some default) prevents a paid
     worker from training/evaluating the wrong task.
     """
     if JOB_SPEC is None:
@@ -117,8 +117,8 @@ def _load_active_env():
         # missing env is always a misconfigured spec. Fail loudly rather than fall back to a
         # default and burn a paid worker on the wrong task.
         raise RuntimeError(
-            "JobSpec sets no environment: provide [environment] id (a verifiers/Prime Hub "
-            "slug, e.g. 'owner/name')."
+            "JobSpec sets no environment: provide [environment] id "
+            "(a published verifiers environment id, e.g. 'owner/name')."
         )
     return load_environment(env_id, JOB_SPEC.environment.params)
 
@@ -140,7 +140,7 @@ def require_active_env():
         raise RuntimeError(
             "no environment is loaded: this worker was started without a JobSpec "
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
-            "carry a JobSpec naming [environment] id (a verifiers/Prime Hub slug, e.g. "
+            "carry a JobSpec naming [environment] id (a published verifiers environment id, e.g. "
             "'owner/name')."
         )
     return ACTIVE_ENV
@@ -826,20 +826,20 @@ def run_sft():
     # FLOPs on padding. TRL's 'bfd' strategy makes padding-free batches whose example boundaries are
     # honored ONLY by an attention impl that reads them — under plain SDPA packed examples
     # cross-contaminate (silent quality loss). The boundary-correct backend is FlashAttention-2
-    # varlen (reads position_ids); but flash-attn has NO prebuilt wheel for torch 2.10 (PyPI
-    # sdist-only; Dao-AILab wheels stop at torch 2.9) so it would build from source on every cold
-    # start (~20 min, fragile) — it is NOT in the worker image. So _fa_ok is False on the current
-    # stack and packing is effectively unavailable until flash-attn is baked into a prebuilt image.
-    # Packing is ON when FA2 is importable (varlen keeps 'bfd' example boundaries correct); else
-    # SKIP — without a boundary-correct attn backend examples would cross-contaminate under SDPA.
+    # varlen (reads position_ids), which the worker image bakes in best-effort: Dockerfile.worker
+    # installs FLASH_ATTN_SPEC (a community cu128/torch2.10/cp312 wheel preferred, source build as a
+    # fallback) and tolerates a build failure -> SDPA. So _fa_ok is True whenever that install landed;
+    # packing is ON then (varlen keeps 'bfd' example boundaries correct). If the best-effort install
+    # failed, _fa_ok is False and we SKIP packing — without a boundary-correct attn backend examples
+    # would cross-contaminate under SDPA.
     _fa_ok = _flash_attn_available()
     if _fa_ok:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
     else:
         print(
-            "[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
-            "2.10). Bake flash-attn into the worker image to enable FA2 varlen packing."
+            "[sft] packing SKIPPED: flash_attn not importable (best-effort image build failed) "
+            "— no boundary-correct attn backend, falling back to SDPA without packing."
         )
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
@@ -1968,5 +1968,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
