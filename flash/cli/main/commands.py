@@ -61,7 +61,7 @@ def cmd_login(args) -> int:
     if not api_key:
         raise ClientError(
             "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
-            "Create or copy a key at https://freesolo.co/sign-in or https://freesolo.co/login."
+            "Create or copy a key at https://freesolo.co/sign-in."
         )
     verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
     api_url = args.api_url or load_credentials()[0]

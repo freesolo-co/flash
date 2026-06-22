@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         "--api-key",
         help=(
             "your freesolo API key (default: FREESOLO_API_KEY); create or copy one at "
-            "https://freesolo.co/sign-in or https://freesolo.co/login"
+            "https://freesolo.co/sign-in"
         ),
     )
     login.add_argument(
