@@ -58,6 +58,14 @@ class GpuClass:
     # A100 SXM4 boards exist in 40 GB and 80 GB variants under ONE Vast name — offers
     # are disambiguated by ``gpu_ram`` (see ``vast_gpu_for_offer``).
     vast_name: str | None = None
+    # Whether this class has passed Flash's LIVE validation smoke (a real train+eval run on the
+    # card). The deployed control plane REJECTS a submit for a non-validated class ("gpu type 'X'
+    # has not passed Flash's live validation smoke"), so client-side allocation restricts to the
+    # validated pool by default (see ``validated_classes`` / allocator) — otherwise a default
+    # `flash train` could pick the absolute-cheapest fitting class (e.g. "RTX 2000 Ada") that the
+    # server then refuses, and the run never submits. Exactly the 8 smoke-validated members below
+    # are marked True.
+    validated: bool = False
 
 
 # Fallback hourly rates are RunPod secure-cloud on-demand (snapshot 2026-06-11); live
@@ -72,6 +80,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm89",
         0.69,
         vast_name="RTX 4090",
+        validated=True,
     ),
     # Vast-validated 2026-06-12: Qwen3-0.6B SFT train+eval smoke on a verified
     # datacenter ($0.60/hr South Korea), incl. vLLM eval on a CUDA-13 driver.
@@ -84,6 +93,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         0.99,
         min_cuda_modern="13.0",
         vast_name="RTX 5090",
+        validated=True,
     ),
     # ---- Ampere/Ada workstation + datacenter cards (cheap capacity pools) ----
     GpuClass("RTX A4000", "NVIDIA_RTX_A4000", 16, "a4000", "sm86", 0.25, vast_name="RTX A4000"),
@@ -115,6 +125,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm86",
         0.27,
         vast_name="RTX A5000",
+        validated=True,
     ),
     # Vast-validated 2026-06-12: Qwen3-0.6B SFT train+eval smoke ($0.25/hr Czechia).
     GpuClass(
@@ -125,6 +136,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm86",
         0.46,
         vast_name="RTX 3090",
+        validated=True,
     ),
     GpuClass("L4", "NVIDIA_L4", 24, "l4", "sm89", 0.39, vast_name="L4"),
     # Blackwell workstation card; cheap verified-datacenter capacity on Vast.
@@ -139,6 +151,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         0.34,
         min_cuda_modern="13.0",
         vast_name="RTX PRO 4000",
+        validated=True,
     ),
     GpuClass("RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49, vast_name="RTX A6000"),
     GpuClass("A40", "NVIDIA_A40", 48, "a40", "sm86", 0.44, vast_name="A40"),
@@ -166,6 +179,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm80",
         1.39,
         vast_name="A100 PCIE",
+        validated=True,
     ),
     GpuClass(
         "A100 SXM", "NVIDIA_A100_SXM4_80GB", 80, "a100sxm", "sm80", 1.49, vast_name="A100 SXM4"
@@ -175,7 +189,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     # 80 GB SXM H100 on the live market and carries 14 GB more VRAM, so it's a strong
     # cost/VRAM pick for big-context GRPO tiers.
     GpuClass(
-        "H100 NVL", None, 94, "h100nvl", "sm90", 2.39, vast_name="H100 NVL"
+        "H100 NVL", None, 94, "h100nvl", "sm90", 2.39, vast_name="H100 NVL", validated=True
     ),
     GpuClass(
         "RTX Pro 6000",
@@ -198,14 +212,21 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         1.79,
         min_cuda_modern="13.0",
         vast_name="RTX PRO 6000",
+        validated=True,
     ),
 )
 
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
 
-# Canonical friendly names Flash exposes in configs / the catalog. Every managed class is
-# eligible for selection — there is no validation gate.
+# Canonical friendly names Flash exposes in configs / the catalog.
 KNOWN = tuple(GPU_INFO)
+
+# The names that have passed Flash's live validation smoke. Client-side allocation restricts to
+# these by default because the deployed control plane REJECTS a submit for any class outside the
+# pool ("gpu type 'X' has not passed Flash's live validation smoke"); allocating an unvalidated
+# (e.g. absolute-cheapest) class would just make the server refuse the run. Kept in sync with the
+# ``validated=True`` flags above.
+VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
 
 
 def _alias_keys(name: str) -> set[str]:
@@ -260,7 +281,7 @@ def canonical_gpu(name: str) -> str:
     if key in _ALIASES:
         return _ALIASES[key]
     raise UnsupportedGpuError(
-        f'unsupported gpu {name!r}; Flash manages {", ".join(KNOWN)} (or gpu.type = "cheapest")'
+        f'unsupported gpu {name!r}; Flash manages {", ".join(KNOWN)}'
     )
 
 
@@ -314,21 +335,27 @@ def min_cuda_modern(name: str) -> str:
     return get_gpu_info(name).min_cuda_modern or "12.8"
 
 
-def cheapest_gpu(min_vram_gb: int) -> str:
+def cheapest_gpu(min_vram_gb: int, *, validated_only: bool = True) -> str:
     """Cheapest RunPod GPU class with at least ``min_vram_gb`` VRAM (live rates, cached).
 
     RunPod-static by design (the cross-provider equivalent lives in
     ``flash.providers.allocator``): Vast-only classes are excluded so the result is
-    always deployable via Flash, and offline resolution stays deterministic. Every
-    fitting class is eligible — there is no validation gate.
+    always deployable via Flash, and offline resolution stays deterministic. Restricted to the
+    live-validated pool by default (``validated_only``) so the picked class matches what the
+    deployed control plane will actually accept — a non-validated class submits then gets rejected.
     """
-    pool = [g for g in GPU_INFO.values() if g.enum_member and g.vram_gb >= min_vram_gb]
+    pool = [
+        g
+        for g in GPU_INFO.values()
+        if g.enum_member and g.vram_gb >= min_vram_gb and (g.validated or not validated_only)
+    ]
     if not pool:
-        # This helper filters to RunPod-provisionable classes (enum_member set) on purpose;
-        # a Vast-only class can still fit. Say so, so the message isn't misleading when a
-        # fitting GPU exists on Vast but not RunPod (the cross-provider allocator may still place it).
+        # This helper filters to RunPod-provisionable VALIDATED classes (enum_member set +
+        # validated) on purpose; a Vast-only / unvalidated class can still fit. Say so, so the
+        # message isn't misleading when a fitting GPU exists outside this pool (the cross-provider
+        # allocator may still place a validated Vast class).
         raise UnsupportedGpuError(
-            f"no RunPod-provisionable GPU class has >= {min_vram_gb} GB VRAM"
+            f"no validated RunPod-provisionable GPU class has >= {min_vram_gb} GB VRAM"
         )
     from flash.providers.runpod.pricing import hourly_rate
 
@@ -342,13 +369,14 @@ def provisional_gpu(
     train=None,
     thinking: bool = False,
 ) -> str:
-    """The cheapest GPU class whose VRAM covers the model -- a parse-time provisional.
+    """The cheapest VALIDATED GPU class whose VRAM covers the model -- a parse-time provisional.
 
-    GPU pinning is gone and there is no validation gate: this picks the cheapest
-    RunPod-provisionable class whose VRAM covers the model (every fitting class is eligible).
-    The submit-time allocator (``flash.providers.allocator``) ALWAYS re-resolves the cheapest
-    fitting class live across all providers; this is the RunPod-static, offline-deterministic
-    equivalent the schema uses for sizing/display.
+    GPU pinning is gone: this picks the cheapest RunPod-provisionable class whose VRAM covers the
+    model, restricted to the live-validated pool (``cheapest_gpu``'s default) so the provisional
+    matches what the deployed control plane will accept. The submit-time allocator
+    (``flash.providers.allocator``) ALWAYS re-resolves the cheapest fitting VALIDATED class live
+    across all providers; this is the RunPod-static, offline-deterministic equivalent the schema
+    uses for sizing/display.
     """
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom

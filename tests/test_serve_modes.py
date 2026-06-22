@@ -48,6 +48,71 @@ def test_deploy_rejects_unknown_mode():
     assert set(MODES) == {"dev", "always-on"}
 
 
+def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
+    """A non-2xx from the serving backend (e.g. Modal has zero base-model engines) must surface
+    as a ServingError carrying the upstream status + body — NOT a bare httpx exception — so the
+    API layer can return a clean 502 instead of an unhandled 500 + traceback."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(500, text="no base-model engines loaded", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert ei.value.status_code == 500
+    assert "500" in str(ei.value)
+    assert "no base-model engines loaded" in str(ei.value)
+    assert "operator must check" in str(ei.value)  # 5xx -> serving-outage / no-engine hint
+
+
+def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
+    """A 4xx (e.g. missing/invalid FREESOLO_INTERNAL_KEY) is a client/auth error with THIS request,
+    not a serving outage — the hint must point at the key/request, NOT claim 'no engine'."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    req = httpx.Request("POST", "https://serve.example/adapters")
+    resp = httpx.Response(401, text="invalid internal key", request=req)
+    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    msg = str(ei.value)
+    assert ei.value.status_code == 401
+    assert "401" in msg
+    assert "FREESOLO_INTERNAL_KEY" in msg  # client/auth hint
+    # NOT the 5xx operator hint (this is a 4xx client/auth failure):
+    assert "no engine" not in msg
+    assert "operator must check" not in msg
+
+
+def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch):
+    """A transport error (serving backend unreachable) is also a ServingError (status_code None)."""
+    import httpx
+
+    import flash.serve.deploy as deploy_mod
+    from flash.serve.deploy import ServingError
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+
+    def fake_post(url, *a, **k):
+        raise httpx.ConnectError("connection refused", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(deploy_mod.httpx, "post", fake_post)
+    with pytest.raises(ServingError) as ei:
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", "RTX 4090")
+    assert ei.value.status_code is None
+    assert "could not reach" in str(ei.value)
+
+
 def test_undeploy_calls_freesolo_delete(monkeypatch):
     """undeploy issues a single DELETE to the serving app keyed by run_id and returns the
     removed id; an unrelated run is unaffected (the serving app keys by adapterId)."""
@@ -62,7 +127,7 @@ def test_undeploy_calls_freesolo_delete(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def fake_delete(url, headers=None, timeout=None):
+    def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
         deleted_urls.append(url)
         return _Resp()
 
