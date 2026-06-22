@@ -177,6 +177,13 @@ class GpuSpec:
     network_volume: str | None = None
     network_volume_gb: int = 100
     datacenter: str | None = None  # e.g. "EU-RO-1"; required pool pin for the volume
+    # OPT-IN per-run provider pin. Unlike gpu.type (no pin — the submit-time allocator always
+    # re-picks the cheapest fitting validated CLASS across ALL providers), provider pins which
+    # SUBSTRATE the allocator may use: "vast" or "runpod" restricts allocation to that provider;
+    # None (default) keeps the cross-provider cheapest-wins behavior. Used for A/B-ing one provider
+    # against the full pool. The allocator raises a clear error if the pinned provider isn't
+    # available/configured.
+    provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -273,6 +280,7 @@ class JobSpec:
                 network_volume=gpu.get("network_volume"),
                 network_volume_gb=int(gpu.get("network_volume_gb", 100)),
                 datacenter=gpu.get("datacenter"),
+                provider=gpu.get("provider"),
             ),
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),
