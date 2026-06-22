@@ -80,7 +80,8 @@ def test_me(api):
     # A verified freesolo user key resolves to a per-token identity without inventing an email.
     payload = me.json()
     assert payload["kind"] == "freesolo_api_key"
-    assert payload["key_prefix"].startswith(_USER_PREFIX)
+    assert payload["key_prefix"].startswith("fslo_")
+    assert payload["key_prefix"] != key[:12]
     assert "email" not in payload
 
 
@@ -139,7 +140,9 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
     row = auth_mod.authenticate("Bearer fslo-user-good")
     assert row is not None
     assert row["email"] is None
-    assert row["key_prefix"].startswith("fslo-user")
+    assert row["auth_kind"] == "freesolo_api_key"
+    assert row["key_prefix"].startswith("fslo_")
+    assert row["key_prefix"] != "fslo-user-go"
     # An unverified token returns None (401).
     assert auth_mod.authenticate("Bearer fslo-user-bad") is None
     # The same key resolves to the same identity across requests (stable per-token row).
@@ -183,6 +186,7 @@ def test_freesolo_verify_identity_parser_is_tolerant():
         json.dumps(
             {
                 "email": " ",
+                "id": "top-level-not-api-key-id",
                 "user": {"id": "user-nested", "email": "user@example.com"},
                 "org": {"id": "org-nested"},
                 "api_key": {"id": "key-nested", "key_prefix": "fslo_nested"},
@@ -202,6 +206,11 @@ def test_freesolo_verify_identity_parser_is_tolerant():
         "training_agent_job_id": "job-123",
         "project_id": "project-456",
     }
+
+    without_api_key_id = auth_mod._identity_from_verify_body(
+        json.dumps({"id": "top-level-id", "user": {"id": "user-nested"}}).encode()
+    )
+    assert without_api_key_id == {"user_id": "user-nested"}
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
