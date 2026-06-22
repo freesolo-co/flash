@@ -401,9 +401,12 @@ def test_assert_usable_gpu_full_card_ok(monkeypatch):
     from flash.engine.worker import perf
 
     monkeypatch.setitem(sys.modules, "torch", _fake_torch_named("NVIDIA RTX A5000"))
-    monkeypatch.delitem(sys.modules, "pynvml", raising=False)
-    # No pynvml installed in the offline test env -> the import inside fails (ImportError),
-    # which the guard treats as "can't probe", not a failure. Name has no "MIG" -> usable.
+    # Force the pynvml import to raise ImportError DETERMINISTICALLY: setting sys.modules[name]=None
+    # makes `import name` raise regardless of whether a real pynvml is installed in the test env
+    # (a plain delitem would let Python re-import an installed pynvml and run a real NVML probe,
+    # flaking on hosts that have it). The guard treats the ImportError as "can't probe", not a
+    # failure; name has no "MIG" -> usable.
+    monkeypatch.setitem(sys.modules, "pynvml", None)
     perf.assert_usable_gpu()  # must NOT raise
 
 
@@ -427,7 +430,46 @@ def test_assert_usable_gpu_no_cuda_raises_retriable(monkeypatch):
     from flash.engine.worker import perf
 
     monkeypatch.setitem(sys.modules, "torch", _fake_torch_named("", available=False))
+    # Shrink the startup-grace poll so the test doesn't actually sleep through the retries.
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_RETRIES", 1)
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_DELAY_S", 0)
     with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER):
+        perf.assert_usable_gpu()
+
+
+def test_assert_usable_gpu_cuda_ready_after_grace(monkeypatch):
+    """CUDA reporting "not available" at the first poll but ready a moment later must NOT raise:
+    the startup grace exists so we don't preempt the handler's wait_for_gpu and spuriously resubmit
+    a host whose CUDA comes up a few seconds late."""
+    from flash.engine.worker import perf
+
+    calls = {"n": 0}
+
+    def _avail_on_second_try():
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    t = types.ModuleType("torch")
+    t.cuda = types.SimpleNamespace(
+        is_available=_avail_on_second_try,
+        get_device_name=lambda *a: "NVIDIA RTX A5000",
+    )
+    monkeypatch.setitem(sys.modules, "torch", t)
+    monkeypatch.setitem(sys.modules, "pynvml", None)  # deterministic ImportError -> skip NVML probe
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_RETRIES", 4)
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_DELAY_S", 0)
+    perf.assert_usable_gpu()  # must NOT raise; available on the 2nd poll
+    assert calls["n"] == 2
+
+
+def test_assert_usable_gpu_torch_import_failure_surfaces(monkeypatch):
+    """A torch import failure is an IMAGE problem, not transient infra: the guard must SURFACE it
+    (re-raise), not swallow-and-return, or the worker proceeds into training and dies with a far
+    less actionable error."""
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", None)  # deterministic ImportError on `import torch`
+    with pytest.raises(ImportError):
         perf.assert_usable_gpu()
 
 
@@ -453,8 +495,10 @@ def test_assert_usable_gpu_nvml_probe_failure_raises_retriable(monkeypatch):
 
 
 def test_retriable_infra_marker_is_an_infra_retry_marker():
-    """The worker's marker phrase MUST be in the runner's infra-retry set, or a MIG host would
-    be mis-classified as a non-retried job_failed (the live regression). Lock-step contract."""
+    """The worker's marker phrase MUST be in the runner's ``_infra_markers`` retry set, or a MIG
+    host would be mis-classified as a non-retried job_failed (the live regression). Lock-step
+    contract — assert against the actual ``_infra_markers = (...)`` tuple, not the whole file, so a
+    marker left only in a comment/docstring (but dropped from the tuple) does NOT pass."""
     from flash.engine.worker.perf import RETRIABLE_INFRA_MARKER
 
     src = (
@@ -462,4 +506,16 @@ def test_retriable_infra_marker_is_an_infra_retry_marker():
         .Path(__import__("flash.runner.lifecycle", fromlist=["__file__"]).__file__)
         .read_text()
     )
-    assert RETRIABLE_INFRA_MARKER in src
+    # Slice exactly the `_infra_markers = (...)` tuple block: from its start to the `infra_shaped =`
+    # statement that immediately follows the closing paren. A regex on parens is fragile here — the
+    # tuple's inline comments themselves contain ")" — so anchor on the following statement instead.
+    start = src.index("_infra_markers = (")
+    end = src.index("infra_shaped", start)
+    markers_block = src[start:end]
+    # Require the marker as a QUOTED string literal inside the tuple, so a marker left only in a
+    # comment/docstring (but dropped from the tuple) does NOT satisfy the contract.
+    quoted = (f'"{RETRIABLE_INFRA_MARKER}"', f"'{RETRIABLE_INFRA_MARKER}'")
+    assert any(q in markers_block for q in quoted), (
+        f"{RETRIABLE_INFRA_MARKER!r} is missing from lifecycle.py's _infra_markers tuple; "
+        "a MIG/NVML-restricted host would be mis-classified as a non-retried job_failed."
+    )

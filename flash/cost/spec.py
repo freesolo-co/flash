@@ -29,7 +29,12 @@ def spec_steps(spec) -> int:
     ``max_steps``, where ``num_examples`` is ``max_examples`` if pinned else the real env size."""
     from flash.catalog import MODELS, vocab_size_for
     from flash.engine.recipe import RECIPE
-    from flash.engine.vram import sft_logits_fused, sft_realized_batch
+    from flash.engine.vram import (
+        fetch_hf_params_b,
+        params_b_from_str,
+        sft_logits_fused,
+        sft_realized_batch,
+    )
 
     t = spec.train
     if spec.algorithm == "grpo":
@@ -49,8 +54,21 @@ def spec_steps(spec) -> int:
         if t.max_length is not None
         else (RECIPE.sft.max_seq_len_thinking if spec.thinking else RECIPE.sft.max_seq_len)
     )
-    _info = MODELS.get(spec.model)  # non-raising: an open model -> None -> treated as <3B (cap applies)
-    sft_fused = sft_logits_fused(_info.params_b if _info else None, sft_seq)
+    # Resolve params_b EXACTLY as the worker does (engine.worker.run_sft): the catalog stat when the
+    # model is curated, else the real HF safetensors param count for an open-policy model. The
+    # fused-CE decision (and thus the big-vocab micro-batch cap) hinges on the >=3B threshold, so
+    # treating an uncataloged >=3B model as <3B here would flip fused off, change the realized batch
+    # via the cap, and misprice the step count vs what the worker actually runs. fetch_hf_params_b is
+    # best-effort: with no network it returns None and we degrade to the prior <3B (cap-on) behavior.
+    _info = MODELS.get(spec.model)  # non-raising: an open model -> None
+    _params_b = (
+        (getattr(_info, "params_b", 0.0) or params_b_from_str(getattr(_info, "params", None)))
+        if _info
+        else None
+    )
+    if not _params_b:
+        _params_b = fetch_hf_params_b(spec.model)  # uncataloged: HF safetensors metadata
+    sft_fused = sft_logits_fused(_params_b, sft_seq)
     batch = sft_realized_batch(
         requested_batch, seq_len=sft_seq, vocab=vocab_size_for(spec.model), fused=sft_fused
     )
