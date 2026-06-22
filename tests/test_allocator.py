@@ -243,6 +243,46 @@ def test_required_vram_sft_small_model_includes_big_vocab_logits():
     assert n_fused < n_short  # the fused CE removes the logits term at >= 2048 ctx
 
 
+def test_sft_equation_covers_honest_peak_across_seq_boundary():
+    """Boundary regression: for EVERY catalog SFT model across the seq grid (straddling the 2048
+    Liger threshold) x batch x rank, the equation must reserve >= the INDEPENDENT honest peak (incl.
+    the capped big-vocab logits), and a validated card must fit. This is the in-CI distillation of
+    the 148k-config offline sweep -- if the SFT logits term is ever dropped again, this fails."""
+    import math
+
+    from flash.catalog import MODELS, vocab_size_for
+    from flash.engine import vram
+    from flash.engine.vram import params_b_from_str, sft_logits_fused, sft_per_device
+    from flash.providers.allocator import required_vram_gb
+    from flash.providers.base import GPU_INFO
+
+    validated = [g.vram_gb for g in GPU_INFO.values() if getattr(g, "validated", False)]
+
+    def honest_peak(pb, seq, vocab, quant, rank, bs):
+        bpp = vram._BYTES_PER_PARAM.get(quant, 2.0)
+        width = math.sqrt(max(pb, 0.1))
+        base = pb * bpp + vram._BASE_OVERHEAD_GB + (rank / 16.0) * (0.3 + 0.04 * pb)
+        fused = sft_logits_fused(pb, seq)
+        pd = sft_per_device(bs, seq_len=seq, vocab=vocab, fused=fused)
+        act = vram._ACT_COEF * pd * (seq / 1024.0) * width
+        logits = 0.0 if fused else pd * seq * vocab * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9
+        return base + act + logits
+
+    for mid, info in MODELS.items():
+        if "sft" not in info.algos:
+            continue
+        pb = info.params_b or params_b_from_str(info.params) or 0.0
+        vocab, quant = vocab_size_for(mid), getattr(info, "quant", "bf16") or "bf16"
+        for seq in (512, 1024, 1536, 2047, 2048, 4096, 32768):
+            for bs in (1, 4, 8, 32):
+                for rank in (8, 32, 128):
+                    tr = {"max_length": seq, "batch_size": bs, "lora_rank": rank}
+                    need = required_vram_gb(mid, "sft", train=tr)
+                    peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs) * 1.1)
+                    assert need >= peak, (mid, seq, bs, rank, need, peak)
+                    assert any(gb >= need for gb in validated), (mid, seq, bs, rank, need)
+
+
 # ---------------------------------------------------------------------------
 # Fix 3: SFT per-device micro-batch sized by the real vocab (big-vocab OOM guard)
 # ---------------------------------------------------------------------------
