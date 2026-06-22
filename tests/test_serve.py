@@ -186,8 +186,14 @@ def test_undeploy_propagates_serving_error(monkeypatch):
     assert ei.value.status_code == 500
 
     # A transport error (never reached the backend) is also translated into a ServingError.
+    # httpx.RequestError must carry the originating request (httpx>=0.27); building it with only a
+    # message can raise TypeError before undeploy_adapter() can translate it, so mirror the real
+    # undeploy call (DELETE {serving}/adapters/{run_id}).
     def _boom_delete(*a, **k):
-        raise d.httpx.RequestError("no route to host")
+        raise d.httpx.RequestError(
+            "no route to host",
+            request=d.httpx.Request("DELETE", "https://serve.example/adapters/flash-7-abcd"),
+        )
 
     monkeypatch.setattr(d.httpx, "delete", _boom_delete)
     with pytest.raises(d.ServingError):
