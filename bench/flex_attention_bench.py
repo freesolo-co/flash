@@ -95,9 +95,11 @@ def correctness_check(model_id: str, attn: str, max_len: int) -> dict:
         return {"ran": False, "error": f"load: {e}"}
 
     torch.manual_seed(0)
-    a = torch.randint(0, 1000, (40,))
-    b1 = torch.randint(0, 1000, (40,))
-    b2 = torch.randint(0, 1000, (40,))
+    # Cap token ids to the model's real vocab so tiny/toy models don't hit an embedding IndexError.
+    vocab = min(1000, getattr(model.config, "vocab_size", 1000) or 1000)
+    a = torch.randint(0, vocab, (40,))
+    b1 = torch.randint(0, vocab, (40,))
+    b2 = torch.randint(0, vocab, (40,))
     # position_ids restart at the boundary (what 'bfd' packing emits) — this is the ONLY boundary
     # signal we pass. A flex/varlen path derives its block-diagonal document mask from these restarts;
     # we deliberately do NOT pass an explicit 4D mask, mirroring flash's real packed SFT call.

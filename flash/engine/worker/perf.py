@@ -250,7 +250,8 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
     package dir). ALSO removes ``flash-linear-attention``'s distribution metadata
     (``*.dist-info``/``*.egg-info``/``*.egg-link``/editable ``.pth``) from every site dir it scans,
     so pip doesn't see "requirement already satisfied" and skip the git reinstall (copilot PR #32).
-    Returns ``(removed_dirs, still_importable)``. Used by the Hopper auto-drop.
+    Returns ``(removed_dirs, still_importable)``. Used by the Hopper fla fast-path setup
+    (and as its fail-closed fallback).
     """
     import importlib
     import importlib.util
