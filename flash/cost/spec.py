@@ -10,8 +10,8 @@ import sys
 from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
 
-# Fallback SFT dataset size when an uncapped run's env can't be counted locally (a Hub env that
-# isn't importable in this interpreter). Most published verifiers SFT datasets land in the
+# Fallback SFT dataset size when an uncapped run's env can't be counted locally (a published env
+# that isn't importable in this interpreter). Most published verifiers SFT datasets land in the
 # low-thousands of rows; this is a representative middle estimate so the quote is in the right
 # ballpark rather than hard-failing. Pin [train].max_examples for an exact figure.
 DEFAULT_UNCOUNTED_SFT_EXAMPLES = 1000
@@ -22,8 +22,8 @@ def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
     be loaded. Best-effort -- prices an uncapped SFT run on the real dataset size, not a guess.
 
     Loading imports the verifiers env into THIS interpreter, which only succeeds when ``verifiers``
-    (and the env package) are importable here. ``flash env install`` installs Hub envs into a
-    separate (``prime``) environment, so a Hub env is typically NOT importable in the cost path's
+    (and the env package) are importable here. ``flash env install`` installs published envs into a
+    separate environment, so a published env is typically NOT importable in the cost path's
     venv -- this then returns ``None`` and the caller falls back to a default count (see
     ``spec_steps``) instead of hard-failing."""
     if not env_id:
@@ -79,8 +79,7 @@ def spec_steps(spec) -> int:
         examples = pinned_examples
     else:
         # No cap: the worker trains the FULL env dataset, so price its real size when we can
-        # count it. A Hub env usually ISN'T importable in this interpreter (`flash env install`
-        # puts it in a separate `prime` env, not this venv), so counting returns None -- in that
+        # count it. A published env usually ISN'T importable in this interpreter, so counting returns None -- in that
         # case fall back to a representative default with a clear warning instead of hard-failing,
         # so `flash train <toml> --cost` still produces a quote without pinning max_examples.
         examples = count_env_examples(spec.environment.id, spec.environment.params)
@@ -89,7 +88,7 @@ def spec_steps(spec) -> int:
             print(
                 f"warning: could not count training examples for environment "
                 f"{spec.environment.id!r} (it is not importable in this environment; "
-                f"`flash env install` installs Hub envs into a separate `prime` venv). "
+                f"try `flash env install {spec.environment.id}`). "
                 f"Estimating with a default of {examples} examples -- pin [train].max_examples "
                 f"for an exact cost.",
                 file=sys.stderr,

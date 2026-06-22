@@ -581,7 +581,7 @@ def test_logs_offset_paging(api):
 
 
 def test_local_env_path_rejected(api):
-    # Prime Hub-only: a local [environment] path is rejected on the managed service.
+    # Managed service only accepts published environment ids, not local paths.
     key = _login()
     bad = {**SPEC, "environment": {"id": "custom", "path": "/home/user/env.py"}}
     r = api.post("/v1/runs", json={"spec": bad, "dry_run": True}, headers=_bearer(key))
@@ -915,15 +915,15 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
-    """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
-    plane's PRIME_API_KEY), namespaced per identity — so the user needs no Prime account."""
+    """POST /v1/envs publishes an uploaded package under FreeSolo's managed account,
+    namespaced per identity."""
     import base64
     import io
     import tarfile
 
     import flash.server.envs as envs_mod
 
-    # Stub the actual `prime env push` so the test doesn't hit Prime; echo the namespaced name.
+    # Stub the actual environment publish so the test doesn't hit the external publisher.
     monkeypatch.setattr(
         envs_mod, "_prime_push", lambda env_dir, *, name, is_new: f"freesolo-co/{name}"
     )

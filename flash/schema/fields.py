@@ -83,7 +83,7 @@ class ConfigError(ValueError):
 
 
 def _require_slug(value: str, message: str) -> None:
-    """Require a Prime Hub-style "owner/name" slug: exactly one slash, both parts
+    """Require an "owner/name" id: exactly one slash, both parts
     non-empty. Raises ConfigError(message) otherwise. Centralizes the rule used for
     [environment] id and train.hf_repo so they cannot drift apart."""
     parts = value.split("/")

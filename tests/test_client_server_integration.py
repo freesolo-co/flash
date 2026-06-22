@@ -37,7 +37,7 @@ from fastapi.testclient import TestClient
 from flash.client.http import ApiClient, ApiError
 
 # A representative managed-run spec -- the shape the freesolo bridge / SDK
-# submits: catalog model, Prime Hub environment slug, an HF repo for artifacts.
+# submits: catalog model, published environment id, an HF repo for artifacts.
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
