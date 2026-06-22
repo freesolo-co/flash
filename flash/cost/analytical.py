@@ -34,11 +34,19 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # wall is ceil(completions / slots) waves x latency, not completions x latency.
 REWARD_CONCURRENCY = 16.0
 
-# Cold-start overhead (seconds): container boot + deps + model download (+ vLLM init for GRPO).
-WORKER_BOOT_S = 180.0
-DEPS_INSTALL_S = 120.0
+# Cold-start overhead (seconds): container boot + deps + model load (+ vLLM init for GRPO).
+#
+# Calibrated against a real fresh-worker run (0.8B SFT, RTX 3090 @ $0.239/hr) whose billed wall
+# was ~708s for only ~26 priced steps -- i.e. cold start, not training, dominated. A fresh worker
+# spent ~12.5 min in `sft_model_load` alone (download + checkpoint deserialize + GPU placement +
+# framework/CUDA init), so the MODEL-LOAD term -- not boot/deps -- is the dominant cost of a short
+# job. MODEL_LOAD_BASE_S is the fixed (size-independent) load/init overhead; the download term on
+# top of it scales with checkpoint size, so bigger models pay a longer cold start.
+WORKER_BOOT_S = 120.0  # container pull + start
+DEPS_INSTALL_S = 90.0  # pip/uv resolve + install
+MODEL_LOAD_BASE_S = 235.0  # fixed checkpoint deserialize + GPU placement + framework/CUDA init
 VLLM_INIT_S = 120.0
-DOWNLOAD_RATE_GBPS = 0.4  # effective HF snapshot download (hf_transfer)
+DOWNLOAD_RATE_GBPS = 0.4  # effective HF snapshot download (hf_transfer), on top of the base load
 
 DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
 
@@ -54,8 +62,11 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def setup_seconds(config: RunConfig) -> float:
-    """Cold-start wall time billed before the first optimizer step."""
-    s = WORKER_BOOT_S + DEPS_INSTALL_S + download_weight_gb(config.model_id) / DOWNLOAD_RATE_GBPS
+    """Cold-start wall time billed before the first optimizer step: container boot + deps + model
+    load (a fixed deserialize/placement/init base + a size-scaled download), plus vLLM init for
+    GRPO. The model-load term dominates a short job's bill (see the constants above)."""
+    model_load = MODEL_LOAD_BASE_S + download_weight_gb(config.model_id) / DOWNLOAD_RATE_GBPS
+    s = WORKER_BOOT_S + DEPS_INSTALL_S + model_load
     if config.is_grpo:
         s += VLLM_INIT_S
     return s
