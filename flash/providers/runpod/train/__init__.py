@@ -77,7 +77,10 @@ def upload_code(repo: str | None = None) -> str:
             "hf_repo must be set (the run's [train] hf_repo: HF dataset repo for code + artifacts)"
         )
     token = os.environ.get("HF_TOKEN")
-    pkg_dir = os.path.dirname(os.path.abspath(flash.__file__))
+    # ``realpath`` collapses any symlink in the package path so the upload reads the REAL installed
+    # tree, not a link target a redeploy may have re-pointed (e.g. a /current -> /releases/<sha>
+    # symlink layout). This is the package the worker re-imports, so what we upload == what runs.
+    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     api = HfApi(token=token)
     # Run artifact repos are always private (they carry run code, adapters, and metrics).
     api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True)
@@ -92,6 +95,14 @@ def upload_code(repo: str | None = None) -> str:
         repo_id=repo,
         repo_type="dataset",
         ignore_patterns=["__pycache__/*", "*.pyc"],
+        # Mirror the local package EXACTLY: delete every remote file under code/flash that isn't in
+        # this upload (delete_patterns are relative to path_in_repo, so "**" scopes to code/flash/**
+        # only). The "don't delete what we re-add" optimization in upload_folder keeps unchanged
+        # files; this only removes ORPHANS — modules renamed/deleted between releases, or a stale
+        # snapshot a prior partial/diff commit left behind. Without it, a purely additive upload
+        # leaves dead .py files in code/flash that the worker still imports, so a run can pick up
+        # OLD code (the "missing recent fixes" symptom) even after a clean redeploy.
+        delete_patterns=["**"],
     )
     return repo
 
