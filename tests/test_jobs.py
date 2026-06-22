@@ -179,6 +179,36 @@ def test_poll_job_retriable_without_exclude_class_does_not_set_flag(monkeypatch)
     assert res.exclude_class is False
 
 
+def test_poll_job_exclude_class_requires_retriable(monkeypatch):
+    # A malformed/stale heartbeat with exclude_class but NOT retriable must NOT trigger class
+    # exclusion (exclude_class implies retriable): the failure stays job_failed, flag stays False.
+    res = _poll_failed_with_heartbeat(monkeypatch, {"stage": "error_sft", "exclude_class": True})
+    assert res.failure == "job_failed"
+    assert res.exclude_class is False
+
+
+def test_poll_job_completed_decode_error_consults_worker_flags(monkeypatch):
+    # COMPLETED but the output decodes as an error (a handler exception). A MIG slice can surface
+    # here too, so poll_job must consult the worker heartbeat -> job_preempted + exclude_class,
+    # not silently drop them as a plain job_failed.
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # An output envelope that decode_output raises RuntimeError on (success False).
+    bad = {"success": False, "error": "boom", "stdout": "x"}
+    monkeypatch.setattr(
+        runpod_api, "job_status", lambda eid, jid: {"status": "COMPLETED", "output": bad}
+    )
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: {"retriable": True, "exclude_class": True},
+    )
+    assert res.failure == "job_preempted"
+    assert res.exclude_class is True
+
+
 def test_poll_job_stall_detection(monkeypatch):
     # job stays IN_PROGRESS forever, heartbeat never advances -> stall
     import itertools
@@ -624,11 +654,11 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         assert gpus_seen[0] == "RTX A5000"  # cheapest validated class with >= 12 GB
 
 
-def test_supervisor_excludes_gpu_class_on_mig_retry(monkeypatch):
-    # A RETRIABLE_INFRA_GPU (MIG slice) failure must re-allocate OFF the failed CLASS, not just
-    # retry on the same one: the cheapest validated 24 GB class (RTX A5000) is the MIG-prone one, so
-    # the retry must land on a DIFFERENT validated class (a consumer card that can't be MIG-sliced).
-    # This is the live failure being fixed (a 9B SFT / gsm8k GRPO run died on a Blackwell-MIG A5000).
+def test_supervisor_excludes_gpu_class_on_second_mig(monkeypatch):
+    # A MIG slice (exclude_class) doesn't blacklist the class on the FIRST occurrence — a retry
+    # lands on a fresh host that's usually a real full GPU — so attempt 1 retries the SAME class.
+    # Only the SECOND MIG from that class is treated as class-systemic and excluded, walking the
+    # run onto a DIFFERENT validated class (a consumer card that can't be MIG-sliced).
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
@@ -653,9 +683,8 @@ def test_supervisor_excludes_gpu_class_on_mig_retry(monkeypatch):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
-            if attempt == 0:
-                # What poll_job produces for a MIG slice: the worker's boot-guard stamped
-                # retriable + exclude_class into heartbeat.json -> job_preempted + exclude_class.
+            # attempts 0 and 1 both hand back a MIG slice (job_preempted + exclude_class).
+            if attempt < 2:
                 return jobs.PollResult(
                     False,
                     failure="job_preempted",
@@ -678,14 +707,16 @@ def test_supervisor_excludes_gpu_class_on_mig_retry(monkeypatch):
         orch.submit_job(spec, dry_run=False, background=False)
 
         assert orch.get_status("mig-walk").state == "done"
-        # job_preempted is infra-shaped -> it retried instead of failing immediately.
-        assert len(gpus_seen) == 2
-        # attempt 0 ran the cheapest (MIG-prone) class; the retry walked OFF it to a DIFFERENT one.
+        assert len(gpus_seen) == 3
+        # attempt 0 = cheapest MIG-prone class; attempt 1 RETRIES the SAME class (1st MIG, no
+        # exclusion); attempt 2 walks OFF it after the 2nd MIG.
         assert gpus_seen[0] == "RTX A5000"
-        assert gpus_seen[1] != "RTX A5000"
-        # the retry's allocation excluded the failed class (the first allocation didn't).
+        assert gpus_seen[1] == "RTX A5000"
+        assert gpus_seen[2] != "RTX A5000"
+        # the class is excluded only on the THIRD allocation (after the 2nd MIG), not before.
         assert seen_excludes[0] == frozenset()
-        assert "RTX A5000" in seen_excludes[1]
+        assert seen_excludes[1] == frozenset()
+        assert "RTX A5000" in seen_excludes[2]
 
 
 def test_supervisor_mig_failure_without_marker_does_not_retry(monkeypatch):
