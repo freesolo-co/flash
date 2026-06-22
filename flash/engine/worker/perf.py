@@ -506,7 +506,8 @@ def wait_for_gpu():
             last = str(e)[:160]
         print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
         _t.sleep(10)
-    raise RuntimeError(f"GPU never became ready after 12 tries: {last}")
+    # Infra-shaped: a host whose GPU never comes up is dead, not a code bug -> retry on a fresh one.
+    raise RetriableInfraError(f"GPU never became ready after 12 tries: {last}")
 
 
 def free_gpu(trainer=None):
