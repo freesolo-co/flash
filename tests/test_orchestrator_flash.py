@@ -171,3 +171,32 @@ def test_run_job_background_swallows_exception(monkeypatch):
     # Must not raise — the wrapper swallows it (state already persisted by _run_job_inner).
     runner._run_job_background(spec)
     assert calls["n"] == 1
+
+
+def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch):
+    """If _run_job crashes BEFORE _run_job_inner persisted a terminal state (e.g. an import/resolve
+    error), the daemon wrapper must still record a terminal `failed` (via terminal-sticky _update) so
+    the run doesn't hang non-terminal forever."""
+    import os
+    import tempfile
+
+    import flash.runner as runner
+    from flash.runner import RunStatus
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
+        os.makedirs(runner.RUNS_DIR, exist_ok=True)
+        # a non-terminal (queued) run, as submit_job persists before dispatching the daemon thread
+        runner._save_status(RunStatus(run_id="bg-fail", state="queued", spec={}))
+
+        def boom(spec):
+            raise RuntimeError("crashed before persisting terminal state")
+
+        monkeypatch.setattr(runner, "_run_job", boom)
+        spec = type("S", (), {"run_id": "bg-fail"})()
+        runner._run_job_background(spec)  # must not raise
+
+        status = runner.get_status("bg-fail")
+        assert status.state == "failed"
+        assert "crashed before persisting" in (status.error or "")

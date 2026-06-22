@@ -163,18 +163,25 @@ def _run_job_background(spec: JobSpec) -> None:
     callers — e.g. ``test_supervisor_fail_fast`` — expect the exception). In a daemon thread that
     re-raise has no caller, so Python prints a full ``Exception in thread`` traceback for *every*
     failed/cancelled run — log noise that buries real errors and trips monitoring. Swallow + log a
-    one-line note here (the run record already carries the failure detail), leaving the synchronous
-    raise path untouched. Defined in this module (not lifecycle) so it dispatches through the
-    package-level ``_run_job`` that tests monkeypatch.
+    one-line note here, while defensively ensuring a terminal ``failed`` state via the
+    terminal-sticky ``_update`` (covers a crash BEFORE ``_run_job_inner`` persisted anything, e.g. an
+    import/model-resolve error), leaving the synchronous raise path untouched. Defined in this module
+    (not lifecycle) so it dispatches through the package-level ``_run_job`` that tests monkeypatch.
     """
     import logging
 
     try:
         _run_job(spec)
-    except Exception:
-        logging.getLogger(__name__).warning(
-            "background run %s ended in error (terminal state already persisted)", spec.run_id
-        )
+    except Exception as e:
+        # _run_job -> _run_job_inner normally persists the terminal failure before its re-raise, but a
+        # crash before that persist point would leave the run stuck non-terminal. _update is
+        # terminal-sticky: it records `failed` only when the run isn't already terminal, so it never
+        # clobbers an already-persisted failure detail yet a pre-persist crash still ends the run.
+        # Guard the safety-net itself (suppress) so a missing/unwritable status can't re-raise out of
+        # the daemon thread — that traceback is the exact noise this wrapper exists to prevent.
+        with contextlib.suppress(Exception):
+            _update(spec.run_id, "failed", error=str(e))
+        logging.getLogger(__name__).warning("background run %s ended in error: %s", spec.run_id, e)
 
 
 def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -> RunStatus:
