@@ -395,6 +395,12 @@ class RetriableInfraError(RuntimeError):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
 
 
+# Transient-startup grace for assert_usable_gpu's CUDA-availability poll (it runs before the
+# handler's wait_for_gpu). Module-level so tests can monkeypatch them to run instantly.
+_GPU_GUARD_AVAIL_RETRIES = 6
+_GPU_GUARD_AVAIL_DELAY_S = 5.0
+
+
 def assert_usable_gpu() -> None:
     """Fail FAST (and RETRIABLY) on a MIG slice / NVML-restricted device before any real CUDA work.
 
@@ -414,11 +420,30 @@ def assert_usable_gpu() -> None:
     """
     try:
         import torch
-    except Exception as e:  # torch import failure is a different (image) problem; let it surface
-        print("[gpu-guard] torch import failed; skipping MIG/NVML guard:", e)
-        return
-    if not torch.cuda.is_available():
-        raise RetriableInfraError("CUDA reports no available device at worker boot")
+    except Exception as e:
+        # torch import failure is an IMAGE problem, not transient infra: surface it (re-raise)
+        # instead of swallowing and returning. Swallowing would let the worker proceed into
+        # training and fail later with a far less actionable error than the import traceback here.
+        print("[gpu-guard] torch import failed; surfacing:", e)
+        raise
+    # Transient-startup grace: rented hosts can report "CUDA not available" for a few seconds at
+    # boot. This guard runs in main() BEFORE the handler's wait_for_gpu(), so failing on the very
+    # first is_available() check would preempt that polling and spuriously resubmit a host whose
+    # CUDA comes up a moment later. Poll a few times (constants are module-level so tests shrink
+    # them) before declaring the host device-less.
+    import time as _t
+
+    cuda_ready = False
+    for _i in range(max(1, _GPU_GUARD_AVAIL_RETRIES)):
+        cuda_ready = bool(torch.cuda.is_available())
+        if cuda_ready:
+            break
+        if _i + 1 < _GPU_GUARD_AVAIL_RETRIES:
+            _t.sleep(_GPU_GUARD_AVAIL_DELAY_S)
+    if not cuda_ready:
+        raise RetriableInfraError(
+            "CUDA reports no available device after the worker-boot startup grace"
+        )
     try:
         name = torch.cuda.get_device_name(0)
     except Exception as e:
