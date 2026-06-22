@@ -9,6 +9,7 @@ reachable through the package global rather than a statically-bound copy.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from typing import TYPE_CHECKING
 
@@ -140,6 +141,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         _update,
         artifacts_dir,
         get_status,
+        is_infra_shaped,
     )
 
     status = get_status(run_id)
@@ -172,6 +174,36 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
+            # The remote job ended unhappily. Distinguish two cases exactly like the
+            # fresh-submit retry loop (_submit_seed_supervised), so a redeploy continues a
+            # run the same way an in-flight failure would have:
+            #   - INFRA-shaped (host vanished / TIMED_OUT / stalled poll): the job died for
+            #     infrastructure reasons, very likely BECAUSE the control plane was down during
+            #     the redeploy. Don't fail the run — resume this seed on a fresh host, where the
+            #     worker picks up from the latest HF checkpoint.
+            #   - genuine worker crash (a real captured traceback): fail fast; re-running would
+            #     only reproduce the crash and burn money.
+            if is_infra_shaped(res.failure, res.detail):
+                try:
+                    seed_index = list(spec.train.seeds).index(seed)
+                except ValueError:
+                    seed_index = 0
+                print(
+                    f"attach: {run_id} seed {seed} ended infra-shaped ({res.failure}: "
+                    f"{res.detail}); resuming from the last checkpoint on a fresh host",
+                    file=log,
+                )
+                # GC the dead endpoint while its handle is still persisted, then clear the stale
+                # handle and record the seed we are resuming. If a SECOND restart lands during the
+                # fresh allocation, recover_runs sees resume_seed_index and resumes the right seed
+                # (resume_run) instead of restarting from seed 0.
+                with contextlib.suppress(Exception):
+                    _gc_run_endpoints(spec)
+                _update(run_id, "running", remote=None, resume_seed_index=seed_index)
+                _run_seed_loop(
+                    spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0)
+                )
+                return get_status(run_id)
             _update(run_id, "failed", error=f"{res.failure}: {res.detail}")
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the
