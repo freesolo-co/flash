@@ -98,9 +98,11 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     # `flash login` verifies the freesolo key against the freesolo backend, then stores it.
     proc = _run(["login", "--api-key", "fs-stub-key"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    # The key must never be echoed; only the storage location is printed.
+    # The key and local config path must never be echoed.
     assert "fs-stub-key" not in proc.stdout
-    assert "saved to" in proc.stdout
+    assert "saved to" not in proc.stdout
+    assert ".flash" not in proc.stdout
+    assert "you're ready to train" not in proc.stdout
 
     cfg = os.path.join(home, ".flash", "config.json")
     with open(cfg) as f:
