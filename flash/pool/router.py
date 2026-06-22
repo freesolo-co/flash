@@ -162,6 +162,13 @@ class Router:
             # load_lora (e.g. a bad adapter URI surfacing "not found"/"does not exist"), which must
             # fail over to a different backend instead of looping reloads on this one.
             in_generation = False
+            # The acquire() above reserves an in-flight slot before slow IO; it MUST be paired with
+            # exactly one release on every exit path — success, GatewayError, an unexpected
+            # exception, or asyncio.CancelledError (client disconnect). A leaked slot leaves the
+            # backend's ``inflight`` permanently inflated, so balancing treats a healthy backend as
+            # saturated. The single ``finally`` below guarantees that pairing; ``release_failed``
+            # carries the GatewayError path's ``failed=True`` accounting into it.
+            release_failed = False
             try:
                 if must_load and ad is not None:
                     # The (un)load is a WRITER on this backend: exclusive, so no generate forwards a
@@ -188,13 +195,10 @@ class Router:
                     resp = await (
                         self.gateway.chat(be, payload) if kind == "chat" else self.gateway.completions(be, payload)
                     )
-                async with self._lock:
-                    self.state.release(be.id)
                 return resp, be.id
             except GatewayError as e:
                 last_err = e
-                async with self._lock:
-                    self.state.release(be.id, failed=True)
+                release_failed = True
                 # Adapter swapped/evicted out from under us AT GENERATION TIME -> drop its placement
                 # here and retry the SAME backend (the next pick reloads it). Only for a chat miss,
                 # not a load/unload failure. Don't fail over, don't mark the backend unhealthy.
@@ -219,6 +223,13 @@ class Router:
                 if failovers > self.config.max_retries:
                     break
                 continue
+            finally:
+                # Pairs the acquire() above exactly once for THIS iteration, on every exit:
+                # success (return), GatewayError (continue/break, failed=True), an unexpected
+                # exception, or CancelledError. A continuing iteration re-acquires at the top of the
+                # loop, so acquire/release stay balanced; this is the only release in the body.
+                async with self._lock:
+                    self.state.release(be.id, failed=release_failed)
 
         raise NoCapacityError(f"all backends failed for model {model!r}: {last_err}")
 
@@ -429,10 +440,14 @@ def create_pool_app(
         except KeyError as e:
             raise HTTPException(status_code=400, detail=f"missing field {e}") from e
         async with router._lock:
-            router.state.register_adapter(ad)
-        result = ad.snapshot()
+            # register_adapter returns the CANONICAL adapter: on re-registration it updates and
+            # returns the EXISTING instance (live placements + version preserved), which is NOT the
+            # freshly-built ``ad`` above. Snapshot the returned object so the response reports the
+            # real placements/version instead of empty/0 for a re-registered adapter.
+            canonical = router.state.register_adapter(ad)
+        result = canonical.snapshot()
         if body.get("place"):  # optional eager placement to reach the replica count
-            result["placement"] = await router.place_adapter(ad.name)
+            result["placement"] = await router.place_adapter(canonical.name)
         return result
 
     @app.post("/adapters/{name}/sync")

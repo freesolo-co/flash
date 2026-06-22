@@ -127,6 +127,10 @@ def test_parse_extra_pip_whitespace_and_json_list():
     assert _parse_extra_pip("   ") == []
     # whitespace-split path
     assert _parse_extra_pip("causal-conv1d  torch==2.6") == ["causal-conv1d", "torch==2.6"]
+    # shlex branch must STRIP each token too: a quoted token keeps its inner whitespace through
+    # shlex.split, which would then fail `pip install`. Mirror the JSON branch's strip behaviour.
+    assert _parse_extra_pip('pkgA "  pkgB  "') == ["pkgA", "pkgB"]
+    assert _parse_extra_pip('"  spaced  "') == ["spaced"]
     # JSON-list path (for specs that contain spaces/commas), with empties dropped + stripped
     assert _parse_extra_pip('["pkgA", "  pkgB ", ""]') == ["pkgA", "pkgB"]
 

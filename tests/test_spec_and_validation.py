@@ -146,6 +146,26 @@ def test_gpus_per_node_derives_from_inference_gpus() -> None:
     assert gpus_per_node(None) == 1
 
 
+def test_node_gpus_from_train_strict_int_rejects_bool_and_fractional() -> None:
+    # node_gpus_from_train is the tolerant parse-time path (holds a RAW [train] dict). It must use
+    # the strict-int contract, not plain int(): int(True)==1 and int(2.9)==2 would silently
+    # provision the wrong topology from a malformed/persisted spec. An invalid value falls back to a
+    # colocated single-GPU node (1) rather than raising.
+    from flash.spec import node_gpus_from_train
+
+    assert node_gpus_from_train({"inference_gpus": 0}) == 1  # colocate
+    assert node_gpus_from_train({"inference_gpus": 2}) == 3  # 1 trainer + 2 inference
+    assert node_gpus_from_train({"inference_gpus": 2.0}) == 3  # whole float accepted
+    assert node_gpus_from_train({}) == 1  # missing -> default colocate
+    assert node_gpus_from_train({"inference_gpus": None}) == 1  # explicit None -> default
+    # bool is NOT a count: int(True)==1 would wrongly request 2 GPUs -> reject (fall back to 1)
+    assert node_gpus_from_train({"inference_gpus": True}) == 1
+    # fractional float would truncate (2.9 -> 2 -> 3 GPUs) -> reject (fall back to 1)
+    assert node_gpus_from_train({"inference_gpus": 2.9}) == 1
+    # unparseable string -> fall back to 1 (not int("x") crash)
+    assert node_gpus_from_train({"inference_gpus": "x"}) == 1
+
+
 def test_disaggregated_guard_skips_sft(monkeypatch) -> None:
     # SFT has no rollout engine, so the guard does NOT reject a requires_disaggregated model's
     # SFT run even on the colocate (no inference_gpus) path.

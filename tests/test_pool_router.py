@@ -317,6 +317,73 @@ def test_load_failure_fails_over_instead_of_looping_reloads():
     assert gpu0_loads == 1, f"gpu0 load should be attempted once then failed over, not looped: {gw.events}"
 
 
+class _ChatRaisingGateway(_RecordingGateway):
+    """A gateway whose chat() raises a chosen exception, to prove generate() never leaks the
+    in-flight slot it reserved before the network IO."""
+
+    def __init__(self, exc: BaseException):
+        super().__init__()
+        self._exc = exc
+
+    async def chat(self, be, body):
+        raise self._exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [asyncio.CancelledError(), RuntimeError("boom")],
+    ids=["cancelled", "unexpected"],
+)
+def test_generate_releases_inflight_slot_on_cancel_or_unexpected_error(exc):
+    # generate() reserves an in-flight slot (state.acquire) BEFORE the network IO. If the request is
+    # cancelled (client disconnect) or any non-GatewayError exception fires, the slot must still be
+    # released exactly once via the finally — otherwise the backend's inflight stays inflated and
+    # balancing treats a healthy backend as permanently saturated.
+    gw = _ChatRaisingGateway(exc)
+    # base routing (no adapter loaded) -> straight to the forward; the chat raises.
+    r = _router_with(gw, backends=["gpu0"], replicas=1)
+    assert r.state.backends["gpu0"].inflight == 0
+
+    async def scenario():
+        await r.generate({"model": "Q", "messages": []})  # base model "Q" -> no load, just chat
+
+    with pytest.raises(type(exc)):
+        asyncio.run(scenario())
+
+    # the slot reserved before the failing IO was handed back: inflight is balanced again.
+    assert r.state.backends["gpu0"].inflight == 0
+    # a CancelledError / unexpected error is NOT a backend failure (only GatewayError is) -> the
+    # release was not counted as a failure.
+    assert r.state.backends["gpu0"].total_failures == 0
+
+
+def test_register_adapter_response_reflects_reregistered_state():
+    # Re-registering an existing adapter (new weights) must report the LIVE placements + bumped
+    # version from PoolState's canonical (existing) instance — not the empty placements/version=0 of
+    # the freshly-built Adapter the handler constructs from the request body.
+    h = build_harness([{"id": "gpu0", "base_model": "Q", "max_loras": 8}])
+    try:
+        with h.client() as c:
+            _register(c, "run", uri="/lora/run/v0", place=True).raise_for_status()
+            # the eager placement (place=True) actually placed it on gpu0
+            snap = h.status()
+            placed = next(a for a in snap["pool"]["adapters"] if a["name"] == "run")
+            assert placed["placements"] == ["gpu0"]
+            assert placed["version"] == 0
+
+            # re-register the SAME name with NEW weights: PoolState keeps the placement + bumps the
+            # version on the EXISTING (canonical) instance. The response must mirror that returned
+            # canonical adapter, not the freshly-built one (which would report placements=[]/version=0).
+            second = _register(c, "run", uri="/lora/run/v1", place=False)
+            second.raise_for_status()
+            body2 = second.json()
+            assert body2["placements"] == ["gpu0"], body2  # placement preserved, NOT []
+            assert body2["version"] == 1, body2  # weights changed -> bumped, NOT 0
+            assert body2["uri"] == "/lora/run/v1", body2
+    finally:
+        h.stop()
+
+
 def test_maybe_seed_backends_rejects_malformed_entry(monkeypatch):
     # A typo'd FLASH_POOL_BACKENDS entry must fail loudly — silently dropping it would start the pool
     # WITHOUT the intended backend, which is much harder to diagnose than an explicit config error.

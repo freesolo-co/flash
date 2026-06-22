@@ -339,10 +339,18 @@ def node_gpus_from_train(train: Any) -> int:
         raw = train.get("inference_gpus")
     else:
         raw = getattr(train, "inference_gpus", 0)
-    try:
-        inference_gpus = int(raw or 0)
-    except (TypeError, ValueError):
+    if raw is None:
         inference_gpus = 0
+    else:
+        # Same strict-int contract as ``from_dict``'s ``inference_gpus`` validation: a bool or a
+        # fractional float is NOT a valid GPU count (``int(True)`` -> 1, ``int(2.9)`` -> 2 would
+        # silently provision the wrong topology). This is the tolerant parse-time wrapper, so a
+        # malformed/persisted value falls back to 0 (a colocated, single-GPU node) rather than
+        # raising — matching the prior int()-with-fallback behaviour.
+        try:
+            inference_gpus = strict_int(raw, name="train.inference_gpus", minimum=0)
+        except (TypeError, ValueError):
+            inference_gpus = 0
     return max(1, inference_gpus + 1) if inference_gpus > 0 else 1
 
 

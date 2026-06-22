@@ -153,7 +153,9 @@ def _parse_extra_pip(raw: str) -> list[str]:
             f"FLASH_EXTRA_PIP could not be tokenized ({e}); "
             "expected a whitespace-separated string (or a JSON list of strings)"
         ) from e
-    return [d for d in toks if d.strip()]
+    # Strip each token (mirror the JSON branch): a quoted token like '"  pkgB  "' survives shlex
+    # tokenisation with its inner whitespace, which would then fail `pip install`.
+    return [d for d in (t.strip() for t in toks) if d]
 
 
 def build_payload(spec, seed: int, attempt: int) -> dict:
