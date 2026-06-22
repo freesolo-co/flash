@@ -23,17 +23,19 @@ from flash.providers.base import GPU_INFO, providers_for
 def test_realized_rate_never_exceeds_list_for_any_class():
     # The realized (spot/queue) rate is conservative: clamped to the on-demand list so the
     # estimator can never over-quote a class vs its list price. Holds for EVERY registry class,
-    # by construction -- including the historically-over-list RTX A5000 ($0.304 raw vs $0.27 list).
+    # by construction.
     for name in GPU_INFO:
         assert realized_hourly_usd(name) <= gpu_hourly_usd(name), name
-    assert realized_hourly_usd("RTX A5000") <= gpu_hourly_usd("RTX A5000")
 
 
-def test_over_list_realized_entry_is_clamped_to_list():
-    # The raw RTX A5000 table entry sits above its list price; realized_hourly_usd clamps it down
-    # to list (and a genuinely-discounted entry like the RTX 5090 still reports its discount).
-    assert REALIZED_HOURLY_USD["RTX A5000"] > gpu_hourly_usd("RTX A5000")  # raw entry is over list
-    assert realized_hourly_usd("RTX A5000") == gpu_hourly_usd("RTX A5000")  # clamped to list
+def test_over_list_realized_entry_is_clamped_to_list(monkeypatch):
+    # An observed realized rate that sits ABOVE the on-demand list must be clamped down to list, so
+    # the estimator can never over-quote. Inject an over-list entry for a real class and assert the
+    # clamp (a genuinely-discounted entry like the RTX 5090 still reports its discount).
+    over_list = gpu_hourly_usd("RTX 3090") + 0.10
+    monkeypatch.setitem(REALIZED_HOURLY_USD, "RTX 3090", over_list)
+    assert REALIZED_HOURLY_USD["RTX 3090"] > gpu_hourly_usd("RTX 3090")  # raw entry is over list
+    assert realized_hourly_usd("RTX 3090") == gpu_hourly_usd("RTX 3090")  # clamped to list
     assert realized_hourly_usd("RTX 5090") == REALIZED_HOURLY_USD["RTX 5090"]  # below list -> unchanged
     assert realized_hourly_usd("RTX 5090") < gpu_hourly_usd("RTX 5090")
 
@@ -52,7 +54,7 @@ def test_compute_table_only_lists_real_classes():
 
 def test_gpu_tflops_known_and_default():
     assert gpu_tflops("RTX 5090") == GPU_COMPUTE_TFLOPS["RTX 5090"]
-    assert gpu_tflops("RTX 5090") > gpu_tflops("RTX A5000")  # newer/faster
+    assert gpu_tflops("RTX 5090") > gpu_tflops("RTX 3090")  # newer/faster
     assert gpu_tflops("totally-unknown-gpu") == 100.0  # documented default
 
 
