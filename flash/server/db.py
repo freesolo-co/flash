@@ -84,7 +84,9 @@ def ensure_internal_key(api_key: str) -> dict:
     return row
 
 
-def ensure_external_key(api_key: str) -> dict | None:
+def ensure_external_key(
+    api_key: str, *, key_prefix: str | None = None, email: str | None = None
+) -> dict | None:
     """Provision a per-token row for a verified external (freesolo USER) key (idempotent).
 
     Unlike :func:`ensure_internal_key` (one shared service identity), this keys a distinct
@@ -100,7 +102,7 @@ def ensure_external_key(api_key: str) -> dict | None:
         conn.execute(
             "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (hash_key(api_key), "freesolo", "freesolo-user", now),
+            (hash_key(api_key), key_prefix or "freesolo", email, now),
         )
     return lookup_key(api_key)
 

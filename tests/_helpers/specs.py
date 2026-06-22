@@ -12,7 +12,7 @@ def raw_spec(model: str = "Qwen/Qwen3.5-0.8B", **kw) -> dict:
         "model": model,
         "algorithm": "sft",
         "train": {"epochs": 1, "hf_repo": "owner/runs"},
-        "environment": {"id": "owner/env"},  # any verifiers/Hub slug (not loaded here)
+        "environment": {"id": "owner/env"},  # any published verifiers id (not loaded here)
     }
     d.update(kw)
     return d

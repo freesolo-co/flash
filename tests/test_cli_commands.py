@@ -103,6 +103,29 @@ def test_whoami_prints_identity(fake_client, capsys) -> None:
     assert "t@example.com" in out
 
 
+def test_env_setup_replaces_lab_setup(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as env_help:
+        cli.main(["env", "setup", "--help"])
+    assert env_help.value.code == 0
+
+    with pytest.raises(SystemExit) as lab_help:
+        cli.main(["lab", "setup", "--help"])
+    assert lab_help.value.code == 2
+
+    assert _run(["env", "setup"]) == 0
+    assert (tmp_path / "environments" / "starter_env.py").is_file()
+    assert (tmp_path / "configs" / "verifiers_grpo.toml").is_file()
+
+    generated = (tmp_path / "environments" / "starter_env.py").read_text()
+    config = (tmp_path / "configs" / "verifiers_grpo.toml").read_text()
+    output = capsys.readouterr().out
+    assert "Prime" not in generated
+    assert "Prime" not in config
+    assert "Prime" not in output
+
+
 def test_models_table(fake_client, capsys) -> None:
     assert _run(["models"]) == 0
     out = capsys.readouterr().out
@@ -164,7 +187,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     from flash.spec import EnvironmentSpec, JobSpec
 
     # An unrecorded env resolves to just verifiers (the worker pip-installs verifiers; the
-    # Hub env itself is installed on the worker via `prime env install` — no local path / pip
+    # Published env itself is installed on the worker — no local path / pip dependency here.
     # wheel delivery).
     spec = JobSpec(model="Qwen/Qwen3.5-0.8B", environment=EnvironmentSpec(id="owner/env"))
     assert spec_payload(spec)["environment"]["pip"] == ["verifiers"]
