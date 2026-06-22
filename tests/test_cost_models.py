@@ -19,7 +19,7 @@ def test_total_params_is_the_catalog_stat(model_id):
 
 
 def test_quant_lookup():
-    assert model_quant("Qwen/Qwen3.5-9B") == "4bit-qlora"
+    assert model_quant("Qwen/Qwen3.5-9B") == "bf16"
     assert model_quant("Qwen/Qwen3.5-4B") == "bf16"
 
 
