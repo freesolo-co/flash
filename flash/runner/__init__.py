@@ -155,6 +155,37 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+def _run_job_background(spec: JobSpec) -> None:
+    """Daemon-thread entrypoint for background runs.
+
+    ``_run_job`` -> ``_run_job_inner`` persists the terminal state (failed/cancelled) BEFORE the
+    inner ``raise`` that the synchronous ``submit_job(background=False)`` contract depends on (its
+    callers — e.g. ``test_supervisor_fail_fast`` — expect the exception). In a daemon thread that
+    re-raise has no caller, so Python prints a full ``Exception in thread`` traceback for *every*
+    failed/cancelled run — log noise that buries real errors and trips monitoring. Swallow + log a
+    one-line note here, while defensively ensuring a terminal ``failed`` state via the
+    terminal-sticky ``_update`` (covers a crash BEFORE ``_run_job_inner`` persisted anything, e.g. an
+    import/model-resolve error), leaving the synchronous raise path untouched. Defined in this module
+    (not lifecycle) so it dispatches through the package-level ``_run_job`` that tests monkeypatch.
+    """
+    import logging
+
+    try:
+        _run_job(spec)
+    except Exception as e:
+        # _run_job -> _run_job_inner normally persists the terminal failure before its re-raise, but a
+        # crash before that persist point would leave the run stuck non-terminal. Record `failed` ONLY
+        # when the run isn't already terminal: _update allows same-state writes (so workers can update
+        # cost/error/artifacts on a terminal run), so an unconditional write here would clobber an
+        # already-persisted failure detail with this wrapper's (less specific) exception. Guard the
+        # whole safety-net (suppress) so a missing/unwritable status can't re-raise out of the daemon
+        # thread — that traceback is the exact noise this wrapper exists to prevent.
+        with contextlib.suppress(Exception):
+            if get_status(spec.run_id).state not in TERMINAL_STATES:
+                _update(spec.run_id, "failed", error=str(e))
+        logging.getLogger(__name__).warning("background run %s ended in error: %s", spec.run_id, e)
+
+
 def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     across the configured providers (RunPod Flash or Vast); dry-run only records state."""
@@ -173,7 +204,7 @@ def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -
         _save_status(status)
         return status
     if background:
-        threading.Thread(target=_run_job, args=(spec,), daemon=True).start()
+        threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
         return get_status(spec.run_id)
     _run_job(spec)
     return get_status(spec.run_id)
