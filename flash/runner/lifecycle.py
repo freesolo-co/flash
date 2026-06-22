@@ -146,15 +146,29 @@ def _submit_seed_supervised(
     # ``provider:gpu`` form is provider-SCOPED (a (provider, gpu) tuple, same form the no_capacity
     # path uses), a bare ``gpu`` excludes the class market-wide. Inert on the worker (allocation is
     # control-plane-side only).
+    from flash.providers.base import canonical_gpu
+
+    def _canon_gpu(name: str) -> str:
+        # Allocation compares CANONICAL class names (GPU_INFO keys; the no_capacity path stores
+        # (provider, chosen.gpu) where chosen.gpu is canonical), so an operator value like
+        # "rtx 5090" (different case/spacing/alias) must be canonicalized to match. An
+        # unrecognized name (typo) can't match any class anyway, so fall back to the stripped
+        # verbatim string (inert) rather than crashing the run on a bad escape-hatch entry.
+        with contextlib.suppress(Exception):
+            return canonical_gpu(name)
+        return name.strip()
+
     for _raw in (os.environ.get("FLASH_EXCLUDE_CLASSES") or "").split(","):
         _raw = _raw.strip()
         if not _raw:
             continue
         if ":" in _raw:
             _prov, _gpu = _raw.split(":", 1)
-            starved_classes.add((_prov.strip().lower(), _gpu.strip()))
+            starved_classes.add((_prov.strip().lower(), _canon_gpu(_gpu)))
         else:
-            starved_classes.add(_raw)
+            # Bare (market-wide) form: canonicalize too so "rtx 5090" matches the canonical
+            # class the allocator/no_capacity path uses (_is_excluded checks `gpu in exclude`).
+            starved_classes.add(_canon_gpu(_raw))
     # Index into the ranked candidate list. It advances only after an attempt that
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.

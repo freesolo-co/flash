@@ -48,6 +48,7 @@ from flash.providers.vast.jobs.builders import (
     run_label_prefix,
     vast_image,
 )
+from flash.spec import gpus_per_node
 
 logger = get_logger(__name__)
 
@@ -85,8 +86,15 @@ def usable_offers(
     min_vram_gb: int,
     disk_gb: float,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
+    num_gpus: int = 1,
 ) -> list[VastOffer]:
     """Verified datacenter offers able to run the job, cheapest first.
+
+    ``num_gpus`` (default 1) is the per-instance GPU count the run needs — 1 for a
+    colocated run, ``inference_gpus + 1`` for a disaggregated async-GRPO run. It is
+    threaded into ``search_offers`` so a multi-GPU run actually searches for multi-GPU
+    machines (an exact-match ``num_gpus == N`` predicate) instead of silently searching
+    1-GPU offers and reporting "no capacity".
 
     Server-side filters do the heavy lifting; everything load-bearing is re-checked
     client-side (belt and suspenders — the result rows carry the proof fields).
@@ -95,6 +103,7 @@ def usable_offers(
         int(min_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
+        num_gpus=num_gpus,
     )
     # Host tier: ALWAYS datacenter-only (hosting_type==1). The onstart payload ships run secrets
     # (HF_TOKEN, PRIME_API_KEY, OpenRouter/OpenAI/W&B creds) to the box, so verified-but-lower-trust
@@ -138,6 +147,11 @@ def usable_offers(
                 reliability=float(r.get("reliability2") or 0),
                 inet_down=float(r.get("inet_down") or 0),
                 geolocation=str(r.get("geolocation") or ""),
+                # GPUs on the instance, from the Vast offer row (the search predicate already
+                # constrained it to the requested count). Populated so multi-GPU offers aren't
+                # indistinguishable from single-GPU ones downstream (cost reporting / disaggregated
+                # plumbing); defaults to 1 when the row omits the field.
+                num_gpus=int(r.get("num_gpus") or 1),
             )
         )
     return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
@@ -209,6 +223,9 @@ def deploy_and_submit(
                         min(o.vram_gb for o in offers),
                         _effective_disk_gb(spec),
                         exclude_machine_ids=taken,
+                        # Multi-GPU disaggregated runs must refresh against multi-GPU offers too,
+                        # not silently fall back to 1-GPU machines (matches the initial allocation).
+                        num_gpus=gpus_per_node(spec),
                     )
                     if o.gpu in allowed
                 ][:5]
@@ -486,6 +503,9 @@ def submit_run_vast(
                 info.vram_gb,
                 _effective_disk_gb(spec),
                 exclude_machine_ids=exclude_machine_ids,
+                # Disaggregated runs need a multi-GPU instance (inference_gpus + 1 trainer); a
+                # bare default of 1 here would search 1-GPU offers for a multi-GPU run.
+                num_gpus=gpus_per_node(spec),
             )
             if o.gpu == spec.gpu.type
         ]

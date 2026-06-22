@@ -101,3 +101,40 @@ def test_usable_offers_exclude_machines(monkeypatch):
     rows = [_offer(id=1, machine_id=7, dph_total=0.25), _offer(id=2, machine_id=8, dph_total=0.30)]
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: rows)
     assert [o.offer_id for o in vast.usable_offers(24, 60, exclude_machine_ids={7})] == [2]
+
+
+def test_usable_offers_threads_num_gpus_into_search(monkeypatch):
+    """A multi-GPU (disaggregated) request must reach search_offers as an exact GPU count, so a
+    2-GPU run actually searches 2-GPU machines instead of silently searching 1-GPU offers (which
+    would masquerade as 'no capacity'). Default stays 1 for single-GPU runs."""
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    captured = {}
+
+    def fake_search(min_vram_mb, *, min_disk_gb=0, min_reliability=0.95, num_gpus=1, **k):
+        captured["num_gpus"] = num_gpus
+        return []
+
+    monkeypatch.setattr(vast_api, "search_offers", fake_search)
+    vast.usable_offers(24, disk_gb=60, num_gpus=3)
+    assert captured["num_gpus"] == 3
+    # default is single-GPU
+    vast.usable_offers(24, disk_gb=60)
+    assert captured["num_gpus"] == 1
+
+
+def test_usable_offers_populates_num_gpus_from_row(monkeypatch):
+    """VastOffer.num_gpus is read from the Vast offer row so multi-GPU offers are distinguishable
+    from single-GPU ones downstream (cost reporting / disaggregated plumbing); absent -> 1."""
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast
+
+    rows = [
+        _offer(id=1, machine_id=1, dph_total=0.25, num_gpus=2),  # multi-GPU row
+        _offer(id=2, machine_id=2, dph_total=0.30),  # no num_gpus key -> defaults to 1
+    ]
+    monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: rows)
+    by_id = {o.offer_id: o for o in vast.usable_offers(24, 60)}
+    assert by_id[1].num_gpus == 2
+    assert by_id[2].num_gpus == 1

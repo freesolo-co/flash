@@ -119,6 +119,36 @@ def test_vast_allocation_routes_to_vast_runner(orch, monkeypatch):
     assert orch.get_status(spec.run_id).remote["provider"] == "vast"
 
 
+def test_exclude_classes_env_is_canonicalized(orch, monkeypatch):
+    """FLASH_EXCLUDE_CLASSES is the operator escape hatch for capacity-starved classes. Allocation
+    compares CANONICAL class names (the no_capacity path stores (provider, chosen.gpu) where
+    chosen.gpu is canonical), so an operator-entered ``runpod:rtx 5090`` (lower case / alias) must
+    be canonicalized to ``("runpod", "RTX 5090")`` — otherwise the exclusion silently never
+    matches. The bare (market-wide) form is canonicalized too."""
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
+
+    captured = {}
+
+    def fake_allocate(*a, exclude_gpu_classes=frozenset(), **k):
+        captured["exclude"] = set(exclude_gpu_classes)
+        # Stop right after the first allocation (we only care about what was passed in).
+        raise UnsupportedGpuError("stop after capturing the exclusion set")
+
+    monkeypatch.setattr(allocator, "allocate", fake_allocate)
+    # lower-case + single-space provider-scoped entry, plus a bare market-wide alias.
+    monkeypatch.setenv("FLASH_EXCLUDE_CLASSES", "runpod:rtx 5090, l40s")
+    spec = _spec()
+    _seed_status(orch, spec)
+    with pytest.raises(UnsupportedGpuError):
+        orch._submit_seed_supervised(spec, 0, io.StringIO())
+    # provider-scoped tuple canonicalized to the class name allocation actually compares against
+    assert ("runpod", "RTX 5090") in captured["exclude"]
+    assert ("runpod", "rtx 5090") not in captured["exclude"]  # the raw form would never match
+    # bare form canonicalized too (market-wide ban still works regardless of case)
+    assert "L40S" in captured["exclude"]
+
+
 def test_vast_cost_flows_into_run_status(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)

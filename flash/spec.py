@@ -326,6 +326,26 @@ class JobSpec:
         return cls.from_dict(json.loads(raw))
 
 
+def node_gpus_from_train(train: Any) -> int:
+    """GPUs a worker node needs, derived from a [train] spec/dict's ``inference_gpus``.
+
+    The shared core of ``gpus_per_node`` (which takes a whole spec): a colocated run
+    (``inference_gpus == 0``) needs 1 GPU; a disaggregated async-GRPO run
+    (``inference_gpus == N > 0``) needs ``N + 1`` (N rollout cards + 1 trainer card).
+    Tolerant of a missing/partial/raw-dict ``train`` (defaults to 1) so the parse-time
+    allocator (which holds a raw [train] dict) and the submit-time topology size identically.
+    """
+    if isinstance(train, dict):
+        raw = train.get("inference_gpus")
+    else:
+        raw = getattr(train, "inference_gpus", 0)
+    try:
+        inference_gpus = int(raw or 0)
+    except (TypeError, ValueError):
+        inference_gpus = 0
+    return max(1, inference_gpus + 1) if inference_gpus > 0 else 1
+
+
 def gpus_per_node(spec: Any) -> int:
     """GPUs the run's worker node must provision = ONE trainer card + ``train.inference_gpus``.
 
@@ -338,12 +358,7 @@ def gpus_per_node(spec: Any) -> int:
     and the worker's ``FLASH_GPU_COUNT`` so multi-GPU jobs actually request multiple GPUs instead of
     silently falling back to 1. Tolerant of a missing/partial spec (defaults to 1).
     """
-    train = getattr(spec, "train", None)
-    try:
-        inference_gpus = int(getattr(train, "inference_gpus", 0) or 0)
-    except (TypeError, ValueError):
-        inference_gpus = 0
-    return max(1, inference_gpus + 1) if inference_gpus > 0 else 1
+    return node_gpus_from_train(getattr(spec, "train", None))
 
 
 def load_job_spec_from_env() -> JobSpec | None:

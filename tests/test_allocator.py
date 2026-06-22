@@ -199,6 +199,35 @@ def test_provider_pin_vast_returns_vast_allocation(monkeypatch):
     assert all(c.provider == "vast" for c in a.candidates)  # RunPod excluded by the pin
 
 
+def test_vast_allocation_passes_node_gpu_count_into_offer_search(monkeypatch):
+    """A disaggregated GRPO run ([train].inference_gpus>0) needs a MULTI-GPU node
+    (inference_gpus + 1 trainer card). The allocator must thread that count into the Vast offer
+    search (usable_offers -> search_offers) so it actually searches multi-GPU machines instead of
+    1-GPU offers that read as 'no capacity'. A colocated run (inference_gpus 0/absent) stays 1."""
+    from flash.providers import allocator
+    from flash.providers.vast import jobs as vast_jobs
+    from tests._helpers.vast import make_vast_offer
+
+    monkeypatch.setenv("VAST_API_KEY", "x")
+    captured = {}
+
+    def fake_usable(min_vram_gb, disk_gb, exclude_machine_ids=frozenset(), num_gpus=1):
+        captured["num_gpus"] = num_gpus
+        return [make_vast_offer(gpu="A100 SXM", vram_gb=80, dph_total=1.0)]
+
+    monkeypatch.setattr(vast_jobs, "usable_offers", fake_usable)
+
+    # Disaggregated: inference_gpus=2 -> a 3-GPU node (2 rollout + 1 trainer).
+    allocator.allocate(
+        "Qwen/Qwen3.5-4B", "grpo", provider="vast", train={"inference_gpus": 2}
+    )
+    assert captured["num_gpus"] == 3
+
+    # Colocated default (no inference_gpus) -> single-GPU search.
+    allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="vast")
+    assert captured["num_gpus"] == 1
+
+
 def test_nothing_fits_names_constraint(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError

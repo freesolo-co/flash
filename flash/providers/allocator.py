@@ -32,6 +32,7 @@ from flash.providers.base import (
     Candidate,
     UnsupportedGpuError,
 )
+from flash.spec import node_gpus_from_train
 
 logger = get_logger(__name__)
 
@@ -225,7 +226,11 @@ def _runpod_candidates(need: int, exclude_gpu_classes: frozenset) -> list[Candid
 
 
 def _vast_candidates(
-    need: int, disk_gb: int, exclude_machine_ids, exclude_gpu_classes: frozenset
+    need: int,
+    disk_gb: int,
+    exclude_machine_ids,
+    exclude_gpu_classes: frozenset,
+    num_gpus: int = 1,
 ) -> tuple[list[Candidate], tuple]:
     """Vast's fitting, live-validated classes from the live offer book (cheapest per class).
 
@@ -242,9 +247,14 @@ def _vast_candidates(
     book: list = []
     try:
         # The offer search must use the SAME disk floor instances are actually provisioned with
-        # (a smaller requested ``disk_gb`` would surface offers that then fail to rent).
+        # (a smaller requested ``disk_gb`` would surface offers that then fail to rent). ``num_gpus``
+        # is the per-instance GPU count (1 colocated, inference_gpus+1 disaggregated): a multi-GPU
+        # run must search multi-GPU machines, not 1-GPU offers masquerading as "no capacity".
         book = usable_offers(
-            need, max(float(disk_gb), MIN_DISK_GB), exclude_machine_ids=exclude_machine_ids
+            need,
+            max(float(disk_gb), MIN_DISK_GB),
+            exclude_machine_ids=exclude_machine_ids,
+            num_gpus=num_gpus,
         )
     except Exception as exc:
         logger.warning("vast offer search failed (%s); allocating on runpod only", exc)
@@ -314,8 +324,13 @@ def allocate(
     if "runpod" in live:
         candidates += _runpod_candidates(need, exclude_gpu_classes)
     if "vast" in live:
+        # Per-instance GPU count the run needs (1 colocated, inference_gpus+1 disaggregated),
+        # derived from the run's [train] spec/dict so a disaggregated GRPO run searches multi-GPU
+        # offers (not 1-GPU offers that then read as "no capacity"). Shares one source of truth with
+        # gpus_per_node so the parse-time and submit-time topologies match.
+        vast_num_gpus = node_gpus_from_train(train)
         vcands, offer_book = _vast_candidates(
-            need, disk_gb, exclude_machine_ids, exclude_gpu_classes
+            need, disk_gb, exclude_machine_ids, exclude_gpu_classes, num_gpus=vast_num_gpus
         )
         candidates += vcands
     # Authoritative exclusion at the allocate level (the per-provider helpers also pre-filter, so

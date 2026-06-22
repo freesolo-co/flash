@@ -20,6 +20,7 @@ on CPU with a stub.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import os
 import time
@@ -32,6 +33,20 @@ from flash.pool.client import Experience, RolloutPoolClient
 # the current uri). This is the only GPU-touching step; on a real worker it does the PEFT
 # forward/backward and saves the adapter.
 PolicyUpdate = Callable[[Experience, list[list[float]]], str | None]
+
+
+def _cycle_prompts_to(base: Sequence[str], need: int) -> list[str]:
+    """Exactly ``need`` prompts: the base list, cycled (repeated) if it is shorter.
+
+    Materializes ``need`` items in a SINGLE pass via ``itertools.cycle`` + ``islice``.
+    The previous ``prompts += prompts`` doubling allocated O(need) extra entries and
+    could blow memory for a large step count over a tiny prompt set. Same resulting
+    order (the base list, repeated). An empty ``base`` (or ``need <= 0``) yields ``[]``
+    rather than spinning ``cycle`` forever.
+    """
+    if not base or need <= 0:
+        return []
+    return list(itertools.islice(itertools.cycle(base), need))
 
 
 def compute_group_advantages(rewards: Sequence[Sequence[float]], *, eps: float = 1e-6) -> list[list[float]]:
@@ -177,11 +192,9 @@ def run() -> dict:
     if not prompts:
         raise RuntimeError("pool trainer: active env produced no prompts")
     if steps is not None:
-        # cap the prompt pool to what the step count needs (cycle if short)
-        need = steps * batch_prompts
-        while len(prompts) < need:
-            prompts = prompts + prompts
-        prompts = prompts[:need]
+        # Cap the prompt pool to EXACTLY what the step count needs, cycling if the env
+        # yields fewer prompts than `need` (memory-efficient — see _cycle_prompts_to).
+        prompts = _cycle_prompts_to(prompts, steps * batch_prompts)
     prompt_batches = list(pool_policy.batched(prompts, batch_prompts))
 
     client = RolloutPoolClient(pool_url, adapter=adapter, base_model=model_id, timeout=600.0)

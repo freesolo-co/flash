@@ -8,7 +8,11 @@ import time
 
 import pytest
 
-from flash.engine.pool_trainer import GRPOPoolLoop, compute_group_advantages
+from flash.engine.pool_trainer import (
+    GRPOPoolLoop,
+    _cycle_prompts_to,
+    compute_group_advantages,
+)
 from flash.pool.client import RolloutPoolClient
 from tests._helpers.pool_harness import build_harness
 
@@ -31,6 +35,32 @@ def test_compute_group_advantages_constant_group_is_zero():
 
 def test_compute_group_advantages_handles_empty():
     assert compute_group_advantages([[]]) == [[]]
+
+
+def test_cycle_prompts_to_repeats_in_order_without_doubling():
+    """The prompt cap cycles the base list to EXACTLY `need`, in the base's repeated order —
+    not the old `prompts += prompts` power-of-two doubling that over-allocated and could blow
+    memory for a large step count over a tiny prompt set."""
+    base = ["a", "b", "c"]
+    # need not a multiple of len(base): exactly `need` items, cycled in order, no overshoot.
+    assert _cycle_prompts_to(base, 7) == ["a", "b", "c", "a", "b", "c", "a"]
+    # need < len(base): truncates to need (the doubling loop never even ran here, but lock it).
+    assert _cycle_prompts_to(base, 2) == ["a", "b"]
+    # need == len(base): the base list unchanged.
+    assert _cycle_prompts_to(base, 3) == ["a", "b", "c"]
+    # A large need over a tiny base yields exactly `need` (doubling would over-allocate to the
+    # next power of two; islice stops precisely at need).
+    big = _cycle_prompts_to(["x", "y"], 1000)
+    assert len(big) == 1000
+    assert big[:4] == ["x", "y", "x", "y"]
+    assert big[-1] == "y"  # 1000 even -> last is the 2nd base item
+
+
+def test_cycle_prompts_to_empty_base_is_safe():
+    """An empty base (or need<=0) must NOT make itertools.cycle spin forever — it returns []."""
+    assert _cycle_prompts_to([], 5) == []
+    assert _cycle_prompts_to(["a"], 0) == []
+    assert _cycle_prompts_to(["a"], -3) == []
 
 
 def test_distributed_grpo_loop_runs_off_gpu():
