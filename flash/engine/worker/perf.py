@@ -414,9 +414,11 @@ def assert_usable_gpu() -> None:
     """
     try:
         import torch
-    except Exception as e:  # torch import failure is a different (image) problem; let it surface
-        print("[gpu-guard] torch import failed; skipping MIG/NVML guard:", e)
-        return
+    except Exception as e:
+        # A worker image without an importable torch can never train — fail FAST and RETRIABLY
+        # rather than printing and returning (which would let the worker limp on in a broken
+        # state and crash later for an unrelated-looking reason, obscuring the root cause).
+        raise RetriableInfraError(f"torch is not importable on this worker image ({e})") from e
     if not torch.cuda.is_available():
         raise RetriableInfraError("CUDA reports no available device at worker boot")
     try:
