@@ -41,17 +41,18 @@ _BASE_OVERHEAD_GB = 4.0
 # (batch x seq) and model width (~sqrt of params). Coef calibrated so 4.7B SFT at
 # seq 32k / batch 1 lands ~22 GB (measured: fits a 32 GB 5090).
 _ACT_COEF = 0.12
-# SFT activations peak on the worker's PER-DEVICE micro-batch, not [train].batch_size
-# (which is the global/effective batch realized via gradient accumulation). The worker
-# caps the micro-batch at 4: per_device = min(batch_size, 4). Mirror that here so an
-# unset/long-context SFT run (batch defaults low) still reserves the micro-batch activation
-# peak, and a large effective batch isn't mis-counted as resident VRAM (it's grad-accum,
+# SFT activations + logits peak on the worker's PER-DEVICE micro-batch, not [train].batch_size
+# (which is the global/effective batch realized via gradient accumulation). The worker caps the
+# micro-batch at 4 and, when the fused CE is off, vocab-sizes it further to the logits budget (see
+# ``sft_per_device``). Mirror that here so an unset/long-context SFT run still reserves the
+# micro-batch peak, and a large effective batch isn't mis-counted as resident VRAM (it's grad-accum,
 # not in-flight activations).
 _SFT_PER_DEVICE_BS_DEFAULT = 4
 
 
 def _sft_per_device_bs() -> int:
-    """The worker's per-device SFT micro-batch — the activation-peak driver to size against.
+    """The worker's BASE per-device SFT micro-batch cap (before the big-vocab logits cap layered on
+    by ``sft_per_device``) — the activation-peak driver to size against.
 
     SFT micro-batch is a MANAGED default: the control plane no longer forwards
     ``SFT_PER_DEVICE_BS`` to the worker (build_worker_env dropped the tuning allowlist), and the
@@ -63,20 +64,30 @@ def _sft_per_device_bs() -> int:
     return _SFT_PER_DEVICE_BS_DEFAULT
 
 
-def sft_grad_accum(batch_size: int) -> tuple[int, int]:
+def sft_grad_accum(
+    batch_size: int, *, seq_len: int = 0, vocab: int = 0, fused: bool = True
+) -> tuple[int, int]:
     """(per-device micro-batch, grad-accum steps) the worker realizes for a requested GLOBAL
-    ``batch_size``: per_device capped at the micro-batch default, grad-accum CEIL'd so the
+    ``batch_size``: per_device capped at the micro-batch default (and ADDITIONALLY vocab-sized to
+    the logits budget when the fused CE is off — see ``sft_per_device``), grad-accum CEIL'd so the
     realized global batch is never BELOW the request (e.g. batch 6 -> per_device 4 x
-    ceil(6/4)=2 grad-accum = realized 8, >= 6)."""
+    ceil(6/4)=2 grad-accum = realized 8, >= 6).
+
+    ``seq_len``/``vocab``/``fused`` are the big-vocab logits-cap inputs; omitted (or ``fused``) they
+    reduce to the old fixed per-device cap, so existing callers are unchanged."""
     target = max(1, int(batch_size))
-    per_device = max(1, min(_sft_per_device_bs(), target))
+    per_device = sft_per_device(target, seq_len=seq_len, vocab=vocab, fused=fused)
     grad_accum = max(1, -(-target // per_device))  # ceil
     return per_device, grad_accum
 
 
-def sft_realized_batch(batch_size: int) -> int:
-    """The realized SFT global batch (per_device x grad_accum) for a requested ``batch_size``."""
-    per_device, grad_accum = sft_grad_accum(batch_size)
+def sft_realized_batch(
+    batch_size: int, *, seq_len: int = 0, vocab: int = 0, fused: bool = True
+) -> int:
+    """The realized SFT global batch (per_device x grad_accum) for a requested ``batch_size`` —
+    mirrors the worker so the cost step-count matches. Pass seq_len/vocab/fused to honor the
+    big-vocab per-device cap (the cost path does); omitted, it's the old fixed-cap behavior."""
+    per_device, grad_accum = sft_grad_accum(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     return per_device * grad_accum
 
 
@@ -103,6 +114,54 @@ _VOCAB_DEFAULT = 248_320
 # Matches the worker's logits budget (6 GB): the per-device fp32 logits are capped to this
 # (rl_per_device_comps spills the rest into grad-accum), so the estimator never reserves above it.
 _LOGITS_BUDGET_GB = 6.0
+
+# ---- SFT big-vocab logits: the SFT analog of the GRPO fp32-logits term above ----
+# When the worker's fused cross-entropy (Liger) is OFF, an SFT forward materializes the FULL-sequence
+# [per_device, seq_len, vocab] logits AND keeps their gradient live through the backward. At
+# Qwen3.5's ~248k vocab this is the documented big-vocab SFT OOM driver (a 0.8B SFT OOM'd a 24 GB
+# card). The worker fuses CE only for a >=3B model OR a >=2048-token context (mirrors
+# engine.worker.perf._memory_mode); BELOW that the term is real and was previously ignored entirely.
+# An SFT step holds the fp32 logits + their fp32 grad at once, so size it at ~8 B/elem (vs GRPO's
+# 4 B/elem forward-only logprob pass). The worker vocab-sizes the per-device micro-batch so these
+# logits never exceed _LOGITS_BUDGET_GB (sft_logits_per_device_cap, the SFT mirror of
+# rl_per_device_comps) and the estimator reserves exactly that capped term -- so the allocator
+# provably covers the worker's real peak (the "the equation never under-provisions" invariant).
+_SFT_LOGITS_BYTES_PER_ELEM = 8.0
+# Mirror the worker's fused-CE gate (engine.worker.perf) WITHOUT its network AutoConfig probe, so the
+# estimator stays offline/deterministic. Keep in sync with perf._LIGER_MIN_PARAMS / _LONG_CONTEXT_TOKENS.
+_LIGER_MIN_PARAMS_B = 3.0
+_LIGER_LONG_CTX_TOKENS = 2048
+
+
+def sft_logits_fused(params_b: float | None, seq_len: int) -> bool:
+    """Whether the worker fuses the SFT cross-entropy (Liger), so the [per_device, seq, vocab] logits
+    never materialize. Mirrors engine.worker.perf._memory_mode without a network probe: fused for a
+    >=3B model OR a >=2048-token context. (The worker image bakes liger-kernel, so True here means
+    the fused kernel is actually used; if it were ever absent the per-device cap still bounds the
+    logits.)"""
+    if seq_len >= _LIGER_LONG_CTX_TOKENS:
+        return True
+    return (params_b or 0.0) >= _LIGER_MIN_PARAMS_B
+
+
+def sft_logits_per_device_cap(seq_len: int, vocab: int) -> int:
+    """Largest SFT per-device micro-batch whose un-fused [per_device, seq, vocab] fp32 logits (+grad)
+    fit _LOGITS_BUDGET_GB. The SFT mirror of rl_per_device_comps' completion cap, sizing the FULL
+    sequence (not just the completion): the worker spills the remainder into grad-accum so the
+    realized global batch is unchanged, and the estimator reserves the same bounded term."""
+    denom = max(1, int(seq_len)) * max(1, int(vocab)) * _SFT_LOGITS_BYTES_PER_ELEM
+    return max(1, int(_LOGITS_BUDGET_GB * 1e9 / denom))
+
+
+def sft_per_device(batch_size: int, *, seq_len: int = 0, vocab: int = 0, fused: bool = True) -> int:
+    """The per-device SFT micro-batch the worker runs: the requested global batch capped at the
+    micro-batch default (4) and ADDITIONALLY vocab-sized to the logits budget when the fused CE is
+    OFF (small model AND short context) — so the big-vocab [per_device, seq, vocab] logits can't OOM
+    the card. With seq_len/vocab unset (or fused) it's just the old fixed cap (back-compatible)."""
+    per_device = max(1, min(_SFT_PER_DEVICE_BS_DEFAULT, max(1, int(batch_size))))
+    if not fused and seq_len and vocab:
+        per_device = min(per_device, sft_logits_per_device_cap(seq_len, vocab))
+    return per_device
 
 
 def grpo_seq_escalation_gb(params_b: float | None, seq_len: int) -> int:
@@ -206,13 +265,25 @@ def estimate_vram_gb(
         logits = min(completion * vocab * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
         return base + max(rollout, train)
-    # SFT: the activation peak is the worker's per-device micro-batch (capped at 4),
-    # NOT the global/effective batch_size (gradient accumulation realizes
-    # that). Size to the micro-batch the worker actually runs: a default/long-context run reserves
-    # for the per-device cap (no under-routing to a too-small card), while a large effective
-    # batch_size is capped at it (no over-routing, since accum isn't resident VRAM).
-    sft_per_device = min(max(1, batch_size), _sft_per_device_bs())
-    return base + _ACT_COEF * sft_per_device * (seq_len / 1024.0) * width
+    # SFT: peak = base + activations + the big-vocab logits term. Both activations and logits are
+    # driven by the worker's per-device micro-batch (capped at 4 AND vocab-sized to the logits budget
+    # when the fused CE is off), NOT the global/effective batch_size (grad-accum realizes that). Use
+    # the SAME ``sft_per_device`` the worker runs so the estimate tracks what actually executes.
+    fused = sft_logits_fused(params_b, seq_len)
+    pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
+    activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
+    # fp32-logits term: 0 when the worker fuses CE (>=3B model OR >=2048-token ctx, so the lm_head
+    # never materializes [B,T,vocab]); else the [per_device, seq_len, vocab] fp32 logits + grad the
+    # forward holds. The worker's per-device cap keeps this within the budget, so it can't OOM the
+    # card -- the SFT analog of the GRPO logits term above, and the term the SFT estimate previously
+    # ignored (the documented big-vocab SFT OOM). It scales with the FULL seq_len (SFT loss spans the
+    # sequence), unlike GRPO's completion-only logprob pass.
+    logits = (
+        0.0
+        if fused
+        else min(pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9, _LOGITS_BUDGET_GB)
+    )
+    return base + activations + logits
 
 
 def model_required_vram_gb(
