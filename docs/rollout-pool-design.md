@@ -87,7 +87,7 @@ The control-plane side (router/state/client) is **torch-free** — only `fastapi
 
 ```bash
 # 1) operator: start the router (CPU box)
-pip install 'flash[server]'
+pip install 'freesolo-flash[server]'   # dist name is freesolo-flash; CLI/import stay `flash`
 flash-pool serve --port 8077
 
 # 2) operator: pre-rent the fleet and register it (one base model per GPU, multi-LoRA on each).

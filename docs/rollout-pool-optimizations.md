@@ -5,67 +5,78 @@ origin/dev's worker**, by calling **dev's own helpers** (so there's one implemen
 
 | optimization | how the pool applies it | dev source it reuses |
 |---|---|---|
-| **Liger** kernels (fused RMSNorm/RoPE/SwiGLU) | `_apply_liger_kernel_to_instance(model)` after build | dev uses TRL `use_liger_kernel`; gated by `perf.liger_on` defaults |
-| **Chalk** kernels (Qwen3.5/3.6 fused MLP/RoPE/embedding/LoRA-delta) | `install_chalk_kernels(model)` | `flash.engine.chalk_kernels.install_chalk_kernels` (identical call) |
-| **FLA-drop** (Qwen3.5/3.6 GDN on Hopper) | `_drop_fla_on_hopper()` before load | `flash.engine.worker.perf._drop_fla_on_hopper` |
-| **QLoRA** (4-bit NF4 base) | `BitsAndBytesConfig` + `prepare_model_for_kbit_training` | tier from `lora.model_quant` (catalog 4-bit) |
+| **Chalk** kernels (standalone fused RMSNorm/SwiGLU/FLCE + RoPE/LoRA-delta/embedding) | `install_chalk_kernels(model)` after build | `flash.engine.chalk_kernels.install_chalk_kernels` (identical call; runs `liger=False`) |
+| **fla fast-path** (Qwen3.5/3.6 GDN on Hopper) | `_ensure_fla_fastpath_on_hopper()` before load | `flash.engine.worker.perf._ensure_fla_fastpath_on_hopper` |
 | **8-bit paged AdamW** | `loraplus_optimizer_cls(fused_optim_name())` → `PagedAdamW8bit` | `flash.engine.worker.perf` (identical) |
 
-Each is **resolved per model** by `resolve_opt_config(model_id)` with dev's defaults (Liger/Chalk/
-8-bit on; FLA-drop on for Qwen3.5/3.6; QLoRA on for the catalog's 4-bit tiers — 9B and 35B-A3B), and
-every flag is overridable. Each is a no-op off-GPU / where inapplicable (Chalk no-ops on non-Qwen3.5,
-FLA-drop on non-Qwen3.5, QLoRA off-GPU), exactly like dev.
+Each is **resolved per model** by `resolve_opt_config(model_id)` with dev's defaults (chalk + 8-bit
+on; the Hopper fla fast-path on for Qwen3.5/3.6), and every flag is overridable. Chalk is **standalone**
+— it installs its own RMSNorm/SwiGLU/fused-CE (Liger faded out, flash#66), so the policy passes
+`liger=False`. The bases load in **bf16** (QLoRA was removed in #74: the GRPO vLLM rollout merges the
+LoRA into a 4-bit base and that rounding collapses the importance-sampling ratio → no learning, so the
+catalog is bf16 everywhere). Each optimization is a no-op off-GPU / where inapplicable (chalk and the
+fla fast-path no-op on non-Qwen3.5), exactly like dev.
 
 ## Does it work with 35B? Yes — and *better* than dev's colocate
 
-`Qwen/Qwen3.6-35B-A3B` is the catalog's 4-bit-QLoRA MoE. dev runs it **colocated** (trainer + vLLM on
-one card) → **~103 GB → H200-only**. The pool **disaggregates**, so the trainer carries no vLLM:
+`Qwen/Qwen3.6-35B-A3B` is the catalog's MoE tier — **bf16** (not QLoRA), `requires_disaggregated`,
+`single_trainer_only`, with a 300 GB disk floor (`flash/catalog.py`). dev runs GRPO **colocated**
+(trainer + vLLM rollout on one card), which OOMs for the 35B, so its GRPO is rejected for the colocate
+path → it needs a dedicated inference GPU. The pool **disaggregates** by construction, so the trainer
+carries no vLLM:
 
-- **trainer** = QLoRA 4-bit base (~20 GB) → **fits a single A40 (48 GB, ~$0.44/hr)**, not an H200.
-- **rollout** = 35B vLLM (expert-parallel) on the shared inference pool — the only piece that needs a
-  big card, and it's shared across runs.
+- **trainer** = a bf16 LoRA-only trainer (no colocated vLLM, no second weight copy + KV pool).
+- **rollout** = the 35B vLLM (MoE, expert-parallel, all experts resident) on the shared inference
+  pool — the only piece that needs a big card, and it's shared across runs.
 
-So the pool makes 35B trainable on ordinary hardware where dev's colocate cannot. `pool_gpu_plan()`
-returns the (trainer, inference) GPU pick per model:
+Removing the colocated vLLM from the trainer is the whole disaggregation win: the LoRA-only trainer
+fits a smaller, cheaper card than dev's colocate. Submit-time validation enforces the constraints
+(`[train].inference_gpus>0`, single-trainer 1:N only — see
+`engine.rollout_bench.validate_disaggregated_requirement`). For current sizing read `pool_gpu_plan()`
+rather than trusting any number embedded here; the table below is the plan's output at the time of
+writing, and the live allocator calibrates:
 
 ```
-model                 qlora  trainer GPU (vram)     inference GPU (vram)
-Qwen3.5-0.8B          no     small card (~7 GB)     small card
-Qwen3.5-2B            no     small card (~10 GB)    small card
-Qwen3.5-4B            no     ~14 GB                 ~18 GB
-Qwen3.5-9B            yes    ~11 GB (4-bit)         ~17 GB
-Qwen3.6-35B-A3B       yes    A40 ~29 GB (4-bit)     big card + expert-parallel
-MiniCPM5-1B           no     small card             small card
+model                 trainer GPU (vram)            inference GPU (vram)
+Qwen3.5-0.8B          RTX 2000 Ada (~7 GB)          RTX 2000 Ada (~9 GB)
+MiniCPM5-1B           RTX 2000 Ada (~7 GB)          RTX 2000 Ada (~9 GB)
+Qwen3.5-2B            RTX 2000 Ada (~10 GB)         RTX 2000 Ada (~12 GB)
+Qwen3.5-4B            RTX 2000 Ada (~14 GB)         RTX A4500 (~16 GB)
+Qwen3.5-9B            A40 (~26 GB)                  A40 (~28 GB)
+Qwen3.6-35B-A3B       RTX Pro 6000 WK (~86 GB)      RTX Pro 6000 WK (~89 GB), expert-parallel
 ```
-(VRAM is an estimate; the live allocator calibrates. The point: every model maps to a GPU and 35B's
-trainer fits an ordinary card.)
+(VRAM and GPU pick come straight from `pool_gpu_plan(model_id)` — `flash/engine/pool_policy.py` —
+which sizes a bf16 base + LoRA + 8-bit optimizer state under grad checkpointing for the trainer and the
+served base + KV for inference, then picks the cheapest `flash.providers.base.GPU_INFO` class that fits.
+All entries are `qlora=False`. The point: every model maps to a GPU, and the disaggregated 35B trainer
+fits a single card instead of dev's H200 colocate.)
 
 ## Verification
 
 - **CPU-tested** (`tests/test_pool_optimizations.py`): the same optimization SET as dev is selected
-  per model (Liger/Chalk/FLA-drop/QLoRA/8-bit), overrides honored, every catalog model maps to a GPU,
-  and the 35B trainer fits a 48 GB card via QLoRA.
-- **LIVE-proven on a real GPU through the pool** (4× GPU Vast box, public stack): a trainer with
-  `qlora=True, liger=True, optim_8bit=True` ran end-to-end through the router. The log shows:
-  ```
-  OPT liger=True chalk=True qlora=True adamw8=True fla_drop=False
-  bitsandbytes 4-bit (QLoRA) loading active
-  [pool_policy] liger kernels applied
-  [pool_policy] optimizer = PagedAdamW8bit
-  runA step 0/1/2  loss -0.89/-0.62/-0.68  v 1->3   (both runs ok, gen 6/6 across gpu0/gpu1)
-  ```
-  So **QLoRA (4-bit NF4) + Liger + 8-bit paged AdamW** are confirmed applying + training on real
-  hardware via the pool. (Chalk/FLA-drop correctly no-op there — they're Qwen3.5/3.6-only.)
+  per model (chalk + the Hopper fla fast-path for Qwen3.5/3.6 + 8-bit AdamW, `liger=False`), overrides
+  are honored, `qlora` is `False` for every model (the catalog is bf16), every catalog model maps to a
+  trainer + inference GPU, and the 35B trainer is bf16 with a trainer cost far below an H200 colocate.
+- **Live multi-GPU run (done)** — the pool ran end-to-end on a real **4× RTX 3090** box: two real
+  `vllm serve --enable-lora` servers behind the router + two real concurrent LoRA trainers
+  (`GRPOPoolLoop` + `pool_policy`, real transformers/peft forward/backward) pushing real adapters
+  through it (generation load-balanced 6/6 across both GPUs, both LoRAs co-resident on both GPUs,
+  per-step weight-sync hot-swap to vLLM, version 1→3). That run used a **public Qwen2.5** model so the
+  stack is fully reproducible — which means it exercised the pool plumbing and the **model-agnostic**
+  optimizers (bf16 LoRA + 8-bit paged AdamW), not the Qwen3.5/3.6-only paths (chalk and the fla
+  fast-path correctly no-op on Qwen2.5). Full report + logs in
+  [`rollout-pool-live-run.md`](rollout-pool-live-run.md).
 
-## Live coverage of the Qwen3.5/3.6-specific paths (Chalk, FLA-drop, 35B)
+## Live coverage of the Qwen3.5/3.6-specific paths (chalk, fla fast-path, 35B)
 
-Chalk + FLA-drop + the 35B MoE only apply to **Qwen3.5/3.6**, whose `qwen3_5` arch is served only by
-the **patched vLLM in the `flash-worker` image** — public vLLM 0.23 does *not* register `qwen3_5`
-(verified: a Qwen2.5 rollout boots on the public image, a Qwen3.5 rollout does not). On Vast, the
-`flash-worker:cu128` image (~15–20 GB) pulls **unreliably** (instances repeatedly vanished mid-pull),
-which blocks a live Qwen3.5/35B pool run here. That is an **infrastructure** limit, not a code one:
+Chalk + the Hopper fla fast-path + the 35B MoE only apply to **Qwen3.5/3.6**, whose `qwen3_5` arch is
+served only by the **patched vLLM in the `flash-worker` image** — public vLLM 0.23 does *not* register
+`qwen3_5` (verified: a Qwen2.5 rollout boots on the public image, a Qwen3.5 rollout does not). On Vast,
+the `flash-worker:cu128` image (~15–20 GB) pulls **unreliably** (instances repeatedly vanished
+mid-pull), which blocks a live Qwen3.5/35B pool run here. That is an **infrastructure** limit, not a
+code one:
 
-- the Chalk / FLA-drop / QLoRA calls are **dev's own already-validated helpers** (identical code);
+- the chalk / fla-fast-path calls are **dev's own already-validated helpers** (identical code);
 - the per-model selection is **CPU-tested** and the GPU matrix is built;
 - 35B already trains live on H100 via the **same disaggregated approach** (the verl one-step-off path,
   freesolo PR #215) — the pool generalizes that fleet-wide. Run a live Qwen3.5/35B pool E2E on a host
