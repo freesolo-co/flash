@@ -1474,6 +1474,94 @@ def test_attach_requires_handle(monkeypatch):
             orch.attach_run("nh")
 
 
+def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
+    # A recovered run whose remote job ended not-ok (it died while the control plane was down for
+    # the redeploy) must NOT be failed — reattach resumes the in-flight seed on a fresh host
+    # (worker resumes from the latest HF checkpoint), exactly like the fresh-submit retry loop. It
+    # also records resume_seed_index + clears the stale handle so a second restart during the
+    # fresh allocation resumes the right seed.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="i1",
+                state="running",
+                spec=_spec("i1").to_dict(),
+                cost_usd=0.0,
+                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "seed": 0},
+            )
+        )
+        # Poll reports a dead/abandoned job (the common redeploy-window outcome).
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="host vanished"),
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        seen = {}
+
+        def fake_loop(spec, log, *, start_index, prior_cost):
+            seen["start_index"] = start_index
+            seen["remote"] = orch.get_status(spec.run_id).remote
+            seen["resume_seed_index"] = orch.get_status(spec.run_id).resume_seed_index
+            orch._update(spec.run_id, "done", cost_usd=prior_cost)
+
+        monkeypatch.setattr(orch, "_run_seed_loop", fake_loop)
+
+        st = orch.attach_run("i1", log_stream=sys.stderr)
+
+        assert seen["start_index"] == 0, "must resume the in-flight seed (index 0), not skip it"
+        assert seen["remote"] is None, "stale dead handle must be cleared before resuming"
+        assert seen["resume_seed_index"] == 0, "resume marker must be set for a second restart"
+        assert st.state != "failed", "a job lost to the redeploy must be resumed, not failed"
+        assert st.state == "done"
+
+
+def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
+    # The resume delegates the genuine-vs-infra decision to the seed loop (unchanged): a run that
+    # is truly broken reproduces the failure on the resumed attempt, the seed loop fails it, and
+    # attach surfaces that terminal `failed` — so a broken run still terminates (nothing hangs).
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="g1",
+                state="running",
+                spec=_spec("g1").to_dict(),
+                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "seed": 0},
+            )
+        )
+        monkeypatch.setattr(
+            jobs,
+            "poll_job",
+            lambda *a, **k: jobs.PollResult(
+                False, failure="worker_error", detail="Traceback ...\nRuntimeError: bad reward fn"
+            ),
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        resumed = {"called": False}
+
+        def fake_loop(spec, log, *, start_index, prior_cost):
+            # The seed loop re-runs the seed; a genuinely broken run fails there (matches
+            # _submit_seed_supervised raising after a non-infra failure with no retries left).
+            resumed["called"] = True
+            raise RuntimeError("seed 0 failed after retries: worker_error: bad reward fn")
+
+        monkeypatch.setattr(orch, "_run_seed_loop", fake_loop)
+
+        st = orch.attach_run("g1", log_stream=sys.stderr)
+
+        assert resumed["called"] is True, "attach must attempt a checkpoint resume on any non-ok poll"
+        assert st.state == "failed", "a resume that fails again must terminate the run"
+        assert "bad reward fn" in (st.error or "")
+
+
 def test_update_will_not_overwrite_terminal_with_lifecycle_state(monkeypatch):
     # Terminal states are STICKY: once cancelled, no other state may overwrite it —
     # neither a non-terminal lifecycle write (provisioning/running) NOR a late terminal

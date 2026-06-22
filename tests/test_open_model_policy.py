@@ -150,17 +150,11 @@ def test_spec_model_policy_default_catalog():
     assert spec.model_policy == "catalog"
 
 
-def test_spec_model_policy_allow_roundtrip(monkeypatch):
-    monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 1.0, raising=True)
-    spec = spec_from_dict(_raw(model="acme/tiny-1b", model_policy="allow"))
-    assert spec.model_policy == "allow"
-    spec2 = spec.from_dict(spec.to_dict())
-    assert spec2.model_policy == "allow"
-
-
-def test_spec_model_policy_invalid():
-    with pytest.raises(ConfigError):
-        spec_from_dict(_raw(model_policy="yolo"))
+def test_spec_user_model_policy_is_ignored():
+    # model_policy is not a user knob: managed runs always use the curated catalog, so a
+    # user-supplied "allow" in the config is ignored (the policy stays "catalog").
+    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
+    assert spec.model_policy == "catalog"
 
 
 def test_spec_unlisted_model_under_catalog_policy_fails():

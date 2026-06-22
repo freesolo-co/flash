@@ -53,7 +53,8 @@ def _raw(**overrides) -> dict:
         ({"train.lora_rank": True}, "lora_rank must be an integer"),
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
-        ({"model_policy": "yolo"}, "model_policy"),
+        # NOTE: model_policy is no longer a user knob (it's read from the FLASH_MODEL_POLICY env on
+        # the control plane), so a bad user-supplied model_policy is ignored, not rejected here.
         # Multi-GPU / disaggregated topology cross-field checks.
         # inference_gpus>0 but only 1 GPU in the node -> no GPU left to train.
         ({"train.inference_gpus": 1, "gpu.count": 1}, "must be greater than train.inference_gpus"),
@@ -218,12 +219,15 @@ def test_missing_model_is_rejected() -> None:
         spec_from_dict({"algorithm": "sft"})
 
 
-def test_missing_hf_repo_is_rejected() -> None:
-    # [train] hf_repo is now REQUIRED (no operator HF_REPO default); a config without it fails.
+def test_hf_repo_is_managed_not_user_set() -> None:
+    # [train] hf_repo is platform-managed (assigned server-side per run), so it is NEITHER
+    # required NOR honored from a user config: a config without it parses fine, and a user-
+    # supplied value is ignored (left blank for the control plane to assign at submit).
     raw = _raw()
     raw["train"] = {"steps": 10, "lora_rank": 8, "seeds": [0]}
-    with pytest.raises(ConfigError, match=r"train\.hf_repo is required"):
-        spec_from_dict(raw)
+    assert spec_from_dict(raw).train.hf_repo == ""
+    raw["train"]["hf_repo"] = "someone-else/their-repo"
+    assert spec_from_dict(raw).train.hf_repo == ""
 
 
 def test_environment_path_is_rejected() -> None:

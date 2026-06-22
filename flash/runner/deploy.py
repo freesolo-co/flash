@@ -228,7 +228,24 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             )
             return get_status(run_id)
         if not res.ok:
-            _update(run_id, "failed", error=f"{res.failure}: {res.detail}")
+            # Job ended not-ok — usually because it was abandoned during the redeploy. Resume the
+            # in-flight seed from its last HF checkpoint instead of failing; the seed loop
+            # (unchanged) still terminates a genuinely broken run when it re-fails.
+            try:
+                seed_index = list(spec.train.seeds).index(seed)
+            except ValueError:
+                seed_index = 0
+            print(f"attach: {run_id} seed {seed} ended ({res.failure}); resuming from checkpoint", file=log)
+            # GC the dead endpoint, then clear the stale handle and record the seed so a second
+            # restart mid-allocation resumes the right one.
+            with contextlib.suppress(Exception):
+                _gc_run_endpoints(spec)
+            # Bail if the run was raced to terminal during the long poll above: _update's CAS
+            # returns False, and resuming would submit paid work for a dead run.
+            if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
+                print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
+                return get_status(run_id)
+            _run_seed_loop(spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0))
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the
         # run actually used (the in-process path stamps this; recovery must restore it).
@@ -264,7 +281,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # re-allocates against a clean market, so leaving it would make a later restart's
         # resume_run rehydrate that exclusion and wrongly pre-exclude a now-recovered class
         # on a seed that never starved (mirrors _run_seed_loop's resume_starved=None reset).
-        _update(
+        applied = _update(
             run_id,
             "running",
             cost_usd=total,
@@ -275,7 +292,20 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 else {}
             ),
         )
+        # Same TOCTOU guard as the not-ok recovery path: a concurrent thread can flip this
+        # run terminal (e.g. failed/done from another recovery) between the cancel re-check
+        # above and here. The sticky CAS rejects the `running` write (applied is False) — so
+        # don't resume the remaining seeds and submit paid GPU work for an already-terminal
+        # run. (The non-multi-seed arm writes the terminal `done`; the CAS protects a racing
+        # terminal there too, so no extra guard is needed.)
         if more_seeds:
+            if not applied:
+                print(
+                    f"attach: {run_id} went terminal during recovery; "
+                    "not resuming the remaining seeds",
+                    file=log,
+                )
+                return get_status(run_id)
             _run_seed_loop(spec, log, start_index=resumed_index, prior_cost=total)
         else:
             _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
