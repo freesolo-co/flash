@@ -139,7 +139,17 @@ def _submit_seed_supervised(
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
     gpu_walk_offset = 0
-    for attempt in range(max_retries + 1):
+    # MIG / unusable-GPU allocation failures never reach training — the worker bails at
+    # assert_usable_gpu() before the first step — so they must NOT spend the training retry budget
+    # (max_retries, which exists for stalls/preemptions MID-run). A Blackwell-MIG-heavy RunPod pool
+    # can hand back several MIG slices in a row; counting each against max_retries kills a run that
+    # never even started. Give MIG re-allocations a SEPARATE bounded budget on top of max_retries
+    # (still capped, so a fully-MIG pool can't loop forever). `training_retries`/`mig_reallocs` track
+    # the two budgets; `attempt` stays the physical attempt counter (poll backoff / endpoint reuse).
+    MIG_REALLOC_BUDGET = 4
+    training_retries = 0
+    mig_reallocs = 0
+    for attempt in range(max_retries + MIG_REALLOC_BUDGET + 1):
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
@@ -323,15 +333,29 @@ def _submit_seed_supervised(
         except FileNotFoundError:
             # Status file not yet written (early race): treat as not-cancelled and proceed.
             pass
+        # A MIG / unusable-GPU failure (never trained) draws from the separate MIG budget; every
+        # other infra-shaped failure (stall/preempt/poll_error mid-run) spends the training budget.
+        # Stop only when the RELEVANT budget is exhausted — so unlucky MIG slices don't burn the
+        # retries reserved for genuine mid-run failures, and vice versa.
+        if not infra_shaped:
+            will_retry = False
+        elif mig_failure:
+            will_retry = mig_reallocs < MIG_REALLOC_BUDGET
+        else:
+            will_retry = training_retries < max_retries
         print(
             f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and attempt < max_retries else 'not retrying'}"
+            f"{'retrying (resume from last checkpoint)' if will_retry else 'not retrying'}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,
         )
-        if not infra_shaped or attempt >= max_retries:
+        if not will_retry:
             break
+        if mig_failure:
+            mig_reallocs += 1
+        else:
+            training_retries += 1
         # Step to the next-cheapest class only when THIS attempt actually provisioned one
         # and it failed infra-shaped. An allocation/pricing failure (chosen is None) never
         # tried a card, so the next attempt must retry from the cheapest, not walk past it.

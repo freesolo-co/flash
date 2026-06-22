@@ -50,8 +50,26 @@ def _get_provider(key: str) -> Provider:
 def available_providers() -> tuple[str, ...]:
     """Provider NAMES usable from this control plane right now: a provider is available when it
     ``is_configured()`` (creds present). RunPod is the always-on default; Vast needs
-    ``VAST_API_KEY`` (without it, allocation stays on RunPod's static catalog)."""
-    return tuple(n for n in PROVIDER_NAMES if get_provider(n).is_configured())
+    ``VAST_API_KEY`` (without it, allocation stays on RunPod's static catalog).
+
+    Operator escape hatch: ``FLASH_EXCLUDE_PROVIDERS`` (comma/space-separated provider names) drops
+    providers from allocation entirely — e.g. set it to ``runpod`` to force Vast-only when RunPod is
+    fulfilling full-GPU requests with MIG-partitioned Blackwell slices (which PyTorch can't train on,
+    so the run burns retries re-allocating). Ignored if it would leave nothing allocatable, so a
+    typo / over-broad exclusion can never brick the control plane."""
+    import os
+
+    usable = tuple(n for n in PROVIDER_NAMES if get_provider(n).is_configured())
+    excluded = {
+        p.strip().lower()
+        for p in os.environ.get("FLASH_EXCLUDE_PROVIDERS", "").replace(",", " ").split()
+        if p.strip()
+    }
+    if excluded:
+        filtered = tuple(n for n in usable if n not in excluded)
+        if filtered:  # never strand allocation with nothing live (e.g. excluded the only provider)
+            return filtered
+    return usable
 
 
 def configured_providers() -> list[Provider]:

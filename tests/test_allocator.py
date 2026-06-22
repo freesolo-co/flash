@@ -386,3 +386,26 @@ def test_sft_estimate_includes_capped_logits_term():
     fused_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8)
     fused_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8)
     assert abs(fused_big - fused_small) < 1e-6
+
+
+def test_exclude_providers_env_forces_other_provider(monkeypatch):
+    """FLASH_EXCLUDE_PROVIDERS drops a provider from allocation (e.g. 'runpod' to force Vast-only
+    when RunPod hands back MIG slices), but never strands allocation with nothing live."""
+    from flash import providers as P
+
+    # Both providers configured.
+    monkeypatch.setattr(P, "get_provider", lambda n: type("X", (), {"is_configured": lambda self: True})())
+
+    monkeypatch.setenv("FLASH_EXCLUDE_PROVIDERS", "runpod")
+    avail = P.available_providers()
+    assert "runpod" not in avail
+    assert "vast" in avail
+
+    # Comma/space tolerant + case-insensitive.
+    monkeypatch.setenv("FLASH_EXCLUDE_PROVIDERS", "RunPod, vast")
+    # Excluding everything would strand allocation -> fail-safe ignores the exclusion.
+    assert set(P.available_providers()) == set(P.PROVIDER_NAMES)
+
+    # Unset -> unchanged (all configured providers available).
+    monkeypatch.delenv("FLASH_EXCLUDE_PROVIDERS", raising=False)
+    assert set(P.available_providers()) == set(P.PROVIDER_NAMES)
