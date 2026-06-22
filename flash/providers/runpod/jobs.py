@@ -346,11 +346,14 @@ def poll_job(
             elif not detail:
                 detail = str(out)[:1500]
             # Structural classification only ([{status}] prefix is for human-readable logs).
-            if status in PLATFORM_TERMINATIONS or worker_flagged_retriable(heartbeat_reader):
+            retriable, exclude_class = worker_retry_flags(heartbeat_reader)
+            if status in PLATFORM_TERMINATIONS or retriable:
                 failure = "job_preempted"
             else:
                 failure = "job_failed"
-            return PollResult(False, failure=failure, detail=f"[{status}] {detail}")
+            return PollResult(
+                False, failure=failure, detail=f"[{status}] {detail}", exclude_class=exclude_class
+            )
         # While queued, surface worker availability (throttled hosts are the common
         # cause of silent multi-minute waits — make them visible in the run log).
         if status == "IN_QUEUE" and time.time() - last_health_probe > 90:
@@ -550,10 +553,19 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
     return read
 
 
-def worker_flagged_retriable(heartbeat_reader) -> bool:
-    """True if the worker stamped ``retriable`` into heartbeat.json (a RetriableInfraError) — the
-    structured worker<->poller contract that replaces failure-detail parsing. Forces a fresh read."""
+def worker_retry_flags(heartbeat_reader) -> tuple[bool, bool]:
+    """``(retriable, exclude_class)`` from the worker's last heartbeat — the structured
+    worker<->poller contract that replaces failure-detail parsing. ``retriable`` means a
+    RetriableInfraError (retry on a fresh host); ``exclude_class`` means the GPU CLASS is at fault
+    (a MIG slice), so the retry must re-allocate OFF it. Forces a fresh read past the rate limit."""
     if heartbeat_reader is None:
-        return False
+        return (False, False)
     hb = heartbeat_reader(force=True)
-    return bool(isinstance(hb, dict) and hb.get("retriable"))
+    if not isinstance(hb, dict):
+        return (False, False)
+    return (bool(hb.get("retriable")), bool(hb.get("exclude_class")))
+
+
+def worker_flagged_retriable(heartbeat_reader) -> bool:
+    """True if the worker stamped ``retriable`` (RetriableInfraError). See ``worker_retry_flags``."""
+    return worker_retry_flags(heartbeat_reader)[0]
