@@ -395,7 +395,13 @@ def create_app():
         # deploy's provisioning/finalization.
         with _deploy_lock(run_id):
             status = owned_run(run_id, key)
-            deleted = undeploy_adapter(run_id)
+            try:
+                deleted = undeploy_adapter(run_id)
+            except ServingError as exc:
+                # A serving-backend failure (unreachable / non-404 error) is an upstream/gateway
+                # problem, not a flash bug — surface a clean 502 with the real reason (mirrors the
+                # deploy handler) instead of letting the ServingError escape as an unhandled 500.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
             # dev mode is scale-to-zero: the serve endpoint is created only on the first
             # chat, so an empty deletion just means it was never warmed — still a clean
             # undeploy. always-on provisions the endpoint at deploy time, so an empty
