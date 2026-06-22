@@ -47,12 +47,10 @@ from flash.engine.recipe import RECIPE
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     _VL_EXCLUDE_SEGMENTS,  # noqa: F401
-    _patch_peft_weight_converter_compat,  # noqa: F401
     _remap_vl_sync_weights,  # noqa: F401
     assert_lora_applied,
     is_vl_checkpoint,
     lora_exclude_modules,
-    model_quant,  # noqa: F401
     patch_vllm_language_model_only,
     patch_vllm_lm_weight_sync,
     remap_adapter_keys,  # noqa: F401
@@ -81,7 +79,6 @@ from flash.engine.worker.perf import (
     gpu_diagnostics,
     grad_checkpointing_on,
     loraplus_optimizer_cls,
-    model_supports_flex_attn,  # noqa: F401
     optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
@@ -779,7 +776,6 @@ def run_sft():
     # binds only for small short-context runs (a GPU is never undersized). It ALSO binds when an
     # operator disables FLCE (FLASH_FLCE_KERNEL=0): there's then no fused saving to bank on, so we AND
     # in the flag — _sft_fused is False and the cap protects against the full-logits OOM.
-    # (Was `... and liger_on(_memory_mode(...))`; liger_on went away with Liger.)
     _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and kernel_on("FLASH_FLCE_KERNEL", True)
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
@@ -987,10 +983,10 @@ def run_sft():
         processing_class=tok,
         callbacks=[make_checkpoint_upload_callback()],
     )
-    # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
-    # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
-    # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
-    # freesolo-chalk is installed.
+    # Apply chalk's standalone fused kernels (rms_norm/swiglu/FLCE + RoPE/LoRA-delta/embedding) on
+    # the materialized SFT trainer.model — chalk's apply patches the LIVE module, so it must run
+    # AFTER TRL builds the model. No-op unless a FLASH_* kernel flag selects it and freesolo-chalk
+    # is installed.
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
 
     _reset_peak_gpu()  # so peak_gpu_gb reflects the train loop (optimizer-state A/B is measurable)
@@ -1712,9 +1708,9 @@ def run_rl():
         callbacks=[hb_cb, make_checkpoint_upload_callback()],
         **extra_trainer_kwargs,
     )
-    # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
-    # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
-    # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
+    # Apply chalk's standalone fused kernels (rms_norm/swiglu/FLCE + RoPE/LoRA-delta/embedding) on
+    # the module GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes
+    # the model-id string to TRL, so trainer.model is the authoritative target.
     # Capture the install report so the engaged kernels land in metrics (active_kernels below).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
     # The trainer (and its colocated vLLM engine + initial checkpoint load) is now built. Activate

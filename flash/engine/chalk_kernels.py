@@ -70,16 +70,11 @@ def _flag_on(value: str | None, default_on: bool) -> bool:
 
 
 def kernel_on(flag: str, default_on: bool) -> bool:
-    """Public: is a single chalk kernel ``flag`` enabled in this process's ``os.environ``?
+    """Is a single chalk kernel ``flag`` enabled in this process's ``os.environ``?
 
-    Resolves one FLASH_* flag against its default (see :func:`_flag_on`). External modules (e.g.
-    ``flash.engine.worker``) should import this rather than reaching for the underscore helper.
+    Resolves one FLASH_* flag against its default (see :func:`_flag_on`).
     """
     return _flag_on(os.environ.get(flag), default_on)
-
-
-# Back-compat internal alias (kept so existing in-module callers don't churn).
-_kernel_on = kernel_on
 
 
 def is_chalk_enabled(env: Mapping[str, str]) -> bool:
@@ -98,7 +93,7 @@ def _enabled_kwargs() -> dict[str, bool]:
 
     Gap-fillers default-on, overlapping/situational kernels default-off; FLASH_<K> overrides.
     """
-    return {kw: _kernel_on(flag, default_on) for flag, kw, default_on in _KERNELS}
+    return {kw: kernel_on(flag, default_on) for flag, kw, default_on in _KERNELS}
 
 
 def active_kernels(report: Mapping[str, object] | None) -> list[str]:
