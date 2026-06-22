@@ -3,11 +3,18 @@ GPU policy step runs locally, and weights sync to the pool each step."""
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from flash.engine.pool_trainer import GRPOPoolLoop, compute_group_advantages
 from flash.pool.client import RolloutPoolClient
 from tests._helpers.pool_harness import build_harness
+
+
+def _producer_threads_alive() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "flash-rollout-producer" and t.is_alive()]
 
 
 def test_compute_group_advantages_zero_mean_unit_std():
@@ -91,6 +98,43 @@ def test_loop_respects_step_cap():
 
         results = loop.run(prompts(), lambda exp, adv: None, steps=2)
         assert len(results) == 2
+        client.close()
+    finally:
+        h.stop()
+
+
+def test_loop_closes_stream_and_joins_producer_on_early_break():
+    # The ``steps`` cap breaks the consumption loop EARLY (before the infinite prompt source is
+    # exhausted). ``run()`` must close the experience_stream generator so its background producer
+    # thread (and the rollout ThreadPoolExecutor) is torn down — otherwise the producer leaks and
+    # keeps generating/scoring rollouts (a live thread + wasted pool spend) after run() returns.
+    before = {t.ident for t in _producer_threads_alive()}
+    h = build_harness([{"id": "gpu0", "base_model": "Q"}], reward_workers=1)
+    try:
+        client = RolloutPoolClient(h.router_url, adapter="run", base_model="Q")
+        loop = GRPOPoolLoop(client, group_size=2, prefetch=2)
+        loop.register(uri="/lora/run/v0")
+
+        def prompts():  # never runs out; only the steps cap stops the loop
+            i = 0
+            while True:
+                yield [f"p{i}"]
+                i += 1
+
+        results = loop.run(prompts(), lambda exp, adv: f"/lora/run/v{exp.step + 1}", steps=2)
+        assert len(results) == 2
+
+        # The producer thread this run started must be gone (joined) by the time run() returns —
+        # contextlib.closing(...) ran the generator's finally on the early break. Give a brief grace
+        # window since join() has a (generous) timeout in the generator's finally.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            leaked = [t for t in _producer_threads_alive() if t.ident not in before]
+            if not leaked:
+                break
+            time.sleep(0.05)
+        leaked = [t for t in _producer_threads_alive() if t.ident not in before]
+        assert leaked == [], f"producer thread leaked after early break: {leaked}"
         client.close()
     finally:
         h.stop()

@@ -99,6 +99,22 @@ def test_provision_dry_run_does_not_rent():
     assert all(not r.registered and r.url == "(dry-run)" for r in results)
 
 
+def test_provision_dry_run_ids_unique_for_same_gpu_and_base_members():
+    # Two members sharing gpu + base (here split for different max_loras) — ``i`` restarts at 0 per
+    # member, so a (gpu, base, i)-only id would collide across them. The dry-run backend_id must
+    # incorporate the member index so every entry is uniquely identifiable.
+    plan = PoolPlan(
+        members=[
+            PoolMember(base_model="org/Q", gpu="RTX5090", count=2, max_loras=8),
+            PoolMember(base_model="org/Q", gpu="RTX5090", count=2, max_loras=4),
+        ]
+    )
+    results = provision_pool(plan, "http://router", dry_run=True)
+    ids = [r.backend_id for r in results]
+    assert len(results) == 4
+    assert len(set(ids)) == 4, f"dry-run backend_ids collided: {ids}"
+
+
 def test_provision_live_without_rent_raises():
     # A live provision (dry_run=False) with no `rent` callable must fail loudly rather than silently
     # taking the dry-run path and returning unregistered "(dry-run)" backends that look like success.

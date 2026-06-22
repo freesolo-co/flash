@@ -1,7 +1,8 @@
 """Run the rollout-pool router (operator-side, like ``flash-server``).
 
 ``flash-pool serve`` starts the FastAPI router on a CPU box; GPU workers and trainers then talk to
-it over HTTP. Requires the ``server`` extra (``pip install 'flash[server]'``).
+it over HTTP. Requires the ``server`` extra (``pip install 'freesolo-flash[server]'``) — the PyPI
+distribution is ``freesolo-flash`` even though the import package / CLI is ``flash``.
 """
 
 from __future__ import annotations

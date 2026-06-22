@@ -111,14 +111,16 @@ class BackendGateway:
         if r.status_code >= 400:
             # vLLM returns 400 "has already been loaded" / "not found" (the adapter, in its body) on
             # an idempotent re-load / double-unload; tolerate THOSE so reloads and double-unloads are
-            # no-ops. But do NOT treat a bare 404 as success: on these endpoints a 404 means the
-            # route itself is missing (wrong backend URL, or a vLLM without the dynamic-LoRA API) —
-            # swallowing it would let the router believe an adapter is loaded and then fail every
-            # generation. Only the message-bearing 400-style cases are benign.
+            # no-ops. The tolerance is gated on EXACTLY 400 (vLLM's dynamic-LoRA contract for these
+            # cases): a bare 404 means the route itself is missing (wrong backend URL / a vLLM
+            # without the dynamic-LoRA API), and auth/server errors (401/403/5xx) are real failures —
+            # all must surface. Matching the "already"/"not found" substring on ANY non-404 would
+            # swallow e.g. a 401 or a 500 whose body happens to contain those words, letting the
+            # router believe an adapter is loaded and then fail every generation.
             text = _safe_text(r)
             if (
                 tolerate_already
-                and r.status_code != 404
+                and r.status_code == 400
                 and ("already" in text.lower() or "not found" in text.lower())
             ):
                 return {"ok": True, "note": text[:200]}

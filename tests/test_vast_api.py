@@ -106,6 +106,18 @@ def test_search_offers_multi_gpu_query_shape(monkeypatch):
     assert q["gpu_frac"] == {"gte": 0.99}  # whole-machine only (filtered server-side)
 
 
+@pytest.mark.parametrize("bad", [0, -1, -8])
+def test_search_offers_rejects_non_positive_num_gpus(monkeypatch, bad):
+    """0/negative num_gpus would build an impossible ``num_gpus == N`` predicate that returns no
+    offers, masquerading as 'no capacity'. It must fail loudly (ValueError) instead — and BEFORE any
+    network call (so the misconfig surfaces even without a configured API key)."""
+    from flash.providers.vast import api as vast_api
+
+    monkeypatch.delenv("VAST_API_KEY", raising=False)  # guard runs before auth/network
+    with pytest.raises(ValueError, match="num_gpus"):
+        vast_api.search_offers(24576, num_gpus=bad)
+
+
 def test_search_offers_single_gpu_has_no_gpu_frac_filter(monkeypatch):
     """Single-GPU offers are inherently whole-machine, so the gpu_frac filter is NOT added (it
     would needlessly exclude fractional single-GPU offers that expose their one GPU fine)."""

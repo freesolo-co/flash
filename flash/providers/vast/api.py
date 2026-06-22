@@ -69,6 +69,11 @@ def search_offers(
     consumer/hobbyist machines); results additionally carry ``hosting_type`` which
     callers re-check (``usable_offers``) — never trust one filter layer alone.
     """
+    # Validate num_gpus up front: 0/negative would build an impossible ``num_gpus == N`` predicate
+    # that returns no offers, masquerading as 'no capacity' rather than the misconfig it is. Fail
+    # loudly and early instead.
+    if int(num_gpus) < 1:
+        raise ValueError(f"search_offers: num_gpus must be >= 1, got {num_gpus!r}")
     # Apply Vast's server-side datacenter-only filter (hosting_type==1). usable_offers now rejects
     # community/marketplace hosts unconditionally (run secrets ship to the box), so a mixed search
     # would risk filling the price-sorted limit=64 page with community offers and reporting "no

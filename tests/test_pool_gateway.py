@@ -96,3 +96,49 @@ def test_unload_lora_404_missing_route_raises():
     with pytest.raises(GatewayError) as ei:
         asyncio.run(scenario())
     assert ei.value.status == 404
+
+
+@pytest.mark.parametrize("status", [401, 403, 500, 502])
+def test_load_lora_does_not_swallow_auth_or_server_errors_with_already_in_body(status):
+    # A real auth/server failure (401/403/5xx) whose body happens to contain "already" must NOT be
+    # treated as an idempotent no-op just because of the substring — the tolerance is gated on the
+    # vLLM 400 contract only. Swallowing these would let the router believe the adapter is loaded and
+    # then fail every generation against this backend.
+    app = FastAPI()
+
+    @app.post("/v1/load_lora_adapter")
+    async def load(body: dict) -> dict:
+        raise HTTPException(status_code=status, detail="lora has already been loaded (but auth failed)")
+
+    async def scenario():
+        gw = _gateway_for(app)
+        try:
+            await gw.load_lora(_backend(), "run", "/lora/run")
+        finally:
+            await gw.aclose()
+
+    with pytest.raises(GatewayError) as ei:
+        asyncio.run(scenario())
+    assert ei.value.status == status
+
+
+@pytest.mark.parametrize("status", [401, 500])
+def test_unload_lora_does_not_swallow_auth_or_server_errors_with_not_found_in_body(status):
+    # Same gating for unload: a 401/500 carrying "not found" is a real error, not a benign
+    # double-unload.
+    app = FastAPI()
+
+    @app.post("/v1/unload_lora_adapter")
+    async def unload(body: dict) -> dict:
+        raise HTTPException(status_code=status, detail="lora not found (server error)")
+
+    async def scenario():
+        gw = _gateway_for(app)
+        try:
+            await gw.unload_lora(_backend(), "run")
+        finally:
+            await gw.aclose()
+
+    with pytest.raises(GatewayError) as ei:
+        asyncio.run(scenario())
+    assert ei.value.status == status

@@ -19,6 +19,7 @@ on CPU with a stub.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -91,36 +92,43 @@ class GRPOPoolLoop:
         ``policy_update`` is the GPU optimizer step. Stops after ``steps`` (or when the prompts run
         out). Returns one :class:`StepResult` per step."""
         results: list[StepResult] = []
-        stream = self.client.experience_stream(
-            prompt_batches,
-            n=self.group_size,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            prefetch=self.prefetch,
-            max_concurrency=self.max_concurrency,
-            score_fn=self.score_fn,
-        )
-        for exp in stream:
-            advantages = compute_group_advantages(exp.rewards)
-            new_uri = policy_update(exp, advantages)  # the GPU step (off-loaded everything else)
-            sync = self.client.sync_weights(new_uri)  # push fresh policy to the pool
-            flat_adv = [abs(a) for g in advantages for a in g]
-            res = StepResult(
-                step=exp.step,
-                mean_reward=exp.mean_reward,
-                mean_abs_advantage=(sum(flat_adv) / len(flat_adv)) if flat_adv else 0.0,
-                num_prompts=exp.num_prompts,
-                num_completions=exp.num_completions,
-                gen_seconds=exp.gen_seconds,
-                score_seconds=exp.score_seconds,
-                adapter_version=int(sync.get("version", 0)),
-                new_uri=new_uri,
+        # ``contextlib.closing`` guarantees the generator is .close()'d on early break (the ``steps``
+        # cap) or on an exception — NOT just on normal exhaustion. ``experience_stream`` only joins
+        # its background producer thread (and tears down the rollout ThreadPoolExecutor) inside its
+        # own ``finally``, which runs on close(); without this the producer would leak and keep
+        # generating/scoring rollouts after the loop returns (live thread + wasted pool spend).
+        with contextlib.closing(
+            self.client.experience_stream(
+                prompt_batches,
+                n=self.group_size,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+                prefetch=self.prefetch,
+                max_concurrency=self.max_concurrency,
+                score_fn=self.score_fn,
             )
-            results.append(res)
-            if on_step is not None:
-                on_step(res)
-            if steps is not None and len(results) >= steps:
-                break
+        ) as stream:
+            for exp in stream:
+                advantages = compute_group_advantages(exp.rewards)
+                new_uri = policy_update(exp, advantages)  # the GPU step (off-loaded everything else)
+                sync = self.client.sync_weights(new_uri)  # push fresh policy to the pool
+                flat_adv = [abs(a) for g in advantages for a in g]
+                res = StepResult(
+                    step=exp.step,
+                    mean_reward=exp.mean_reward,
+                    mean_abs_advantage=(sum(flat_adv) / len(flat_adv)) if flat_adv else 0.0,
+                    num_prompts=exp.num_prompts,
+                    num_completions=exp.num_completions,
+                    gen_seconds=exp.gen_seconds,
+                    score_seconds=exp.score_seconds,
+                    adapter_version=int(sync.get("version", 0)),
+                    new_uri=new_uri,
+                )
+                results.append(res)
+                if on_step is not None:
+                    on_step(res)
+                if steps is not None and len(results) >= steps:
+                    break
         return results
 
 

@@ -38,7 +38,8 @@ def test_pick_for_base_skips_saturated_backend():
     )
     s.backends["a"].inflight = 2  # saturated (>= cap)
     s.backends["b"].inflight = 5  # below cap
-    assert s.backends["a"].saturated and not s.backends["b"].saturated
+    assert s.backends["a"].saturated
+    assert not s.backends["b"].saturated
     assert s.pick_for_base("Q").id == "b"
 
 
@@ -50,7 +51,8 @@ def test_pick_for_base_all_saturated_falls_back_to_least_loaded():
     )
     s.backends["a"].inflight = 5
     s.backends["b"].inflight = 3
-    assert s.backends["a"].saturated and s.backends["b"].saturated
+    assert s.backends["a"].saturated
+    assert s.backends["b"].saturated
     assert s.pick_for_base("Q").id == "b"  # least-loaded saturated one, no NoCapacityError
 
 

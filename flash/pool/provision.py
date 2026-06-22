@@ -168,14 +168,18 @@ def provision_pool(
     results: list[ProvisionResult] = []
     c = client or httpx.Client(timeout=30.0)
     try:
-        for m in plan.members:
+        for mi, m in enumerate(plan.members):
             for i in range(m.count):
                 if dry_run:
+                    # Include the MEMBER index (``mi``): two PoolMembers can share gpu+base (split
+                    # for different max_loras, or duplicate entries), and ``i`` restarts at 0 per
+                    # member, so a (gpu, base, i)-only id would collide across them and make the
+                    # dry-run plan ambiguous (hiding double-counted GPUs).
                     results.append(
                         ProvisionResult(
                             base_model=m.base_model,
                             gpu=m.gpu,
-                            backend_id=f"{m.gpu}-{m.base_model.split('/')[-1]}-{i}",
+                            backend_id=f"{m.gpu}-{m.base_model.split('/')[-1]}-m{mi}-{i}",
                             url="(dry-run)",
                             registered=False,
                             note="dry-run: not rented",
