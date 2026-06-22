@@ -163,10 +163,24 @@ class PoolState:
             # marks every placement stale (``stale_placements``), and the router hot-swaps the new
             # weights on the next serve (or an explicit sync/place) instead of treating warm
             # backends as already serving the new policy.
+            base_changed = existing.base_model != adapter.base_model
             weights_changed = existing.uri != adapter.uri
             existing.base_model = adapter.base_model
             existing.uri = adapter.uri
             existing.replicas = adapter.replicas
+            if base_changed:
+                # The base model changed under the same adapter name: every existing placement is on
+                # a backend serving the OLD base, so it cannot serve this adapter anymore. Drop those
+                # placements (and detach the adapter from those backends) — otherwise the warm path
+                # in ``pick_backend`` would route requests to a wrong-base backend. The router will
+                # lazily (re)place the adapter on a correct-base backend on the next serve.
+                for bid in list(existing.placements):
+                    be = self.backends.get(bid)
+                    if be is not None:
+                        be.adapters.discard(adapter.name)
+                        be.adapter_clock.pop(adapter.name, None)
+                existing.placements.clear()
+                existing.loaded_version.clear()
             if weights_changed:
                 existing.version += 1
             return existing
@@ -244,7 +258,12 @@ class PoolState:
         cands = self.healthy_for_base(base_model, exclude=exclude)
         if not cands:
             raise NoCapacityError(f"no healthy backend serving base model {base_model!r}")
-        return min(cands, key=lambda b: (b.inflight, b.total_requests))
+        # Prefer backends below their in-flight cap so we don't pile more work onto an already
+        # saturated GPU while a healthy one sits idle. Only when EVERY candidate is saturated do we
+        # fall back to the least-loaded saturated one (better to queue than to drop the request).
+        unsaturated = [b for b in cands if not b.saturated]
+        pool = unsaturated or cands
+        return min(pool, key=lambda b: (b.inflight, b.total_requests))
 
     def pick_backend(self, adapter_name: str, *, exclude: set[str] | None = None) -> PlacementDecision:
         """Pick a backend to serve ``adapter_name`` (loading/evicting if needed). ``exclude`` is
@@ -254,14 +273,18 @@ class PoolState:
             raise NoCapacityError(f"unknown adapter {adapter_name!r}")
         exclude = exclude or set()
 
-        # 1) warm backends that already host the adapter — least in-flight.
+        # 1) warm backends that already host the adapter — least in-flight, but avoid driving an
+        # already-saturated backend further into overload: prefer warm backends below their cap and
+        # only fall back to a saturated warm one when every warm backend is saturated.
         warm = [
             b
             for b in self.backends.values()
             if b.healthy and b.id not in exclude and adapter_name in b.adapters
         ]
         if warm:
-            return PlacementDecision(min(warm, key=lambda b: (b.inflight, b.total_requests)))
+            unsaturated = [b for b in warm if not b.saturated]
+            pool = unsaturated or warm
+            return PlacementDecision(min(pool, key=lambda b: (b.inflight, b.total_requests)))
 
         # 2) base-model backends with a free LoRA slot — fewest adapters, then least in-flight.
         cands = self.healthy_for_base(ad.base_model, exclude=exclude)

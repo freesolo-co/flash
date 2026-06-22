@@ -40,6 +40,58 @@ def test_plan_summary_capacity():
     assert s["max_concurrent_adapters"] == {"Q": 16, "R": 4}
 
 
+def test_plan_summary_capacity_sums_mixed_max_loras_for_same_base():
+    # A base model split across members with DIFFERENT max_loras: a big slice (1 GPU x 16) and a
+    # small slice (2 GPUs x 4). True capacity is 1*16 + 2*4 = 24. The old code did
+    # total_count * max(max_loras) = 3 * 16 = 48, crediting the small GPUs with the big slot count
+    # and overstating what the fleet can actually hold.
+    plan = PoolPlan(
+        members=[
+            PoolMember(base_model="Q", gpu="H200", count=1, max_loras=16),
+            PoolMember(base_model="Q", gpu="RTX5090", count=2, max_loras=4),
+        ]
+    )
+    s = plan_summary(plan)
+    assert s["capacity_per_base_model"] == {"Q": 3}  # 3 GPUs total
+    assert s["max_concurrent_adapters"] == {"Q": 24}  # 1*16 + 2*4, NOT 3*16
+
+
+def test_from_toml_parses_int_counts(tmp_path):
+    p = tmp_path / "pool.toml"
+    p.write_text(
+        '[[pool]]\nbase_model = "Q"\ngpu = "RTX5090"\ncount = 2\nmax_loras = 8\n'
+    )
+    plan = PoolPlan.from_toml(str(p))
+    assert len(plan.members) == 1
+    assert plan.members[0].count == 2
+    assert plan.members[0].max_loras == 8
+
+
+def test_from_toml_accepts_whole_number_float(tmp_path):
+    # A whole-valued float (2.0) is unambiguous and accepted as 2.
+    p = tmp_path / "pool.toml"
+    p.write_text('[[pool]]\nbase_model = "Q"\ngpu = "RTX5090"\ncount = 2.0\n')
+    plan = PoolPlan.from_toml(str(p))
+    assert plan.members[0].count == 2
+    assert isinstance(plan.members[0].count, int)
+
+
+def test_from_toml_rejects_non_integer_float(tmp_path):
+    # 2.9 must fail loudly, not silently truncate to 2 (provisioning a different fleet than intended).
+    p = tmp_path / "pool.toml"
+    p.write_text('[[pool]]\nbase_model = "Q"\ngpu = "RTX5090"\ncount = 2.9\n')
+    with pytest.raises(ValueError, match="count"):
+        PoolPlan.from_toml(str(p))
+
+
+def test_from_toml_rejects_bool(tmp_path):
+    # TOML true/false is not a valid GPU count; int(True) -> 1 would be a silent footgun.
+    p = tmp_path / "pool.toml"
+    p.write_text('[[pool]]\nbase_model = "Q"\ngpu = "RTX5090"\nmax_loras = true\n')
+    with pytest.raises(ValueError, match="max_loras"):
+        PoolPlan.from_toml(str(p))
+
+
 def test_provision_dry_run_does_not_rent():
     plan = PoolPlan(members=[PoolMember(base_model="Q", gpu="RTX5090", count=2)])
     results = provision_pool(plan, "http://router", dry_run=True)

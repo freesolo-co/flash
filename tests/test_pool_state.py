@@ -29,6 +29,31 @@ def test_pick_for_base_no_capacity():
         s.pick_for_base("OTHER")
 
 
+def test_pick_for_base_skips_saturated_backend():
+    # "a" has fewer in-flight but is OVER its cap; "b" is below cap. Even though least-loaded by raw
+    # inflight is "a", a saturated backend must not get more work while a healthy one is free.
+    s = _state(
+        Backend(id="a", url="http://a", base_model="Q", max_concurrency=2),
+        Backend(id="b", url="http://b", base_model="Q", max_concurrency=10),
+    )
+    s.backends["a"].inflight = 2  # saturated (>= cap)
+    s.backends["b"].inflight = 5  # below cap
+    assert s.backends["a"].saturated and not s.backends["b"].saturated
+    assert s.pick_for_base("Q").id == "b"
+
+
+def test_pick_for_base_all_saturated_falls_back_to_least_loaded():
+    # When EVERY backend is saturated we must still return one (queue, don't drop) — the least loaded.
+    s = _state(
+        Backend(id="a", url="http://a", base_model="Q", max_concurrency=2),
+        Backend(id="b", url="http://b", base_model="Q", max_concurrency=2),
+    )
+    s.backends["a"].inflight = 5
+    s.backends["b"].inflight = 3
+    assert s.backends["a"].saturated and s.backends["b"].saturated
+    assert s.pick_for_base("Q").id == "b"  # least-loaded saturated one, no NoCapacityError
+
+
 def test_adapter_lazy_load_then_warm_reuse():
     s = _state(Backend(id="a", url="http://a", base_model="Q"))
     s.register_adapter(Adapter(name="run1", base_model="Q", uri="/lora/run1"))
@@ -41,6 +66,64 @@ def test_adapter_lazy_load_then_warm_reuse():
     d2 = s.pick_backend("run1")
     assert d2.backend.id == "a"
     assert d2.needs_load is False
+
+
+def test_pick_backend_warm_skips_saturated():
+    # Both backends host "run" (warm). "a" has fewer in-flight but is saturated; the warm pick must
+    # prefer the non-saturated "b" rather than driving "a" further into overload.
+    s = _state(
+        Backend(id="a", url="http://a", base_model="Q", max_concurrency=2),
+        Backend(id="b", url="http://b", base_model="Q", max_concurrency=10),
+    )
+    s.register_adapter(Adapter(name="run", base_model="Q", uri="/run"))
+    s.mark_loaded("a", "run")
+    s.mark_loaded("b", "run")
+    s.backends["a"].inflight = 2  # saturated
+    s.backends["b"].inflight = 5  # below cap
+    d = s.pick_backend("run")
+    assert d.backend.id == "b"
+    assert d.needs_load is False  # still a warm hit, just the non-saturated one
+
+
+def test_pick_backend_warm_all_saturated_still_returns():
+    # Every warm backend is saturated: still serve from the least-loaded warm one (no eviction churn,
+    # no NoCapacityError) — the adapter is already loaded so we queue rather than reload elsewhere.
+    s = _state(
+        Backend(id="a", url="http://a", base_model="Q", max_concurrency=2),
+        Backend(id="b", url="http://b", base_model="Q", max_concurrency=2),
+    )
+    s.register_adapter(Adapter(name="run", base_model="Q", uri="/run"))
+    s.mark_loaded("a", "run")
+    s.mark_loaded("b", "run")
+    s.backends["a"].inflight = 5
+    s.backends["b"].inflight = 3
+    d = s.pick_backend("run")
+    assert d.backend.id == "b"  # least-loaded saturated warm backend
+    assert d.needs_load is False
+
+
+def test_reregister_with_changed_base_model_clears_stale_placements():
+    # Re-registering an adapter NAME with a DIFFERENT base_model must drop placements on the old-base
+    # backend, or the warm path would route requests to a backend serving the wrong base model.
+    s = _state(
+        Backend(id="qgpu", url="http://q", base_model="Q"),
+        Backend(id="rgpu", url="http://r", base_model="R"),
+    )
+    ad = s.register_adapter(Adapter(name="run", base_model="Q", uri="/lora/run"))
+    s.mark_loaded("qgpu", "run")
+    assert ad.placements == {"qgpu"}
+    assert "run" in s.backends["qgpu"].adapters
+    # now re-register the SAME name under base model R
+    again = s.register_adapter(Adapter(name="run", base_model="R", uri="/lora/run"))
+    assert again is ad
+    assert ad.base_model == "R"
+    assert ad.placements == set()  # old-base placement cleared
+    assert ad.loaded_version == {}
+    assert "run" not in s.backends["qgpu"].adapters  # detached from the old-base backend
+    # the next pick must (re)load onto the correct-base backend, not warm-route to the old one
+    d = s.pick_backend("run")
+    assert d.backend.id == "rgpu"
+    assert d.needs_load is True
 
 
 def test_multiple_adapters_on_one_gpu():
