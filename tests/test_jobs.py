@@ -271,9 +271,15 @@ def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     from flash.providers.runpod import jobs
 
     ok = {"success": True, "result": base64.b64encode(cloudpickle.dumps({"acc": 1.0})).decode()}
-    # A few IN_QUEUE polls then COMPLETED. Real wall-clock (no fake clock) so elapsed stays far
-    # under queue_grace_s — the timer must clear on leaving IN_QUEUE and never false-stall.
-    seq = iter([{"status": "IN_QUEUE"}] * 5 + [{"status": "COMPLETED", "output": ok}])
+    # A few IN_QUEUE polls, THEN IN_PROGRESS (a worker picked it up), then COMPLETED — exercising the
+    # actual leave-the-queue transition the queue timer must clear on. Real wall-clock (no fake clock)
+    # so elapsed stays far under queue_grace_s; the timer clears on leaving IN_QUEUE and never
+    # false-stalls (the IN_PROGRESS path is governed by heartbeat/setup windows, not queue_grace_s).
+    seq = iter(
+        [{"status": "IN_QUEUE"}] * 5
+        + [{"status": "IN_PROGRESS"}] * 3
+        + [{"status": "COMPLETED", "output": ok}]
+    )
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(seq))
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     h = jobs.JobHandle("ep", "name", "job")
