@@ -141,33 +141,24 @@ def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
 
 def _clear_chalk_flags(monkeypatch):
     # Every FLASH_* chalk kernel flag (chalk_kernels._KERNELS) + the install spec, so a test starts
-    # from a clean env and is not skewed by ambient FLASH_* set in the dev/CI shell. Includes the
-    # default-on gap-fillers (RMSNORM/SWIGLU/FLCE): leaving them ambient would keep chalk "selected"
-    # and break the all-disabled / extra-pip assertions.
-    for k in (
-        "FLASH_RMSNORM_KERNEL",
-        "FLASH_SWIGLU_KERNEL",
-        "FLASH_FLCE_KERNEL",
-        "FLASH_FP8_BASE",
-        "FLASH_TRITON_LORA",
-        "FLASH_EMBED_KERNEL",
-        "FLASH_QKV_KERNEL",
-        "FLASH_ROPE_KERNEL",
-        "FLASH_CHALK_SPEC",
-    ):
+    # from a clean env and is not skewed by ambient FLASH_* set in the dev/CI shell. Derived from the
+    # _KERNELS table so newly-shipped flags (e.g. FLASH_GDN_KERNEL/FLASH_TRAINABLE_QKV) are cleared
+    # too — leaving a default-on flag ambient would keep chalk "selected" and break the all-disabled /
+    # extra-pip assertions.
+    from flash.engine.chalk_kernels import _KERNELS
+
+    for k in (*(flag for flag, _kw, _on in _KERNELS), "FLASH_CHALK_SPEC"):
         monkeypatch.delenv(k, raising=False)
 
 
-# The six default-on gap-filler flags (chalk_kernels._KERNELS): disabling exactly these
-# deselects chalk. QKV/FP8 base are opt-in (default-off) and need no flag to stay off.
-_DEFAULT_ON_CHALK_FLAGS = (
-    "FLASH_RMSNORM_KERNEL",
-    "FLASH_SWIGLU_KERNEL",
-    "FLASH_FLCE_KERNEL",
-    "FLASH_ROPE_KERNEL",
-    "FLASH_TRITON_LORA",
-    "FLASH_EMBED_KERNEL",
-)
+# The default-on gap-filler flags: disabling exactly these deselects chalk. Opt-in kernels
+# (QKV/FP8 base, default-off) need no flag to stay off. DERIVED from the chalk_kernels._KERNELS
+# table (the single source of truth) so this can't go stale as more default-on kernels ship —
+# e.g. FLASH_GDN_KERNEL (0.4.2) and FLASH_TRAINABLE_QKV (0.4.3) are default-on and must be
+# included or "disable everything default-on" would still leave chalk selected.
+from flash.engine.chalk_kernels import _KERNELS as _CHALK_KERNELS_TABLE
+
+_DEFAULT_ON_CHALK_FLAGS = tuple(flag for flag, _kw, default_on in _CHALK_KERNELS_TABLE if default_on)
 
 
 def test_chalk_extra_pip_default_on_with_spec(monkeypatch):
