@@ -292,16 +292,20 @@ def _rewrite_safetensors_header_keys(path: str, rename) -> int:
     safetensors dependency (keeps this module CPU-importable on the server venv).
     """
     import json
+    import os
+    import shutil
     import struct
 
     with open(path, "rb") as f:
-        raw = f.read()
-    if len(raw) < 8:
-        raise ValueError(f"{path}: too small to be a safetensors file")
-    (hdr_len,) = struct.unpack("<Q", raw[:8])
-    header_bytes = raw[8 : 8 + hdr_len]
-    data_section = raw[8 + hdr_len :]
-    header = json.loads(header_bytes)
+        len_bytes = f.read(8)
+        if len(len_bytes) < 8:
+            raise ValueError(f"{path}: too small to be a safetensors file")
+        (hdr_len,) = struct.unpack("<Q", len_bytes)
+        header_bytes = f.read(hdr_len)
+        if len(header_bytes) < hdr_len:
+            raise ValueError(f"{path}: truncated safetensors header")
+        header = json.loads(header_bytes)
+    data_start = 8 + hdr_len
 
     new_header = {}
     renamed = 0
@@ -325,10 +329,21 @@ def _rewrite_safetensors_header_keys(path: str, rename) -> int:
     # Re-serialize compactly. safetensors does not require any specific key order or padding; the
     # only constraint is that data_offsets stay consistent with the (unchanged) data section.
     new_header_bytes = json.dumps(new_header, separators=(",", ":")).encode("utf-8")
-    with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(new_header_bytes)))
-        f.write(new_header_bytes)
-        f.write(data_section)
+    # Stream the (possibly multi-GB) tensor data straight from the original to a temp file instead
+    # of slurping the whole file into memory; os.replace makes the swap atomic so an interrupted
+    # rewrite can't corrupt the adapter.
+    tmp = path + ".remap.tmp"
+    try:
+        with open(path, "rb") as src, open(tmp, "wb") as out:
+            src.seek(data_start)
+            out.write(struct.pack("<Q", len(new_header_bytes)))
+            out.write(new_header_bytes)
+            shutil.copyfileobj(src, out, 8 * 1024 * 1024)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    os.replace(tmp, path)
     return renamed
 
 
@@ -402,8 +417,9 @@ def assert_lora_applied(model, model_id: str) -> int:
     """After ``PeftModel.from_pretrained``, verify the adapter's LoRA actually loaded (non-empty)
     so a future key-mismatch regression fails LOUDLY instead of silently training a fresh LoRA.
 
-    Counts the LoRA A/B submodules present on the PeftModel. Raises for a VL warm-start that ended
-    up with ZERO LoRA modules (the exact silent-drop failure this remap fixes). Returns the count.
+    Counts the LoRA A/B submodules present on the PeftModel. Raises for ANY warm-start that ended
+    up with ZERO LoRA modules (a key mismatch from any cause; the VL ``.language_model.`` mismatch
+    this remap fixes is the common one). Returns the count.
     """
     count = 0
     for name, _ in model.named_modules():
@@ -413,8 +429,9 @@ def assert_lora_applied(model, model_id: str) -> int:
     if count == 0:
         raise RuntimeError(
             f"warm-start adapter for {model_id} loaded ZERO LoRA modules — the SFT adapter was NOT "
-            "applied (key mismatch). GRPO would silently restart from the base model. This is the "
-            "VL '.language_model.' key-mismatch bug; check remap_vl_adapter_dir ran on the adapter."
+            "applied (key mismatch). GRPO would silently restart from the base model. For Qwen3.5/"
+            "3.6 VL this is usually the '.language_model.' key-mismatch (check remap_vl_adapter_dir "
+            "ran on the adapter); otherwise verify the adapter's keys match the model."
         )
     print(f"[init-adapter] verified {count} LoRA submodule(s) applied for {model_id}")
     return count
