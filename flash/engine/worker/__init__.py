@@ -967,7 +967,18 @@ def run_sft():
     mik = {"dtype": "bfloat16", "device_map": None}
     if _attn:
         mik["attn_implementation"] = _attn
-    cfg_kwargs["model_init_kwargs"] = mik
+    # Warm-start: when train.init_from_adapter is set, CONTINUE the prior-stage adapter (SFT->SFT or
+    # GRPO->SFT chain) instead of training a fresh LoRA from the base model. _init_adapter_model loads
+    # the base + the prior adapter as a trainable PeftModel (and asserts the LoRA actually applied, so
+    # a key-mismatch fails loudly rather than silently restarting from base). We then hand TRL the
+    # built PeftModel with peft_config=None (it trains the loaded adapter) and DROP model_init_kwargs
+    # (the model is already materialized; passing model_init_kwargs with a model object errors in TRL).
+    # Without this the SFT stage of a warm-start chain SILENTLY discarded init_from_adapter and trained
+    # from scratch (loss restarted ~14 instead of continuing the prior stage).
+    _sft_init_model, _sft_init_peft = _init_adapter_model(model_id)
+    _sft_warm_started = _sft_init_peft is None  # _init_adapter_model loaded a real adapter
+    if not _sft_warm_started:
+        cfg_kwargs["model_init_kwargs"] = mik
     cfg = TRLSFTConfig(**cfg_kwargs)
 
     # LoRA+ (convergence lever, arXiv 2402.12354; always-on: measured -52% train loss in A/B
@@ -1052,14 +1063,21 @@ def run_sft():
 
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
+    # Warm-start (init_from_adapter set): pass the already-built PeftModel + peft_config=None so TRL
+    # continues the loaded adapter; otherwise the string model_id + a fresh make_lora LoRA.
     trainer = _SFT(
-        model=model_id,
+        model=_sft_init_model if _sft_warm_started else model_id,
         args=cfg,
         train_dataset=ds,
-        peft_config=make_lora(model_id),
+        peft_config=None if _sft_warm_started else make_lora(model_id),
         processing_class=tok,
         callbacks=[make_checkpoint_upload_callback()],
     )
+    if _sft_warm_started:
+        print(
+            f"[sft] warm-start: continuing adapter from train.init_from_adapter="
+            f"{(JOB_SPEC.train.init_from_adapter if JOB_SPEC else '')!r} (peft_config=None)"
+        )
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
     # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
     # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
