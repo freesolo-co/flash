@@ -609,10 +609,10 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
 def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
     # The candidate walk steps to the next-cheapest class on each infra retry but CLAMPS at
     # the last fitting candidate — it must never index past the ranked list. Force a VRAM need
-    # only the 80 GB+ VALIDATED tier satisfies: attempt 0 takes the cheaper (A100 PCIe @ $1.39),
-    # attempt 1 walks to the pricier (RTX Pro 6000 WK @ $1.79), attempt 2's walk offset clamps
-    # back onto that same last class. (Allocation is restricted to the validated pool, so the
-    # unvalidated RTX Pro 6000 Server Edition and A100 SXM are not candidates.)
+    # only the 96 GB VALIDATED tier satisfies (post-2026-06-22 expansion the 80 GB tier has several
+    # validated classes, so we use 96 GB to keep exactly TWO candidates): attempt 0 takes the cheaper
+    # (RTX Pro 6000 WK @ $1.79), attempt 1 walks to the pricier (RTX Pro 6000 @ $2.09), attempt 2's
+    # walk offset clamps back onto that same last class.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
@@ -622,9 +622,9 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
-        # Need 80 GB -> the two VALIDATED big-VRAM RunPod classes fit: A100 PCIe (80 GB @ $1.39)
-        # and RTX Pro 6000 WK (96 GB @ $1.79) -> two candidates.
-        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
+        # Need 96 GB -> the two VALIDATED 96 GB RunPod classes fit: RTX Pro 6000 WK ($1.79) and
+        # RTX Pro 6000 Server Edition ($2.09) -> exactly two candidates (H100 NVL @ 94 GB is Vast-only).
+        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 96)
         gpus_seen: list[str] = []
 
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
@@ -650,7 +650,7 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
 
         assert orch.get_status("clamp").state == "done"
         # Walk advances to the last candidate then clamps on it (never out of range).
-        assert gpus_seen == ["A100 PCIe", "RTX Pro 6000 WK", "RTX Pro 6000 WK"]
+        assert gpus_seen == ["RTX Pro 6000 WK", "RTX Pro 6000", "RTX Pro 6000"]
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
