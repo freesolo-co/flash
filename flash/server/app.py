@@ -135,7 +135,13 @@ def recover_runs() -> None:
     """Recover every in-flight run after a restart so a redeploy never loses a training session:
     re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
     ``queued``/``provisioning`` runs that never reached a worker."""
-    from flash.runner import _gc_run_endpoints, _run_job, _update, attach_run, resume_run
+    from flash.runner import (
+        _gc_run_endpoints,
+        _run_job_background,
+        _update,
+        attach_run,
+        resume_run,
+    )
 
     active: set[str] = set()
     # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
@@ -205,7 +211,7 @@ def recover_runs() -> None:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         with contextlib.suppress(Exception):
             _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
-        threading.Thread(target=lambda s=spec: _run_job(s), daemon=True).start()
+        threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
 
 
 def create_app():
