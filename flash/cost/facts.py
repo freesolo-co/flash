@@ -75,9 +75,11 @@ def gpu_vram_gb(name: str) -> int:
 
 def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
     """Cheapest GPU class that fits ``required_vram_gb``, ranked by the REALIZED (market) $/hr it
-    is BILLED at (ties: vram, name) -- so selection is consistent with the bill and approximates
-    the allocator, which provisions the cheapest live offer. No pin and no validation gate -- every
-    fitting class is eligible. ``provider`` restricts candidates to what it can provision.
+    is BILLED at (ties: vram, name) -- so selection is consistent with the bill. No pin; every
+    fitting class is eligible, validated or not. NOTE this is intentionally gate-free: the
+    submit-time allocator restricts to the live-validated pool, so the actually-provisioned class
+    can be pricier than the one priced here. ``provider`` restricts candidates to what it can
+    provision.
     """
 
     def _selectable(g: GpuClass) -> bool:
