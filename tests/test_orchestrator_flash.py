@@ -200,3 +200,33 @@ def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch):
         status = runner.get_status("bg-fail")
         assert status.state == "failed"
         assert "crashed before persisting" in (status.error or "")
+
+
+def test_run_job_background_does_not_clobber_persisted_failure(monkeypatch):
+    """If the run is ALREADY terminal (e.g. _run_job_inner persisted the real, detailed failure
+    before the re-raise), the wrapper must NOT overwrite its error with the caught exception."""
+    import os
+    import tempfile
+
+    import flash.runner as runner
+    from flash.runner import RunStatus
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
+        os.makedirs(runner.RUNS_DIR, exist_ok=True)
+        # already terminal, carrying the REAL failure detail _run_job_inner persisted
+        runner._save_status(
+            RunStatus(run_id="bg-done", state="failed", spec={}, error="real seed failure detail")
+        )
+
+        def boom(spec):
+            raise RuntimeError("generic wrapper-level error")
+
+        monkeypatch.setattr(runner, "_run_job", boom)
+        spec = type("S", (), {"run_id": "bg-done"})()
+        runner._run_job_background(spec)  # must not raise
+
+        status = runner.get_status("bg-done")
+        assert status.state == "failed"
+        assert status.error == "real seed failure detail"  # NOT clobbered by the wrapper
