@@ -64,6 +64,38 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
     )
 
 
+def test_allocate_excludes_gpu_class_walks_to_different_validated(monkeypatch):
+    """A MIG / unusable-GPU retry must re-allocate OFF the failed CLASS to a DIFFERENT validated
+    one. With static rates a 0.8B GRPO run's validated 24 GB pool ranks RTX A5000 ($0.27) < RTX
+    3090 ($0.46) < RTX 4090 ($0.69) < RTX 5090 ($0.99); excluding the cheapest (A5000 — the
+    MIG-prone class) makes the allocator pick the next validated class, never re-pick A5000."""
+    from flash.providers import allocator
+
+    base = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    assert base.gpu == "RTX A5000"  # the cheapest validated 24 GB class (the MIG one)
+
+    walked = allocator.allocate(
+        "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({"RTX A5000"})
+    )
+    assert walked.gpu != "RTX A5000"  # walked off the MIG-prone class
+    # the excluded class is gone from EVERY candidate, not just the chosen one
+    assert all(c.gpu != "RTX A5000" for c in walked.candidates)
+    # ... onto the next-cheapest validated class (a consumer card that can't be MIG-sliced)
+    assert walked.gpu == "RTX 3090"
+
+
+def test_allocate_exclude_all_fitting_classes_raises(monkeypatch):
+    """Excluding every fitting validated class leaves nothing to allocate -> UnsupportedGpuError
+    (the run terminates cleanly rather than re-picking a banned class)."""
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
+
+    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    all_classes = frozenset(c.gpu for c in a.candidates)
+    with pytest.raises(UnsupportedGpuError, match="excluding GPU classes"):
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=all_classes)
+
+
 def test_offline_allocates_static_cheapest(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import cheapest_gpu
@@ -120,10 +152,11 @@ def test_required_vram_policy_floors_and_downrouting():
     assert need("Qwen/Qwen3.5-0.8B", "grpo") <= 24
     assert 24 < need("Qwen/Qwen3.5-2B", "grpo") <= 32
     assert need(m4, "sft", train={"max_length": 1024, "lora_rank": 8}) < 32
-    # 9B GRPO is 4-bit QLoRA -> fits a 24-32GB card (was 80 GB bf16).
-    assert need("Qwen/Qwen3.5-9B", "grpo") <= 32  # QLoRA 4-bit: fits a ~24-32GB card
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 8192, "max_tokens": 2048, "group_size": 8}) <= 48  # 4-bit
-    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 4096, "group_size": 8}) <= 48
+    # 9B GRPO is bf16 (QLoRA dropped: the 4-bit vLLM-rollout merge collapsed the GRPO
+    # importance ratio -> no learning), so colocated GRPO needs an 80GB-class card.
+    assert need("Qwen/Qwen3.5-9B", "grpo") >= 80  # bf16 colocate: 80GB floor
+    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 8192, "max_tokens": 2048, "group_size": 8}) >= 80
+    assert need("Qwen/Qwen3.5-9B", "grpo", train={"max_length": 4096, "group_size": 8}) >= 80
     # group size and thinking never DECREASE the requirement
     base = need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 4})
     assert need(m4, "grpo", train={"max_length": 4096, "max_tokens": 1024, "group_size": 16}) >= base
@@ -215,9 +248,10 @@ def test_sft_big_vocab_logits_term_present_and_bounded():
 
 
 def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
-    """The worker's SFT per-device cap (sft_per_device) keeps the un-fused [pd, seq, vocab] fp32
-    logits within _LOGITS_BUDGET_GB at every sub-2048 ctx -- the SFT mirror of rl_per_device_comps.
-    The estimator and worker call this SAME helper, so what the allocator reserves == what runs."""
+    """The worker's SFT per-device cap (sft_per_device) keeps the un-fused [pd, seq, vocab] logits
+    within _LOGITS_BUDGET_GB whenever pd CAN be reduced -- the SFT mirror of rl_per_device_comps. At
+    the pd=1 floor the logits are irreducible (a near-2048 big-vocab ctx can exceed the budget); the
+    estimator then reserves that true floor (no clamp), so what's reserved still == what runs."""
     from flash.engine import vram
 
     V = 248_320
@@ -225,7 +259,10 @@ def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
         pd = vram.sft_per_device(4, seq_len=seq, vocab=V, fused=False)
         logits_gb = pd * seq * V * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9
         assert 1 <= pd <= 4
-        assert logits_gb <= vram._LOGITS_BUDGET_GB + 1e-6, (seq, pd, logits_gb)
+        # cap holds logits <= budget unless pd is already floored to 1 (irreducible)
+        assert pd == 1 or logits_gb <= vram._LOGITS_BUDGET_GB + 1e-6, (seq, pd, logits_gb)
+        # the cap is TIGHT: one more micro-batch would breach the budget
+        assert (pd + 1) * seq * V * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9 > vram._LOGITS_BUDGET_GB or pd == 4
     # fused -> no cap, the full micro-batch runs (no needless throughput loss)
     assert vram.sft_per_device(4, seq_len=4096, vocab=V, fused=True) == 4
 
@@ -241,6 +278,46 @@ def test_required_vram_sft_small_model_includes_big_vocab_logits():
     assert n_short >= 12  # base+act (~7) + capped logits (~4), x1.1 -- well above the pre-fix ~8
     n_fused = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_length": 2048})
     assert n_fused < n_short  # the fused CE removes the logits term at >= 2048 ctx
+
+
+def test_sft_equation_covers_honest_peak_across_seq_boundary():
+    """Boundary regression: for EVERY catalog SFT model across the seq grid (straddling the 2048
+    Liger threshold) x batch x rank, the equation must reserve >= the INDEPENDENT honest peak (incl.
+    the capped big-vocab logits), and a validated card must fit. This is the in-CI distillation of
+    the 148k-config offline sweep -- if the SFT logits term is ever dropped again, this fails."""
+    import math
+
+    from flash.catalog import MODELS, vocab_size_for
+    from flash.engine import vram
+    from flash.engine.vram import params_b_from_str, sft_logits_fused, sft_per_device
+    from flash.providers.allocator import required_vram_gb
+    from flash.providers.base import GPU_INFO
+
+    validated = [g.vram_gb for g in GPU_INFO.values() if getattr(g, "validated", False)]
+
+    def honest_peak(pb, seq, vocab, quant, rank, bs):
+        bpp = vram._BYTES_PER_PARAM.get(quant, 2.0)
+        width = math.sqrt(max(pb, 0.1))
+        base = pb * bpp + vram._BASE_OVERHEAD_GB + (rank / 16.0) * (0.3 + 0.04 * pb)
+        fused = sft_logits_fused(pb, seq)
+        pd = sft_per_device(bs, seq_len=seq, vocab=vocab, fused=fused)
+        act = vram._ACT_COEF * pd * (seq / 1024.0) * width
+        logits = 0.0 if fused else pd * seq * vocab * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9
+        return base + act + logits
+
+    for mid, info in MODELS.items():
+        if "sft" not in info.algos:
+            continue
+        pb = info.params_b or params_b_from_str(info.params) or 0.0
+        vocab, quant = vocab_size_for(mid), getattr(info, "quant", "bf16") or "bf16"
+        for seq in (512, 1024, 1536, 2047, 2048, 4096, 32768):
+            for bs in (1, 4, 8, 32):
+                for rank in (8, 32, 128):
+                    tr = {"max_length": seq, "batch_size": bs, "lora_rank": rank}
+                    need = required_vram_gb(mid, "sft", train=tr)
+                    peak = math.ceil(honest_peak(pb, seq, vocab, quant, rank, bs) * 1.1)
+                    assert need >= peak, (mid, seq, bs, rank, need, peak)
+                    assert any(gb >= need for gb in validated), (mid, seq, bs, rank, need)
 
 
 # ---------------------------------------------------------------------------

@@ -462,28 +462,25 @@ def gpu_diagnostics() -> dict:
     return diag
 
 
-# Sentinel phrase carried in the RETRIABLE-infra error message. The worker stamps the
-# RetriableInfraError into heartbeat.json (retriable=True); the provider job pollers
-# (flash/providers/runpod/jobs.py, flash/providers/vast/jobs/*) surface it as an infra-shaped
-# PollResult, so the control plane's retry loop (flash/runner/lifecycle.py) resubmits a
-# MIG/NVML-broken host on a FRESH worker instead of mis-classifying it as a (non-retried)
-# job_failed. Keep the two in lock-step.
+# Human-readable sentinel embedded in the error message (debug tag only — the runner classifies
+# structurally off the worker's heartbeat ``retriable`` flag, not by matching this phrase).
 RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
 
 
 class RetriableInfraError(RuntimeError):
-    """A boot-time infrastructure failure that the control plane should RETRY on a fresh worker.
+    """An infrastructure failure the control plane should RETRY on a fresh worker.
 
     Raised for a host the run can never train on — e.g. RunPod fulfilling a full-GPU request
     with a MIG slice ("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb",
     ``nvidia-smi`` = "[Insufficient Permissions]"), where PyTorch's CUDA caching allocator
-    HARD-ASSERTS mid-backward ("NVML_SUCCESS == r INTERNAL ASSERT FAILED ... CUDACachingAllocator").
-    The message embeds ``RETRIABLE_INFRA_MARKER`` so the runner's infra-retry path provisions a
-    new host rather than failing the run as a genuine (non-retried) worker crash.
+    HARD-ASSERTS mid-backward. The worker's top-level handler stamps ``retriable=True`` (and,
+    when ``exclude_class`` is set, ``exclude_class=True``) into heartbeat.json so the runner
+    retries — and, for a class-level fault like a MIG slice, re-allocates OFF that GPU class.
     """
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, exclude_class: bool = False):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
+        self.exclude_class = exclude_class
 
 
 # Transient-startup grace for assert_usable_gpu's CUDA-availability poll (it runs before the
@@ -535,18 +532,21 @@ def assert_usable_gpu() -> None:
         if i + 1 < tries:
             time.sleep(delay_s)
     if not cuda_ready:
+        # Host/driver-level (a bad node), NOT a class-level MIG fault: retry on a fresh host of the
+        # same class, don't blacklist the whole class. So exclude_class stays False (default).
         raise RetriableInfraError(
             "CUDA reports no available device after the worker-boot startup grace"
         )
     try:
         name = torch.cuda.get_device_name(0)
     except Exception as e:
-        # A device that can't even be named is unusable — retry on a fresh host.
+        # Per-node CUDA/driver issue, not a class-level MIG slice -> fresh host, not class-exclude.
         raise RetriableInfraError(f"could not query the GPU device name ({e})") from e
     if "MIG" in (name or ""):
         raise RetriableInfraError(
             f"GPU is a MIG slice ({name!r}); PyTorch's CUDA allocator NVML-asserts on MIG "
-            "partitions (CUDACachingAllocator NVML_SUCCESS), so this host cannot train"
+            "partitions (CUDACachingAllocator NVML_SUCCESS), so this host cannot train",
+            exclude_class=True,
         )
     # NVML probe: a MIG/permission-restricted device raises here even when the name looks normal.
     try:
@@ -565,7 +565,8 @@ def assert_usable_gpu() -> None:
     except Exception as e:
         raise RetriableInfraError(
             f"NVML probe failed for {name!r} ({e}); the device is permission-restricted "
-            "(MIG / shared host) and PyTorch's allocator will NVML-assert mid-run"
+            "(MIG / shared host) and PyTorch's allocator will NVML-assert mid-run",
+            exclude_class=True,
         ) from e
     print(f"[gpu-guard] usable full GPU: {name}")
 

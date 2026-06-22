@@ -161,6 +161,54 @@ def test_poll_job_failed_without_retriable_heartbeat_is_job_failed(monkeypatch):
     assert res.failure == "job_failed"
 
 
+def test_poll_job_failed_with_exclude_class_surfaces_flag(monkeypatch):
+    # A MIG slice: the worker stamps retriable + exclude_class -> job_preempted AND res.exclude_class
+    # so the runner re-allocates OFF the failed GPU class (not just onto a fresh host of it).
+    res = _poll_failed_with_heartbeat(
+        monkeypatch, {"stage": "error_sft", "retriable": True, "exclude_class": True}
+    )
+    assert res.failure == "job_preempted"
+    assert res.exclude_class is True
+
+
+def test_poll_job_retriable_without_exclude_class_does_not_set_flag(monkeypatch):
+    # A transient host failure (GPU-never-ready / upload exhaustion): retriable but NOT class-level,
+    # so exclude_class stays False -> the retry may re-use the same class on a fresh host.
+    res = _poll_failed_with_heartbeat(monkeypatch, {"stage": "error_sft", "retriable": True})
+    assert res.failure == "job_preempted"
+    assert res.exclude_class is False
+
+
+def test_poll_job_exclude_class_requires_retriable(monkeypatch):
+    # A malformed/stale heartbeat with exclude_class but NOT retriable must NOT trigger class
+    # exclusion (exclude_class implies retriable): the failure stays job_failed, flag stays False.
+    res = _poll_failed_with_heartbeat(monkeypatch, {"stage": "error_sft", "exclude_class": True})
+    assert res.failure == "job_failed"
+    assert res.exclude_class is False
+
+
+def test_poll_job_completed_decode_error_consults_worker_flags(monkeypatch):
+    # COMPLETED but the output decodes as an error (a handler exception). A MIG slice can surface
+    # here too, so poll_job must consult the worker heartbeat -> job_preempted + exclude_class,
+    # not silently drop them as a plain job_failed.
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # An output envelope that decode_output raises RuntimeError on (success False).
+    bad = {"success": False, "error": "boom", "stdout": "x"}
+    monkeypatch.setattr(
+        runpod_api, "job_status", lambda eid, jid: {"status": "COMPLETED", "output": bad}
+    )
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: {"retriable": True, "exclude_class": True},
+    )
+    assert res.failure == "job_preempted"
+    assert res.exclude_class is True
+
+
 def test_poll_job_stall_detection(monkeypatch):
     # job stays IN_PROGRESS forever, heartbeat never advances -> stall
     import itertools
@@ -606,13 +654,11 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         assert gpus_seen[0] == "RTX A5000"  # cheapest validated class with >= 12 GB
 
 
-def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
-    # The candidate walk steps to the next-cheapest class on each infra retry but CLAMPS at
-    # the last fitting candidate — it must never index past the ranked list. Force a VRAM need
-    # only the 80 GB+ VALIDATED tier satisfies: attempt 0 takes the cheaper (A100 PCIe @ $1.39),
-    # attempt 1 walks to the pricier (RTX Pro 6000 WK @ $1.79), attempt 2's walk offset clamps
-    # back onto that same last class. (Allocation is restricted to the validated pool, so the
-    # unvalidated RTX Pro 6000 Server Edition and A100 SXM are not candidates.)
+def test_supervisor_excludes_gpu_class_on_second_mig(monkeypatch):
+    # A MIG slice (exclude_class) doesn't blacklist the class on the FIRST occurrence — a retry
+    # lands on a fresh host that's usually a real full GPU — so attempt 1 retries the SAME class.
+    # Only the SECOND MIG from that class is treated as class-systemic and excluded, walking the
+    # run onto a DIFFERENT validated class (a consumer card that can't be MIG-sliced).
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
@@ -622,9 +668,112 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
-        # Need 80 GB -> the two VALIDATED big-VRAM RunPod classes fit: A100 PCIe (80 GB @ $1.39)
-        # and RTX Pro 6000 WK (96 GB @ $1.79) -> two candidates.
-        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
+        real_allocate = allocator.allocate
+        seen_excludes: list[frozenset] = []
+
+        def spy_allocate(*a, **k):
+            seen_excludes.append(frozenset(k.get("exclude_gpu_classes") or ()))
+            return real_allocate(*a, **k)
+
+        monkeypatch.setattr(allocator, "allocate", spy_allocate)
+
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            # attempts 0 and 1 both hand back a MIG slice (job_preempted + exclude_class).
+            if attempt < 2:
+                return jobs.PollResult(
+                    False,
+                    failure="job_preempted",
+                    detail="[FAILED] train phase 'sft' produced no /tmp/metrics.json",
+                    exclude_class=True,
+                )
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="mig-walk",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("mig-walk").state == "done"
+        assert len(gpus_seen) == 3
+        # attempt 0 = cheapest MIG-prone class; attempt 1 RETRIES the SAME class (1st MIG, no
+        # exclusion); attempt 2 walks OFF it after the 2nd MIG.
+        assert gpus_seen[0] == "RTX A5000"
+        assert gpus_seen[1] == "RTX A5000"
+        assert gpus_seen[2] != "RTX A5000"
+        # the class is excluded only on the THIRD allocation (after the 2nd MIG), not before.
+        assert seen_excludes[0] == frozenset()
+        assert seen_excludes[1] == frozenset()
+        assert "RTX A5000" in seen_excludes[2]
+
+
+def test_supervisor_mig_failure_without_marker_does_not_retry(monkeypatch):
+    # Belt-and-suspenders: a plain job_failed (no retriable / exclude_class flag — a genuine code
+    # crash) is still NOT retried and excludes no class. The MIG path is gated on exclude_class.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+        calls = {"n": 0}
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            calls["n"] += 1
+            return jobs.PollResult(
+                False, failure="job_failed", detail="ValueError: bad reward fn (no infra marker)"
+            )
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="code-crash",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
+        )
+        with pytest.raises(RuntimeError, match="bad reward fn"):
+            orch.submit_job(spec, dry_run=False, background=False)
+        assert calls["n"] == 1  # genuine code error burns no retry budget
+        assert orch.get_status("code-crash").state == "failed"
+
+
+def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
+    # The candidate walk steps to the next-cheapest class on each infra retry but CLAMPS at
+    # the last fitting candidate — it must never index past the ranked list. Force a VRAM need
+    # only the 96 GB VALIDATED tier satisfies (post-2026-06-22 expansion the 80 GB tier has several
+    # validated classes, so we use 96 GB to keep exactly TWO candidates): attempt 0 takes the cheaper
+    # (RTX Pro 6000 WK @ $1.79), attempt 1 walks to the pricier (RTX Pro 6000 @ $2.09), attempt 2's
+    # walk offset clamps back onto that same last class.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+        # Need 96 GB -> the two VALIDATED 96 GB RunPod classes fit: RTX Pro 6000 WK ($1.79) and
+        # RTX Pro 6000 Server Edition ($2.09) -> exactly two candidates (H100 NVL @ 94 GB is Vast-only).
+        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 96)
         gpus_seen: list[str] = []
 
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
@@ -650,7 +799,7 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
 
         assert orch.get_status("clamp").state == "done"
         # Walk advances to the last candidate then clamps on it (never out of range).
-        assert gpus_seen == ["A100 PCIe", "RTX Pro 6000 WK", "RTX Pro 6000 WK"]
+        assert gpus_seen == ["RTX Pro 6000 WK", "RTX Pro 6000", "RTX Pro 6000"]
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
