@@ -1,4 +1,4 @@
-"""`slm train --cost`: map a training config to a pre-flight cost estimate."""
+"""`flash train --cost`: map a training config to a pre-flight cost estimate."""
 
 from __future__ import annotations
 
@@ -158,8 +158,8 @@ def test_sft_steps_max_examples_zero_means_no_cap(monkeypatch):
 
 
 def test_sft_steps_unpinned_falls_back_when_env_cannot_be_counted(monkeypatch, capsys):
-    # A Hub env usually isn't importable in the cost path's venv (`flash env install` puts it in a
-    # separate `prime` env), so counting returns None. Pricing must NOT hard-fail: it falls back to
+    # A published env usually isn't importable in the cost path's venv, so counting returns None.
+    # Pricing must NOT hard-fail: it falls back to
     # a representative default example count (with a clear warning) so `flash train --cost` still
     # produces a quote without pinning [train].max_examples.
     from flash.cost.spec import DEFAULT_UNCOUNTED_SFT_EXAMPLES
@@ -275,4 +275,3 @@ def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
     )
     with pytest.raises((KeyError, ValueError)):
         cmd_train(args)
-

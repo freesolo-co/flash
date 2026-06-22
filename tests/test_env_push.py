@@ -1,12 +1,12 @@
-"""`flash env push` packages a local verifiers env and uploads it to the MANAGED Environments Hub.
+"""`flash env push` packages a local verifiers env and uploads it to the managed publisher.
 
-The control plane publishes it under FreeSolo's Prime account, so the user needs no Prime
-account or local `prime` CLI. The freesolo training agent emits a single `environment.py` while
-the Hub requires an environment directory with a `pyproject.toml`; `flash env push` bridges that:
-pointed at a `.py` module it wraps it in a Prime-compatible package, pointed at a real env dir it
-uploads as-is, and the server climbs past version conflicts on re-publish. These tests cover the
-client side — packaging + upload. The server-side publish (prime, per-identity namespacing,
-conflict-climbing) lives in test_env_publish.py.
+The control plane publishes it under FreeSolo's managed environment account, so the user needs no
+separate environment account or local publisher CLI. The freesolo training agent emits a single
+`environment.py` while the publisher requires an environment directory with a `pyproject.toml`;
+`flash env push` bridges that: pointed at a `.py` module it wraps it in a compatible package,
+pointed at a real env dir it uploads as-is, and the server climbs past version conflicts on
+re-publish. These tests cover the client side — packaging + upload. The server-side publish
+(per-identity namespacing, conflict-climbing) lives in test_env_publish.py.
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def test_push_single_py_uses_sibling_config_id_name(monkeypatch, tmp_path):
 
 
 def test_push_sibling_config_id_with_dot_yields_valid_module(monkeypatch, tmp_path):
-    # A sibling config Hub slug name is NOT pre-sanitized and may contain a `.` (or other chars
+    # A sibling config published id name is NOT pre-sanitized and may contain a `.` (or other chars
     # invalid in a Python package dir / `[tool.hatch] packages` entry). The packaged module dir
     # must still be a valid identifier ([a-z0-9_]) so the wheel build doesn't break.
     env_file = tmp_path / "environment.py"
