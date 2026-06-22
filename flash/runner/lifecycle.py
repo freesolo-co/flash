@@ -276,8 +276,13 @@ def _submit_seed_supervised(
                 # pool emptying between search and rent). That must consume a retry, not
                 # kill the run — the budget exists precisely for flakes.
                 res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
-                if attempt < max_retries:
-                    time.sleep(10 * (attempt + 1))  # let the transient clear
+                # Back off before the next attempt to let the transient clear. A deploy/submit
+                # exception is a poll_error (NOT exclude_class), so it draws on the TRAINING
+                # budget — gate the sleep on that budget, not on `attempt`. `attempt` now runs
+                # past max_retries once MIG reallocations add attempts, so `attempt < max_retries`
+                # would silently drop the backoff while training retries still remain.
+                if training_retries < max_retries:
+                    time.sleep(10 * (training_retries + 1))  # let the transient clear
         if res.ok:
             # A best-effort cancel may fail to stop the worker, which then completes
             # successfully after cancel_run() persisted `cancelled`. Don't let a late
@@ -343,9 +348,18 @@ def _submit_seed_supervised(
             will_retry = mig_reallocs < MIG_REALLOC_BUDGET
         else:
             will_retry = training_retries < max_retries
+        # MIG / unusable-GPU failures bail at assert_usable_gpu() BEFORE the first training
+        # step, so there is no checkpoint to resume — reprovision on a fresh GPU instead. A
+        # genuine mid-training failure (stall/preempt/poll_error) does resume from the latest
+        # HF checkpoint. Pick the message per failure type so the log isn't misleading.
+        if not will_retry:
+            retry_note = "not retrying"
+        elif mig_failure:
+            retry_note = "retrying (reprovisioning on a fresh GPU)"
+        else:
+            retry_note = "retrying (resume from last checkpoint)"
         print(
-            f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if will_retry else 'not retrying'}"
+            f"seed={seed} attempt={attempt} failed ({res.failure}); {retry_note}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,

@@ -218,6 +218,105 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# MIG / unusable-GPU separate retry budget (Blackwell MIG-slice hardening)
+# ---------------------------------------------------------------------------
+def _mig_fail(detail="assert_usable_gpu: MIG slice"):
+    """A worker-flagged MIG / unusable-GPU failure: exclude_class implies retriable, so the
+    poller stamps a retriable infra category (job_preempted) AND exclude_class=True."""
+    from flash.providers.base import PollResult
+
+    return PollResult(False, failure="job_preempted", detail=detail, exclude_class=True)
+
+
+def test_mig_failures_consume_mig_budget_not_training_retries(orch, monkeypatch):
+    """Consecutive MIG / unusable-GPU allocations must draw on the SEPARATE MIG budget, leaving the
+    training-retry budget (max_retries) fully intact for a genuine mid-training failure afterwards.
+
+    max_retries=2, MIG_REALLOC_BUDGET=4 → loop allows max_retries+MIG_REALLOC_BUDGET+1 = 7 attempts.
+    Sequence: 4 MIG failures (consume the whole MIG budget), then 2 training stalls (which must still
+    be allowed because training_retries was untouched by the MIG failures), then a success.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast_jobs
+
+    # Hand back a DIFFERENT validated class each allocation so every MIG failure looks like a fresh
+    # MIG-prone class (a MIG-heavy pool), exercising the budget rather than the seen-once→exclude path.
+    classes = ["RTX A5000", "RTX A4500", "A40", "L40", "RTX A6000", "RTX 6000 Ada", "RTX 4090"]
+    alloc_excludes = []
+
+    def fake_allocate(model, algorithm, **kw):
+        alloc_excludes.append(kw["exclude_gpu_classes"])
+        gpu = classes[min(len(alloc_excludes) - 1, len(classes) - 1)]
+        return _alloc(provider="vast", gpu=gpu, offer=_offer_obj(gpu=gpu))
+
+    monkeypatch.setattr(allocator, "allocate", fake_allocate)
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
+
+    submit_calls = []
+
+    def fake_vast_submit(run_spec, seed, log=None, on_handle=None, attempt=0, offers=None, **kw):
+        submit_calls.append(attempt)
+        on_handle(_vast_handle_dict(instance_id=100 + attempt, machine_id=200 + attempt))
+        if attempt < 4:
+            return _mig_fail()  # MIG / unusable GPU: separate budget
+        if attempt < 6:
+            return PollResult(False, failure="stalled", detail="no worker progress")  # training retry
+        return PollResult(True, metrics={"train_tokens": 4096, "cost_usd": 0.5})
+
+    monkeypatch.setattr(vast_jobs, "submit_run_vast", fake_vast_submit)
+    spec = _spec()  # max_retries=2
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+
+    # It reached success ONLY because the 4 MIG failures did not eat the 2 training retries:
+    # attempts 0-3 = MIG, 4-5 = training stalls, 6 = success.
+    assert metrics["train_tokens"] == 4096
+    assert submit_calls == [0, 1, 2, 3, 4, 5, 6]
+    # MIG retries reprovision on a fresh GPU (no checkpoint); training retries resume from checkpoint.
+    logged = log.getvalue()
+    assert "reprovisioning on a fresh GPU" in logged
+    assert "resume from last checkpoint" in logged
+
+
+def test_mig_budget_is_a_hard_cap(orch, monkeypatch):
+    """A fully-MIG pool can't loop forever: once mig_reallocs hits MIG_REALLOC_BUDGET (4) the run
+    stops, having consumed ZERO training retries (so the cap is the MIG budget, not max_retries)."""
+    from flash.providers import allocator
+    from flash.providers.vast import api as vast_api
+    from flash.providers.vast import jobs as vast_jobs
+
+    classes = ["RTX A5000", "RTX A4500", "A40", "L40", "RTX A6000", "RTX 6000 Ada"]
+    n = {"i": 0}
+
+    def fake_allocate(model, algorithm, **kw):
+        gpu = classes[min(n["i"], len(classes) - 1)]
+        n["i"] += 1
+        return _alloc(provider="vast", gpu=gpu, offer=_offer_obj(gpu=gpu))
+
+    monkeypatch.setattr(allocator, "allocate", fake_allocate)
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
+
+    submit_calls = []
+
+    def fake_vast_submit(run_spec, seed, log=None, on_handle=None, attempt=0, offers=None, **kw):
+        submit_calls.append(attempt)
+        on_handle(_vast_handle_dict(instance_id=300 + attempt, machine_id=400 + attempt))
+        return _mig_fail()  # every GPU is a MIG slice
+
+    monkeypatch.setattr(vast_jobs, "submit_run_vast", fake_vast_submit)
+    spec = _spec()  # max_retries=2, MIG_REALLOC_BUDGET=4
+    _seed_status(orch, spec)
+    with pytest.raises(RuntimeError, match="failed after retries"):
+        orch._submit_seed_supervised(spec, 0, io.StringIO())
+    # 1 initial + MIG_REALLOC_BUDGET(4) reallocs = 5 submits, then the MIG budget is exhausted and
+    # it stops — it does NOT run on to consume the 2 training retries (would be 7 if conflated).
+    assert submit_calls == [0, 1, 2, 3, 4]
+
+
+# ---------------------------------------------------------------------------
 # cancel / attach routing
 # ---------------------------------------------------------------------------
 def test_cancel_routes_vast(orch, monkeypatch):
