@@ -56,8 +56,8 @@ _KERNELS: list[tuple[str, str, bool]] = [
     ("FLASH_ROPE_KERNEL", "rope", True),
     ("FLASH_TRITON_LORA", "fused_lora_delta", True),
     ("FLASH_EMBED_KERNEL", "fused_embedding", True),
-    ("FLASH_GDN_KERNEL", "gdn", True),  # chalk-native GDN conv+SiLU (freesolo-chalk 0.4.2); fla still owns the scan. GDN block +1.14-1.15x E2E (H100). Replaces the eager F.silu(F.conv1d) flash runs (causal_conv1d omitted: sdist build fails).
-    ("FLASH_TRAINABLE_QKV", "trainable_attn_epilogue", True),  # chalk-native TRAINABLE fused QK-norm+partial-RoPE (freesolo-chalk 0.4.3, fwd+bwd). ENGAGES in training with q/k/v in LoRA (the production all-linear case the eval-only attn_epilogue could never hit). Replaces the eager q_norm/k_norm + apply_rotary_pos_emb stack; H100 geomean 2.85x fwd+bwd. Self-test gated -> eager on any failure.
+    ("FLASH_GDN_KERNEL", "gdn", True),  # chalk-native GDN conv+SiLU (freesolo-chalk 0.4.2); fla still owns the scan. Full GDN block +13-15% E2E at the production batch/seq regime, VERIFIED H100/A100/A40 + 5090 (0.4.4 arch matrix). Replaces the eager F.silu(F.conv1d) flash runs (causal_conv1d omitted: sdist build fails).
+    ("FLASH_TRAINABLE_QKV", "trainable_attn_epilogue", True),  # chalk-native TRAINABLE fused QK-norm+partial-RoPE (freesolo-chalk 0.4.3, fwd+bwd). ENGAGES in training with q/k/v in LoRA (the production all-linear case the eval-only attn_epilogue could never hit). Replaces the eager q_norm/k_norm + apply_rotary_pos_emb stack; geomean fwd+bwd H100 2.85x / A100 3.42x / A40 6.32x / 5090 3.18x (0.4.4 arch matrix). Self-test gated -> eager on any failure.
     ("FLASH_QKV_KERNEL", "attn_epilogue", False),  # opt-in (eval-only; needs q/k/v out of LoRA). chalk skips the trainable one when this is on (they patch the same forward).
     ("FLASH_FP8_BASE", "fp8_frozen_base", False),  # opt-in (Hopper sm_90+ only)
 ]
