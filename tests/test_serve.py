@@ -78,10 +78,11 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def fake_post(url, json=None, headers=None, timeout=None):
+    def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
         seen["url"] = url
         seen["json"] = json
         seen["headers"] = headers
+        seen["follow_redirects"] = follow_redirects
         return _Resp()
 
     monkeypatch.setattr(d.httpx, "post", fake_post)
@@ -99,9 +100,14 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch):
         "repoId": "org/repo",
         "baseModel": "Qwen/Qwen3.5-0.8B",
         "subfolder": "sft/flash-7-abcd/seed0/adapter",
+        # flash always uploads adapters to HF *dataset* repos, so serving must be told to
+        # pull from the dataset namespace (else snapshot_download 404s on the model namespace).
+        "repoType": "dataset",
         "status": "ready",
     }
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+    # Modal 303-redirects slow requests to an async-result poll URL, so registration follows them.
+    assert seen["follow_redirects"] is True
     assert dep.openai_model == "flash-7-abcd"
     assert dep.endpoint_name == "https://serve.example"
     assert dep.state == "ready"
@@ -140,7 +146,7 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def fake_delete(url, headers=None, timeout=None):
+    def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
         seen["url"] = url
         seen["headers"] = headers
         return _Resp(200)
@@ -179,12 +185,24 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
         def json(self):
             return completion
 
-    def fake_post(url, json=None, timeout=None):
-        seen["url"] = url
-        seen["json"] = json
-        return _Resp()
+    class _FakeClient:
+        # chat() uses an explicit httpx.Client (context manager) so it can follow Modal's 303
+        # async-result redirects; the fake records the call and the client kwargs.
+        def __init__(self, *args, **kwargs):
+            seen["client_kwargs"] = kwargs
 
-    monkeypatch.setattr(d.httpx, "post", fake_post)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, json=None):
+            seen["url"] = url
+            seen["json"] = json
+            return _Resp()
+
+    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
     out = d.chat(
         run_id="flash-7-abcd",
         messages=[{"role": "user", "content": "2+2?"}],
@@ -193,6 +211,9 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
         thinking=True,
     )
     assert seen["url"] == "https://serve.example/v1/chat/completions"
+    # Modal 303-redirects slow ASGI requests to an async-result poll URL, so the chat client
+    # MUST follow redirects (else httpx raises on the 303 mid cold-start).
+    assert seen["client_kwargs"]["follow_redirects"] is True
     assert seen["json"]["model"] == "flash-7-abcd"
     assert seen["json"]["max_tokens"] == 8
     assert seen["json"]["messages"] == [{"role": "user", "content": "2+2?"}]

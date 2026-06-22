@@ -55,7 +55,15 @@ def _post_adapter_or_raise(url: str, body: dict) -> httpx.Response:
     """POST an adapter registration to the serving backend, translating any transport- or
     status-level failure into a ``ServingError`` that carries the upstream detail."""
     try:
-        resp = httpx.post(url, json=body, headers=_internal_key_header(), timeout=60.0)
+        # follow_redirects: Modal answers a slow request with a 303 to an async-result poll URL
+        # (?__modal_function_call_id=...); without following it httpx raises on the 303 (see chat).
+        resp = httpx.post(
+            url,
+            json=body,
+            headers=_internal_key_header(),
+            timeout=60.0,
+            follow_redirects=True,
+        )
         resp.raise_for_status()
         return resp
     except httpx.HTTPStatusError as exc:
@@ -181,6 +189,12 @@ def deploy_adapter(
         "repoId": hf_repo,
         "baseModel": model,
         "subfolder": subfolder,
+        # The trainer always streams the adapter into a *dataset* repo (the worker's
+        # hf_upload_folder uses repo_type="dataset"), so serving must pull from the dataset
+        # namespace. Without this the serving app defaults repoType to "model" and
+        # snapshot_download 404s on the model namespace — deploy returns 200 but the engine
+        # warmup fails, the adapter is silently disabled, and the first chat 404s.
+        "repoType": "dataset",
         "status": "ready",
     }
     _post_adapter_or_raise(f"{base}/adapters", body)
@@ -199,6 +213,8 @@ def undeploy_adapter(run_id: str) -> list[str]:
         f"{base}/adapters/{run_id}",
         headers=_internal_key_header(),
         timeout=60.0,
+        # Modal answers a slow request with a 303 to an async-result poll URL; follow it (see chat).
+        follow_redirects=True,
     )
     if resp.status_code == 404:
         return []
@@ -232,7 +248,12 @@ def chat(
         # completions diverge from training behavior even though the caller passes thinking=.
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
     }
-    # Cold starts (scale-from-zero per base model) can take minutes; give it room.
-    resp = httpx.post(f"{base}/v1/chat/completions", json=body, timeout=30 * 60.0)
+    # Cold starts (scale-from-zero per base model) can take minutes. Modal serves a slow ASGI
+    # request by 303-redirecting to an async-result poll URL (?__modal_function_call_id=...), so
+    # the client must follow redirects to retrieve the eventual completion — without this httpx
+    # raises on the 303 and the chat fails mid cold-start. max_redirects is raised because a long
+    # cold start polls across several redirect cycles before the result is ready.
+    with httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client:
+        resp = client.post(f"{base}/v1/chat/completions", json=body)
     resp.raise_for_status()
     return resp.json()
