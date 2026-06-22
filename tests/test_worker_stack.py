@@ -404,9 +404,10 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B", 4096) is True
 
 
-def test_make_lora_enables_pissa_and_rslora(monkeypatch):
-    """The whole catalog is bf16 (4-bit QLoRA dropped), so PiSSA's SVD always has the unquantized
-    base it needs: make_lora enables PiSSA + rsLoRA unconditionally for every model."""
+def test_make_lora_uses_standard_init_and_rslora(monkeypatch):
+    """PiSSA was removed (its saved adapter is a residual against the PiSSA-mutated base, which
+    corrupts serving + GRPO warm-start that load it onto the ORIGINAL base). make_lora uses the
+    standard zero-B init (serve/warm-start safe) and keeps rsLoRA, for every model."""
     captured = {}
     fake_peft = types.ModuleType("peft")
     fake_peft.LoraConfig = lambda **kw: (captured.update(kw), kw)[1]
@@ -418,7 +419,8 @@ def test_make_lora_enables_pissa_and_rslora(monkeypatch):
     for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
         captured.clear()
         worker.make_lora(model_id)
-        assert captured.get("init_lora_weights") == "pissa_niter_16"
+        assert captured.get("init_lora_weights") is True
+        assert "pissa" not in str(captured.get("init_lora_weights")).lower()
         assert captured.get("use_rslora") is True
 
 
