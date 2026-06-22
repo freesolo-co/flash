@@ -121,6 +121,9 @@ def test_safetensors_remap_for_vl_strips_infix_and_preserves_data(monkeypatch, t
     for old, new in zip(VL_KEYS, CAUSAL_LM_KEYS, strict=True):
         assert hdr[new]["data_offsets"] == [VL_KEYS.index(old) * 4, VL_KEYS.index(old) * 4 + 4]
     assert _read_safetensors_tensor_bytes(st) == before_data
+    # The rewrite streams via a temp file + atomic os.replace; it must not leave one behind.
+    assert not os.path.exists(st + ".remap.tmp")
+    assert [p for p in os.listdir(adir) if p.endswith(".tmp")] == []
 
 
 def test_safetensors_remap_noop_for_non_vl(monkeypatch, tmp_path):
