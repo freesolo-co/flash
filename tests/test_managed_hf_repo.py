@@ -35,20 +35,31 @@ def _submit(monkeypatch, spec: JobSpec) -> dict:
 
 
 def test_managed_hf_repo_assigned_per_run(monkeypatch):
-    monkeypatch.delenv("FLASH_ARTIFACT_NAMESPACE", raising=False)
     spec = _submit(monkeypatch, _spec())
     assert spec["train"]["hf_repo"] == "Freesolo-Co/flashrun-flash-managed-1"
 
 
 def test_managed_hf_repo_overrides_user_value(monkeypatch):
     # Even if a legacy/old-client spec carries a user namespace, the control plane overrides it.
-    monkeypatch.delenv("FLASH_ARTIFACT_NAMESPACE", raising=False)
     spec = _submit(monkeypatch, _spec(hf_repo="freesolo-founders/whatever"))
     assert spec["train"]["hf_repo"] == "Freesolo-Co/flashrun-flash-managed-1"
 
 
-def test_managed_hf_repo_namespace_env_override(monkeypatch):
-    # The operator can point artifact repos at a different owned namespace.
-    monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", "my-org")
-    spec = _submit(monkeypatch, _spec())
-    assert spec["train"]["hf_repo"] == "my-org/flashrun-flash-managed-1"
+def test_managed_hf_repo_finalizes_local_run_id(monkeypatch):
+    # The JobSpec default run_id "local" is treated as unset: submit_job assigns a real run_id and
+    # a matching per-run repo, so default-constructed/programmatic specs never collide on
+    # "flashrun-local". (Regression guard for the run_id-finalization review fix.)
+    from flash.spec import JobSpec
+
+    base = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "sft",
+            "environment": {"id": "owner/env"},
+            "train": {"epochs": 1, "seeds": [0]},
+        }
+    )
+    assert base.run_id == "local"
+    spec = _submit(monkeypatch, base)
+    assert spec["run_id"] != "local"
+    assert spec["train"]["hf_repo"] == f"Freesolo-Co/flashrun-{spec['run_id']}"
