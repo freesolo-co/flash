@@ -281,7 +281,7 @@ def canonical_gpu(name: str) -> str:
     if key in _ALIASES:
         return _ALIASES[key]
     raise UnsupportedGpuError(
-        f'unsupported gpu {name!r}; Flash manages {", ".join(KNOWN)} (or gpu.type = "cheapest")'
+        f'unsupported gpu {name!r}; Flash manages {", ".join(KNOWN)}'
     )
 
 
