@@ -259,35 +259,9 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
             return res.metrics
         last_detail = f"{res.failure}: {res.detail}"
-        # Infra-shaped failures are retried on a FRESH endpoint/host; genuine worker
-        # code errors are not. Detail markers cover the observed flake classes:
-        # platform timeouts, worker pip-install network timeouts, and sick-GPU hosts.
-        _infra_markers = (
-            "TIMED_OUT",
-            "Failed to fetch",
-            "operation timed out",
-            "python_dependencies failed",
-            "Connection reset",
-            "cuda not available",
-            "GPU never became ready",
-            # Host vanished mid-run: the instance went "missing"/dead and NOTHING was captured
-            # (no marker error, no error_<phase>.txt, no console log) so _failure_detail falls back
-            # to this bare sentinel. A genuine worker code crash instead yields a RICHER detail
-            # (the captured traceback), so this exact phrase only ever marks a dead host -> retry it
-            # on a fresh one. Without this, a single ~1-in-200 host death killed the whole run.
-            "terminated without a DONE sentinel",
-            # MIG slice / NVML-restricted host: the worker's boot guard (engine.worker.perf
-            # assert_usable_gpu / RetriableInfraError) detected a device the run can never train on
-            # — e.g. RunPod fulfilling a full-GPU request with a MIG partition (nvidia-smi
-            # "[Insufficient Permissions]"), which otherwise NVML-asserts mid-backward and was
-            # mis-classified as a non-retried job_failed. This exact marker phrase is embedded in
-            # that error's message, so a bad host is resubmitted on a fresh worker. Keep this in
-            # lock-step with engine.worker.perf.RETRIABLE_INFRA_MARKER.
-            "RETRIABLE_INFRA_GPU",
-        )
-        infra_shaped = res.failure in ("stalled", "poll_error") or any(
-            m in (res.detail or "") for m in _infra_markers
-        )
+        # Retry only on a structured failure category the provider already classified; a real job
+        # failure fails fast. No detail-string parsing. (USER cancels are caught below, not here.)
+        infra_shaped = res.failure in ("stalled", "poll_error", "job_preempted")
         # A cancel deletes the endpoint, which the poller sees as an
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.
