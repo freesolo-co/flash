@@ -150,3 +150,24 @@ def test_upload_code_mirrors_package_purging_stale_remote(monkeypatch):
     # still uploads from the real (symlink-collapsed) package dir, and skips bytecode
     assert up["folder_path"] == os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     assert "*.pyc" in up.get("ignore_patterns", [])
+
+
+def test_run_job_background_swallows_exception(monkeypatch):
+    """The daemon-thread entrypoint must NOT let _run_job's exception escape (it would surface as
+    an alarming 'Exception in thread' traceback for every failed run); the synchronous _run_job
+    keeps raising for its callers. Terminal state is already persisted before the raise, so the
+    wrapper just logs and returns."""
+    import flash.runner as runner
+
+    calls = {"n": 0}
+
+    def boom(spec):
+        calls["n"] += 1
+        raise RuntimeError("seed 0 failed after retries: job_failed")
+
+    # The wrapper dispatches through the package-level _run_job that tests patch.
+    monkeypatch.setattr(runner, "_run_job", boom)
+    spec = type("S", (), {"run_id": "bg-run"})()
+    # Must not raise — the wrapper swallows it (state already persisted by _run_job_inner).
+    runner._run_job_background(spec)
+    assert calls["n"] == 1
