@@ -63,12 +63,12 @@ def test_cheapest_gpu_policy(monkeypatch):
     from flash.providers.runpod import pricing
 
     # Validated-only by default: the cheapest LIVE-VALIDATED enum class that fits each VRAM tier
-    # wins on static rates (unvalidated cheaper cards — RTX 2000 Ada @ 16G, A40 @ 48G — excluded,
-    # because the deployed control plane would reject a submit for them).
-    assert gpus.cheapest_gpu(16) == "RTX A5000"  # cheapest VALIDATED >=16G (RTX 2000 Ada excluded)
-    assert gpus.cheapest_gpu(24) == "RTX A5000"  # cheapest VALIDATED >=24G enum class
-    assert gpus.cheapest_gpu(32) == "RTX 5090"  # validated >=32G (A40 is unvalidated)
-    assert gpus.cheapest_gpu(48) == "A100 PCIe"  # cheapest validated >=48G (80G A100 PCIe)
+    # wins on static rates. After the 2026-06-22 live-smoke expansion the pool includes RTX 2000 Ada
+    # (16G) and RTX A6000 (48G); A40 (48G) stays unvalidated (no RunPod capacity to smoke it in-window).
+    assert gpus.cheapest_gpu(16) == "RTX 2000 Ada"  # now validated, cheapest >=16G ($0.24)
+    assert gpus.cheapest_gpu(24) == "RTX A5000"  # cheapest VALIDATED >=24G (16G cards don't fit)
+    assert gpus.cheapest_gpu(32) == "RTX A6000"  # 48G A6000 now validated, $0.49 < 5090 $0.99
+    assert gpus.cheapest_gpu(48) == "RTX A6000"  # cheapest validated >=48G ($0.49, was A100 PCIe)
     # The error names the REAL constraint: this helper filters to RunPod-provisionable VALIDATED
     # classes, so a fitting Vast-only / unvalidated class doesn't make the message a lie.
     with pytest.raises(gpus.UnsupportedGpuError, match="no validated RunPod-provisionable GPU"):
@@ -82,10 +82,11 @@ def test_provisional_gpu_cheapest_for_model(monkeypatch):
     from flash.providers.base import provisional_gpu
 
     # GPU pinning is gone: provisional_gpu returns the cheapest fitting VALIDATED class for the
-    # model. 0.8B GRPO -> cheapest validated >=24G (A5000). 9B GRPO needs the 32G tier, whose
-    # cheapest VALIDATED class is RTX 5090 (the cheaper 48G A40 is unvalidated and excluded).
+    # model. 0.8B GRPO -> cheapest validated >=24G (A5000). 9B GRPO needs ~28G; the cheapest
+    # VALIDATED class that fits is now the 48G RTX A6000 ($0.49, live-validated 2026-06-22) — cheaper
+    # than the 32G RTX 5090 ($0.99).
     assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX A5000"
-    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "RTX 5090"
+    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "RTX A6000"
 
 
 def test_config_cheapest_policy_validated_pool(monkeypatch):
@@ -99,14 +100,14 @@ def test_config_cheapest_policy_validated_pool(monkeypatch):
         "gpu": {"type": "cheapest"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    # Cheapest fitting VALIDATED class for a small model (the unvalidated RTX 2000 Ada is excluded
-    # — the deployed control plane would reject it).
-    assert spec.gpu.type == "RTX A5000"
+    # Cheapest fitting VALIDATED class for a small model: post-expansion that's the 16 GB RTX 2000
+    # Ada ($0.24, live-validated 2026-06-22 for SFT) — 0.8B SFT needs ~12 GB.
+    assert spec.gpu.type == "RTX 2000 Ada"
     # GPU pinning is gone: a config's gpu.type is IGNORED — the schema always resolves the
     # cheapest fitting VALIDATED class, no matter what class the config names.
     for klass in ("L4", "L40S", "RTX 3090", "A40"):
         raw["gpu"] = {"type": klass}
-        assert spec_from_dict(raw, run_id="x").gpu.type == "RTX A5000"
+        assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 2000 Ada"
 
 
 def test_flash_gpu_enum_members():
@@ -133,8 +134,9 @@ def test_config_defaults_gpu_from_model():
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    # 9B 4-bit QLoRA SFT fits a 24 GB card; validated pool -> cheapest validated class (A5000).
-    assert spec.gpu.type == "RTX A5000"
+    # 9B 4-bit QLoRA SFT is fused (>=3B) -> ~16 GB; the cheapest validated class is now the 16 GB
+    # RTX 2000 Ada (live-validated 2026-06-22: 9B SFT train smoke passed on it).
+    assert spec.gpu.type == "RTX 2000 Ada"
 
 
 def test_build_worker_env():
