@@ -84,6 +84,17 @@ def test_from_toml_rejects_non_integer_float(tmp_path):
         PoolPlan.from_toml(str(p))
 
 
+def test_from_toml_rejects_zero_or_negative_count(tmp_path):
+    # count/max_loras must be >= 1 — a 0/-1 would parse but yield a nonsensical/empty fleet.
+    p = tmp_path / "pool.toml"
+    p.write_text('[[pool]]\nbase_model = "Q"\ngpu = "RTX5090"\ncount = 0\n')
+    with pytest.raises(ValueError, match="count"):
+        PoolPlan.from_toml(str(p))
+    p.write_text('[[pool]]\nbase_model = "Q"\ngpu = "RTX5090"\ncount = 1\nmax_loras = 0\n')
+    with pytest.raises(ValueError, match="max_loras"):
+        PoolPlan.from_toml(str(p))
+
+
 def test_from_toml_rejects_bool(tmp_path):
     # TOML true/false is not a valid GPU count; int(True) -> 1 would be a silent footgun.
     p = tmp_path / "pool.toml"
