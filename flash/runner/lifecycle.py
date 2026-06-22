@@ -128,7 +128,18 @@ def _submit_seed_supervised(
             with contextlib.suppress(Exception):
                 runpod_api.delete_endpoint(eid)
 
+    # Retry budget for infra-shaped failures (preempt / stall / no-capacity). The managed schema
+    # fixes spec.gpu.max_retries to the operator default (a user [gpu] table is ignored), so an
+    # operator raises the floor for a DEGRADED-SPOT window via the control-plane env FLASH_MAX_RETRIES
+    # (e.g. =8 when Vast spot is preempting first steps). Never lowers the spec value; absent/invalid
+    # -> the spec default. Control-plane-owned, so it applies uniformly to every run on the plane.
     max_retries = int(spec.gpu.max_retries)
+    _env_retries = os.environ.get("FLASH_MAX_RETRIES")
+    if _env_retries:
+        try:
+            max_retries = max(max_retries, int(_env_retries))
+        except ValueError:
+            pass
     last_detail = None
     bad_machines: set[int] = set()
     # GPU CLASSES to walk OFF entirely after the worker flagged one as a class-level fault
