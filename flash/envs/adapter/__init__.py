@@ -1,8 +1,8 @@
-"""Adapter that runs Prime Intellect ``verifiers`` / Environments Hub envs on Flash.
+"""Adapter that runs published ``verifiers`` environments on Flash.
 
 Wraps a ``verifiers`` ``Environment`` (``SingleTurnEnv``, ``MultiTurnEnv``, ``ToolEnv`` and
-its subclasses) in Flash's small ``Environment`` protocol so Hub environments run unchanged
-on Flash's trainer.
+its subclasses) in Flash's small ``Environment`` protocol so published environments run
+unchanged on Flash's trainer.
 
 GRPO supports all three shapes (the worker routes on ``multi_turn`` / ``is_tool_env``):
   * single-turn — TRL's single-shot generation + per-completion reward;
@@ -30,9 +30,9 @@ verifiers contract (docs):
   * multi-turn: ``env.env_response(messages, state)`` -> env reply messages;
     ``env.is_completed(state)`` -> done flag (both async)
 
-Hub conveniences handled here so the *documented* flow (``flash env install owner/name`` +
-``[environment] id = "owner/name"``) works on real Prime Intellect envs:
-  * the ``owner/name`` Hub slug is mapped to the bare ``verifiers`` load id;
+Published-env conveniences handled here so the *documented* flow
+(``flash env install owner/name`` + ``[environment] id = "owner/name"``) works:
+  * the ``owner/name`` id is mapped to the bare ``verifiers`` load id;
   * a ``RubricGroup`` (rubrics-of-rubrics) is flattened so the real reward funcs are found;
     unweighted (monitor) funcs are skipped — only weighted funcs count toward the reward;
   * a ``JudgeRubric``'s judge client/model/prompt is supplied to reward funcs that declare a
@@ -67,7 +67,7 @@ from flash.envs.base import BaseEnvironment
 
 
 def vf_load_id(env_ref: str) -> str:
-    """Map a Hub slug (``owner/name``) to the bare ``verifiers`` load id (``name``)."""
+    """Map a published id (``owner/name``) to the bare ``verifiers`` load id (``name``)."""
     return env_ref.split("/", 1)[1] if "/" in env_ref else env_ref
 
 
@@ -179,7 +179,7 @@ class VerifiersEnvironment(BaseEnvironment):
 
     # -- reward / scoring -------------------------------------------------
     def _normalize_info(self, example: dict) -> dict:
-        # Hub rows may store `info` as a JSON string (a supported Verifiers row shape);
+        # Published env rows may store `info` as a JSON string (a supported Verifiers row shape);
         # parse it so reward funcs that do `info[...]` get a dict, not a str (which would
         # raise TypeError, be swallowed as 0.0, and poison the signal).
         info = example.get("info") or {}
@@ -368,15 +368,15 @@ def _import_vf():
         return vf
     except ImportError as exc:
         raise ImportError(
-            "the 'verifiers' package is required to run Prime Hub environments; "
+            "the 'verifiers' package is required to run published environments; "
             "install it (e.g. `uv pip install verifiers`) or run `flash env install <env>`"
         ) from exc
 
 
 def load_verifiers_environment(env_id: str, **kwargs) -> VerifiersEnvironment:
-    """Load an installed / Hub verifiers environment by id and wrap it for Flash.
+    """Load an installed / published verifiers environment by id and wrap it for Flash.
 
-    ``env_id`` may be a Hub slug (``owner/name``); it is mapped to the bare verifiers load id.
+    ``env_id`` may be a published id (``owner/name``); it is mapped to the bare verifiers load id.
     Remaining ``kwargs`` are forwarded to the env's ``vf.load_environment``.
     """
     vf = _import_vf()

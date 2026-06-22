@@ -61,11 +61,11 @@ def upload_code(repo: str | None = None) -> str:
     that per-run repo.
 
     The worker downloads ``code/**`` to ``/runcode``. Verifiers-only: there are no built-in
-    example environments to ship — Hub/installed envs are pip-installed on the worker (see
+    example environments to ship — published/installed envs are pip-installed on the worker (see
     ``registry.worker_pip_for_env``).
 
     Only the ``flash`` package is uploaded, NOT the client's project tree. Managed runs must
-    reference a published Hub env by ``id`` (``flash env push`` to publish a local env first); the
+    reference a published env by ``id`` (``flash env push`` to publish a local env first); the
     worker pip-installs the env wheel.
     """
     from huggingface_hub import HfApi

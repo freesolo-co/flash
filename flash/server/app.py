@@ -2,7 +2,7 @@
 
 This is the operator-side component. It holds the
 provider credentials (``RUNPOD_API_KEY``, ``HF_TOKEN``, ``PRIME_API_KEY`` —
-the worker needs the last to ``prime env install`` the run's Prime Hub env) and
+the worker needs the last to install the run's published environment) and
 exposes the full run lifecycle to clients that authenticate with their freesolo API
 key (verified against the freesolo backend) — clients never see provider credentials.
 
@@ -247,8 +247,8 @@ def create_app():
         if key is None:
             raise HTTPException(
                 status_code=401,
-                detail="invalid or missing API key; log in with `flash login` using your "
-                "freesolo API key",
+                detail="invalid or missing API key; create or copy one at "
+                "https://freesolo.co/sign-in, then log in with `flash login`",
             )
         return key
 
@@ -267,11 +267,14 @@ def create_app():
 
     @app.get("/v1/me")
     def me(key: dict = Depends(require_key)):
-        return {
+        payload = {
+            "kind": "internal" if key["key_prefix"] == "internal" else "freesolo_api_key",
             "key_prefix": key["key_prefix"],
-            "email": key["email"],
-            "created_at": key["created_at"],
         }
+        for field in ("email", "user_id", "org_id", "api_key_id", "training_agent_job_id", "project_id"):
+            if key.get(field):
+                payload[field] = key[field]
+        return payload
 
     @app.get("/v1/models")
     def models(_: dict = Depends(require_key)):
@@ -279,9 +282,8 @@ def create_app():
 
     @app.post("/v1/envs")
     def publish_env(payload: dict, key: dict = Depends(require_key)):
-        # Publish a client-built verifiers env package to the MANAGED Prime account (this control
-        # plane's PRIME_API_KEY), namespaced per identity and PRIVATE — so users never need their
-        # own Prime account. The client just packages local source and uploads it here.
+        # Publish a client-built verifiers env package to the managed environment account,
+        # namespaced per identity and private. The client just packages local source and uploads it.
         from flash.server import envs
 
         # Default to "" only when the key is missing/None — pass a present-but-falsy
@@ -309,8 +311,8 @@ def create_app():
             raise HTTPException(
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
-                "publish the environment to the Prime Hub (`flash env push`), then reference it "
-                'by its Hub id (`[environment] id = "owner/name"`)',
+                "publish the environment with `flash env push`, then reference it "
+                'by id (`[environment] id = "owner/name"`)',
             )
         try:
             return spec_from_dict(spec_raw, run_id=run_id)

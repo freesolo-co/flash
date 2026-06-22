@@ -102,8 +102,8 @@ PHASE = os.environ.get(
 def _load_active_env():
     """Load the run's verifiers environment from the JobSpec; require an explicit env.
 
-    There is no default/builtin environment (verifiers-only): a run MUST name a verifiers/
-    Prime Hub env id. Failing here (instead of falling back to some default) prevents a paid
+    There is no default/builtin environment (verifiers-only): a run MUST name a published
+    verifiers environment id. Failing here (instead of falling back to some default) prevents a paid
     worker from training/evaluating the wrong task.
     """
     if JOB_SPEC is None:
@@ -117,8 +117,8 @@ def _load_active_env():
         # missing env is always a misconfigured spec. Fail loudly rather than fall back to a
         # default and burn a paid worker on the wrong task.
         raise RuntimeError(
-            "JobSpec sets no environment: provide [environment] id (a verifiers/Prime Hub "
-            "slug, e.g. 'owner/name')."
+            "JobSpec sets no environment: provide [environment] id "
+            "(a published verifiers environment id, e.g. 'owner/name')."
         )
     return load_environment(env_id, JOB_SPEC.environment.params)
 
@@ -140,7 +140,7 @@ def require_active_env():
         raise RuntimeError(
             "no environment is loaded: this worker was started without a JobSpec "
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
-            "carry a JobSpec naming [environment] id (a verifiers/Prime Hub slug, e.g. "
+            "carry a JobSpec naming [environment] id (a published verifiers environment id, e.g. "
             "'owner/name')."
         )
     return ACTIVE_ENV
@@ -1968,5 +1968,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

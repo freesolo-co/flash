@@ -1,9 +1,9 @@
 """Managed environment publishing.
 
 `POST /v1/envs` accepts a packaged verifiers env — built client-side, so the user needs NO
-Prime Intellect account — and publishes it to FreeSolo's Prime Hub account using the control
-plane's ``PRIME_API_KEY``. Every env is therefore managed under one account: namespaced per
-freesolo identity (so users can't collide) and published PRIVATE.
+separate environment account — and publishes it to FreeSolo's managed environment account.
+Every env is therefore managed under one account: namespaced per freesolo identity (so users
+can't collide) and published PRIVATE.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ _PUSH_MAX_ATTEMPTS = 8
 # joining with ``--`` makes namespaces NON-prefix-colliding: ``dev--x`` can't be mistaken for a
 # member of ``dev-clado-ai``'s namespace. With a single ``-`` join, a short namespace (``dev``) is a
 # raw-string prefix of a longer one (``dev-clado-ai``), which let one identity's re-publish hijack
-# another's Hub env (Cursor "idempotent hub name prefix hijack"). The double dash is the boundary.
+# another's env (Cursor "idempotent env name prefix hijack"). The double dash is the boundary.
 _NS_SEP = "--"
 
 
@@ -40,17 +40,19 @@ _MAX_UPLOAD_BYTES = 64 * 1024 * 1024  # 64 MB compressed
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024  # 256 MB extracted
 _MAX_MEMBERS = 5000
 
-# Per-attempt wall clock for a single `prime env push` subprocess: it shells out to a build frontend
-# + several Hub HTTP round-trips, so a network stall / hub outage / CLI deadlock would otherwise
-# block the request handler thread forever. Each retry gets its OWN timeout and the attempt count is
-# bounded (_PUSH_MAX_ATTEMPTS), so total wall time is bounded too. A timeout surfaces as a 504.
+# Per-attempt wall clock for a single environment-publish subprocess: it shells out to a build
+# frontend + several network round-trips, so a network stall / publisher outage / CLI deadlock would
+# otherwise block the request handler thread forever. Each retry gets its OWN timeout and the attempt
+# count is bounded (_PUSH_MAX_ATTEMPTS), so total wall time is bounded too. A timeout surfaces as a
+# 504.
 _PUSH_TIMEOUT_S = 180
 
-# Allowlisted PEP 517 build backends. `prime env push` BUILDS A WHEEL LOCALLY on this control plane
+# Allowlisted PEP 517 build backends. The publisher BUILDS A WHEEL LOCALLY on this control plane
 # (`uv build --wheel` / `python -m build --wheel`, cwd = the extracted upload), which imports and runs
 # the project's declared ``build-system.build-backend``. An untrusted ``pyproject.toml`` could name an
 # arbitrary backend — or ship one in-tree via ``backend-path`` — giving ARBITRARY CODE EXECUTION on
-# the control plane (with access to PRIME_API_KEY/filesystem) the moment the frontend imports it. So
+# the control plane (with access to publisher credentials/filesystem) the moment the frontend imports
+# it. So
 # we reject any package whose build backend isn't one of the standard, well-known backends, and reject
 # ``backend-path`` outright (it loads code FROM the untrusted upload). This is the standard set; flash's
 # own client emits ``hatchling.build`` (see cli/main/envpush.py:_ENV_PUSH_PYPROJECT).
@@ -73,10 +75,9 @@ def _human_mb(n: int) -> str:
 
 class EnvPublishError(Exception):
     """A managed env publish failed. ``status`` is the HTTP status the route should return:
-    400 for a bad client package, 413 when the upload exceeds a size cap, 502 when `prime env push`
+    400 for a bad client package, 413 when the upload exceeds a size cap, 502 when the publisher
     fails for a reason retrying can't fix, 503 when the control plane itself isn't configured to
-    publish (no PRIME_API_KEY / `prime` CLI), 504 when `prime env push` times out (hung CLI / hub
-    outage)."""
+    publish, 504 when the publisher times out."""
 
     def __init__(self, message: str, *, status: int = 400):
         super().__init__(message)
@@ -84,15 +85,14 @@ class EnvPublishError(Exception):
 
 
 def namespace_for(key: dict) -> str:
-    """Stable, Hub-safe prefix isolating one identity's envs under the shared FreeSolo Prime account.
+    """Stable prefix isolating one identity's envs under the shared FreeSolo managed account.
 
-    It MUST be per-key distinct: the server DB stores the SAME placeholder email for every external
-    key ("freesolo-user") and the internal key ("freesolo-internal") — see ``db.ensure_external_key``
-    / ``ensure_internal_key`` — so namespacing on ``email`` would collapse every external user into
-    one namespace and let them collide on env names. So we only trust ``email`` when it's a real,
+    It MUST be per-key distinct. Older rows may still carry placeholder emails such as
+    "freesolo-user"/"freesolo-internal", and newer external rows may have ``email = NULL`` until the
+    Freesolo verify endpoint returns a real address. So we only trust ``email`` when it's a real,
     user-specific address (contains ``@``); otherwise we fall back to the per-key primary-key ``id``
     (each external token gets its own ``api_keys`` row), then a non-placeholder ``key_prefix``. The
-    chosen identifier is stable across re-publishes, so a user's re-push bumps the SAME Hub env."""
+    chosen identifier is stable across re-publishes, so a user's re-push bumps the SAME env."""
     email = str(key.get("email") or "")
     if "@" in email:
         raw = email
@@ -105,7 +105,7 @@ def namespace_for(key: dict) -> str:
 
 
 def _sanitize_name(name: str) -> str:
-    # Hub env names are lowercase, like the identity namespace they're joined to.
+    # Published env names are lowercase, like the identity namespace they're joined to.
     slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")
     return slug or "env"
 
@@ -173,9 +173,9 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
 
 
 def _slug_from(env_dir: Path, output: str, *, pushed_name: str | None = None) -> str | None:
-    """The published ``owner/name`` slug, from prime's metadata file or its stdout.
+    """The published ``owner/name`` slug, from publisher metadata or stdout.
 
-    ``pushed_name`` is the ``--name`` we pushed under: if prime records the env ``owner`` but not a
+    ``pushed_name`` is the ``--name`` we pushed under: if the publisher records the env ``owner`` but not a
     usable ``name`` (or only the stdout names the owner), we can still reconstruct the slug from the
     name we know we published, so a successful push isn't reported as a failure for lack of a slug.
     """
@@ -188,7 +188,7 @@ def _slug_from(env_dir: Path, output: str, *, pushed_name: str | None = None) ->
                 return f"{owner}/{name}"
         except Exception:
             pass
-    # prime's success line, across phrasings ("Successfully pushed", "Pushed", "Published ...").
+    # Publisher success line, across phrasings ("Successfully pushed", "Pushed", "Published ...").
     match = re.search(
         r"(?:[Ss]uccessfully\s+)?(?:[Pp]ushed|[Pp]ublished)\s+([A-Za-z0-9][\w.-]*)/([\w.-]+)",
         output,
@@ -205,7 +205,7 @@ def _slug_from(env_dir: Path, output: str, *, pushed_name: str | None = None) ->
 
 
 def _is_permanent_push_failure(output: str) -> bool:
-    """Does this `prime env push` failure clearly NOT come from a version/content-hash conflict —
+    """Does this publish failure clearly NOT come from a version/content-hash conflict —
     i.e. one ``--auto-bump`` cannot fix (auth, permissions, not-found, build/test errors)?
 
     We match PERMANENT classes here, not conflict markers, on purpose: an INCOMPLETE list just
@@ -220,8 +220,7 @@ def _is_permanent_push_failure(output: str) -> bool:
     or "version 1.404.0 already exists"), and a bare ``"404" in output`` (or even a ``\b``-bounded one)
     would spuriously flag the digits inside such a hash/version as a permanent failure and fail-fast a
     resolvable conflict. The textual markers (unauthorized/forbidden/not found/…) already cover the
-    real auth/not-found cases on their own; the HTTP-status match is just a belt-and-suspenders for
-    prime phrasings like "HTTP 404: …"."""
+    real auth/not-found cases on their own; the HTTP-status match is just a belt-and-suspenders."""
     o = output.lower()
     text_markers = (
         "unauthorized", "authentication", "invalid api key", "permission", "forbidden",
@@ -238,8 +237,8 @@ def _is_permanent_push_failure(output: str) -> bool:
 def _assert_safe_build_backend(env_dir: Path) -> None:
     """Reject an uploaded project whose ``pyproject.toml`` would run UNTRUSTED code at build time.
 
-    `prime env push` builds a wheel locally on this control plane (``uv build --wheel`` /
-    ``python -m build --wheel`` with cwd = the extracted upload — see prime_cli's env push), and a
+    The publisher builds a wheel locally on this control plane (``uv build --wheel`` /
+    ``python -m build --wheel`` with cwd = the extracted upload), and a
     PEP 517 build IMPORTS AND EXECUTES the project's declared ``build-system.build-backend``. With an
     untrusted ``pyproject.toml`` that's an arbitrary-code-execution surface on the control plane:
 
@@ -295,11 +294,11 @@ def _assert_safe_build_backend(env_dir: Path) -> None:
 
 
 def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
-    """`prime env push` the package under the control plane's Prime account (PRIVATE), climbing
+    """Publish the package under the control plane's managed account (PRIVATE), climbing
     past version conflicts. Returns the published slug. Raises EnvPublishError on failure.
 
-    prime rejects a push whose (version, source-content-hash) already exists on the Hub. Rather
-    than parse prime's rejection message — it varies by version and phrasing (``Upload failed``,
+    The publisher rejects a push whose (version, source-content-hash) already exists. Rather
+    than parse its rejection message — it varies by version and phrasing (``Upload failed``,
     ``HTTP 400: Wheel version with content hash …``, ``version already exists`` …), so any literal
     marker list silently rots — we drive the retry off prime's **exit code** and let ``--auto-bump``
     resolve the version: it rewrites ``pyproject``'s version to the next patch *in place*, so each
@@ -311,16 +310,18 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
     fail-fasting a real conflict. The non-retriable basics (no key / no CLI) are pre-checked below."""
     if not os.environ.get("PRIME_API_KEY"):
         raise EnvPublishError(
-            "this control plane has no PRIME_API_KEY configured, so it cannot publish to the "
-            "managed Environments Hub",
+            "this control plane is missing managed environment publish credentials",
             status=503,
         )
     if not shutil.which("prime"):
-        raise EnvPublishError("the `prime` CLI is not installed on this control plane", status=503)
+        raise EnvPublishError(
+            "the managed environment publisher (`prime` CLI) is not installed",
+            status=503,
+        )
     # The env dir is unpacked from a CLIENT-uploaded tarball, so a preexisting ``.prime/`` (and its
     # ``.env-metadata.json``) is UNTRUSTED — a client could ship one naming another owner/name to
     # spoof the published slug. Remove it so the ONLY metadata we read back is what THIS push writes
-    # under the control plane's own Prime account, with the server-derived ``--name`` below. The
+    # under the control plane's own managed account, with the server-derived ``--name`` below. The
     # published owner is the authenticated managed account; the name is server-controlled (caller
     # namespace + sanitized name) — never client metadata.
     shutil.rmtree(env_dir / ".prime", ignore_errors=True)
@@ -341,7 +342,7 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
     for attempt in range(_PUSH_MAX_ATTEMPTS):
         # is_new starts at the declared version; otherwise (and on every retry) --auto-bump climbs.
         cmd = list(base) if (is_new and attempt == 0) else [*base, "--auto-bump"]
-        # Bound each attempt: a hung `prime env push` (network stall / hub outage / CLI deadlock)
+        # Bound each attempt: a hung publish (network stall / publisher outage / CLI deadlock)
         # would otherwise block the request handler thread forever. Each retry gets its own timeout
         # and the attempt count is bounded, so total wall time stays bounded. A timeout is a 504 (we
         # don't retry it — the attempt's --auto-bump may already have rewritten pyproject's version,
@@ -352,21 +353,21 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
             )
         except subprocess.TimeoutExpired as exc:
             raise EnvPublishError(
-                f"`prime env push` timed out after {_PUSH_TIMEOUT_S}s (the Hub may be unreachable "
-                f"or the CLI hung); aborting to keep the control plane responsive",
+                f"environment publish timed out after {_PUSH_TIMEOUT_S}s; aborting to keep the "
+                f"control plane responsive",
                 status=504,
             ) from exc
         last = f"{proc.stdout or ''}{proc.stderr or ''}"
         if proc.returncode == 0:
             slug = _slug_from(env_dir, last, pushed_name=name)
             if not slug:
-                # A clean exit but no discoverable owner/name: the env is on the Hub but we can't
+                # A clean exit but no discoverable owner/name: the env is published but we can't
                 # name it. This is degenerate (prime writes .prime/.env-metadata.json on a real
                 # success), so surface it as a server-side problem (502) — not a 400 that blames the
                 # user's package for what was actually a successful publish.
                 raise EnvPublishError(
                     "env published, but the control plane could not determine its owner/name id "
-                    f"from prime's output: {last.strip()[:300]}",
+                    f"from publisher output: {last.strip()[:300]}",
                     status=502,
                 )
             return slug
@@ -376,25 +377,25 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
         # burning every attempt (and pointlessly rewriting pyproject's version each time).
         if _is_permanent_push_failure(last):
             raise EnvPublishError(
-                "`prime env push` failed and retrying will not help (not a version conflict): "
+                "environment publish failed and retrying will not help (not a version conflict): "
                 f"{last.strip()[:500]}",
                 status=502,
             )
-    # Retry exhaustion is a server/Hub-side publish failure, not a bad client package — surface it
+    # Retry exhaustion is a server-side publish failure, not a bad client package — surface it
     # as 502, not the default 400 that would blame the user's upload.
     raise EnvPublishError(
-        f"`prime env push` failed after {_PUSH_MAX_ATTEMPTS} attempts "
+        f"environment publish failed after {_PUSH_MAX_ATTEMPTS} attempts "
         f"(version conflict unresolved by --auto-bump): {last.strip()[:500]}",
         status=502,
     )
 
 
 def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> str:
-    """Decode + extract a client-built env package and publish it to the managed Prime account.
+    """Decode + extract a client-built env package and publish it to the managed account.
 
-    Returns the published ``owner/name`` slug. The Hub env name is ``<identity>--<name>`` so each
+    Returns the published ``owner/name`` slug. The published env name is ``<identity>--<name>`` so each
     freesolo identity's envs are isolated under the one shared account, published PRIVATE. Both the
-    owner (the managed Prime account) and the namespace are SERVER-controlled — never taken from the
+    owner (the managed account) and the namespace are SERVER-controlled — never taken from the
     uploaded package — so one identity cannot publish into another's slug.
     """
     # The payload is arbitrary client JSON, so these can arrive as non-strings (e.g. {"name": 1});
@@ -428,8 +429,8 @@ def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> 
         )
     ns = namespace_for(key)
     clean = _sanitize_name(name)
-    # Server-controlled namespacing isolates each identity's envs under the one managed Prime
-    # account. We join with ``_NS_SEP`` ("--"), which a namespace slug can never contain, so the
+    # Server-controlled namespacing isolates each identity's envs under the one managed account. We
+    # join with ``_NS_SEP`` ("--"), which a namespace slug can never contain, so the
     # prefix test below is a true namespace-BOUNDARY check — a short namespace ("dev") can't match a
     # name that belongs to a longer one ("dev-clado-ai-...") and hijack another identity's env.
     # Idempotent on re-publish: a re-push passes the name part of the already-namespaced slug
@@ -442,7 +443,7 @@ def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> 
         _safe_extract(tar_bytes, dest)
         if not (dest / "pyproject.toml").is_file():
             raise EnvPublishError("env package is missing a pyproject.toml")
-        # `prime env push` builds a wheel on THIS host, importing the project's build backend, so an
+        # The publisher builds a wheel on THIS host, importing the project's build backend, so an
         # untrusted pyproject.toml is an RCE surface. Reject non-standard/in-tree build backends
         # before we ever hand the dir to the build frontend.
         _assert_safe_build_backend(dest)
