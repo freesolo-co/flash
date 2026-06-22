@@ -90,7 +90,7 @@ def _strict_int(value: Any, *, name: str, minimum: int | None = None) -> int:
     JSON/env/TOML source would quietly provision a different topology than intended. We require an
     exact integer: a bool is rejected (a JSON/TOML boolean is not a count), and a float is accepted
     only if it is whole (``2.0`` -> 2) — a fractional value (``2.9``) fails loudly. ``minimum``, if
-    given, floors the value (e.g. 0 for a non-negative knob). Shared with the rollout-pool config
+    given, enforces a lower bound (raises if below it). Shared with the rollout-pool config
     (flash.pool.config._strict_int) so the strict-int contract lives in exactly one place.
     """
     if isinstance(value, bool):

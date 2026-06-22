@@ -15,24 +15,32 @@ from dataclasses import dataclass, field
 from flash.spec import _strict_int as _spec_strict_int
 
 
-def _int(name: str, default: int) -> int:
+def _int(name: str, default: int, minimum: int | None = None) -> int:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
     try:
-        return int(raw.strip())
+        val = int(raw.strip())
     except ValueError:
         return default
+    # An out-of-range env value (e.g. a negative retry/replica count that would make the retry loop
+    # skip every attempt) is treated like an unparseable one: fall back to the safe default.
+    if minimum is not None and val < minimum:
+        return default
+    return val
 
 
-def _float(name: str, default: float) -> float:
+def _float(name: str, default: float, minimum: float | None = None) -> float:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
     try:
-        return float(raw.strip())
+        val = float(raw.strip())
     except ValueError:
         return default
+    if minimum is not None and val < minimum:
+        return default
+    return val
 
 
 @dataclass
@@ -47,9 +55,9 @@ class RouterConfig:
     @classmethod
     def from_env(cls) -> RouterConfig:
         return cls(
-            max_retries=_int("FLASH_POOL_MAX_RETRIES", 2),
-            default_replicas=_int("FLASH_POOL_DEFAULT_REPLICAS", 1),
-            health_interval=_float("FLASH_POOL_HEALTH_INTERVAL", 15.0),
+            max_retries=_int("FLASH_POOL_MAX_RETRIES", 2, minimum=0),
+            default_replicas=_int("FLASH_POOL_DEFAULT_REPLICAS", 1, minimum=1),
+            health_interval=_float("FLASH_POOL_HEALTH_INTERVAL", 15.0, minimum=0.0),
         )
 
 

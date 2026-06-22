@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.pool.config import PoolMember, PoolPlan
+from flash.pool.config import PoolMember, PoolPlan, RouterConfig
 from flash.pool.provision import (
     build_vllm_serve_command,
     plan_summary,
@@ -164,3 +164,23 @@ def test_reward_worker_app_scores():
         assert httpx.get(srv.url + "/health", timeout=10).json()["reward_id"] == "lens"
     finally:
         srv.stop()
+
+
+def test_router_config_from_env_rejects_negative_values(monkeypatch):
+    # A negative max_retries would make range(max_retries + 1) skip every attempt; an out-of-range
+    # env value falls back to the safe default instead of breaking the retry loop.
+    monkeypatch.setenv("FLASH_POOL_MAX_RETRIES", "-1")
+    monkeypatch.setenv("FLASH_POOL_DEFAULT_REPLICAS", "0")
+    monkeypatch.setenv("FLASH_POOL_HEALTH_INTERVAL", "-5")
+    cfg = RouterConfig.from_env()
+    assert cfg.max_retries == 2  # default (>= 0)
+    assert cfg.default_replicas == 1  # default (>= 1)
+    assert cfg.health_interval == 15.0  # default (>= 0)
+
+
+def test_router_config_from_env_accepts_valid_values(monkeypatch):
+    monkeypatch.setenv("FLASH_POOL_MAX_RETRIES", "5")
+    monkeypatch.setenv("FLASH_POOL_DEFAULT_REPLICAS", "3")
+    monkeypatch.setenv("FLASH_POOL_HEALTH_INTERVAL", "30")
+    cfg = RouterConfig.from_env()
+    assert (cfg.max_retries, cfg.default_replicas, cfg.health_interval) == (5, 3, 30.0)

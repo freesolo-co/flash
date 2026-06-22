@@ -54,7 +54,7 @@ def build_vllm_serve_command(
         "--max-lora-rank",
         str(max_lora_rank),
         "--max-cpu-loras",
-        str(max_cpu_loras if max_cpu_loras is not None else max(max_loras * 2, max_loras)),
+        str(max_cpu_loras if max_cpu_loras is not None else max_loras * 2),
         "--gpu-memory-utilization",
         str(gpu_memory_utilization),
         "--tensor-parallel-size",
