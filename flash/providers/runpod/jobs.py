@@ -58,7 +58,10 @@ __all__ = [
 ]
 
 TERMINAL_OK = {"COMPLETED"}
-TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
+# The provider killed the worker (reclaim/preempt/time-cap) -> infra-shaped, retried. A worker
+# "FAILED" is the run dying on its own (real traceback) -> fails fast.
+PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
+TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
 
 # Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
 # training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
@@ -342,9 +345,12 @@ def poll_job(
                 detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])[-2000:]
             elif not detail:
                 detail = str(out)[:1500]
-            # Prefix the terminal status so the runner's infra-retry markers
-            # (e.g. TIMED_OUT) match even when RunPod sets no error/output text.
-            return PollResult(False, failure="job_failed", detail=f"[{status}] {detail}")
+            # Structural classification only ([{status}] prefix is for human-readable logs).
+            if status in PLATFORM_TERMINATIONS or worker_flagged_retriable(heartbeat_reader):
+                failure = "job_preempted"
+            else:
+                failure = "job_failed"
+            return PollResult(False, failure=failure, detail=f"[{status}] {detail}")
         # While queued, surface worker availability (throttled hosts are the common
         # cause of silent multi-minute waits — make them visible in the run log).
         if status == "IN_QUEUE" and time.time() - last_health_probe > 90:
@@ -532,8 +538,8 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
     """
     text_reader = make_hf_text_reader(hf_repo, f"{prefix}/heartbeat.json", min_interval_s)
 
-    def read() -> dict | None:
-        raw = text_reader()
+    def read(force: bool = False) -> dict | None:
+        raw = text_reader(force=force)
         if raw is None:
             return None
         try:
@@ -542,3 +548,12 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
             return None
 
     return read
+
+
+def worker_flagged_retriable(heartbeat_reader) -> bool:
+    """True if the worker stamped ``retriable`` into heartbeat.json (a RetriableInfraError) — the
+    structured worker<->poller contract that replaces failure-detail parsing. Forces a fresh read."""
+    if heartbeat_reader is None:
+        return False
+    hb = heartbeat_reader(force=True)
+    return bool(isinstance(hb, dict) and hb.get("retriable"))

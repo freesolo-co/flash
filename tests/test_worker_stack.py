@@ -401,9 +401,12 @@ def test_assert_usable_gpu_full_card_ok(monkeypatch):
     from flash.engine.worker import perf
 
     monkeypatch.setitem(sys.modules, "torch", _fake_torch_named("NVIDIA RTX A5000"))
-    monkeypatch.delitem(sys.modules, "pynvml", raising=False)
-    # No pynvml installed in the offline test env -> the import inside fails (ImportError),
-    # which the guard treats as "can't probe", not a failure. Name has no "MIG" -> usable.
+    # Force the pynvml import to raise ImportError DETERMINISTICALLY: setting sys.modules[name]=None
+    # makes `import name` raise regardless of whether a real pynvml is installed in the test env
+    # (a plain delitem would let Python re-import an installed pynvml and run a real NVML probe,
+    # flaking on hosts that have it). The guard treats the ImportError as "can't probe", not a
+    # failure; name has no "MIG" -> usable.
+    monkeypatch.setitem(sys.modules, "pynvml", None)
     perf.assert_usable_gpu()  # must NOT raise
 
 
@@ -427,7 +430,46 @@ def test_assert_usable_gpu_no_cuda_raises_retriable(monkeypatch):
     from flash.engine.worker import perf
 
     monkeypatch.setitem(sys.modules, "torch", _fake_torch_named("", available=False))
+    # Shrink the startup-grace poll so the test doesn't actually sleep through the retries.
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_RETRIES", 1)
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_DELAY_S", 0)
     with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER):
+        perf.assert_usable_gpu()
+
+
+def test_assert_usable_gpu_cuda_ready_after_grace(monkeypatch):
+    """CUDA reporting "not available" at the first poll but ready a moment later must NOT raise:
+    the startup grace exists so we don't preempt the handler's wait_for_gpu and spuriously resubmit
+    a host whose CUDA comes up a few seconds late."""
+    from flash.engine.worker import perf
+
+    calls = {"n": 0}
+
+    def _avail_on_second_try():
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    t = types.ModuleType("torch")
+    t.cuda = types.SimpleNamespace(
+        is_available=_avail_on_second_try,
+        get_device_name=lambda *a: "NVIDIA RTX A5000",
+    )
+    monkeypatch.setitem(sys.modules, "torch", t)
+    monkeypatch.setitem(sys.modules, "pynvml", None)  # deterministic ImportError -> skip NVML probe
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_RETRIES", 4)
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_DELAY_S", 0)
+    perf.assert_usable_gpu()  # must NOT raise; available on the 2nd poll
+    assert calls["n"] == 2
+
+
+def test_assert_usable_gpu_torch_import_failure_surfaces(monkeypatch):
+    """A torch import failure is an IMAGE problem, not transient infra: the guard must SURFACE it
+    (re-raise), not swallow-and-return, or the worker proceeds into training and dies with a far
+    less actionable error."""
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", None)  # deterministic ImportError on `import torch`
+    with pytest.raises(ImportError):
         perf.assert_usable_gpu()
 
 
@@ -452,14 +494,33 @@ def test_assert_usable_gpu_nvml_probe_failure_raises_retriable(monkeypatch):
         perf.assert_usable_gpu()
 
 
-def test_retriable_infra_marker_is_an_infra_retry_marker():
-    """The worker's marker phrase MUST be in the runner's infra-retry set, or a MIG host would
-    be mis-classified as a non-retried job_failed (the live regression). Lock-step contract."""
-    from flash.engine.worker.perf import RETRIABLE_INFRA_MARKER
+def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):
+    # A GPU that never comes up is infra-shaped -> typed RetriableInfraError, not RuntimeError.
+    import time as _time
 
-    src = (
-        __import__("pathlib")
-        .Path(__import__("flash.runner.lifecycle", fromlist=["__file__"]).__file__)
-        .read_text()
-    )
-    assert RETRIABLE_INFRA_MARKER in src
+    from flash.engine.worker.perf import RetriableInfraError, wait_for_gpu
+
+    monkeypatch.setattr(_time, "sleep", lambda *_a: None)
+    try:
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    except ImportError:
+        pass
+    with pytest.raises(RetriableInfraError):
+        wait_for_gpu()
+
+
+def test_required_upload_exhaustion_raises_retriable_infra_error(monkeypatch):
+    # A required upload that fails after its retries is bad host/network -> RetriableInfraError.
+    from flash.engine import worker
+    from flash.engine.worker.perf import RetriableInfraError
+
+    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
+    monkeypatch.setattr(worker.time, "sleep", lambda *_a: None)
+
+    def boom():
+        raise OSError("connection reset by peer")
+
+    with pytest.raises(RetriableInfraError):
+        worker._hf_upload(boom, "DONE", required=True, label="DONE")

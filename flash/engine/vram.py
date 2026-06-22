@@ -127,8 +127,10 @@ _LOGITS_BUDGET_GB = 6.0
 # rl_per_device_comps) and the estimator reserves exactly that capped term -- so the allocator
 # provably covers the worker's real peak (the "the equation never under-provisions" invariant).
 _SFT_LOGITS_BYTES_PER_ELEM = 8.0
-# Mirror the worker's fused-CE gate (engine.worker.perf) WITHOUT its network AutoConfig probe, so the
-# estimator stays offline/deterministic. Keep in sync with perf._LIGER_MIN_PARAMS / _LONG_CONTEXT_TOKENS.
+# Canonical fused-CE (Liger) gate thresholds: the worker fuses the SFT cross-entropy for a >=3B
+# model OR a >=2048-token context. SINGLE SOURCE OF TRUTH -- engine.worker.perf imports these (its
+# _LIGER_MIN_PARAMS / _LONG_CONTEXT_TOKENS derive from them) and sft_logits_fused mirrors the gate
+# offline (no network AutoConfig probe) so the cost estimator stays deterministic.
 _LIGER_MIN_PARAMS_B = 3.0
 _LIGER_LONG_CTX_TOKENS = 2048
 
@@ -447,6 +449,24 @@ def fetch_hf_params_b(model_id: str) -> float | None:
         # to None so callers report "size unknown" rather than failing.
         pass
     return None
+
+
+def resolve_params_b(model_id: str) -> float | None:
+    """Model size in billions, resolved the ONE way the worker and the cost estimator agree on:
+    the curated catalog ``params_b`` (else its ``params`` display string), else the real HF
+    safetensors param count for an open-policy (uncataloged) model. Best-effort: returns None only
+    when the model is uncataloged AND HF metadata is unavailable, so callers degrade to the
+    size-unknown path (e.g. the fused-CE gate stays memory-safe, the colocate cap stays loose).
+    The single source of truth for "how big is this model" -- run_sft, run_rl and cost.spec all
+    call this so they can never drift."""
+    from flash.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    if info is not None:
+        pb = getattr(info, "params_b", 0.0) or params_b_from_str(getattr(info, "params", None))
+        if pb:
+            return pb
+    return fetch_hf_params_b(model_id)
 
 
 def check_fit(

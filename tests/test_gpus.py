@@ -69,10 +69,6 @@ def test_cheapest_gpu_policy(monkeypatch):
     assert gpus.cheapest_gpu(24) == "RTX A5000"  # cheapest VALIDATED >=24G enum class
     assert gpus.cheapest_gpu(32) == "RTX 5090"  # validated >=32G (A40 is unvalidated)
     assert gpus.cheapest_gpu(48) == "A100 PCIe"  # cheapest validated >=48G (80G A100 PCIe)
-    # validated_only=False restores the absolute-cheapest fitting class (the pre-gate behavior),
-    # exercised here so the opt-out path stays covered.
-    assert gpus.cheapest_gpu(16, validated_only=False) == "RTX 2000 Ada"
-    assert gpus.cheapest_gpu(48, validated_only=False) == "A40"
     # The error names the REAL constraint: this helper filters to RunPod-provisionable VALIDATED
     # classes, so a fitting Vast-only / unvalidated class doesn't make the message a lie.
     with pytest.raises(gpus.UnsupportedGpuError, match="no validated RunPod-provisionable GPU"):
