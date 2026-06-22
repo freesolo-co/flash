@@ -38,7 +38,6 @@ def test_expanded_gpu_table():
 
     # Cheap-capacity classes the cheapest policy exists for are all mapped.
     assert canonical_gpu("A100") == "A100 PCIe"
-    assert canonical_gpu("rtx a5000") == "RTX A5000"
     assert canonical_gpu("NVIDIA GeForce RTX 3090") == "RTX 3090"
     assert canonical_gpu("h100") == "H100"
     assert get_gpu_info("A40").vram_gb == 48
@@ -66,7 +65,8 @@ def test_cheapest_gpu_policy(monkeypatch):
     # wins on static rates. After the 2026-06-22 live-smoke expansion the pool includes RTX 2000 Ada
     # (16G) and RTX A6000 (48G); A40 (48G) stays unvalidated (no RunPod capacity to smoke it in-window).
     assert gpus.cheapest_gpu(16) == "RTX 2000 Ada"  # now validated, cheapest >=16G ($0.24)
-    assert gpus.cheapest_gpu(24) == "RTX A5000"  # cheapest VALIDATED >=24G (16G cards don't fit)
+    # cheapest VALIDATED >=24G (16G cards don't fit).
+    assert gpus.cheapest_gpu(24) == "RTX 3090"
     assert gpus.cheapest_gpu(32) == "RTX A6000"  # 48G A6000 now validated, $0.49 < 5090 $0.99
     assert gpus.cheapest_gpu(48) == "RTX A6000"  # cheapest validated >=48G ($0.49, was A100 PCIe)
     # The error names the REAL constraint: this helper filters to RunPod-provisionable VALIDATED
@@ -82,10 +82,10 @@ def test_provisional_gpu_cheapest_for_model(monkeypatch):
     from flash.providers.base import provisional_gpu
 
     # GPU pinning is gone: provisional_gpu returns the cheapest fitting VALIDATED class for the
-    # model. 0.8B GRPO -> cheapest validated >=24G (A5000). 9B is now bf16 (QLoRA dropped: the
+    # model. 0.8B GRPO -> cheapest validated >=24G (RTX 3090). 9B is now bf16 (QLoRA dropped: the
     # 4-bit vLLM-rollout merge broke GRPO learning), so colocated 9B GRPO needs an 80G-class card
-    # -> cheapest validated is the 80G A100 PCIe.
-    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX A5000"
+    # -> the cheapest validated 80G class (A100 PCIe).
+    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX 3090"
     assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A100 PCIe"
 
 

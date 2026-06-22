@@ -63,7 +63,7 @@ class GpuClass:
     # has not passed Flash's live validation smoke"), so client-side allocation restricts to the
     # validated pool by default (see ``validated_classes`` / allocator) — otherwise a default
     # `flash train` could pick the absolute-cheapest fitting class (e.g. "RTX 2000 Ada") that the
-    # server then refuses, and the run never submits. Exactly the 8 smoke-validated members below
+    # server then refuses, and the run never submits. Exactly the smoke-validated members below
     # are marked True.
     validated: bool = False
 
@@ -122,17 +122,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm89",
         0.26,
         vast_name="RTX 4000Ada",
-    ),
-    # Validated 2026-06-11: Qwen3-0.6B SFT + GRPO smokes passed — cheapest 24 GB class.
-    GpuClass(
-        "RTX A5000",
-        "NVIDIA_RTX_A5000",
-        24,
-        "a5000",
-        "sm86",
-        0.27,
-        vast_name="RTX A5000",
-        validated=True,
     ),
     # Vast-validated 2026-06-12: Qwen3-0.6B SFT train+eval smoke ($0.25/hr Czechia).
     GpuClass(
@@ -218,20 +207,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm120",
         2.09,
         min_cuda_modern="13.0",
-        validated=True,
-    ),
-    # RTX Pro 6000 Blackwell Workstation Edition: same 96 GB die as the Server Edition,
-    # a distinct RunPod GpuType, typically a touch cheaper. Also offered on Vast. The
-    # single biggest non-datacenter 96 GB option -> cheapest 80 GB-floor GRPO host.
-    GpuClass(
-        "RTX Pro 6000 WK",
-        "NVIDIA_RTX_PRO_6000_BLACKWELL_WORKSTATION_EDITION",
-        96,
-        "pro6000wk",
-        "sm120",
-        1.79,
-        min_cuda_modern="13.0",
-        vast_name="RTX PRO 6000",
         validated=True,
     ),
 )
@@ -448,9 +423,6 @@ class PollResult:
     # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
     failure: str | None = None
     detail: str | None = None
-    # job_preempted only: the GPU CLASS is at fault (a MIG slice), so the retry must re-allocate
-    # OFF it, not just onto a fresh host of the same class. Set from the worker's heartbeat.
-    exclude_class: bool = False
 
 
 # ---------------------------------------------------------------------------
