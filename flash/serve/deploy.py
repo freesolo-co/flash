@@ -22,6 +22,7 @@ unauthenticated.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import asdict, dataclass
 
 import httpx
@@ -36,6 +37,20 @@ DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.ru
 
 MODES = ("dev", "always-on")
 DEFAULT_IDLE_TIMEOUT_S = 300
+
+# A chat must complete (warm or cold start) within this many seconds of wall-clock time, or
+# we raise instead of hanging. Modal scale-from-zero cold starts are minutes, not 30 min, so
+# this is generous yet bounded — the old code used a 30-minute httpx timeout applied *per
+# redirect hop*, which (combined with Modal's long-polling async-result redirects) let a single
+# chat crawl for many minutes / appear to hang forever. Env-overridable for slow base models.
+CHAT_DEADLINE_S = 8 * 60.0
+# Per-HTTP-request socket timeout (one POST or one async-result poll). Bounded so a single
+# stalled hop can't wedge us; the overall budget is enforced by CHAT_DEADLINE_S across hops.
+CHAT_HTTP_TIMEOUT_S = 90.0
+# How long to wait between async-result polls (Modal returns the result via a redirect to a
+# ?__modal_function_call_id= poll URL; we poll it ourselves with a small backoff rather than
+# letting httpx chase the redirect chain, which has no global deadline).
+_CHAT_POLL_INTERVAL_S = 2.0
 
 
 class ServingError(RuntimeError):
@@ -240,6 +255,32 @@ def undeploy_adapter(run_id: str) -> list[str]:
     return [run_id]
 
 
+def _chat_deadline_s() -> float:
+    """Overall wall-clock budget for one chat (env-overridable, never unbounded)."""
+    raw = os.environ.get("FREESOLO_CHAT_TIMEOUT_S")
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return CHAT_DEADLINE_S
+
+
+def _is_modal_async_redirect(resp: httpx.Response) -> bool:
+    """True when Modal answered with a redirect to its async-result poll URL.
+
+    Modal serves a request that outruns its synchronous window by returning a 303/302/307 whose
+    ``Location`` is the same path with a ``?__modal_function_call_id=`` query — polling that URL
+    eventually yields the completion. (A redirect *without* that marker is something else and is
+    surfaced as an error rather than silently chased.)"""
+    if resp.status_code not in (302, 303, 307, 308):
+        return False
+    loc = resp.headers.get("location") or ""
+    return "__modal_function_call_id=" in loc
+
+
 def chat(
     run_id: str,
     messages: list[dict],
@@ -252,6 +293,18 @@ def chat(
     The adapter is addressed by ``model=run_id`` (its registered ``adapterId``); the
     response is the parsed OpenAI chat-completion dict, so
     ``resp["choices"][0]["message"]["content"]`` keeps working downstream.
+
+    Cold starts (scale-from-zero per base model) can take a couple of minutes. The warm path
+    returns ``200`` directly (exactly like a raw POST). On a cold start Modal answers with a
+    redirect to an async-result poll URL (``?__modal_function_call_id=...``); we poll that URL
+    ourselves with a small backoff against a hard wall-clock deadline and raise on timeout.
+
+    Earlier this delegated redirect-following to httpx (``follow_redirects=True``,
+    ``max_redirects=100``, ``timeout=30*60``). That hung: Modal's async-result URL *long-polls*
+    (each poll blocks a few seconds, then redirects again until the result is ready), httpx
+    applies its timeout *per hop* (no global budget), and chasing up to 100 such hops let a
+    single chat crawl for many minutes / appear to hang forever — while a plain POST returned in
+    seconds. Polling explicitly with one bounded deadline fixes that.
     """
     base = serving_base_url()
     body = {
@@ -265,12 +318,34 @@ def chat(
         # completions diverge from training behavior even though the caller passes thinking=.
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
     }
-    # Cold starts (scale-from-zero per base model) can take minutes. Modal serves a slow ASGI
-    # request by 303-redirecting to an async-result poll URL (?__modal_function_call_id=...), so
-    # the client must follow redirects to retrieve the eventual completion — without this httpx
-    # raises on the 303 and the chat fails mid cold-start. max_redirects is raised because a long
-    # cold start polls across several redirect cycles before the result is ready.
-    with httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client:
-        resp = client.post(f"{base}/v1/chat/completions", json=body)
-    resp.raise_for_status()
+    deadline = time.monotonic() + _chat_deadline_s()
+    url = f"{base}/v1/chat/completions"
+    # follow_redirects=False: we never let httpx chase Modal's async-result redirect chain (it has
+    # no global deadline and the poll URL long-polls). We handle the one redirect ourselves below.
+    with httpx.Client(follow_redirects=False, timeout=CHAT_HTTP_TIMEOUT_S) as client:
+        try:
+            resp = client.post(url, json=body, headers=_internal_key_header())
+            # Cold start: chase the async-result poll URL ourselves, bounded by `deadline`.
+            while _is_modal_async_redirect(resp):
+                if time.monotonic() >= deadline:
+                    raise ServingError(
+                        f"chat for {run_id} timed out after {_chat_deadline_s():.0f}s waiting on the "
+                        "serving backend (cold start did not finish); retry once the engine is warm"
+                    )
+                poll_url = str(resp.url.join(resp.headers["location"]))
+                time.sleep(_CHAT_POLL_INTERVAL_S)
+                # Modal's async-result poll is a GET; it returns 200 when ready, or redirects again.
+                resp = client.get(poll_url, headers=_internal_key_header())
+        except httpx.TimeoutException as exc:
+            raise ServingError(
+                f"chat for {run_id} timed out talking to the serving backend at {base}: {exc}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise ServingError(
+                f"could not reach the serving backend at {base}: {exc}"
+            ) from exc
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise _serving_status_error(url, exc) from exc
     return resp.json()
