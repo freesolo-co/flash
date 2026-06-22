@@ -16,6 +16,7 @@ from collections.abc import Callable
 
 from flash.catalog import public_model_rows
 from flash.client import client_from_config
+from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.schema import spec_from_dict
 
@@ -29,7 +30,10 @@ def create_train_run(args: dict) -> dict:
     if args.get("dry_run"):
         # Fully local: validate without credentials, a server, or a GPU.
         return {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}
-    return client_from_config().create_run(spec_payload(spec))
+    return client_from_config().create_run(
+        spec_payload(spec),
+        runtime_secrets=runtime_secrets_from_local_env(),
+    )
 
 
 def get_run_status(args: dict) -> dict:
