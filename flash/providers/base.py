@@ -178,7 +178,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
     # L40S exists at RunPod but not in the Flash SDK's GpuType enum -> Vast-only.
     GpuClass("L40S", None, 48, "l40s", "sm89", 0.87, vast_name="L40S"),
-    # ---- big-VRAM tier (large-MoE QLoRA, future >9B bf16) ----
+    # ---- big-VRAM tier (9B bf16 GRPO, future >9B bf16) ----
     # 40 GB SXM4 boards share Vast's "A100 SXM4" name with the 80 GB variant; offers
     # are split by gpu_ram (vast_gpu_for_offer). Not a RunPod Flash class -> Vast-only.
     GpuClass("A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 0.89, vast_name="A100 SXM4"),
