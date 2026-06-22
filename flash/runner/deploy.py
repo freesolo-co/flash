@@ -185,7 +185,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             # restart mid-allocation resumes the right one.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
-            _update(run_id, "running", remote=None, resume_seed_index=seed_index)
+            # Bail if the run was raced to terminal during the long poll above: _update's CAS
+            # returns False, and resuming would submit paid work for a dead run.
+            if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
+                print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
+                return get_status(run_id)
             _run_seed_loop(spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0))
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the
@@ -217,14 +221,27 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # next seed index so a restart in that gap resumes the remaining seeds rather
         # than failing the run. (The last seed keeps its handle for post-run
         # observability, mirroring the fresh-submit seed loop.)
-        _update(
+        applied = _update(
             run_id,
             "running",
             cost_usd=total,
             artifacts_dir=artifacts_dir(spec),
             **({"remote": None, "resume_seed_index": resumed_index} if more_seeds else {}),
         )
+        # Same TOCTOU guard as the not-ok recovery path: a concurrent thread can flip this
+        # run terminal (e.g. failed/done from another recovery) between the cancel re-check
+        # above and here. The sticky CAS rejects the `running` write (applied is False) — so
+        # don't resume the remaining seeds and submit paid GPU work for an already-terminal
+        # run. (The non-multi-seed arm writes the terminal `done`; the CAS protects a racing
+        # terminal there too, so no extra guard is needed.)
         if more_seeds:
+            if not applied:
+                print(
+                    f"attach: {run_id} went terminal during recovery; "
+                    "not resuming the remaining seeds",
+                    file=log,
+                )
+                return get_status(run_id)
             _run_seed_loop(spec, log, start_index=resumed_index, prior_cost=total)
         else:
             _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
