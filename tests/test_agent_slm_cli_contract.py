@@ -73,14 +73,14 @@ def test_agent_required_subcommands_exist(subcommand: str) -> None:
 
 
 def test_env_install_subcommand_exists() -> None:
-    """The migration seam: the agent installs published Hub envs via `flash env install`."""
+    """The migration path: the agent records published GitHub env refs via `flash env install`."""
     with pytest.raises(SystemExit) as excinfo:
         main(["env", "install", "--help"])
     assert excinfo.value.code == 0, "`flash env install` is missing from the CLI"
 
 
 def test_env_push_subcommand_exists() -> None:
-    """The agent publishes a locally-authored verifiers env via `flash env push`."""
+    """The agent publishes a locally-authored Freesolo env via `flash env push`."""
     with pytest.raises(SystemExit) as excinfo:
         main(["env", "push", "--help"])
     assert excinfo.value.code == 0, "`flash env push` is missing from the CLI"
@@ -103,9 +103,9 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
     config = tmp_path / "flash_grpo.toml"
     config.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
-        'algorithm = "grpo"\n'
-        "[environment]\n"
-        'id = "owner/name"\n'
+            'algorithm = "grpo"\n'
+            "[environment]\n"
+            'id = "github:owner/repo@main:env/freesolo/environment.py"\n'
         "[train]\n"
         'hf_repo = "owner/runs"\n'
         "steps = 10\n"

@@ -15,7 +15,7 @@ from flash.providers.base import (
 from flash.schema.fields import (
     ConfigError,
     _coerce_scalar,
-    _require_slug,
+    _require_environment_ref,
     _train_float,
     _train_int,
     _train_stops,
@@ -147,13 +147,14 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         env_raw = {}
     if not isinstance(env_raw, dict):
         raise ConfigError("[environment] must be a table")
-    # Local environment paths are gone: a run names a published Hub env by [environment] id.
+    # Local environment paths are gone: a run names a GitHub-backed Freesolo env by
+    # [environment] id.
     # A stray `path` (alone or alongside `id`) is a stale config — reject it loudly instead of
     # silently ignoring the key and training against the wrong/missing env.
     if env_raw.get("path"):
         raise ConfigError(
             "local environment paths are no longer supported — remove `path` and reference a "
-            'published Hub `id` ("owner/name")'
+            "GitHub Freesolo environment `id`"
         )
     # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
     # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
@@ -314,19 +315,18 @@ def _validate_spec(spec: JobSpec) -> None:
         raise ConfigError("train.steps must be positive for GRPO")
     if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
         raise ConfigError("train.epochs must be positive for SFT")
-    # Verifiers-only: every run must name an environment by its verifiers/Prime Hub slug
-    # via [environment] id. There is no default environment and no local path mode.
+    # Every run must name a Freesolo environment by GitHub ref via [environment] id.
+    # There is no default environment and no local path mode.
     if not spec.environment.id:
         raise ConfigError(
-            "config must set [environment] id (a verifiers/Prime Hub env slug, e.g. "
-            '"owner/name"); there is no local path mode'
+            "config must set [environment] id (a GitHub Freesolo environment ref, "
+            'e.g. "github:freesolo-co/training@main:path/to/freesolo/environment.py"); '
+            "there is no local path mode"
         )
-    # The id must be a full Prime Hub slug "owner/name": exactly one slash, both parts
-    # non-empty. A bare id like "gsm8k" passes the presence check but then the worker runs
-    # `prime env install gsm8k` (invalid — Prime needs owner/name) and fails after provisioning.
-    _require_slug(
+    _require_environment_ref(
         spec.environment.id,
-        '[environment] id must be a published Prime Hub slug "owner/name"',
+        "[environment] id must be a GitHub Freesolo environment ref "
+        '(for example "github:owner/repo@main:path/to/freesolo/environment.py")',
     )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")

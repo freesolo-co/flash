@@ -37,7 +37,7 @@ def test_grpo_capability_still_enforced():
                 {
                     "model": "test/sft-only",
                     "algorithm": "grpo",
-                    "environment": {"id": "owner/env"},
+                    "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
                     "train": {"steps": 1, "hf_repo": "owner/runs"},
                 },
                 run_id="x",
@@ -47,7 +47,7 @@ def test_grpo_capability_still_enforced():
             {
                 "model": "test/sft-only",
                 "algorithm": "sft",
-                "environment": {"id": "owner/env"},
+                "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
                 "train": {"epochs": 1, "hf_repo": "owner/runs"},
             },
             run_id="x",
@@ -63,7 +63,7 @@ def test_qwen35_9b_now_supports_grpo():
         {
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
-            "environment": {"id": "owner/env"},
+            "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
             "train": {"steps": 1, "hf_repo": "owner/runs"},
             "gpu": {"type": "A100 PCIe"},
         },

@@ -22,15 +22,12 @@ __all__ = [
 
 
 def _missing_hf_credentials() -> list[str]:
-    """Shared run infra every substrate needs: the HF write token, plus PRIME_API_KEY (the
-    worker ``prime env install``s the run's Hub env regardless of the GPU provider). The HF
-    dataset repo is per-run (``[train] hf_repo``), not an operator var."""
+    """Shared run infra every substrate needs."""
     problems: list[str] = []
-    if not os.environ.get("PRIME_API_KEY"):
+    if not (os.environ.get("FLASH_ENV_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")):
         problems.append(
-            "  - PRIME_API_KEY: a Prime Intellect API key; the GPU worker uses it to "
-            "`prime env install` the run's Hub environment (public + private), e.g. "
-            "`export PRIME_API_KEY=pit_...`"
+            "  - GITHUB_TOKEN or FLASH_ENV_GITHUB_TOKEN: a token with read access to "
+            "GitHub-hosted Freesolo environments, e.g. `export GITHUB_TOKEN=github_pat_...`"
         )
     if not os.environ.get("HF_TOKEN"):
         problems.append(
@@ -54,7 +51,7 @@ def check_run_preflight(require_hf: bool = True) -> None:
     """Validate operator config across the configured providers; raise on missing.
 
     Only the providers this control plane actually uses are checked: RunPod's requirements
-    (RUNPOD_API_KEY + the shared PRIME_API_KEY/HF_TOKEN) are always checked, and a configured
+    (RUNPOD_API_KEY + the shared GITHUB_TOKEN/HF_TOKEN) are always checked, and a configured
     Vast key (VAST_API_KEY) adds its own check. The HF dataset repo is per-run
     (``[train] hf_repo``), not an operator var.
     """
