@@ -31,9 +31,9 @@ def test_deploy_dry_run():
     assert d["est_idle_cost_usd_per_day"] == 0.0
 
 
-def test_deploy_qlora_dry_run_is_not_rejected():
-    """A QLoRA tier (9B) is deployable: freesolo serving folds the bf16 LoRA delta into
-    the bf16 base just like a bf16 tier, instead of being rejected up front."""
+def test_deploy_9b_dry_run_is_not_rejected():
+    """The 9B (bf16 LoRA) tier is deployable: freesolo serving folds the bf16 LoRA delta
+    into the bf16 base, instead of being rejected up front."""
     from flash.serve.deploy import deploy_adapter
 
     dep = deploy_adapter(
