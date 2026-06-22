@@ -85,9 +85,11 @@ class PoolPlan:
             PoolMember(
                 base_model=m["base_model"],
                 gpu=m["gpu"],
-                count=_strict_int(m.get("count", 1), field="count", base_model=m.get("base_model")),
+                count=_strict_int(
+                    m.get("count", 1), field="count", base_model=m.get("base_model"), minimum=1
+                ),
                 max_loras=_strict_int(
-                    m.get("max_loras", 8), field="max_loras", base_model=m.get("base_model")
+                    m.get("max_loras", 8), field="max_loras", base_model=m.get("base_model"), minimum=1
                 ),
             )
             for m in data.get("pool", [])
@@ -95,12 +97,15 @@ class PoolPlan:
         return cls(members=members)
 
 
-def _strict_int(value: object, *, field: str, base_model: object = None) -> int:
+def _strict_int(
+    value: object, *, field: str, base_model: object = None, minimum: int | None = None
+) -> int:
     """Coerce a TOML scalar to an int WITHOUT silently truncating (pool-config wording).
 
     Thin wrapper over the shared strict-int contract in flash.spec so the no-truncation /
     no-bool / whole-float-only rule lives in exactly one place; this just renders the
-    pool-specific ``pool <field> [for base_model ...]`` message.
+    pool-specific ``pool <field> [for base_model ...]`` message. ``minimum`` enforces a lower
+    bound (e.g. 1 for count/max_loras, so count=0/-1 fails instead of yielding an empty fleet).
     """
     where = f" for base_model {base_model!r}" if base_model is not None else ""
-    return _spec_strict_int(value, name=f"pool {field}{where}")
+    return _spec_strict_int(value, name=f"pool {field}{where}", minimum=minimum)
