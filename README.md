@@ -59,4 +59,4 @@ The control plane owns provider credentials: `RUNPOD_API_KEY` is always required
 plus the shared `HF_TOKEN`.
 The artifact repo is per-run (the run TOML's `[train] hf_repo`), not an
 operator-wide env var. Clients authenticate with their freesolo API key (`flash login`);
-create or copy one at https://freesolo.co/sign-in or https://freesolo.co/login.
+create or copy one at https://freesolo.co/sign-in.

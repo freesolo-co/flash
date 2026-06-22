@@ -248,8 +248,7 @@ def create_app():
             raise HTTPException(
                 status_code=401,
                 detail="invalid or missing API key; create or copy one at "
-                "https://freesolo.co/sign-in or https://freesolo.co/login, then log in with "
-                "`flash login`",
+                "https://freesolo.co/sign-in, then log in with `flash login`",
             )
         return key
 
