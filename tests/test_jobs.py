@@ -161,6 +161,24 @@ def test_poll_job_failed_without_retriable_heartbeat_is_job_failed(monkeypatch):
     assert res.failure == "job_failed"
 
 
+def test_poll_job_failed_with_exclude_class_surfaces_flag(monkeypatch):
+    # A MIG slice: the worker stamps retriable + exclude_class -> job_preempted AND res.exclude_class
+    # so the runner re-allocates OFF the failed GPU class (not just onto a fresh host of it).
+    res = _poll_failed_with_heartbeat(
+        monkeypatch, {"stage": "error_sft", "retriable": True, "exclude_class": True}
+    )
+    assert res.failure == "job_preempted"
+    assert res.exclude_class is True
+
+
+def test_poll_job_retriable_without_exclude_class_does_not_set_flag(monkeypatch):
+    # A transient host failure (GPU-never-ready / upload exhaustion): retriable but NOT class-level,
+    # so exclude_class stays False -> the retry may re-use the same class on a fresh host.
+    res = _poll_failed_with_heartbeat(monkeypatch, {"stage": "error_sft", "retriable": True})
+    assert res.failure == "job_preempted"
+    assert res.exclude_class is False
+
+
 def test_poll_job_stall_detection(monkeypatch):
     # job stays IN_PROGRESS forever, heartbeat never advances -> stall
     import itertools
@@ -604,6 +622,106 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         rates = [hourly_rate(g) for g in gpus_seen]
         assert rates == sorted(rates)
         assert gpus_seen[0] == "RTX A5000"  # cheapest validated class with >= 12 GB
+
+
+def test_supervisor_excludes_gpu_class_on_mig_retry(monkeypatch):
+    # A RETRIABLE_INFRA_GPU (MIG slice) failure must re-allocate OFF the failed CLASS, not just
+    # retry on the same one: the cheapest validated 24 GB class (RTX A5000) is the MIG-prone one, so
+    # the retry must land on a DIFFERENT validated class (a consumer card that can't be MIG-sliced).
+    # This is the live failure being fixed (a 9B SFT / gsm8k GRPO run died on a Blackwell-MIG A5000).
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+        real_allocate = allocator.allocate
+        seen_excludes: list[frozenset] = []
+
+        def spy_allocate(*a, **k):
+            seen_excludes.append(frozenset(k.get("exclude_gpu_classes") or ()))
+            return real_allocate(*a, **k)
+
+        monkeypatch.setattr(allocator, "allocate", spy_allocate)
+
+        gpus_seen: list[str] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            gpus_seen.append(spec.gpu.type)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            if attempt == 0:
+                # What poll_job produces for a MIG slice: the worker's boot-guard stamped
+                # retriable + exclude_class into heartbeat.json -> job_preempted + exclude_class.
+                return jobs.PollResult(
+                    False,
+                    failure="job_preempted",
+                    detail="[FAILED] train phase 'sft' produced no /tmp/metrics.json",
+                    exclude_class=True,
+                )
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="mig-walk",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("mig-walk").state == "done"
+        # job_preempted is infra-shaped -> it retried instead of failing immediately.
+        assert len(gpus_seen) == 2
+        # attempt 0 ran the cheapest (MIG-prone) class; the retry walked OFF it to a DIFFERENT one.
+        assert gpus_seen[0] == "RTX A5000"
+        assert gpus_seen[1] != "RTX A5000"
+        # the retry's allocation excluded the failed class (the first allocation didn't).
+        assert seen_excludes[0] == frozenset()
+        assert "RTX A5000" in seen_excludes[1]
+
+
+def test_supervisor_mig_failure_without_marker_does_not_retry(monkeypatch):
+    # Belt-and-suspenders: a plain job_failed (no retriable / exclude_class flag — a genuine code
+    # crash) is still NOT retried and excludes no class. The MIG path is gated on exclude_class.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.pricing as pricing
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
+        calls = {"n": 0}
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            calls["n"] += 1
+            return jobs.PollResult(
+                False, failure="job_failed", detail="ValueError: bad reward fn (no infra marker)"
+            )
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="code-crash",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
+        )
+        with pytest.raises(RuntimeError, match="bad reward fn"):
+            orch.submit_job(spec, dry_run=False, background=False)
+        assert calls["n"] == 1  # genuine code error burns no retry budget
+        assert orch.get_status("code-crash").state == "failed"
 
 
 def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
