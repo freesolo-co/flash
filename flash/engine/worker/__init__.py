@@ -71,12 +71,14 @@ from flash.engine.worker.perf import (
     _reset_peak_gpu,
     _sdpa_cudnn_ctx,
     assert_usable_gpu,
+    flex_attn_status,
     free_gpu,
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
     liger_on,
     loraplus_optimizer_cls,
+    model_supports_flex_attn,  # noqa: F401
     optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
@@ -852,14 +854,36 @@ def run_sft():
     # stack and packing is effectively unavailable until flash-attn is baked into a prebuilt image.
     # Packing is ON when FA2 is importable (varlen keeps 'bfd' example boundaries correct); else
     # SKIP — without a boundary-correct attn backend examples would cross-contaminate under SDPA.
+    # Packing needs a boundary-correct attn so 'bfd'-packed examples don't cross-contaminate.
+    # FA2 varlen is one such backend; flex_attention (block-diagonal doc mask) is the other, and it
+    # works WITHOUT flash-attn — so it enables packing on archs that support it even on torch 2.10 /
+    # sm120 where FA2 is absent. MEASURED ~1.7x SFT throughput at equal VRAM on a Llama-arch 0.5B
+    # (5090). flex support is per-arch (Llama/Qwen2/3 yes; Qwen3.5/3.6 hybrid-GDN no — HF #34809),
+    # so we only turn flex packing on when the model's arch supports it.
     _fa_ok = _flash_attn_available()
+    # When FA2 is absent, flex is the fallback boundary-correct backend — but only if the model's
+    # arch supports it. Capture WHY it's unavailable so the SKIPPED message is accurate (a real arch
+    # limitation vs a possibly-transient config-probe failure), instead of always blaming the arch.
+    _flex_status = "unsupported" if _fa_ok else flex_attn_status(model_id)
+    _flex_ok = _flex_status == "supported"
     if _fa_ok:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
+    elif _flex_ok:
+        cfg_kwargs["packing"] = True
+        print("[sft] example packing enabled (flex_attention block-diagonal mask)")
     else:
+        # flash-attn is absent on torch 2.10; distinguish the flex fallback reason so the diagnosis
+        # isn't misleading when the config probe merely failed (offline / transient HF error).
+        _flex_reason = (
+            "the model's arch lacks flex_attention support"
+            if _flex_status == "unsupported"
+            else "the flex_attention support probe failed (offline / transient HF error)"
+        )
         print(
-            "[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
-            "2.10). Bake flash-attn into the worker image to enable FA2 varlen packing."
+            f"[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
+            f"2.10 and {_flex_reason}). Bake flash-attn into the worker image, or use a flex-capable "
+            f"arch (with a reachable config), to enable packing."
         )
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
@@ -867,12 +891,16 @@ def run_sft():
         cfg_kwargs["use_liger_kernel"] = True
         print("[sft] liger fused kernels enabled")
     _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
-    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen attn.
-    # With FA2 importable force flash_attention_2 — a pure win over the SDPA default which would
-    # cross-contaminate packed examples.
-    if cfg_kwargs.get("packing") and _fa_ok:
-        _attn = "flash_attention_2"
-        print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen/masked attn.
+    # Force the boundary-correct backend whenever packing is on, over the SDPA default which would
+    # cross-contaminate packed examples: FA2 varlen if available, else flex_attention's doc mask.
+    if cfg_kwargs.get("packing"):
+        if _fa_ok:
+            _attn = "flash_attention_2"
+            print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+        elif _flex_ok:
+            _attn = "flex_attention"
+            print("[sft] attn_implementation=flex_attention (packing boundary-correct block mask)")
     quant = model_quant(model_id)
     if quant == "4bit-qlora":
         # QLoRA tier: 4-bit NF4 base + bf16 LoRA adapters (e.g. Qwen3.5-9B on a 5090).

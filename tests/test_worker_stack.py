@@ -292,6 +292,77 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
     assert w.optimal_attn_impl() is None
 
 
+def test_model_supports_flex_attn_gates_on_arch(monkeypatch):
+    """flex packing is enabled only for arches whose transformers class sets _supports_flex_attn:
+    Llama/Qwen2/Qwen3 yes; the Qwen3.5/3.6 hybrid-GDN class no (HF #34809). Probe reads the config
+    only and is safe (False) on any error. Uses an injected fake transformers (CPU venv has none)."""
+    from flash.engine.worker import perf
+
+    class _SupportsFlex:
+        _supports_flex_attn = True
+
+    class _NoFlex:
+        _supports_flex_attn = False
+
+    def fake_transformers(arch=None, raise_on_cfg=False):
+        mod = types.ModuleType("transformers")
+
+        def _from_pretrained(*a, **k):
+            if raise_on_cfg:
+                raise RuntimeError("offline")
+            return types.SimpleNamespace(architectures=[arch])
+
+        mod.AutoConfig = types.SimpleNamespace(from_pretrained=_from_pretrained)
+        mod.LlamaForCausalLM = _SupportsFlex
+        mod.Qwen3_5ForConditionalGeneration = _NoFlex
+        return mod
+
+    # Llama-arch (e.g. MiniCPM5-1B) -> flex supported -> packing eligible
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers("LlamaForCausalLM"))
+    assert perf.model_supports_flex_attn("openbmb/MiniCPM5-1B") is True
+    # Qwen3.5 hybrid arch -> flex NOT supported -> packing stays off (correctly)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers("Qwen3_5ForConditionalGeneration"))
+    assert perf.model_supports_flex_attn("Qwen/Qwen3.5-4B") is False
+    # Any error (offline / unknown model) -> False, so packing never turns on unsafely
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers(raise_on_cfg=True))
+    assert perf.model_supports_flex_attn("whatever") is False
+
+
+def test_flex_attn_status_distinguishes_unsupported_from_probe_failure(monkeypatch):
+    """flex_attn_status() must separate a real arch limitation ('unsupported') from a possibly
+    transient config-probe failure ('probe_failed') so the worker's packing-SKIPPED diagnosis is
+    accurate (it shouldn't blame the arch when the model config merely couldn't be fetched)."""
+    from flash.engine.worker import perf
+
+    class _SupportsFlex:
+        _supports_flex_attn = True
+
+    class _NoFlex:
+        _supports_flex_attn = False
+
+    def fake_transformers(arch=None, raise_on_cfg=False):
+        mod = types.ModuleType("transformers")
+
+        def _from_pretrained(*a, **k):
+            if raise_on_cfg:
+                raise RuntimeError("offline")
+            return types.SimpleNamespace(architectures=[arch])
+
+        mod.AutoConfig = types.SimpleNamespace(from_pretrained=_from_pretrained)
+        mod.LlamaForCausalLM = _SupportsFlex
+        mod.Qwen3_5ForConditionalGeneration = _NoFlex
+        return mod
+
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers("LlamaForCausalLM"))
+    assert perf.flex_attn_status("openbmb/MiniCPM5-1B") == "supported"
+    # Probe SUCCEEDED but the arch genuinely lacks flex support.
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers("Qwen3_5ForConditionalGeneration"))
+    assert perf.flex_attn_status("Qwen/Qwen3.5-4B") == "unsupported"
+    # Probe FAILED (offline / transient) -> must NOT be reported as an arch limitation.
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers(raise_on_cfg=True))
+    assert perf.flex_attn_status("whatever") == "probe_failed"
+
+
 def test_liger_on_requires_default_and_gpu(monkeypatch):
     """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
     liger_kernel (both absent in CI), so it's off here too."""
