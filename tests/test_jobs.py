@@ -715,7 +715,8 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
 
         rates = [hourly_rate(g) for g in gpus_seen]
         assert rates == sorted(rates)
-        assert gpus_seen[0] == "RTX A5000"  # cheapest validated class with >= 12 GB
+        # cheapest validated, non-MIG class with >= 24 GB (RTX A5000 is runpod_mig_risk -> skipped)
+        assert gpus_seen[0] == "RTX 3090"
 
 
 def test_supervisor_excludes_gpu_class_on_second_mig(monkeypatch):
@@ -772,15 +773,16 @@ def test_supervisor_excludes_gpu_class_on_second_mig(monkeypatch):
 
         assert orch.get_status("mig-walk").state == "done"
         assert len(gpus_seen) == 3
-        # attempt 0 = cheapest MIG-prone class; attempt 1 RETRIES the SAME class (1st MIG, no
-        # exclusion); attempt 2 walks OFF it after the 2nd MIG.
-        assert gpus_seen[0] == "RTX A5000"
-        assert gpus_seen[1] == "RTX A5000"
-        assert gpus_seen[2] != "RTX A5000"
+        # attempt 0 = cheapest allocated class (RTX 3090; the cheaper RTX A5000 is already skipped up
+        # front as runpod_mig_risk); attempt 1 RETRIES the SAME class on a fresh host (1st simulated
+        # MIG, no exclusion); attempt 2 walks OFF it after the 2nd MIG — the runtime safety net.
+        assert gpus_seen[0] == "RTX 3090"
+        assert gpus_seen[1] == "RTX 3090"
+        assert gpus_seen[2] != "RTX 3090"
         # the class is excluded only on the THIRD allocation (after the 2nd MIG), not before.
         assert seen_excludes[0] == frozenset()
         assert seen_excludes[1] == frozenset()
-        assert "RTX A5000" in seen_excludes[2]
+        assert "RTX 3090" in seen_excludes[2]
 
 
 def test_supervisor_mig_failure_without_marker_does_not_retry(monkeypatch):
@@ -821,11 +823,12 @@ def test_supervisor_mig_failure_without_marker_does_not_retry(monkeypatch):
 
 def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
     # The candidate walk steps to the next-cheapest class on each infra retry but CLAMPS at
-    # the last fitting candidate — it must never index past the ranked list. Force a VRAM need
-    # only the 96 GB VALIDATED tier satisfies (post-2026-06-22 expansion the 80 GB tier has several
-    # validated classes, so we use 96 GB to keep exactly TWO candidates): attempt 0 takes the cheaper
-    # (RTX Pro 6000 WK @ $1.79), attempt 1 walks to the pricier (RTX Pro 6000 @ $2.09), attempt 2's
-    # walk offset clamps back onto that same last class.
+    # the last fitting candidate — it must never index past the ranked list. Force a VRAM need that
+    # only the 96 GB VALIDATED tier satisfies; the sole non-MIG 96 GB RunPod class is RTX Pro 6000
+    # Server Edition (the cheaper RTX Pro 6000 WK is runpod_mig_risk and skipped), so we drop the
+    # need to 80 GB and exclude all but the two cheapest 80 GB classes (A100 PCIe, A100 SXM) to keep
+    # exactly TWO candidates: attempt 0 takes the cheaper (A100 PCIe @ $1.39), attempt 1 walks to the
+    # pricier (A100 SXM @ $1.49), attempt 2's walk offset clamps back onto that same last class.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
@@ -835,9 +838,18 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
         monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
-        # Need 96 GB -> the two VALIDATED 96 GB RunPod classes fit: RTX Pro 6000 WK ($1.79) and
-        # RTX Pro 6000 Server Edition ($2.09) -> exactly two candidates (H100 NVL @ 94 GB is Vast-only).
-        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 96)
+        # Need 80 GB; the validated 80 GB+ RunPod pool is A100 PCIe ($1.39), A100 SXM ($1.49), RTX
+        # Pro 6000 Server ($2.09), H100 ($3.29). Exclude the two priciest so exactly TWO candidates
+        # remain for a clean walk+clamp assertion.
+        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
+        real_allocate = allocator.allocate
+        monkeypatch.setattr(
+            allocator,
+            "allocate",
+            lambda *a, **k: real_allocate(
+                *a, **{**k, "exclude_gpu_classes": frozenset({"RTX Pro 6000", "H100"})}
+            ),
+        )
         gpus_seen: list[str] = []
 
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
@@ -863,7 +875,7 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
 
         assert orch.get_status("clamp").state == "done"
         # Walk advances to the last candidate then clamps on it (never out of range).
-        assert gpus_seen == ["RTX Pro 6000 WK", "RTX Pro 6000", "RTX Pro 6000"]
+        assert gpus_seen == ["A100 PCIe", "A100 SXM", "A100 SXM"]
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -913,8 +925,9 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         orch.submit_job(spec, dry_run=False, background=False)
 
         assert orch.get_status("alloc-blip").state == "done"
-        # First allocation failed (no provision); the retry provisioned the cheapest class.
-        assert gpus_seen == ["RTX A5000"]
+        # First allocation failed (no provision); the retry provisioned the cheapest class
+        # (RTX 3090 — the cheaper RTX A5000 is runpod_mig_risk and skipped on RunPod).
+        assert gpus_seen == ["RTX 3090"]
 
 
 def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
