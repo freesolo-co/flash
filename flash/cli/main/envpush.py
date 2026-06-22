@@ -10,11 +10,19 @@ from pathlib import Path
 # (e.g. freesolo-co/flash-bench -> .../freesolo-co/simple/), so derive the index from the
 # slug owner; a single hardcoded owner index 404s for other orgs.
 PRIME_HUB_INDEX_TMPL = "https://hub.primeintellect.ai/{owner}/simple/"
+_INSTALL_ERROR_LIMIT = 4000
 
 
 def _prime_hub_index(env_id: str) -> str:
     owner = env_id.split("/", 1)[0] if "/" in env_id else "primeintellect"
     return PRIME_HUB_INDEX_TMPL.format(owner=owner)
+
+
+def _trim_install_output(stdout: str | None, stderr: str | None) -> str:
+    detail = "\n".join(part.strip() for part in (stderr, stdout) if part and part.strip())
+    if len(detail) > _INSTALL_ERROR_LIMIT:
+        return f"...\n{detail[-_INSTALL_ERROR_LIMIT:]}"
+    return detail
 
 
 def cmd_env_install(args) -> int:
@@ -55,10 +63,13 @@ def cmd_env_install(args) -> int:
             else [sys.executable, "-m", "pip", "install"]
         )
         cmd = [*installer, _bare_wheel_name(env_id), "--extra-index-url", extras["extra_index_url"]]
-    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
     rc = proc.returncode
     if rc != 0:
         print("install failed", file=sys.stderr)
+        detail = _trim_install_output(getattr(proc, "stdout", None), getattr(proc, "stderr", None))
+        if detail:
+            print(detail, file=sys.stderr)
         return rc
     record_installed_env(env_id, package=_bare_wheel_name(env_id), extras=extras)
     print(f"installed {env_id}; recorded in ~/.flash/envs.json")
