@@ -901,15 +901,12 @@ def run_sft():
     # instruction targets are far shorter than max_seq_len; unpacked batches waste most of their
     # FLOPs on padding. TRL's 'bfd' strategy makes padding-free batches whose example boundaries are
     # honored ONLY by an attention impl that reads them — under plain SDPA packed examples
-    # cross-contaminate (silent quality loss). The boundary-correct backend is FlashAttention-2
-    # varlen (reads position_ids); but flash-attn has NO prebuilt wheel for torch 2.10 (PyPI
-    # sdist-only; Dao-AILab wheels stop at torch 2.9) so it would build from source on every cold
-    # start (~20 min, fragile) — it is NOT in the worker image, so _fa_ok is False on the current
-    # stack. That alone used to disable packing — but flex_attention (block-diagonal doc mask) is a
-    # SECOND boundary-correct backend that needs NO flash-attn, so it enables 'bfd' packing on archs
-    # that support it even on torch 2.10 / sm120 where FA2 is absent. MEASURED ~1.7x SFT throughput
-    # at equal VRAM on a Llama-arch 0.5B (5090). flex support is per-arch (Llama/Qwen2/3 yes;
-    # Qwen3.5/3.6 hybrid-GDN no — HF #34809), so we only enable flex packing when the arch supports it.
+    # cross-contaminate (silent quality loss). Prefer FlashAttention-2 varlen (reads position_ids),
+    # which the worker image bakes in best-effort via FLASH_ATTN_SPEC. If that install did not land,
+    # flex_attention (block-diagonal doc mask) is the second boundary-correct backend and needs no
+    # flash-attn wheel. MEASURED ~1.7x SFT throughput at equal VRAM on a Llama-arch 0.5B (5090).
+    # flex support is per-arch (Llama/Qwen2/3 yes; Qwen3.5/3.6 hybrid-GDN no — HF #34809), so we
+    # only enable flex packing when the arch supports it.
     _fa_ok = _flash_attn_available()
     # When FA2 is absent, flex is the fallback boundary-correct backend — but only if the model's
     # arch supports it. Capture WHY it's unavailable so the SKIPPED message is accurate (a real arch
@@ -923,17 +920,17 @@ def run_sft():
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (flex_attention block-diagonal mask)")
     else:
-        # flash-attn is absent on torch 2.10; distinguish the flex fallback reason so the diagnosis
-        # isn't misleading when the config probe merely failed (offline / transient HF error).
+        # Distinguish the flex fallback reason so the diagnosis isn't misleading when the config
+        # probe merely failed (offline / transient HF error).
         _flex_reason = (
             "the model's arch lacks flex_attention support"
             if _flex_status == "unsupported"
             else "the flex_attention support probe failed (offline / transient HF error)"
         )
         print(
-            f"[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
-            f"2.10 and {_flex_reason}). Bake flash-attn into the worker image, or use a flex-capable "
-            f"arch (with a reachable config), to enable packing."
+            f"[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn not importable "
+            f"and {_flex_reason}). Ensure the image's best-effort flash-attn install succeeds, or "
+            f"use a flex-capable arch (with a reachable config), to enable packing."
         )
     # Fused CE/RMSNorm/SwiGLU come from chalk (STANDALONE), NOT Liger: install_chalk_kernels patches
     # the live model AFTER the trainer builds it, with chalk's FLCE on by default — so the big
