@@ -17,7 +17,7 @@ def test_catalog_validation():
 
     info = get_model("Qwen/Qwen3.5-4B")
     assert "grpo" in info.algos
-    # 9B is the QLoRA GRPO tier (4-bit NF4 base on a ~24-32 GB card).
+    # 9B is the bf16 GRPO tier (needs an 80 GB-class card; QLoRA was dropped).
     assert validate_model_for_algorithm("Qwen/Qwen3.5-9B", "grpo").id == "Qwen/Qwen3.5-9B"
     # An sft-only model still rejects grpo (inject one — no catalog entry is sft-only now).
     from flash.catalog import MODELS, ModelInfo
