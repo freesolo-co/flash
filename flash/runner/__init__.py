@@ -174,13 +174,15 @@ def _run_job_background(spec: JobSpec) -> None:
         _run_job(spec)
     except Exception as e:
         # _run_job -> _run_job_inner normally persists the terminal failure before its re-raise, but a
-        # crash before that persist point would leave the run stuck non-terminal. _update is
-        # terminal-sticky: it records `failed` only when the run isn't already terminal, so it never
-        # clobbers an already-persisted failure detail yet a pre-persist crash still ends the run.
-        # Guard the safety-net itself (suppress) so a missing/unwritable status can't re-raise out of
-        # the daemon thread — that traceback is the exact noise this wrapper exists to prevent.
+        # crash before that persist point would leave the run stuck non-terminal. Record `failed` ONLY
+        # when the run isn't already terminal: _update allows same-state writes (so workers can update
+        # cost/error/artifacts on a terminal run), so an unconditional write here would clobber an
+        # already-persisted failure detail with this wrapper's (less specific) exception. Guard the
+        # whole safety-net (suppress) so a missing/unwritable status can't re-raise out of the daemon
+        # thread — that traceback is the exact noise this wrapper exists to prevent.
         with contextlib.suppress(Exception):
-            _update(spec.run_id, "failed", error=str(e))
+            if get_status(spec.run_id).state not in TERMINAL_STATES:
+                _update(spec.run_id, "failed", error=str(e))
         logging.getLogger(__name__).warning("background run %s ended in error: %s", spec.run_id, e)
 
 
