@@ -405,6 +405,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
     even when the worker exited 0 — run_mode only uploads on a non-zero exit, so an OOM/segfault or
     silent early-exit otherwise leaves the failure undebuggable (no metrics, often no error_<phase>,
     and the message points at a console that was never uploaded)."""
+    import contextlib
     import os
     import subprocess
 
@@ -457,7 +458,5 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
         # doesn't leak state across tests (flaky under isolated/parallel runners).
         for _p in ("/tmp/console_sft.txt", "/tmp/console_sft.txt.tail"):
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(_p)
-            except FileNotFoundError:
-                pass
