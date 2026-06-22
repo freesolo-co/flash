@@ -126,6 +126,27 @@ def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
     return d
 
 
+def _managed_artifact_namespace() -> str:
+    """The HF namespace the control plane creates per-run artifact repos under. Defaults to the
+    operator org whose HF_TOKEN the control plane runs with; override with FLASH_ARTIFACT_NAMESPACE.
+    """
+    return os.environ.get("FLASH_ARTIFACT_NAMESPACE", "Freesolo-Co")
+
+
+def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
+    """Assign the run's HF artifact repo server-side — it is platform-managed, never user-set.
+
+    Each run gets its own private dataset repo ``<namespace>/flashrun-<run_id>`` under the
+    operator's namespace. The control-plane HF_TOKEN creates and writes it (code, adapters,
+    checkpoints, telemetry); a user-chosen namespace would 403 that token at ``upload_code``.
+    Any inbound ``train.hf_repo`` is overwritten. Requires a finalized (non-``local``) run_id.
+    """
+    repo = f"{_managed_artifact_namespace()}/flashrun-{spec.run_id}"
+    d = spec.to_dict()
+    d["train"] = {**d["train"], "hf_repo": repo}
+    return JobSpec.from_dict(d)
+
+
 def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     across the configured providers (RunPod Flash or Vast); dry-run only records state."""
@@ -133,6 +154,8 @@ def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -
     spec = JobSpec.from_dict(
         {**_with_model_disk(spec, info), "run_id": spec.run_id or new_run_id()}
     )
+    # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
+    spec = _assign_managed_hf_repo(spec)
     status = RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
     _save_status(status)
     if dry_run:
