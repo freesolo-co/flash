@@ -388,105 +388,13 @@ RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
 class RetriableInfraError(RuntimeError):
     """An infrastructure failure the control plane should RETRY on a fresh worker.
 
-    Raised for a host the run can never train on — e.g. RunPod fulfilling a full-GPU request
-    with a MIG slice ("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb",
-    ``nvidia-smi`` = "[Insufficient Permissions]"), where PyTorch's CUDA caching allocator
-    HARD-ASSERTS mid-backward. The worker's top-level handler stamps ``retriable=True`` (and,
-    when ``exclude_class`` is set, ``exclude_class=True``) into heartbeat.json so the runner
-    retries — and, for a class-level fault like a MIG slice, re-allocates OFF that GPU class.
+    Raised for a host the run can never train on — e.g. a GPU that never comes up
+    (``wait_for_gpu`` times out) or a required-upload failure. The worker's top-level handler
+    stamps ``retriable=True`` into heartbeat.json so the runner retries on a fresh worker.
     """
 
-    def __init__(self, reason: str, exclude_class: bool = False):
+    def __init__(self, reason: str):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
-        self.exclude_class = exclude_class
-
-
-# Transient-startup grace for assert_usable_gpu's CUDA-availability poll (it runs before the
-# handler's wait_for_gpu). Module-level so tests can monkeypatch them to run instantly.
-_GPU_GUARD_AVAIL_RETRIES = 6
-_GPU_GUARD_AVAIL_DELAY_S = 5.0
-
-
-def assert_usable_gpu() -> None:
-    """Fail FAST (and RETRIABLY) on a MIG slice / NVML-restricted device before any real CUDA work.
-
-    RunPod has been observed fulfilling a full-GPU class request with a MIG partition whose
-    ``nvidia-smi`` reports "[Insufficient Permissions]"; PyTorch's caching allocator then trips an
-    NVML assertion mid-backward ("RuntimeError: NVML_SUCCESS == r INTERNAL ASSERT FAILED ...
-    c10/cuda/CUDACachingAllocator.cpp"), which the control plane mis-classified as job_failed
-    (not retrying), burning the run. Detect the bad host at boot and raise the RETRIABLE infra
-    error so the run is resubmitted on a fresh worker.
-
-    Detection (any one trips it):
-      * the device name contains "MIG" (a MIG partition), or
-      * a minimal NVML probe (memory query) raises (driver/permission restricted), or
-      * CUDA reports no device even after a transient-startup grace poll.
-    A torch import failure is re-raised (an image problem, not retriable infra). The NVML check is
-    best-effort: a probe that simply can't run (pynvml absent) is NOT treated as a failure — we
-    only fail on a name match or an NVML call that actively raises.
-    """
-    try:
-        import torch
-    except Exception as e:
-        # torch import failure is an IMAGE problem, not transient infra: surface it (re-raise)
-        # instead of swallowing and returning. Swallowing would let the worker proceed into
-        # training and fail later with a far less actionable error than the import traceback here.
-        print("[gpu-guard] torch import failed; surfacing:", e)
-        raise
-    # Transient-startup grace: rented hosts can report "CUDA not available" for a few seconds at
-    # boot. This guard runs in main() BEFORE the handler's wait_for_gpu(), so failing on the very
-    # first is_available() check would preempt that polling and spuriously resubmit a host whose
-    # CUDA comes up a moment later. Poll a few times (constants are module-level so tests shrink
-    # them) before declaring the host device-less.
-    # Normalize to a single, sane loop bound so the poll/sleep logic stays consistent.
-    tries = max(1, int(_GPU_GUARD_AVAIL_RETRIES))
-    delay_s = float(_GPU_GUARD_AVAIL_DELAY_S)
-
-    cuda_ready = False
-    for i in range(tries):
-        cuda_ready = bool(torch.cuda.is_available())
-        if cuda_ready:
-            break
-        if i + 1 < tries:
-            time.sleep(delay_s)
-    if not cuda_ready:
-        # Host/driver-level (a bad node), NOT a class-level MIG fault: retry on a fresh host of the
-        # same class, don't blacklist the whole class. So exclude_class stays False (default).
-        raise RetriableInfraError(
-            "CUDA reports no available device after the worker-boot startup grace"
-        )
-    try:
-        name = torch.cuda.get_device_name(0)
-    except Exception as e:
-        # Per-node CUDA/driver issue, not a class-level MIG slice -> fresh host, not class-exclude.
-        raise RetriableInfraError(f"could not query the GPU device name ({e})") from e
-    if "MIG" in (name or ""):
-        raise RetriableInfraError(
-            f"GPU is a MIG slice ({name!r}); PyTorch's CUDA allocator NVML-asserts on MIG "
-            "partitions (CUDACachingAllocator NVML_SUCCESS), so this host cannot train",
-            exclude_class=True,
-        )
-    # NVML probe: a MIG/permission-restricted device raises here even when the name looks normal.
-    try:
-        import pynvml  # bundled with the cuda torch wheel (nvidia-ml-py)
-
-        pynvml.nvmlInit()
-        try:
-            h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            pynvml.nvmlDeviceGetMemoryInfo(h)  # the call that fails on a restricted MIG host
-        finally:
-            with contextlib.suppress(Exception):
-                pynvml.nvmlShutdown()
-    except ImportError:
-        # No NVML bindings available -> can't probe; the name check above is the guard.
-        pass
-    except Exception as e:
-        raise RetriableInfraError(
-            f"NVML probe failed for {name!r} ({e}); the device is permission-restricted "
-            "(MIG / shared host) and PyTorch's allocator will NVML-assert mid-run",
-            exclude_class=True,
-        ) from e
-    print(f"[gpu-guard] usable full GPU: {name}")
 
 
 def wait_for_gpu():

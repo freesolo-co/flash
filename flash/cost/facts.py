@@ -12,7 +12,6 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "RTX 2000 Ada": 89.0,
     "RTX A4500": 89.0,
     "RTX 4000 Ada": 90.0,
-    "RTX A5000": 89.0,
     "RTX 3090": 71.0,
     "L4": 60.0,
     "RTX Pro 4000": 95.0,
@@ -28,7 +27,6 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "H100 NVL": 835.0,
     "H100": 990.0,
     "RTX Pro 6000": 250.0,
-    "RTX Pro 6000 WK": 250.0,
 }
 _DEFAULT_TFLOPS = 100.0
 
@@ -53,7 +51,6 @@ REALIZED_HOURLY_USD: dict[str, float] = {
     "RTX 3090": 0.239,
     "RTX 4090": 0.426,
     "RTX 5090": 0.871,
-    "RTX A5000": 0.304,
     "RTX 6000 Ada": 0.601,
     "A100 PCIe": 1.035,
     "A100 SXM": 1.133,
