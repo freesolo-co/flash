@@ -133,3 +133,49 @@ def test_patch_vllm_lm_weight_sync_idempotent(monkeypatch):
     # A second call must NOT double-wrap (the _flash_sync_patched sentinel guards it).
     assert lora.patch_vllm_lm_weight_sync("Qwen/Qwen3.5-9B") is False
     assert FakeVLModel.load_weights is first
+
+
+def test_patch_vllm_lm_weight_sync_warns_on_missing_required_module(monkeypatch, capsys):
+    """If the REQUIRED dense vLLM module can't be imported, the installer must NOT silently no-op
+    (the run would otherwise crash later at the first sync_weights() with a far less actionable
+    error). It logs a loud warning and returns False; the OPTIONAL MoE module stays quiet."""
+    import sys
+
+    import flash.engine.worker.lora as lora
+
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: True)
+    # None in sys.modules makes importlib.import_module raise deterministically (whether or not a
+    # real vLLM is installed in the test env).
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.models.qwen3_5", None)
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.models.qwen3_5_moe", None)
+
+    assert lora.patch_vllm_lm_weight_sync("Qwen/Qwen3.5-0.8B") is False
+    out = capsys.readouterr().out
+    assert "patch_vllm_lm_weight_sync" in out
+    assert "vllm.model_executor.models.qwen3_5" in out
+    # The optional MoE module's absence must NOT produce its own warning.
+    assert "qwen3_5_moe" not in out
+
+
+def test_patch_vllm_lm_weight_sync_warns_when_required_class_renamed(monkeypatch, capsys):
+    """The required module imports but no longer has the expected class (vLLM renamed it) -> warn,
+    don't silently no-op."""
+    import sys
+    import types
+
+    import flash.engine.worker.lora as lora
+
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: True)
+    # Module present but missing Qwen3_5ForConditionalGeneration.
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.models.qwen3_5",
+        types.ModuleType("vllm.model_executor.models.qwen3_5"),
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.models.qwen3_5_moe", types.ModuleType("x")
+    )
+
+    assert lora.patch_vllm_lm_weight_sync("Qwen/Qwen3.5-9B") is False
+    out = capsys.readouterr().out
+    assert "Qwen3_5ForConditionalGeneration" in out
