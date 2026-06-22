@@ -69,7 +69,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
         if exc.code in (401, 403):
             raise ClientError(
                 "freesolo rejected this API key — create or copy a valid key at "
-                "https://freesolo.co/sign-in or https://freesolo.co/login, then pass it with "
+                "https://freesolo.co/sign-in, then pass it with "
                 "`flash login --api-key` (or FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
@@ -201,7 +201,7 @@ def client_from_config(require_key: bool = True) -> ApiClient:
     api_url, api_key = load_credentials()
     if require_key and not api_key:
         raise ClientError(
-            "not logged in — create or copy a freesolo API key at https://freesolo.co/sign-in "
-            "or https://freesolo.co/login, then run `flash login` (or set FREESOLO_API_KEY)"
+            "not logged in — create or copy a freesolo API key at https://freesolo.co/sign-in, "
+            "then run `flash login` (or set FREESOLO_API_KEY)"
         )
     return ApiClient(api_url, api_key)
