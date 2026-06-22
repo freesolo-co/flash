@@ -77,9 +77,11 @@ def test_me(api):
     key = _login()
     me = api.get("/v1/me", headers=_bearer(key))
     assert me.status_code == 200
-    # A verified freesolo user key resolves to a per-token "freesolo" identity.
-    assert me.json()["email"] == "freesolo-user"
-    assert me.json()["key_prefix"] == "freesolo"
+    # A verified freesolo user key resolves to a per-token identity without inventing an email.
+    payload = me.json()
+    assert payload["kind"] == "freesolo_api_key"
+    assert payload["key_prefix"].startswith(_USER_PREFIX)
+    assert "email" not in payload
 
 
 def test_requests_without_key_are_rejected(api):
@@ -136,12 +138,36 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
 
     row = auth_mod.authenticate("Bearer fslo-user-good")
     assert row is not None
-    assert row["email"] == "freesolo-user"
+    assert row["email"] is None
+    assert row["key_prefix"].startswith("fslo-user")
     # An unverified token returns None (401).
     assert auth_mod.authenticate("Bearer fslo-user-bad") is None
     # The same key resolves to the same identity across requests (stable per-token row).
     again = auth_mod.authenticate("Bearer fslo-user-good")
     assert again["id"] == row["id"]
+
+
+def test_freesolo_user_identity_from_verify_response(api, monkeypatch):
+    import flash.server.auth as auth_mod
+
+    auth_mod._verify_cache.clear()
+    auth_mod._identity_cache["fslo_abc123_secret"] = (
+        {
+            "user_id": "user-123",
+            "org_id": "org-456",
+            "api_key_id": "key-789",
+            "key_prefix": "fslo_abc123",
+        },
+        time.time() + auth_mod._VERIFY_CACHE_TTL_S,
+    )
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token == "fslo_abc123_secret")
+
+    row = auth_mod.authenticate("Bearer fslo_abc123_secret")
+    assert row is not None
+    assert row["user_id"] == "user-123"
+    assert row["org_id"] == "org-456"
+    assert row["api_key_id"] == "key-789"
+    assert row["key_prefix"] == "fslo_abc123"
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
@@ -493,7 +519,7 @@ def test_logs_offset_paging(api):
 
 
 def test_local_env_path_rejected(api):
-    # Prime Hub-only: a local [environment] path is rejected on the managed service.
+    # Managed service only accepts published environment ids, not local paths.
     key = _login()
     bad = {**SPEC, "environment": {"id": "custom", "path": "/home/user/env.py"}}
     r = api.post("/v1/runs", json={"spec": bad, "dry_run": True}, headers=_bearer(key))
@@ -827,15 +853,15 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
-    """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
-    plane's PRIME_API_KEY), namespaced per identity — so the user needs no Prime account."""
+    """POST /v1/envs publishes an uploaded package under FreeSolo's managed account,
+    namespaced per identity."""
     import base64
     import io
     import tarfile
 
     import flash.server.envs as envs_mod
 
-    # Stub the actual `prime env push` so the test doesn't hit Prime; echo the namespaced name.
+    # Stub the actual environment publish so the test doesn't hit the external publisher.
     monkeypatch.setattr(
         envs_mod, "_prime_push", lambda env_dir, *, name, is_new: f"freesolo-co/{name}"
     )

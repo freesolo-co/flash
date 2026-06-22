@@ -1,10 +1,9 @@
-"""Regression test: the documented `flash env install <prime-hub-env>` flow.
+"""Regression test: the documented `flash env install <owner/name>` flow.
 
 DEFECT (since fixed): `flash env install primeintellect/hendrycks-math` ran
-`pip install primeintellect/hendrycks-math` (a local path) with no Prime Hub index, so it
-always failed. The fix derives the bare wheel name from the `owner/name` slug, defaults
-Hub slugs to the Prime index via `--extra-index-url`, and records the index in the manifest
-so the GPU worker can install it too.
+`pip install primeintellect/hendrycks-math` (a local path) with no package index, so it
+always failed. The fix derives the bare wheel name from the `owner/name` id, adds the
+extra index URL, and records the index in the manifest so the GPU worker can install it too.
 """
 
 from __future__ import annotations
@@ -42,7 +41,7 @@ def test_env_install_prime_hub_slug(monkeypatch):
         # installs the BARE wheel name, not the owner/name slug (which pip treats as a path)
         assert "hendrycks-math" in cmd
         assert "primeintellect/hendrycks-math" not in cmd
-        # carries the Prime Hub index
+        # carries the package index
         assert "--extra-index-url" in cmd
         assert any("hub.primeintellect.ai" in str(c) for c in cmd)
 
@@ -55,7 +54,7 @@ def test_env_install_prime_hub_slug(monkeypatch):
 
 
 def test_env_install_rejects_bare_id(monkeypatch, capsys):
-    # The managed service is Prime Hub slug-only (`owner/name`). A bare id can't be resolved,
+    # The managed service requires full `owner/name` ids. A bare id can't be resolved,
     # so `cmd_env_install` must reject it (return 1) WITHOUT shelling out to prime/pip.
     from flash.cli import main as cli
 
