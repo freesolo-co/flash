@@ -173,34 +173,20 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
         if not res.ok:
-            # The recovered job ended without success — almost always BECAUSE the control plane
-            # was down for the redeploy (an abandoned/stalled poll, a vanished host, a platform
-            # timeout). Don't fail the run: resume the in-flight seed on a fresh host, where the
-            # worker picks up from the latest HF checkpoint — the same recovery the fresh-submit
-            # path performs for an in-flight failure. Classification of genuine vs infra failure
-            # is left to the seed loop (_submit_seed_supervised, unchanged): a deterministic
-            # worker crash reproduces on the resumed attempt and the seed loop's own retry policy
-            # fails the run after it, surfacing the real error — so nothing is silently lost and a
-            # truly-broken run still terminates.
+            # Job ended not-ok — usually because it was abandoned during the redeploy. Resume the
+            # in-flight seed from its last HF checkpoint instead of failing; the seed loop
+            # (unchanged) still terminates a genuinely broken run when it re-fails.
             try:
                 seed_index = list(spec.train.seeds).index(seed)
             except ValueError:
                 seed_index = 0
-            print(
-                f"attach: {run_id} seed {seed} ended not-ok ({res.failure}: {res.detail}); "
-                f"resuming from the last checkpoint on a fresh host",
-                file=log,
-            )
-            # GC the dead endpoint while its handle is still persisted, then clear the stale handle
-            # and record the seed we are resuming. If a SECOND restart lands during the fresh
-            # allocation, recover_runs sees resume_seed_index and resumes the right seed
-            # (resume_run) instead of restarting from seed 0.
+            print(f"attach: {run_id} seed {seed} ended ({res.failure}); resuming from checkpoint", file=log)
+            # GC the dead endpoint, then clear the stale handle and record the seed so a second
+            # restart mid-allocation resumes the right one.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
             _update(run_id, "running", remote=None, resume_seed_index=seed_index)
-            _run_seed_loop(
-                spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0)
-            )
+            _run_seed_loop(spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0))
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the
         # run actually used (the in-process path stamps this; recovery must restore it).

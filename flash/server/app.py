@@ -107,7 +107,7 @@ def _deploy_lock(run_id: str) -> _RunLock:
 
 
 def _append_run_log(run_id: str, message: str) -> None:
-    """Append a timestamped operator note to a run's log so it surfaces in `flash logs`."""
+    """Append a timestamped note to a run's log so it surfaces in `flash logs`."""
     import time
 
     with open(runs_file_path(run_id, ".log"), "a") as f:
@@ -115,26 +115,14 @@ def _append_run_log(run_id: str, message: str) -> None:
 
 
 def recover_runs() -> None:
-    """Recover every in-flight run after a control-plane restart so a redeploy never loses
-    a training session (per-run daemon threads). Each recoverable run takes one of three paths:
-
-    - ``running`` with a live remote handle -> reattach and keep polling that exact GPU job
-      (it kept running on the provider while the control plane was down).
-    - multi-seed run restarted in the inter-seed gap (``resume_seed_index`` set) -> resume the
-      remaining seeds; the finished seeds' work is preserved.
-    - ``queued``/``provisioning`` with no handle yet -> the crash landed before any worker was
-      provisioned, so there is no remote job to reattach to. RESUBMIT it from scratch instead of
-      failing it (the old behavior). A fresh ``_run_job`` allocates a GPU and runs the seed loop
-      from the start; nothing is lost because no remote work had happened. The org was already
-      charged at submit, and resubmit does not re-charge.
-    """
+    """Recover every in-flight run after a restart so a redeploy never loses a training session:
+    re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
+    ``queued``/``provisioning`` runs that never reached a worker."""
     from flash.runner import _gc_run_endpoints, _run_job, _update, attach_run, resume_run
 
     active: set[str] = set()
-    # Pre-handle runs to resubmit. Deferred until AFTER the orphan sweep: a crash between
-    # renting a Vast instance and persisting the handle can leave that instance orphaned, and
-    # these runs are deliberately kept OUT of `active` so the sweep reaps it — launching the
-    # resubmit only after the sweep keeps it from racing (and reaping) the fresh allocation.
+    # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
+    # attempt is reaped without racing the resubmit's fresh allocation.
     resubmit: list[JobSpec] = []
     for row in db.all_runs():
         try:
@@ -144,44 +132,24 @@ def recover_runs() -> None:
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
-            # Only remote-backed runs are "active" (kept by the orphan sweep). A run with no
-            # handle is being resubmitted (fresh allocation); if it had already rented a Vast
-            # instance (crash between rent and on_handle), that stale one must NOT be shielded.
+            # Only handle-backed runs are kept by the sweep; a handle-less run is being
+            # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
         elif status.resume_seed_index is not None:
-            # Multi-seed run that restarted in the inter-seed gap: the completed seed's
-            # handle was deliberately cleared and the next index recorded. There is no
-            # live job to reattach to, so resume the remaining seeds rather than failing
-            # the run and discarding the already-completed work. Keep it in `active` so
-            # the orphan sweep below doesn't reap the label its next seed will reuse.
+            # Restarted between seeds: resume the remaining seeds, preserving the finished ones.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
-            # No handle and no completed seed: the restart hit the window between submit and the
-            # first on_handle (allocation / provisioning), so no worker exists. The aborted
-            # attempt may have registered its uniquely-named RunPod endpoint before crashing;
-            # GC it (by reconstructed name) so it doesn't hold worker quota, then resubmit the
-            # run from scratch (below, after the sweep) instead of throwing the session away.
-            #
-            # Parse the persisted spec ONCE, fault-isolated: a malformed spec (e.g. a legacy
-            # `environment.path`, or a bad type that makes `from_dict` raise) must only skip
-            # THIS run, not abort recovery of every other in-flight run and the orphan sweep
-            # below.
+            # No handle yet: the restart hit the submit->provisioning window, so no worker exists.
+            # A spec that won't parse can never be resubmitted -> mark it terminally failed
+            # (operator-visible, dropped from _RECOVERABLE so it isn't re-skipped every restart);
+            # otherwise GC any half-made endpoint and resubmit from scratch.
             try:
                 spec = JobSpec.from_dict(status.spec)
             except Exception as exc:
-                # An unparseable persisted spec can never be resubmitted, so don't just log and
-                # leave it in a recoverable state — that hides the failure from the user (only
-                # server logs show it) and re-tries-then-skips it on EVERY restart forever.
-                # Instead persist it as terminal `failed` with an operator-visible note via the
-                # SAME status API the runner uses on any other failure. `failed` is terminal, so
-                # it drops out of `_RECOVERABLE` and is never re-attempted. Marking-failed is
-                # itself best-effort: if it raises it must not re-abort recovery of other runs or
-                # the orphan sweep, so suppress and still `continue` (skip resubmitting it).
                 _log.warning(
-                    "marking run %s failed: its persisted spec could not be parsed "
-                    "(malformed/legacy spec); recovery of other runs continues",
+                    "marking run %s failed: persisted spec could not be parsed",
                     status.run_id,
                     exc_info=True,
                 )
@@ -194,30 +162,17 @@ def recover_runs() -> None:
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
             resubmit.append(spec)
-    # Standing per-run billing (Vast instances) survives a crash until destroyed:
-    # anything labeled ours that no recoverable run owns is an orphan. Each available
-    # provider's ``sweep_orphans`` hook reaps its own (RunPod's is a no-op). Dispatched
-    # generically through the registry — ``sweep_orphans`` is part of base.Provider, so
-    # no provider is special-cased. ``active`` carries raw run ids; each provider applies
-    # its own label-prefix transform. Best-effort: never raises.
+    # Reap orphaned per-run instances (Vast bills until destroyed); each provider sweeps its own.
     from flash.providers import configured_providers
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):
             prov.sweep_orphans(active_labels=active)
 
-    # Resubmit the pre-handle runs only now — after the sweep has reaped any instance their
-    # aborted attempt orphaned — so the fresh allocation can't be swept out from under them.
     for spec in resubmit:
-        _log.info(
-            "resubmitting run %s after control-plane restart "
-            "(it had not provisioned a worker yet, so nothing was lost)",
-            spec.run_id,
-        )
+        _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         with contextlib.suppress(Exception):
-            _append_run_log(
-                spec.run_id, "control plane restarted before a worker was provisioned; resubmitting"
-            )
+            _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
         threading.Thread(target=lambda s=spec: _run_job(s), daemon=True).start()
 
 
