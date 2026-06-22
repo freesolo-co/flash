@@ -57,13 +57,24 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
+def _submit_seed_supervised(
+    spec: JobSpec,
+    seed: int,
+    log,
+    bad_gpu_classes: set[str] | None = None,
+    mig_seen_once: set[str] | None = None,
+) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
-    Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
-    live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
-    fresh per attempt because offers are a live market. There is no GPU pin, no validation
-    gate, and no provider pin — the cheapest fitting class always wins.
+    ``bad_gpu_classes`` is the RUN-level set of GPU classes excluded after one handed back a MIG
+    slice / unusable GPU TWICE (exclude_class). ``mig_seen_once`` tracks classes that MIG'd ONCE so
+    the SECOND occurrence is what excludes them. Both are passed in by the seed loop and SHARED
+    across seeds, so a class found MIG-prone on one seed stays excluded for the rest of the run.
+
+    Each attempt first ALLOCATES the GPU: the cheapest LIVE-VALIDATED class across providers
+    (RunPod live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
+    fresh per attempt because offers are a live market. There is no GPU pin and no provider pin —
+    the cheapest fitting class in the validated pool always wins.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF
     checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
@@ -111,6 +122,19 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
     bad_machines: set[int] = set()
+    # GPU CLASSES to walk OFF entirely after the worker flagged one as a class-level fault
+    # (exclude_class — RunPod fulfilled a full-GPU request with a MIG slice, e.g. an "RTX A5000"
+    # that was really a Blackwell MIG partition). Stepping the price walk by one index isn't enough
+    # — the next-cheapest candidate can be the SAME class on another provider — so the whole class
+    # is excluded from re-allocation, walking onto a different validated class (consumer cards like
+    # RTX 4090/5090/3090 can't be MIG-sliced). SHARED across the run's seeds when the loop passes it
+    # in, so a MIG-prone class stays excluded for every subsequent seed.
+    if bad_gpu_classes is None:
+        bad_gpu_classes = set()
+    # Classes that returned a MIG slice ONCE: the second occurrence is what moves them into
+    # bad_gpu_classes (retry the same class once before excluding — a one-off MIG isn't systemic).
+    if mig_seen_once is None:
+        mig_seen_once = set()
     # Index into the ranked candidate list. It advances only after an attempt that
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
@@ -174,6 +198,10 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 spec.algorithm,
                 disk_gb=spec.gpu.disk_gb,
                 exclude_machine_ids=frozenset(bad_machines),
+                # Walk OFF any class that returned a MIG / unusable-GPU (RETRIABLE_INFRA_GPU)
+                # failure: re-allocate to a DIFFERENT validated class instead of re-picking the
+                # same MIG-prone one and failing identically.
+                exclude_gpu_classes=frozenset(bad_gpu_classes),
                 # Pass the run's train knobs + thinking so the VRAM estimate reflects THIS job's
                 # max_length / group_size / batch_size / lora_rank (and the seq escalation) instead
                 # of the generic defaults — else a long-context / big-group run is sized at seq=1024
@@ -259,35 +287,33 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
             return res.metrics
         last_detail = f"{res.failure}: {res.detail}"
-        # Infra-shaped failures are retried on a FRESH endpoint/host; genuine worker
-        # code errors are not. Detail markers cover the observed flake classes:
-        # platform timeouts, worker pip-install network timeouts, and sick-GPU hosts.
-        _infra_markers = (
-            "TIMED_OUT",
-            "Failed to fetch",
-            "operation timed out",
-            "python_dependencies failed",
-            "Connection reset",
-            "cuda not available",
-            "GPU never became ready",
-            # Host vanished mid-run: the instance went "missing"/dead and NOTHING was captured
-            # (no marker error, no error_<phase>.txt, no console log) so _failure_detail falls back
-            # to this bare sentinel. A genuine worker code crash instead yields a RICHER detail
-            # (the captured traceback), so this exact phrase only ever marks a dead host -> retry it
-            # on a fresh one. Without this, a single ~1-in-200 host death killed the whole run.
-            "terminated without a DONE sentinel",
-            # MIG slice / NVML-restricted host: the worker's boot guard (engine.worker.perf
-            # assert_usable_gpu / RetriableInfraError) detected a device the run can never train on
-            # — e.g. RunPod fulfilling a full-GPU request with a MIG partition (nvidia-smi
-            # "[Insufficient Permissions]"), which otherwise NVML-asserts mid-backward and was
-            # mis-classified as a non-retried job_failed. This exact marker phrase is embedded in
-            # that error's message, so a bad host is resubmitted on a fresh worker. Keep this in
-            # lock-step with engine.worker.perf.RETRIABLE_INFRA_MARKER.
-            "RETRIABLE_INFRA_GPU",
-        )
-        infra_shaped = res.failure in ("stalled", "poll_error") or any(
-            m in (res.detail or "") for m in _infra_markers
-        )
+        # Retry only on a structured failure category the provider already classified; a real job
+        # failure fails fast. No detail-string parsing. (USER cancels are caught below, not here.)
+        infra_shaped = res.failure in ("stalled", "poll_error", "job_preempted")
+        # A MIG / unusable-GPU failure (worker-flagged exclude_class) MIGHT be a property of the GPU
+        # CLASS or just an unlucky host. Don't over-react on the FIRST one: a retry already lands on
+        # a fresh host (usually a real full GPU), so retry the SAME class once; only when a class
+        # hands back a MIG slice a SECOND time do we treat it as class-systemic and exclude it for
+        # the rest of the run (shared across seeds) — re-allocating OFF it onto a different validated
+        # class (consumer cards can't be MIG-sliced). Avoids a needless price jump on a one-off MIG.
+        mig_failure = res.exclude_class
+        if mig_failure and chosen is not None:
+            if chosen.gpu in mig_seen_once:
+                bad_gpu_classes.add(chosen.gpu)
+                print(
+                    f"retry: excluding GPU class {chosen.gpu!r} for the rest of this run "
+                    "(handed back a MIG slice / unusable GPU TWICE); re-allocating to a different class",
+                    file=log,
+                    flush=True,
+                )
+            else:
+                mig_seen_once.add(chosen.gpu)
+                print(
+                    f"retry: GPU class {chosen.gpu!r} returned a MIG slice / unusable GPU; "
+                    "retrying the SAME class once on a fresh host before excluding it",
+                    file=log,
+                    flush=True,
+                )
         # A cancel deletes the endpoint, which the poller sees as an
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.
@@ -309,7 +335,10 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         # Step to the next-cheapest class only when THIS attempt actually provisioned one
         # and it failed infra-shaped. An allocation/pricing failure (chosen is None) never
         # tried a card, so the next attempt must retry from the cheapest, not walk past it.
-        if chosen is not None:
+        # A MIG failure already walks the run forward by EXCLUDING the class (the next allocation
+        # drops it, so candidate[0] is the next class) — advancing the offset too would over-walk
+        # and skip the new cheapest, so only the throttle/stall walk bumps the offset.
+        if chosen is not None and not mig_failure:
             gpu_walk_offset += 1
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones
@@ -341,6 +370,7 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
     Shared by a fresh submit (start_index=0) and post-restart recovery, which
     resumes the remaining seeds after the in-flight one completes."""
     from flash.runner import (
+        TERMINAL_STATES,
         _persist_metrics,
         _RunCancelled,
         _submit_seed_supervised,
@@ -351,19 +381,31 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
 
     total_cost = prior_cost
     seeds = spec.train.seeds
+    # Shared across seeds: a GPU class confirmed MIG-prone (MIG'd twice) stays excluded for the
+    # rest of the run, and a class that MIG'd once is remembered so its next MIG excludes it —
+    # instead of re-discovering both seed by seed.
+    bad_gpu_classes: set[str] = set()
+    mig_seen_once: set[str] = set()
     for i in range(start_index, len(seeds)):
         seed = seeds[i]
-        # An early cancel (before any remote handle existed) sets `cancelled`;
-        # do not overwrite it with `running` and submit the GPU job anyway.
-        if get_status(spec.run_id).state == "cancelled":
-            raise _RunCancelled(f"run {spec.run_id} was cancelled")
+        # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped
+        # into ANY terminal state — not just `cancelled` — by a concurrent thread/process
+        # (e.g. another recovery marking it failed/done) between the resume decision and here.
+        # Bail before _update + _submit_seed_supervised so we never submit PAID GPU work for an
+        # already-terminal run. (The `running` _update below would be CAS-rejected anyway, but
+        # the supervised submit would still have spent.) _RunCancelled is the loop's terminal
+        # signal; its callers already swallow it / leave the existing terminal state intact.
+        if get_status(spec.run_id).state in TERMINAL_STATES:
+            raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting seed")
         _update(spec.run_id, "running")
         print(
             f"starting seed={seed} phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
             file=log,
             flush=True,
         )
-        metrics = _submit_seed_supervised(spec, seed, log)
+        metrics = _submit_seed_supervised(
+            spec, seed, log, bad_gpu_classes=bad_gpu_classes, mig_seen_once=mig_seen_once
+        )
         total_cost += _persist_metrics(spec, seed, metrics)
         # A cancel can land while this thread writes metrics — after the supervised
         # late-cancel check. Re-read before the post-seed status writes so a late
