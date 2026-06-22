@@ -58,7 +58,7 @@ WORKER_DEPS = [
     # kernels Liger never had (RoPE / LoRA-delta / embedding). Pure Triton/CUDA, JITs on every arch
     # incl. Blackwell. Baked in (as Liger was) so cold starts don't pip-install it. Keep this spec
     # in lockstep with DEFAULT_CHALK_SPEC below + the freesolo-chalk install in Dockerfile.worker.
-    "freesolo-chalk>=0.3.0,<0.4.0",
+    "freesolo-chalk>=0.3.0,<0.5.0",
     # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this, transformers
     # falls back to a pure-PyTorch delta rule that is dramatically slower + memory-heavier (measured
     # A/B, Vast H100 SXM, Qwen3.5-0.8B LoRA: seq4096 4413->371 ms/step = 11.9x; seq8192 13.7x;
@@ -214,7 +214,7 @@ def _chalk_selected(spec=None) -> bool:
 # each kernel WINS on speed/memory on every GPU arch). Keep in lockstep with the freesolo-chalk pin
 # in WORKER_DEPS + Dockerfile.worker. Bump intentionally after validating a new line; an operator can
 # pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z.
-DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.3.0,<0.4.0"
+DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.3.0,<0.5.0"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
