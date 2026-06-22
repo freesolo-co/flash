@@ -7,10 +7,17 @@ FLASH_<K>=1 enables an opt-in one; the pre-build pass (model=None) is a no-op; t
 is absent or every kernel is disabled; and that a chalk apply error never aborts training.
 """
 
+import importlib.util
 import sys
 import types
 
-from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels, is_chalk_enabled
+from flash.engine.chalk_kernels import (
+    active_kernels,
+    flce_flag_on,
+    fused_ce_available,
+    install_chalk_kernels,
+    is_chalk_enabled,
+)
 
 # Every FLASH_* kernel flag (so a test can clear leftovers from the environment).
 # Every FLASH_* kernel flag. The first six are DEFAULT-ON (chalk's standalone stack: rms_norm,
@@ -181,3 +188,47 @@ def test_active_kernels_filters_report():
     assert active_kernels(rep) == ["fused_lora_delta", "rope"]
     assert active_kernels({}) == []
     assert active_kernels(None) == []
+
+
+def _inject_fake_chalk(monkeypatch):
+    """Make ``importlib.util.find_spec('chalk')`` succeed (CPU venv has no real chalk) by inserting a
+    fake module WITH a __spec__ — find_spec returns the spec of an already-imported module."""
+    m = types.ModuleType("chalk")
+    m.__spec__ = importlib.util.spec_from_loader("chalk", loader=None)
+    monkeypatch.setitem(sys.modules, "chalk", m)
+
+
+def test_flce_flag_on_default_and_override(monkeypatch):
+    """flce_flag_on() = the operator's FLASH_FLCE_KERNEL setting: default-ON, OFF when set falsey."""
+    monkeypatch.delenv("FLASH_FLCE_KERNEL", raising=False)
+    assert flce_flag_on() is True  # default-on
+    monkeypatch.setenv("FLASH_FLCE_KERNEL", "0")
+    assert flce_flag_on() is False
+    monkeypatch.setenv("FLASH_FLCE_KERNEL", "1")
+    assert flce_flag_on() is True
+
+
+def test_fused_ce_available_requires_flag_and_chalk(monkeypatch):
+    """fused_ce_available() (the WORKER gate) is True ONLY when the FLCE flag is on AND chalk is
+    importable. The flag alone (chalk missing/failed-to-install) is NOT enough — gating on the flag
+    only would skip run_sft's large-vocab logits cap and OOM ~248k-vocab runs."""
+    # Flag on (default) but chalk NOT importable -> False (the bug this fixes).
+    monkeypatch.delenv("FLASH_FLCE_KERNEL", raising=False)
+    monkeypatch.delitem(sys.modules, "chalk", raising=False)
+    assert fused_ce_available() is False
+    # Flag on AND chalk importable -> True (the normal fused path).
+    _inject_fake_chalk(monkeypatch)
+    assert fused_ce_available() is True
+    # Flag OFF, even with chalk importable -> False (operator disabled FLCE).
+    monkeypatch.setenv("FLASH_FLCE_KERNEL", "0")
+    assert fused_ce_available() is False
+
+
+def test_chalk_importable_reflects_find_spec(monkeypatch):
+    """_chalk_importable() is a real find_spec('chalk') probe (no import side effects)."""
+    from flash.engine.chalk_kernels import _chalk_importable
+
+    monkeypatch.delitem(sys.modules, "chalk", raising=False)
+    assert _chalk_importable() is False  # CPU venv genuinely has no freesolo-chalk
+    _inject_fake_chalk(monkeypatch)
+    assert _chalk_importable() is True

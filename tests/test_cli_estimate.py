@@ -202,6 +202,33 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
     assert _spec_steps(spec) != 80  # the pre-fix uncapped (pd=4 -> realized 8) step count
 
 
+def test_sft_steps_respect_flce_flag(monkeypatch):
+    # spec_steps gates the fused-CE decision on the OPERATOR's FLASH_FLCE_KERNEL flag, the SAME gate
+    # run_sft applies. For a >=3B big-vocab model sft_logits_fused() is True, so with FLCE ON the CE
+    # fuses (cap off -> pd=4 -> realized 8 -> 80 steps); with FLCE OFF the big-vocab cap binds at a
+    # 1024 ctx (pd=4->1 -> realized 6 -> 108 steps). The pre-fix code used sft_logits_fused alone and
+    # priced 80 either way, undershooting the FLCE-off run's real step count.
+    import math
+
+    raw = {
+        "model": "Qwen/Qwen3.5-4B",  # 4.7B, ~248k vocab -> sft_logits_fused True (>=3B)
+        "algorithm": "sft",
+        "environment": {"id": "acme/sft-data"},
+        "train": {
+            "seeds": [0], "hf_repo": "owner/runs",
+            "max_examples": 320, "batch_size": 6, "epochs": 2, "max_length": 1024,
+        },
+        "gpu": {"type": "RTX 4090"},
+    }
+    spec = spec_from_dict(raw)
+    # FLCE on (default): CE fuses -> no big-vocab cap -> realized 8 -> 80 steps.
+    monkeypatch.delenv("FLASH_FLCE_KERNEL", raising=False)
+    assert _spec_steps(spec) == math.ceil(320 / 8) * 2 == 80
+    # FLCE off: cap binds (pd 4->1 at 1024 ctx, 248k vocab) -> realized 6 -> 108 steps.
+    monkeypatch.setenv("FLASH_FLCE_KERNEL", "0")
+    assert _spec_steps(spec) == math.ceil(320 / 6) * 2 == 108
+
+
 def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
     cfg = tmp_path / "run.toml"
     cfg.write_text(

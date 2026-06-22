@@ -229,6 +229,7 @@ def estimate_vram_gb(
     thinking: bool = False,
     use_vllm: bool = True,
     vocab: int = _VOCAB_DEFAULT,
+    fused: bool | None = None,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU, over the full knob matrix.
 
@@ -275,7 +276,18 @@ def estimate_vram_gb(
     # driven by the worker's per-device micro-batch (capped at 4 AND vocab-sized to the logits budget
     # when the fused CE is off), NOT the global/effective batch_size (grad-accum realizes that). Use
     # the SAME ``sft_per_device`` the worker runs so the estimate tracks what actually executes.
-    fused = sft_logits_fused(params_b, seq_len)
+    # ``fused`` mirrors run_sft's _sft_fused: the conservative size gate AND the fused CE being on.
+    # When None (the caller didn't pin it) resolve it here so the estimate tracks the worker's cap.
+    # It gates on flce_flag_on() (the OPERATOR's FLASH_FLCE_KERNEL setting), NOT chalk-importability:
+    # this estimate runs on the control plane (where freesolo-chalk is intentionally absent) but
+    # provisions/prices for a worker that DOES carry chalk, so it banks the fused-CE saving whenever
+    # the operator left FLCE on, and drops it (cap binds, logits reserved) only when FLCE is off —
+    # which is exactly the divergence the bug was about. (run_sft additionally requires chalk
+    # importable, because it's the process actually running the kernel.)
+    if fused is None:
+        from flash.engine.chalk_kernels import flce_flag_on
+
+        fused = sft_logits_fused(params_b, seq_len) and flce_flag_on()
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
     # fp32-logits term: 0 when the worker fuses CE (>=3B model OR >=2048-token ctx, so the lm_head

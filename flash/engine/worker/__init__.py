@@ -35,7 +35,11 @@ import traceback
 from flash.engine.accounting import RunMetrics
 
 # Shared, substrate-neutral fine-tuning internals (live in this same package).
-from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels, kernel_on
+from flash.engine.chalk_kernels import (
+    active_kernels,
+    fused_ce_available,
+    install_chalk_kernels,
+)
 from flash.engine.recipe import RECIPE
 
 # Re-export the pure helpers split into the leaf submodules ``.perf`` and ``.lora``.
@@ -773,10 +777,12 @@ def run_sft():
     # chalk's FLCE fuses every run BY DEFAULT (standalone, no size / liger_kernel-importable gate),
     # so the fused-CE memory saving is normally taken. The allocator stays CONSERVATIVE about banking
     # on it: sft_logits_fused is the >=3B / >=2048-ctx mirror, so the large-vocab logits cap below
-    # binds only for small short-context runs (a GPU is never undersized). It ALSO binds when an
-    # operator disables FLCE (FLASH_FLCE_KERNEL=0): there's then no fused saving to bank on, so we AND
-    # in the flag — _sft_fused is False and the cap protects against the full-logits OOM.
-    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and kernel_on("FLASH_FLCE_KERNEL", True)
+    # binds only for small short-context runs (a GPU is never undersized). It ALSO binds when the
+    # fused CE can't actually run — i.e. an operator disables FLCE (FLASH_FLCE_KERNEL=0) OR
+    # freesolo-chalk (the FLCE provider) isn't importable: there's then no fused saving to bank on,
+    # so fused_ce_available() is False and the cap protects against the full-logits OOM. (Gating on
+    # the FLAG alone would wrongly assume the saving whenever chalk is missing/failed-to-install.)
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and fused_ce_available()
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
     )

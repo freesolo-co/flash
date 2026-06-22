@@ -28,6 +28,7 @@ def spec_steps(spec) -> int:
     (else recipe default). SFT: ``epochs x ceil(num_examples / realized_batch)`` capped by
     ``max_steps``, where ``num_examples`` is ``max_examples`` if pinned else the real env size."""
     from flash.catalog import vocab_size_for
+    from flash.engine.chalk_kernels import flce_flag_on
     from flash.engine.recipe import RECIPE
     from flash.engine.vram import resolve_params_b, sft_logits_fused, sft_realized_batch
 
@@ -54,7 +55,12 @@ def spec_steps(spec) -> int:
     # micro-batch cap) hinges on the >=3B threshold, so an uncataloged >=3B model must not be priced
     # as <3B (which would flip fused off, change the realized batch via the cap, and misprice the
     # step count). Best-effort: no network -> None -> the prior <3B (cap-on) behavior.
-    sft_fused = sft_logits_fused(resolve_params_b(spec.model), sft_seq)
+    # Mirror run_sft's _sft_fused: AND in flce_flag_on() so the priced step count tracks the worker.
+    # If the operator turned the fused CE off (FLASH_FLCE_KERNEL=0) the big-vocab cap binds and
+    # changes the realized batch / step count, which the prior sft_logits_fused-alone gate missed.
+    # Gates on the FLAG (not chalk-importability): this runs on the control plane where chalk is
+    # intentionally absent but prices a worker that carries it (same rationale as estimate_vram_gb).
+    sft_fused = sft_logits_fused(resolve_params_b(spec.model), sft_seq) and flce_flag_on()
     batch = sft_realized_batch(
         requested_batch, seq_len=sft_seq, vocab=vocab_size_for(spec.model), fused=sft_fused
     )

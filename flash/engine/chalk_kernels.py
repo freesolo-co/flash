@@ -88,6 +88,55 @@ def is_chalk_enabled(env: Mapping[str, str]) -> bool:
     return any(_flag_on(env.get(flag), default_on) for flag, _kw, default_on in _KERNELS)
 
 
+def flce_flag_on() -> bool:
+    """Is chalk's fused-linear cross-entropy (FLCE) ENABLED by flag (``FLASH_FLCE_KERNEL``)?
+
+    The single source of truth for the operator's FLCE setting (default-on; an operator disables it
+    with ``FLASH_FLCE_KERNEL=0``). The VRAM/cost estimator gates on THIS — it runs on the control
+    plane (where freesolo-chalk is intentionally absent) but provisions/prices for a worker that DOES
+    have chalk, so it must bank the fused-CE saving whenever the operator left FLCE on, while still
+    dropping it (cap binds) when the operator turned FLCE off. ``run_sft`` gates on the stricter
+    :func:`fused_ce_available` (this AND chalk actually importable on the worker).
+    """
+    return kernel_on("FLASH_FLCE_KERNEL", True)
+
+
+def _chalk_importable() -> bool:
+    """True when the ``freesolo-chalk`` package (import name ``chalk``) can be imported here.
+
+    ``find_spec`` only — no import side effects (and no CUDA init) — and it probes the SAME thing
+    ``install_chalk_kernels`` does (``from chalk.transformers import ...``), so "chalk is available"
+    is decided one way. chalk is optional: it is absent on the control plane and may be missing /
+    failed-to-install on a worker, in which case its FLCE (the large-vocab logits fuser) never runs.
+    """
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("chalk") is not None
+    except Exception:
+        # A broken/partial chalk install can make find_spec itself raise -> treat as unavailable.
+        return False
+
+
+def fused_ce_available() -> bool:
+    """Can chalk's fused-linear cross-entropy (FLCE) ACTUALLY run in THIS process?
+
+    For the WORKER (``run_sft``), which is the process that actually runs the kernel and so must
+    protect against a missing install. True ONLY when BOTH hold:
+      * the ``FLASH_FLCE_KERNEL`` flag is on (:func:`flce_flag_on`), AND
+      * ``freesolo-chalk`` is importable (it supplies FLCE; a no-op when absent).
+
+    The fused-CE memory saving (the [per_device, seq, vocab] fp32 logits never materialize) only
+    happens when both are true. Gating on the flag ALONE wrongly assumes the saving whenever chalk is
+    missing/failed-to-install, so the worker would skip the large-vocab logits cap and OOM on
+    ~248k-vocab runs. CONSERVATIVE by construction: any uncertainty -> False -> the cap binds (no
+    OOM). (The offline estimator instead uses :func:`flce_flag_on`: it can't import chalk on the
+    control plane but provisions for a worker that has it, so it banks the saving on the flag alone —
+    using this stricter check there would under-bank and over-provision EVERY ≥3B / long-ctx run.)
+    """
+    return flce_flag_on() and _chalk_importable()
+
+
 def _enabled_kwargs() -> dict[str, bool]:
     """The ``apply_chalk_kernel_to_qwen35`` boolean kwargs resolved from the FLASH_* flags.
 

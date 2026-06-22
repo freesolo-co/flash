@@ -363,6 +363,35 @@ def test_flex_attn_status_distinguishes_unsupported_from_probe_failure(monkeypat
     assert perf.flex_attn_status("whatever") == "probe_failed"
 
 
+def test_flex_attn_status_arch_not_found_is_probe_failed(monkeypatch):
+    """When the config LISTS architectures but NONE of the named classes resolve on the top-level
+    ``transformers`` module (e.g. a remote-code-only class), support was never determined -> the
+    status must be 'probe_failed' (undetermined), NOT 'unsupported' (a confirmed arch limitation).
+    'unsupported' is reserved for when a class DID resolve but lacks _supports_flex_attn."""
+    from flash.engine.worker import perf
+
+    class _NoFlex:
+        _supports_flex_attn = False
+
+    def fake_transformers(arch):
+        mod = types.ModuleType("transformers")
+        mod.AutoConfig = types.SimpleNamespace(
+            from_pretrained=lambda *a, **k: types.SimpleNamespace(architectures=[arch])
+        )
+        # Only a non-flex class is exposed; an unknown arch name will NOT resolve via getattr.
+        mod.Qwen3_5ForConditionalGeneration = _NoFlex
+        return mod
+
+    # Arch listed but its class isn't importable here -> "couldn't determine" -> probe_failed.
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers("SomeRemoteCodeForCausalLM"))
+    assert perf.flex_attn_status("org/remote-code-model") == "probe_failed"
+    # Control: a class that DOES resolve but lacks flex -> the definitive "unsupported".
+    monkeypatch.setitem(
+        sys.modules, "transformers", fake_transformers("Qwen3_5ForConditionalGeneration")
+    )
+    assert perf.flex_attn_status("Qwen/Qwen3.5-4B") == "unsupported"
+
+
 def test_liger_default_model_size_gate(monkeypatch):
     """The model-size gate (_liger_default_for_model) drives the memory-mode behaviors — sleep and
     grad checkpointing: OFF for small models (1B-class, speed mode — measured net loss PR #174) and

@@ -58,14 +58,17 @@ def flex_attn_status(model_id: str) -> str:
 
     Returns one of:
       - ``"supported"``    — an arch in the config sets ``_supports_flex_attn=True``.
-      - ``"unsupported"``  — the probe succeeded but no arch supports flex (e.g. the Qwen3.5/3.6
+      - ``"unsupported"``  — a named arch class RESOLVED but lacks flex support (e.g. the Qwen3.5/3.6
         hybrid-GDN ``Qwen3_5ForConditionalGeneration``; HF issue #34809).
-      - ``"probe_failed"`` — the config probe raised (offline / transient HF error / unknown model).
+      - ``"probe_failed"`` — the config probe raised (offline / transient HF error / unknown model),
+        the config lists NO architectures, OR none of the named arch classes resolve on the
+        top-level ``transformers`` module (e.g. remote-code-only classes) — i.e. we couldn't even
+        determine support.
 
     The two not-``"supported"`` cases are deliberately distinct so the caller can report an ACCURATE
-    reason: ``"unsupported"`` is a real arch limitation, but ``"probe_failed"`` may be transient and
-    flex could actually work once the config is reachable. Best-effort: reads the config only (no
-    instantiate, no weights).
+    reason: ``"unsupported"`` is a CONFIRMED arch limitation (a class resolved and lacked flex), but
+    ``"probe_failed"`` may be transient / undetermined and flex could actually work once support can
+    be checked. Best-effort: reads the config only (no instantiate, no weights).
     """
     try:
         import transformers
@@ -78,11 +81,19 @@ def flex_attn_status(model_id: str) -> str:
             # "couldn't tell" (like a failed probe), NOT a real arch limitation, so don't report
             # the definitive "unsupported".
             return "probe_failed"
+        resolved_any = False  # did at least one named arch class actually resolve on `transformers`?
         for arch in archs:
             cls = getattr(transformers, arch, None)
-            if cls is not None and getattr(cls, "_supports_flex_attn", False):
+            if cls is None:
+                continue  # class not importable in this transformers version (e.g. remote-code only)
+            resolved_any = True
+            if getattr(cls, "_supports_flex_attn", False):
                 return "supported"
-        return "unsupported"
+        # A class RESOLVED but none set _supports_flex_attn -> a CONFIRMED arch limitation.
+        # NONE resolved -> "class not found" is "couldn't determine", NOT a confirmed limitation,
+        # so report probe_failed (same spirit as the empty-architectures case above) instead of
+        # wrongly logging the arch as unsupported.
+        return "unsupported" if resolved_any else "probe_failed"
     except Exception:
         # Pure status helper: the caller (worker / bench) logs the SKIPPED reason exactly once, so
         # this doesn't double-log — it returns the status and lets the caller decide what to report.

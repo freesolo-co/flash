@@ -388,3 +388,28 @@ def test_sft_estimate_includes_capped_logits_term():
     fused_big = e(0.8, "sft", seq_len=2048, vocab=248_320, batch_size=8)
     fused_small = e(0.8, "sft", seq_len=2048, vocab=8_000, batch_size=8)
     assert abs(fused_big - fused_small) < 1e-6
+
+
+def test_sft_estimate_respects_flce_flag(monkeypatch):
+    """The SFT VRAM estimate gates the fused-CE saving on the OPERATOR's FLASH_FLCE_KERNEL flag, the
+    SAME gate run_sft applies — so when an operator disables FLCE the estimate stops banking the
+    fused saving and RESERVES the big-vocab logits term, matching the worker's large-vocab cap (the
+    bug: estimate used sft_logits_fused alone and undershot when FLCE was off)."""
+    from flash.engine.vram import estimate_vram_gb as e
+
+    # A ≥3B / long-ctx run: sft_logits_fused() is True, so with FLCE ON (default) the term is fused
+    # away and a big vocab doesn't inflate the estimate.
+    monkeypatch.delenv("FLASH_FLCE_KERNEL", raising=False)
+    on_big = e(4.0, "sft", seq_len=2048, vocab=248_320, batch_size=8)
+    on_small = e(4.0, "sft", seq_len=2048, vocab=8_000, batch_size=8)
+    assert abs(on_big - on_small) < 1e-6  # FLCE on -> no logits term
+
+    # FLCE OFF: the estimate must now UN-fuse and reserve the big-vocab logits term (goes up), so the
+    # allocator provisions for the worker's un-fused peak instead of undershooting.
+    monkeypatch.setenv("FLASH_FLCE_KERNEL", "0")
+    off_big = e(4.0, "sft", seq_len=2048, vocab=248_320, batch_size=8)
+    assert off_big > on_big  # FLCE off -> logits term reserved -> larger estimate
+
+    # An explicitly threaded `fused` overrides the flag (the param the worker can pass through).
+    forced = e(4.0, "sft", seq_len=2048, vocab=248_320, batch_size=8, fused=True)
+    assert abs(forced - on_big) < 1e-6
