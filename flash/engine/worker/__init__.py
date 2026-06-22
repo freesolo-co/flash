@@ -49,11 +49,15 @@ from flash.engine.worker.lora import (
     _VL_EXCLUDE_SEGMENTS,  # noqa: F401
     _patch_peft_weight_converter_compat,
     _remap_vl_sync_weights,  # noqa: F401
+    assert_lora_applied,
     is_vl_checkpoint,
     lora_exclude_modules,
     model_quant,
     patch_vllm_language_model_only,
     patch_vllm_lm_weight_sync,
+    remap_adapter_keys,  # noqa: F401
+    remap_vl_adapter_dir,
+    strip_language_model_infix,  # noqa: F401
     vllm_language_model_only_kwargs,  # noqa: F401
 )
 from flash.engine.worker.perf import (
@@ -1237,6 +1241,13 @@ def _init_adapter_model(model_id: str):
     from transformers import AutoModelForCausalLM
 
     print(f"[init-adapter] initializing LoRA from {prefix}")
+    # VL checkpoints (Qwen3.5/3.6): the SFT step saved the adapter against the FULL multimodal model
+    # (keys under ``base_model.model.model.language_model.layers.*``), but we load the base here via
+    # AutoModelForCausalLM (text-only tree, ``base_model.model.model.layers.*``). Strip the
+    # ``.language_model.`` infix on disk so PeftModel.from_pretrained matches the SFT keys —
+    # otherwise peft only WARNS about missing keys and silently trains a fresh LoRA, discarding the
+    # SFT. No-op for non-VL checkpoints. See flash/engine/worker/lora.py.
+    remap_vl_adapter_dir(adir, model_id)
     # 4-bit-QLoRA tier: load the frozen base in NF4 so a continued-adapter GRPO run fits
     # the same memory budget as a fresh-LoRA one (and TRL still sees Linear4bit modules ->
     # bitsandbytes vLLM rollout).
@@ -1260,6 +1271,9 @@ def _init_adapter_model(model_id: str):
             **({"attn_implementation": _attn} if _attn else {}),
         )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
+    # Fail loudly if the adapter didn't actually apply (a future key-mismatch regression would
+    # otherwise silently start GRPO from the base model again).
+    assert_lora_applied(model, model_id)
     return model, None
 
 
