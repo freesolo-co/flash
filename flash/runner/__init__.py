@@ -287,5 +287,4 @@ from flash.runner.lifecycle import (  # noqa: E402,F401
     _run_seed_loop,
     _spec_with_gpu,
     _submit_seed_supervised,
-    is_infra_shaped,
 )
