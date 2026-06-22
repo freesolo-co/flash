@@ -640,14 +640,16 @@ def make_lora(model_id: str | None = None):
         "target_modules": targets,
         "task_type": "CAUSAL_LM",
     }
-    # Adapter initialization (convergence lever: measured -35% train loss in A/B (gpu-bench)).
-    # PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds) so LoRA
-    # converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
-    # NOTE: PiSSA mutates the effective base, so the saved adapter is a PiSSA-residual unless
-    # converted — fine for our train+eval+serve-same-stack flow. PiSSA's SVD needs an UNQUANTIZED
-    # base, which the bf16-everywhere catalog always provides.
-    kwargs["init_lora_weights"] = "pissa_niter_16"
-    print("[lora] init_lora_weights=pissa_niter_16")
+    # Adapter initialization: standard zero-B init (the LoRA delta starts at zero, so the saved
+    # adapter is a plain residual that loads correctly onto the ORIGINAL base).
+    # PiSSA was removed (sync with origin/dev #78/#79): it mutates the effective base during
+    # training, so its saved adapter only reconstructs against the PiSSA-residual base. Loading that
+    # adapter onto the unmodified base at SERVING or GRPO WARM-START (which is exactly our flow)
+    # corrupts the model -> the served model emits only whitespace and warm-start GRPO hangs. peft
+    # can convert PiSSA->standard on save, but the simpler, robust choice is the default init (the
+    # convergence gain isn't worth silently breaking serve + warm-start).
+    kwargs["init_lora_weights"] = True
+    print("[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)")
     # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
     kwargs["use_rslora"] = True
     if model_id and targets == "all-linear":
