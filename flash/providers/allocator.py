@@ -76,12 +76,22 @@ def _runpod_candidates(need: int, exclude_gpu_classes: frozenset[str]) -> list[C
     Restricted to the validated pool (``g.validated``): the deployed control plane rejects a submit
     for any non-validated class, so allocating one would only fail at submit time. Any class in
     ``exclude_gpu_classes`` is dropped — used to walk OFF a MIG-prone class (a class RunPod has been
-    seen fulfilling with a MIG slice) onto a different one on the infra-retry path."""
+    seen fulfilling with a MIG slice) onto a different one on the infra-retry path.
+
+    Classes flagged ``runpod_mig_risk`` are skipped UP FRONT on RunPod: RunPod has been observed
+    serving these validated *types* (RTX A5000, RTX Pro 6000 WK) as Blackwell MIG slices, which crash
+    training (PyTorch's CUDA allocator NVML-asserts on MIG partitions) and burn the run after the
+    retry budget. The flag is RunPod-specific — these classes stay in the validated pool and remain
+    eligible on Vast (which rents whole boards), so this exclusion does NOT touch ``_vast_candidates``.
+    """
     provider = get_provider("runpod")
     return [
         Candidate("runpod", g.name, provider.hourly_rate(g.name), g.vram_gb)
         for g in provider.gpu_classes()
-        if g.vram_gb >= need and g.validated and g.name not in exclude_gpu_classes
+        if g.vram_gb >= need
+        and g.validated
+        and not g.runpod_mig_risk
+        and g.name not in exclude_gpu_classes
     ]
 
 
