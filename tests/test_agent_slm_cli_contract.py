@@ -1,13 +1,14 @@
-"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the
-`slm` CLI and consumes its run-id / run-state / metrics outputs. This asserts that
-the flash side of that seam still provides what the agent depends on.
+"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the CLI —
+it invokes `slm`, the deprecated alias of `flash` (same entrypoint, kept for back-compat) —
+and consumes its run-id / run-state / metrics outputs. This asserts that the flash side of
+that seam still provides what the agent depends on.
 
 The agent package lives in a sibling folder (../agent/src) that is NOT installed in
 the flash venv, so we add it to sys.path here (mirroring how the existing
 end-to-end tests import across packages). When that import can't resolve, the
 agent-side assertions are skipped rather than failing the flash suite.
 
-Run: cd flash && FLASH_SKIP_NET=1 .venv/bin/python -m pytest \
+Run: cd flash && .venv/bin/python -m pytest \
         tests/test_agent_slm_cli_contract.py -q
 """
 
@@ -57,7 +58,8 @@ from flash.runner import (
     ],
 )
 def test_agent_required_subcommands_exist(subcommand: str) -> None:
-    """The agent's worker drives `slm train/status/logs/ps/cancel/env install/...`.
+    """The agent's worker drives the CLI's `train/status/logs/ps/cancel/env install/...`
+    subcommands (invoked as `slm`, the deprecated alias of `flash` — see the module docstring).
 
     argparse exits with code 2 and an 'invalid choice' message when a subcommand
     does not exist. We invoke each with `--help`, which exits 0 for a real
@@ -67,21 +69,21 @@ def test_agent_required_subcommands_exist(subcommand: str) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main([subcommand, "--help"])
     # --help exits 0 for an existing subcommand; an unknown subcommand exits 2.
-    assert excinfo.value.code == 0, f"`slm {subcommand}` is missing from the CLI"
+    assert excinfo.value.code == 0, f"`flash {subcommand}` is missing from the CLI"
 
 
 def test_env_install_subcommand_exists() -> None:
-    """The migration seam: the agent installs published Hub envs via `slm env install`."""
+    """The migration seam: the agent installs published Hub envs via `flash env install`."""
     with pytest.raises(SystemExit) as excinfo:
         main(["env", "install", "--help"])
-    assert excinfo.value.code == 0, "`slm env install` is missing from the CLI"
+    assert excinfo.value.code == 0, "`flash env install` is missing from the CLI"
 
 
 def test_env_push_subcommand_exists() -> None:
-    """The agent publishes a locally-authored verifiers env via `slm env push`."""
+    """The agent publishes a locally-authored verifiers env via `flash env push`."""
     with pytest.raises(SystemExit) as excinfo:
         main(["env", "push", "--help"])
-    assert excinfo.value.code == 0, "`slm env push` is missing from the CLI"
+    assert excinfo.value.code == 0, "`flash env push` is missing from the CLI"
 
 
 def test_unknown_subcommand_is_rejected() -> None:
@@ -93,7 +95,7 @@ def test_unknown_subcommand_is_rejected() -> None:
 
 
 def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
-    """`slm train --dry-run` is the fully-local path the agent uses to validate a
+    """`flash train --dry-run` is the fully-local path the agent uses to validate a
     config without a server/GPU. The agent reads `run_id` + `state` from the JSON it
     prints (see codex/outputs.py run_id field), so this asserts those keys exist with
     a real run id and a `dry_run` state — fully offline.
@@ -139,10 +141,10 @@ def test_new_run_id_format_is_filesystem_safe_and_stable() -> None:
 
 
 def test_agent_tracker_run_id_round_trips_through_resolver(tmp_path: Path) -> None:
-    """End-to-end of the run-id seam: an flash run id written into the agent's
+    """End-to-end of the run-id seam: a flash run id written into the agent's
     progress.json tracker (as best_run_id) must be read back unchanged by the agent's
     resolve_training_run_id, and reflected into the summary JSON. This is exactly the
-    flow `slm train` -> tracker -> agent output uses, so a change to either the id
+    flow `flash train` -> tracker -> agent output uses, so a change to either the id
     format or the tracker field name breaks it.
     """
     common = _import_agent("workflows.common")
@@ -168,7 +170,7 @@ def test_agent_tracker_run_id_round_trips_through_resolver(tmp_path: Path) -> No
 def test_agent_terminal_states_subset_of_flash_terminal_states() -> None:
     """The agent waits for a run to reach a terminal state before reading final
     metrics. flash.runner.TERMINAL_STATES is the source of truth; the CLI's
-    _CLI_DONE_STATES (what `slm`/the agent polls until) must be a superset and must
+    _CLI_DONE_STATES (what `flash`/the agent polls until) must be a superset and must
     include every flash terminal state, or the agent could poll forever on a state
     the CLI never treats as done.
     """
@@ -181,7 +183,7 @@ def test_agent_terminal_states_subset_of_flash_terminal_states() -> None:
 
 
 def test_get_status_returns_fields_the_agent_reads(tmp_path, monkeypatch) -> None:
-    """`slm status <run_id>` returns the run's status JSON; the agent reads `state`
+    """`flash status <run_id>` returns the run's status JSON; the agent reads `state`
     and `run_id` from it (and the CLI's cost/ps commands read cost_usd/spec). Assert a
     persisted RunStatus exposes those keys so a field rename in RunStatus can't
     silently strip what the agent/CLI consume.

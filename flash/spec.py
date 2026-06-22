@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -26,11 +25,12 @@ def _str_tuple(value: Any) -> tuple[str, ...]:
     return tuple(s for s in (str(x) for x in value) if s)
 
 
-def _coerce_bool(value: Any) -> bool:
-    """Parse a bool from loosely-typed spec sources (JSON/env/persisted dicts).
+def coerce_bool(value: Any) -> bool:
+    """Parse a bool from loosely-typed sources (JSON request bodies / env / persisted dicts).
 
-    bool(...) on a string is truthy for ANY non-empty string, so "false"/"0" would
-    wrongly become True; treat the usual falsey strings as False.
+    bool(...) on a string is truthy for ANY non-empty string, so "false"/"0"/"no" would
+    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False, so
+    e.g. JSON ``"is_new": "false"`` is parsed as False. An already-bool value passes through.
     """
     if isinstance(value, str):
         return value.strip().lower() not in _FALSE_STRINGS
@@ -73,34 +73,14 @@ def _opt_int(value: Any) -> int | None:
     """Parse an optional int from a loosely-typed spec source; None stays None.
 
     Rejects JSON booleans: ``bool`` is an ``int`` subclass in Python, so ``int(True)`` would
-    silently coerce a stray boolean train knob to 1 (and ``False`` to 0). Also rejects
-    non-integer floats (e.g. ``2.9``) instead of silently truncating to ``2`` — for a topology
-    knob like ``train.inference_gpus`` that would re-hydrate a different rollout split than the
-    schema validated. Mirrors the bool + finite-integer rejection in schema._train_int — a
-    bool is a type error, and a fractional value is not an integer.
+    silently coerce a stray boolean train knob to 1 (and ``False`` to 0). Mirrors the
+    bool rejection in schema._train_int — a bool is a type error, not a number.
     """
     if value is None:
         return None
     if isinstance(value, bool):
         raise TypeError(f"expected a number, got bool {value!r}")
-    if isinstance(value, float):
-        if not math.isfinite(value) or float(value) != int(value):
-            raise TypeError(f"expected an integer, got non-integer float {value!r}")
-        return int(value)
     return int(value)
-
-
-def _req_int(value: Any, *, default: int) -> int:
-    """Parse a required int from a loosely-typed spec source, applying ``default`` for None.
-
-    Like ``_opt_int`` but never returns None — for re-hydrating topology fields such as
-    ``gpu.count`` that drive paid multi-GPU provisioning. A bare ``int()`` there would accept
-    ``True`` as ``1`` and truncate ``2.9`` -> ``2``, silently provisioning a different topology
-    than the schema (schema._require_int) validated on the inbound request.
-    """
-    if value is None:
-        return default
-    return _opt_int(value)  # type: ignore[return-value]  # non-None in -> non-None out
 
 
 def _opt_float(value: Any) -> float | None:
@@ -139,8 +119,10 @@ class TrainSpec:
     # LoRA from instead of training fresh — e.g. a GRPO run continuing an SFT adapter.
     init_from_adapter: str = ""
     # Per-run HuggingFace artifact repo ("owner/name") for this run's adapter/checkpoint/
-    # code storage AND serving. REQUIRED (validated in schema._validate_spec); there is no
-    # operator-wide default. The operator's HF_TOKEN must have write access to it.
+    # code storage AND serving. PLATFORM-MANAGED, not a user field: the control plane assigns
+    # it server-side in runner.submit_job (a per-run private dataset under the operator's
+    # namespace, written by the operator HF_TOKEN). A user-supplied value is ignored by
+    # schema.spec_from_dict; this field carries the control-plane-assigned repo to the worker.
     hf_repo: str = ""
     # Optimizer/batching knobs (SFT + GRPO). None -> the worker's tuned recipe default.
     # batch_size is the GLOBAL/effective batch (SFT: grad-accum is sized to hit it; GRPO:
@@ -167,42 +149,16 @@ class TrainSpec:
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
     stop_sequences: tuple[str, ...] = ()
-    # Periodic mid-run eval cadence (GRPO ONLY; ignored for SFT): every ``eval_every_steps``
-    # optimizer steps, greedily evaluate the policy on the ENVIRONMENT's held-out ``eval_dataset``
-    # with the env's rubric (reward + eval-metric metrics) and record the curve into metrics.json,
-    # so the agent judges the run on held-out eval, not just the training reward. 0/None disables.
-    # The eval queries and grading logic live in the environment, and the completion budget
-    # matches the run's normal ``max_tokens``.
-    eval_every_steps: int | None = None
-    # How many held-out examples each mid-run eval pass scores: a FIXED random sample of this
-    # many rows (seeded, so the same subset every pass -> a comparable curve), instead of the
-    # whole eval split (which can be huge and dominate training). None/0 -> the built-in default (64).
-    eval_examples: int | None = None
-    # Disaggregated (async) GRPO rollout: number of GPUs in the node dedicated to the vLLM rollout
-    # server, the rest train (see engine.rollout_bench.select_rollout_split). 0 = colocate (the
-    # current single-GPU TRL path). >0 requires a multi-GPU node ([gpu] count = train + inference).
-    inference_gpus: int = 0
 
 
 @dataclass(frozen=True)
 class GpuSpec:
+    # The parse-time provisional GPU class (cheapest VALIDATED class that fits the model). GPU
+    # pinning is gone: the submit-time allocator always re-picks the cheapest fitting validated
+    # class across ALL providers, so a config's gpu.type does NOT pin — ``type`` is just the
+    # offline sizing/display default and the carrier the runner overwrites with the
+    # actually-allocated class.
     type: str = DEFAULT_GPU
-    # Number of GPUs in the node (= trainer GPUs + [train].inference_gpus). 1 = single-GPU
-    # (colocate, the default). >1 provisions a multi-GPU node (Vast: an offer with num_gpus==count;
-    # RunPod Flash: gpu_count on the endpoint) for the disaggregated async GRPO path
-    # (see engine.rollout_bench / engine.disaggregated). All GPUs are the same `type`.
-    count: int = 1
-    # GPU substrate: "auto" (cheapest across providers at submit time), "runpod", or
-    # "vast" (verified datacenters only).
-    provider: str = "auto"
-    # The raw user gpu.type input ("cheapest"/"auto" or a concrete class), always set
-    # by config parsing. The runner re-allocates the class at submit time iff
-    # this is a policy word — ``type`` is then just the parse-time provisional; a
-    # concrete ``requested`` pins the class and the allocator only picks the provider.
-    requested: str = ""
-    # Whether to allow GPU classes Flash hasn't validated. Set only by the [gpu]
-    # allow_unvalidated TOML field; None leaves it disallowed.
-    allow_unvalidated: bool | None = None
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
@@ -304,16 +260,9 @@ class JobSpec:
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
-                eval_every_steps=_opt_int(train.get("eval_every_steps")),
-                eval_examples=_opt_int(train.get("eval_examples")),
-                inference_gpus=_opt_int(train.get("inference_gpus")) or 0,
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),
-                count=_req_int(gpu.get("count"), default=1),
-                provider=gpu.get("provider", "auto"),
-                requested=gpu.get("requested", ""),
-                allow_unvalidated=gpu.get("allow_unvalidated"),
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 2)),
@@ -324,7 +273,7 @@ class JobSpec:
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),
             model_policy=data.get("model_policy", "catalog"),
-            thinking=_coerce_bool(data.get("thinking", False)),
+            thinking=coerce_bool(data.get("thinking", False)),
             wandb=_coerce_wandb(data.get("wandb")),
         )
 

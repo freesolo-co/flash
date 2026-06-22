@@ -52,8 +52,8 @@ def test_thinking_rejected_for_non_thinking_model():
 
 
 def test_always_thinking_model_requires_flag(monkeypatch):
-    # No curated always-thinker yet; simulate one via the resolver. Stub the GPU policy
-    # too so the unlisted id never triggers the network-backed open-model sizing path.
+    # No curated always-thinker yet; simulate one via the resolver. Stub the provisional GPU
+    # sizing too so the unlisted id never triggers the network-backed open-model sizing path.
     info = ModelInfo(
         id="acme/r1-distill",
         display_name="acme r1",
@@ -63,19 +63,19 @@ def test_always_thinking_model_requires_flag(monkeypatch):
         thinking="always",
     )
     monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
-    monkeypatch.setattr("flash.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
+    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "RTX 5090")
     # An always-thinker can't run with thinking OFF (the default); the rejection triggers on the
     # default-off as well as an explicit thinking=false.
     with pytest.raises(ConfigError) as ei:
-        spec_from_dict(_raw(model="acme/r1-distill", model_policy="allow", thinking=False))
+        spec_from_dict(_raw(model="acme/r1-distill", thinking=False))
     assert "thinking = true" in str(ei.value)
-    spec = spec_from_dict(_raw(model="acme/r1-distill", model_policy="allow", thinking=True))
+    spec = spec_from_dict(_raw(model="acme/r1-distill", thinking=True))
     assert spec.thinking is True
 
 
 def test_thinking_unknown_capability_warns_but_allows(monkeypatch, capsys):
     # Open-model-policy entries resolve to thinking="unknown": the run proceeds with a
-    # warning rather than a hard error. Stub the resolver + GPU policy (no network).
+    # warning rather than a hard error. Stub the resolver + provisional GPU sizing (no network).
     info = ModelInfo(
         id="acme/tiny-1b",
         display_name="acme tiny",
@@ -85,10 +85,13 @@ def test_thinking_unknown_capability_warns_but_allows(monkeypatch, capsys):
         thinking="unknown",
     )
     monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
-    monkeypatch.setattr("flash.schema.resolve_gpu_policy", lambda *a, **k: "RTX 5090")
-    spec = spec_from_dict(_raw(model="acme/tiny-1b", model_policy="allow", thinking=True))
+    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "RTX 5090")
+    spec = spec_from_dict(_raw(model="acme/tiny-1b", thinking=True))
     assert spec.thinking is True
-    assert "warning" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    # Warning goes to stderr (stdout is reserved for the MCP server's JSON protocol).
+    assert "warning" in captured.err
+    assert "warning" not in captured.out
 
 
 def test_thinking_must_be_boolean():

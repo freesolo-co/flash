@@ -1,11 +1,10 @@
 """Control-plane API: freesolo bearer auth, multi-tenant isolation (CPU-only).
 
-User auth is freesolo API keys only (no native key system). Tests run offline
-(FLASH_SKIP_NET=1): the `api` fixture monkeypatches ``auth._freesolo_verify`` to accept
-any token shaped like a freesolo user key, so each distinct token resolves to its own
-run-ownership identity via ``db.ensure_external_key``. All runs are dry-run so nothing
-touches the network; operator env vars are dummies (the startup preflight only checks
-presence).
+User auth is freesolo API keys only (no native key system). Tests run offline: the `api`
+fixture monkeypatches ``auth._freesolo_verify`` to accept any token shaped like a freesolo
+user key, so each distinct token resolves to its own run-ownership identity via
+``db.ensure_external_key``. All runs are dry-run so nothing touches the network; operator
+env vars are dummies (the startup preflight only checks presence).
 """
 
 from __future__ import annotations
@@ -65,8 +64,8 @@ def api(tmp_path, monkeypatch):
     import flash.server.app as app_mod
 
     importlib.reload(app_mod)
-    # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. The real
-    # network verify never runs (FLASH_SKIP_NET is set for the suite anyway).
+    # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
+    # replaces the real network verify.
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     with TestClient(app_mod.create_app()) as client:
@@ -120,7 +119,7 @@ def test_internal_key_rejected_when_unconfigured(api):
 
 
 def test_freesolo_user_key_authenticates(api, monkeypatch):
-    # A user who `slm login`s with a freesolo key sends it as the bearer. With the token
+    # A user who `flash login`s with a freesolo key sends it as the bearer. With the token
     # verified by the backend it authenticates and resolves to a stable per-token identity
     # (its own run-ownership row).
     import flash.server.auth as auth_mod
@@ -175,7 +174,6 @@ def test_freesolo_verify_does_not_cache_network_errors(monkeypatch):
     # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -209,7 +207,6 @@ def test_freesolo_verify_5xx_transient_but_4xx_cached(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -257,7 +254,6 @@ def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -314,7 +310,6 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     def boom(*a, **k):
         raise AssertionError("oversized token must not reach the network")
@@ -325,20 +320,23 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
     assert huge not in auth_mod._verify_cache
 
 
-def test_freesolo_user_key_no_network_when_skip_net(api, monkeypatch):
-    # FLASH_SKIP_NET set: _freesolo_verify short-circuits before any network call (urlopen is
-    # patched to blow up to prove it's never called) and authenticate returns None.
+def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch):
+    # When the backend verify can't be reached (the offline test harness makes urlopen fail),
+    # _freesolo_verify returns False and authenticate yields None — an unverifiable key is
+    # never admitted.
+    import urllib.error
+
     import flash.server.auth as auth_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    # Drop the fixture's stub so the real _freesolo_verify (with its SKIP_NET guard) runs.
+    # Drop the fixture's stub so the real _freesolo_verify runs, and make the backend
+    # unreachable (offline): the verify can't be reached.
     importlib.reload(auth_mod)
-
-    def boom(req, timeout=None):
-        raise AssertionError("no network call may happen under FLASH_SKIP_NET")
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(
+        auth_mod.urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("offline")),
+    )
     assert auth_mod.authenticate("Bearer unknown-token") is None
 
 
@@ -350,7 +348,6 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
     # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     calls = {"n": 0}
 
     def fake_urlopen(req, timeout=None):
@@ -385,7 +382,6 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     class _Resp:
         status = 200
@@ -495,6 +491,63 @@ def test_deploy_dry_run(api):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_deploy_serving_error_is_clean_502(api, monkeypatch):
+    """A serving-backend failure during deploy surfaces as a clean 502 with the upstream
+    reason — NOT an unhandled 500 + traceback. This is the main user-facing behavior change
+    of the route: ServingError (raised by deploy_adapter when freesolo serving rejects the
+    registration or is unreachable) is translated to HTTPException(502)."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    # Make the run real-deployable: flip its persisted state to "done" (a finished run with
+    # trained adapter artifacts). Ownership lives in the DB, so this only changes the gate.
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+
+    # The serving backend rejects the registration (e.g. upstream 5xx). deploy_adapter is
+    # imported into the app namespace, so patch it there.
+    def boom(**kwargs):
+        raise ServingError("serving backend unreachable: no engine for base model")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", boom)
+
+    resp = api.post(
+        f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key)
+    )
+    assert resp.status_code == 502, resp.text
+    # The 502 carries the upstream reason verbatim, not a generic/unhandled-500 body.
+    assert "serving backend unreachable" in resp.json()["detail"]
+    # The failed deploy left no active deployment record behind.
+    assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
+
+
+def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
+    """An undeploy that hits a serving-backend failure surfaces as a clean 502 (same as deploy),
+    not an unhandled 500: ServingError from undeploy_adapter is translated to HTTPException(502)."""
+    import flash.server.app as app_mod
+    from flash.serve.deploy import ServingError
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+
+    def boom(_run_id):
+        raise ServingError("serving backend unreachable: could not delete endpoint")
+
+    monkeypatch.setattr(app_mod, "undeploy_adapter", boom)
+
+    resp = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+    assert resp.status_code == 502, resp.text
+    assert "serving backend unreachable" in resp.json()["detail"]
+
+
 def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     # A finished run (state="done") MUST be deployable: mark_deployed has to record the
     # deployment and flip to "deployed". But a cancelled/failed run must never be flipped
@@ -572,10 +625,14 @@ def test_deploy_lock_is_usable_and_weakly_cleaned():
     assert "run-xyz" not in dict(app_mod._DEPLOY_LOCKS)
 
 
-def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
-    # A recoverable run with no persisted handle (crash between endpoint
-    # registration and on_handle) must have its reconstructable RunPod endpoint
-    # GC'd before being failed, so it doesn't hold worker quota until manual cleanup.
+def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
+    # A recoverable run with no persisted handle (crash in the submit->on_handle window,
+    # before any worker was provisioned) must NOT be lost on a control-plane restart: its
+    # reconstructable RunPod endpoint is GC'd (so it doesn't hold worker quota), then the run
+    # is RESUBMITTED from scratch — there is no remote work to reattach to, so a fresh job is
+    # the only way to preserve the session.
+    import threading
+
     import flash.runner as runner
     import flash.server.db as db_mod
 
@@ -600,8 +657,235 @@ def test_recover_runs_gcs_no_handle_endpoints(monkeypatch, tmp_path):
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-1"}])
     gced = []
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: gced.append(s.run_id))
+    # Capture the resubmit instead of provisioning a real GPU; recover_runs resolves _run_job
+    # via a function-local `from flash.runner import _run_job`, so patching the package attr wins.
+    resubmitted = []
+    done = threading.Event()
+
+    def fake_run_job(s):
+        resubmitted.append(s.run_id)
+        done.set()
+
+    monkeypatch.setattr(runner, "_run_job", fake_run_job)
 
     app_mod.recover_runs()
 
-    assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint"
-    assert runner.get_status("nohandle-1").state == "failed"
+    assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
+    assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint first"
+    assert resubmitted == ["nohandle-1"], "no-handle run must be resubmitted, not failed"
+    # The resubmit GC's the orphaned endpoint and re-runs the job; the run is NOT failed.
+    assert runner.get_status("nohandle-1").state != "failed"
+
+
+def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
+    # Fault isolation: if the FIRST recoverable run's persisted spec is malformed (e.g. a
+    # legacy `environment.path`, which makes JobSpec.from_dict raise), recovery of that one
+    # run must be skipped — it must NOT abort recover_runs() and thereby skip recovery of
+    # every OTHER in-flight run and the orphan sweep that follows. Here run #1 has a bad spec
+    # and run #2 has a valid no-handle spec: assert run #2 is still resubmitted AND the orphan
+    # sweep still runs (the bad spec didn't take down the whole recovery pass).
+    import threading
+
+    import flash.providers as providers_mod
+    import flash.providers.runpod.train as runpod_train
+    import flash.runner as runner
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+
+    # Run #1: a malformed spec — a legacy local `environment.path` makes from_dict raise.
+    bad_spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "environment": {"path": "/legacy/local/env"},
+        "train": {"steps": 1, "seeds": [0]},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "bad-1",
+    }
+    # Run #2: a valid no-handle spec — must still be recovered (resubmitted) despite run #1.
+    good_spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "train": {"steps": 1, "seeds": [0]},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "good-2",
+    }
+    runner._save_status(
+        runner.RunStatus(run_id="bad-1", state="provisioning", spec=bad_spec, remote=None)
+    )
+    runner._save_status(
+        runner.RunStatus(run_id="good-2", state="provisioning", spec=good_spec, remote=None)
+    )
+    # Order matters: the bad run is iterated FIRST, so an unguarded parse would abort here.
+    monkeypatch.setattr(
+        app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}]
+    )
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+
+    # A malformed spec can't be parsed into a JobSpec, so the good-spec branch's
+    # `_gc_run_endpoints(spec)` is unavailable — yet the aborted attempt may still have
+    # registered its uniquely-named RunPod endpoint before crashing, which the no-op RunPod
+    # `sweep_orphans` won't reap. recover_runs must instead derive the endpoint name from the
+    # RAW persisted status (gpu.type + run_id, no spec parse) and `terminate_endpoint` it.
+    # The malformed path imports it via `from flash.providers.runpod.train import
+    # terminate_endpoint`, so patch the attribute on that module and record the call args.
+    terminated = []
+    monkeypatch.setattr(
+        runpod_train,
+        "terminate_endpoint",
+        lambda gpu_type, run_id=None: terminated.append((gpu_type, run_id)) or [],
+    )
+
+    # The orphan sweep must still run after the loop. recover_runs resolves it via a
+    # function-local `from flash.providers import configured_providers`, so patch the
+    # package attr; record that sweep_orphans fired.
+    swept = threading.Event()
+
+    class _FakeProvider:
+        def sweep_orphans(self, active_labels=None):
+            swept.set()
+            return []
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeProvider()])
+
+    resubmitted = []
+    done = threading.Event()
+
+    def fake_run_job(s):
+        resubmitted.append(s.run_id)
+        done.set()
+
+    monkeypatch.setattr(runner, "_run_job", fake_run_job)
+
+    app_mod.recover_runs()
+
+    assert done.wait(timeout=5), "the valid run must still be resubmitted despite a prior bad spec"
+    assert resubmitted == ["good-2"], "only the valid run resubmits; the malformed one is skipped"
+    assert swept.is_set(), "a malformed spec must not abort the orphan sweep that follows the loop"
+
+    # The malformed run must NOT be silently skipped and left recoverable (it would be
+    # retried-then-skipped on every restart forever, invisible to the user). It must be
+    # persisted as terminal `failed` with an operator-visible error note, so it surfaces to
+    # the user AND drops out of the recoverable set (never re-attempted).
+    bad_status = runner.get_status("bad-1")
+    assert bad_status.state == "failed", "an unparseable persisted spec must be marked failed"
+    assert bad_status.state in runner.TERMINAL_STATES, "failed is terminal, so it won't recover again"
+    assert bad_status.state not in app_mod._RECOVERABLE, "the failed run leaves the recoverable set"
+    assert bad_status.error, "the failed run must carry an operator-visible error note"
+    assert "unrecoverable" in bad_status.error, (
+        "the failure note must explain the malformed spec to the operator"
+    )
+
+    # Resource-leak guard: even though the spec couldn't be parsed, the malformed run's RunPod
+    # endpoint must still be torn down — derived from the RAW persisted gpu.type + run_id, not
+    # from a JobSpec — so a crash that registered an endpoint before persisting a handle can't
+    # leak it (RunPod's `sweep_orphans` is a no-op and would never catch it). Best-effort GC
+    # must run for the malformed run AND not have aborted the failed-marking / sweep / resubmit
+    # above (all already asserted), proving it's properly suppressed and ordered.
+    assert ("RTX 5090", "bad-1") in terminated, (
+        "a malformed-spec run's endpoint must be GC'd by reconstructed name (raw gpu.type + "
+        "run_id), since its spec can't be parsed and the RunPod orphan sweep is a no-op"
+    )
+
+
+def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
+    """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
+    plane's PRIME_API_KEY), namespaced per identity — so the user needs no Prime account."""
+    import base64
+    import io
+    import tarfile
+
+    import flash.server.envs as envs_mod
+
+    # Stub the actual `prime env push` so the test doesn't hit Prime; echo the namespaced name.
+    monkeypatch.setattr(
+        envs_mod, "_prime_push", lambda env_dir, *, name, is_new: f"freesolo-co/{name}"
+    )
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in (
+            ("pyproject.toml", b"[project]\nname='e'\n"),
+            ("e/__init__.py", b"x=1\n"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    pkg = base64.b64encode(buf.getvalue()).decode()
+
+    resp = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "MyEnv", "is_new": True, "package_b64": pkg},
+    )
+    assert resp.status_code == 200
+    slug = resp.json()["id"]
+    assert slug.startswith("freesolo-co/")  # published under the managed account
+    assert slug.endswith("-myenv")  # per-identity namespaced + sanitized
+
+    # Unauthenticated requests are rejected.
+    assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
+
+
+def test_publish_env_parses_is_new_robustly(api, monkeypatch):
+    """`is_new` from the JSON body must be parsed as a real bool: the string "false"/"0" is False
+    (a plain bool() would make any non-empty string True), and it defaults to True when absent."""
+    import base64
+    import io
+    import tarfile
+
+    import flash.server.envs as envs_mod
+
+    seen: dict = {}
+
+    def fake_push(env_dir, *, name, is_new):
+        seen["is_new"] = is_new
+        return f"freesolo-co/{name}"
+
+    monkeypatch.setattr(envs_mod, "_prime_push", fake_push)
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for nm, content in (("pyproject.toml", b"[project]\nname='e'\n"), ("e/__init__.py", b"x=1\n")):
+            info = tarfile.TarInfo(nm)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    pkg = base64.b64encode(buf.getvalue()).decode()
+
+    def _publish(body_extra):
+        resp = api.post(
+            "/v1/envs",
+            headers=_bearer(_login()),
+            json={"name": "e", "package_b64": pkg, **body_extra},
+        )
+        assert resp.status_code == 200, resp.text
+        return seen["is_new"]
+
+    # Falsey string forms -> False (the bug: bool("false") was True).
+    assert _publish({"is_new": "false"}) is False
+    assert _publish({"is_new": "0"}) is False
+    assert _publish({"is_new": False}) is False
+    # Truthy forms and absence -> True.
+    assert _publish({"is_new": "true"}) is True
+    assert _publish({"is_new": True}) is True
+    assert _publish({}) is True  # default when absent
+
+
+def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
+    """Regression: a present-but-falsy non-string `name`/`package_b64` (e.g. 0, False, []) must
+    reach publish_package's type check and yield the *type* 400 — not be `or ""`-coerced to an
+    empty string first (which would surface a different/misleading 400)."""
+    # name = 0 -> hits the name type check, not "missing env name".
+    r = api.post("/v1/envs", headers=_bearer(_login()), json={"name": 0, "package_b64": "x"})
+    assert r.status_code == 400, r.text
+    assert "name must be a string" in r.text.lower()
+    # package_b64 = False (valid string name) -> hits the package type check.
+    r2 = api.post("/v1/envs", headers=_bearer(_login()), json={"name": "e", "package_b64": False})
+    assert r2.status_code == 400, r2.text
+    assert "must be a base64 string" in r2.text.lower()

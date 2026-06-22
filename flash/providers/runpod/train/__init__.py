@@ -65,7 +65,7 @@ def upload_code(repo: str | None = None) -> str:
     ``registry.worker_pip_for_env``).
 
     Only the ``flash`` package is uploaded, NOT the client's project tree. Managed runs must
-    reference a published Hub env by ``id`` (``slm env push`` to publish a local env first); the
+    reference a published Hub env by ``id`` (``flash env push`` to publish a local env first); the
     worker pip-installs the env wheel.
     """
     from huggingface_hub import HfApi
@@ -77,7 +77,10 @@ def upload_code(repo: str | None = None) -> str:
             "hf_repo must be set (the run's [train] hf_repo: HF dataset repo for code + artifacts)"
         )
     token = os.environ.get("HF_TOKEN")
-    pkg_dir = os.path.dirname(os.path.abspath(flash.__file__))
+    # ``realpath`` collapses any symlink in the package path so the upload reads the REAL installed
+    # tree, not a link target a redeploy may have re-pointed (e.g. a /current -> /releases/<sha>
+    # symlink layout). This is the package the worker re-imports, so what we upload == what runs.
+    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     api = HfApi(token=token)
     # Run artifact repos are always private (they carry run code, adapters, and metrics).
     api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True)
@@ -92,6 +95,10 @@ def upload_code(repo: str | None = None) -> str:
         repo_id=repo,
         repo_type="dataset",
         ignore_patterns=["__pycache__/*", "*.pyc"],
+        # Exact-mirror code/flash so the worker never re-imports an orphaned/renamed module a prior
+        # additive upload left behind. delete_patterns are relative to path_in_repo, so "**" is
+        # scoped to code/flash (only orphans there are purged; unchanged files are kept).
+        delete_patterns=["**"],
     )
     return repo
 

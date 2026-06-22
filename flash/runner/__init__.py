@@ -66,19 +66,12 @@ class RunStatus:
     artifacts_dir: str | None = None
     deployment: dict | None = None
     # Durable job handle {endpoint_id, endpoint_name, job_id} — lets any process
-    # reattach to / cancel the remote job (see `slm attach`).
+    # reattach to / cancel the remote job (see `flash attach`).
     remote: dict | None = None
     # Index of the next seed to run for a multi-seed job, set while the remote handle
     # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds
     # after an inter-seed restart instead of failing the run (losing completed work).
     resume_seed_index: int | None = None
-    # (provider, class) pairs proven capacity-starved that the resumed seed's FIRST
-    # capacity walk must exclude. Persisted (as [[provider, class], ...] — JSON has no
-    # tuples) ONLY by the no_capacity recovery branch, so a control-plane restart in the
-    # handle-less re-provision gap resumes via recover_runs -> resume_run WITHOUT
-    # re-picking the throttled class. Cleared once a fresh next seed is recorded (the new
-    # seed re-allocates against a clean market) and on terminal done.
-    resume_starved: list[list[str]] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -133,37 +126,39 @@ def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
     return d
 
 
+# The HF namespace the control plane creates per-run artifact repos under: the operator org whose
+# HF_TOKEN the control plane runs with. An operator-infra constant, not a user/env knob.
+_ARTIFACT_NAMESPACE = "Freesolo-Co"
+
+
+def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
+    """Assign the run's HF artifact repo server-side — it is platform-managed, never user-set.
+
+    Each run gets its own private dataset repo ``Freesolo-Co/flashrun-<run_id>``. The control-plane
+    HF_TOKEN creates and writes it (code, adapters, checkpoints, telemetry); a user-chosen namespace
+    would 403 that token at ``upload_code``. Any inbound ``train.hf_repo`` is overwritten. The
+    run_id must be finalized first: a per-run repo keyed on the placeholder ``"local"`` would
+    collide across runs and overwrite each other's code/adapters/state.
+    """
+    if not spec.run_id or spec.run_id == "local":
+        raise ValueError("run_id must be finalized before assigning the per-run artifact repo")
+    repo = f"{_ARTIFACT_NAMESPACE}/flashrun-{spec.run_id}"
+    d = spec.to_dict()
+    d["train"] = {**d["train"], "hf_repo": repo}
+    return JobSpec.from_dict(d)
+
+
 def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     across the configured providers (RunPod Flash or Vast); dry-run only records state."""
-    info = resolve_model(
-        spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type, train=spec.train
-    )
-    # Re-run the GENERIC multi-GPU topology guards here too. `spec_from_dict` runs them at parse, but
-    # a JobSpec built directly or rehydrated via `JobSpec.from_dict()` (a programmatic submission)
-    # reaches submit_job WITHOUT going through the schema, so an invalid topology — gpu.count>1 with
-    # inference_gpus==0 (colocated path strands paid cards), inference_gpus>=gpu.count (no trainer
-    # GPU), or an indivisible TP split — would otherwise pass straight to allocation/provisioning and
-    # only fail on the paid worker. Cheap, spec-only, idempotent for specs that did go through parse.
-    # ConfigError is a ValueError subclass, so it propagates uniformly with the disaggregated guard
-    # below (programmatic callers catch ValueError; the server catches the precise ConfigError).
-    from flash.schema import validate_topology
-
-    validate_topology(spec)
-    # Fail fast: a disaggregated-only model (e.g. Qwen3.6-35B-A3B) can't run colocated GRPO, and a
-    # single-trainer-only model (the 35B) can't use a multi-trainer (>1 trainer card) DDP split.
-    from flash.engine.rollout_bench import validate_disaggregated_requirement
-
-    validate_disaggregated_requirement(
-        requires_disaggregated=info.requires_disaggregated,
-        algorithm=spec.algorithm,
-        inference_gpus=spec.train.inference_gpus,
-        single_trainer_only=getattr(info, "single_trainer_only", False),
-        gpu_count=spec.gpu.count,
-    )
-    spec = JobSpec.from_dict(
-        {**_with_model_disk(spec, info), "run_id": spec.run_id or new_run_id()}
-    )
+    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
+    # Finalize the run_id BEFORE assigning the per-run artifact repo. The JobSpec default run_id is
+    # the placeholder "local" (truthy), so `or new_run_id()` alone would keep it; treat "local" as
+    # unset so programmatic/test callers also get a unique id and per-run repos never collide.
+    run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
+    spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
+    # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
+    spec = _assign_managed_hf_repo(spec)
     status = RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
     _save_status(status)
     if dry_run:
@@ -216,10 +211,7 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     # a policy GPU can be re-allocated to a different RunPod class at submit time, so
     # the worker stamps "allocated_gpu" into metrics for the cost fallback below.
     gpu_type = metrics.get("allocated_gpu") or spec.gpu.type
-    # _gpu_rate is the PER-CARD RunPod price; a disaggregated run rents [gpu] count cards
-    # (trainer + inference), so the wall-based projection below must rate the whole node, not
-    # one card. (Vast stamps its own total cost_usd from the offer and short-circuits this.)
-    rate = _gpu_rate(gpu_type) * max(1, int(getattr(spec.gpu, "count", 1)))
+    rate = _gpu_rate(gpu_type)
     # A non-runpod provider (e.g. Vast) stamps the real cost_usd from its offer's $/hr
     # AND tags notes["provider"] with its own name — and a near-zero-duration run can
     # legitimately stamp cost_usd == 0.0. The RunPod arm, by contrast, never stamps a real
@@ -248,8 +240,15 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     return float(cost)
 
 
-def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> None:
-    # The read-check-write below must be atomic: a concurrent `slm cancel` (also via
+def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
+    """Atomically transition a run's status, honoring terminal-stickiness.
+
+    Returns ``True`` if the transition was applied, ``False`` if it was rejected because
+    the run was already in a terminal state (the sticky compare-and-set below). Callers
+    that gate PAID work on a transition (e.g. the recovery path resuming ``_run_seed_loop``)
+    must check this return so a run concurrently flipped terminal does not get resumed.
+    """
+    # The read-check-write below must be atomic: a concurrent `flash cancel` (also via
     # _update) landing between the get_status read and the _save_status write could
     # otherwise be clobbered by this stale background update, resurrecting a cancelled
     # run. The control plane is single-instance with per-run threads, so a process-wide
@@ -275,12 +274,13 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         # run, so a GENUINE training-completion `done` racing in from the run's own training
         # thread is protected by the CAS below — cancel correctly loses to a real finish.
         if status.state in TERMINAL_STATES and state != status.state and not allow_from_terminal:
-            return
+            return False
         status.state = state
         status.updated_at = time.time()
         for key, value in updates.items():
             setattr(status, key, value)
         _save_status(status)
+        return True
 
 
 def _save_status(status: RunStatus) -> None:

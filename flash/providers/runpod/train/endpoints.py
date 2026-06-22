@@ -390,7 +390,7 @@ def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
     to avoid evicting a concurrent run's handler in the same process.
 
     NOTE: this only touches THIS process's in-memory cache, so it does nothing in a fresh
-    ``slm cancel`` process. Use ``terminate_endpoint`` to actually delete the remote endpoint.
+    ``flash cancel`` process. Use ``terminate_endpoint`` to actually delete the remote endpoint.
     """
     friendly = canonical_gpu(friendly_gpu)
     prefix = f"flash-{gpu_short(friendly)}"

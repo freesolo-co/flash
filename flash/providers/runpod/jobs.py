@@ -9,7 +9,7 @@ the run. This module owns the lifecycle instead:
   build_function_input()   -> the exact FunctionRequest payload Flash workers expect
   submit + poll_job()      -> REST queue API with hardened retries; the job handle
                               {endpoint_id, job_id} is persisted by the runner so
-                              any process can re-attach (`slm attach`).
+                              any process can re-attach (`flash attach`).
 """
 
 from __future__ import annotations
@@ -58,43 +58,26 @@ __all__ = [
 ]
 
 TERMINAL_OK = {"COMPLETED"}
-TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
+# The provider killed the worker (reclaim/preempt/time-cap) -> infra-shaped, retried. A worker
+# "FAILED" is the run dying on its own (real traceback) -> fails fast.
+PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
+TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
 
 # Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
-# training loop begins (boot -> model_prefetched -> sft_start/rl_start, then later
-# sft_model_load/rl_train_start).
-# ``model_prefetched`` is emitted by prefetch_model() the instant the weight download finishes —
-# which in a DISAGGREGATED run lands BEFORE the standalone vLLM server is even launched. It must
-# stay a setup stage: otherwise the prefetch ping flips to the tight training window and the
-# subsequent ~20-min 35B server boot (only ``rl_server_boot`` pings, themselves setup) gets killed
-# by stall_after_s despite making real progress.
-# ``rl_server_boot`` is the disaggregated (multi-GPU) rollout server's boot heartbeat, emitted
-# every ~60s while vLLM loads the model and binds its port — still pre-training, so it likewise
-# stays under setup_grace_s (otherwise the FIRST boot ping would prematurely flip to the tight
-# training window while the server is still booting).
+# training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
 # Receiving one proves the worker is alive but NOT that the slow setup (model download +
 # vLLM init) finished, so they must not flip stall detection to the tight training window.
 _SETUP_HEARTBEAT_STAGES = frozenset(
-    {
-        "boot",
-        "model_prefetched",
-        "sft_start",
-        "rl_start",
-        "sft_model_load",
-        "rl_train_start",
-        "rl_server_boot",
-    }
+    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
 )
 
 
 def stall_kwargs() -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
     run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
-    window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat;
-    ``queue_grace_s`` = how long a job may sit IN_QUEUE (no worker assigned) before it's judged
-    capacity-starved and fails ``no_capacity`` so the orchestrator advances to the next class.
+    window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat.
     """
-    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 720.0}
+    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0}
 
 
 def volume_endpoint_kwargs(spec) -> dict:
@@ -186,7 +169,7 @@ def deploy_train_endpoint(
     # overrides the baked image (e.g. a hotfix tag); since WORKER_IMAGE is a non-empty constant the
     # image is always set, so the boot-install/live-function path is only reachable if both are
     # explicitly cleared (not a normal configuration).
-    image = (os.environ.get("FLASH_WORKER_IMAGE") or "").strip() or WORKER_IMAGE
+    image = os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
     # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
@@ -198,9 +181,7 @@ def deploy_train_endpoint(
         kwargs = dict(
             name=name,
             gpu=flash_gpu(friendly),
-            # GPUs per worker on the endpoint (= trainer + inference_gpus). >1 for the
-            # disaggregated async GRPO path; default 1 (single-GPU colocate).
-            gpu_count=max(1, int(getattr(getattr(spec, "gpu", None), "count", 1))),
+            gpu_count=1,
             min_cuda_version=min_cuda_for(friendly),
             execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
             workers=(0, 1),
@@ -236,7 +217,7 @@ def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict
     of fla's #640-buggy GDN Triton kernel. A bare call would reinstall the generic deps and
     reintroduce that sm90 correctness issue even when the endpoint was configured correctly.
     """
-    if (os.environ.get("FLASH_WORKER_IMAGE") or "").strip() or WORKER_IMAGE:
+    if os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE:
         # Baked serverless-worker image (client mode): the image's rp_handler reads job["input"]
         # and calls _train_body, so the job input IS the train payload (submit_job wraps it in
         # {"input": ...}). No live-function source, no boot-install deps.
@@ -306,8 +287,8 @@ def poll_job(
     heartbeat_reader=None,
     stall_after_s: float = 1200.0,
     setup_grace_s: float = 3000.0,
-    queue_grace_s: float = 720.0,
     unhealthy_grace_s: float = 240.0,
+    throttled_grace_s: float = 300.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
@@ -318,6 +299,10 @@ def poll_job(
     slow cold start isn't misread as a stall; after it we use the tight ``stall_after_s``.
     Needs a ``heartbeat_reader`` to tell the phases apart — without one we keep
     ``stall_after_s`` throughout (no regression).
+
+    ``throttled_grace_s`` bounds how long we wait on a worker stuck THROTTLED (no RunPod
+    capacity for the pinned GPU class) before returning a retryable stall so the runner
+    walks to the next-best GPU.
     """
 
     say = make_say(log)
@@ -330,10 +315,7 @@ def poll_job(
     seen_heartbeat = False
     last_health_probe = 0.0
     unhealthy_since: float | None = None  # first time the worker was seen stuck UNHEALTHY
-    # A good probe in THIS IN_QUEUE episode saw a CONFIRMED-empty queue: no usable worker
-    # (running/ready/idle) AND none initializing. This (and only this) gates the no_capacity
-    # fast-path; it latches across a single probe flake (see the except below).
-    capacity_confirmed = False
+    throttled_since: float | None = None  # first time the worker was seen stuck THROTTLED
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
@@ -349,18 +331,19 @@ def poll_job(
             say(f"job {handle.job_id}: {status}")
             last_status = status
             last_progress = time.time()
-        # The initializing flag (and its freshness) is meaningful only WHILE queued and is set
-        # solely by the IN_QUEUE health probe. Clear it whenever the job is not IN_QUEUE so a
-        # later re-queue (e.g. RUNNING -> the worker dies -> back to IN_QUEUE) starts from a clean
-        # slate instead of inheriting a stale confirmation that would let the no_capacity fast-path
-        # fire on a stale read for a queue that is now genuinely cold-starting again.
-        if status != "IN_QUEUE":
-            capacity_confirmed = False
         if status in TERMINAL_OK:
             try:
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:
-                return PollResult(False, failure="job_failed", detail=str(e))
+                # COMPLETED but the output decodes as an error (a handler exception). Consult the
+                # worker flags too: a MIG slice can surface here, and must still retry / walk class.
+                retriable, exclude_class = worker_retry_flags(heartbeat_reader)
+                return PollResult(
+                    False,
+                    failure="job_preempted" if retriable else "job_failed",
+                    detail=str(e),
+                    exclude_class=exclude_class,
+                )
         if status in TERMINAL_FAIL:
             detail = str(st.get("error") or "")[:1500]
             out = st.get("output")
@@ -370,9 +353,19 @@ def poll_job(
                 detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])[-2000:]
             elif not detail:
                 detail = str(out)[:1500]
-            # Prefix the terminal status so the runner's infra-retry markers
-            # (e.g. TIMED_OUT) match even when RunPod sets no error/output text.
-            return PollResult(False, failure="job_failed", detail=f"[{status}] {detail}")
+            # Structural classification only ([{status}] prefix is for human-readable logs).
+            # A platform termination (CANCELLED/TIMED_OUT) is already retryable — skip the worker
+            # heartbeat read entirely (no worker error there, and it may not even exist yet).
+            if status in PLATFORM_TERMINATIONS:
+                return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
+            # A worker FAILED: consult the structured worker flags (one forced heartbeat read).
+            retriable, exclude_class = worker_retry_flags(heartbeat_reader)
+            return PollResult(
+                False,
+                failure="job_preempted" if retriable else "job_failed",
+                detail=f"[{status}] {detail}",
+                exclude_class=exclude_class,
+            )
         # While queued, surface worker availability (throttled hosts are the common
         # cause of silent multi-minute waits — make them visible in the run log).
         if status == "IN_QUEUE" and time.time() - last_health_probe > 90:
@@ -382,23 +375,6 @@ def poll_job(
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
                 recovering = workers.get("initializing")
-                # A worker summary that carries NONE of the expected counter keys (an empty `{}` or a
-                # partial/malformed `/health` response) is UNKNOWN, not a confirmed-empty pool: every
-                # `.get(...)` returning None would otherwise make `not usable and not recovering` True
-                # and let the no_capacity fast-path delete a healthy endpoint on a bad read. Treat it
-                # like a probe flake — leave `capacity_confirmed` at its prior (latched) value rather
-                # than asserting an empty queue from data we never actually saw.
-                _counter_keys = ("running", "ready", "idle", "initializing", "throttled", "unhealthy")
-                # Latch a CONFIRMED capacity-starved read: an empty queue with NO usable worker
-                # (running/ready/idle) AND none initializing. Requiring `not usable` here is what
-                # keeps a backlog/scheduling delay (job IN_QUEUE while usable workers EXIST) from
-                # being misread as capacity starvation. This survives a later probe flake (see
-                # except below) so a single transient probe error at the queue_grace_s boundary
-                # can't revive false "maybe initializing" doubt and defer the fast-path by the full
-                # setup grace. A flake never *sets* it True (only a good probe can), so a stale-False
-                # read can't fire the fast-path either.
-                if any(k in workers for k in _counter_keys):
-                    capacity_confirmed = not usable and not recovering
                 if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
                     say(f"queued; workers: {workers}")
                 # Fail fast on a worker stuck UNHEALTHY: a dead worker / failed image pull won't
@@ -420,77 +396,28 @@ def poll_job(
                         )
                 else:
                     unhealthy_since = None  # recovered / usable worker appeared
+                # Fail fast on a worker stuck THROTTLED: RunPod has no capacity for the pinned GPU
+                # class/pool and a throttled worker won't self-recover, so don't burn the full
+                # setup_grace_s (~50 min) waiting on it. Once it has stayed throttled with nothing
+                # usable or (re)initializing for throttled_grace_s, return a (retryable) stall so
+                # the runner's gpu-walk re-provisions on the NEXT-BEST GPU class — the cheapest fit
+                # often has no capacity while the next-best (a few cents/hr more) does.
+                if workers.get("throttled") and not usable and not recovering:
+                    if throttled_since is None:
+                        throttled_since = time.time()
+                    elif time.time() - throttled_since > throttled_grace_s:
+                        return PollResult(
+                            False,
+                            failure="stalled",
+                            detail=f"worker stuck throttled for "
+                            f"{int(time.time() - throttled_since)}s while IN_QUEUE (no RunPod "
+                            f"capacity for the pinned GPU class); retrying on the next-best GPU",
+                        )
+                else:
+                    throttled_since = None  # capacity appeared / usable worker
             except Exception:
                 # Health surfacing is diagnostic only; a probe failure must not stop polling.
-                # The no_capacity fast-path needs a CONFIRMED-empty queue (`capacity_confirmed`),
-                # which only a successful probe can set True — so a flake can never spuriously fire
-                # the fast-path. And we deliberately do NOT reset `capacity_confirmed` here: if a
-                # prior good probe in THIS episode already confirmed an empty, non-initializing
-                # queue, that trustworthy verdict survives a single transient flake at the
-                # queue_grace_s boundary instead of being deferred by the full setup grace (~50 min).
                 pass
-        # CAPACITY FAST-PATH: a job that can't even LEAVE the queue (no worker ever assigned)
-        # is on a capacity-starved GPU class — RunPod keeps the worker `throttled` and the job
-        # IN_QUEUE indefinitely. Fail FAST with ``no_capacity`` (well before the multi-minute
-        # setup grace) so the orchestrator advances to the next-cheapest AVAILABLE class instead
-        # of burning the whole retry budget on a class with zero free workers. Only fires while
-        # still IN_QUEUE: once a worker picks the job up (status RUNNING) the slow-but-legit
-        # cold start (image pull / dep install / model download) gets the full setup grace below.
-        #
-        # SKIP it while a worker is `initializing`: a large baked image / slow pull can keep the
-        # job IN_QUEUE past queue_grace_s while a worker is ACTIVELY being brought up — that's a
-        # cold start, not capacity starvation, so deleting the endpoint here would throw away a
-        # worker about to run. The setup_grace_s stall window (and the unhealthy fast-path) still
-        # bound this, so a worker that never finishes initializing is not waited on forever.
-        #
-        # Require ``capacity_confirmed``: only fire on a CONFIRMED-empty queue — a successful probe
-        # in THIS IN_QUEUE episode that saw NO usable worker (running/ready/idle) AND none
-        # initializing. ``capacity_confirmed`` already encodes both (``not usable and not
-        # recovering``) and latches across a single probe flake, so a backlog/scheduling delay that
-        # keeps the job IN_QUEUE while usable workers EXIST can't be misread as capacity starvation
-        # (those still bound by stall_after_s/setup_grace_s below). If every probe in the window
-        # errored we have no trustworthy view (capacity_confirmed stays False), so we don't delete
-        # the endpoint on a stale/unverified read; setup_grace_s bounds the wait either way.
-        if (
-            status == "IN_QUEUE"
-            and capacity_confirmed
-            and time.time() - last_progress > queue_grace_s
-        ):
-            # REPROBE at the boundary before deleting the endpoint (PR #4 review). The 90s probe
-            # cadence means ``capacity_confirmed`` can be up to ~90s stale here: a worker could have
-            # started ``initializing`` AFTER the last good probe but before this boundary, and the
-            # latched empty-pool read would wrongly delete an endpoint that is actively cold-starting.
-            # Require a FRESH empty sample at the moment we'd walk away. If the fresh probe shows a
-            # worker now usable or initializing, treat it as a cold start (clear the latch, mark
-            # progress so setup_grace_s — not queue_grace_s — bounds it) and keep polling. A probe
-            # error here leaves the latched verdict intact (it was trustworthy when set), so a single
-            # flake can't strand the run; the fast-path still fires on the stale-but-confirmed read.
-            try:
-                _h = runpod_api.endpoint_health(handle.endpoint_id)
-                _w = _h.get("workers") or {}
-                _usable = _w.get("running") or _w.get("ready") or _w.get("idle")
-                _recovering = _w.get("initializing")
-                _ck = ("running", "ready", "idle", "initializing", "throttled", "unhealthy")
-                last_health_probe = time.time()
-                if any(k in _w for k in _ck) and (_usable or _recovering):
-                    # A worker appeared since the latch — this is a slow cold start, not starvation.
-                    capacity_confirmed = False
-                    last_progress = time.time()
-                    say(f"queued; worker appeared at no_capacity boundary, deferring: {_w}")
-                    time.sleep(interval_s)
-                    continue
-            except Exception:
-                # Reprobe failure: fall back to the latched (previously confirmed) verdict.
-                pass
-            return PollResult(
-                False,
-                failure="no_capacity",
-                detail=(
-                    f"no worker assigned for {int(time.time() - last_progress)}s while IN_QUEUE "
-                    f"(GPU class capacity-starved / throttled; limit {int(queue_grace_s)}s) — "
-                    "advancing to the next-cheapest available class"
-                ),
-            )
         # heartbeat progress surfacing + stall detection
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
@@ -626,8 +553,8 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
     """
     text_reader = make_hf_text_reader(hf_repo, f"{prefix}/heartbeat.json", min_interval_s)
 
-    def read() -> dict | None:
-        raw = text_reader()
+    def read(force: bool = False) -> dict | None:
+        raw = text_reader(force=force)
         if raw is None:
             return None
         try:
@@ -636,3 +563,25 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
             return None
 
     return read
+
+
+def worker_retry_flags(heartbeat_reader) -> tuple[bool, bool]:
+    """``(retriable, exclude_class)`` from the worker's last heartbeat — the structured
+    worker<->poller contract that replaces failure-detail parsing. ``retriable`` means a
+    RetriableInfraError (retry on a fresh host); ``exclude_class`` means the GPU CLASS is at fault
+    (a MIG slice), so the retry must re-allocate OFF it. Forces a fresh read past the rate limit."""
+    if heartbeat_reader is None:
+        return (False, False)
+    hb = heartbeat_reader(force=True)
+    if not isinstance(hb, dict):
+        return (False, False)
+    retriable = bool(hb.get("retriable"))
+    # exclude_class IMPLIES retriable (a class fault is always retriable): never return it on a
+    # non-retriable failure, so a malformed/stale heartbeat can't trigger class exclusion alone.
+    exclude_class = retriable and bool(hb.get("exclude_class"))
+    return (retriable, exclude_class)
+
+
+def worker_flagged_retriable(heartbeat_reader) -> bool:
+    """True if the worker stamped ``retriable`` (RetriableInfraError). See ``worker_retry_flags``."""
+    return worker_retry_flags(heartbeat_reader)[0]

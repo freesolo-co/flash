@@ -1,7 +1,7 @@
 """CLI command handlers for the managed Flash service.
 
 Every run-lifecycle command is a thin HTTP call to the Flash control plane —
-users authenticate with their freesolo API key (`slm login` verifies it against
+users authenticate with their freesolo API key (`flash login` verifies it against
 the freesolo backend), never with provider credentials. Config parsing/validation
 and `--dry-run` stay fully local.
 """
@@ -26,6 +26,7 @@ from flash.client import (
 )
 from flash.client.config import load_credentials
 from flash.client.specs import spec_payload
+from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
 
@@ -47,7 +48,7 @@ _OK_STATES = {"done", "dry_run", "deployed"}
 
 
 def cmd_version(args) -> int:
-    print(f"slm {__version__}")
+    print(f"flash {__version__}")
     return 0
 
 
@@ -68,7 +69,7 @@ def cmd_login(args) -> int:
     path = save_credentials(api_key, api_url=api_url)
     # Never echo the key itself; the stored file is the single source of truth.
     print(f"logged in: freesolo verified your key (saved to {path})")
-    print("you're ready to train — try `slm train <config.toml>`")
+    print("you're ready to train — try `flash train <config.toml>`")
     return 0
 
 
@@ -81,7 +82,7 @@ _STARTER_ENV_PY = '''\
 """Starter local verifiers environment.
 
 Replace the dataset and rubric with your task, then publish it to the Prime Hub with
-`slm env push environments/starter_env.py`. A managed run references the published env by
+`flash env push environments/starter_env.py`. A managed run references the published env by
 its Hub slug: set [environment] id = "owner/name" in the config.
 See https://github.com/PrimeIntellect-ai/verifiers for the full API.
 """
@@ -112,7 +113,7 @@ def cmd_lab_setup(args) -> int:
     Path("environments").mkdir(exist_ok=True)
     Path("configs").mkdir(exist_ok=True)
     Path("configs/endpoints.toml").write_text(
-        "# OpenAI-compatible endpoints returned by `slm deploy` can be stored here.\n"
+        "# OpenAI-compatible endpoints returned by `flash deploy` can be stored here.\n"
     )
     starter_env = Path("environments/starter_env.py")
     if not starter_env.exists():
@@ -123,18 +124,16 @@ def cmd_lab_setup(args) -> int:
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
             "# Environment: a verifiers / Prime Hub env slug. Publish the scaffolded\n"
-            "# environments/starter_env.py with `slm env push environments/starter_env.py`\n"
-            "# (then `slm env install owner/name`) to get the slug, and set it below.\n"
+            "# environments/starter_env.py with `flash env push environments/starter_env.py`\n"
+            "# (then `flash env install owner/name`) to get the slug, and set it below.\n"
             "[environment]\n"
             'id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
             "[train]\n"
-            'hf_repo = "your-org/your-runs"   # HF dataset repo for adapters/checkpoints\n'
             "steps = 150\n"
             "lora_rank = 32\n"
-            "seeds = [0]\n\n"
-            "# Managed GPU (RTX 4090 or RTX 5090 only).\n"
-            "[gpu]\n"
-            'type = "RTX 5090"\n'
+            "seeds = [0]\n"
+            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
     print(
         "created environments/, environments/starter_env.py, configs/, "
@@ -153,7 +152,7 @@ def cmd_models(args) -> int:
 
 
 def cmd_gpus(args) -> int:
-    """List GPU classes, VRAM, per-provider $/hr and live validation."""
+    """List GPU classes, VRAM, and per-provider $/hr."""
     from flash.providers import available_providers
     from flash.providers.base import GPU_INFO
     from flash.providers.runpod.pricing import live_rates
@@ -173,17 +172,18 @@ def cmd_gpus(args) -> int:
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
-    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}  validated_on")
+    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}")
     for info in sorted(GPU_INFO.values(), key=lambda g: rates.get(g.name, g.hourly_usd)):
         runpod_rate = rates.get(info.name, info.hourly_usd) if info.enum_member else None
-        validated = ",".join(info.validated_on) or "- (needs gpu.allow_unvalidated)"
         print(
             f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}"
-            f"{fmt_rate(vast_rates.get(info.name))}  {validated}"
+            f"{fmt_rate(vast_rates.get(info.name))}"
         )
     print(
-        '\nTip: omit gpu.type (or set "cheapest") to allocate the cheapest validated class\n'
-        "across providers that fits the model; gpu.provider pins runpod/vast."
+        "\nTip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
+        "cheapest live-validated class that fits the model across all providers, so you don't pin a\n"
+        "GPU type. You can still tune the run via the [gpu] config table (disk_gb, max_wall_seconds,\n"
+        "max_retries, network_volume / network_volume_gb, datacenter)."
     )
     return 0
 
@@ -198,7 +198,7 @@ def cmd_env_init(args) -> int:
     (root / f"{mod}.py").write_text(
         f'"""Custom verifiers environment ({args.name}).\n\n'
         "Replace the dataset and rubric with your task, then publish it to the Prime Hub\n"
-        f"with `slm env push environments/{mod}/{mod}.py` and reference it by id\n"
+        f"with `flash env push environments/{mod}/{mod}.py` and reference it by id\n"
         '([environment] id = "owner/name") in your config.\n'
         "See https://github.com/PrimeIntellect-ai/verifiers for the full API.\n"
         '"""\n\n'
@@ -223,7 +223,7 @@ def cmd_env_init(args) -> int:
     (root / "README.md").write_text(f"# {args.name}\n\nCustom verifiers environment for Flash.\n")
     print(f"created {root}")
     print(
-        f"publish it to the Prime Hub with `slm env push environments/{mod}/{mod}.py`, "
+        f"publish it to the Prime Hub with `flash env push environments/{mod}/{mod}.py`, "
         'then reference it by id ([environment] id = "owner/name") in your config.'
     )
     return 0
@@ -240,15 +240,15 @@ def cmd_env_list(args) -> int:
     local = Path("environments")
     if local.is_dir():
         # Both directory envs (environments/<name>/<name>.py) and top-level single-file
-        # modules (environments/<name>.py, e.g. the `slm lab` starter env). These are local
-        # env SOURCES — publish one with `slm env push <path>` to run it on the managed
+        # modules (environments/<name>.py, e.g. the `flash lab` starter env). These are local
+        # env SOURCES — publish one with `flash env push <path>` to run it on the managed
         # service by its Hub id.
         paths: list[str] = []
         for p in local.iterdir():
             if p.name.startswith("__"):
                 continue
             if p.is_dir():
-                # `slm env init` maps a hyphenated dir to an underscored inner module file
+                # `flash env init` maps a hyphenated dir to an underscored inner module file
                 # (my-env/ -> my-env/my_env.py). List that exact path, and only when it
                 # actually exists (an empty/incomplete folder isn't a publishable source).
                 stem = p.name.replace("-", "_")
@@ -258,18 +258,36 @@ def cmd_env_list(args) -> int:
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
         if paths:
-            print("local env sources (publish with `slm env push <path>`):")
+            print("local env sources (publish with `flash env push <path>`):")
             for path in sorted(paths):
                 print(f"  {path}")
     return 0
 
 
+def _cmd_train_cost(args) -> int:
+    """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
+
+    Catalog-only and deterministic; an uncapped SFT run loads the env to count its train split."""
+    from flash.cost import estimate_cost
+
+    spec = spec_from_file(
+        args.config,
+        run_id=None,
+        overrides=args.overrides,
+        extra_configs=args.extra_configs,
+    )
+    print(estimate_cost(runconfig_from_spec(spec)).breakdown())
+    return 0
+
+
 def cmd_train(args) -> int:
+    if getattr(args, "cost", False):
+        return _cmd_train_cost(args)
     spec = spec_from_file(
         args.config,
         run_id=new_run_id() if args.dry_run else None,
-        overrides=getattr(args, "overrides", None),
-        extra_configs=getattr(args, "extra_configs", None),
+        overrides=args.overrides,
+        extra_configs=args.extra_configs,
     )
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.
@@ -294,7 +312,7 @@ def cmd_train(args) -> int:
         print(json.dumps(status, indent=2))
         return 0
     print(
-        f"run {run_id} submitted; following logs (Ctrl-C detaches, `slm attach {run_id}` resumes)",
+        f"run {run_id} submitted; following logs (Ctrl-C detaches, `flash attach {run_id}` resumes)",
         file=sys.stderr,
     )
     return _follow_run(client, run_id)
@@ -394,7 +412,7 @@ def cmd_deploy(args) -> int:
     if dep.get("mode") == "always-on":
         print(
             f"note: always-on keeps a {dep.get('gpu')} warm 24/7 "
-            f"(~${dep.get('est_idle_cost_usd_per_day')}/day). Use `slm undeploy {args.run_id}` "
+            f"(~${dep.get('est_idle_cost_usd_per_day')}/day). Use `flash undeploy {args.run_id}` "
             "to stop billing.",
             file=sys.stderr,
         )

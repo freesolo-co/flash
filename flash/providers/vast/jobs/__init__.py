@@ -33,9 +33,9 @@ from flash._logging import get_logger
 from flash.providers._poll import PollErrorTracker, make_say, surface_heartbeat
 from flash.providers.base import GPU_INFO, PollResult, min_cuda_modern, vast_gpu_for_offer
 from flash.providers.runpod.jobs import (
-    _SETUP_HEARTBEAT_STAGES,
     make_hf_heartbeat_reader,
     make_hf_text_reader,
+    worker_flagged_retriable,
 )
 from flash.providers.vast import api as vast_api
 from flash.providers.vast.jobs.builders import (
@@ -84,13 +84,8 @@ def usable_offers(
     min_vram_gb: int,
     disk_gb: float,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
-    num_gpus: int = 1,
 ) -> list[VastOffer]:
     """Verified datacenter offers able to run the job, cheapest first.
-
-    ``num_gpus`` (default 1) rents an instance with exactly that many GPUs — the disaggregated
-    async GRPO path needs a multi-GPU node ([gpu] count). ``min_vram_gb`` is the PER-GPU floor
-    (each card holds a trainer or rollout shard), unchanged by the count.
 
     Server-side filters do the heavy lifting; everything load-bearing is re-checked
     client-side (belt and suspenders — the result rows carry the proof fields).
@@ -99,7 +94,6 @@ def usable_offers(
         int(min_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
         min_disk_gb=disk_gb,
         min_reliability=RELIABILITY_FLOOR,
-        num_gpus=num_gpus,
     )
     # Host tier: ALWAYS datacenter-only (hosting_type==1). The onstart payload ships run secrets
     # (HF_TOKEN, PRIME_API_KEY, OpenRouter/OpenAI/W&B creds) to the box, so verified-but-lower-trust
@@ -116,23 +110,8 @@ def usable_offers(
         # Host tier: accept ONLY verified datacenter hosts (hosting_type==1); community/marketplace
         # (hosting_type==0) and anything else is rejected (we ship run secrets to the box).
         _bad_host = r.get("hosting_type") != 1
-        # MULTI-GPU: require a WHOLE-machine offer with an EXPLICIT gpu_frac ~= 1.0. A fractional
-        # multi-GPU offer (e.g. 2 of an 8-GPU box, gpu_frac=0.25/0.5) rents 2 GPUs to the INSTANCE
-        # but the CONTAINER gets only 1 (Vast sets NVIDIA_VISIBLE_DEVICES=void and mounts the
-        # fraction's devices — verified: nvidia-smi -L=1, env void). A MISSING gpu_frac is treated
-        # as NOT-whole-machine here (a $0.54 missing-frac offer also yielded a 1-GPU container), so
-        # require the field present and >=0.99 — whole-machine offers carry gpu_frac=1.0 explicitly.
-        # float() guarded: a present-but-non-numeric gpu_frac (e.g. "" / null-ish string) would
-        # raise ValueError and abort the WHOLE offer search; treat unparseable as not-whole-machine
-        # (rejected), consistent with requiring an explicit numeric >=0.99.
-        try:
-            _gf_val = float(r.get("gpu_frac"))
-        except (TypeError, ValueError):
-            _gf_val = 0.0
-        _frac_ok = num_gpus <= 1 or _gf_val >= 0.99
         if (
             _bad_host
-            or not _frac_ok
             or r.get("verification") != "verified"
             # Exact class gate: guard against a board whose canonical class nominal VRAM
             # is below the request (e.g. asking for 48 GB but the mapping landed on a
@@ -158,7 +137,6 @@ def usable_offers(
                 reliability=float(r.get("reliability2") or 0),
                 inet_down=float(r.get("inet_down") or 0),
                 geolocation=str(r.get("geolocation") or ""),
-                num_gpus=int(r.get("num_gpus") or num_gpus),
             )
         )
     return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
@@ -204,13 +182,7 @@ def deploy_and_submit(
                 offer.offer_id,
                 image=vast_image(),
                 disk_gb=_effective_disk_gb(spec),
-                # Expose ALL rented GPUs to the container. The worker image is pytorch/pytorch
-                # (not nvidia/cuda) and the NVIDIA container runtime only surfaces the GPUs named
-                # in NVIDIA_VISIBLE_DEVICES — without this a multi-GPU offer's container can come up
-                # with just 1 GPU (observed: a num_gpus=2 5090 offer exposed 1 GPU, breaking the
-                # disaggregated split). "all" = all GPUs in the container's cgroup, i.e. exactly the
-                # rented ones (not other tenants'); harmless for single-GPU runs.
-                env={"NVIDIA_VISIBLE_DEVICES": "all"},
+                env={},
                 onstart=onstart,
                 label=label,
                 runtype="args",
@@ -236,7 +208,6 @@ def deploy_and_submit(
                         min(o.vram_gb for o in offers),
                         _effective_disk_gb(spec),
                         exclude_machine_ids=taken,
-                        num_gpus=int(getattr(spec.gpu, "count", 1)),
                     )
                     if o.gpu in allowed
                 ][:5]
@@ -268,8 +239,9 @@ _make_hf_file_reader = make_hf_text_reader
 
 def _failure_detail(
     hf_repo: str, prefix: str, phase: str, marker: dict | None, instance_id: int | None = None
-) -> str:
-    """Best root-cause detail we can assemble from the HF artifacts."""
+) -> tuple[str, bool]:
+    """Best root-cause detail from the HF artifacts, plus ``captured``: whether any real evidence
+    was found. ``captured=False`` means a silent host death (retry); a captured cause fails fast."""
     parts = []
     if marker and marker.get("error"):
         parts.append(str(marker["error"]))
@@ -282,7 +254,7 @@ def _failure_detail(
         logs = vast_api.instance_logs(int(instance_id))
         if logs:
             parts.append(f"--- instance log tail ---\n{logs[-3000:]}")
-    return "\n".join(parts) or "vast worker terminated without a DONE sentinel"
+    return ("\n".join(parts) or "vast worker terminated without a DONE sentinel", bool(parts))
 
 
 # Vast instance states that mean "the container is gone / will not progress".
@@ -297,7 +269,6 @@ def poll_vast_job(
     interval_s: float = 15.0,
     heartbeat_reader=None,
     stall_after_s: float = 1500.0,
-    setup_grace_s: float = 3000.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll instance status + HF artifacts to a terminal state (cf. jobs.poll_job).
@@ -305,17 +276,8 @@ def poll_vast_job(
     COMPLETED  fresh DONE sentinel on HF -> metrics.json (cost stamped from the
                offer's real $/hr).
     FAILED     attempt marker with ok=false, or instance dead without DONE.
-    STALLED    never left loading within LOAD_TIMEOUT_S, heartbeat frozen for the
-               applicable window, or the client-side deadline passed.
-
-    Cold start (model download + vLLM init) is slow and only emits SETUP heartbeats
-    (``_SETUP_HEARTBEAT_STAGES``). ``run_rl()`` emits ``rl_start`` BEFORE ``prefetch_model()``
-    and only ``model_prefetched`` AFTER the weight ``snapshot_download()`` finishes — on a 70GB+
-    checkpoint at Vast's 200 Mbps floor that download can exceed 25 min with NO new heartbeat,
-    so a flat ``stall_after_s`` would destroy a healthy slow-setup instance. Until a TRAINING-phase
-    heartbeat arrives we apply the larger ``setup_grace_s`` (mirrors runpod ``poll_job``); after it
-    we use the tight ``stall_after_s``. Without a ``heartbeat_reader`` we can't tell setup from
-    training, so we stay on ``stall_after_s`` (no regression).
+    STALLED    never left loading within LOAD_TIMEOUT_S, heartbeat frozen for
+               stall_after_s, or the client-side deadline passed.
     """
 
     say = make_say(log)
@@ -376,7 +338,6 @@ def poll_vast_job(
     last_hb_key = None
     last_progress = time.time()
     became_running = False
-    seen_heartbeat = False  # a TRAINING-phase heartbeat has arrived (setup is done)
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
@@ -417,10 +378,15 @@ def poll_vast_job(
             if raw_marker:
                 with contextlib.suppress(ValueError):
                     marker = json.loads(raw_marker)
+            detail, captured = _failure_detail(
+                hf_repo, prefix, spec.phase, marker, handle.instance_id
+            )
+            # Silent host death (no evidence) or a worker-flagged RetriableInfraError -> retry.
+            preempted = not captured or worker_flagged_retriable(heartbeat_reader)
             return PollResult(
                 False,
-                failure="job_failed",
-                detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.instance_id),
+                failure="job_preempted" if preempted else "job_failed",
+                detail=detail,
             )
 
         raw_marker = marker_reader()
@@ -430,10 +396,14 @@ def poll_vast_job(
             except ValueError:
                 marker = None
             if marker and not marker.get("ok"):
+                detail, _ = _failure_detail(
+                    hf_repo, prefix, spec.phase, marker, handle.instance_id
+                )
+                preempted = worker_flagged_retriable(heartbeat_reader)
                 return PollResult(
                     False,
-                    failure="job_failed",
-                    detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.instance_id),
+                    failure="job_preempted" if preempted else "job_failed",
+                    detail=detail,
                 )
             if marker and marker.get("ok"):
                 done = done_reader(force=True)
@@ -448,27 +418,16 @@ def poll_vast_job(
                 f"(image pull / host issue)",
             )
 
-        new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
+        new_key, _stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
             last_progress = time.time()
-            # Only a TRAINING-phase heartbeat means cold-start setup (model download +
-            # vLLM boot) is done and we can switch to the tight window; setup heartbeats
-            # keep the larger grace budget.
-            if stage not in _SETUP_HEARTBEAT_STAGES:
-                seen_heartbeat = True
-        # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s,
-        # but only when a heartbeat_reader lets us tell setup from training; without one we
-        # can't, so stay on stall_after_s (no regression).
-        in_setup = heartbeat_reader is not None and not seen_heartbeat
-        stall_limit = setup_grace_s if in_setup else stall_after_s
-        if became_running and time.time() - last_progress > stall_limit:
-            phase = "setup (pre-training)" if in_setup else "training"
+        if became_running and time.time() - last_progress > stall_after_s:
             return PollResult(
                 False,
                 failure="stalled",
                 detail=f"no worker progress for {int(time.time() - last_progress)}s "
-                f"during {phase} (instance status {status}, limit {int(stall_limit)}s)",
+                f"(instance status {status})",
             )
         time.sleep(interval_s)
 
@@ -502,7 +461,6 @@ def submit_run_vast(
                 info.vram_gb,
                 _effective_disk_gb(spec),
                 exclude_machine_ids=exclude_machine_ids,
-                num_gpus=int(getattr(spec.gpu, "count", 1)),
             )
             if o.gpu == spec.gpu.type
         ]
@@ -521,10 +479,6 @@ def submit_run_vast(
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         stall = 1500.0
-        # Cold-start grace (mirrors runpod stall_kwargs): the weight download + vLLM boot only
-        # emit SETUP heartbeats, and on a 70GB+ checkpoint at Vast's 200 Mbps floor the prefetch
-        # alone can take >25 min, so the pre-training window must be larger than ``stall``.
-        setup_grace = 3000.0
         # Wall cap + provision/install grace; Vast has no server-side execution
         # timeout, so the client deadline (and the bootstrap's own cap) bound spend.
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + 1800
@@ -535,7 +489,6 @@ def submit_run_vast(
             log=log,
             heartbeat_reader=reader,
             stall_after_s=stall,
-            setup_grace_s=setup_grace,
             deadline_s=deadline,
         )
     finally:

@@ -1,6 +1,6 @@
 """Per-GPU hourly rates: RunPod live pricing with a static fallback.
 
-Cost projection (runner, serve) and the ``gpu.type = "cheapest"`` policy both
+Cost projection (runner, serve) and the cheapest-validated-class allocation both
 need $/hr per GPU class. Rates move with the market, so we read them live from the
 RunPod pricing API (the ``runpod`` SDK's GraphQL wrapper — the plain REST surface has
 no GPU-types route and direct GraphQL is 403 for scoped keys) and cache them on disk;
@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 
 CACHE_TTL_S = 6 * 3600.0  # 6h price cache
 _CACHE_PATH = Path.home() / ".flash" / "gpu_rates.json"
-_MEM: dict = {"ts": 0.0, "rates": {}}
+_MEM: dict = {"ts": 0.0, "rates": {}, "failed_ts": 0.0, "warned": False}
 
 
 def _static_rates() -> dict[str, float]:
@@ -69,15 +69,19 @@ def _fetch_live_rates() -> dict[str, float]:
 def live_rates(refresh: bool = False) -> dict[str, float]:
     """Friendly-name -> $/hr. Live (cached ``CACHE_TTL_S``) over the static snapshot.
 
-    Offline-safe: FLASH_SKIP_NET (or any fetch failure) returns the static rates.
+    Offline-safe: any fetch failure (no network / no RunPod key) returns the static rates.
     """
     static = _static_rates()
-    if os.environ.get("FLASH_SKIP_NET"):
-        return static
     now = time.time()
     if not refresh:
         if _MEM["rates"] and now - _MEM["ts"] < CACHE_TTL_S:
             return {**static, **_MEM["rates"]}
+        # A recent live fetch FAILED (e.g. the client has no `runpod` module, no network, or no
+        # RunPod key — none of which change mid-process). The static rates are correct, so don't
+        # re-attempt (and re-warn) on every lookup; without this a single `flash gpus`/`train`
+        # logs the warning once per GPU class. Retry only after the cache TTL.
+        if _MEM["failed_ts"] and now - _MEM["failed_ts"] < CACHE_TTL_S:
+            return static
         try:
             disk = json.loads(_CACHE_PATH.read_text())
             if now - float(disk.get("ts", 0)) < CACHE_TTL_S and disk.get("rates"):
@@ -89,7 +93,10 @@ def live_rates(refresh: bool = False) -> dict[str, float]:
     try:
         fetched = _fetch_live_rates()
     except Exception as exc:
-        logger.warning("live GPU pricing unavailable (%s); using static rates", exc)
+        _MEM["failed_ts"] = now  # remember the failure so we don't refetch/rewarn every call
+        if not _MEM["warned"]:  # warn once per process, not once per GPU class
+            logger.warning("live GPU pricing unavailable (%s); using static rates", exc)
+            _MEM["warned"] = True
         fetched = {}
     if fetched:
         _MEM.update(ts=now, rates=fetched)

@@ -53,153 +53,18 @@ def _raw(**overrides) -> dict:
         ({"train.lora_rank": True}, "lora_rank must be an integer"),
         ({"train.lora_alpha": False}, "lora_alpha must be an integer"),
         ({"algorithm": "ppo"}, "unsupported algorithm"),
-        ({"model_policy": "yolo"}, "model_policy"),
-        ({"gpu.allow_unvalidated": "yes"}, "must be a boolean"),
-        # Multi-GPU / disaggregated topology cross-field checks.
-        # inference_gpus>0 but only 1 GPU in the node -> no GPU left to train.
-        ({"train.inference_gpus": 1, "gpu.count": 1}, "must be greater than train.inference_gpus"),
-        ({"train.inference_gpus": 2, "gpu.count": 2}, "must be greater than train.inference_gpus"),
-        # the disaggregated rollout server is GRPO-only (SFT has no rollout engine).
-        (
-            {"algorithm": "sft", "train.inference_gpus": 1, "gpu.count": 2},
-            "only valid for grpo",
-        ),
-        ({"gpu.count": 0}, "gpu.count must be >= 1"),
+        # NOTE: model_policy is no longer a user knob (it's read from the FLASH_MODEL_POLICY env on
+        # the control plane), so a bad user-supplied model_policy is ignored, not rejected here.
+        # Unknown config sections/keys are rejected (not silently dropped → 16x-cost defaults).
+        # The classic footgun: rollout knobs under a [grpo] table instead of [train].
+        ({"grpo.group_size": 4}, "unknown config section"),
+        ({"sft.epochs": 3}, r"under \[train\]"),
+        ({"train.max_token": 256}, "unknown key"),  # typo of max_tokens
     ],
 )
 def test_spec_validation_rejections(overrides, match) -> None:
     with pytest.raises(ConfigError, match=match):
         spec_from_dict(_raw(**overrides))
-
-
-def test_invalid_tensor_parallel_split_rejected_at_submit() -> None:
-    """A TP split the catalog model's head count can't satisfy must fail at submit (before renting),
-    not only at the worker's pre-server-boot guard. MiniCPM5-1B has 16 heads, so inference_gpus=3
-    (TP=3) is impossible (16 % 3 != 0)."""
-    raw = _raw(model="openbmb/MiniCPM5-1B")
-    raw["train"]["inference_gpus"] = 3
-    raw["gpu"]["count"] = 4
-    with pytest.raises(ConfigError, match="invalid tensor-parallel split"):
-        spec_from_dict(raw)
-
-
-def test_valid_tensor_parallel_split_accepted_at_submit() -> None:
-    """A divisible TP split passes: MiniCPM5-1B (16 heads) with inference_gpus=2 (16 % 2 == 0)."""
-    raw = _raw(model="openbmb/MiniCPM5-1B")
-    raw["train"]["inference_gpus"] = 2
-    raw["gpu"]["count"] = 3
-    spec = spec_from_dict(raw)
-    assert spec.train.inference_gpus == 2
-
-
-def test_disaggregated_topology_accepted() -> None:
-    # A valid multi-GPU disaggregated GRPO config (2 GPUs: 1 train + 1 infer) parses. Use a
-    # NON-VL dense model (MiniCPM5-1B): the dense Qwen3.5 line is a text-only fine-tune of a VL
-    # checkpoint and is now rejected from OPTIONAL disaggregation (see the dedicated VL test).
-    s = spec_from_dict(_raw(model="openbmb/MiniCPM5-1B", **{"train.inference_gpus": 1, "gpu.count": 2}))
-    assert s.gpu.count == 2
-    assert s.train.inference_gpus == 1
-    # An explicit inference_gpus = 0 (colocate) is accepted, not rejected as below-minimum.
-    s0 = spec_from_dict(_raw(**{"train.inference_gpus": 0, "gpu.count": 1}))
-    assert s0.train.inference_gpus == 0
-    assert s0.gpu.count == 1
-    # Default (omitted) is single-GPU colocate.
-    sd = spec_from_dict(_raw())
-    assert sd.gpu.count == 1
-    assert sd.train.inference_gpus == 0
-    # train_gpus>1 ratios (2:1, 2:2) now validate — the FSDP multi-trainer launch is wired.
-    s21 = spec_from_dict(
-        _raw(model="openbmb/MiniCPM5-1B", **{"train.inference_gpus": 1, "gpu.count": 3})
-    )  # 2 train : 1 infer
-    assert s21.gpu.count - s21.train.inference_gpus == 2
-    s22 = spec_from_dict(
-        _raw(model="openbmb/MiniCPM5-1B", **{"train.inference_gpus": 2, "gpu.count": 4})
-    )  # 2 train : 2 infer
-    assert s22.gpu.count - s22.train.inference_gpus == 2
-
-
-def test_moe_invalid_tensor_parallel_split_rejected_at_submit() -> None:
-    """The 35B-A3B MoE declares 16 heads and defaults to TENSOR parallelism, so a 1:3 split
-    (inference_gpus=3, 16 % 3 != 0) must be rejected at submit — not skipped just because it's MoE."""
-    raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
-    raw["train"]["inference_gpus"] = 3
-    raw["gpu"]["count"] = 4
-    raw["gpu"]["type"] = "A100 PCIe"
-    with pytest.raises(ConfigError, match="invalid tensor-parallel split"):
-        spec_from_dict(raw)
-
-
-def test_moe_tp_split_skipped_under_data_parallel(monkeypatch) -> None:
-    """With FLASH_DISAGG_PARALLEL=dp (MoE-only data parallelism, tp=1) the head-divisibility law
-    doesn't apply, so the same indivisible 1:3 split is accepted (each card is a full replica)."""
-    monkeypatch.setenv("FLASH_DISAGG_PARALLEL", "dp")
-    raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
-    raw["train"]["inference_gpus"] = 3
-    raw["gpu"]["count"] = 4
-    raw["gpu"]["type"] = "A100 PCIe"
-    spec = spec_from_dict(raw)
-    assert spec.train.inference_gpus == 3
-
-
-def test_dense_tp_split_rejected_even_under_data_parallel(monkeypatch) -> None:
-    """FLASH_DISAGG_PARALLEL=dp must NOT skip the head-divisibility guard for a DENSE model: vLLM
-    rejects offline data parallelism for dense models, so the worker downgrades a dense `dp` request
-    back to TP. A dense catalog model (MiniCPM5-1B, 16 heads) with an indivisible 1:3 split must
-    still be rejected at submit even with dp set — else it passes schema only to crash on a paid
-    node after the worker's dp->tp downgrade."""
-    monkeypatch.setenv("FLASH_DISAGG_PARALLEL", "dp")
-    raw = _raw(model="openbmb/MiniCPM5-1B")
-    raw["train"]["inference_gpus"] = 3
-    raw["gpu"]["count"] = 4
-    with pytest.raises(ConfigError, match="invalid tensor-parallel split"):
-        spec_from_dict(raw)
-
-
-def test_moe_valid_tensor_parallel_split_accepted() -> None:
-    """A divisible TP split passes for the MoE too: 16 heads with inference_gpus=2 (16 % 2 == 0)."""
-    raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
-    raw["train"]["inference_gpus"] = 2
-    raw["gpu"]["count"] = 3
-    raw["gpu"]["type"] = "A100 PCIe"
-    spec = spec_from_dict(raw)
-    assert spec.train.inference_gpus == 2
-
-
-def test_qwen35_dense_indivisible_tp_split_rejected_at_submit() -> None:
-    """Regression: the Qwen3.5 dense catalog entries now declare their head counts, so an
-    indivisible TP split is rejected at SUBMIT (before renting), not only at the worker's guard.
-    Qwen3.5-0.8B has 8 heads, so inference_gpus=3 (8 % 3 != 0) is invalid."""
-    raw = _raw(model="Qwen/Qwen3.5-0.8B")
-    raw["train"]["inference_gpus"] = 3
-    raw["gpu"]["count"] = 4
-    with pytest.raises(ConfigError, match="invalid tensor-parallel split"):
-        spec_from_dict(raw)
-
-
-@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B"])
-def test_vl_optional_disaggregated_split_rejected_at_submit(model) -> None:
-    """A vision-language catalog model trained text-only must NOT run an OPTIONAL disaggregated
-    split: the `trl vllm-serve` server can't skip the vision tower (no language-model-only flag), so
-    a split would load the full model (extra VRAM + the RTX 5090 PTX issue). These colocate on one
-    card, so the split is rejected at submit. (A DIVISIBLE head count is used so this fails on the VL
-    guard, not the head-divisibility guard — 0.8B has 8 heads, 4B/9B have 16, all % 2 == 0.)"""
-    raw = _raw(model=model)
-    raw["train"]["inference_gpus"] = 2
-    raw["gpu"]["count"] = 3
-    raw["gpu"]["type"] = "RTX 5090"
-    with pytest.raises(ConfigError, match="vision-language checkpoint"):
-        spec_from_dict(raw)
-
-
-def test_requires_disaggregated_vl_split_still_accepted() -> None:
-    """The 35B-A3B is VL but requires_disaggregated (the one validated VL split, on H200-class GPUs),
-    so the VL guard must NOT reject its disaggregated split — only the OPTIONAL dense-VL splits."""
-    raw = _raw(model="Qwen/Qwen3.6-35B-A3B")
-    raw["train"]["inference_gpus"] = 2  # 16 heads % 2 == 0, and is_moe so dp/tp both fine
-    raw["gpu"]["count"] = 3
-    raw["gpu"]["type"] = "A100 PCIe"
-    spec = spec_from_dict(raw)
-    assert spec.train.inference_gpus == 2
 
 
 def test_sft_epochs_must_be_positive() -> None:
@@ -214,12 +79,15 @@ def test_missing_model_is_rejected() -> None:
         spec_from_dict({"algorithm": "sft"})
 
 
-def test_missing_hf_repo_is_rejected() -> None:
-    # [train] hf_repo is now REQUIRED (no operator HF_REPO default); a config without it fails.
+def test_hf_repo_is_managed_not_user_set() -> None:
+    # [train] hf_repo is platform-managed (assigned server-side per run), so it is NEITHER
+    # required NOR honored from a user config: a config without it parses fine, and a user-
+    # supplied value is ignored (left blank for the control plane to assign at submit).
     raw = _raw()
     raw["train"] = {"steps": 10, "lora_rank": 8, "seeds": [0]}
-    with pytest.raises(ConfigError, match=r"train\.hf_repo is required"):
-        spec_from_dict(raw)
+    assert spec_from_dict(raw).train.hf_repo == ""
+    raw["train"]["hf_repo"] = "someone-else/their-repo"
+    assert spec_from_dict(raw).train.hf_repo == ""
 
 
 def test_environment_path_is_rejected() -> None:
@@ -243,24 +111,69 @@ def test_bare_environment_id_is_rejected() -> None:
             spec_from_dict(raw)
 
 
-def test_bare_eval_env_id_is_rejected() -> None:
-    # The eval env ([environment.params] eval_env_id) is also prime-installed on the worker, so a
-    # bare eval id must be rejected up front (not fail after a GPU is provisioned).
-    raw = _raw()
-    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "gsm8k"}}
-    with pytest.raises(ConfigError, match=r"eval_env_id must be a published Prime Hub slug"):
-        spec_from_dict(raw)
-    # A full owner/name eval slug is accepted.
-    raw = _raw()
-    raw["environment"] = {"id": "owner/train", "params": {"eval_env_id": "owner/eval"}}
-    spec_from_dict(raw)  # no raise
-
-
 def test_environment_must_be_a_table() -> None:
     raw = _raw()
     raw["environment"] = "gsm8k"
     with pytest.raises(ConfigError, match=r"\[environment\] must be a table"):
         spec_from_dict(raw)
+
+
+@pytest.mark.parametrize("section", ["gpu", "environment", "train"])
+def test_falsy_non_table_section_is_rejected_not_coerced(section: str) -> None:
+    # A present-but-falsy non-dict (e.g. `gpu = false`) must hit the "must be a table" check,
+    # not be silently coerced to {} by `or {}` (which would bypass validation). A MISSING
+    # section still defaults to an empty table (covered by the happy-path tests).
+    raw = _raw()
+    raw[section] = False
+    with pytest.raises(ConfigError, match=rf"\[{section}\] must be a table"):
+        spec_from_dict(raw)
+
+
+def test_environment_subfields_reject_wrong_types() -> None:
+    # The [environment] sub-fields are consumed by EnvironmentSpec(...) via dict(... or {}) /
+    # tuple(... or ()): a present-but-wrong-typed value would otherwise crash opaquely
+    # (dict("x") / dict(1)) or silently misbehave (pip = "x" char-split into ('x',)). Each
+    # must fail fast with a clear ConfigError instead.
+    # A falsy non-table (params = false) is rejected too, mirroring the section-level rule that
+    # `environment = false` must fail rather than silently coerce to {} and bypass intent.
+    for bad in ("notatable", 123, False):
+        raw = _raw()
+        raw["environment"] = {"id": "primeintellect/gsm8k", "params": bad}
+        with pytest.raises(ConfigError, match=r"\[environment\] params must be a table"):
+            spec_from_dict(raw)
+    for bad in ("notalist", 123, False):
+        raw = _raw()
+        raw["environment"] = {"id": "primeintellect/gsm8k", "pip": bad}
+        with pytest.raises(ConfigError, match=r"\[environment\] pip must be a list of strings"):
+            spec_from_dict(raw)
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k", "pip": ["ok", 123]}
+    with pytest.raises(ConfigError, match=r"\[environment\] pip entries must be strings"):
+        spec_from_dict(raw)
+
+
+def test_environment_subfields_accept_valid_and_missing() -> None:
+    # Missing sub-fields keep their defaults, and valid values pass through unchanged.
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k"}
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {}
+    assert spec.environment.pip == ()
+    raw = _raw()
+    raw["environment"] = {
+        "id": "primeintellect/gsm8k",
+        "params": {"k": "v"},
+        "pip": ["pkg==1.0"],
+    }
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {"k": "v"}
+    assert spec.environment.pip == ("pkg==1.0",)
+    # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
+    raw = _raw()
+    raw["environment"] = {"id": "primeintellect/gsm8k", "params": None, "pip": None}
+    spec = spec_from_dict(raw)
+    assert spec.environment.params == {}
+    assert spec.environment.pip == ()
 
 
 def test_jobspec_from_dict_rejects_path() -> None:
@@ -354,26 +267,6 @@ def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
         orch.get_status("flash-000-nope")
 
 
-def test_submit_job_revalidates_topology_for_direct_jobspec(tmp_path, monkeypatch) -> None:
-    """A JobSpec built directly (bypassing spec_from_dict) with an invalid topology must be rejected
-    by submit_job BEFORE allocation — not reach a paid worker. gpu.count>1 + inference_gpus==0 takes
-    the colocated path and strands the extra paid card, so it must fail at submit."""
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
-    raw = _raw()
-    raw["gpu"]["count"] = 2  # multi-GPU node...
-    raw["train"]["inference_gpus"] = 0  # ...but colocated -> the extra card can never train
-    spec = JobSpec.from_dict(raw)  # bypasses schema._validate_spec
-    with pytest.raises(ValueError, match="requires train"):
-        orch.submit_job(spec, dry_run=True)
-
-    # And an indivisible TP split on a direct catalog spec is likewise caught at submit.
-    raw2 = _raw(model="openbmb/MiniCPM5-1B")
-    raw2["gpu"]["count"] = 4
-    raw2["train"]["inference_gpus"] = 3  # 16 % 3 != 0
-    with pytest.raises(ValueError, match="invalid tensor-parallel split"):
-        orch.submit_job(JobSpec.from_dict(raw2), dry_run=True)
-
-
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw(), run_id="flash-1-x")
@@ -418,7 +311,6 @@ def test_vram_sft_per_device_bs_is_managed_default(monkeypatch) -> None:
 def test_fetch_hf_params_is_offline_safe(monkeypatch) -> None:
     from flash.engine import vram
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
     assert vram.fetch_hf_params_b("any/model") is None
 
 
@@ -499,3 +391,34 @@ def test_worker_env_rejects_invalid_env_names(name: str) -> None:
     # fail at parse time, not after a worker has been provisioned.
     with pytest.raises(ConfigError, match="invalid environment variable name"):
         spec_from_dict(_raw(worker_env={name: "v"}))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Falsey string forms (the bug a plain bool() has: any non-empty string is True).
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+        ("none", False),
+        ("", False),
+        ("  false  ", False),
+        # Truthy string forms.
+        ("true", True),
+        ("1", True),
+        ("yes", True),
+        ("anything-else", True),
+        # Already-typed values pass through bool().
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        (None, False),
+    ],
+)
+def test_coerce_bool(value, expected) -> None:
+    from flash.spec import coerce_bool
+
+    assert coerce_bool(value) is expected

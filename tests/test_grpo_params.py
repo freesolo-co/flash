@@ -104,7 +104,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
             "steps": 10,
@@ -115,8 +115,6 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
             "kl_penalty_coef": 0.02,
             "advantage_clip": 1.5,
             "thinking_length_penalty_coef": 0.001,
-            "eval_every_steps": 5,
-            "eval_examples": 32,
         },
     }
     spec = spec_from_dict(raw, run_id="grpo-x")
@@ -126,43 +124,12 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     assert spec.train.kl_penalty_coef == 0.02
     assert spec.train.advantage_clip == 1.5
     assert spec.train.thinking_length_penalty_coef == 0.001
-    assert spec.train.eval_every_steps == 5  # mid-run eval cadence from [train]
-    assert spec.train.eval_examples == 32  # mid-run eval RANDOM-sample size from [train]
     # survives the JSON round-trip the worker reconstructs from
     rt = JobSpec.from_dict(spec.to_dict()).train
     assert rt.group_size == 4
     assert rt.thinking_length_penalty_coef == 0.001
-    assert rt.eval_every_steps == 5
-    assert rt.eval_examples == 32
     # GRPO knobs are NOT in environment.params (that goes verbatim to load_environment)
     assert spec.environment.params == {}
-
-
-def test_eval_examples_zero_is_accepted_as_default() -> None:
-    """`[train] eval_examples = 0` is the documented "use the built-in default (64)" no-op, so the
-    server-side TOML validator must ACCEPT it (it parses to 0; eval_config maps 0 -> 64), matching
-    the worker JSON path — a negative is still rejected."""
-    import pytest
-
-    from flash.engine.midrun_eval import eval_config
-    from flash.schema import ConfigError, spec_from_dict
-
-    raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
-        "algorithm": "grpo",
-        "model_policy": "allow",
-        "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
-        "train": {"seeds": [0], "steps": 10, "hf_repo": "owner/runs", "eval_examples": 0},
-    }
-    spec = spec_from_dict(raw, run_id="eval0")
-    assert spec.train.eval_examples == 0  # accepted (not a ConfigError), not coerced
-    # and downstream it resolves to the built-in default sample size (64), not 0
-    assert eval_config(256, spec_eval_examples=spec.train.eval_examples)["num_examples"] == 64
-    # a negative eval_examples is still rejected at parse time
-    raw["train"]["eval_examples"] = -1
-    with pytest.raises(ConfigError, match="eval_examples must be >= 0"):
-        spec_from_dict(raw, run_id="evalneg")
 
 
 def test_opt_int_float_reject_bools() -> None:
@@ -242,7 +209,7 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
             "steps": 10,
@@ -259,34 +226,26 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
     assert spec_from_dict(raw, run_id="grpo-y").train.init_from_adapter == ""
 
 
-def test_hf_repo_per_run_parses_and_validates() -> None:
-    # [train] hf_repo is the REQUIRED per-run HF artifact repo (no operator HF_REPO default);
-    # it must parse through schema (server) AND JobSpec.from_dict (worker), an absent value
-    # must be rejected as required, and a malformed value must 400 at parse time.
-    from flash.schema import ConfigError
-
+def test_hf_repo_is_managed_not_user_set() -> None:
+    # [train] hf_repo is the platform-managed per-run HF artifact repo: the control plane assigns
+    # it server-side at submit (see runner.submit_job). It is NOT required and a user-supplied
+    # value is IGNORED — verified through both schema (server) and JobSpec.from_dict (worker).
     raw = {
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
-        "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
-        "train": {"seeds": [0], "steps": 10, "hf_repo": "myorg/runs"},
+        "train": {"seeds": [0], "steps": 10},
     }
+    # absent -> fine (no longer required); left blank for the control plane to assign
     spec = spec_from_dict(raw, run_id="hf-x")
-    assert spec.train.hf_repo == "myorg/runs"
-    # survives the JSON round-trip the worker reconstructs from
-    assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == "myorg/runs"
-    # absent -> rejected (it is required; there is no operator HF_REPO fallback)
-    with pytest.raises(ConfigError, match=r"train\.hf_repo is required"):
-        spec_from_dict({**raw, "train": {"seeds": [0], "steps": 10}}, run_id="hf-y")
-    # malformed values are rejected at parse time (server 400), not passed to the worker
-    for bad in ("noslash", "/name", "owner/", "a/b/c", "owner//name"):
-        with pytest.raises(ConfigError):
-            spec_from_dict(
-                {**raw, "train": {"seeds": [0], "steps": 10, "hf_repo": bad}},
-                run_id="hf-bad",
-            )
+    assert spec.train.hf_repo == ""
+    assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == ""
+    # user-supplied -> ignored (the control plane overrides it at submit)
+    spec2 = spec_from_dict(
+        {**raw, "train": {"seeds": [0], "steps": 10, "hf_repo": "someone-else/their-repo"}},
+        run_id="hf-y",
+    )
+    assert spec2.train.hf_repo == ""
 
 
 def test_optimizer_and_batching_knobs_roundtrip() -> None:
@@ -298,7 +257,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
             "hf_repo": "owner/runs",
@@ -368,7 +327,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
     }
     bad_cases = [
         {"batch_size": 0},  # must be >= 1
@@ -407,7 +366,7 @@ def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
         "algorithm": "grpo",
         "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest", "allow_unvalidated": True},
+        "gpu": {"type": "cheapest"},
     }
     for bad in ({"steps": 1.5}, {"epochs": 2.5}, {"steps": 0}, {"epochs": -1}):
         with pytest.raises(ConfigError):

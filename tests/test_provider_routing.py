@@ -16,7 +16,7 @@ from flash.spec import JobSpec
 
 
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
-    gpu = {"type": "RTX A5000", "provider": "auto", "requested": "auto", "max_retries": 2}
+    gpu = {"type": "RTX A5000", "max_retries": 2}
     gpu.update(gpu_kw)
     return JobSpec.from_dict(
         {
@@ -38,7 +38,7 @@ def _offer_obj(offer_id=5, machine_id=2, gpu="RTX 3090", dph=0.25):
 def _alloc(provider="vast", gpu="RTX 3090", rate=0.25, offer=None, provider_offers=()):
     from flash.providers.base import Allocation, Candidate
 
-    cand = Candidate(provider, gpu, rate, 24, True, offer=offer)
+    cand = Candidate(provider, gpu, rate, 24, offer=offer)
     return Allocation(
         provider=provider,
         gpu=gpu,
@@ -68,7 +68,6 @@ def _vast_handle_dict(instance_id=1, machine_id=2):
 def orch(monkeypatch, tmp_path):
     from flash import runner
 
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     return runner
@@ -218,63 +217,6 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
     assert calls == [0]  # code errors burn no retry budget
 
 
-def test_concrete_requested_pins_class(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.vast import jobs as vast_jobs
-
-    pins = []
-
-    def fake_allocate(model, algorithm, **kw):
-        pins.append(kw["gpu"])
-        offer = _offer_obj()
-        return _alloc(offer=offer, provider_offers=[offer])
-
-    monkeypatch.setattr(allocator, "allocate", fake_allocate)
-    monkeypatch.setattr(
-        vast_jobs,
-        "submit_run_vast",
-        lambda *a, **k: PollResult(True, metrics={"a": 1}),
-    )
-    spec = _spec(type="RTX 3090", requested="RTX 3090")
-    _seed_status(orch, spec)
-    orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert pins == ["RTX 3090"]  # concrete request -> class pinned through allocation
-    pins.clear()
-    spec = _spec(requested="cheapest")
-    _seed_status(orch, spec)
-    orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert pins == [None]  # policy request -> allocator free to re-pick
-
-
-def test_empty_requested_pins_concrete_type(orch, monkeypatch):
-    """An empty gpu.requested (a direct-API spec that skipped config parsing) is treated
-    as a concrete pin of gpu.type: the allocator runs (so failover/pricing still apply)
-    but only to pick the provider for that one class — it never re-picks the class."""
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.vast import jobs as vast_jobs
-
-    pins = []
-
-    def fake_allocate(model, algorithm, **kw):
-        pins.append(kw["gpu"])
-        offer = _offer_obj()
-        return _alloc(offer=offer, provider_offers=[offer])
-
-    monkeypatch.setattr(allocator, "allocate", fake_allocate)
-    monkeypatch.setattr(
-        vast_jobs,
-        "submit_run_vast",
-        lambda *a, **k: PollResult(True, metrics={"a": 1}),
-    )
-    spec = _spec(type="RTX A5000", requested="")  # no routing intent recorded
-    _seed_status(orch, spec)
-    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
-    assert metrics["a"] == 1
-    assert pins == ["RTX A5000"]  # empty requested -> concrete gpu.type pinned through
-
-
 # ---------------------------------------------------------------------------
 # cancel / attach routing
 # ---------------------------------------------------------------------------
@@ -292,7 +234,6 @@ def test_cancel_routes_vast(orch, monkeypatch):
     monkeypatch.setattr(runpod_api, "cancel_job", lambda *a: runpod_calls.append(a))
     # make the vast provider "available" so _gc_run_endpoints invokes its gc sweep
     monkeypatch.setenv("VAST_API_KEY", "x")
-    monkeypatch.delenv("FLASH_SKIP_NET", raising=False)
 
     spec = _spec()
     st = _seed_status(orch, spec)
@@ -468,42 +409,25 @@ def test_pinned_class_no_capacity_escalates_instead_of_failing(orch, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# config: provider fields
+# config: gpu fields
 # ---------------------------------------------------------------------------
-def test_config_provider_fields(monkeypatch):
-    from flash.schema import ConfigError, spec_from_dict
+def test_config_gpu_fields(monkeypatch):
+    from flash.schema import spec_from_dict
 
-    monkeypatch.setenv("FLASH_SKIP_NET", "1")
-    monkeypatch.delenv("FLASH_GPU_ALLOW_UNVALIDATED", raising=False)
     base = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "environment": {"id": "owner/env"},
     }
-    # omitted gpu.type -> smart-allocation default, original request preserved
+    # GPU pinning is gone: gpu.type is always the cheapest-fitting VALIDATED provisional regardless
+    # of what the config says. Omitted gpu.type -> the deterministic offline cheapest validated
+    # provisional: post-2026-06-22 expansion that's the 16 GB RTX 2000 Ada for 0.8B SFT (~12 GB).
     spec = spec_from_dict(dict(base), run_id="x")
-    assert spec.gpu.requested == "auto"
-    assert spec.gpu.provider == "auto"
-    assert spec.gpu.type == "RTX A5000"  # deterministic offline provisional
-    # round-trip keeps the routing fields
+    assert spec.gpu.type == "RTX 2000 Ada"  # deterministic offline cheapest-fitting validated provisional
+    # round-trip preserves the resolved class
     again = JobSpec.from_dict(spec.to_dict())
-    assert (again.gpu.provider, again.gpu.requested) == ("auto", "auto")
-
-    with pytest.raises(ConfigError, match="provider"):
-        spec_from_dict({**base, "gpu": {"provider": "lambda"}}, run_id="x")
-    # class/provider mismatch fails at parse time
-    with pytest.raises(ConfigError, match="not available on provider"):
-        spec_from_dict(
-            {**base, "gpu": {"type": "L40S", "provider": "runpod", "allow_unvalidated": True}},
-            run_id="x",
-        )
-    # vast-only class pinned to vast parses (with the unvalidated opt-in)
-    spec = spec_from_dict(
-        {**base, "gpu": {"type": "L40S", "provider": "vast", "allow_unvalidated": True}},
-        run_id="x",
-    )
-    assert spec.gpu.type == "L40S"
-    assert spec.gpu.provider == "vast"
-    assert spec.gpu.requested == "L40S"
-    assert spec.gpu.allow_unvalidated is True
+    assert again.gpu.type == "RTX 2000 Ada"
+    # a config gpu.type is IGNORED (no pin) -> still the cheapest validated provisional
+    spec = spec_from_dict({**base, "gpu": {"type": "L40S"}}, run_id="x")
+    assert spec.gpu.type == "RTX 2000 Ada"

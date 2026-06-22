@@ -27,7 +27,7 @@ def cancel_run(run_id: str) -> RunStatus:
     cancelled.
 
     Uses ``terminate_endpoint`` (reconstructs the run's uniquely-named endpoint and deletes it
-    via the RunPod API) so the cancel works **cross-process** — a fresh ``slm cancel`` actually
+    via the RunPod API) so the cancel works **cross-process** — a fresh ``flash cancel`` actually
     stops the GPU worker, instead of leaving it running until the wall cap. Best-effort: any
     teardown error is recorded but still flips the run to ``cancelled``.
     """
@@ -172,63 +172,25 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # first so a recovery thread can't overwrite the user's terminal `cancelled`.
         if get_status(run_id).state == "cancelled":
             return get_status(run_id)
-        if not res.ok and res.failure == "no_capacity":
-            # The recovered job is stuck IN_QUEUE on a capacity-starved / throttled class with
-            # no usable worker (a control-plane restart landed mid-queue). The fresh-submit path
-            # WALKS to the next-cheapest available class on no_capacity; recovery must do the same
-            # instead of terminally failing on a transient market condition. Tear down the stale
-            # endpoint (its worker never started, so nothing is lost) and resume THIS seed through
-            # the supervised submit, which owns the capacity walk + crash budget.
-            with contextlib.suppress(Exception):
-                from flash.providers import get_provider as _gp
-
-                _gp(handle.provider).destroy(handle)
-            try:
-                resume_index = list(spec.train.seeds).index(seed)
-            except ValueError:
-                resume_index = 0
-            # Drop the now-dead handle so a cancel / restart in the re-provision gap can't reattach
-            # to the deleted endpoint; _run_seed_loop's next on_handle records the fresh one.
-            # Carry the recovered (provider, class) into the resumed seed's capacity-walk
-            # exclusion: it just proved ``no_capacity``, so the first allocation must not
-            # re-pick it and burn another queue grace before walking. Scoped to the failing
-            # provider (matching the fresh-submit path) and applied only to this resumed seed.
-            starved = (
-                frozenset({(handle.provider, allocated_gpu)})
-                if allocated_gpu
-                else frozenset()
-            )
-            # Record the resume index AND the just-starved exclusion: in the handle-less
-            # re-provision gap a control-plane restart must RESUME this seed (recover_runs'
-            # resume_seed_index branch) rather than fall through to "server restarted before
-            # job submission". And resume_run starts a FRESH seed loop, so the starved pair
-            # has to be persisted here — otherwise the restarted walk has an empty exclusion
-            # and can immediately re-pick the throttled class. Persist as a list of lists
-            # (JSON has no tuples); resume_run rehydrates it. _run_seed_loop clears both as it
-            # advances to a fresh next seed, so no stale exclusion lingers past this seed.
-            _update(
-                run_id,
-                "running",
-                remote=None,
-                resume_seed_index=resume_index,
-                resume_starved=[list(pair) for pair in starved],
-            )
-            print(
-                f"recovery: {run_id} seed {seed} was IN_QUEUE with no capacity; "
-                "re-provisioning via the capacity walk instead of failing",
-                file=log,
-                flush=True,
-            )
-            _run_seed_loop(
-                spec,
-                log,
-                start_index=resume_index,
-                prior_cost=float(status.cost_usd or 0.0),
-                initial_starved=starved,
-            )
-            return get_status(run_id)
         if not res.ok:
-            _update(run_id, "failed", error=f"{res.failure}: {res.detail}")
+            # Job ended not-ok — usually because it was abandoned during the redeploy. Resume the
+            # in-flight seed from its last HF checkpoint instead of failing; the seed loop
+            # (unchanged) still terminates a genuinely broken run when it re-fails.
+            try:
+                seed_index = list(spec.train.seeds).index(seed)
+            except ValueError:
+                seed_index = 0
+            print(f"attach: {run_id} seed {seed} ended ({res.failure}); resuming from checkpoint", file=log)
+            # GC the dead endpoint, then clear the stale handle and record the seed so a second
+            # restart mid-allocation resumes the right one.
+            with contextlib.suppress(Exception):
+                _gc_run_endpoints(spec)
+            # Bail if the run was raced to terminal during the long poll above: _update's CAS
+            # returns False, and resuming would submit paid work for a dead run.
+            if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
+                print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
+                return get_status(run_id)
+            _run_seed_loop(spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0))
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the
         # run actually used (the in-process path stamps this; recovery must restore it).
@@ -259,23 +221,27 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # next seed index so a restart in that gap resumes the remaining seeds rather
         # than failing the run. (The last seed keeps its handle for post-run
         # observability, mirroring the fresh-submit seed loop.)
-        # Also clear any persisted resume_starved: a no_capacity recovery may have stored a
-        # starved (provider, class) exclusion for the seed we just finished. The next seed
-        # re-allocates against a clean market, so leaving it would make a later restart's
-        # resume_run rehydrate that exclusion and wrongly pre-exclude a now-recovered class
-        # on a seed that never starved (mirrors _run_seed_loop's resume_starved=None reset).
-        _update(
+        applied = _update(
             run_id,
             "running",
             cost_usd=total,
             artifacts_dir=artifacts_dir(spec),
-            **(
-                {"remote": None, "resume_seed_index": resumed_index, "resume_starved": None}
-                if more_seeds
-                else {}
-            ),
+            **({"remote": None, "resume_seed_index": resumed_index} if more_seeds else {}),
         )
+        # Same TOCTOU guard as the not-ok recovery path: a concurrent thread can flip this
+        # run terminal (e.g. failed/done from another recovery) between the cancel re-check
+        # above and here. The sticky CAS rejects the `running` write (applied is False) — so
+        # don't resume the remaining seeds and submit paid GPU work for an already-terminal
+        # run. (The non-multi-seed arm writes the terminal `done`; the CAS protects a racing
+        # terminal there too, so no extra guard is needed.)
         if more_seeds:
+            if not applied:
+                print(
+                    f"attach: {run_id} went terminal during recovery; "
+                    "not resuming the remaining seeds",
+                    file=log,
+                )
+                return get_status(run_id)
             _run_seed_loop(spec, log, start_index=resumed_index, prior_cost=total)
         else:
             _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
@@ -297,7 +263,7 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
     recorded (see ``_run_seed_loop``). A control-plane restart in that handle-less window
     must RESUME from that index rather than fail the run and discard the finished seeds.
     Unlike ``attach_run`` there is no live job to poll — the prior process already tore the
-    seed's endpoint down — so we start a fresh seed loop from the recorded index. The slm
+    seed's endpoint down — so we start a fresh seed loop from the recorded index. The flash
     package was uploaded to HF on the original submit, so the worker can still fetch it; no
     re-upload is needed.
     """
@@ -320,21 +286,12 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
     spec = JobSpec.from_dict(status.spec)
     log = log_stream or sys.stderr
     print(f"resuming {run_id}: remaining seeds from index {status.resume_seed_index}", file=log)
-    # Rehydrate any proven-starved (provider, class) exclusion the no_capacity recovery
-    # branch persisted, so a restart in the re-provision gap doesn't re-pick the throttled
-    # class on the resumed seed's first capacity walk. Normal inter-seed resumes carry no
-    # such exclusion (the field is cleared when a fresh next seed is recorded), so this is
-    # an empty frozenset for them.
-    initial_starved = frozenset(
-        (pair[0], pair[1]) for pair in (status.resume_starved or []) if len(pair) == 2
-    )
     try:
         _run_seed_loop(
             spec,
             log,
             start_index=status.resume_seed_index,
             prior_cost=float(status.cost_usd or 0.0),
-            initial_starved=initial_starved,
         )
     except _RunCancelled:
         pass  # cancel_run already set the terminal state

@@ -41,17 +41,18 @@ _BASE_OVERHEAD_GB = 4.0
 # (batch x seq) and model width (~sqrt of params). Coef calibrated so 4.7B SFT at
 # seq 32k / batch 1 lands ~22 GB (measured: fits a 32 GB 5090).
 _ACT_COEF = 0.12
-# SFT activations peak on the worker's PER-DEVICE micro-batch, not [train].batch_size
-# (which is the global/effective batch realized via gradient accumulation). The worker
-# caps the micro-batch at 4: per_device = min(batch_size, 4). Mirror that here so an
-# unset/long-context SFT run (batch defaults low) still reserves the micro-batch activation
-# peak, and a large effective batch isn't mis-counted as resident VRAM (it's grad-accum,
+# SFT activations + logits peak on the worker's PER-DEVICE micro-batch, not [train].batch_size
+# (which is the global/effective batch realized via gradient accumulation). The worker caps the
+# micro-batch at 4 and, when the fused CE is off, vocab-sizes it further to the logits budget (see
+# ``sft_per_device``). Mirror that here so an unset/long-context SFT run still reserves the
+# micro-batch peak, and a large effective batch isn't mis-counted as resident VRAM (it's grad-accum,
 # not in-flight activations).
 _SFT_PER_DEVICE_BS_DEFAULT = 4
 
 
 def _sft_per_device_bs() -> int:
-    """The worker's per-device SFT micro-batch — the activation-peak driver to size against.
+    """The worker's BASE per-device SFT micro-batch cap (before the big-vocab logits cap layered on
+    by ``sft_per_device``) — the activation-peak driver to size against.
 
     SFT micro-batch is a MANAGED default: the control plane no longer forwards
     ``SFT_PER_DEVICE_BS`` to the worker (build_worker_env dropped the tuning allowlist), and the
@@ -61,6 +62,35 @@ def _sft_per_device_bs() -> int:
     ``SFT_PER_DEVICE_BS=1`` operator env to a too-small GPU that then OOMs at the default
     micro-batch 4 (the asymmetry the env-knobs cleanup removed everywhere else)."""
     return _SFT_PER_DEVICE_BS_DEFAULT
+
+
+def sft_grad_accum(
+    batch_size: int, *, seq_len: int = 0, vocab: int = 0, fused: bool = True
+) -> tuple[int, int]:
+    """(per-device micro-batch, grad-accum steps) the worker realizes for a requested GLOBAL
+    ``batch_size``: per_device capped at the micro-batch default (and ADDITIONALLY vocab-sized to
+    the logits budget when the fused CE is off — see ``sft_per_device``), grad-accum CEIL'd so the
+    realized global batch is never BELOW the request (e.g. batch 6 -> per_device 4 x
+    ceil(6/4)=2 grad-accum = realized 8, >= 6).
+
+    ``seq_len``/``vocab``/``fused`` are the big-vocab logits-cap inputs; omitted (or ``fused``) they
+    reduce to the old fixed per-device cap, so existing callers are unchanged."""
+    target = max(1, int(batch_size))
+    per_device = sft_per_device(target, seq_len=seq_len, vocab=vocab, fused=fused)
+    grad_accum = max(1, -(-target // per_device))  # ceil
+    return per_device, grad_accum
+
+
+def sft_realized_batch(
+    batch_size: int, *, seq_len: int = 0, vocab: int = 0, fused: bool = True
+) -> int:
+    """The realized SFT global batch (per_device x grad_accum) for a requested ``batch_size`` —
+    mirrors the worker so the cost step-count matches. Pass seq_len/vocab/fused to honor the
+    big-vocab per-device cap (the cost path does); omitted, it's the old fixed-cap behavior."""
+    per_device, grad_accum = sft_grad_accum(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
+    return per_device * grad_accum
+
+
 # Colocated-GRPO vLLM KV pool: grows with the engine's max context (seq) and model
 # width, but vLLM bounds the pool to a fraction of the card and PAGES rather than OOMs,
 # so it's capped (_KV_CAP) instead of growing without bound at long context.
@@ -84,6 +114,60 @@ _VOCAB_DEFAULT = 248_320
 # Matches the worker's logits budget (6 GB): the per-device fp32 logits are capped to this
 # (rl_per_device_comps spills the rest into grad-accum), so the estimator never reserves above it.
 _LOGITS_BUDGET_GB = 6.0
+
+# ---- SFT big-vocab logits: the SFT analog of the GRPO fp32-logits term above ----
+# When the worker's fused cross-entropy (Liger) is OFF, an SFT forward materializes the FULL-sequence
+# [per_device, seq_len, vocab] logits AND keeps their gradient live through the backward. At
+# Qwen3.5's ~248k vocab this is the documented big-vocab SFT OOM driver (a 0.8B SFT OOM'd a 24 GB
+# card). The worker fuses CE only for a >=3B model OR a >=2048-token context (mirrors
+# engine.worker.perf._memory_mode); BELOW that the term is real and was previously ignored entirely.
+# An SFT step holds, AT ONCE, the fp32 logits (4) + their fp32 grad (4) + the bf16 logits the model
+# emits (2) + the bf16 grad (2) + the cross-entropy log_softmax temp (4) ~= 16 B/elem. (8 B/elem --
+# fp32 logits+grad only -- UNDER-counted: a live 2B SFT seq1024 at per_device=2 peaked ~15.8 GiB and
+# OOM'd a 16 GB card whose usable is ~15.6 GiB.) At 16 B/elem the per-device cap drops to 1 for a
+# big-vocab un-fused SFT, so the worker materializes far less and the real peak clears even the
+# tightest 16 GB card. The worker vocab-sizes the per-device micro-batch so these logits never
+# exceed _LOGITS_BUDGET_GB while pd CAN be reduced; the estimator reserves the TRUE per-device-capped
+# term (no budget clamp -- the irreducible pd=1 floor can exceed the budget at a near-2048 ctx) -- so
+# the allocator provably covers the worker's real peak. VALIDATED by a live re-run.
+_SFT_LOGITS_BYTES_PER_ELEM = 16.0
+# Canonical fused-CE (Liger) gate thresholds: the worker fuses the SFT cross-entropy for a >=3B
+# model OR a >=2048-token context. SINGLE SOURCE OF TRUTH -- engine.worker.perf imports these (its
+# _LIGER_MIN_PARAMS / _LONG_CONTEXT_TOKENS derive from them) and sft_logits_fused mirrors the gate
+# offline (no network AutoConfig probe) so the cost estimator stays deterministic.
+_LIGER_MIN_PARAMS_B = 3.0
+_LIGER_LONG_CTX_TOKENS = 2048
+
+
+def sft_logits_fused(params_b: float | None, seq_len: int) -> bool:
+    """Whether the worker fuses the SFT cross-entropy (Liger), so the [per_device, seq, vocab] logits
+    never materialize. Mirrors engine.worker.perf._memory_mode without a network probe: fused for a
+    >=3B model OR a >=2048-token context. (The worker image bakes liger-kernel, so True here means
+    the fused kernel is actually used; if it were ever absent the per-device cap still bounds the
+    logits.)"""
+    if seq_len >= _LIGER_LONG_CTX_TOKENS:
+        return True
+    return (params_b or 0.0) >= _LIGER_MIN_PARAMS_B
+
+
+def sft_logits_per_device_cap(seq_len: int, vocab: int) -> int:
+    """Largest SFT per-device micro-batch whose un-fused [per_device, seq, vocab] fp32 logits (+grad)
+    fit _LOGITS_BUDGET_GB. The SFT mirror of rl_per_device_comps' completion cap, sizing the FULL
+    sequence (not just the completion): the worker spills the remainder into grad-accum so the
+    realized global batch is unchanged, and the estimator reserves the same bounded term."""
+    denom = max(1, int(seq_len)) * max(1, int(vocab)) * _SFT_LOGITS_BYTES_PER_ELEM
+    return max(1, int(_LOGITS_BUDGET_GB * 1e9 / denom))
+
+
+def sft_per_device(batch_size: int, *, seq_len: int = 0, vocab: int = 0, fused: bool = True) -> int:
+    """The per-device SFT micro-batch the worker runs: the requested global batch capped at the
+    micro-batch default (4) and ADDITIONALLY vocab-sized to the logits budget when the fused CE is
+    OFF (small model AND short context) — so the big-vocab [per_device, seq, vocab] logits can't OOM
+    the card. With seq_len/vocab unset (or fused) it's just the old fixed cap (back-compatible)."""
+    per_device = max(1, min(_SFT_PER_DEVICE_BS_DEFAULT, max(1, int(batch_size))))
+    if not fused and seq_len and vocab:
+        per_device = min(per_device, sft_logits_per_device_cap(seq_len, vocab))
+    return per_device
 
 
 def grpo_seq_escalation_gb(params_b: float | None, seq_len: int) -> int:
@@ -187,13 +271,22 @@ def estimate_vram_gb(
         logits = min(completion * vocab * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
         return base + max(rollout, train)
-    # SFT: the activation peak is the worker's per-device micro-batch (capped at 4),
-    # NOT the global/effective batch_size (gradient accumulation realizes
-    # that). Size to the micro-batch the worker actually runs: a default/long-context run reserves
-    # for the per-device cap (no under-routing to a too-small card), while a large effective
-    # batch_size is capped at it (no over-routing, since accum isn't resident VRAM).
-    sft_per_device = min(max(1, batch_size), _sft_per_device_bs())
-    return base + _ACT_COEF * sft_per_device * (seq_len / 1024.0) * width
+    # SFT: peak = base + activations + the big-vocab logits term. Both activations and logits are
+    # driven by the worker's per-device micro-batch (capped at 4 AND vocab-sized to the logits budget
+    # when the fused CE is off), NOT the global/effective batch_size (grad-accum realizes that). Use
+    # the SAME ``sft_per_device`` the worker runs so the estimate tracks what actually executes.
+    fused = sft_logits_fused(params_b, seq_len)
+    pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
+    activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
+    # fp32-logits term: 0 when the worker fuses CE (>=3B model OR >=2048-token ctx, so the lm_head
+    # never materializes [B,T,vocab]); else the [per_device, seq_len, vocab] logits the forward holds.
+    # Reserve the TRUE per-device-capped value -- NOT clamped to the budget: the budget only chooses
+    # ``pd`` (so pd>1 cases stay <= budget), but once pd floors to 1 the logits are IRREDUCIBLE and
+    # can exceed the budget at a near-2048 ctx -- clamping there would under-reserve and OOM (the
+    # worker can't go below pd=1). The SFT analog of the GRPO logits term, sized over the FULL seq_len
+    # (SFT loss spans the sequence) -- the term the SFT estimate once ignored entirely.
+    logits = 0.0 if fused else pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
+    return base + activations + logits
 
 
 def model_required_vram_gb(
@@ -205,7 +298,7 @@ def model_required_vram_gb(
     headroom: float = 1.1,
 ) -> int:
     """Cheapest-sufficient VRAM (GB) for a specific run -- the matrix the allocator and
-    ``resolve_gpu_policy`` both size against.
+    ``provisional_gpu`` both size against.
 
     Catalog models size from their known param count + the run's actual knobs (``train``
     may be a TrainSpec, a dict, or None for recipe defaults). Curated GRPO floors
@@ -338,9 +431,11 @@ def model_required_vram_gb(
 
 
 def fetch_hf_params_b(model_id: str) -> float | None:
-    """Total params (billions) from the HF API safetensors metadata (no download)."""
-    if os.environ.get("FLASH_SKIP_NET"):
-        return None
+    """Total params (billions) from the HF API safetensors metadata (no download).
+
+    Best-effort: returns ``None`` when the size can't be read (no network / no HF metadata),
+    so callers fall back to the offline heuristic rather than failing.
+    """
     try:
         from huggingface_hub import HfApi
 
@@ -355,6 +450,24 @@ def fetch_hf_params_b(model_id: str) -> float | None:
         # to None so callers report "size unknown" rather than failing.
         pass
     return None
+
+
+def resolve_params_b(model_id: str) -> float | None:
+    """Model size in billions, resolved the ONE way the worker and the cost estimator agree on:
+    the curated catalog ``params_b`` (else its ``params`` display string), else the real HF
+    safetensors param count for an open-policy (uncataloged) model. Best-effort: returns None only
+    when the model is uncataloged AND HF metadata is unavailable, so callers degrade to the
+    size-unknown path (e.g. the fused-CE gate stays memory-safe, the colocate cap stays loose).
+    The single source of truth for "how big is this model" -- run_sft, run_rl and cost.spec all
+    call this so they can never drift."""
+    from flash.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    if info is not None:
+        pb = getattr(info, "params_b", 0.0) or params_b_from_str(getattr(info, "params", None))
+        if pb:
+            return pb
+    return fetch_hf_params_b(model_id)
 
 
 def check_fit(

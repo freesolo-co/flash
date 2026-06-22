@@ -1,7 +1,7 @@
 [project]
-name = "flash"
-version = "0.2.0"
-description = "Flash — managed LoRA post-training (SFT/GRPO) for verifiers environments, driven by the `slm` CLI"
+name = "freesolo-flash"
+version = "0.2.10"
+description = "Flash — managed LoRA post-training (SFT/GRPO) for verifiers environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.10-3.12 (not 3.13 yet).
 requires-python = ">=3.11,<3.13"
@@ -17,17 +17,11 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-dependencies = [
-    "runpod-flash",
-    # >=0.34: upload_code()'s update_repo_settings(private=True) needs the visibility-via-settings
-    # API (older 0.25.x update_repo_settings only accepts `gated` and raises TypeError on `private`;
-    # visibility there lived on the now-removed update_repo_visibility).
-    "huggingface-hub>=0.34",
-    "datasets>=2.19",
-    "verifiers>=0.1.10",
-    # Thin HTTP client for the freesolo serving app (adapter deploy/undeploy/chat).
-    "httpx>=0.27",
-]
+# The client CLI is pure standard library (urllib + tomllib + argparse): `pip install freesolo-flash`
+# pulls NOTHING. Every runtime dep below is server/worker-side and lives in an extra (`server`
+# for the control plane, `gpu` for the local worker). Verified: all client commands run with
+# httpx/huggingface-hub/datasets/verifiers uninstalled.
+dependencies = []
 
 [project.optional-dependencies]
 # Heavy deps for running the fine-tuning worker locally (on the GPU worker these are
@@ -40,6 +34,10 @@ gpu = [
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
     "accelerate>=1.4",
+    # Worker runtime: env dataset loading, the verifiers env adapter, and HF checkpoint I/O.
+    "datasets>=2.19",
+    "verifiers>=0.1.10",
+    "huggingface-hub>=0.34",
 ]
 # freesolo-chalk (Freesolo's custom Triton/CUDA kernels, complements Liger) is an OPTIONAL,
 # separately-installed package — it is not on PyPI yet, so it is deliberately NOT a hard
@@ -49,18 +47,46 @@ gpu = [
 # setting the FLASH_* kernel flag(s) AND FLASH_CHALK_SPEC=<installable chalk spec> (git URL with
 # access, or a wheel); the submit path appends that spec to the worker's extra_pip, which is
 # installed for every job (works on the default baked-image path, unlike FLASH_WORKER_EXTRA_DEPS).
-server = ["fastapi", "uvicorn"]
-# Convenience aggregate of all optional runtime extras.
-all = ["flash[gpu,server]"]
+# Control-plane / operator deps. runpod-flash (RunPod provider SDK) + huggingface-hub (provider
+# code upload + repo settings) are imported server-side; httpx is the serving client (flash/serve).
+# Keeping runpod-flash out of the base install also stops its `flash` console script shadowing
+# ours, so `pip install freesolo-flash` gives an unambiguous `flash` command. huggingface-hub>=0.34:
+# upload_code()'s update_repo_settings(private=True) needs the visibility-via-settings API
+# (0.25.x only accepts `gated` and raises TypeError on `private`).
+# `prime>=0.6.3`: the control plane shells out to Prime Intellect's CLI for `prime env push`;
+# 0.6.3 is the verified-working version for the managed publish semantics (--auto-bump / --plain /
+# --visibility). Floor-pin (like the other deps here) so older 0.5.x — which differs in push flags
+# — can't be resolved.
+# verifiers + datasets: the control plane CHARGES the run at submit (server/billing.charge_run_estimate),
+# and for an SFT run with no [train].max_examples cap that estimate loads/counts the env's real train
+# split (cost.spec.count_env_examples -> envs.load_environment -> the verifiers adapter), so the server
+# needs the env-loading stack too -- not just the GPU worker.
+server = [
+    "fastapi",
+    "uvicorn",
+    "runpod-flash",
+    "httpx>=0.27",
+    "huggingface-hub>=0.34",
+    "prime>=0.6.3",
+    "datasets>=2.19",
+    "verifiers>=0.1.10",
+]
+# NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
+# plane) run on SEPARATE machines and are mutually exclusive: `prime` (server) requires a newer
+# `verifiers` than the worker's `trl<1.7` allows, so a combined `gpu+server` install is genuinely
+# unresolvable. They're declared conflicting under `[tool.uv]` so each resolves on its own.
 
 [project.urls]
 Homepage = "https://github.com/freesolo-co/flash"
 Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
+# `flash` is the CLI. `slm` is a deprecated alias kept for back-compat (same entrypoint) —
+# e.g. the agent worker shells out to `slm`; remove it once those callers move to `flash`.
+flash = "flash.cli.main:main"
 slm = "flash.cli.main:main"
-# Operator-only: the control plane is a separate service, run once on the host, not a `slm`
-# subcommand. Requires the `server` extra (`pip install 'flash[server]'`).
+# Operator-only: the control plane is a separate service, run once on the host, not a `flash`
+# subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
 flash-server = "flash.server.__main__:main"
 # Operator-only: the shared rollout-pool router (an "nginx for GRPO rollouts") + reward workers.
 # Requires the `server` extra. See flash/pool/ and docs/rollout-pool-design.md.
@@ -86,12 +112,21 @@ markers = [
 [tool.uv]
 # Heavy GPU extras are worker-side; keep the default sync light.
 package = true
+# The `gpu` (worker) and `server` (control plane) extras are NEVER installed together — they run on
+# different machines — and their transitive pins are mutually exclusive: `prime` (server) pulls a
+# newer `verifiers` than the worker's `trl<1.7` allows. Declaring them conflicting lets uv resolve
+# each independently instead of failing on the impossible union.
+conflicts = [[{ extra = "gpu" }, { extra = "server" }]]
 
 [dependency-groups]
 dev = [
     "mypy>=1.13.0",
     "pytest>=9.0.3",
     "ruff>=0.6",
+    # Offline worker/env tests import these without the heavy `gpu` stack; the CI test env
+    # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
+    "datasets>=2.19",
+    "verifiers>=0.1.10",
 ]
 
 [tool.mypy]

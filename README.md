@@ -7,14 +7,14 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 
 ## Scope
 
-- `slm train <cfg.toml>` / control-plane `POST /runs` — submit a training job;
+- `flash train <cfg.toml>` / control-plane `POST /runs` — submit a training job;
   one dedicated GPU per run, supervised server-side (stall watchdog, bounded
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
-- `slm deploy` (scale-to-zero or always-on), `slm chat` —
+- `flash deploy` (scale-to-zero or always-on), `flash chat` —
   serving for trained adapters.
 - **Verifiers-only environments.** Every run names a Prime Intellect `verifiers`
   environment by its published Hub slug (`[environment] id = "owner/name"`).
-  Scaffold a local env, publish it with `slm env push`, then reference it by id.
+  Scaffold a local env, publish it with `flash env push`, then reference it by id.
   The worker wraps it via `flash/envs/adapter.py`. There are no
   built-in task environments and no freesolo bridge. Single-turn environments
   are fully supported (SFT/GRPO/eval).
@@ -36,22 +36,22 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash/envs/` — environment machinery: registry and the
   `adapter` that wraps Prime Intellect / Hub `verifiers`
   environments onto the worker's interface
-- `slm lab setup` / `slm env init` — scaffold a starter local verifiers env and a
+- `flash lab setup` / `flash env init` — scaffold a starter local verifiers env and a
   ready-to-run config to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
   plane (run operator-side via the separate `flash-server` command)
 - `flash/mcp/` — stdio MCP bridge for coding agents
 - `Dockerfile` — the control-plane image (used by the repo docker-compose)
-- `tests/` — pytest suite (CPU-only with `FLASH_SKIP_NET=1`)
+- `tests/` — pytest suite (CPU-only; offline-by-default, no GPU/network)
 
 ## Local commands
 
 ```bash
 cd flash
 uv sync --extra server
-FLASH_SKIP_NET=1 uv run pytest          # CPU tests (no GPU/network)
+uv run pytest                           # CPU tests (offline-by-default, no GPU/network)
 uv run ruff check . && uv run ruff format .
-uv run slm --help
+uv run flash --help
 uv run flash-server                      # control plane (operator-side, run once)
 ```
 
@@ -59,4 +59,4 @@ The control plane owns provider credentials: `RUNPOD_API_KEY` is always required
 (RunPod is the default substrate), `VAST_API_KEY` is opt-in (only checked when set),
 plus the shared `HF_TOKEN`.
 The artifact repo is per-run (the run TOML's `[train] hf_repo`), not an
-operator-wide env var. Clients authenticate with their freesolo API key (`slm login`).
+operator-wide env var. Clients authenticate with their freesolo API key (`flash login`).

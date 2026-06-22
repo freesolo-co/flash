@@ -13,7 +13,7 @@ Both packages import in the flash venv (the backend schemas are pure pydantic), 
 we add ../backend to sys.path the way the e2e tests import across packages. If the
 backend isn't importable, its half is skipped.
 
-Run: cd flash && FLASH_SKIP_NET=1 .venv/bin/python -m pytest \
+Run: cd flash && .venv/bin/python -m pytest \
         tests/test_backend_jobspec_contract.py -q
 """
 
@@ -64,7 +64,9 @@ def test_backend_run_config_parses_into_valid_jobspec() -> None:
     assert spec.algorithm == "grpo"
     assert spec.environment.id == "owner/my-env"
     assert spec.environment.params == {"split": "train"}
-    assert spec.train.hf_repo == "owner/my-runs"
+    # hf_repo is platform-managed: a user/backend-supplied value is ignored (left blank for the
+    # control plane to assign per run at submit), so it must NOT survive parsing.
+    assert spec.train.hf_repo == ""
     assert spec.train.steps == 120
     assert tuple(spec.train.seeds) == (0, 1)
     assert spec.train.group_size == 8
@@ -116,28 +118,19 @@ def test_sft_backend_config_maps_to_jobspec() -> None:
 
 def test_backend_config_missing_required_fields_is_rejected_consistently() -> None:
     """The contract also covers the negative: a config the agent could author wrong
-    (no [environment] id, or no train.hf_repo) must be rejected by flash with a
-    ConfigError (-> HTTP 400 on the control plane), not silently accepted. This keeps
-    the backend/agent and flash agreeing on what a *complete* job spec is.
+    (no [environment] id) must be rejected by flash with a ConfigError (-> HTTP 400 on
+    the control plane), not silently accepted. This keeps the backend/agent and flash
+    agreeing on what a *complete* job spec is. (hf_repo is platform-managed, not a
+    required user field — see test_backend_run_config_parses_into_valid_jobspec.)
     """
     no_env = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"hf_repo": "owner/my-runs", "steps": 10},
-        "gpu": {"type": "RTX 5090"},
-    }
-    with pytest.raises(ConfigError):
-        spec_from_dict(no_env)
-
-    no_repo = {
-        "model": "Qwen/Qwen3.5-4B",
-        "algorithm": "grpo",
-        "environment": {"id": "owner/my-env"},
         "train": {"steps": 10},
         "gpu": {"type": "RTX 5090"},
     }
     with pytest.raises(ConfigError):
-        spec_from_dict(no_repo)
+        spec_from_dict(no_env)
 
 
 def test_stale_local_env_path_is_rejected_at_both_layers() -> None:

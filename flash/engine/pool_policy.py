@@ -72,7 +72,7 @@ def resolve_opt_config(
     quant = model_quant(model_id)
     qlora_default = ("4bit" in quant) or ("qlora" in quant)
     return OptConfig(
-        liger=True if liger is None else liger,
+        liger=False if liger is None else liger,  # FADED: chalk standalone replaces Liger (flash#66)
         chalk=True if chalk is None else chalk,
         drop_fla=_is_qwen35(model_id) if drop_fla is None else drop_fla,
         qlora=qlora_default if qlora is None else qlora,
@@ -118,19 +118,6 @@ def pool_gpu_plan(model_id: str, *, opt: OptConfig | None = None) -> dict:
         "inference_vram_gb": round(infer_gb),
         "inference_usd_hr": i_usd,
     }
-
-
-def _apply_liger(model, model_id: str) -> None:
-    """Apply Liger fused kernels (RMSNorm/RoPE/SwiGLU) to the live model instance (dev uses TRL's
-    use_liger_kernel; here we patch directly). Best-effort — degrades to eager if Liger is absent."""
-    try:
-        from liger_kernel.transformers import _apply_liger_kernel_to_instance
-
-        base = getattr(getattr(model, "base_model", model), "model", model)  # unwrap PEFT
-        _apply_liger_kernel_to_instance(model=base)
-        print("[pool_policy] liger kernels applied", flush=True)
-    except Exception as e:
-        print(f"[pool_policy] liger skipped: {e}", flush=True)
 
 
 def _build_optimizer(params, lr: float, use_8bit: bool):
@@ -228,15 +215,14 @@ def build_lora_policy_update(
     )
     model = get_peft_model(model, peft_cfg)
 
-    # (3) Liger kernels (fused RMSNorm/RoPE/SwiGLU) — dev sets TRL use_liger_kernel; here we apply
-    # them directly to the instance. (4) Chalk gap-filling kernels on top (dev's install_chalk_kernels).
-    if oc.liger and on_gpu:
-        _apply_liger(model, model_id)
+    # Fused kernels: chalk STANDALONE (Liger is faded out — see flash#66). chalk supplies its own
+    # RMSNorm/SwiGLU/fused-linear-CE PLUS kernels Liger never had (RoPE the Qwen3.5 hybrid needs,
+    # LoRA-delta, embedding gather) and the ~248k-vocab FLCE OOM protection. No more _apply_liger.
     if oc.chalk and on_gpu:
         try:
             from flash.engine.chalk_kernels import install_chalk_kernels
 
-            rep = install_chalk_kernels(model)
+            rep = install_chalk_kernels(model)  # chalk runs standalone (liger=False)
             if rep:
                 print(f"[pool_policy] chalk kernels: {rep}", flush=True)
         except Exception as e:

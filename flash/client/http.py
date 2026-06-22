@@ -26,7 +26,7 @@ class ApiError(ClientError):
         self.status = status
 
 
-# Login is handled by the freesolo backend (not the flash control plane): `slm login`
+# Login is handled by the freesolo backend (not the flash control plane): `flash login`
 # verifies the user's freesolo API key here. The same key authenticates the flash
 # control plane, which accepts freesolo-issued keys.
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
@@ -69,7 +69,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
         if exc.code in (401, 403):
             raise ClientError(
                 "freesolo rejected this API key — create or copy a valid key from your "
-                "freesolo dashboard and pass it with `slm login --api-key` (or FREESOLO_API_KEY)"
+                "freesolo dashboard and pass it with `flash login --api-key` (or FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
     except urllib.error.URLError as exc:
@@ -119,6 +119,21 @@ class ApiClient:
 
     def health(self) -> dict:
         return self._request("GET", "/v1/health", timeout=10.0)
+
+    # -- environments ------------------------------------------------------------------
+    def publish_env(self, *, name: str, is_new: bool, package_b64: str) -> dict:
+        """Upload a packaged verifiers env to the managed Environments Hub (the control plane
+        publishes it under FreeSolo's Prime account); returns ``{"id": "owner/name"}``.
+
+        The server may retry `prime env push` up to its own bound (default 8 attempts x 180s =
+        ~24 min worst case, plus extract/build), so the client timeout must comfortably exceed
+        that — otherwise the client gives up while the publish is still running server-side."""
+        return self._request(
+            "POST",
+            "/v1/envs",
+            body={"name": name, "is_new": is_new, "package_b64": package_b64},
+            timeout=1800.0,
+        )
 
     # -- runs --------------------------------------------------------------------------
     def create_run(self, spec: dict) -> dict:
@@ -182,6 +197,6 @@ def client_from_config(require_key: bool = True) -> ApiClient:
     api_url, api_key = load_credentials()
     if require_key and not api_key:
         raise ClientError(
-            "not logged in — run `slm login` with your freesolo API key (or set FREESOLO_API_KEY)"
+            "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
     return ApiClient(api_url, api_key)

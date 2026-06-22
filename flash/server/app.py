@@ -14,6 +14,7 @@ to their persisted RunPod job handles.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import threading
 import weakref
@@ -31,9 +32,9 @@ from flash.runner import (
     submit_job,
 )
 from flash.schema import ConfigError, spec_from_dict
+from flash.serve.deploy import ServingError, deploy_adapter, undeploy_adapter
 from flash.serve.deploy import chat as serve_chat
-from flash.serve.deploy import deploy_adapter, undeploy_adapter
-from flash.spec import JobSpec
+from flash.spec import JobSpec, coerce_bool
 
 from . import auth, db
 
@@ -41,6 +42,24 @@ _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
+
+_log = logging.getLogger("flash.server")
+
+
+def _reverse_charge_best_effort(*, token: str, run_id: str, charge: dict) -> None:
+    """Refund a run's pre-flight charge after its submit failed; never raises (logs on failure
+    so the refund error can't mask the submit error). Idempotent by ``run_id``."""
+    try:
+        from flash.server.billing import reverse_run_charge
+
+        reverse_run_charge(token=token, run_id=run_id, charge=charge)
+    except Exception:
+        # A refund failure must NOT mask the submit error: log and swallow.
+        _log.exception(
+            "failed to reverse the pre-flight charge for run %s after a submit failure; "
+            "the org may be charged for a run that never started — reconcile manually",
+            run_id,
+        )
 
 
 class _RunLock:
@@ -87,11 +106,24 @@ def _deploy_lock(run_id: str) -> _RunLock:
         return lk
 
 
+def _append_run_log(run_id: str, message: str) -> None:
+    """Append a timestamped note to a run's log so it surfaces in `flash logs`."""
+    import time
+
+    with open(runs_file_path(run_id, ".log"), "a") as f:
+        f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
+
+
 def recover_runs() -> None:
-    """Re-attach to in-flight runs after a server restart (per-run daemon threads)."""
-    from flash.runner import _gc_run_endpoints, _update, attach_run, resume_run
+    """Recover every in-flight run after a restart so a redeploy never loses a training session:
+    re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
+    ``queued``/``provisioning`` runs that never reached a worker."""
+    from flash.runner import _gc_run_endpoints, _run_job, _update, attach_run, resume_run
 
     active: set[str] = set()
+    # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
+    # attempt is reaped without racing the resubmit's fresh allocation.
+    resubmit: list[JobSpec] = []
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
@@ -100,39 +132,63 @@ def recover_runs() -> None:
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
-            # Only remote-backed runs are "active" (kept by the orphan sweep). A run
-            # with no handle is being failed below; if it had already rented a Vast
-            # instance (crash between rent and on_handle), it must NOT shield that
-            # instance from the sweep.
+            # Only handle-backed runs are kept by the sweep; a handle-less run is being
+            # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
         elif status.resume_seed_index is not None:
-            # Multi-seed run that restarted in the inter-seed gap: the completed seed's
-            # handle was deliberately cleared and the next index recorded. There is no
-            # live job to reattach to, so resume the remaining seeds rather than failing
-            # the run and discarding the already-completed work. Keep it in `active` so
-            # the orphan sweep below doesn't reap the label its next seed will reuse.
+            # Restarted between seeds: resume the remaining seeds, preserving the finished ones.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
-            # The first attempt may have registered its uniquely-named RunPod
-            # endpoint before on_handle() persisted the handle. GC it (by
-            # reconstructed name) before failing, so it doesn't hold worker quota
-            # until manual cleanup. Best-effort; vast orphans are swept below.
+            # No handle yet: the restart hit the submit->provisioning window, so no worker exists.
+            # A spec that won't parse can never be resubmitted -> mark it terminally failed
+            # (operator-visible, dropped from _RECOVERABLE so it isn't re-skipped every restart);
+            # otherwise GC any half-made endpoint and resubmit from scratch.
+            try:
+                spec = JobSpec.from_dict(status.spec)
+            except Exception as exc:
+                _log.warning(
+                    "marking run %s failed: persisted spec could not be parsed",
+                    status.run_id,
+                    exc_info=True,
+                )
+                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                with contextlib.suppress(Exception):
+                    _update(status.run_id, "failed", error=detail)
+                with contextlib.suppress(Exception):
+                    _append_run_log(status.run_id, detail)
+                # The aborted attempt may STILL have registered its uniquely-named RunPod
+                # endpoint before crashing (the exact leak the good-spec branch's
+                # `_gc_run_endpoints` guards against). The orphan sweep below won't reap it —
+                # RunPod's `sweep_orphans` is a no-op — so do a best-effort RunPod GC HERE.
+                # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
+                # endpoint name is derived deterministically from the run id + GPU class
+                # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
+                # persisted status without parsing the spec. Terminate by that reconstructed
+                # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
+                with contextlib.suppress(Exception):
+                    gpu_type = (status.spec.get("gpu") or {}).get("type")
+                    if gpu_type:
+                        from flash.providers.runpod.train import terminate_endpoint
+
+                        terminate_endpoint(gpu_type, status.run_id)
+                continue
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(JobSpec.from_dict(status.spec))
-            _update(status.run_id, "failed", error="server restarted before job submission")
-    # Standing per-run billing (Vast instances) survives a crash until destroyed:
-    # anything labeled ours that no recoverable run owns is an orphan. Each available
-    # provider's ``sweep_orphans`` hook reaps its own (RunPod's is a no-op). Dispatched
-    # generically through the registry — ``sweep_orphans`` is part of base.Provider, so
-    # no provider is special-cased. ``active`` carries raw run ids; each provider applies
-    # its own label-prefix transform. Best-effort: never raises.
+                _gc_run_endpoints(spec)
+            resubmit.append(spec)
+    # Reap orphaned per-run instances (Vast bills until destroyed); each provider sweeps its own.
     from flash.providers import configured_providers
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):
             prov.sweep_orphans(active_labels=active)
+
+    for spec in resubmit:
+        _log.info("resubmitting run %s after control-plane restart", spec.run_id)
+        with contextlib.suppress(Exception):
+            _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
+        threading.Thread(target=lambda s=spec: _run_job(s), daemon=True).start()
 
 
 def create_app():
@@ -157,7 +213,7 @@ def create_app():
         if key is None:
             raise HTTPException(
                 status_code=401,
-                detail="invalid or missing API key; log in with `slm login` using your "
+                detail="invalid or missing API key; log in with `flash login` using your "
                 "freesolo API key",
             )
         return key
@@ -187,6 +243,31 @@ def create_app():
     def models(_: dict = Depends(require_key)):
         return {"models": public_model_rows()}
 
+    @app.post("/v1/envs")
+    def publish_env(payload: dict, key: dict = Depends(require_key)):
+        # Publish a client-built verifiers env package to the MANAGED Prime account (this control
+        # plane's PRIME_API_KEY), namespaced per identity and PRIVATE — so users never need their
+        # own Prime account. The client just packages local source and uploads it here.
+        from flash.server import envs
+
+        # Default to "" only when the key is missing/None — pass a present-but-falsy
+        # non-string (0, False, []) THROUGH so publish_package's type checks reject it with
+        # the right 400, instead of `or ""` silently coercing it to a valid-looking empty string.
+        _pkg = payload.get("package_b64")
+        _name = payload.get("name")
+        try:
+            slug = envs.publish_package(
+                package_b64="" if _pkg is None else _pkg,
+                name="" if _name is None else _name,
+                # Robust bool parse: JSON `"is_new": "false"`/`"0"` must NOT become True
+                # (plain bool() is truthy for any non-empty string). Defaults True when absent.
+                is_new=coerce_bool(payload.get("is_new", True)),
+                key=key,
+            )
+        except envs.EnvPublishError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {"id": slug}
+
     def _parse_spec(payload: dict, run_id: str) -> JobSpec:
         spec_raw = payload.get("spec") or {}
         env_raw = spec_raw.get("environment") or {}
@@ -194,7 +275,7 @@ def create_app():
             raise HTTPException(
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
-                "publish the environment to the Prime Hub (`slm env push`), then reference it "
+                "publish the environment to the Prime Hub (`flash env push`), then reference it "
                 'by its Hub id (`[environment] id = "owner/name"`)',
             )
         try:
@@ -203,14 +284,43 @@ def create_app():
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/v1/runs")
-    def create_run(payload: dict, key: dict = Depends(require_key)):
+    def create_run(
+        payload: dict,
+        key: dict = Depends(require_key),
+        authorization: str | None = Header(default=None),
+    ):
         spec = _parse_spec(payload, run_id=new_run_id())
         dry_run = bool(payload.get("dry_run", False))
-        db.record_run(spec.run_id, key["id"])
+        # Charge the pre-flight estimate to the user's org BEFORE accepting the run, so it's gated
+        # on balance and never starts unpaid. Skipped for --dry-run and the internal service
+        # identity (no user org to bill).
+        billed = not dry_run and key.get("key_prefix") != "internal"
+        token = (authorization or "").removeprefix("Bearer ").strip()
+        charge: dict = {}
+        if billed:
+            from flash.server.billing import BillingError as _BillingError
+            from flash.server.billing import charge_run_estimate
+
+            try:
+                charge = charge_run_estimate(token=token, spec=spec)
+            except _BillingError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+            except ValueError as exc:
+                # Unpriceable config (e.g. uncapped SFT whose env can't be counted): 400 with a
+                # fixable message, not a 500.
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # record_run is inside the try so any post-charge failure (SQLite, submit) reverses the
+        # debit — the org must never pay for a run that didn't start.
         try:
+            db.record_run(spec.run_id, key["id"])
             status = submit_job(spec, dry_run=dry_run, background=True)
         except Exception as exc:
-            db.delete_run(spec.run_id)
+            db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
+            # The run never started — reverse the charge so the org isn't billed for it.
+            if billed:
+                _reverse_charge_best_effort(token=token, run_id=spec.run_id, charge=charge)
+            if isinstance(exc, HTTPException):
+                raise
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return status.to_dict()
 
@@ -293,6 +403,11 @@ def create_app():
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                 )
+            except ServingError as exc:
+                # The serving backend rejected the registration or was unreachable. This is an
+                # upstream/gateway failure, not a flash bug, so surface a clean 502 with the
+                # real reason instead of letting httpx escape as an unhandled 500 + traceback.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
             except Exception as exc:
                 if isinstance(exc, ValueError):
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -317,7 +432,13 @@ def create_app():
         # deploy's provisioning/finalization.
         with _deploy_lock(run_id):
             status = owned_run(run_id, key)
-            deleted = undeploy_adapter(run_id)
+            try:
+                deleted = undeploy_adapter(run_id)
+            except ServingError as exc:
+                # A serving-backend failure (unreachable / non-404 error) is an upstream/gateway
+                # problem, not a flash bug — surface a clean 502 with the real reason (mirrors the
+                # deploy handler) instead of letting the ServingError escape as an unhandled 500.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
             # dev mode is scale-to-zero: the serve endpoint is created only on the first
             # chat, so an empty deletion just means it was never warmed — still a clean
             # undeploy. always-on provisions the endpoint at deploy time, so an empty
@@ -330,7 +451,7 @@ def create_app():
                 raise HTTPException(
                     status_code=502,
                     detail=f"could not delete the serving endpoint for {run_id}; it may still "
-                    "be running — retry `slm undeploy`",
+                    "be running — retry `flash undeploy`",
                 )
             return {"run_id": run_id, "deleted_endpoints": deleted}
 
@@ -366,7 +487,7 @@ def create_app():
         if deployment.get("state") in (None, "undeployed", "dry_run"):
             raise HTTPException(
                 status_code=409,
-                detail=f"run {run_id} has no active deployment; `slm deploy {run_id}` first",
+                detail=f"run {run_id} has no active deployment; `flash deploy {run_id}` first",
             )
         # Legacy run with no artifact repo (mirrors the /deploy guard): a run that never had a
         # [train].hf_repo was never registered with freesolo serving, so reject early with a

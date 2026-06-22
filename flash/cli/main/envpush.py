@@ -1,14 +1,12 @@
-"""Environment publish/install machinery for the `slm env` subcommands.
+"""Environment publish/install machinery for the `flash env` subcommands.
 
-`slm env install` records a published Prime Hub env locally; `slm env push` packages a
+`flash env install` records a published Prime Hub env locally; `flash env push` packages a
 local verifiers env and publishes it (always PRIVATE) to the Prime Environments Hub.
 """
 
 from __future__ import annotations
 
 import ast
-import json
-import os
 import sys
 from pathlib import Path
 
@@ -40,7 +38,7 @@ def cmd_env_install(args) -> int:
             file=sys.stderr,
         )
         return 1
-    # `slm env install` is a LOCAL-client convenience: it installs the env into the client's
+    # `flash env install` is a LOCAL-client convenience: it installs the env into the client's
     # interpreter and records it in ~/.flash/envs.json for local authoring/dry-run. The
     # managed worker does NOT reinstall from this record — it installs Hub envs itself via an
     # authenticated `prime env install` on the GPU box. A Hub slug `owner/name` maps to the pip
@@ -61,7 +59,7 @@ def cmd_env_install(args) -> int:
         )
         installer = (
             # `uv pip install` outside an active venv errors with "No virtual environment
-            # found"; --python targets the CLI's own interpreter so a global/pipx `slm`
+            # found"; --python targets the CLI's own interpreter so a global/pipx `flash`
             # install still records the env.
             ["uv", "pip", "install", "--python", sys.executable]
             if shutil.which("uv")
@@ -80,7 +78,7 @@ def cmd_env_install(args) -> int:
 
 
 # A verifiers env packaged for the Prime Hub is a pyproject + an importable module exposing
-# load_environment(). When `slm env push` is pointed at a bare module (a single `.py`, as the
+# load_environment(). When `flash env push` is pointed at a bare module (a single `.py`, as the
 # freesolo training agent emits, or a dir without a pyproject), we wrap it in this layout so the
 # push Just Works instead of erroring on "pyproject.toml not found".
 _ENV_PUSH_PYPROJECT = """\
@@ -100,8 +98,6 @@ packages = ["{module}"]
 """
 
 _PUSH_INITIAL_VERSION = "0.1.0"
-_PUSH_MAX_ATTEMPTS = 8
-_PUSH_CONFLICT_MARKERS = ("already exists", "version already", "duplicate", "conflict", "409")
 
 
 def _push_env_name(raw: str) -> str:
@@ -109,26 +105,6 @@ def _push_env_name(raw: str) -> str:
 
     name = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
     return name or "flash-env"
-
-
-def _push_is_version_conflict(text: str) -> bool:
-    lowered = text.lower()
-    return any(marker in lowered for marker in _PUSH_CONFLICT_MARKERS)
-
-
-def _push_slug_from(env_dir, output: str) -> str | None:
-    import re
-
-    meta = Path(env_dir) / ".prime" / ".env-metadata.json"
-    try:
-        data = json.loads(meta.read_text())
-        owner, name = data.get("owner"), data.get("name")
-        if owner and name:
-            return f"{owner}/{name}"
-    except (OSError, json.JSONDecodeError):
-        pass
-    match = re.search(r"[Ss]uccessfully pushed\s+([A-Za-z0-9][\w.-]*/[\w.-]+)", output)
-    return match.group(1) if match else None
 
 
 def _config_env_name(config_path) -> str | None:
@@ -199,74 +175,102 @@ def _with_syspath_bootstrap(env_source: str) -> str:
     return "".join(lines[:insert_after]) + bootstrap + "".join(lines[insert_after:])
 
 
-def _run_prime_push(env_dir, *, is_new: bool, name: str | None = None) -> int:
-    """Run `prime env push` on a packaged env dir (always PRIVATE), climbing past conflicts.
+# Tool/cache dirs that aren't part of the environment SOURCE. We never ship them: `.prime/` in
+# particular carries Prime CLI metadata (.env-metadata.json) from a prior local push — shipping it
+# bloats the upload and could let stale client metadata confuse server-side slug discovery (the
+# server also strips it defensively, but don't send it in the first place).
+_TAR_EXCLUDE_DIRS = frozenset({".prime", ".git", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"})
 
-    When `name` is given it is passed as `--name` so the push targets that exact Hub env."""
-    import subprocess
 
-    # Published environments are always PRIVATE — they can hold proprietary task data.
-    base = ["prime", "env", "push", "--plain", "--path", str(env_dir), "--visibility", "PRIVATE"]
-    if name:
-        base += ["--name", name]
-    # Disable prime's interactive version check so a push isn't blocked in non-interactive
-    # use (PRIME_API_KEY is inherited from the user's environment).
-    env = {**os.environ, "PRIME_DISABLE_VERSION_CHECK": "1"}
-    auto_bump = not is_new  # a re-publish must land on a fresh version
-    for _ in range(_PUSH_MAX_ATTEMPTS):
-        cmd = [*base, "--auto-bump"] if auto_bump else list(base)
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        output = f"{proc.stdout or ''}{proc.stderr or ''}"
-        if proc.stdout:
-            print(proc.stdout, end="")
-        if proc.stderr:
-            print(proc.stderr, end="")
-        if proc.returncode == 0:
-            slug = _push_slug_from(env_dir, output)
-            if slug:
-                print(f"published {slug}")
-            else:
-                # Don't report a clean success we can't confirm: the push exited 0 but we
-                # couldn't parse the owner/name id, so the env reference may be unrecorded.
-                print(
-                    "warning: `prime env push` exited 0 but no owner/name id could be parsed; "
-                    "verify the environment on the Prime Hub before training against it",
-                    file=sys.stderr,
-                )
-            return 0
-        if _push_is_version_conflict(output):
-            auto_bump = True
-            continue
-        return proc.returncode
-    print(f"push failed after {_PUSH_MAX_ATTEMPTS} version-conflict retries", file=sys.stderr)
-    return 1
+def _tar_b64(directory: Path) -> str:
+    """Pack a directory's contents into a base64 ``.tar.gz`` (members rooted at the top level)
+    for upload, skipping tool/cache dirs (``.prime/``, ``.git/``, ``__pycache__``, ...). Packaging
+    is pure file I/O — no `prime` CLI or Prime account needed locally.
+
+    We walk with ``os.walk`` and PRUNE excluded directories in place (``dirs[:] = ...``) so we never
+    descend into them: a plain ``rglob('*')`` would still recurse into (and stat every entry under)
+    huge trees like ``.venv``/``.git`` only to discard them, making the push needlessly slow on a
+    real project. The resulting member SET is identical to the previous filter on
+    ``_TAR_EXCLUDE_DIRS`` (those dirs and everything beneath them are omitted), and the output is
+    deterministic: entries are sorted at each level (parent-before-children walk order). Tar member
+    order doesn't affect correctness — the server extracts in stream order and the content hash is
+    computed from a re-sorted file list — so this is purely a traversal-efficiency fix."""
+    import base64
+    import io
+    import os
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for root, dirs, files in os.walk(directory):
+            root_path = Path(root)
+            # Prune excluded directories IN PLACE so os.walk never descends into them (this is the
+            # whole fix — the excluded subtrees are never traversed/statted). Sort the survivors so
+            # traversal order is deterministic.
+            dirs[:] = sorted(d for d in dirs if d not in _TAR_EXCLUDE_DIRS)
+            # Add the surviving directory entries themselves (so empty dirs are preserved, as the old
+            # rglob walk did), then this level's files — both sorted for determinism. recursive=False:
+            # we walk every path ourselves, so letting tar recurse would add contents twice.
+            for name in dirs:
+                child = root_path / name
+                tar.add(child, arcname=str(child.relative_to(directory)), recursive=False)
+            for name in sorted(files):
+                child = root_path / name
+                tar.add(child, arcname=str(child.relative_to(directory)), recursive=False)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _pyproject_name(env_dir: Path) -> str | None:
+    """The ``[project] name`` of a ready-made env dir, used to name the managed Hub env."""
+    import tomllib
+
+    try:
+        data = tomllib.loads((env_dir / "pyproject.toml").read_text())
+        name = (data.get("project") or {}).get("name")
+        return str(name) if name else None
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return None
+
+
+def _upload_and_report(name: str, *, is_new: bool, package_b64: str) -> int:
+    """Upload a packaged env to the managed Environments Hub (the control plane publishes it
+    under FreeSolo's Prime account) and print the returned id."""
+    from flash.client import ClientError, client_from_config
+
+    try:
+        result = client_from_config().publish_env(name=name, is_new=is_new, package_b64=package_b64)
+    except ClientError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    slug = result.get("id")
+    if not slug:
+        print("warning: the env was published but the server returned no id", file=sys.stderr)
+        return 1
+    print(f"published {slug}")
+    print(f'reference it in your config:\n\n  [environment]\n  id = "{slug}"')
+    return 0
 
 
 def cmd_env_push(args) -> int:
     import shutil
     import tempfile
 
-    if not shutil.which("prime"):
-        print("the `prime` CLI is required to publish to the Environments Hub.")
-        print("install it (https://docs.primeintellect.ai) then re-run `slm env push`.")
-        return 1
-
     src = Path(args.path)
     if not src.exists():
         print(f"no such path: {src}", file=sys.stderr)
         return 1
 
-    # A proper env directory (has a pyproject.toml) is pushed as-is; its name comes from the
-    # pyproject. Otherwise the published env name is derived from the env's path.
+    # A ready-made env directory (has a pyproject.toml) is uploaded as-is; its name comes from
+    # the pyproject. Publishing happens server-side under FreeSolo's managed Prime account, so no
+    # local `prime` CLI or Prime Intellect account is required.
     if src.is_dir() and (src / "pyproject.toml").is_file():
-        # First attempt never forces --auto-bump; the version-conflict retry enables it only
-        # when the version actually collides, so a genuine first publish keeps its version.
-        return _run_prime_push(src, is_new=True)
+        env_name = _pyproject_name(src) or _push_env_name(src.name)
+        return _upload_and_report(env_name, is_new=True, package_b64=_tar_b64(src))
 
     # Wrap a bare verifiers module (a single .py, or a one-module dir) into a Prime-compatible
-    # env package and push that. `--auto-bump` retries handle re-publishes. `data_dir` is a
-    # committed `datasets/` sibling of the module (if any); we ship it inside the package so an
-    # env that reads a `__file__`-relative data file still resolves once installed.
+    # env package and upload that. `data_dir` is a committed `datasets/` sibling of the module
+    # (if any); we ship it inside the package so an env that reads a `__file__`-relative data
+    # file still resolves once installed.
     if src.is_file() and src.suffix == ".py":
         module_source = src.read_text()
         # Re-publish to the SAME Hub env when a sibling flash config names one: use its
@@ -288,7 +292,7 @@ def cmd_env_push(args) -> int:
         if len(modules) != 1:
             print(
                 f"{src} has no pyproject.toml and {'no' if not modules else 'multiple'} "
-                "top-level .py module(s); point `slm env push` at the env's .py file or add a "
+                "top-level .py module(s); point `flash env push` at the env's .py file or add a "
                 "pyproject.toml.",
                 file=sys.stderr,
             )
@@ -302,11 +306,16 @@ def cmd_env_push(args) -> int:
         print(f"cannot publish {src}: expected a verifiers .py module or an env directory.")
         return 1
 
-    module = env_name.replace("-", "_")
+    # The module dir name must be a valid Python identifier. `env_name` may be a sibling config's
+    # Hub slug name (`_config_env_name`), which is NOT sanitized and can contain `.`/other chars
+    # invalid in a package dir (and would mismatch `[tool.hatch...] packages = ["<module>"]`,
+    # breaking the build). Normalize through `_push_env_name` (collapses non-[a-z0-9] runs to `-`)
+    # before mapping `-`->`_`, so the module is always [a-z0-9_].
+    module = _push_env_name(env_name).replace("-", "_")
     # A Python package name can't start with a digit, so prefix one (e.g. "2026-task").
     if module[:1].isdigit():
         module = f"env_{module}"
-    with tempfile.TemporaryDirectory(prefix="slm-env-push-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
         (pkg / module).mkdir()
         (pkg / module / "__init__.py").write_text(_with_syspath_bootstrap(module_source))
@@ -321,4 +330,4 @@ def cmd_env_push(args) -> int:
             _ENV_PUSH_PYPROJECT.format(name=env_name, module=module, version=_PUSH_INITIAL_VERSION)
         )
         (pkg / "README.md").write_text(f"# {env_name}\n\nFlash verifiers environment.\n")
-        return _run_prime_push(pkg, is_new=is_new, name=env_name)
+        return _upload_and_report(env_name, is_new=is_new, package_b64=_tar_b64(pkg))
