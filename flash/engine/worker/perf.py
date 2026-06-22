@@ -373,6 +373,84 @@ def gpu_diagnostics() -> dict:
     return diag
 
 
+# Sentinel phrase carried in the RETRIABLE-infra error message. The control plane's
+# infra-retry matcher (flash/runner/lifecycle.py _infra_markers) keys off this exact phrase in
+# the worker's persisted traceback, so a MIG/NVML-broken host is resubmitted on a FRESH worker
+# instead of being mis-classified as a (non-retried) job_failed. Keep the two in lock-step.
+RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
+
+
+class RetriableInfraError(RuntimeError):
+    """A boot-time infrastructure failure that the control plane should RETRY on a fresh worker.
+
+    Raised for a host the run can never train on — e.g. RunPod fulfilling a full-GPU request
+    with a MIG slice ("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb",
+    ``nvidia-smi`` = "[Insufficient Permissions]"), where PyTorch's CUDA caching allocator
+    HARD-ASSERTS mid-backward ("NVML_SUCCESS == r INTERNAL ASSERT FAILED ... CUDACachingAllocator").
+    The message embeds ``RETRIABLE_INFRA_MARKER`` so the runner's infra-retry path provisions a
+    new host rather than failing the run as a genuine (non-retried) worker crash.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
+
+
+def assert_usable_gpu() -> None:
+    """Fail FAST (and RETRIABLY) on a MIG slice / NVML-restricted device before any real CUDA work.
+
+    RunPod has been observed fulfilling a full-GPU class request with a MIG partition whose
+    ``nvidia-smi`` reports "[Insufficient Permissions]"; PyTorch's caching allocator then trips an
+    NVML assertion mid-backward ("RuntimeError: NVML_SUCCESS == r INTERNAL ASSERT FAILED ...
+    c10/cuda/CUDACachingAllocator.cpp"), which the control plane mis-classified as job_failed
+    (not retrying), burning the run. Detect the bad host at boot and raise the RETRIABLE infra
+    error so the run is resubmitted on a fresh worker.
+
+    Detection (any one trips it):
+      * the device name contains "MIG" (a MIG partition), or
+      * a minimal NVML probe (memory query) raises (driver/permission restricted), or
+      * CUDA reports no device at all.
+    The NVML check is best-effort: a probe that simply can't run (pynvml absent) is NOT treated as
+    a failure — we only fail on a name match or an NVML call that actively raises.
+    """
+    try:
+        import torch
+    except Exception as e:  # torch import failure is a different (image) problem; let it surface
+        print("[gpu-guard] torch import failed; skipping MIG/NVML guard:", e)
+        return
+    if not torch.cuda.is_available():
+        raise RetriableInfraError("CUDA reports no available device at worker boot")
+    try:
+        name = torch.cuda.get_device_name(0)
+    except Exception as e:
+        # A device that can't even be named is unusable — retry on a fresh host.
+        raise RetriableInfraError(f"could not query the GPU device name ({e})") from e
+    if "MIG" in (name or ""):
+        raise RetriableInfraError(
+            f"GPU is a MIG slice ({name!r}); PyTorch's CUDA allocator NVML-asserts on MIG "
+            "partitions (CUDACachingAllocator NVML_SUCCESS), so this host cannot train"
+        )
+    # NVML probe: a MIG/permission-restricted device raises here even when the name looks normal.
+    try:
+        import pynvml  # bundled with the cuda torch wheel (nvidia-ml-py)
+
+        pynvml.nvmlInit()
+        try:
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            pynvml.nvmlDeviceGetMemoryInfo(h)  # the call that fails on a restricted MIG host
+        finally:
+            with contextlib.suppress(Exception):
+                pynvml.nvmlShutdown()
+    except ImportError:
+        # No NVML bindings available -> can't probe; the name check above is the guard.
+        pass
+    except Exception as e:
+        raise RetriableInfraError(
+            f"NVML probe failed for {name!r} ({e}); the device is permission-restricted "
+            "(MIG / shared host) and PyTorch's allocator will NVML-assert mid-run"
+        ) from e
+    print(f"[gpu-guard] usable full GPU: {name}")
+
+
 def wait_for_gpu():
     """Rented nodes sometimes report 'CUDA device not ready' transiently at startup.
     Poll a trivial CUDA op until it succeeds before doing real work; raise if never ready."""
