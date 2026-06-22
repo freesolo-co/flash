@@ -648,10 +648,18 @@ def make_lora(model_id: str | None = None):
     # model emits only whitespace and warm-start GRPO hangs. peft can convert PiSSA->standard on
     # save, but the simpler, robust choice is the default init (the convergence gain isn't worth
     # silently breaking serve + warm-start).
-    kwargs["init_lora_weights"] = True
-    print("[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)")
-    # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
-    kwargs["use_rslora"] = True
+    # Default: standard zero-B init (PiSSA removed for serve/warm-start safety). FLASH_INIT_LORA_PISSA=1
+    # re-enables PiSSA for A/B QUALITY testing ONLY (it corrupts serve/warm-start — never ship it on).
+    if os.environ.get("FLASH_INIT_LORA_PISSA", "").strip().lower() in ("1", "true", "yes"):
+        kwargs["init_lora_weights"] = "pissa_niter_16"
+        print("[lora] init_lora_weights=pissa_niter_16 (A/B TEST ONLY — PiSSA breaks serve/warm-start)")
+    else:
+        kwargs["init_lora_weights"] = True
+        print("[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)")
+    # rsLoRA scaling (convergence lever, default-on: measured -47% train loss in A/B (gpu-bench)).
+    # FLASH_USE_RSLORA=0 disables it for A/B quality testing (e.g. the linkd-search re-check).
+    kwargs["use_rslora"] = os.environ.get("FLASH_USE_RSLORA", "1").strip().lower() not in ("0", "false", "no")
+    print(f"[lora] use_rslora={kwargs['use_rslora']}")
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
         if exclude:
