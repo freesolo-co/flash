@@ -438,7 +438,10 @@ def assert_lora_applied(model, model_id: str) -> int:
 
 
 def model_quant(model_id: str) -> str:
-    """Quantization tier for this model: catalog entry > bf16 (managed; no override)."""
+    """Quantization tier for this model: catalog entry > bf16 (managed; no override).
+
+    The whole catalog is bf16, so this always returns ``"bf16"`` today; kept as the single
+    source of truth a future non-bf16 tier could feed (no caller branches on it now)."""
     try:
         from flash.catalog import MODELS
 
