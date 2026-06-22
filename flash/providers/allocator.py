@@ -76,12 +76,22 @@ def _runpod_candidates(need: int, exclude_gpu_classes: frozenset[str]) -> list[C
     Restricted to the validated pool (``g.validated``): the deployed control plane rejects a submit
     for any non-validated class, so allocating one would only fail at submit time. Any class in
     ``exclude_gpu_classes`` is dropped — used to walk OFF a MIG-prone class (a class RunPod has been
-    seen fulfilling with a MIG slice) onto a different one on the infra-retry path."""
+    seen fulfilling with a MIG slice) onto a different one on the infra-retry path.
+
+    Classes flagged ``runpod_mig_risk`` are skipped UP FRONT on RunPod: RunPod has been observed
+    serving these validated *types* (RTX A5000, RTX Pro 6000 WK) as Blackwell MIG slices, which crash
+    training (PyTorch's CUDA allocator NVML-asserts on MIG partitions) and burn the run after the
+    retry budget. The flag is RunPod-specific — these classes stay in the validated pool and remain
+    eligible on Vast (which rents whole boards), so this exclusion does NOT touch ``_vast_candidates``.
+    """
     provider = get_provider("runpod")
     return [
         Candidate("runpod", g.name, provider.hourly_rate(g.name), g.vram_gb)
         for g in provider.gpu_classes()
-        if g.vram_gb >= need and g.validated and g.name not in exclude_gpu_classes
+        if g.vram_gb >= need
+        and g.validated
+        and not g.runpod_mig_risk
+        and g.name not in exclude_gpu_classes
     ]
 
 
@@ -132,11 +142,17 @@ def allocate(
     exclude_gpu_classes: set[str] | frozenset[str] = frozenset(),
     train=None,
     thinking: bool = False,
+    provider: str | None = None,
 ) -> Allocation:
-    """Pick the cheapest (provider, GPU class) able to run the job across ALL providers.
+    """Pick the cheapest (provider, GPU class) able to run the job across the live providers.
 
-    There is no GPU pin and no provider pin — every fitting, LIVE-VALIDATED class on every live
-    provider is eligible, and the cheapest wins. Allocation is restricted to the validated pool
+    By default there is no GPU pin and no provider pin — every fitting, LIVE-VALIDATED class on
+    every live provider is eligible, and the cheapest wins. An OPT-IN ``provider`` pin ("vast" /
+    "runpod") restricts the candidate pool to that single substrate (for A/B-ing one provider
+    against the full pool); ``None`` keeps the cross-provider cheapest-wins behavior. A pin to a
+    provider that isn't live/configured raises ``UnsupportedGpuError``.
+
+    Allocation is restricted to the validated pool
     (``GpuClass.validated``) because the deployed control plane rejects a submit for any
     non-validated class, so picking the absolute-cheapest fitting class (e.g. an unvalidated "RTX
     2000 Ada") would just make the server refuse the run. ``train``/``thinking`` size the
@@ -151,6 +167,18 @@ def allocate(
     exclude_gpu_classes = frozenset(exclude_gpu_classes)
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
     live = available_providers()
+    if provider is not None:
+        # OPT-IN provider pin: restrict the candidate pool to the one named substrate. A pin to a
+        # provider that isn't live/configured (e.g. "vast" without VAST_API_KEY) is a clear config
+        # error, not a silent fall-through to the other provider — A/B "vast-only" must NOT quietly
+        # run on RunPod.
+        live = tuple(p for p in live if p == provider)
+        if not live:
+            raise UnsupportedGpuError(
+                f"provider {provider!r} pinned but not available/configured "
+                f"(live: {available_providers() or '(none)'}); "
+                "set its credentials (e.g. VAST_API_KEY for vast) or remove the [gpu] provider pin"
+            )
     candidates: list[Candidate] = []
     offer_book: tuple = ()
     if "runpod" in live:
