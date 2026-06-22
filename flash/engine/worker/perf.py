@@ -92,35 +92,18 @@ def _estimate_params(cfg) -> float:
 
 
 def _liger_default_for_model(model_id: str) -> bool:
-    """Default Liger ON only for models large enough that fused-CE's memory win pays off
-    (≥ _LIGER_MIN_PARAMS, ~3B). 1B-class models measured net-negative -> default OFF."""
+    """True when the model is large enough (≥ _LIGER_MIN_PARAMS, ~3B) to warrant the memory-mode
+    optimizations (sleep, grad checkpointing) — the worker's size gate, read via ``_memory_mode``.
+    (The ~3B cutoff is the old Liger fused-CE threshold this shared; flash now runs chalk
+    standalone — chalk's FLCE is unconditionally on regardless of size — but the memory cutoff
+    that the sleep/grad-checkpointing decisions key off is the same number, so the helper stays.)"""
     try:
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         return _estimate_params(cfg) >= _LIGER_MIN_PARAMS
     except Exception as e:
-        print("liger model-size probe failed (default off):", e)
-        return False
-
-
-def liger_on(default_on: bool) -> bool:
-    """Whether to enable a Liger kernel path. ``default_on`` is the model-size decision (on only
-    for models large enough that fused-CE's memory win pays off; 1B-class is a measured net loss).
-    Even when on, require a CUDA GPU AND that ``liger_kernel`` is importable — the local
-    ``flash[gpu]`` extra doesn't ship it, so blindly setting use_liger_kernel would crash a
-    local GPU run. No GPU / absent -> off."""
-    if not default_on:
-        return False
-    try:
-        import importlib.util
-
-        import torch
-
-        return bool(
-            torch.cuda.is_available() and importlib.util.find_spec("liger_kernel") is not None
-        )
-    except Exception:
+        print("model size probe failed (default off):", e)
         return False
 
 

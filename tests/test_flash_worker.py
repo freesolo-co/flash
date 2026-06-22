@@ -129,7 +129,14 @@ def _clear_chalk_flags(monkeypatch):
 
 # The three default-on gap-filler flags (chalk_kernels._KERNELS): disabling exactly these
 # deselects chalk. QKV/MLP/FP8 base are opt-in (default-off) and need no flag to stay off.
-_DEFAULT_ON_CHALK_FLAGS = ("FLASH_ROPE_KERNEL", "FLASH_TRITON_LORA", "FLASH_EMBED_KERNEL")
+_DEFAULT_ON_CHALK_FLAGS = (
+    "FLASH_RMSNORM_KERNEL",
+    "FLASH_SWIGLU_KERNEL",
+    "FLASH_FLCE_KERNEL",
+    "FLASH_ROPE_KERNEL",
+    "FLASH_TRITON_LORA",
+    "FLASH_EMBED_KERNEL",
+)
 
 
 def test_chalk_extra_pip_default_on_with_spec(monkeypatch):

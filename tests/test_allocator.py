@@ -282,14 +282,16 @@ def test_sft_logits_cap_no_regression_small_vocab_or_fused():
     assert sft_grad_accum(8) == (4, 2)
 
 
-def test_sft_logits_fused_gate_mirrors_worker():
-    """sft_logits_fused mirrors the worker's liger_on(_memory_mode): fused for a >=3B model OR a
-    >=2048-token context; a small short-context run is NOT fused (so the cap applies there)."""
+def test_sft_logits_fused_conservative_size_gate():
+    """sft_logits_fused is the allocator's CONSERVATIVE fused-CE gate: it banks on the saving only
+    for a >=3B model OR a >=2048-token context. chalk's FLCE actually fuses every run, but a small
+    short-context run is sized as if un-fused (so the GPU is never undersized) and the per-device
+    logits cap applies there."""
     from flash.engine.vram import sft_logits_fused
 
-    assert sft_logits_fused(0.8, 1024) is False  # small + short -> not fused -> cap applies
-    assert sft_logits_fused(4.0, 1024) is True  # >=3B -> fused
-    assert sft_logits_fused(0.8, 2048) is True  # long ctx -> fused
+    assert sft_logits_fused(0.8, 1024) is False  # small + short -> conservatively not banked -> cap applies
+    assert sft_logits_fused(4.0, 1024) is True  # >=3B
+    assert sft_logits_fused(0.8, 2048) is True  # long ctx
     assert sft_logits_fused(None, 1024) is False  # unknown size -> memory-safe (cap applies)
 
 

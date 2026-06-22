@@ -47,14 +47,17 @@ WORKER_DEPS = [
     # compatible with torch2.10 break transformers 5.6-5.10's hub_kernels integration at IMPORT
     # (LayerRepository now requires a version; transformers passes none -> ValueError on every
     # `import transformers`). FlashAttention via the Hub is therefore disabled; attention uses
-    # SDPA (already a flash/efficient backend on Ampere/Ada) + the Liger fused kernels below,
+    # SDPA (already a flash/efficient backend on Ampere/Ada) + the chalk fused kernels below,
     # which are the dominant LoRA speedup anyway. (FA via a pinned flash-attn wheel is a future
     # per-arch experiment, kept out of the default deps to avoid a fragile cold-start install.)
-    # Liger fused Triton kernels (pure Triton -> JITs on every arch incl. Blackwell): fused
-    # linear cross-entropy for SFT (use_liger_kernel) and the chunked GRPO loss
-    # (use_liger_loss) — the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
     "wandb>=0.17",
-    "liger-kernel>=0.5",
+    # freesolo-chalk: flash's STANDALONE fused-kernel stack — it REPLACES Liger entirely. chalk
+    # supplies its OWN RMSNorm + SwiGLU + fused-linear-CE (the FLCE is the big large-vocab
+    # Qwen3.5 ~248k memory/throughput win that keeps the logits from materializing), PLUS the
+    # kernels Liger never had (RoPE / LoRA-delta / embedding). Pure Triton/CUDA, JITs on every arch
+    # incl. Blackwell. Baked in (as Liger was) so cold starts don't pip-install it. Keep this spec
+    # in lockstep with DEFAULT_CHALK_SPEC below + the freesolo-chalk install in Dockerfile.worker.
+    "freesolo-chalk>=0.2.0,<0.3.0",
     # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this,
     # transformers falls back to a pure-PyTorch delta rule and GRPO trainer steps are
     # 2-3x slower (measured A/B on Qwen3.5-2B: ~65 s/step -> ~20 s/step steady).
@@ -62,13 +65,12 @@ WORKER_DEPS = [
     # NB: fla's gated chunk_bwd is broken on HOPPER (H100) with Triton >= 3.4 (fla #640), so
     # resolve_worker_deps DROPS fla on sm90 (the correct pure-PyTorch delta rule runs instead). The
     # dense Qwen3.5 GDN models route to consumer cards by default, where fla works.
-    # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
-    # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
-    # (chalk_extra_pip) appends the version-pinned ``freesolo-chalk`` (DEFAULT_CHALK_SPEC) from PyPI
-    # to the worker's `extra_pip` for EVERY job by default — installed + applied automatically, like
-    # Liger. Override the source with FLASH_CHALK_SPEC (an exact version / git URL / wheel), or
-    # disable every kernel (FLASH_<K>=0) to skip the install. The worker pip-installs extra_pip for
-    # EVERY job (baked-image RunPod
+    # NB: freesolo-chalk is baked into the base deps above (it's REQUIRED now — chalk runs every
+    # fused kernel, standalone). The submit path (chalk_extra_pip) ALSO appends the resolved chalk
+    # spec to the worker's `extra_pip` so an operator can OVERRIDE the version/source per-run via
+    # FLASH_CHALK_SPEC (an exact version / git URL / wheel) — e.g. pin to the chalk standalone commit
+    # before 0.2.0 lands on PyPI; a redundant install matching the baked version is harmless. The
+    # worker pip-installs extra_pip for EVERY job (baked-image RunPod
     # _train_body + Vast bootstrap). Do NOT rely on
     # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS for this: the durable baked-image submit path
     # (jobs.build_function_input) returns the raw payload and never consults resolve_worker_deps, so
@@ -185,9 +187,11 @@ def _chalk_selected(spec=None) -> bool:
 
 # Default chalk install spec when FLASH_CHALK_SPEC is unset. VERSION-PINNED (bounded range, like the
 # rest of WORKER_DEPS) so a default run is reproducible and a breaking freesolo-chalk release can't
-# silently land on production jobs — 0.1.x patches are allowed, 0.2 is not. Bump intentionally after
-# validating a new line; an operator can pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z.
-DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.1.0,<0.2.0"
+# silently land on production jobs — 0.2.x patches are allowed, 0.3 is not. 0.2.0 is the STANDALONE
+# line (chalk's own RMSNorm/SwiGLU/FLCE, replacing Liger); keep in lockstep with the freesolo-chalk
+# pin in WORKER_DEPS + Dockerfile.worker. Bump intentionally after validating a new line; an operator
+# can pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z (or a git URL before 0.2.0 is on PyPI).
+DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.2.0,<0.3.0"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:

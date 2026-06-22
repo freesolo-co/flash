@@ -1,23 +1,26 @@
-"""Optional chalk GPU kernels (the ``freesolo-chalk`` package).
+"""chalk GPU kernels (the ``freesolo-chalk`` package) — flash's STANDALONE kernel stack.
 
-Chalk holds Freesolo's hand-written Triton/CUDA kernels that complement Liger: the RoPE the
-qwen3.5 hybrid arch needs (Liger refuses it), the LoRA-delta matmul, fused MLP, the QKV
-norm+RoPE attention epilogue, embedding gather, and FP8 frozen-base GEMMs.
+chalk holds Freesolo's hand-written Triton/CUDA kernels for the Qwen3.5/3.6 layers. flash no
+longer uses Liger at all: chalk runs standalone and supplies EVERY fused kernel — its own
+RMSNorm, SwiGLU, and fused-linear-cross-entropy (the layers Liger used to own, which chalk now
+beats or ties on every GPU arch), PLUS the kernels Liger never had: the RoPE the qwen3.5 hybrid
+arch needs (Liger refused it), the LoRA-delta matmul, embedding gather, fused MLP, the QKV
+norm+RoPE attention epilogue, and FP8 frozen-base GEMMs.
 
-Chalk ships a Liger-style one-call entry point, ``apply_chalk_kernel_to_qwen35(model, ...)``,
-mirroring ``apply_liger_kernel_to_qwen3``: enablement is the call itself (no env flag), each kernel
-is a boolean keyword, and it NEVER raises on a kernel failure (every installer self-tests +
-arch-gates and falls back to the eager/Liger path; a no-op off-GPU). flash applies it
-AUTOMATICALLY — like Liger — after the trainer builds the model, with the **gap-filling** kernels
-Liger leaves on the eager path ON BY DEFAULT: RoPE, the LoRA-delta matmul, and embedding gather.
-The kernels that OVERLAP Liger (fused MLP / SwiGLU — Liger owns MLP) or are situational (the
-eval-only QKV epilogue, the Hopper-only FP8 frozen base) stay OPT-IN.
+chalk ships a Liger-style one-call entry point, ``apply_chalk_kernel_to_qwen35(model, ...)``:
+enablement is the call itself (no env flag), each kernel is a boolean keyword, and it NEVER
+raises on a kernel failure (every installer self-tests + arch-gates and falls back to the eager
+path; a no-op off-GPU). flash applies it AUTOMATICALLY after the trainer builds the model, with
+``liger=False`` (CHALK STANDALONE — chalk installs its OWN rms_norm/swiglu/FLCE, zero Liger).
 
-Liger is applied by TRL (``use_liger_kernel``); chalk composes ON TOP of the live Liger modules,
-so flash calls chalk with ``liger=False``. Per-kernel ``FLASH_*`` flags are OVERRIDES:
-``FLASH_<K>=0`` disables a default-on kernel, ``FLASH_<K>=1`` enables an opt-in one. If
-``freesolo-chalk`` isn't installed (no ``FLASH_CHALK_SPEC``, or on the control plane) the whole
-module degrades to a no-op.
+The PRODUCTION kernels are ON BY DEFAULT — chalk replaces Liger for everything: rms_norm, swiglu,
+fused-linear-CE (the FLCE that keeps the ~248k-vocab logits from materializing — flash's
+large-vocab OOM protection now comes from chalk, not Liger), RoPE, the LoRA-delta matmul, and
+embedding gather. Situational kernels stay OPT-IN: the fused MLP (overlaps swiglu, measured
+net-negative on H100), the eval-only QKV epilogue (needs q/k/v out of LoRA targets), and the
+Hopper-only FP8 frozen base. Per-kernel ``FLASH_*`` flags are OVERRIDES: ``FLASH_<K>=0`` disables
+a default-on kernel, ``FLASH_<K>=1`` enables an opt-in one. If ``freesolo-chalk`` isn't installed
+(e.g. on the control plane) the whole module degrades to a no-op.
 """
 
 from __future__ import annotations
@@ -30,21 +33,28 @@ from flash._logging import get_logger
 log = get_logger(__name__)
 
 # Chalk kernel table: (FLASH_* flag, apply_chalk_kernel_to_qwen35 keyword, default_on).
-# The GAP-FILLERS that complement Liger are ON BY DEFAULT — applied automatically like
-# apply_liger_kernel — because each chalk installer self-tests on install and falls back to the
-# eager/Liger path on any failure, so always-applying them is safe:
-#   * rope             — the RoPE Liger REFUSES on the qwen3.5 hybrid arch (its only real gap)
-#   * fused_lora_delta — the LoRA-delta matmul on the trainable path (Liger doesn't touch adapters)
-#   * fused_embedding  — the embedding gather (Liger doesn't touch it)
-# The OVERLAPPING / situational kernels stay OPT-IN (default off): the fused MLP overlaps Liger's
-# SwiGLU (Liger owns MLP), the attn epilogue is eval-only (needs q/k/v out of LORA_TARGETS), and the
+# chalk is the STANDALONE stack (no Liger) — every PRODUCTION fused kernel is ON BY DEFAULT,
+# applied automatically after the trainer builds the model. Each chalk installer self-tests on
+# install and falls back to the eager path on any failure, so always-applying them is safe:
+#   * rmsnorm                     — chalk's fused RMSNorm (replaces Liger's)
+#   * swiglu                      — chalk's fused SwiGLU activation (replaces Liger's)
+#   * fused_linear_cross_entropy  — chalk's chunked LM-head+CE; keeps the ~248k-vocab logits from
+#                                   materializing (the large-vocab OOM protection — was Liger's FLCE)
+#   * rope                        — the RoPE Liger REFUSED on the qwen3.5 hybrid arch
+#   * fused_lora_delta            — the LoRA-delta matmul on the trainable path (adapters)
+#   * fused_embedding             — the embedding gather
+# Situational kernels stay OPT-IN (default off): the fused MLP overlaps swiglu (measured
+# net-negative on H100), the attn epilogue is eval-only (needs q/k/v out of LORA_TARGETS), and the
 # FP8 frozen base is Hopper sm_90+ only. FLASH_<K>=0 turns a default-on kernel OFF; FLASH_<K>=1
 # turns a default-off one ON. The keyword is exactly chalk's apply_chalk_kernel_to_qwen35 kwarg.
 _KERNELS: list[tuple[str, str, bool]] = [
+    ("FLASH_RMSNORM_KERNEL", "rmsnorm", True),
+    ("FLASH_SWIGLU_KERNEL", "swiglu", True),
+    ("FLASH_FLCE_KERNEL", "fused_linear_cross_entropy", True),
     ("FLASH_ROPE_KERNEL", "rope", True),
     ("FLASH_TRITON_LORA", "fused_lora_delta", True),
     ("FLASH_EMBED_KERNEL", "fused_embedding", True),
-    ("FLASH_MLP_KERNEL", "fused_mlp", False),  # opt-in (Liger owns MLP/SwiGLU)
+    ("FLASH_MLP_KERNEL", "fused_mlp", False),  # opt-in (overlaps swiglu; net-negative on H100)
     ("FLASH_QKV_KERNEL", "attn_epilogue", False),  # opt-in (eval-only; needs q/k/v out of LoRA)
     ("FLASH_FP8_BASE", "fp8_frozen_base", False),  # opt-in (Hopper sm_90+ only)
 ]
@@ -87,7 +97,7 @@ def active_kernels(report: Mapping[str, object] | None) -> list[str]:
     """The chalk kernels that actually ENGAGED (truthy, non-error result) in an apply report.
 
     For a metrics note recording which kernels ran (so chalk engagement is verifiable without the
-    console). Excludes ``liger`` (TRL applies Liger; chalk's report carries it as False here).
+    console). Excludes ``liger`` (chalk runs standalone; its report carries ``liger`` as False).
     """
     return sorted(
         k
@@ -97,16 +107,16 @@ def active_kernels(report: Mapping[str, object] | None) -> list[str]:
 
 
 def install_chalk_kernels(model=None) -> dict:
-    """Apply chalk's gap-filling kernels to ``model`` — ON by default (like Liger), flags override.
+    """Apply chalk's STANDALONE kernel stack to ``model`` — production kernels ON by default.
 
-    Uses chalk's Liger-style entry point ``apply_chalk_kernel_to_qwen35(model, liger=False, ...)``:
-    Liger is already applied by TRL (``use_liger_kernel``), so chalk composes on top of the live
-    Liger modules. Each kernel is a boolean resolved from its ``FLASH_*`` flag (gap-fillers
-    default-on). Returns chalk's per-kernel report, or ``{}`` when every kernel is disabled, there is
-    no model yet, or freesolo-chalk isn't installed.
+    Uses chalk's one-call entry point ``apply_chalk_kernel_to_qwen35(model, liger=False, ...)``:
+    ``liger=False`` means chalk installs its OWN rms_norm/swiglu/FLCE (plus rope/lora-delta/
+    embedding) — flash does NOT use Liger. Each kernel is a boolean resolved from its ``FLASH_*``
+    flag (production kernels default-on). Returns chalk's per-kernel report, or ``{}`` when every
+    kernel is disabled, there is no model yet, or freesolo-chalk isn't installed.
 
-    chalk's apply patches the LIVE module, so the worker calls this AFTER TRL builds the trainer
-    (``model=trainer.model``); ``model is None`` is a safe no-op kept for defensive callers.
+    chalk's apply patches the LIVE module, so the worker calls this AFTER the trainer builds the
+    model (``model=trainer.model``); ``model is None`` is a safe no-op kept for defensive callers.
     """
     if model is None:
         # chalk's apply patches the materialized module -> nothing to do before the model is built.
@@ -120,13 +130,13 @@ def install_chalk_kernels(model=None) -> dict:
     try:
         from chalk.transformers import apply_chalk_kernel_to_qwen35
     except ImportError:
-        # chalk is installed by default (PyPI; chalk_extra_pip), so this only fires if an install
-        # was disabled/failed. Always safe: the kernels degrade to the eager/Liger path. Only the
+        # chalk is installed by default (baked into the worker image + chalk_extra_pip), so this only
+        # fires if an install was disabled/failed. Always safe: the kernels degrade to eager. Only the
         # post-build call reaches this import (the pre-build pass returns early), so it logs at most
         # once per run — no per-process dedup needed.
         log.info(
             "freesolo-chalk is not installed on this worker (set FLASH_CHALK_SPEC to an installable "
-            "spec, or check the default PyPI install); chalk kernels off, using eager/Liger."
+            "spec, or check the default PyPI install); chalk kernels off, using the eager path."
         )
         return {}
     except Exception as e:
@@ -136,9 +146,10 @@ def install_chalk_kernels(model=None) -> dict:
         return {}
 
     try:
-        # liger=False: TRL already applied Liger (use_liger_kernel); chalk composes on the live
-        # Liger modules. apply_chalk_kernel_to_qwen35 never raises on a per-kernel failure, but
-        # guard the call itself so a chalk API/version skew can never abort training.
+        # liger=False: CHALK STANDALONE — chalk installs its OWN rms_norm/swiglu/FLCE (+ rope/
+        # lora-delta/embedding); flash does NOT enable TRL's Liger. apply_chalk_kernel_to_qwen35
+        # never raises on a per-kernel failure, but guard the call itself so a chalk API/version
+        # skew can never abort training.
         report = apply_chalk_kernel_to_qwen35(model, liger=False, **kwargs)
     except Exception as e:  # never block training on the optional kernel stack
         log.warning("chalk apply failed (ignored, kernels disabled): %s", e)

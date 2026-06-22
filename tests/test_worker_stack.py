@@ -270,18 +270,6 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
     assert w.optimal_attn_impl() is None
 
 
-def test_liger_on_requires_default_and_gpu(monkeypatch):
-    """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
-    liger_kernel (both absent in CI), so it's off here too."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
-    assert w.liger_on(False) is False
-    assert w.liger_on(True) is False  # no CUDA / liger_kernel in CI
-
-
 def test_liger_default_model_size_gate(monkeypatch):
     """Liger default is OFF for small models (1B-class, measured net loss PR #174) and ON only
     for models ≥ ~3B where fused-CE's memory win pays off."""
