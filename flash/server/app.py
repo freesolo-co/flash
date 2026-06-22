@@ -268,7 +268,7 @@ def create_app():
     @app.get("/v1/me")
     def me(key: dict = Depends(require_key)):
         payload = {
-            "kind": "internal" if key["key_prefix"] == "internal" else "freesolo_api_key",
+            "kind": "internal" if key.get("auth_kind") == "internal" else "freesolo_api_key",
             "key_prefix": key["key_prefix"],
         }
         for field in ("email", "user_id", "org_id", "api_key_id", "training_agent_job_id", "project_id"):
@@ -356,7 +356,7 @@ def create_app():
         # Charge the pre-flight estimate to the user's org BEFORE accepting the run, so it's gated
         # on balance and never starts unpaid. Skipped for --dry-run and the internal service
         # identity (no user org to bill).
-        billed = not dry_run and key.get("key_prefix") != "internal"
+        billed = not dry_run and key.get("auth_kind") != "internal"
         token = (authorization or "").removeprefix("Bearer ").strip()
         charge: dict = {}
         if billed:
