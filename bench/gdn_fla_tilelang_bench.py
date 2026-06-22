@@ -45,6 +45,17 @@ def _remove_fla() -> None:
     import shutil
 
     _run("uninstall", "-y", "-q", "flash-linear-attention")
+    # pip uninstall can leave flash_linear_attention*.dist-info behind; with stale metadata present a
+    # later `pip install` reports "already satisfied" and skips the reinstall (same scenario as
+    # perf._remove_fla_from_disk). Strip the metadata from every site dir so the reinstall runs.
+    import glob as _glob
+
+    for _root in sys.path:
+        if _root and os.path.isdir(_root):
+            for _pat in ("flash_linear_attention*.dist-info", "flash-linear-attention*.dist-info",
+                         "flash_linear_attention*.egg-info"):
+                for _md in _glob.glob(os.path.join(_root, _pat)):
+                    shutil.rmtree(_md, ignore_errors=True)
     for _ in range(6):
         importlib.invalidate_caches()
         spec = importlib.util.find_spec("fla")

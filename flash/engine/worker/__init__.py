@@ -35,7 +35,7 @@ import traceback
 from flash.engine.accounting import RunMetrics
 
 # Shared, substrate-neutral fine-tuning internals (live in this same package).
-from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
+from flash.engine.chalk_kernels import _kernel_on, active_kernels, install_chalk_kernels
 from flash.engine.recipe import RECIPE
 
 # Re-export the pure helpers split into the leaf submodules ``.perf`` and ``.lora``.
@@ -771,12 +771,14 @@ def run_sft():
     # the fused path is unavailable.
     _sft_params_b = resolve_params_b(model_id)  # catalog stat else HF safetensors (open models)
     _sft_vocab = vocab_size_for(model_id)
-    # chalk's FLCE fuses EVERY run (standalone, no size / liger_kernel-importable gate), so the
-    # fused-CE memory saving is always really taken. The allocator just stays CONSERVATIVE about
-    # banking on it: sft_logits_fused is the >=3B / >=2048-ctx mirror, so the large-vocab logits cap
-    # below binds only for small short-context runs where it doesn't bank on the saving (a GPU is
-    # never undersized). (Was `... and liger_on(_memory_mode(...))`; liger_on went away with Liger.)
-    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len)
+    # chalk's FLCE fuses every run BY DEFAULT (standalone, no size / liger_kernel-importable gate),
+    # so the fused-CE memory saving is normally taken. The allocator stays CONSERVATIVE about banking
+    # on it: sft_logits_fused is the >=3B / >=2048-ctx mirror, so the large-vocab logits cap below
+    # binds only for small short-context runs (a GPU is never undersized). It ALSO binds when an
+    # operator disables FLCE (FLASH_FLCE_KERNEL=0): there's then no fused saving to bank on, so we AND
+    # in the flag — _sft_fused is False and the cap protects against the full-logits OOM.
+    # (Was `... and liger_on(_memory_mode(...))`; liger_on went away with Liger.)
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and _kernel_on("FLASH_FLCE_KERNEL", True)
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
     )
