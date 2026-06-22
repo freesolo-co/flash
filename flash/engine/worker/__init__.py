@@ -57,8 +57,6 @@ from flash.engine.worker.lora import (
     vllm_language_model_only_kwargs,  # noqa: F401
 )
 from flash.engine.worker.perf import (
-    _LIGER_MIN_PARAMS,  # noqa: F401
-    _LONG_CONTEXT_TOKENS,  # noqa: F401
     _attn_impl_for_capability,  # noqa: F401
     _drop_fla_on_hopper,
     _estimate_params,  # noqa: F401
@@ -765,14 +763,8 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     # SDK [train] knobs override the recipe default.
-    from flash.catalog import MODELS as _SFT_CATALOG
     from flash.catalog import vocab_size_for
-    from flash.engine.vram import (
-        fetch_hf_params_b,
-        params_b_from_str,
-        sft_grad_accum,
-        sft_logits_fused,
-    )
+    from flash.engine.vram import resolve_params_b, sft_grad_accum, sft_logits_fused
 
     _t = JOB_SPEC.train if JOB_SPEC else None
     sft_lr = _t.learning_rate if _t and _t.learning_rate is not None else RECIPE.sft.learning_rate
@@ -792,14 +784,7 @@ def run_sft():
     # logits stay within the logits budget; grad-accum rises to keep the effective batch unchanged
     # (the SFT mirror of rl_per_device_comps' GRPO cap). fused mirrors liger_on(_memory_mode(...))
     # below, so the cap binds exactly when the worker won't fuse the CE.
-    _sft_info = _SFT_CATALOG.get(model_id)
-    _sft_params_b = (
-        (getattr(_sft_info, "params_b", 0.0) or params_b_from_str(getattr(_sft_info, "params", None)))
-        if _sft_info
-        else None
-    )
-    if not _sft_params_b:
-        _sft_params_b = fetch_hf_params_b(model_id)  # uncataloged: HF safetensors metadata
+    _sft_params_b = resolve_params_b(model_id)  # catalog stat else HF safetensors (open models)
     _sft_vocab = vocab_size_for(model_id)
     _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len)
     per_device_bs, grad_accum = sft_grad_accum(
@@ -1481,15 +1466,13 @@ def run_rl():
     # the global completion batch = prompts_per_step * group_size, i.e. each optimizer step
     # actually optimizes `prompts_per_step` prompts. The per-device *completion* micro-batch
     # is the VRAM knob (thinking-aware; see rl_per_device_comps).
-    from flash.engine.vram import fetch_hf_params_b, params_b_from_str
+    from flash.engine.vram import resolve_params_b
 
-    _params_b = params_b_from_str(getattr(_info, "params", None)) if _info else None
-    # Open-model (uncataloged) GRPO: _info carries no param count, so size the colocate
-    # activation cap from the HF safetensors metadata (no download). Without this, a large
-    # open model falls back to the ~2B-width default in rl_per_device_comps and gets too LOOSE
-    # a per-device cap -> colocate OOM. Best-effort: stays None offline, keeping prior behavior.
-    if _params_b is None:
-        _params_b = fetch_hf_params_b(model_id)
+    # Open-model (uncataloged) GRPO: size the colocate activation cap from the catalog stat, else
+    # the HF safetensors metadata (no download). Without a real count a large open model falls back
+    # to the ~2B-width default in rl_per_device_comps and gets too LOOSE a per-device cap ->
+    # colocate OOM. Best-effort: stays None offline, keeping prior behavior.
+    _params_b = resolve_params_b(model_id)
     from flash.catalog import vocab_size_for
 
     per_device_comps = rl_per_device_comps(
