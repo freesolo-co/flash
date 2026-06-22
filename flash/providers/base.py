@@ -63,20 +63,9 @@ class GpuClass:
     # has not passed Flash's live validation smoke"), so client-side allocation restricts to the
     # validated pool by default (see ``validated_classes`` / allocator) — otherwise a default
     # `flash train` could pick the absolute-cheapest fitting class (e.g. "RTX 2000 Ada") that the
-    # server then refuses, and the run never submits. Exactly the 8 smoke-validated members below
+    # server then refuses, and the run never submits. Exactly the smoke-validated members below
     # are marked True.
     validated: bool = False
-    # RunPod-only hazard: RunPod has been observed FULFILLING a request for this validated GPU
-    # *type* with a Blackwell MIG SLICE ("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG
-    # 1g.24gb", nvidia-smi = "[Insufficient Permissions]"), on which PyTorch's CUDA caching
-    # allocator HARD-ASSERTS mid-backward (CUDACachingAllocator NVML_SUCCESS) and burns the run.
-    # So the RunPod ALLOCATION path skips these classes (see allocator._runpod_candidates /
-    # cheapest_gpu) -- the allocator picks a full-GPU class RunPod can't MIG-partition (consumer
-    # cards like RTX 3090/4090, datacenter A100/H100) instead. The flag is RunPod-specific: these
-    # classes stay validated + submittable and remain available on Vast (the MIG substitution is a
-    # RunPod behavior; Vast rents whole boards). The worker's runtime MIG guard (assert_usable_gpu)
-    # stays the safety net for any MIG slice that still slips through.
-    runpod_mig_risk: bool = False
 
 
 # Fallback hourly rates are RunPod secure-cloud on-demand (snapshot 2026-06-11); live
@@ -133,20 +122,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm89",
         0.26,
         vast_name="RTX 4000Ada",
-    ),
-    # Validated 2026-06-11: Qwen3-0.6B SFT + GRPO smokes passed — cheapest 24 GB class.
-    # runpod_mig_risk: RunPod serves this type as a Blackwell MIG 1g.24gb slice (observed live on a
-    # gsm8k GRPO run) -> excluded from RunPod allocation, kept for Vast (whole boards).
-    GpuClass(
-        "RTX A5000",
-        "NVIDIA_RTX_A5000",
-        24,
-        "a5000",
-        "sm86",
-        0.27,
-        vast_name="RTX A5000",
-        validated=True,
-        runpod_mig_risk=True,
     ),
     # Vast-validated 2026-06-12: Qwen3-0.6B SFT train+eval smoke ($0.25/hr Czechia).
     GpuClass(
@@ -233,23 +208,6 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         2.09,
         min_cuda_modern="13.0",
         validated=True,
-    ),
-    # RTX Pro 6000 Blackwell Workstation Edition: same 96 GB die as the Server Edition,
-    # a distinct RunPod GpuType, typically a touch cheaper. Also offered on Vast. The
-    # single biggest non-datacenter 96 GB option -> cheapest 80 GB-floor GRPO host.
-    # runpod_mig_risk: RunPod serves this type as a Blackwell MIG slice -> excluded from RunPod
-    # allocation (the 80 GB GRPO floor lands on A100/H100/Pro 6000 Server instead), kept for Vast.
-    GpuClass(
-        "RTX Pro 6000 WK",
-        "NVIDIA_RTX_PRO_6000_BLACKWELL_WORKSTATION_EDITION",
-        96,
-        "pro6000wk",
-        "sm120",
-        1.79,
-        min_cuda_modern="13.0",
-        vast_name="RTX PRO 6000",
-        validated=True,
-        runpod_mig_risk=True,
     ),
 )
 
@@ -380,14 +338,12 @@ def cheapest_gpu(min_vram_gb: int) -> str:
     ``flash.providers.allocator``): Vast-only classes are excluded so the result is
     always deployable via Flash, and offline resolution stays deterministic. Restricted to the
     live-validated pool so the picked class matches what the deployed control plane will actually
-    accept — a non-validated class submits then gets rejected. MIG-risk classes (``runpod_mig_risk``
-    — types RunPod serves as Blackwell MIG slices) are skipped too, so the RunPod-static provisional
-    matches what the RunPod allocator path will actually provision (a full, non-MIG GPU).
+    accept — a non-validated class submits then gets rejected.
     """
     pool = [
         g
         for g in GPU_INFO.values()
-        if g.enum_member and g.vram_gb >= min_vram_gb and g.validated and not g.runpod_mig_risk
+        if g.enum_member and g.vram_gb >= min_vram_gb and g.validated
     ]
     if not pool:
         # This helper filters to RunPod-provisionable VALIDATED classes (enum_member set +
@@ -467,9 +423,6 @@ class PollResult:
     # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
     failure: str | None = None
     detail: str | None = None
-    # job_preempted only: the GPU CLASS is at fault (a MIG slice), so the retry must re-allocate
-    # OFF it, not just onto a fresh host of the same class. Set from the worker's heartbeat.
-    exclude_class: bool = False
 
 
 # ---------------------------------------------------------------------------
