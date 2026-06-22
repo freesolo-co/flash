@@ -35,7 +35,7 @@ import traceback
 from flash.engine.accounting import RunMetrics
 
 # Shared, substrate-neutral fine-tuning internals (live in this same package).
-from flash.engine.chalk_kernels import _kernel_on, active_kernels, install_chalk_kernels
+from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels, kernel_on
 from flash.engine.recipe import RECIPE
 
 # Re-export the pure helpers split into the leaf submodules ``.perf`` and ``.lora``.
@@ -778,7 +778,7 @@ def run_sft():
     # operator disables FLCE (FLASH_FLCE_KERNEL=0): there's then no fused saving to bank on, so we AND
     # in the flag — _sft_fused is False and the cap protects against the full-logits OOM.
     # (Was `... and liger_on(_memory_mode(...))`; liger_on went away with Liger.)
-    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and _kernel_on("FLASH_FLCE_KERNEL", True)
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and kernel_on("FLASH_FLCE_KERNEL", True)
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
     )

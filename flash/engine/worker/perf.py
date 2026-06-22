@@ -72,7 +72,13 @@ def flex_attn_status(model_id: str) -> str:
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        for arch in getattr(cfg, "architectures", None) or []:
+        archs = getattr(cfg, "architectures", None) or []
+        if not archs:
+            # No architectures in the config -> we genuinely can't determine support. That's
+            # "couldn't tell" (like a failed probe), NOT a real arch limitation, so don't report
+            # the definitive "unsupported".
+            return "probe_failed"
+        for arch in archs:
             cls = getattr(transformers, arch, None)
             if cls is not None and getattr(cls, "_supports_flex_attn", False):
                 return "supported"

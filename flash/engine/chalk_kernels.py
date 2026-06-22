@@ -69,9 +69,17 @@ def _flag_on(value: str | None, default_on: bool) -> bool:
     return value.strip().lower() not in ("0", "false", "no", "off")
 
 
-def _kernel_on(flag: str, default_on: bool) -> bool:
-    """As :func:`_flag_on`, reading ``flag`` from this process's ``os.environ``."""
+def kernel_on(flag: str, default_on: bool) -> bool:
+    """Public: is a single chalk kernel ``flag`` enabled in this process's ``os.environ``?
+
+    Resolves one FLASH_* flag against its default (see :func:`_flag_on`). External modules (e.g.
+    ``flash.engine.worker``) should import this rather than reaching for the underscore helper.
+    """
     return _flag_on(os.environ.get(flag), default_on)
+
+
+# Back-compat internal alias (kept so existing in-module callers don't churn).
+_kernel_on = kernel_on
 
 
 def is_chalk_enabled(env: Mapping[str, str]) -> bool:

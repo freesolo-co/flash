@@ -79,7 +79,17 @@ def terminate(pod_id: str) -> None:
     print(json.dumps({"terminated": pod_id}))
 
 
+_USAGE = "usage: runpod_pod.py {create <gpu> <name> <disk> | status <id> | terminate <id>}"
+_CMDS = {
+    "create": lambda a: create(a[0], a[1], a[2]),
+    "status": lambda a: status(a[0]),
+    "terminate": lambda a: terminate(a[0]),
+}
+
 if __name__ == "__main__":
-    {"create": lambda: create(sys.argv[2], sys.argv[3], sys.argv[4]),
-     "status": lambda: status(sys.argv[2]),
-     "terminate": lambda: terminate(sys.argv[2])}[sys.argv[1]]()
+    if len(sys.argv) < 2 or sys.argv[1] not in _CMDS:
+        raise SystemExit(_USAGE)
+    try:
+        _CMDS[sys.argv[1]](sys.argv[2:])
+    except IndexError:
+        raise SystemExit(_USAGE) from None
