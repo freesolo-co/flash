@@ -70,20 +70,24 @@ def required_vram_gb(
     )
 
 
-def _runpod_candidates(need: int) -> list[Candidate]:
+def _runpod_candidates(need: int, exclude_gpu_classes: frozenset[str]) -> list[Candidate]:
     """RunPod's fitting, live-validated classes priced live (static fallback).
 
     Restricted to the validated pool (``g.validated``): the deployed control plane rejects a submit
-    for any non-validated class, so allocating one would only fail at submit time."""
+    for any non-validated class, so allocating one would only fail at submit time. Any class in
+    ``exclude_gpu_classes`` is dropped — used to walk OFF a MIG-prone class (a class RunPod has been
+    seen fulfilling with a MIG slice) onto a different one on the infra-retry path."""
     provider = get_provider("runpod")
     return [
         Candidate("runpod", g.name, provider.hourly_rate(g.name), g.vram_gb)
         for g in provider.gpu_classes()
-        if g.vram_gb >= need and g.validated
+        if g.vram_gb >= need and g.validated and g.name not in exclude_gpu_classes
     ]
 
 
-def _vast_candidates(need: int, disk_gb: int, exclude_machine_ids) -> tuple[list[Candidate], tuple]:
+def _vast_candidates(
+    need: int, disk_gb: int, exclude_machine_ids, exclude_gpu_classes: frozenset[str]
+) -> tuple[list[Candidate], tuple]:
     """Vast's fitting, live-validated classes from the live offer book (cheapest per class).
 
     Returns (candidates, full_offer_book). Restricted to the validated pool (``GPU_INFO[gpu]
@@ -112,6 +116,8 @@ def _vast_candidates(need: int, disk_gb: int, exclude_machine_ids) -> tuple[list
             continue
         if not GPU_INFO[o.gpu].validated:  # only offer live-validated classes the server accepts
             continue
+        if o.gpu in exclude_gpu_classes:  # walked OFF this class (e.g. MIG-prone) on infra retry
+            continue
         seen.add(o.gpu)
         out.append(Candidate("vast", o.gpu, o.dph_total, GPU_INFO[o.gpu].vram_gb, offer=o))
     return out, tuple(book)
@@ -123,6 +129,7 @@ def allocate(
     *,
     disk_gb: int = 60,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
+    exclude_gpu_classes: set[str] | frozenset[str] = frozenset(),
     train=None,
     thinking: bool = False,
 ) -> Allocation:
@@ -134,21 +141,33 @@ def allocate(
     non-validated class, so picking the absolute-cheapest fitting class (e.g. an unvalidated "RTX
     2000 Ada") would just make the server refuse the run. ``train``/``thinking`` size the
     requirement to the run's actual knobs (context, group, rank, batch) via the matrix.
+
+    ``exclude_gpu_classes`` drops whole GPU CLASSES from the candidate pool (across every provider).
+    The infra-retry path uses it to walk OFF a class that returned a RETRIABLE_INFRA_GPU failure —
+    e.g. an "RTX A5000" request RunPod fulfilled with a Blackwell MIG slice — so the retry
+    re-allocates to a DIFFERENT validated class (a consumer card like RTX 4090/5090/3090 that can't
+    be MIG-partitioned) instead of re-picking the same MIG-prone class and failing identically.
     """
+    exclude_gpu_classes = frozenset(exclude_gpu_classes)
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
     live = available_providers()
     candidates: list[Candidate] = []
     offer_book: tuple = ()
     if "runpod" in live:
-        candidates += _runpod_candidates(need)
+        candidates += _runpod_candidates(need, exclude_gpu_classes)
     if "vast" in live:
-        vcands, offer_book = _vast_candidates(need, disk_gb, exclude_machine_ids)
+        vcands, offer_book = _vast_candidates(
+            need, disk_gb, exclude_machine_ids, exclude_gpu_classes
+        )
         candidates += vcands
     if not candidates:
+        excluded = (
+            f" (excluding GPU classes {sorted(exclude_gpu_classes)})" if exclude_gpu_classes else ""
+        )
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any live provider "
-            f"({', '.join(live) or '(none)'}); add VAST_API_KEY for more classes, or the run "
-            "genuinely exceeds every available GPU class"
+            f"({', '.join(live) or '(none)'}){excluded}; add VAST_API_KEY for more classes, or the "
+            "run genuinely exceeds every available GPU class"
         )
     # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small job),
     # then registry order.
