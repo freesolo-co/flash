@@ -294,7 +294,15 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             network_volume_gb=int(gpu_raw.get("network_volume_gb", 100)),
             datacenter=gpu_raw.get("datacenter"),
         ),
-        run_id=run_id or raw.get("run_id", "local"),  # server-assigned; round-trips a rehydrated spec
+        # Platform-managed: the run_id is the explicit argument the control plane passes
+        # (new_run_id() at create_run, or the finalizer in submit_job) — NEVER trusted from the raw
+        # user config, even though it stays a RECOGNIZED key (see _TOP_LEVEL_KEYS). A user-supplied
+        # [run_id] in TOML/JSON would otherwise be user-controllable here, risking run-id collisions
+        # and wrong artifact/endpoint paths. The placeholder "local" is finalized downstream
+        # (submit_job treats "local" as unset and assigns new_run_id()). Re-serializing an
+        # already-finalized spec round-trips through JobSpec.from_dict (which DOES carry run_id), not
+        # this user-config parser, so dropping the raw rehydration here is round-trip-safe.
+        run_id=run_id or "local",
         worker_env=worker_env,
         model_policy=model_policy,
         thinking=thinking,

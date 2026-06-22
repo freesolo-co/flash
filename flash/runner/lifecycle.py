@@ -62,10 +62,10 @@ def _submit_seed_supervised(
 ) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
-    Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
-    live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
-    fresh per attempt because offers are a live market. There is no GPU pin, no validation
-    gate, and no provider pin — the cheapest fitting class always wins.
+    Each attempt first ALLOCATES the GPU: the cheapest LIVE-VALIDATED class across providers
+    (RunPod live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
+    fresh per attempt because offers are a live market. There is no GPU pin and no provider pin —
+    the cheapest fitting class in the validated pool always wins.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF
     checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
@@ -299,35 +299,14 @@ def _submit_seed_supervised(
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
             return res.metrics
         last_detail = f"{res.failure}: {res.detail}"
-        # Infra-shaped failures are retried on a FRESH endpoint/host; genuine worker
-        # code errors are not. Detail markers cover the observed flake classes:
-        # platform timeouts, worker pip-install network timeouts, and sick-GPU hosts.
-        _infra_markers = (
-            "TIMED_OUT",
-            "Failed to fetch",
-            "operation timed out",
-            "python_dependencies failed",
-            "Connection reset",
-            "cuda not available",
-            "GPU never became ready",
-            # Host vanished mid-run: the instance went "missing"/dead and NOTHING was captured
-            # (no marker error, no error_<phase>.txt, no console log) so _failure_detail falls back
-            # to this bare sentinel. A genuine worker code crash instead yields a RICHER detail
-            # (the captured traceback), so this exact phrase only ever marks a dead host -> retry it
-            # on a fresh one. Without this, a single ~1-in-200 host death killed the whole run.
-            "terminated without a DONE sentinel",
-            # MIG slice / NVML-restricted host: the worker's boot guard (engine.worker.perf
-            # assert_usable_gpu / RetriableInfraError) detected a device the run can never train on
-            # — e.g. RunPod fulfilling a full-GPU request with a MIG partition (nvidia-smi
-            # "[Insufficient Permissions]"), which otherwise NVML-asserts mid-backward and was
-            # mis-classified as a non-retried job_failed. This exact marker phrase is embedded in
-            # that error's message, so a bad host is resubmitted on a fresh worker. Keep this in
-            # lock-step with engine.worker.perf.RETRIABLE_INFRA_MARKER.
-            "RETRIABLE_INFRA_GPU",
-        )
-        infra_shaped = res.failure in ("stalled", "poll_error", "no_capacity") or any(
-            m in (res.detail or "") for m in _infra_markers
-        )
+        # Retry only on a structured failure category the provider already classified; a real job
+        # failure fails fast. No detail-string parsing — sick-host / preemption flakes that used to
+        # be matched on the failure detail are now classified upstream as ``job_preempted`` (the
+        # provider poller flags them via ``worker_flagged_retriable``). ``no_capacity`` (the class is
+        # throttled / stuck with no free workers) is also infra-shaped, but it drives the
+        # capacity-walk below (``is_capacity``) rather than the crash-retry budget. (USER cancels are
+        # caught below, not here.)
+        infra_shaped = res.failure in ("stalled", "poll_error", "no_capacity", "job_preempted")
         # A cancel deletes the endpoint, which the poller sees as an
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.

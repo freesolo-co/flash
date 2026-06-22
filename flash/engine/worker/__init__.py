@@ -57,8 +57,7 @@ from flash.engine.worker.lora import (
     vllm_language_model_only_kwargs,  # noqa: F401
 )
 from flash.engine.worker.perf import (
-    _LIGER_MIN_PARAMS,  # noqa: F401
-    _LONG_CONTEXT_TOKENS,  # noqa: F401
+    RetriableInfraError,
     _attn_impl_for_capability,  # noqa: F401
     _drop_fla_on_hopper,
     _estimate_params,  # noqa: F401
@@ -199,7 +198,8 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> None
                 time.sleep(5 * (attempt + 1))
                 continue
             if required:
-                raise RuntimeError(f"required upload of {repo_subpath!r} failed: {e}") from e
+                # Already retried 3x -> the host/network is bad, not the run. Infra-shaped.
+                raise RetriableInfraError(f"required upload of {repo_subpath!r} failed: {e}") from e
             print(f"{label} warn:", e)
             return
 
@@ -798,14 +798,8 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     # SDK [train] knobs override the recipe default.
-    from flash.catalog import MODELS as _SFT_CATALOG
     from flash.catalog import vocab_size_for
-    from flash.engine.vram import (
-        fetch_hf_params_b,
-        params_b_from_str,
-        sft_grad_accum,
-        sft_logits_fused,
-    )
+    from flash.engine.vram import resolve_params_b, sft_grad_accum, sft_logits_fused
 
     _t = JOB_SPEC.train if JOB_SPEC else None
     sft_lr = _t.learning_rate if _t and _t.learning_rate is not None else RECIPE.sft.learning_rate
@@ -825,14 +819,7 @@ def run_sft():
     # logits stay within the logits budget; grad-accum rises to keep the effective batch unchanged
     # (the SFT mirror of rl_per_device_comps' GRPO cap). fused mirrors liger_on(_memory_mode(...))
     # below, so the cap binds exactly when the worker won't fuse the CE.
-    _sft_info = _SFT_CATALOG.get(model_id)
-    _sft_params_b = (
-        (getattr(_sft_info, "params_b", 0.0) or params_b_from_str(getattr(_sft_info, "params", None)))
-        if _sft_info
-        else None
-    )
-    if not _sft_params_b:
-        _sft_params_b = fetch_hf_params_b(model_id)  # uncataloged: HF safetensors metadata
+    _sft_params_b = resolve_params_b(model_id)  # catalog stat else HF safetensors (open models)
     _sft_vocab = vocab_size_for(model_id)
     _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len)
     per_device_bs, grad_accum = sft_grad_accum(
@@ -1874,15 +1861,13 @@ def run_rl():
     # the global completion batch = prompts_per_step * group_size, i.e. each optimizer step
     # actually optimizes `prompts_per_step` prompts. The per-device *completion* micro-batch
     # is the VRAM knob (thinking-aware; see rl_per_device_comps).
-    from flash.engine.vram import fetch_hf_params_b, params_b_from_str
+    from flash.engine.vram import resolve_params_b
 
-    _params_b = params_b_from_str(getattr(_info, "params", None)) if _info else None
-    # Open-model (uncataloged) GRPO: _info carries no param count, so size the colocate
-    # activation cap from the HF safetensors metadata (no download). Without this, a large
-    # open model falls back to the ~2B-width default in rl_per_device_comps and gets too LOOSE
-    # a per-device cap -> colocate OOM. Best-effort: stays None offline, keeping prior behavior.
-    if _params_b is None:
-        _params_b = fetch_hf_params_b(model_id)
+    # Open-model (uncataloged) GRPO: size the colocate activation cap from the catalog stat, else
+    # the HF safetensors metadata (no download). Without a real count a large open model falls back
+    # to the ~2B-width default in rl_per_device_comps and gets too LOOSE a per-device cap ->
+    # colocate OOM. Best-effort: stays None offline, keeping prior behavior.
+    _params_b = resolve_params_b(model_id)
     from flash.catalog import vocab_size_for
 
     # colocated=not disaggregated: the colocate activation cap only applies when the rollout engine
@@ -2756,11 +2741,10 @@ def main():
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
+        # Structured retry signal both pollers read: infra failure -> retry on a fresh worker.
+        retriable = isinstance(e, RetriableInfraError)
         tb = traceback.format_exc()
         traceback.print_exc()
-        # Upload the FULL traceback under a phase-specific name (error_<phase>.txt) so the
-        # train (sft/rl) root-cause error survives for debugging. heartbeat.json is
-        # single-file/overwritten, so the per-phase error file is the persistent signal.
         try:
             err_name = error_artifact_name(RUN_MODE)
             err_path = f"/tmp/{err_name}"
@@ -2770,9 +2754,9 @@ def main():
         except Exception as up_err:
             print("error-upload warn:", up_err)
         try:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], diag=gpu_diagnostics())
+            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], retriable=retriable, diag=gpu_diagnostics())
         except Exception:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500])
+            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], retriable=retriable)
         # keep container alive briefly so logs flush, then exit non-zero -> restart
         time.sleep(10)
         raise

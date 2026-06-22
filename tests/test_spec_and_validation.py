@@ -354,6 +354,21 @@ def test_job_spec_json_round_trip() -> None:
     assert restored.phase == "rl"  # grpo's internal phase id
 
 
+def test_run_id_is_platform_managed_not_user_supplied() -> None:
+    # run_id is platform-MANAGED (see _TOP_LEVEL_KEYS docstring): spec_from_dict must NEVER trust a
+    # user-supplied [run_id] in the raw config — only the explicit argument the control plane passes
+    # (or the "local" placeholder, finalized downstream in submit_job). A user-controllable run_id
+    # would risk run-id collisions and wrong artifact/endpoint paths.
+    attacker = spec_from_dict(_raw(run_id="attacker-chosen"))
+    assert attacker.run_id == "local"  # raw [run_id] ignored; placeholder, not the user's value
+    # The explicit argument wins and is NOT overridden by a (conflicting) raw [run_id].
+    managed = spec_from_dict(_raw(run_id="attacker-chosen"), run_id="platform-assigned")
+    assert managed.run_id == "platform-assigned"
+    # Round-trip safety: re-serializing an already-finalized spec goes through JobSpec.from_dict,
+    # which DOES carry run_id — so dropping the raw rehydration in spec_from_dict is lossless here.
+    assert JobSpec.from_dict(managed.to_dict()).run_id == "platform-assigned"
+
+
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
     spec = spec_from_dict(_raw(), run_id="env-1")
 

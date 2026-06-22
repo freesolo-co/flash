@@ -36,6 +36,7 @@ from flash.providers.runpod.jobs import (
     _SETUP_HEARTBEAT_STAGES,
     make_hf_heartbeat_reader,
     make_hf_text_reader,
+    worker_flagged_retriable,
 )
 from flash.providers.vast import api as vast_api
 from flash.providers.vast.jobs.builders import (
@@ -268,8 +269,9 @@ _make_hf_file_reader = make_hf_text_reader
 
 def _failure_detail(
     hf_repo: str, prefix: str, phase: str, marker: dict | None, instance_id: int | None = None
-) -> str:
-    """Best root-cause detail we can assemble from the HF artifacts."""
+) -> tuple[str, bool]:
+    """Best root-cause detail from the HF artifacts, plus ``captured``: whether any real evidence
+    was found. ``captured=False`` means a silent host death (retry); a captured cause fails fast."""
     parts = []
     if marker and marker.get("error"):
         parts.append(str(marker["error"]))
@@ -282,7 +284,7 @@ def _failure_detail(
         logs = vast_api.instance_logs(int(instance_id))
         if logs:
             parts.append(f"--- instance log tail ---\n{logs[-3000:]}")
-    return "\n".join(parts) or "vast worker terminated without a DONE sentinel"
+    return ("\n".join(parts) or "vast worker terminated without a DONE sentinel", bool(parts))
 
 
 # Vast instance states that mean "the container is gone / will not progress".
@@ -417,10 +419,15 @@ def poll_vast_job(
             if raw_marker:
                 with contextlib.suppress(ValueError):
                     marker = json.loads(raw_marker)
+            detail, captured = _failure_detail(
+                hf_repo, prefix, spec.phase, marker, handle.instance_id
+            )
+            # Silent host death (no evidence) or a worker-flagged RetriableInfraError -> retry.
+            preempted = not captured or worker_flagged_retriable(heartbeat_reader)
             return PollResult(
                 False,
-                failure="job_failed",
-                detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.instance_id),
+                failure="job_preempted" if preempted else "job_failed",
+                detail=detail,
             )
 
         raw_marker = marker_reader()
@@ -430,10 +437,14 @@ def poll_vast_job(
             except ValueError:
                 marker = None
             if marker and not marker.get("ok"):
+                detail, _ = _failure_detail(
+                    hf_repo, prefix, spec.phase, marker, handle.instance_id
+                )
+                preempted = worker_flagged_retriable(heartbeat_reader)
                 return PollResult(
                     False,
-                    failure="job_failed",
-                    detail=_failure_detail(hf_repo, prefix, spec.phase, marker, handle.instance_id),
+                    failure="job_preempted" if preempted else "job_failed",
+                    detail=detail,
                 )
             if marker and marker.get("ok"):
                 done = done_reader(force=True)

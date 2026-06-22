@@ -77,7 +77,7 @@ def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     hb_iter = iter(heartbeats) if heartbeats is not None else None
 
-    reader = (lambda: next(hb_iter, None)) if hb_iter is not None else None
+    reader = (lambda force=False: next(hb_iter, None)) if hb_iter is not None else None
     h = jobs.JobHandle("ep", "name", "job")
     ok_payload = {
         "success": True,
@@ -118,6 +118,47 @@ def test_poll_job_failure(monkeypatch):
     assert not res.ok
     assert res.failure == "job_failed"
     assert "worker exploded" in res.detail
+
+
+def test_poll_job_platform_preempt_maps_to_job_preempted(monkeypatch):
+    # Platform terminations -> structured "job_preempted" (retried), not "job_failed".
+    for status in ("CANCELLED", "TIMED_OUT"):
+        res, _ = _poll(
+            monkeypatch,
+            [{"status": "IN_PROGRESS"}, {"status": status}],
+        )
+        assert not res.ok
+        assert res.failure == "job_preempted", status
+        assert f"[{status}]" in res.detail
+
+
+def _poll_failed_with_heartbeat(monkeypatch, hb):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    seq = iter([{"status": "IN_PROGRESS"}, {"status": "FAILED", "error": "boom"}])
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(seq))
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    return jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: hb,
+        stall_after_s=10.0,
+    )
+
+
+def test_poll_job_failed_with_retriable_heartbeat_is_job_preempted(monkeypatch):
+    # Worker stamped retriable=True -> infra-shaped, retried.
+    res = _poll_failed_with_heartbeat(monkeypatch, {"stage": "error_sft", "retriable": True})
+    assert not res.ok
+    assert res.failure == "job_preempted"
+
+
+def test_poll_job_failed_without_retriable_heartbeat_is_job_failed(monkeypatch):
+    # No retriable flag -> a real code error, fails fast.
+    res = _poll_failed_with_heartbeat(monkeypatch, {"stage": "error_sft", "error": "ValueError"})
+    assert not res.ok
+    assert res.failure == "job_failed"
 
 
 def test_poll_job_stall_detection(monkeypatch):
@@ -858,6 +899,31 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         assert st.state == "done"
         assert calls["n"] == 2
         assert st.remote["job_id"] == "j2"  # latest handle persisted
+
+
+def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
+    # A "job_preempted" first attempt retries on a fresh endpoint and completes.
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+
+        calls = {"n": 0}
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+            calls["n"] += 1
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}"})
+            if calls["n"] == 1:
+                return jobs.PollResult(False, failure="job_preempted", detail="[CANCELLED] None")
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        orch.submit_job(_spec("cancel-retry"), dry_run=False, background=False)
+        assert orch.get_status("cancel-retry").state == "done"
+        assert calls["n"] == 2
 
 
 def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
