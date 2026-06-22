@@ -237,16 +237,20 @@ def _local_env_wheel() -> Path | None:
     return Path(raw).expanduser()
 
 
+def _staged_wheel_pip_spec(wheel: Path, env_key: str) -> str:
+    if not wheel.is_file():
+        raise FileNotFoundError(f"{env_key} does not exist: {wheel}")
+    if wheel.suffix != ".whl":
+        raise ValueError(f"{env_key} must point to a .whl file: {wheel}")
+    return f"/runcode/code/wheels/{wheel.name}"
+
+
 def local_env_extra_pip() -> list[str]:
     """Worker pip spec(s) for a staged local verifiers env wheel."""
     wheel = _local_env_wheel()
     if wheel is None:
         return []
-    if not wheel.is_file():
-        raise FileNotFoundError(f"FLASH_ENV_WHEEL does not exist: {wheel}")
-    if wheel.suffix != ".whl":
-        raise ValueError(f"FLASH_ENV_WHEEL must point to a .whl file: {wheel}")
-    return [f"/runcode/code/wheels/{wheel.name}"]
+    return [_staged_wheel_pip_spec(wheel, "FLASH_ENV_WHEEL")]
 
 
 def hub_env_ids_for_run(env_id: str, params: dict | None = None) -> list[str]:
@@ -300,9 +304,20 @@ def chalk_extra_pip(spec=None) -> list[str]:
     """
     if not _chalk_selected(spec):
         return []
+    eff = _effective_worker_env(spec)
+    # Explicit FLASH_CHALK_SPEC wins (exact version, git URL, or worker-side wheel path).
+    spec_str = eff.get("FLASH_CHALK_SPEC", "").strip()
+    if spec_str:
+        return _split_pip_specs(spec_str)
+    # If the operator stages a local chalk wheel, automatically point extra_pip at the worker-side
+    # copy. Requiring a second FLASH_CHALK_SPEC=/runcode/... knob is easy to forget and silently
+    # falls back to PyPI/stale baked chalk, which defeats the point of staging a validation wheel.
+    chalk_wheel = (eff.get("FLASH_CHALK_WHEEL") or "").strip()
+    if chalk_wheel:
+        return [_staged_wheel_pip_spec(Path(chalk_wheel).expanduser(), "FLASH_CHALK_WHEEL")]
     # PyPI default (version-pinned for reproducibility) — chalk is published, so a normal run
-    # installs + applies it automatically. An explicit FLASH_CHALK_SPEC overrides the source.
-    spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
+    # installs + applies it automatically.
+    spec_str = DEFAULT_CHALK_SPEC
     return _split_pip_specs(spec_str)
 
 

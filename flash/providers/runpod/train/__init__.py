@@ -105,8 +105,8 @@ def upload_code(repo: str | None = None) -> str:
         delete_patterns=["**"],
     )
     # Private validation path for unpublished chalk builds: stage a local wheel into the same
-    # run-private code artifact, then set FLASH_CHALK_SPEC=/runcode/code/wheels/<wheel>.whl for the
-    # run. This avoids unauthenticated workers reaching the internal chalk repo before PyPI is cut.
+    # run-private code artifact. chalk_extra_pip() points selected runs at the staged worker-side
+    # /runcode/code/wheels/<wheel>.whl unless FLASH_CHALK_SPEC explicitly overrides it.
     chalk_wheel = (os.environ.get("FLASH_CHALK_WHEEL") or "").strip()
     if chalk_wheel:
         wheel_path = Path(chalk_wheel).expanduser()

@@ -192,7 +192,7 @@ def _clear_chalk_flags(monkeypatch):
     # extra-pip assertions.
     from flash.engine.chalk_kernels import _KERNELS
 
-    for k in (*(flag for flag, _kw, _on in _KERNELS), "FLASH_CHALK_SPEC"):
+    for k in (*(flag for flag, _kw, _on in _KERNELS), "FLASH_CHALK_SPEC", "FLASH_CHALK_WHEEL"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -224,6 +224,17 @@ def test_chalk_extra_pip_defaults_to_pypi_without_spec(monkeypatch):
     assert chalk_extra_pip() == [DEFAULT_CHALK_SPEC]
     assert DEFAULT_CHALK_SPEC.startswith("freesolo-chalk")
     assert "<" in DEFAULT_CHALK_SPEC  # bounded range, not an unpinned floating install
+
+
+def test_chalk_extra_pip_uses_staged_wheel_without_spec(monkeypatch, tmp_path):
+    """FLASH_CHALK_WHEEL stages a local wheel and should not require a second worker path knob."""
+    from flash.providers.runpod.train import chalk_extra_pip
+
+    _clear_chalk_flags(monkeypatch)
+    wheel = tmp_path / "freesolo_chalk-0.4.12-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    monkeypatch.setenv("FLASH_CHALK_WHEEL", str(wheel))
+    assert chalk_extra_pip() == ["/runcode/code/wheels/freesolo_chalk-0.4.12-py3-none-any.whl"]
 
 
 def test_chalk_extra_pip_adds_spec_when_selected(monkeypatch):
