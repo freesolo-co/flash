@@ -27,15 +27,41 @@ def test_required_vram_catalog_and_open(monkeypatch):
     assert all(c.vram_gb >= 35 for c in a.candidates)
 
 
-def test_no_validation_gate_picks_cheapest_fitting(monkeypatch):
+def test_allocation_restricted_to_validated_pool(monkeypatch):
     from flash.providers import allocator
+    from flash.providers.base import VALIDATED
 
-    # There is no validation gate: the cheapest fitting class wins even if it's a class
-    # Flash hasn't smoke-tested (previously the gate forced the cheapest VALIDATED class,
-    # RTX A5000 @ $0.27, for 0.8B GRPO). Offline only RunPod is available.
+    # The deployed control plane rejects a submit for any non-validated class, so client-side
+    # allocation must only ever pick a class in the live-validated pool — across ALL candidates,
+    # not just the chosen one. Offline only RunPod is available; 0.8B GRPO needs the 24 GB tier
+    # whose cheapest VALIDATED class is RTX A5000 @ $0.27 (cheaper unvalidated 24 GB classes like
+    # L4 exist but are excluded). 16 GB unvalidated classes (RTX 2000 Ada @ $0.24) never appear.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
-    assert a.hourly_usd <= 0.27  # at least as cheap as the previously-validated A5000 floor
+    assert all(c.gpu in VALIDATED for c in a.candidates), [
+        c.gpu for c in a.candidates if c.gpu not in VALIDATED
+    ]
+    assert a.gpu == "RTX A5000"  # the cheapest VALIDATED 24 GB class
+
+
+def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
+    """A small SFT fits a 16-17 GB card; the absolute-cheapest fitting class (RTX 2000 Ada /
+    RTX A4000, ~$0.24-0.25) is UNVALIDATED and must be skipped for the cheapest VALIDATED one,
+    so the run actually submits (the live `flash train` default-submit failure this fixes)."""
+    from flash.providers import allocator
+    from flash.providers.base import GPU_INFO, VALIDATED
+
+    # 4B SFT (seq 1024, rank 8) down-routes below 24 GB in the matrix (see test_required_vram_*).
+    a = allocator.allocate(
+        "Qwen/Qwen3.5-4B", "sft", train={"max_length": 1024, "lora_rank": 8}
+    )
+    assert a.min_vram_gb < 24  # a sub-24 GB run where unvalidated cheap cards exist
+    assert all(c.gpu in VALIDATED for c in a.candidates)
+    # The cheapest fitting UNVALIDATED RunPod class would have been chosen without the gate.
+    assert any(
+        (not g.validated) and g.enum_member and g.vram_gb >= a.min_vram_gb
+        for g in GPU_INFO.values()
+    )
 
 
 def test_offline_allocates_static_cheapest(monkeypatch):
