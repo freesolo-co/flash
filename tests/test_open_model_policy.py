@@ -83,17 +83,29 @@ def test_spec_model_policy_default_catalog():
     assert spec.model_policy == "catalog"
 
 
-def test_spec_model_policy_allow_roundtrip(monkeypatch):
+def test_spec_model_policy_allow_via_operator_env(monkeypatch):
+    # model_policy is operator-controlled via the FLASH_MODEL_POLICY control-plane env, NOT a user
+    # knob: setting the env to "allow" lets a fitting non-catalog model through.
+    monkeypatch.setenv("FLASH_MODEL_POLICY", "allow")
     monkeypatch.setattr("flash.engine.vram.fetch_hf_params_b", lambda model_id, **k: 1.0, raising=True)
-    spec = spec_from_dict(_raw(model="acme/tiny-1b", model_policy="allow"))
+    spec = spec_from_dict(_raw(model="acme/tiny-1b"))
     assert spec.model_policy == "allow"
     spec2 = spec.from_dict(spec.to_dict())
     assert spec2.model_policy == "allow"
 
 
-def test_spec_model_policy_invalid():
-    with pytest.raises(ConfigError):
-        spec_from_dict(_raw(model_policy="yolo"))
+def test_spec_user_model_policy_is_ignored(monkeypatch):
+    # A user-supplied model_policy in the config is ignored (the operator env governs); the
+    # default policy stays "catalog" even when the user asks for "allow".
+    monkeypatch.delenv("FLASH_MODEL_POLICY", raising=False)
+    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
+    assert spec.model_policy == "catalog"
+
+
+def test_operator_model_policy_invalid(monkeypatch):
+    monkeypatch.setenv("FLASH_MODEL_POLICY", "yolo")
+    with pytest.raises(ConfigError, match="FLASH_MODEL_POLICY"):
+        spec_from_dict(_raw())
 
 
 def test_spec_unlisted_model_under_catalog_policy_fails():
