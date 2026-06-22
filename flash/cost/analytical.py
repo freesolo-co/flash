@@ -12,7 +12,6 @@ from .facts import (
     download_weight_gb,
     gpu_tflops,
     gpu_vram_gb,
-    model_quant,
     pick_gpu,
     realized_hourly_usd,
     reward_seconds_per_completion,
@@ -103,8 +102,6 @@ def select_gpu(config: RunConfig) -> tuple[str, int]:
 def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: float) -> tuple[str, ...]:
     n = config.normalized()
     notes: list[str] = []
-    if (quant := model_quant(n.model_id)) != "bf16":
-        notes.append(f"{quant}: smaller VRAM footprint -> cheaper GPU class fits")
     if n.is_grpo:
         comps = n.batch_size * n.group_size
         rsec = reward_seconds_per_completion(n.reward_seconds_per_completion)

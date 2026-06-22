@@ -72,11 +72,11 @@ def required_vram_gb(
         headroom=vram_headroom(),
     )
     # Disaggregated GRPO ([train].inference_gpus>0) splits memory across the node's GPUs: the
-    # inference server (full bf16 weights + KV) and the trainer (quant weights + LoRA optimizer +
+    # inference server (full bf16 weights + KV) and the trainer (bf16 weights + LoRA optimizer +
     # activations) live on SEPARATE cards, so no single GPU needs the colocate total. The binding
     # per-GPU need is max(server bf16 weights + KV/overhead, the trainer's share ~= colocate minus
     # the vLLM engine/KV). Sizing to that lets a big model fit a per-role card (e.g. Qwen3.6-35B-A3B
-    # served bf16 on a 94GB H100 NVL, 4-bit trainer on the other) instead of demanding the colocate
+    # served bf16 on a 94GB H100 NVL, bf16 LoRA trainer on the other) instead of demanding the colocate
     # floor (~96GB) — which no available 2-GPU node meets — while staying FLOORED by the bf16 weights
     # so the server can never be under-provisioned into an OOM. Also unblocks 4B 1:2 on a 5090 (the
     # disaggregated server/trainer each fit 32GB though colocate 4B needs ~35GB).

@@ -221,12 +221,9 @@ def build_vllm_serve_cmd(
     Only flags that ``trl vllm-serve``'s ScriptArguments actually defines are emitted (verified
     against trl/scripts/vllm_serve.py): model, tensor_parallel_size, data_parallel_size, host, port,
     gpu_memory_utilization, max_model_len, enable_prefix_caching, trust_remote_code. The CLI has NO
-    quantization/load_format option, so a ``4bit-qlora`` model is served bf16/auto on its OWN
-    inference card (in disaggregated mode the inference GPU holds ONLY the rollout, not a colocated
-    trainer, so the full-precision weights fit a big enough card). The trainer still loads the base
-    4-bit (its model_init_kwargs are independent); TRL merges the LoRA into bf16 before each weight
-    sync, so trainer-4-bit + server-bf16 stays consistent. ``quant`` is accepted for signature
-    stability / sizing notes but does not change the server command.
+    quantization/load_format option, so the model is served bf16/auto on its OWN inference card (in
+    disaggregated mode the inference GPU holds ONLY the rollout, not a colocated trainer). ``quant``
+    is accepted for signature stability / sizing notes but does not change the server command.
     """
     bin_ = trl_bin or os.environ.get("FLASH_TRL_BIN", "trl")
     if parallel == "dp":

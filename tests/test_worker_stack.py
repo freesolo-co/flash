@@ -404,10 +404,9 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B", 4096) is True
 
 
-def test_make_lora_skips_pissa_on_4bit_qlora(monkeypatch):
-    """PiSSA init raises on a 4-bit base (peft TypeError -> the whole run crashed), so make_lora
-    must SKIP PiSSA on the QLoRA tier (catalog 9B) and keep it on the bf16/LoRA tier. rsLoRA stays
-    on for both. Regression for the Qwen3.5-9B QLoRA training crash."""
+def test_make_lora_uses_pissa_and_rslora(monkeypatch):
+    """The bf16-everywhere catalog always provides an unquantized base, so make_lora unconditionally
+    uses PiSSA init (-35% train loss in A/B) and rsLoRA scaling (-47% train loss in A/B)."""
     captured = {}
     fake_peft = types.ModuleType("peft")
     fake_peft.LoraConfig = lambda **kw: (captured.update(kw), kw)[1]
@@ -416,17 +415,6 @@ def test_make_lora_skips_pissa_on_4bit_qlora(monkeypatch):
     worker = _import_worker(monkeypatch)
     monkeypatch.setattr(worker, "lora_exclude_modules", lambda m: None)
 
-    # 4-bit QLoRA tier -> NO PiSSA of ANY variant (any pissa_* init crashes on a 4-bit base);
-    # rsLoRA still on.
-    monkeypatch.setattr(worker, "model_quant", lambda m: "4bit-qlora")
-    captured.clear()
-    worker.make_lora("Qwen/Qwen3.5-9B")
-    _init = str(captured.get("init_lora_weights", "")).lower()
-    assert not _init.startswith("pissa"), f"PiSSA must be skipped on 4-bit, got {_init!r}"
-    assert captured.get("use_rslora") is True
-
-    # bf16/LoRA tier -> PiSSA on
-    monkeypatch.setattr(worker, "model_quant", lambda m: "bf16")
     captured.clear()
     worker.make_lora("Qwen/Qwen3.5-0.8B")
     assert captured.get("init_lora_weights") == "pissa_niter_16"

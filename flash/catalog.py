@@ -181,9 +181,8 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="A100 PCIe",
         thinking="hybrid",
-        notes="QLoRA (4-bit NF4 base + bf16 LoRA). GRPO's colocated vLLM rollout loads the "
-        "base 4-bit via bitsandbytes too, so both copies are 4-bit -> fits ~24-32 GB "
-        "instead of 80 GB bf16. ~near-lossless vs bf16 LoRA.",
+        notes="bf16 LoRA. SFT fits a 48 GB card; colocated GRPO holds two bf16 weight copies + "
+        "KV + the 248k-vocab fp32 logits, so it needs an 80 GB-class GPU (grpo_min_vram_gb).",
     ),
     # ---- Qwen3.6 MoE: the DISAGGREGATED (multi-GPU async) GRPO tier ----
     # GRPO-only: the 35B OOMs when the bf16 trainer and the bf16 vLLM rollout share one card, so its

@@ -387,9 +387,9 @@ def _build_cmd(
         ]
     else:
         entry = ["-m", "verl.trainer.main_ppo"]
-    # Trainer strategy. fsdp2 (default) uses DTensor — incompatible with bnb 8-bit optim / 4-bit
-    # QLoRA. fsdp (FSDP1) uses FlatParameter (no DTensor) and on 1 trainer GPU is NO_SHARD (= a
-    # single un-sharded model on one GPU, what we want), which UNBLOCKS 8-bit + QLoRA.
+    # Trainer strategy. fsdp2 (default) uses DTensor — incompatible with bnb 8-bit optim. fsdp
+    # (FSDP1) uses FlatParameter (no DTensor) and on 1 trainer GPU is NO_SHARD (= a single
+    # un-sharded model on one GPU, what we want), which UNBLOCKS the 8-bit optimizer.
     _strategy = os.environ.get("FLASH_VERL_STRATEGY", "fsdp2").strip() or "fsdp2"
     ov = [
         "algorithm.adv_estimator=grpo",
@@ -421,7 +421,7 @@ def _build_cmd(
         "actor_rollout_ref.actor.kl_loss_coef=0.001",
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
         "actor_rollout_ref.actor.entropy_coeff=0",
-        # Trainer strategy (fsdp2=DTensor default; fsdp=FSDP1/FlatParameter for 8-bit+QLoRA, no DTensor).
+        # Trainer strategy (fsdp2=DTensor default; fsdp=FSDP1/FlatParameter for the 8-bit optimizer, no DTensor).
         f"actor_rollout_ref.actor.strategy={_strategy}",
         f"actor_rollout_ref.ref.strategy={_strategy}",
         # verl requires explicit micro-batch sizes (or use_dynamic_bsz). Set small per-GPU micro-batches.
@@ -509,14 +509,6 @@ def _build_cmd(
         ov += [
             "actor_rollout_ref.actor.optim.optimizer_impl=bitsandbytes.optim",
             "actor_rollout_ref.actor.optim.optimizer=AdamW8bit",
-        ]
-    if os.environ.get("FLASH_VERL_QLORA", "").strip().lower() in ("1", "true", "yes"):
-        # QLoRA: serve the rollout's base in 4-bit too (vLLM bitsandbytes) to match the 4-bit trainer
-        # base — so a big model's rollout also fits the smaller/cheaper GPU. verl _apply_quantization
-        # passes this straight to vLLM.
-        ov += [
-            "actor_rollout_ref.rollout.load_format=bitsandbytes",
-            "actor_rollout_ref.rollout.quantization=bitsandbytes",
         ]
     # NOTE: token-based dynamic batching (use_dynamic_bsz) was REMOVED — measured SLOWER, not faster:
     # 4B 1:1 went 383.4 (off) -> 540.3 (on, +41%). With the fixed-size benchmark prompts the larger
@@ -679,82 +671,6 @@ def _patch_verl_chalk():
         print(f"[verl] chalk patch skipped: {e}", flush=True)
 
 
-def _patch_verl_qlora():
-    """Load the frozen base in 4-bit NF4 (QLoRA) on the verl trainer — the COST lever: a 4-bit base
-    (~1/4 the VRAM) lets a big model train + serve on a SMALLER/cheaper GPU (e.g. 35B ~70GB bf16 ->
-    ~18GB). verl has no native 4-bit support, so patch its FSDP from_pretrained to pass a
-    BitsAndBytesConfig and skip verl's `module.to(torch_dtype)` (bitsandbytes forbids casting a 4-bit
-    model). REQUIRES strategy=fsdp (FSDP1/FlatParameter): fsdp2's fully_shard can't wrap Params4bit
-    ("only Tensors of floating point dtype can require gradients"). Gated by FLASH_VERL_QLORA,
-    idempotent, compile-checked + reverted on syntax error."""
-    try:
-        out = subprocess.run(
-            [
-                RUN_PY,
-                "-c",
-                "import verl.workers.engine.fsdp.transformer_impl as m; print(m.__file__)",
-            ],
-            text=True,
-            capture_output=True,
-            timeout=120,
-        )
-        path = (out.stdout.strip().splitlines() or [""])[-1].strip()
-        if not path or not os.path.exists(path):
-            print(
-                f"[verl] QLoRA patch: transformer_impl not found ({out.stderr[-200:]})", flush=True
-            )
-            return
-        src = _read(path)
-        if "FLASH-QLORA" in src:
-            print("[verl] QLoRA patch: already applied", flush=True)
-            return
-        anchor = (
-            "                    config=self.model_config.hf_config,\n"
-            "                    trust_remote_code=self.model_config.trust_remote_code,\n"
-            "                )\n"
-        )
-        if anchor not in src:
-            print("[verl] QLoRA patch: anchor not found (verl drift) — skipping", flush=True)
-            return
-        repl = (
-            "                    config=self.model_config.hf_config,\n"
-            "                    quantization_config=__import__('transformers').BitsAndBytesConfig(  # FLASH-QLORA\n"
-            "                        load_in_4bit=True, bnb_4bit_quant_type='nf4',\n"
-            "                        bnb_4bit_compute_dtype=__import__('torch').bfloat16,\n"
-            "                        bnb_4bit_use_double_quant=True),\n"
-            "                    trust_remote_code=self.model_config.trust_remote_code,\n"
-            "                )\n"
-        )
-        src = src.replace(anchor, repl, 1)
-        cast_anchor = "            # some parameters may not in torch_dtype\n            module.to(torch_dtype)\n"
-        if cast_anchor in src:
-            src = src.replace(
-                cast_anchor,
-                "            # some parameters may not in torch_dtype\n"
-                "            if not (getattr(module, 'is_loaded_in_4bit', False) or getattr(module, 'is_quantized', False)):  # FLASH-QLORA\n"
-                "                module.to(torch_dtype)\n",
-                1,
-            )
-        else:
-            print(
-                "[verl] QLoRA patch: .to(dtype) cast anchor not found (may still crash)", flush=True
-            )
-        _write(path, src)
-        chk = subprocess.run(
-            [RUN_PY, "-c", f"import ast; ast.parse(open({path!r}).read())"],
-            text=True,
-            capture_output=True,
-            timeout=60,
-        )
-        if chk.returncode != 0:
-            _write(path, src)
-            print(f"[verl] QLoRA patch: reverted (syntax) {chk.stderr[-200:]}", flush=True)
-            return
-        print(f"[verl] QLoRA patch: applied 4-bit NF4 base load to {path}", flush=True)
-    except Exception as e:
-        print(f"[verl] QLoRA patch skipped: {e}", flush=True)
-
-
 def run():
     from flash.engine import worker as W
     from flash.engine.disaggregated import detect_total_gpus
@@ -788,10 +704,6 @@ def run():
     # Apply our chalk kernels (+ Liger) on the verl actor via a verl-file patch — reliable across
     # Ray workers (the sitecustomize approach didn't fire in the trainer actor).
     _patch_verl_chalk()
-    # QLoRA (4-bit NF4 base) — the COST lever (fit a big model on a smaller GPU). Needs FSDP1, so the
-    # submit pairs FLASH_VERL_QLORA=1 with FLASH_VERL_STRATEGY=fsdp.
-    if os.environ.get("FLASH_VERL_QLORA", "").strip().lower() in ("1", "true", "yes"):
-        _patch_verl_qlora()
 
     _hb("verl_prefetch")
     W.prefetch_model(model_id)

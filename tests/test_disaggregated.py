@@ -44,22 +44,20 @@ def test_build_cmd_data_parallel_replicas_for_moe():
 
 def test_build_cmd_never_emits_unsupported_quant_flags():
     # `trl vllm-serve` (TRL 1.6) has NO --quantization/--load_format option; emitting them makes
-    # HfArgumentParser reject the args and the server launch fail. A QLoRA model is served bf16 on
-    # its own inference card in disaggregated mode (the trainer keeps the 4-bit base separately).
-    for q in ("4bit-qlora", "bf16"):
-        cmd = build_vllm_serve_cmd("m/x", select_rollout_split(2, 1), max_model_len=2048, port=8000, quant=q)
-        assert "--quantization" not in cmd
-        assert "--load_format" not in cmd
+    # HfArgumentParser reject the args and the server launch fail. The bf16 catalog is served
+    # auto/bf16 on its own inference card in disaggregated mode.
+    cmd = build_vllm_serve_cmd("m/x", select_rollout_split(2, 1), max_model_len=2048, port=8000)
+    assert "--quantization" not in cmd
+    assert "--load_format" not in cmd
 
 
 def test_build_cmd_only_emits_trl_supported_flags():
     # Guard against the exact blocker the verify pass caught: every --flag must be a real TRL
-    # ScriptArguments field, or `trl vllm-serve` rejects the launch. Covers bf16 + qlora + extras.
-    for q in ("bf16", "4bit-qlora"):
-        cmd = build_vllm_serve_cmd("m/x", select_rollout_split(3, 2), max_model_len=1024, port=9000, quant=q)
-        flags = [tok for tok in cmd[2:] if tok.startswith("--")]  # skip the 'trl vllm-serve' prefix
-        unknown = [f for f in flags if f not in TRL_VLLM_SERVE_FLAGS]
-        assert not unknown, f"unsupported trl vllm-serve flags emitted: {unknown}"
+    # ScriptArguments field, or `trl vllm-serve` rejects the launch.
+    cmd = build_vllm_serve_cmd("m/x", select_rollout_split(3, 2), max_model_len=1024, port=9000)
+    flags = [tok for tok in cmd[2:] if tok.startswith("--")]  # skip the 'trl vllm-serve' prefix
+    unknown = [f for f in flags if f not in TRL_VLLM_SERVE_FLAGS]
+    assert not unknown, f"unsupported trl vllm-serve flags emitted: {unknown}"
 
 
 def test_build_cmd_respects_trl_bin_and_extra():

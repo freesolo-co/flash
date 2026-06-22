@@ -31,7 +31,6 @@ GPU_VRAM_GB = _gpu_vram_table()
 _BYTES_PER_PARAM = {
     "bf16": 2.0,
     "fp16": 2.0,
-    "4bit-qlora": 0.55,  # NF4 weights + quantization constants
 }
 
 # Fixed overheads (GB): CUDA context + activations w/ gradient checkpointing +
@@ -234,7 +233,7 @@ def estimate_vram_gb(
     """Estimated peak VRAM (GB) for a LoRA job on one GPU, over the full knob matrix.
 
     Terms (all in GB):
-      weights      params x bytes/param (bf16=2, 4bit-qlora=0.55)
+      weights      params x bytes/param (bf16=2)
       base         CUDA context + framework + fragmentation headroom
       lora_opt     LoRA adapter + grads + Adam states (rank-linear, model-scaled)
       activations  grad-checkpointed activations ~ batch x seq x sqrt(params)
@@ -392,16 +391,6 @@ def model_required_vram_gb(
         floor = 0
         if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
             floor = int(info.grpo_min_vram_gb)
-        if quant == "4bit-qlora":
-            # GRPO needs the curated grpo_min_vram_gb (2 weight copies + KV); SFT is single-copy and
-            # fits the smaller min_vram_gb. Don't leak the GRPO floor into SFT allocations or SFT
-            # over-provisions.
-            _q_floor = (
-                int(getattr(info, "grpo_min_vram_gb", 0) or info.min_vram_gb)
-                if is_grpo
-                else int(info.min_vram_gb)
-            )
-            floor = max(floor, _q_floor)
         # Big-model GRPO is TIGHT at its floor (2 weight copies + KV pool), so long context
         # overflows it -> escalate to a bigger tier. See grpo_seq_escalation_gb.
         if is_grpo and floor:
