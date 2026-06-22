@@ -50,8 +50,6 @@ RUN pip install --no-cache-dir \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139" \
     "tilelang==0.1.11" \
     "apache-tvm-ffi==0.1.11" \
-    "causal-conv1d>=1.4" \
-
     "hf_transfer" \
     "verifiers>=0.1.10" \
     "prime" \

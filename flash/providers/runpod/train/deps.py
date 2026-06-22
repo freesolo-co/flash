@@ -75,15 +75,17 @@ WORKER_DEPS = [
     # installs / image rebuilds are reproducible. Keep in lockstep with Dockerfile.worker + perf.py.
     "tilelang==0.1.11",
     "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
-    # Fused short causal-conv1d kernel for Gated-DeltaNet (Qwen3.5/3.6). The GDN layer runs a short
-    # depthwise causal conv BEFORE the delta rule; without this package transformers/fla silently
-    # falls back to a slow/heavy pure-PyTorch conv on EVERY GDN layer on ALL GPUs (the fla pins above
-    # do NOT bundle it). HF auto-detects the package and routes the conv through the fused CUDA kernel
-    # when present. A/B-measured (linkd-search Qwen3.5-2B GRPO): faster s/step, reward unchanged.
-    # No version pin needed (single small kernel pkg, stable API); keep in lockstep with
-    # Dockerfile.worker. NB: it builds against the installed torch/CUDA at cold-start — harmless if the
-    # build fails (HF just keeps the PyTorch fallback), but it's why it's a separate line not a hard pin.
-    "causal-conv1d>=1.4",
+    # NB on causal_conv1d (#14, INVESTIGATED — deliberately NOT added here): the Qwen3.5/3.6 GDN
+    # layer runs a short depthwise causal conv before the delta rule, and the `causal_conv1d` package
+    # would fuse it (HF auto-detects via is_causal_conv1d_available). BUT: (a) it only gates the small
+    # conv step — the DOMINANT GDN cost (chunk_gated_delta_rule) is gated INDEPENDENTLY on fla and
+    # ALREADY runs on the fla kernel without it, so the win is bounded to the conv (modest); and
+    # (b) causal-conv1d ships SDIST-ONLY on PyPI (no torch2.10/cu128 wheels) -> pip BUILDS FROM SOURCE
+    # at cold-start, which FAILED REPRODUCIBLY on the Vast worker across two GPU classes (RTX 5090 +
+    # A100 SXM) with check=True killing the run. Putting it in WORKER_DEPS would break every cold-start
+    # boot-install run. If revisited, it must be BAKED into Dockerfile.worker (build once at image-build
+    # time with the -devel toolkit) AND the published image rebuild must be VALIDATED to actually
+    # compile it — it is not a safe per-run pip dep. See /tmp/flash_combine_results.md NEW-OPT TESTS.
     # NB: freesolo-chalk is baked into the base deps above (it's REQUIRED now — chalk runs every
     # fused kernel, standalone). The submit path (chalk_extra_pip) ALSO appends the resolved chalk
     # spec to the worker's `extra_pip` so an operator can OVERRIDE the version/source per-run via
