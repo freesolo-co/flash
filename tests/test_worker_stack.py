@@ -494,28 +494,33 @@ def test_assert_usable_gpu_nvml_probe_failure_raises_retriable(monkeypatch):
         perf.assert_usable_gpu()
 
 
-def test_retriable_infra_marker_is_an_infra_retry_marker():
-    """The worker's marker phrase MUST be in the runner's ``_infra_markers`` retry set, or a MIG
-    host would be mis-classified as a non-retried job_failed (the live regression). Lock-step
-    contract — assert against the actual ``_infra_markers = (...)`` tuple, not the whole file, so a
-    marker left only in a comment/docstring (but dropped from the tuple) does NOT pass."""
-    from flash.engine.worker.perf import RETRIABLE_INFRA_MARKER
+def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):
+    # A GPU that never comes up is infra-shaped -> typed RetriableInfraError, not RuntimeError.
+    import time as _time
 
-    src = (
-        __import__("pathlib")
-        .Path(__import__("flash.runner.lifecycle", fromlist=["__file__"]).__file__)
-        .read_text()
-    )
-    # Slice exactly the `_infra_markers = (...)` tuple block: from its start to the `infra_shaped =`
-    # statement that immediately follows the closing paren. A regex on parens is fragile here — the
-    # tuple's inline comments themselves contain ")" — so anchor on the following statement instead.
-    start = src.index("_infra_markers = (")
-    end = src.index("infra_shaped", start)
-    markers_block = src[start:end]
-    # Require the marker as a QUOTED string literal inside the tuple, so a marker left only in a
-    # comment/docstring (but dropped from the tuple) does NOT satisfy the contract.
-    quoted = (f'"{RETRIABLE_INFRA_MARKER}"', f"'{RETRIABLE_INFRA_MARKER}'")
-    assert any(q in markers_block for q in quoted), (
-        f"{RETRIABLE_INFRA_MARKER!r} is missing from lifecycle.py's _infra_markers tuple; "
-        "a MIG/NVML-restricted host would be mis-classified as a non-retried job_failed."
-    )
+    from flash.engine.worker.perf import RetriableInfraError, wait_for_gpu
+
+    monkeypatch.setattr(_time, "sleep", lambda *_a: None)
+    try:
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    except ImportError:
+        pass
+    with pytest.raises(RetriableInfraError):
+        wait_for_gpu()
+
+
+def test_required_upload_exhaustion_raises_retriable_infra_error(monkeypatch):
+    # A required upload that fails after its retries is bad host/network -> RetriableInfraError.
+    from flash.engine import worker
+    from flash.engine.worker.perf import RetriableInfraError
+
+    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
+    monkeypatch.setattr(worker.time, "sleep", lambda *_a: None)
+
+    def boom():
+        raise OSError("connection reset by peer")
+
+    with pytest.raises(RetriableInfraError):
+        worker._hf_upload(boom, "DONE", required=True, label="DONE")
