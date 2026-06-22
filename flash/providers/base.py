@@ -335,19 +335,20 @@ def min_cuda_modern(name: str) -> str:
     return get_gpu_info(name).min_cuda_modern or "12.8"
 
 
-def cheapest_gpu(min_vram_gb: int, *, validated_only: bool = True) -> str:
-    """Cheapest RunPod GPU class with at least ``min_vram_gb`` VRAM (live rates, cached).
+def cheapest_gpu(min_vram_gb: int) -> str:
+    """Cheapest live-validated RunPod GPU class with at least ``min_vram_gb`` VRAM (live rates,
+    cached).
 
     RunPod-static by design (the cross-provider equivalent lives in
     ``flash.providers.allocator``): Vast-only classes are excluded so the result is
     always deployable via Flash, and offline resolution stays deterministic. Restricted to the
-    live-validated pool by default (``validated_only``) so the picked class matches what the
-    deployed control plane will actually accept — a non-validated class submits then gets rejected.
+    live-validated pool so the picked class matches what the deployed control plane will actually
+    accept — a non-validated class submits then gets rejected.
     """
     pool = [
         g
         for g in GPU_INFO.values()
-        if g.enum_member and g.vram_gb >= min_vram_gb and (g.validated or not validated_only)
+        if g.enum_member and g.vram_gb >= min_vram_gb and g.validated
     ]
     if not pool:
         # This helper filters to RunPod-provisionable VALIDATED classes (enum_member set +
@@ -421,7 +422,11 @@ class JobHandle:
 class PollResult:
     ok: bool
     metrics: dict | None = None
-    failure: str | None = None  # "job_failed" | "stalled" | "poll_error"
+    # "job_failed"    : genuine worker/job code error (NOT retried)
+    # "job_preempted" : provider killed the worker (platform termination) -> infra-shaped, retried
+    # "stalled"       : no worker progress within the budget -> infra-shaped, retried
+    # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
+    failure: str | None = None
     detail: str | None = None
 
 
