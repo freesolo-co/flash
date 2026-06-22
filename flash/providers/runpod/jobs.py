@@ -472,7 +472,14 @@ def poll_job(
         time.sleep(interval_s)
 
 
-def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> PollResult:
+def submit_run(
+    spec,
+    seed: int,
+    log=None,
+    on_handle=None,
+    attempt: int = 0,
+    runtime_secrets: dict[str, str] | None = None,
+) -> PollResult:
     """Durable equivalent of ``submit_train``: deploy, submit, persist handle, poll.
 
     ``on_handle(handle_dict)`` is invoked as soon as the job is queued so the
@@ -498,7 +505,7 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     extra_pip = (
         list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
     ) + chalk_extra_pip(spec)
-    worker_env = build_worker_env(spec, seed)
+    worker_env = build_worker_env(spec, seed, runtime_secrets=runtime_secrets)
     endpoint_id, name = deploy_train_endpoint(
         spec.gpu.type,
         execution_timeout_ms=timeout_s * 1000,
