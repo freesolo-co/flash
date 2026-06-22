@@ -80,7 +80,7 @@ def compare(params_b=4.0, batch=8, group=8, resp_len=512, steps=30, reward_laten
         gen_gpu_seconds = n * steps * gN
         m_infer = max(1, math.ceil(gen_gpu_seconds / max(trainer_wall_s, 1e-9)))
         infer_usd = m_infer * trainer_wall_s * A40["usd_hr"] / 3600.0
-        reward_gpu = max(1, math.ceil(n / 8))
+        reward_gpu = max(1, math.ceil(n / REWARD_CONCURRENCY))
         reward_usd = reward_gpu * trainer_wall_s * CPU_REWARD_USD_HR / 3600.0
         pool_usd = trainer_usd + infer_usd + reward_usd
         s_dev = (1 - pool_usd / dev_usd) * 100

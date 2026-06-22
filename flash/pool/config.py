@@ -9,6 +9,7 @@ Two configs:
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -37,6 +38,10 @@ def _float(name: str, default: float, minimum: float | None = None) -> float:
     try:
         val = float(raw.strip())
     except ValueError:
+        return default
+    # nan/inf parse fine but slip past the `minimum` guard (nan < x is always False) and break
+    # downstream loops/sizing — treat a non-finite env value like an unparseable one.
+    if not math.isfinite(val):
         return default
     if minimum is not None and val < minimum:
         return default

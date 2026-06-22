@@ -189,6 +189,14 @@ def test_router_config_from_env_rejects_negative_values(monkeypatch):
     assert cfg.health_interval == 15.0  # default (>= 0)
 
 
+def test_router_config_from_env_rejects_non_finite_float(monkeypatch):
+    # nan/inf parse as floats but slip past the `minimum` guard (nan < 0 is False); they must fall
+    # back to the safe default rather than poison the health-probe loop.
+    for bad in ("nan", "inf", "-inf"):
+        monkeypatch.setenv("FLASH_POOL_HEALTH_INTERVAL", bad)
+        assert RouterConfig.from_env().health_interval == 15.0, bad
+
+
 def test_router_config_from_env_accepts_valid_values(monkeypatch):
     monkeypatch.setenv("FLASH_POOL_MAX_RETRIES", "5")
     monkeypatch.setenv("FLASH_POOL_DEFAULT_REPLICAS", "3")
