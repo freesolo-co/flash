@@ -656,6 +656,84 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     assert runner.get_status("nohandle-1").state != "failed"
 
 
+def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
+    # Fault isolation: if the FIRST recoverable run's persisted spec is malformed (e.g. a
+    # legacy `environment.path`, which makes JobSpec.from_dict raise), recovery of that one
+    # run must be skipped — it must NOT abort recover_runs() and thereby skip recovery of
+    # every OTHER in-flight run and the orphan sweep that follows. Here run #1 has a bad spec
+    # and run #2 has a valid no-handle spec: assert run #2 is still resubmitted AND the orphan
+    # sweep still runs (the bad spec didn't take down the whole recovery pass).
+    import threading
+
+    import flash.providers as providers_mod
+    import flash.runner as runner
+    import flash.server.db as db_mod
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.app as app_mod
+
+    importlib.reload(app_mod)
+
+    # Run #1: a malformed spec — a legacy local `environment.path` makes from_dict raise.
+    bad_spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "environment": {"path": "/legacy/local/env"},
+        "train": {"steps": 1, "seeds": [0]},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "bad-1",
+    }
+    # Run #2: a valid no-handle spec — must still be recovered (resubmitted) despite run #1.
+    good_spec = {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": "grpo",
+        "train": {"steps": 1, "seeds": [0]},
+        "gpu": {"type": "RTX 5090"},
+        "run_id": "good-2",
+    }
+    runner._save_status(
+        runner.RunStatus(run_id="bad-1", state="provisioning", spec=bad_spec, remote=None)
+    )
+    runner._save_status(
+        runner.RunStatus(run_id="good-2", state="provisioning", spec=good_spec, remote=None)
+    )
+    # Order matters: the bad run is iterated FIRST, so an unguarded parse would abort here.
+    monkeypatch.setattr(
+        app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}]
+    )
+    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+
+    # The orphan sweep must still run after the loop. recover_runs resolves it via a
+    # function-local `from flash.providers import configured_providers`, so patch the
+    # package attr; record that sweep_orphans fired.
+    swept = threading.Event()
+
+    class _FakeProvider:
+        def sweep_orphans(self, active_labels=None):
+            swept.set()
+            return []
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeProvider()])
+
+    resubmitted = []
+    done = threading.Event()
+
+    def fake_run_job(s):
+        resubmitted.append(s.run_id)
+        done.set()
+
+    monkeypatch.setattr(runner, "_run_job", fake_run_job)
+
+    app_mod.recover_runs()
+
+    assert done.wait(timeout=5), "the valid run must still be resubmitted despite a prior bad spec"
+    assert resubmitted == ["good-2"], "only the valid run resubmits; the malformed one is skipped"
+    assert swept.is_set(), "a malformed spec must not abort the orphan sweep that follows the loop"
+
+
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
     plane's PRIME_API_KEY), namespaced per identity — so the user needs no Prime account."""

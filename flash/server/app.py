@@ -163,9 +163,24 @@ def recover_runs() -> None:
             # attempt may have registered its uniquely-named RunPod endpoint before crashing;
             # GC it (by reconstructed name) so it doesn't hold worker quota, then resubmit the
             # run from scratch (below, after the sweep) instead of throwing the session away.
+            #
+            # Parse the persisted spec ONCE, fault-isolated: a malformed spec (e.g. a legacy
+            # `environment.path`, or a bad type that makes `from_dict` raise) must only skip
+            # THIS run, not abort recovery of every other in-flight run and the orphan sweep
+            # below. Log it so a stuck-recoverable run is diagnosable, skip it, and continue.
+            try:
+                spec = JobSpec.from_dict(status.spec)
+            except Exception:
+                _log.warning(
+                    "skipping recovery of run %s: its persisted spec could not be parsed "
+                    "(malformed/legacy spec); recovery of other runs continues",
+                    status.run_id,
+                    exc_info=True,
+                )
+                continue
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(JobSpec.from_dict(status.spec))
-            resubmit.append(JobSpec.from_dict(status.spec))
+                _gc_run_endpoints(spec)
+            resubmit.append(spec)
     # Standing per-run billing (Vast instances) survives a crash until destroyed:
     # anything labeled ours that no recoverable run owns is an orphan. Each available
     # provider's ``sweep_orphans`` hook reaps its own (RunPod's is a no-op). Dispatched
