@@ -226,34 +226,26 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
     assert spec_from_dict(raw, run_id="grpo-y").train.init_from_adapter == ""
 
 
-def test_hf_repo_per_run_parses_and_validates() -> None:
-    # [train] hf_repo is the REQUIRED per-run HF artifact repo (no operator HF_REPO default);
-    # it must parse through schema (server) AND JobSpec.from_dict (worker), an absent value
-    # must be rejected as required, and a malformed value must 400 at parse time.
-    from flash.schema import ConfigError
-
+def test_hf_repo_is_managed_not_user_set() -> None:
+    # [train] hf_repo is the platform-managed per-run HF artifact repo: the control plane assigns
+    # it server-side at submit (see runner.submit_job). It is NOT required and a user-supplied
+    # value is IGNORED — verified through both schema (server) and JobSpec.from_dict (worker).
     raw = {
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
-        "model_policy": "allow",
         "environment": {"id": "owner/env"},
-        "gpu": {"type": "cheapest"},
-        "train": {"seeds": [0], "steps": 10, "hf_repo": "myorg/runs"},
+        "train": {"seeds": [0], "steps": 10},
     }
+    # absent -> fine (no longer required); left blank for the control plane to assign
     spec = spec_from_dict(raw, run_id="hf-x")
-    assert spec.train.hf_repo == "myorg/runs"
-    # survives the JSON round-trip the worker reconstructs from
-    assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == "myorg/runs"
-    # absent -> rejected (it is required; there is no operator HF_REPO fallback)
-    with pytest.raises(ConfigError, match=r"train\.hf_repo is required"):
-        spec_from_dict({**raw, "train": {"seeds": [0], "steps": 10}}, run_id="hf-y")
-    # malformed values are rejected at parse time (server 400), not passed to the worker
-    for bad in ("noslash", "/name", "owner/", "a/b/c", "owner//name"):
-        with pytest.raises(ConfigError):
-            spec_from_dict(
-                {**raw, "train": {"seeds": [0], "steps": 10, "hf_repo": bad}},
-                run_id="hf-bad",
-            )
+    assert spec.train.hf_repo == ""
+    assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == ""
+    # user-supplied -> ignored (the control plane overrides it at submit)
+    spec2 = spec_from_dict(
+        {**raw, "train": {"seeds": [0], "steps": 10, "hf_repo": "someone-else/their-repo"}},
+        run_id="hf-y",
+    )
+    assert spec2.train.hf_repo == ""
 
 
 def test_optimizer_and_batching_knobs_roundtrip() -> None:
