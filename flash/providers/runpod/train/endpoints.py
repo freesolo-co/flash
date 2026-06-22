@@ -52,9 +52,9 @@ def _train_body(input_data: dict) -> dict:
 
     # NB: the Hopper fla guard lives in engine.worker._drop_fla_on_hopper (runs in the worker
     # process AFTER all installs, before any model import) — doing it here would be undone by a
-    # later extra_pip / `prime env install` that pulls fla back, and depends on a handler redeploy.
+    # later env install that pulls fla back, and depends on a handler redeploy.
 
-    # Extra pip deps for verifiers / Prime Hub environments (installed per-run).
+    # Extra pip deps for verifiers / published environments (installed per-run).
     extra_pip = input_data.get("extra_pip") or []
     if extra_pip:
         # check=True: a deterministic dependency failure should fail fast here,
@@ -66,17 +66,16 @@ def _train_body(input_data: dict) -> dict:
     # startup (fla's GDN backward is miscomputed on sm90, #640). No env toggle: fla only ever runs
     # on the consumer archs where its Triton kernel is correct.
 
-    # Install the run's verifiers environment(s) from the Prime Hub via the authenticated
-    # `prime` CLI. The public pip index does not serve PRIVATE env wheels, so a plain pip
-    # install can't fetch them; `prime env install` pulls/builds/installs public + private
-    # alike, authenticated by PRIME_API_KEY forwarded from the control plane.
+    # Install the run's verifiers environment(s) through the authenticated private installer.
+    # The public pip index does not serve private env wheels, so a plain pip install can't fetch
+    # them; this path pulls/builds/installs public + private alike.
     hub_env_ids = input_data.get("hub_env_ids") or []
     if hub_env_ids:
         worker_env = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
         prime_key = worker_env.get("PRIME_API_KEY") or os.environ.get("PRIME_API_KEY")
         if not prime_key:
             raise RuntimeError(
-                "PRIME_API_KEY is required to install the Prime Hub environment on the worker"
+                "PRIME_API_KEY is required to install the published environment on the worker"
             )
         # Only install `prime` when it isn't already on the worker (it's often baked into
         # the worker image) — an unconditional install adds latency and a per-run PyPI

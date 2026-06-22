@@ -1,5 +1,4 @@
-"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the CLI —
-it invokes `slm`, the deprecated alias of `flash` (same entrypoint, kept for back-compat) —
+"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the `flash` CLI
 and consumes its run-id / run-state / metrics outputs. This asserts that the flash side of
 that seam still provides what the agent depends on.
 
@@ -9,7 +8,7 @@ end-to-end tests import across packages). When that import can't resolve, the
 agent-side assertions are skipped rather than failing the flash suite.
 
 Run: cd flash && .venv/bin/python -m pytest \
-        tests/test_agent_slm_cli_contract.py -q
+        tests/test_agent_flash_cli_contract.py -q
 """
 
 from __future__ import annotations
@@ -59,7 +58,7 @@ from flash.runner import (
 )
 def test_agent_required_subcommands_exist(subcommand: str) -> None:
     """The agent's worker drives the CLI's `train/status/logs/ps/cancel/env install/...`
-    subcommands (invoked as `slm`, the deprecated alias of `flash` — see the module docstring).
+    subcommands.
 
     argparse exits with code 2 and an 'invalid choice' message when a subcommand
     does not exist. We invoke each with `--help`, which exits 0 for a real
@@ -73,7 +72,7 @@ def test_agent_required_subcommands_exist(subcommand: str) -> None:
 
 
 def test_env_install_subcommand_exists() -> None:
-    """The migration seam: the agent installs published Hub envs via `flash env install`."""
+    """The migration path: the agent installs published envs via `flash env install`."""
     with pytest.raises(SystemExit) as excinfo:
         main(["env", "install", "--help"])
     assert excinfo.value.code == 0, "`flash env install` is missing from the CLI"
