@@ -1901,18 +1901,33 @@ def write_train_meta(
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
-    if not (adapter_prefix and HF_REPO):
+    """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
+
+    Two forms of ``adapter_prefix``:
+      * ``"<prefix>"``            -> read from THIS run's own artifact repo (HF_REPO).
+      * ``"<owner>/<repo>:<prefix>"`` -> CROSS-REPO warm-start: read the SFT adapter from
+        another run's managed artifact repo. Required since hf_repo is now a per-run managed
+        repo (Freesolo-Co/flashrun-<run_id>), so an SFT adapter never lives in the GRPO run's
+        own repo. The control-plane HF_TOKEN can read sibling managed repos.
+    """
+    if not adapter_prefix:
+        return None
+    if ":" in adapter_prefix:
+        repo, prefix = adapter_prefix.split(":", 1)
+    else:
+        repo, prefix = HF_REPO, adapter_prefix
+    if not (repo and prefix):
         return None
     from huggingface_hub import snapshot_download
 
     snapshot_download(
-        repo_id=HF_REPO,
+        repo_id=repo,
         repo_type="dataset",
-        allow_patterns=[f"{adapter_prefix}/adapter/*"],
+        allow_patterns=[f"{prefix}/adapter/*"],
         local_dir="/tmp/evdl",
         token=os.environ.get("HF_TOKEN"),
     )
-    adir = os.path.join("/tmp/evdl", adapter_prefix, "adapter")
+    adir = os.path.join("/tmp/evdl", prefix, "adapter")
     return adir if os.path.isdir(adir) else None
 
 
