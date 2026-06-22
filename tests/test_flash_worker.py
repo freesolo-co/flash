@@ -120,8 +120,8 @@ def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
 def _clear_chalk_flags(monkeypatch):
     # Every FLASH_* chalk kernel flag (chalk_kernels._KERNELS) + the install spec, so a test starts
     # from a clean env and is not skewed by ambient FLASH_* set in the dev/CI shell. Includes the
-    # default-on gap-fillers (RMSNORM/SWIGLU/FLCE): leaving them ambient would keep chalk "selected"
-    # and break the all-disabled / extra-pip assertions.
+    # default-on standalone kernels (RMSNORM/SWIGLU/FLCE): leaving them ambient would keep chalk
+    # "selected" and break the all-disabled / extra-pip assertions.
     for k in (
         "FLASH_RMSNORM_KERNEL",
         "FLASH_SWIGLU_KERNEL",
@@ -137,7 +137,8 @@ def _clear_chalk_flags(monkeypatch):
         monkeypatch.delenv(k, raising=False)
 
 
-# The six default-on gap-filler flags (chalk_kernels._KERNELS): disabling exactly these
+# The six default-on chalk kernel flags (chalk_kernels._KERNELS): the standalone stack
+# (RMSNORM/SWIGLU/FLCE) plus the gap-fillers (ROPE/TRITON_LORA/EMBED). Disabling exactly these
 # deselects chalk. QKV/MLP/FP8 base are opt-in (default-off) and need no flag to stay off.
 _DEFAULT_ON_CHALK_FLAGS = (
     "FLASH_RMSNORM_KERNEL",
