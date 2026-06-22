@@ -57,6 +57,7 @@ from flash.engine.worker.lora import (
     vllm_language_model_only_kwargs,  # noqa: F401
 )
 from flash.engine.worker.perf import (
+    RetriableInfraError,
     _attn_impl_for_capability,  # noqa: F401
     _drop_fla_on_hopper,
     _estimate_params,  # noqa: F401
@@ -197,7 +198,8 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> None
                 time.sleep(5 * (attempt + 1))
                 continue
             if required:
-                raise RuntimeError(f"required upload of {repo_subpath!r} failed: {e}") from e
+                # Already retried 3x -> the host/network is bad, not the run. Infra-shaped.
+                raise RetriableInfraError(f"required upload of {repo_subpath!r} failed: {e}") from e
             print(f"{label} warn:", e)
             return
 
@@ -1976,11 +1978,10 @@ def main():
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
+        # Structured retry signal both pollers read: infra failure -> retry on a fresh worker.
+        retriable = isinstance(e, RetriableInfraError)
         tb = traceback.format_exc()
         traceback.print_exc()
-        # Upload the FULL traceback under a phase-specific name (error_<phase>.txt) so the
-        # train (sft/rl) root-cause error survives for debugging. heartbeat.json is
-        # single-file/overwritten, so the per-phase error file is the persistent signal.
         try:
             err_name = error_artifact_name(RUN_MODE)
             err_path = f"/tmp/{err_name}"
@@ -1990,9 +1991,9 @@ def main():
         except Exception as up_err:
             print("error-upload warn:", up_err)
         try:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], diag=gpu_diagnostics())
+            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], retriable=retriable, diag=gpu_diagnostics())
         except Exception:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500])
+            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], retriable=retriable)
         # keep container alive briefly so logs flush, then exit non-zero -> restart
         time.sleep(10)
         raise
