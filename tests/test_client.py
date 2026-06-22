@@ -61,6 +61,16 @@ def test_bearer_header_and_payload(stub):
     assert seen["body"] == {"spec": {"model": "m"}}
 
 
+def test_create_run_sends_runtime_secrets_outside_spec(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.create_run({"model": "m"}, runtime_secrets={"WANDB_API_KEY": "wb-user"})
+    assert seen["body"] == {
+        "spec": {"model": "m"},
+        "runtime_secrets": {"WANDB_API_KEY": "wb-user"},
+    }
+
+
 def test_api_error_carries_server_detail(stub):
     url, _ = stub
     client = ApiClient(url, "fslo-user-test")
