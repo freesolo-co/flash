@@ -1,10 +1,9 @@
-"""Regression test: the documented `flash env install <prime-hub-env>` flow.
+"""Regression test: the documented `flash env install <owner/name>` flow.
 
 DEFECT (since fixed): `flash env install primeintellect/hendrycks-math` ran
-`pip install primeintellect/hendrycks-math` (a local path) with no Prime Hub index, so it
-always failed. The fix derives the bare wheel name from the `owner/name` slug, defaults
-Hub slugs to the Prime index via `--extra-index-url`, and records the index in the manifest
-so the GPU worker can install it too.
+`pip install primeintellect/hendrycks-math` (a local path) with no package index, so it
+always failed. The fix derives the bare wheel name from the `owner/name` id, adds the
+extra index URL, and records the index in the manifest so the GPU worker can install it too.
 """
 
 from __future__ import annotations
@@ -18,6 +17,12 @@ from pathlib import Path
 
 class _FakeProc:
     returncode = 0
+
+
+class _FailedProc:
+    returncode = 7
+    stdout = "stdout detail"
+    stderr = "pip could not find the package"
 
 
 def test_env_install_prime_hub_slug(monkeypatch):
@@ -42,7 +47,7 @@ def test_env_install_prime_hub_slug(monkeypatch):
         # installs the BARE wheel name, not the owner/name slug (which pip treats as a path)
         assert "hendrycks-math" in cmd
         assert "primeintellect/hendrycks-math" not in cmd
-        # carries the Prime Hub index
+        # carries the package index
         assert "--extra-index-url" in cmd
         assert any("hub.primeintellect.ai" in str(c) for c in cmd)
 
@@ -54,8 +59,26 @@ def test_env_install_prime_hub_slug(monkeypatch):
         assert "hub.primeintellect.ai" in entry["extra_index_url"]
 
 
+def test_env_install_failure_surfaces_installer_output(monkeypatch, capsys):
+    import flash.envs.registry as registry
+    from flash.cli import main as cli
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(registry, "INSTALLED_MANIFEST", Path(tmp) / "envs.json")
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _FailedProc())
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+        rc = cli.cmd_env_install(argparse.Namespace(env_id="owner/missing-env"))
+
+    assert rc == 7
+    err = capsys.readouterr().err
+    assert "install failed" in err
+    assert "pip could not find the package" in err
+    assert "stdout detail" in err
+
+
 def test_env_install_rejects_bare_id(monkeypatch, capsys):
-    # The managed service is Prime Hub slug-only (`owner/name`). A bare id can't be resolved,
+    # The managed service requires full `owner/name` ids. A bare id can't be resolved,
     # so `cmd_env_install` must reject it (return 1) WITHOUT shelling out to prime/pip.
     from flash.cli import main as cli
 
