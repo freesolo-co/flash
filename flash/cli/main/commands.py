@@ -180,9 +180,10 @@ def cmd_gpus(args) -> int:
             f"{fmt_rate(vast_rates.get(info.name))}"
         )
     print(
-        "\nTip: GPU allocation is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest live-validated class that fits the model across all providers. There is no GPU\n"
-        "knob to set: every run is sized and routed for you."
+        "\nTip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
+        "cheapest live-validated class that fits the model across all providers, so you don't pin a\n"
+        "GPU type. You can still tune the run via the [gpu] config table (disk_gb, max_wall_seconds,\n"
+        "max_retries, network_volume / network_volume_gb, datacenter)."
     )
     return 0
 
