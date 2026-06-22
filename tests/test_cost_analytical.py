@@ -157,12 +157,12 @@ def test_select_gpu_picks_cheapest_including_unvalidated():
     assert not cheaper, f"{cheaper} cheaper than {gpu} for {need} GB"
 
 
-def test_qlora_model_fits_a_smaller_card_than_bf16_would():
-    # Qwen3.5-9B is QLoRA: its GRPO requirement fits a 32 GB card (the chosen class may be bigger
-    # if cheaper -- it's the requirement that shrinks).
+def test_9b_bf16_grpo_needs_an_80gb_class():
+    # Qwen3.5-9B is bf16 (QLoRA was dropped: the 4-bit vLLM-rollout merge collapsed the GRPO
+    # importance-sampling ratio -> no learning). Colocated bf16 GRPO needs an 80 GB-class card.
     e = estimate_cost(RunConfig(BIG, "grpo", 100))
-    assert e.required_vram_gb <= 32
-    assert any("qlora" in n.lower() for n in e.notes)
+    assert e.required_vram_gb >= 80
+    assert e.gpu_vram_gb >= 80
 
 
 def test_invalid_config_rejected():
