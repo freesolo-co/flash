@@ -149,6 +149,7 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
     def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
         seen["url"] = url
         seen["headers"] = headers
+        seen["follow_redirects"] = follow_redirects
         return _Resp(200)
 
     monkeypatch.setattr(d.httpx, "delete", fake_delete)
@@ -156,8 +157,43 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
     assert out == ["flash-7-abcd"]
     assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+    # Modal 303-redirects slow requests to an async-result poll URL, so undeploy follows them too.
+    assert seen["follow_redirects"] is True
 
     # A 404 (already gone) returns an empty list, not an error.
+    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
+    assert d.undeploy_adapter("flash-7-abcd") == []
+
+
+def test_undeploy_propagates_serving_error(monkeypatch):
+    """A non-404 failure from the serving app surfaces as a ServingError (carrying the upstream
+    status, so the server maps it to a 502) — exactly like deploy — instead of letting a raw
+    httpx error escape as an unhandled 500. A 404 still no-ops (already-gone is success)."""
+    import flash.serve.deploy as d
+
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+            self.text = "kaboom"
+
+        def raise_for_status(self):
+            raise d.httpx.HTTPStatusError("boom", request=None, response=self)
+
+    # Non-404 (500) → ServingError carrying the upstream status, not a raw httpx error.
+    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(500))
+    with pytest.raises(d.ServingError) as ei:
+        d.undeploy_adapter("flash-7-abcd")
+    assert ei.value.status_code == 500
+
+    # A transport error (never reached the backend) is also translated into a ServingError.
+    def _boom_delete(*a, **k):
+        raise d.httpx.RequestError("no route to host")
+
+    monkeypatch.setattr(d.httpx, "delete", _boom_delete)
+    with pytest.raises(d.ServingError):
+        d.undeploy_adapter("flash-7-abcd")
+
+    # A 404 short-circuits before raise_for_status(), so it stays a no-op success (not a ServingError).
     monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
     assert d.undeploy_adapter("flash-7-abcd") == []
 
