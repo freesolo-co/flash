@@ -24,7 +24,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         captured = {}
 
-        def fake_submit(spec, seed, log=None):
+        def fake_submit(spec, seed, log=None, **kwargs):
             captured["gpu"] = spec.gpu.type
             captured["seed"] = seed
             return {
@@ -107,3 +107,46 @@ def test_upload_code_forces_private_on_reused_repo(monkeypatch):
     assert calls["settings"], "update_repo_settings was not called — reused public repo can leak"
     assert calls["settings"][0].get("private") is True
     assert calls["settings"][0].get("repo_id") == "owner/run-artifacts"
+
+
+def test_upload_code_mirrors_package_purging_stale_remote(monkeypatch):
+    """The upload must MIRROR the local flash package: delete_patterns=['**'] (relative to
+    code/flash) so any orphaned/renamed remote module from a prior commit is purged, not left for
+    the worker to re-import. This is the deployment-robustness guard against a run picking up OLD
+    code in code/flash after a redeploy (the "missing recent fixes on submit" symptom)."""
+    import os
+    import sys
+    import types
+
+    import flash
+
+    calls = {"upload": []}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, repo, **kw):
+            pass
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def upload_folder(self, **kw):
+            calls["upload"].append(kw)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = _FakeApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    import flash.providers.runpod.train as flash_train
+
+    flash_train.upload_code("owner/run-artifacts")
+    assert calls["upload"], "upload_folder was not called"
+    up = calls["upload"][0]
+    assert up["path_in_repo"] == "code/flash"
+    # the exact-mirror guard: delete everything under code/flash not in this upload
+    assert up.get("delete_patterns") == ["**"]
+    # still uploads from the real (symlink-collapsed) package dir, and skips bytecode
+    assert up["folder_path"] == os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
+    assert "*.pyc" in up.get("ignore_patterns", [])

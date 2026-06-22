@@ -121,12 +121,16 @@ _LOGITS_BUDGET_GB = 6.0
 # Qwen3.5's ~248k vocab this is the documented big-vocab SFT OOM driver (a 0.8B SFT OOM'd a 24 GB
 # card). The worker fuses CE only for a >=3B model OR a >=2048-token context (mirrors
 # engine.worker.perf._memory_mode); BELOW that the term is real and was previously ignored entirely.
-# An SFT step holds the fp32 logits + their fp32 grad at once, so size it at ~8 B/elem (vs GRPO's
-# 4 B/elem forward-only logprob pass). The worker vocab-sizes the per-device micro-batch so these
-# logits never exceed _LOGITS_BUDGET_GB (sft_logits_per_device_cap, the SFT mirror of
-# rl_per_device_comps) and the estimator reserves exactly that capped term -- so the allocator
-# provably covers the worker's real peak (the "the equation never under-provisions" invariant).
-_SFT_LOGITS_BYTES_PER_ELEM = 8.0
+# An SFT step holds, AT ONCE, the fp32 logits (4) + their fp32 grad (4) + the bf16 logits the model
+# emits (2) + the bf16 grad (2) + the cross-entropy log_softmax temp (4) ~= 16 B/elem. (8 B/elem --
+# fp32 logits+grad only -- UNDER-counted: a live 2B SFT seq1024 at per_device=2 peaked ~15.8 GiB and
+# OOM'd a 16 GB card whose usable is ~15.6 GiB.) At 16 B/elem the per-device cap drops to 1 for a
+# big-vocab un-fused SFT, so the worker materializes far less and the real peak clears even the
+# tightest 16 GB card. The worker vocab-sizes the per-device micro-batch so these logits never
+# exceed _LOGITS_BUDGET_GB while pd CAN be reduced; the estimator reserves the TRUE per-device-capped
+# term (no budget clamp -- the irreducible pd=1 floor can exceed the budget at a near-2048 ctx) -- so
+# the allocator provably covers the worker's real peak. VALIDATED by a live re-run.
+_SFT_LOGITS_BYTES_PER_ELEM = 16.0
 # Canonical fused-CE (Liger) gate thresholds: the worker fuses the SFT cross-entropy for a >=3B
 # model OR a >=2048-token context. SINGLE SOURCE OF TRUTH -- engine.worker.perf imports these (its
 # _LIGER_MIN_PARAMS / _LONG_CONTEXT_TOKENS derive from them) and sft_logits_fused mirrors the gate
@@ -275,16 +279,13 @@ def estimate_vram_gb(
     pd = sft_per_device(batch_size, seq_len=seq_len, vocab=vocab, fused=fused)
     activations = _ACT_COEF * pd * (seq_len / 1024.0) * width
     # fp32-logits term: 0 when the worker fuses CE (>=3B model OR >=2048-token ctx, so the lm_head
-    # never materializes [B,T,vocab]); else the [per_device, seq_len, vocab] fp32 logits + grad the
-    # forward holds. The worker's per-device cap keeps this within the budget, so it can't OOM the
-    # card -- the SFT analog of the GRPO logits term above, and the term the SFT estimate previously
-    # ignored (the documented big-vocab SFT OOM). It scales with the FULL seq_len (SFT loss spans the
-    # sequence), unlike GRPO's completion-only logprob pass.
-    logits = (
-        0.0
-        if fused
-        else min(pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9, _LOGITS_BUDGET_GB)
-    )
+    # never materializes [B,T,vocab]); else the [per_device, seq_len, vocab] logits the forward holds.
+    # Reserve the TRUE per-device-capped value -- NOT clamped to the budget: the budget only chooses
+    # ``pd`` (so pd>1 cases stay <= budget), but once pd floors to 1 the logits are IRREDUCIBLE and
+    # can exceed the budget at a near-2048 ctx -- clamping there would under-reserve and OOM (the
+    # worker can't go below pd=1). The SFT analog of the GRPO logits term, sized over the FULL seq_len
+    # (SFT loss spans the sequence) -- the term the SFT estimate once ignored entirely.
+    logits = 0.0 if fused else pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
     return base + activations + logits
 
 
