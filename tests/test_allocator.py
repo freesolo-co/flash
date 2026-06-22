@@ -34,14 +34,15 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
     # The deployed control plane rejects a submit for any non-validated class, so client-side
     # allocation must only ever pick a class in the live-validated pool — across ALL candidates,
     # not just the chosen one. Offline only RunPod is available; 0.8B GRPO needs the 24 GB tier
-    # whose cheapest VALIDATED class is RTX A5000 @ $0.27 (cheaper unvalidated 24 GB classes like
-    # L4 exist but are excluded). 16 GB unvalidated classes (RTX 2000 Ada @ $0.24) never appear.
+    # whose cheapest VALIDATED RunPod class is RTX 3090 @ $0.46 (the cheaper RTX A5000 @ $0.27 is
+    # runpod_mig_risk and skipped on RunPod; cheaper unvalidated 24 GB classes like L4 are excluded
+    # too). 16 GB unvalidated classes (RTX 2000 Ada @ $0.24) never appear.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert all(c.gpu in VALIDATED for c in a.candidates), [
         c.gpu for c in a.candidates if c.gpu not in VALIDATED
     ]
-    assert a.gpu == "RTX A5000"  # the cheapest VALIDATED 24 GB class
+    assert a.gpu == "RTX 3090"  # the cheapest VALIDATED non-MIG 24 GB RunPod class
 
 
 def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
@@ -65,23 +66,88 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
 
 
 def test_allocate_excludes_gpu_class_walks_to_different_validated(monkeypatch):
-    """A MIG / unusable-GPU retry must re-allocate OFF the failed CLASS to a DIFFERENT validated
-    one. With static rates a 0.8B GRPO run's validated 24 GB pool ranks RTX A5000 ($0.27) < RTX
-    3090 ($0.46) < RTX 4090 ($0.69) < RTX 5090 ($0.99); excluding the cheapest (A5000 — the
-    MIG-prone class) makes the allocator pick the next validated class, never re-pick A5000."""
+    """A MIG / unusable-GPU retry (runtime safety net) must re-allocate OFF the failed CLASS to a
+    DIFFERENT validated one. On RunPod the validated, non-MIG fitting pool for 0.8B GRPO (>=24 GB)
+    ranks RTX 3090 ($0.46) < RTX A6000 ($0.49) < RTX 4090 ($0.69) < ... (RTX A5000 is already skipped
+    up front as runpod_mig_risk); excluding the cheapest (RTX 3090) makes the allocator pick the
+    next validated class, never re-pick the excluded one."""
     from flash.providers import allocator
 
     base = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    assert base.gpu == "RTX A5000"  # the cheapest validated 24 GB class (the MIG one)
+    assert base.gpu == "RTX 3090"  # cheapest validated non-MIG 24 GB class
 
     walked = allocator.allocate(
-        "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({"RTX A5000"})
+        "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({"RTX 3090"})
     )
-    assert walked.gpu != "RTX A5000"  # walked off the MIG-prone class
+    assert walked.gpu != "RTX 3090"  # walked off the excluded class
     # the excluded class is gone from EVERY candidate, not just the chosen one
-    assert all(c.gpu != "RTX A5000" for c in walked.candidates)
-    # ... onto the next-cheapest validated class (a consumer card that can't be MIG-sliced)
-    assert walked.gpu == "RTX 3090"
+    assert all(c.gpu != "RTX 3090" for c in walked.candidates)
+    # ... onto the next-cheapest validated full GPU (a card RunPod can't MIG-slice)
+    assert walked.gpu == "RTX A6000"
+
+
+def test_runpod_allocation_never_returns_mig_substituted_types(monkeypatch):
+    """REGRESSION (live MIG burn): RunPod serves some validated GPU *types* as Blackwell MIG slices
+    (RTX A5000, RTX Pro 6000 WK), which crash training (PyTorch's CUDA allocator NVML-asserts on MIG
+    partitions). The allocator must NEVER pick — or even rank — a runpod_mig_risk class on RunPod for
+    a model that fits a cheaper full GPU. The 0.8B GRPO (24 GB) lands on RTX 3090 and the 9B GRPO
+    (80 GB) on A100 PCIe — both full, non-MIG cards RunPod can't partition."""
+    from flash.providers import allocator
+    from flash.providers.base import GPU_INFO
+
+    mig_types = {g.name for g in GPU_INFO.values() if g.runpod_mig_risk}
+    assert mig_types == {"RTX A5000", "RTX Pro 6000 WK"}  # the two confirmed-substituted types
+
+    a08 = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    assert a08.provider == "runpod"
+    assert a08.gpu == "RTX 3090"  # cheapest validated, non-MIG, full 24 GB RunPod card
+    a9 = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
+    assert a9.provider == "runpod"
+    assert a9.gpu == "A100 PCIe"  # cheapest validated, non-MIG, full 80 GB RunPod card
+    # No MIG-substituted type appears in EITHER ranked candidate list (not just the chosen one).
+    for a in (a08, a9):
+        assert not (mig_types & {c.gpu for c in a.candidates}), [
+            c.gpu for c in a.candidates if c.gpu in mig_types
+        ]
+
+
+def test_runpod_mig_risk_types_stay_validated_and_submittable(monkeypatch):
+    """The exclusion is allocator-only: the MIG-risk types must STILL be in the validated pool so
+    the deployed control plane's validation gate keeps accepting them as submittable classes (we
+    change which class the ALLOCATOR picks for RunPod, not the schema's allowlist)."""
+    from flash.providers.base import GPU_INFO, VALIDATED
+
+    for name in ("RTX A5000", "RTX Pro 6000 WK"):
+        g = GPU_INFO[name]
+        assert g.runpod_mig_risk is True
+        assert g.validated is True  # stays in the validated pool ...
+        assert name in VALIDATED  # ... so the server's validation gate still accepts it
+        # ... and stays available on Vast (the MIG substitution is a RunPod behavior; Vast rents
+        # whole boards), so the exclusion must NOT remove its Vast identity.
+        assert g.vast_name is not None
+
+
+def test_default_max_retries_raised_for_mig_walk():
+    """The GPU retry budget is raised (2 -> 6) so the runtime MIG-walk (exclude_class) reliably
+    reaches a full GPU as a safety net for any MIG slice that slips past the allocator-side skip.
+    Covers both the GpuSpec default and the JobSpec.from_dict default (the worker payload path)."""
+    from flash.spec import GpuSpec, JobSpec
+
+    assert GpuSpec().max_retries == 6
+    assert JobSpec.from_dict({}).gpu.max_retries == 6
+    assert JobSpec.from_dict({"gpu": {}}).gpu.max_retries == 6
+    # An explicit value still wins (the default is only the fallback).
+    assert JobSpec.from_dict({"gpu": {"max_retries": 3}}).gpu.max_retries == 3
+
+
+def test_cheapest_gpu_skips_mig_risk_class(monkeypatch):
+    """cheapest_gpu (the RunPod-static, parse-time provisional) must also skip runpod_mig_risk
+    classes so the provisional matches what the RunPod allocator path actually provisions — else a
+    `flash train` dry-run would display RTX A5000 while the real submit lands on RTX 3090."""
+    from flash.providers.base import cheapest_gpu
+
+    assert cheapest_gpu(24) == "RTX 3090"  # NOT RTX A5000 (runpod_mig_risk)
+    assert cheapest_gpu(80) == "A100 PCIe"  # NOT RTX Pro 6000 WK (runpod_mig_risk)
 
 
 def test_allocate_exclude_all_fitting_classes_raises(monkeypatch):

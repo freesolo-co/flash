@@ -162,8 +162,12 @@ class GpuSpec:
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
-    # each retry resumes from the latest streamed checkpoint.
-    max_retries: int = 2
+    # each retry resumes from the latest streamed checkpoint. Raised from 2 -> 6 so the runtime
+    # MIG-walk has headroom: RunPod can hand back a Blackwell MIG slice for a validated GPU *type*,
+    # and each MIG hit (exclude_class) costs a retry to walk OFF that class onto a full GPU. With the
+    # allocator now skipping the known MIG-substituted types up front (runpod_mig_risk), this is the
+    # safety net for any MIG slice that still slips through on an unflagged type.
+    max_retries: int = 6
     # OPT-IN persistent RunPod network volume mounted at /runpod-volume, used as a
     # cross-run HF model cache (repeat runs skip the model download). Trade-offs: it
     # pins the run to the volume's datacenter (smaller GPU pool — usually the bigger
@@ -272,7 +276,7 @@ class JobSpec:
                 type=gpu.get("type", DEFAULT_GPU),
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
-                max_retries=int(gpu.get("max_retries", 2)),
+                max_retries=int(gpu.get("max_retries", 6)),
                 network_volume=gpu.get("network_volume"),
                 network_volume_gb=int(gpu.get("network_volume_gb", 100)),
                 datacenter=gpu.get("datacenter"),
