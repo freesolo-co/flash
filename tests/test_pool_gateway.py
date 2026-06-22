@@ -17,6 +17,7 @@ import asyncio
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse, Response
 
 from flash.pool.gateway import BackendGateway, GatewayError
 from flash.pool.state import Backend
@@ -120,6 +121,89 @@ def test_load_lora_does_not_swallow_auth_or_server_errors_with_already_in_body(s
     with pytest.raises(GatewayError) as ei:
         asyncio.run(scenario())
     assert ei.value.status == status
+
+
+def test_chat_non_json_2xx_body_raises():
+    # A JSON-expecting call (chat/completions, reward worker) that gets a 200 carrying a NON-JSON
+    # body (HTML error page, proxy interstitial, truncated output) must FAIL FAST: blanket-succeeding
+    # it would let the router treat a broken backend as a real result and surface a confusing
+    # downstream error instead of engaging retry/failover.
+    app = FastAPI()
+
+    @app.post("/v1/chat/completions")
+    async def chat() -> Response:
+        return PlainTextResponse("<html>502 Bad Gateway</html>")  # 200 status, HTML body
+
+    async def scenario():
+        gw = _gateway_for(app)
+        try:
+            await gw.chat(_backend(), {"model": "Q", "messages": []})
+        finally:
+            await gw.aclose()
+
+    with pytest.raises(GatewayError) as ei:
+        asyncio.run(scenario())
+    assert ei.value.status == 200
+    assert "not JSON" in str(ei.value)
+    assert "502 Bad Gateway" in str(ei.value)  # the real body is surfaced to the operator
+
+
+def test_reward_worker_non_json_2xx_body_raises():
+    # Same fail-fast contract for the reward-worker path (BackendGateway.post).
+    app = FastAPI()
+
+    @app.post("/score")
+    async def score() -> Response:
+        return PlainTextResponse("not json")
+
+    async def scenario():
+        gw = _gateway_for(app)
+        try:
+            await gw.post("reward", "http://backend/score", {"x": 1})
+        finally:
+            await gw.aclose()
+
+    with pytest.raises(GatewayError):
+        asyncio.run(scenario())
+
+
+def test_load_lora_tolerates_empty_2xx_body():
+    # Control ops (load/unload) may legitimately get an EMPTY 200 from vLLM's dynamic-LoRA endpoint
+    # — that is a success, not a misconfigured backend. A truly-empty 2xx body must NOT raise.
+    app = FastAPI()
+
+    @app.post("/v1/load_lora_adapter")
+    async def load(body: dict) -> Response:
+        return Response(status_code=200)  # empty body, no JSON
+
+    async def scenario():
+        gw = _gateway_for(app)
+        try:
+            await gw.load_lora(_backend(), "run", "/lora/run")  # must NOT raise
+        finally:
+            await gw.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_load_lora_nonempty_non_json_2xx_body_raises():
+    # But a NON-empty non-JSON 2xx on a control op is still a misconfigured backend (wrong content
+    # behind a success status) and must surface — the empty-body tolerance is exactly that narrow.
+    app = FastAPI()
+
+    @app.post("/v1/load_lora_adapter")
+    async def load(body: dict) -> Response:
+        return PlainTextResponse("<html>proxy</html>")
+
+    async def scenario():
+        gw = _gateway_for(app)
+        try:
+            await gw.load_lora(_backend(), "run", "/lora/run")
+        finally:
+            await gw.aclose()
+
+    with pytest.raises(GatewayError):
+        asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("status", [401, 500])

@@ -117,6 +117,81 @@ def test_build_payload_carries_per_run_hf_repo(monkeypatch):
     assert payload["env"]["HF_REPO"] == "myorg/runs"
 
 
+# ---------------------------------------------------------------------------
+# FLASH_EXTRA_PIP parsing (the always-installed extra_pip knob for baked runs)
+# ---------------------------------------------------------------------------
+def test_parse_extra_pip_whitespace_and_json_list():
+    from flash.providers.vast.jobs.builders import _parse_extra_pip
+
+    assert _parse_extra_pip("") == []
+    assert _parse_extra_pip("   ") == []
+    # whitespace-split path
+    assert _parse_extra_pip("causal-conv1d  torch==2.6") == ["causal-conv1d", "torch==2.6"]
+    # JSON-list path (for specs that contain spaces/commas), with empties dropped + stripped
+    assert _parse_extra_pip('["pkgA", "  pkgB ", ""]') == ["pkgA", "pkgB"]
+
+
+def test_parse_extra_pip_malformed_json_raises_clear_error():
+    from flash.providers.vast.jobs.builders import _parse_extra_pip
+
+    # A value that opens like JSON ("[") but doesn't parse must NOT surface a low-signal
+    # JSONDecodeError from deep in the builder — it names the knob and the expected formats.
+    with pytest.raises(ValueError, match="FLASH_EXTRA_PIP"):
+        _parse_extra_pip("[bad")
+
+
+def test_parse_extra_pip_json_object_rejected():
+    from flash.providers.vast.jobs.builders import _parse_extra_pip
+
+    # Valid JSON, wrong shape (object, not a list) -> clear error, not a downstream TypeError and not
+    # silently swallowed as the single shell token "{}".
+    with pytest.raises(ValueError, match="must be a list"):
+        _parse_extra_pip("{}")
+
+
+def test_parse_extra_pip_json_non_string_items_rejected():
+    from flash.providers.vast.jobs.builders import _parse_extra_pip
+
+    # A list with non-string items (e.g. a bare number) is almost certainly a mistake and would
+    # otherwise be coerced into a nonsense pip spec -> reject with a clear error.
+    with pytest.raises(ValueError, match="only strings"):
+        _parse_extra_pip('["ok", 1]')
+
+
+def _spec_with_extra_pip(value: str) -> JobSpec:
+    # FLASH_EXTRA_PIP reaches build_payload's effective worker env via the run's [worker_env]
+    # (build_worker_env does NOT forward it from os.environ — it's not in the allowlist).
+    return JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "sft",
+            "run_id": "flash-1700000000-abcd1234",
+            "train": {"epochs": 1, "seeds": [0], "hf_repo": "org/repo"},
+            "gpu": {"type": "RTX 3090", "provider": "vast", "max_wall_seconds": 3600},
+            "worker_env": {"FLASH_EXTRA_PIP": value},
+        }
+    )
+
+
+def test_build_payload_threads_json_list_extra_pip():
+    """End-to-end: a JSON-list FLASH_EXTRA_PIP rides the always-installed extra_pip into the
+    baked-run payload (the one knob that reaches a baked Vast run)."""
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec_with_extra_pip('["causal-conv1d>=1.4", "some-wheel @ https://x/y.whl"]')
+    payload = vast.build_payload(spec, seed=0, attempt=0)
+    assert "causal-conv1d>=1.4" in payload["extra_pip"]
+    assert "some-wheel @ https://x/y.whl" in payload["extra_pip"]
+
+
+def test_build_payload_malformed_extra_pip_surfaces_clear_error():
+    from flash.providers.vast import jobs as vast
+
+    spec = _spec_with_extra_pip("[not-valid-json")
+    with pytest.raises(ValueError, match="FLASH_EXTRA_PIP"):
+        vast.build_payload(spec, seed=0, attempt=0)
+
+
 def _bootstrap_env(monkeypatch, phase="sft", rcs=(0,), metrics=True):
     from flash.providers.vast import _bootstrap as vb
 

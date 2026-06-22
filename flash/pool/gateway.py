@@ -60,6 +60,7 @@ class BackendGateway:
             protocol.load_lora_body(lora_name, lora_path),
             self.control_timeout,
             tolerate_already=True,
+            expect_json=False,
         )
 
     async def unload_lora(self, be: Backend, lora_name: str) -> None:
@@ -69,6 +70,7 @@ class BackendGateway:
             protocol.unload_lora_body(lora_name),
             self.control_timeout,
             tolerate_already=True,
+            expect_json=False,
         )
 
     async def chat(self, be: Backend, body: dict) -> dict:
@@ -90,9 +92,15 @@ class BackendGateway:
         timeout: float,
         *,
         tolerate_already: bool = False,
+        expect_json: bool = True,
     ) -> dict:
         return await self._post_url(
-            be.id, protocol.join(be.url, path), body, timeout, tolerate_already=tolerate_already
+            be.id,
+            protocol.join(be.url, path),
+            body,
+            timeout,
+            tolerate_already=tolerate_already,
+            expect_json=expect_json,
         )
 
     async def _post_url(
@@ -103,6 +111,7 @@ class BackendGateway:
         timeout: float,
         *,
         tolerate_already: bool = False,
+        expect_json: bool = True,
     ) -> dict:
         try:
             r = await self._client.post(url, json=body, timeout=timeout)
@@ -127,8 +136,23 @@ class BackendGateway:
             raise GatewayError(f"{label} {url}: HTTP {r.status_code}: {text[:300]}", status=r.status_code)
         try:
             return r.json()
-        except ValueError:
-            return {"ok": True}
+        except ValueError as e:
+            # A 2xx whose body is NOT JSON. For JSON-expecting callers (chat/completions, reward
+            # workers) this is a backend returning the wrong content (HTML error page, proxy
+            # interstitial, truncated body) behind a success status — blanket-succeeding it would let
+            # the router treat a broken call as a real result and surface a confusing downstream
+            # error instead of engaging retry/failover. Fail fast with the body so the operator sees
+            # the real problem. Control ops (load/unload) pass expect_json=False: vLLM's dynamic-LoRA
+            # endpoints may answer with an EMPTY 200, which is a legitimate success there — tolerate
+            # ONLY a truly-empty body in that case; a non-empty non-JSON 2xx is still a misconfigured
+            # backend and surfaces.
+            text = _safe_text(r)
+            if not expect_json and not text.strip():
+                return {"ok": True}
+            raise GatewayError(
+                f"{label} {url}: HTTP {r.status_code} but body is not JSON: {text[:300]}",
+                status=r.status_code,
+            ) from e
 
 
 def _safe_text(r: httpx.Response) -> str:

@@ -103,6 +103,50 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
     return f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"
 
 
+def _parse_extra_pip(raw: str) -> list[str]:
+    """Parse ``FLASH_EXTRA_PIP`` into a clean list of pip specs.
+
+    Two accepted formats: a JSON list of strings (for specs containing commas/spaces, e.g.
+    ``'["torch==2.6", "causal-conv1d>=1.4"]'``), or a whitespace-split string. A leading ``[`` (or
+    ``{``, so an object literal is caught rather than treated as a single shell token) selects the
+    JSON path. Malformed input is a provisioning-time operator error, so surface a clear
+    ``ValueError`` naming the knob and the expected formats rather than a low-signal
+    ``JSONDecodeError``/``TypeError`` from deep in the builder; same for a JSON value that isn't a
+    list of strings (e.g. a JSON object ``{}`` or a list with non-string items)."""
+    raw = raw.strip()
+    if not raw:
+        return []
+    if raw[0] in "[{":
+        import json as _json
+
+        try:
+            decoded = _json.loads(raw)
+        except ValueError as e:
+            raise ValueError(
+                f"FLASH_EXTRA_PIP looks like JSON but failed to parse ({e}); "
+                "expected a JSON list of strings (or a whitespace-separated string)"
+            ) from e
+        if not isinstance(decoded, list):
+            raise ValueError(
+                f"FLASH_EXTRA_PIP JSON must be a list of strings, got {type(decoded).__name__}; "
+                "expected a JSON list of strings (or a whitespace-separated string)"
+            )
+        items: list[str] = []
+        for d in decoded:
+            if not isinstance(d, str):
+                raise ValueError(
+                    f"FLASH_EXTRA_PIP JSON list must contain only strings, got "
+                    f"{type(d).__name__} ({d!r}); expected a JSON list of strings"
+                )
+            d = d.strip()
+            if d:
+                items.append(d)
+        return items
+    import shlex as _shlex
+
+    return [d for d in _shlex.split(raw) if d.strip()]
+
+
 def build_payload(spec, seed: int, attempt: int) -> dict:
     """The bootstrap's input — field-compatible with _train_body's, plus the bits the
     instance can't infer (HF prefix for markers, wall cap, attempt)."""
@@ -117,16 +161,7 @@ def build_payload(spec, seed: int, attempt: int) -> dict:
     # it. Resolved from the effective worker env (per-run [worker_env] over os.environ).
     _eff = build_worker_env(spec, seed)
     _extra_raw = _eff.get("FLASH_EXTRA_PIP", "").strip()
-    _extra_pip_user: list[str] = []
-    if _extra_raw:
-        if _extra_raw.startswith("["):
-            import json as _json
-
-            _extra_pip_user = [str(d).strip() for d in _json.loads(_extra_raw) if str(d).strip()]
-        else:
-            import shlex as _shlex
-
-            _extra_pip_user = [d for d in _shlex.split(_extra_raw) if d.strip()]
+    _extra_pip_user = _parse_extra_pip(_extra_raw)
 
     return {
         "hf_repo": spec.train.hf_repo,
