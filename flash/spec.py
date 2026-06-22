@@ -87,7 +87,9 @@ def _strict_int(value: Any, *, name: str, minimum: int | None = None) -> int:
     """Coerce a loosely-typed scalar to an int WITHOUT silently truncating.
 
     Plain ``int(...)`` accepts ``2.9`` (-> 2) and ``True`` (-> 1), so a malformed spec from a
-    JSON/env/TOML source would quietly provision a different topology than intended. We require an
+    JSON or TOML source would quietly provision a different topology than intended. (It takes
+    already-typed scalars — raw env strings are parsed by ``flash.pool.config._int``/``_float``
+    first, which is why a bare string like ``"2"`` is rejected here.) We require an
     exact integer: a bool is rejected (a JSON/TOML boolean is not a count), and a float is accepted
     only if it is whole (``2.0`` -> 2) — a fractional value (``2.9``) fails loudly. ``minimum``, if
     given, enforces a lower bound (raises if below it). Shared with the rollout-pool config

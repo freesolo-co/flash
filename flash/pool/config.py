@@ -66,7 +66,7 @@ class PoolMember:
     """One slice of the desired fleet: ``count`` GPUs of ``gpu`` class each serving ``base_model``."""
 
     base_model: str
-    gpu: str  # managed GPU class label (see `slm gpus`), e.g. "RTX5090"
+    gpu: str  # managed GPU class label (see `flash gpus`), e.g. "RTX 5090" or "A100 PCIe"
     count: int = 1
     max_loras: int = 8
 
