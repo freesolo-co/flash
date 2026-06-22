@@ -55,22 +55,21 @@ def cmd_version(args) -> int:
 
 def cmd_login(args) -> int:
     # Login is handled by the freesolo backend (not the flash control plane): the user
-    # supplies the freesolo API key they created in the dashboard, and we verify it against
+    # supplies the freesolo API key they created at freesolo.co, and we verify it against
     # freesolo before storing it. The same key authenticates flash's control plane.
     api_key = args.api_key or os.environ.get("FREESOLO_API_KEY")
     if not api_key:
         raise ClientError(
             "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
-            "Create a key in your freesolo dashboard."
+            "Create or copy a key at https://freesolo.co/sign-in."
         )
     verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
     api_url = args.api_url or load_credentials()[0]
     # save_credentials clears the stored url when it's the default, so logging into the
     # default plane also drops a stale custom url from a previous custom-URL login.
-    path = save_credentials(api_key, api_url=api_url)
+    save_credentials(api_key, api_url=api_url)
     # Never echo the key itself; the stored file is the single source of truth.
-    print(f"logged in: freesolo verified your key (saved to {path})")
-    print("you're ready to train — try `flash train <config.toml>`")
+    print("logged in: freesolo verified your key")
     return 0
 
 
@@ -82,10 +81,9 @@ def cmd_whoami(args) -> int:
 _STARTER_ENV_PY = '''\
 """Starter local verifiers environment.
 
-Replace the dataset and rubric with your task, then publish it to the Prime Hub with
-`flash env push environments/starter_env.py`. A managed run references the published env by
-its Hub slug: set [environment] id = "owner/name" in the config.
-See https://github.com/PrimeIntellect-ai/verifiers for the full API.
+Replace the dataset and rubric with your task, then publish it with
+`flash env push environments/starter_env.py`. A managed run references the published
+environment by id: set [environment] id = "owner/name" in the config.
 """
 
 import verifiers as vf
@@ -110,7 +108,7 @@ def load_environment(**kwargs) -> vf.Environment:
 '''
 
 
-def cmd_lab_setup(args) -> int:
+def cmd_env_setup(args) -> int:
     Path("environments").mkdir(exist_ok=True)
     Path("configs").mkdir(exist_ok=True)
     Path("configs/endpoints.toml").write_text(
@@ -124,11 +122,11 @@ def cmd_lab_setup(args) -> int:
         sample.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
-            "# Environment: a verifiers / Prime Hub env slug. Publish the scaffolded\n"
-            "# environments/starter_env.py with `flash env push environments/starter_env.py`\n"
-            "# (then `flash env install owner/name`) to get the slug, and set it below.\n"
+            "# Environment: a published verifiers environment id. Publish the scaffolded\n"
+            "# environments/starter_env.py with `flash env push environments/starter_env.py`,\n"
+            "# then set the returned id below.\n"
             "[environment]\n"
-            'id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
+            'id = "owner/name"   # a published verifiers environment id\n\n'
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
@@ -195,13 +193,12 @@ def cmd_env_init(args) -> int:
     root.mkdir(parents=True, exist_ok=True)
     # Verifiers-only: scaffold a real verifiers env whose load_environment returns a
     # vf.Environment (here a SingleTurnEnv + Rubric over a datasets.Dataset). This is what
-    # a Hub push expects, so a freshly scaffolded env actually loads.
+    # `flash env push` expects, so a freshly scaffolded env actually loads.
     (root / f"{mod}.py").write_text(
         f'"""Custom verifiers environment ({args.name}).\n\n'
-        "Replace the dataset and rubric with your task, then publish it to the Prime Hub\n"
-        f"with `flash env push environments/{mod}/{mod}.py` and reference it by id\n"
+        "Replace the dataset and rubric with your task, then publish it\n"
+        f"with `flash env push environments/{mod}/{mod}.py` and reference the returned id\n"
         '([environment] id = "owner/name") in your config.\n'
-        "See https://github.com/PrimeIntellect-ai/verifiers for the full API.\n"
         '"""\n\n'
         "import verifiers as vf\n"
         "from datasets import Dataset\n\n\n"
@@ -224,7 +221,7 @@ def cmd_env_init(args) -> int:
     (root / "README.md").write_text(f"# {args.name}\n\nCustom verifiers environment for Flash.\n")
     print(f"created {root}")
     print(
-        f"publish it to the Prime Hub with `flash env push environments/{mod}/{mod}.py`, "
+        f"publish it with `flash env push environments/{mod}/{mod}.py`, "
         'then reference it by id ([environment] id = "owner/name") in your config.'
     )
     return 0
@@ -235,15 +232,15 @@ def cmd_env_list(args) -> int:
 
     installed = list_installed_verifiers_envs()
     if installed:
-        print("installed (verifiers / Prime Hub):")
+        print("installed verifiers environments:")
         for env_id in installed:
             print(f"  {env_id}")
     local = Path("environments")
     if local.is_dir():
         # Both directory envs (environments/<name>/<name>.py) and top-level single-file
-        # modules (environments/<name>.py, e.g. the `flash lab` starter env). These are local
+        # modules (environments/<name>.py, e.g. the `flash env setup` starter env). These are local
         # env SOURCES — publish one with `flash env push <path>` to run it on the managed
-        # service by its Hub id.
+        # service by its published id.
         paths: list[str] = []
         for p in local.iterdir():
             if p.name.startswith("__"):
@@ -269,7 +266,7 @@ def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
     Catalog-only and deterministic; an uncapped SFT run tries to count the env's train split, and
-    falls back to a default example count (with a warning) when the Hub env isn't importable here."""
+    falls back to a default example count when the published env isn't importable here."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(
