@@ -109,16 +109,36 @@ def build_payload(spec, seed: int, attempt: int) -> dict:
     from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
     from flash.providers.runpod.train import build_worker_env, chalk_extra_pip
 
+    # Per-run additive pip specs for the BAKED-image path (the Vast default + the RunPod baked path):
+    # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS only reach the boot-install path, which Vast skips
+    # because deps are baked into WORKER_IMAGE. FLASH_EXTRA_PIP (whitespace-separated, or a JSON list
+    # for specs with commas) is the ONE knob that rides the always-installed `extra_pip` to a baked
+    # run — used to A/B a wheel (e.g. causal-conv1d) on top of the published image without rebuilding
+    # it. Resolved from the effective worker env (per-run [worker_env] over os.environ).
+    _eff = build_worker_env(spec, seed)
+    _extra_raw = _eff.get("FLASH_EXTRA_PIP", "").strip()
+    _extra_pip_user: list[str] = []
+    if _extra_raw:
+        if _extra_raw.startswith("["):
+            import json as _json
+
+            _extra_pip_user = [str(d).strip() for d in _json.loads(_extra_raw) if str(d).strip()]
+        else:
+            import shlex as _shlex
+
+            _extra_pip_user = [d for d in _shlex.split(_extra_raw) if d.strip()]
+
     return {
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
-        "env": build_worker_env(spec, seed),
+        "env": _eff,
         # The Vast bootstrap pip-installs extra_pip for every job (provider/vast/_bootstrap.py),
         # so the opt-in chalk spec rides along here to reach default runs — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
-        + chalk_extra_pip(spec),
+        + chalk_extra_pip(spec)
+        + _extra_pip_user,
         "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
         "hf_prefix": f"{spec.phase}/{spec.run_id}/seed{seed}",
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
