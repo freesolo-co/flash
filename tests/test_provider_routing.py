@@ -119,6 +119,39 @@ def test_vast_allocation_routes_to_vast_runner(orch, monkeypatch):
     assert orch.get_status(spec.run_id).remote["provider"] == "vast"
 
 
+def test_user_wandb_runtime_secret_reaches_selected_provider(orch, monkeypatch):
+    from flash.providers import allocator
+    from flash.providers.base import PollResult
+    from flash.providers.runpod import jobs as rp_jobs
+
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(provider="runpod", gpu="RTX 3090", rate=0.46))
+    captured = {}
+
+    def fake_runpod_submit(
+        run_spec,
+        seed,
+        log=None,
+        on_handle=None,
+        attempt=0,
+        runtime_secrets=None,
+    ):
+        captured["runtime_secrets"] = dict(runtime_secrets or {})
+        if on_handle:
+            on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": "j"})
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec()
+    _seed_status(orch, spec)
+    orch._submit_seed_supervised(
+        spec,
+        0,
+        io.StringIO(),
+        runtime_secrets={"WANDB_API_KEY": "user-wb"},
+    )
+    assert captured["runtime_secrets"] == {"WANDB_API_KEY": "user-wb"}
+
+
 def test_vast_cost_flows_into_run_status(orch, monkeypatch):
     spec = _spec()
     _seed_status(orch, spec)
