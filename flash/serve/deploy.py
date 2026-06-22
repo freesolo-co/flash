@@ -344,6 +344,15 @@ def chat(
             raise ServingError(
                 f"could not reach the serving backend at {base}: {exc}"
             ) from exc
+    # If we exited the poll loop still holding a 3xx, it is NOT Modal's async-result redirect (those
+    # are what the loop chases). httpx only raises_for_status on 4xx/5xx, so such a redirect would
+    # slip through and blow up confusingly in resp.json(); surface it as a clear serving error.
+    if 300 <= resp.status_code < 400:
+        raise ServingError(
+            f"chat for {run_id} got an unexpected {resp.status_code} redirect to "
+            f"{resp.headers.get('location')!r} from the serving backend at {base} (not a Modal "
+            "async-result redirect); the deployment may be misconfigured"
+        )
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:

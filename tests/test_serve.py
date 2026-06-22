@@ -334,6 +334,24 @@ def test_chat_polls_modal_async_result_redirect(monkeypatch):
     assert all("__modal_function_call_id=fc-XYZ" in u for u in seen["polls"])
 
 
+def test_chat_raises_on_non_modal_redirect(monkeypatch):
+    """A 3xx that is NOT Modal's async-result redirect (no __modal_function_call_id) must raise a
+    clear ServingError instead of slipping past the poll loop + raise_for_status (httpx only raises
+    4xx/5xx) and blowing up confusingly in resp.json()."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    seen = _install_fake_chat_client(
+        monkeypatch,
+        post_resp=_ChatResp(302, location="https://elsewhere.example/login"),
+    )
+
+    with pytest.raises(d.ServingError, match="redirect"):
+        d.chat(run_id="flash-7-abcd", messages=[{"role": "user", "content": "hi"}])
+    # Never entered the modal-poll loop (the redirect had no __modal_function_call_id marker).
+    assert seen["polls"] == []
+
+
 def test_chat_raises_serving_error_on_deadline(monkeypatch):
     """If the async-result poll never resolves before the wall-clock deadline, chat() raises a
     ServingError (carrying a clear timeout message) — it can NEVER hang indefinitely."""
