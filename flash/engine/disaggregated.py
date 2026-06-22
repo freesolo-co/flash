@@ -513,16 +513,46 @@ def launch_vllm_server(
     log = open(log_path, "wb")  # noqa: SIM115 — handle lives with the long-running subprocess
     print(f"[rl][disagg] launching rollout server: {' '.join(cmd)}")
     print(f"[rl][disagg] server CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')} log={log_path}")
-    return subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    except Exception:
+        # The child never started, so nothing inherits the fd — close it here instead of
+        # leaking it (mirrors the parent-handle close-in-finally pattern). On success the
+        # handle stays open: the live child keeps writing to it until terminate_server closes it.
+        with contextlib.suppress(Exception):
+            log.close()
+        raise
+    # Track the parent's copy of the log fd ON the Popen so terminate_server can close it. The
+    # child has its own dup of the fd (inherited at fork), so closing the parent copy here while
+    # the server runs would NOT stop the child writing — but leaving it open across repeated
+    # launch/terminate cycles on a long-lived worker leaks one fd per server (the reported bug).
+    proc._flash_log_handle = log  # type: ignore[attr-defined]
+    return proc
 
 
 def terminate_server(proc: subprocess.Popen | None, *, timeout: float = 15.0) -> None:
-    """Best-effort shutdown of the rollout server after training (free its GPU + port)."""
-    if proc is None or proc.poll() is not None:
+    """Best-effort shutdown of the rollout server after training (free its GPU + port).
+
+    Also closes the parent's copy of the log-file handle opened by ``launch_vllm_server`` (the
+    child keeps its own inherited dup until it exits), so repeated launch/terminate cycles on a
+    long-lived in-process worker don't leak one file descriptor per rollout server.
+    """
+    if proc is None:
         return
     try:
-        proc.terminate()
-        proc.wait(timeout=timeout)
-    except Exception:
-        with contextlib.suppress(Exception):
-            proc.kill()
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=timeout)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+    finally:
+        # Close the parent log handle regardless of how termination went (and even if the
+        # process had already exited on entry) so the fd is always reclaimed exactly once.
+        log = getattr(proc, "_flash_log_handle", None)
+        if log is not None:
+            with contextlib.suppress(Exception):
+                log.close()
+            with contextlib.suppress(Exception):
+                proc._flash_log_handle = None  # type: ignore[attr-defined]

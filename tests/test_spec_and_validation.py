@@ -67,6 +67,63 @@ def test_spec_validation_rejections(overrides, match) -> None:
         spec_from_dict(_raw(**overrides))
 
 
+def _stub_disaggregated_model(monkeypatch, *, single_trainer_only: bool = True) -> None:
+    """Make spec_from_dict resolve to a synthetic requires_disaggregated model on a normal GPU.
+
+    The only catalog requires_disaggregated entry (Qwen3.6-35B-A3B) is so large that the
+    submit-time GPU sizing (provisional_gpu / resolve_model) rejects it BEFORE the disaggregated
+    guard runs, so it can't exercise the wiring through spec_from_dict. Stub the two resolution
+    seams so a requires_disaggregated model reaches the guard, proving spec_from_dict invokes it.
+    """
+    from flash.catalog import ModelInfo
+
+    info = ModelInfo(
+        id="X/Disagg-Test",
+        display_name="Disagg Test",
+        params="35B",
+        algos=("grpo",),
+        min_vram_gb=40,
+        thinking="hybrid",
+        requires_disaggregated=True,
+        single_trainer_only=single_trainer_only,
+    )
+    # A canonical Flash-managed GPU name so the run clears _validate_spec's canonical_gpu() check
+    # (the disaggregated guard, not GPU sizing, is what these tests exercise).
+    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "H100")
+    monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
+
+
+def test_disaggregated_guard_is_wired_into_spec_from_dict(monkeypatch) -> None:
+    # A requires_disaggregated model on the COLOCATE GRPO path (no inference_gpus) must be
+    # rejected at submit by spec_from_dict — the guard (validate_disaggregated_requirement) is
+    # actually called, not just defined. Without the wiring this config would be accepted and
+    # only fail after a paid GPU is rented.
+    _stub_disaggregated_model(monkeypatch)
+    raw = _raw(model="X/Disagg-Test")
+    raw["train"] = {"steps": 10, "lora_rank": 8, "seeds": [0]}
+    with pytest.raises(ConfigError, match="disaggregated GRPO path"):
+        spec_from_dict(raw)
+
+
+def test_disaggregated_guard_accepts_inference_gpus(monkeypatch) -> None:
+    # Same model WITH inference_gpus>0 satisfies the guard and parses (the disaggregated path).
+    _stub_disaggregated_model(monkeypatch)
+    raw = _raw(model="X/Disagg-Test")
+    raw["train"] = {"steps": 10, "lora_rank": 8, "seeds": [0], "inference_gpus": 1}
+    spec = spec_from_dict(raw)
+    assert spec.train.inference_gpus == 1
+
+
+def test_disaggregated_guard_skips_sft(monkeypatch) -> None:
+    # SFT has no rollout engine, so the guard does NOT reject a requires_disaggregated model's
+    # SFT run even on the colocate (no inference_gpus) path.
+    _stub_disaggregated_model(monkeypatch)
+    raw = _raw(model="X/Disagg-Test", algorithm="sft")
+    raw["train"] = {"epochs": 1, "lora_rank": 8, "seeds": [0]}
+    spec = spec_from_dict(raw)
+    assert spec.algorithm == "sft"
+
+
 def test_sft_epochs_must_be_positive() -> None:
     raw = _raw(algorithm="sft")
     raw["train"] = {"epochs": 0, "lora_rank": 8, "seeds": [0]}
