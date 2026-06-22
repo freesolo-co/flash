@@ -29,7 +29,7 @@ MFU_TRAIN, MFU_DECODE = 0.35, 0.12
 REWARD_CONCURRENCY = 16.0
 
 # ---- GPU facts (flash/cost/facts.py TFLOPS + flash/providers/base.py $/hr) ----
-A100 = {"tflops": 312.0, "usd_hr": 1.00}   # training-class (colocate + pool trainer)
+A100 = {"tflops": 312.0, "usd_hr": 1.39}   # training-class (colocate + pool trainer); A100 PCIe 80GB $/hr from flash/providers/base.py (SXM is 1.49)
 A40 = {"tflops": 150.0, "usd_hr": 0.44}    # bandwidth-class inference card (pool rollout)
 CPU_REWARD_USD_HR = 0.10                    # a CPU reward worker (serves REWARD_CONCURRENCY slots)
 
