@@ -64,6 +64,38 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
     )
 
 
+def test_allocate_excludes_gpu_class_walks_to_different_validated(monkeypatch):
+    """A MIG / unusable-GPU retry must re-allocate OFF the failed CLASS to a DIFFERENT validated
+    one. With static rates a 0.8B GRPO run's validated 24 GB pool ranks RTX A5000 ($0.27) < RTX
+    3090 ($0.46) < RTX 4090 ($0.69) < RTX 5090 ($0.99); excluding the cheapest (A5000 — the
+    MIG-prone class) makes the allocator pick the next validated class, never re-pick A5000."""
+    from flash.providers import allocator
+
+    base = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    assert base.gpu == "RTX A5000"  # the cheapest validated 24 GB class (the MIG one)
+
+    walked = allocator.allocate(
+        "Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=frozenset({"RTX A5000"})
+    )
+    assert walked.gpu != "RTX A5000"  # walked off the MIG-prone class
+    # the excluded class is gone from EVERY candidate, not just the chosen one
+    assert all(c.gpu != "RTX A5000" for c in walked.candidates)
+    # ... onto the next-cheapest validated class (a consumer card that can't be MIG-sliced)
+    assert walked.gpu == "RTX 3090"
+
+
+def test_allocate_exclude_all_fitting_classes_raises(monkeypatch):
+    """Excluding every fitting validated class leaves nothing to allocate -> UnsupportedGpuError
+    (the run terminates cleanly rather than re-picking a banned class)."""
+    from flash.providers import allocator
+    from flash.providers.base import UnsupportedGpuError
+
+    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    all_classes = frozenset(c.gpu for c in a.candidates)
+    with pytest.raises(UnsupportedGpuError, match="excluding GPU classes"):
+        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", exclude_gpu_classes=all_classes)
+
+
 def test_offline_allocates_static_cheapest(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import cheapest_gpu
