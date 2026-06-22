@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -28,6 +29,7 @@ _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "freesolo/environment.py"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,10 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
     if text.startswith("github:"):
         body = text[len("github:") :]
         repo_ref, sep, path = body.partition(":")
+        try:
+            path = _normalize_env_path(path)
+        except ValueError:
+            return None
         if not sep:
             path = _DEFAULT_ENVIRONMENT_PATH
         repo_part, at, ref = repo_ref.partition("@")
@@ -63,7 +69,7 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
             ref = _DEFAULT_GITHUB_REF
         owner_repo = repo_part.split("/", 1)
         if len(owner_repo) == 2 and all(owner_repo):
-            return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path or _DEFAULT_ENVIRONMENT_PATH)
+            return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
         return None
 
     parsed = urllib.parse.urlparse(text)
@@ -76,8 +82,14 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
     repo = repo[:-4] if repo.endswith(".git") else repo
     if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
         ref = parts[3]
-        path = "/".join(parts[4:]) or _DEFAULT_ENVIRONMENT_PATH
-        if parts[2] == "tree" and not path.endswith(".py"):
+        raw_path = "/".join(parts[4:])
+        try:
+            path = _normalize_env_path(raw_path)
+        except ValueError:
+            return None
+        if not raw_path:
+            path = _DEFAULT_ENVIRONMENT_PATH
+        if parts[2] == "tree" and raw_path and not path.endswith(".py"):
             path = f"{path.rstrip('/')}/{_DEFAULT_ENVIRONMENT_PATH}"
     else:
         ref = _DEFAULT_GITHUB_REF
@@ -85,8 +97,49 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
     return GitHubEnvironmentRef(owner, repo, ref, path)
 
 
+def _normalize_env_path(path: str | None) -> str:
+    if not path:
+        return _DEFAULT_ENVIRONMENT_PATH
+    raw = path.strip()
+    if not raw:
+        return _DEFAULT_ENVIRONMENT_PATH
+    raw = raw.replace("\\", "/").lstrip("/")
+    if not raw:
+        return _DEFAULT_ENVIRONMENT_PATH
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        return _DEFAULT_ENVIRONMENT_PATH
+    if any(part == ".." or part == "." for part in parts):
+        raise ValueError(f"unsafe environment path: {path!r}")
+    return "/".join(parts)
+
+
 def _github_token() -> str | None:
     return os.environ.get("FLASH_ENV_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
+
+
+def _is_commit_sha(value: str) -> bool:
+    return _COMMIT_SHA_RE.fullmatch(value) is not None
+
+
+def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
+    if _is_commit_sha(parsed.ref):
+        return parsed.ref
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
+    req = urllib.request.Request(commit_url, headers=headers)
+    data = _urlopen(req, timeout=60.0)
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to resolve commit for {parsed.canonical()}: invalid GitHub response")
+    sha = payload.get("sha")
+    if not isinstance(sha, str) or not _is_commit_sha(sha):
+        raise RuntimeError(f"Failed to resolve commit for {parsed.canonical()}")
+    return sha
 
 
 def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
@@ -145,7 +198,10 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
-    cache_key = hashlib.sha256(parsed.canonical().encode("utf-8")).hexdigest()[:24]
+    resolved_ref = _resolve_ref_sha(parsed)
+    cache_key = hashlib.sha256(
+        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode("utf-8")
+    ).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
     env_file = cache_dir / parsed.path
     if env_file.is_file():
