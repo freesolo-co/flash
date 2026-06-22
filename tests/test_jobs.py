@@ -783,12 +783,12 @@ def test_attach_requires_handle(monkeypatch):
             orch.attach_run("nh")
 
 
-def test_attach_resumes_from_checkpoint_on_infra_failure(monkeypatch):
-    # The remote job died for INFRASTRUCTURE reasons (host vanished / TIMED_OUT) while the
-    # control plane was down for a redeploy. Reattach must NOT fail the run — it must resume
-    # the seed on a fresh host (worker resumes from the latest HF checkpoint), exactly like the
-    # fresh-submit retry loop. It also records resume_seed_index + clears the stale handle so a
-    # second restart during the fresh allocation resumes the right seed.
+def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
+    # A recovered run whose remote job ended not-ok (it died while the control plane was down for
+    # the redeploy) must NOT be failed — reattach resumes the in-flight seed on a fresh host
+    # (worker resumes from the latest HF checkpoint), exactly like the fresh-submit retry loop. It
+    # also records resume_seed_index + clears the stale handle so a second restart during the
+    # fresh allocation resumes the right seed.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
@@ -803,7 +803,7 @@ def test_attach_resumes_from_checkpoint_on_infra_failure(monkeypatch):
                 remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "seed": 0},
             )
         )
-        # Poll reports a stalled/dead host — the canonical infra-shaped failure.
+        # Poll reports a dead/abandoned job (the common redeploy-window outcome).
         monkeypatch.setattr(
             jobs,
             "poll_job",
@@ -825,14 +825,14 @@ def test_attach_resumes_from_checkpoint_on_infra_failure(monkeypatch):
         assert seen["start_index"] == 0, "must resume the in-flight seed (index 0), not skip it"
         assert seen["remote"] is None, "stale dead handle must be cleared before resuming"
         assert seen["resume_seed_index"] == 0, "resume marker must be set for a second restart"
-        assert st.state != "failed", "an infra-shaped death must be resumed, not failed"
+        assert st.state != "failed", "a job lost to the redeploy must be resumed, not failed"
         assert st.state == "done"
 
 
-def test_attach_fails_on_genuine_worker_crash(monkeypatch):
-    # A genuine worker CODE crash (a real captured traceback, not an infra flake) must fail the
-    # run fast — re-running would only reproduce the crash and burn money. So attach must NOT
-    # resume in this case.
+def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
+    # The resume delegates the genuine-vs-infra decision to the seed loop (unchanged): a run that
+    # is truly broken reproduces the failure on the resumed attempt, the seed loop fails it, and
+    # attach surfaces that terminal `failed` — so a broken run still terminates (nothing hangs).
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
@@ -855,14 +855,19 @@ def test_attach_fails_on_genuine_worker_crash(monkeypatch):
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         resumed = {"called": False}
-        monkeypatch.setattr(
-            orch, "_run_seed_loop", lambda *a, **k: resumed.__setitem__("called", True)
-        )
+
+        def fake_loop(spec, log, *, start_index, prior_cost):
+            # The seed loop re-runs the seed; a genuinely broken run fails there (matches
+            # _submit_seed_supervised raising after a non-infra failure with no retries left).
+            resumed["called"] = True
+            raise RuntimeError("seed 0 failed after retries: worker_error: bad reward fn")
+
+        monkeypatch.setattr(orch, "_run_seed_loop", fake_loop)
 
         st = orch.attach_run("g1", log_stream=sys.stderr)
 
-        assert resumed["called"] is False, "a genuine worker crash must NOT be resumed"
-        assert st.state == "failed"
+        assert resumed["called"] is True, "attach must attempt a checkpoint resume on any non-ok poll"
+        assert st.state == "failed", "a resume that fails again must terminate the run"
         assert "bad reward fn" in (st.error or "")
 
 
