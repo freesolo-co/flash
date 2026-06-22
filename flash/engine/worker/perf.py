@@ -14,6 +14,11 @@ import os
 import sys
 import time
 
+# Fused-CE (Liger) gate thresholds live in ONE place — flash.engine.vram — so the worker's run-time
+# gate and the cost estimator's offline mirror (sft_logits_fused) can never drift. vram is a pure
+# leaf (no worker import), so this is cycle-free.
+from flash.engine.vram import _LIGER_LONG_CTX_TOKENS, _LIGER_MIN_PARAMS_B
+
 
 def _attn_impl_for_capability(major: int) -> str | None:
     """Map a CUDA compute capability to the trainer ``attn_implementation``.
@@ -117,7 +122,9 @@ def optimal_attn_impl() -> str | None:
 # RTX 4090 0.83x, RTX 5090 0.79x) — the per-step Triton overhead isn't repaid because the small
 # model's logits don't dominate memory. Its value appears on LARGE models (lets a bigger batch
 # fit / avoids OOM). So gate by estimated model size.
-_LIGER_MIN_PARAMS = 3e9  # ~3B; 1B-class models measured net-negative -> Liger off below this
+# ~3B in raw param count; the canonical threshold (in billions) lives in flash.engine.vram.
+# 1B-class models measured net-negative -> Liger off below this.
+_LIGER_MIN_PARAMS = _LIGER_MIN_PARAMS_B * 1e9
 
 
 def _estimate_params(cfg) -> float:
@@ -231,7 +238,7 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
 # Long-context runs are memory-bound (activations + vLLM KV cache scale with sequence length), so
 # they need the memory features even on a SMALL model — PR #174 measured a 1B model OOM on GRPO at
 # 4096 ctx in speed mode, but it fits in memory mode. So "memory mode" = large model OR long ctx.
-_LONG_CONTEXT_TOKENS = 2048
+_LONG_CONTEXT_TOKENS = _LIGER_LONG_CTX_TOKENS  # canonical value in flash.engine.vram
 
 
 def _memory_mode(model_id: str, max_length: int = 0) -> bool:
@@ -440,6 +447,12 @@ class RetriableInfraError(RuntimeError):
         super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
 
 
+# Transient-startup grace for assert_usable_gpu's CUDA-availability poll (it runs before the
+# handler's wait_for_gpu). Module-level so tests can monkeypatch them to run instantly.
+_GPU_GUARD_AVAIL_RETRIES = 6
+_GPU_GUARD_AVAIL_DELAY_S = 5.0
+
+
 def assert_usable_gpu() -> None:
     """Fail FAST (and RETRIABLY) on a MIG slice / NVML-restricted device before any real CUDA work.
 
@@ -453,17 +466,39 @@ def assert_usable_gpu() -> None:
     Detection (any one trips it):
       * the device name contains "MIG" (a MIG partition), or
       * a minimal NVML probe (memory query) raises (driver/permission restricted), or
-      * CUDA reports no device at all.
-    The NVML check is best-effort: a probe that simply can't run (pynvml absent) is NOT treated as
-    a failure — we only fail on a name match or an NVML call that actively raises.
+      * CUDA reports no device even after a transient-startup grace poll.
+    A torch import failure is re-raised (an image problem, not retriable infra). The NVML check is
+    best-effort: a probe that simply can't run (pynvml absent) is NOT treated as a failure — we
+    only fail on a name match or an NVML call that actively raises.
     """
     try:
         import torch
-    except Exception as e:  # torch import failure is a different (image) problem; let it surface
-        print("[gpu-guard] torch import failed; skipping MIG/NVML guard:", e)
-        return
-    if not torch.cuda.is_available():
-        raise RetriableInfraError("CUDA reports no available device at worker boot")
+    except Exception as e:
+        # torch import failure is an IMAGE problem, not transient infra: surface it (re-raise)
+        # instead of swallowing and returning. Swallowing would let the worker proceed into
+        # training and fail later with a far less actionable error than the import traceback here.
+        print("[gpu-guard] torch import failed; surfacing:", e)
+        raise
+    # Transient-startup grace: rented hosts can report "CUDA not available" for a few seconds at
+    # boot. This guard runs in main() BEFORE the handler's wait_for_gpu(), so failing on the very
+    # first is_available() check would preempt that polling and spuriously resubmit a host whose
+    # CUDA comes up a moment later. Poll a few times (constants are module-level so tests shrink
+    # them) before declaring the host device-less.
+    # Normalize to a single, sane loop bound so the poll/sleep logic stays consistent.
+    tries = max(1, int(_GPU_GUARD_AVAIL_RETRIES))
+    delay_s = float(_GPU_GUARD_AVAIL_DELAY_S)
+
+    cuda_ready = False
+    for i in range(tries):
+        cuda_ready = bool(torch.cuda.is_available())
+        if cuda_ready:
+            break
+        if i + 1 < tries:
+            time.sleep(delay_s)
+    if not cuda_ready:
+        raise RetriableInfraError(
+            "CUDA reports no available device after the worker-boot startup grace"
+        )
     try:
         name = torch.cuda.get_device_name(0)
     except Exception as e:
@@ -517,7 +552,8 @@ def wait_for_gpu():
             last = str(e)[:160]
         print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
         _t.sleep(10)
-    raise RuntimeError(f"GPU never became ready after 12 tries: {last}")
+    # Infra-shaped: a host whose GPU never comes up is dead, not a code bug -> retry on a fresh one.
+    raise RetriableInfraError(f"GPU never became ready after 12 tries: {last}")
 
 
 def free_gpu(trainer=None):
