@@ -240,7 +240,14 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     return float(cost)
 
 
-def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> None:
+def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
+    """Atomically transition a run's status, honoring terminal-stickiness.
+
+    Returns ``True`` if the transition was applied, ``False`` if it was rejected because
+    the run was already in a terminal state (the sticky compare-and-set below). Callers
+    that gate PAID work on a transition (e.g. the recovery path resuming ``_run_seed_loop``)
+    must check this return so a run concurrently flipped terminal does not get resumed.
+    """
     # The read-check-write below must be atomic: a concurrent `flash cancel` (also via
     # _update) landing between the get_status read and the _save_status write could
     # otherwise be clobbered by this stale background update, resurrecting a cancelled
@@ -267,12 +274,13 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         # run, so a GENUINE training-completion `done` racing in from the run's own training
         # thread is protected by the CAS below — cancel correctly loses to a real finish.
         if status.state in TERMINAL_STATES and state != status.state and not allow_from_terminal:
-            return
+            return False
         status.state = state
         status.updated_at = time.time()
         for key, value in updates.items():
             setattr(status, key, value)
         _save_status(status)
+        return True
 
 
 def _save_status(status: RunStatus) -> None:
