@@ -10,6 +10,7 @@ on Vast. Usage:
 """
 import json
 import os
+import shlex
 import sys
 import urllib.request
 
@@ -35,7 +36,7 @@ def call(method: str, url: str, body=None):
 def create(gpu: str, name: str, disk: str) -> None:
     start = (
         "apt-get update -qq && apt-get install -y -qq openssh-server >/dev/null 2>&1; "
-        "mkdir -p /run/sshd /root/.ssh; echo '" + PUBKEY + "' >> /root/.ssh/authorized_keys; "
+        "mkdir -p /run/sshd /root/.ssh; echo " + shlex.quote(PUBKEY) + " >> /root/.ssh/authorized_keys; "
         "chmod 600 /root/.ssh/authorized_keys; /usr/sbin/sshd -D -p 22"
     )
     body = {

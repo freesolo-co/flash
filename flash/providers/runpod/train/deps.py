@@ -173,11 +173,12 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
 def _chalk_selected(spec=None) -> bool:
     """True if ANY chalk kernel would run on the worker -> chalk must be installed.
 
-    chalk's gap-fillers (RoPE/LoRA/embedding) are ON BY DEFAULT (engine.chalk_kernels), so this
-    is True for a normal run. It is False only when every kernel that would otherwise be enabled is
-    explicitly set to 0 — i.e. the three default-on gap-fillers (ROPE/TRITON_LORA/EMBED) disabled
-    via ``FLASH_<K>=0`` (the default-off opt-in kernels — QKV/MLP/FP8 base — need no flag to stay
-    off, so deselecting chalk does NOT require setting them to 0). Resolved against the EFFECTIVE worker env
+    chalk is now a STANDALONE stack: its RMSNorm/SwiGLU/FLCE kernels are ON BY DEFAULT (replacing
+    Liger) alongside the older default-on gap-fillers (RoPE/LoRA/embedding) — all via
+    engine.chalk_kernels — so this is True for a normal run. It is False only when EVERY default-on
+    kernel is explicitly set to 0 via ``FLASH_<K>=0`` (RMSNorm/SwiGLU/FLCE + ROPE/TRITON_LORA/EMBED;
+    the default-off opt-in kernels — QKV/MLP/FP8 base — need no flag to stay off, so deselecting
+    chalk does NOT require setting them to 0). Resolved against the EFFECTIVE worker env
     — the run's ``[worker_env]`` merged over ``os.environ`` so a per-run override is honored (see
     ``_effective_worker_env``). Delegates to ``chalk_kernels.is_chalk_enabled`` (the single source
     of truth for the flag/default logic) rather than re-parsing the kernel table here.
