@@ -341,6 +341,7 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
     Shared by a fresh submit (start_index=0) and post-restart recovery, which
     resumes the remaining seeds after the in-flight one completes."""
     from flash.runner import (
+        TERMINAL_STATES,
         _persist_metrics,
         _RunCancelled,
         _submit_seed_supervised,
@@ -353,10 +354,15 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
     seeds = spec.train.seeds
     for i in range(start_index, len(seeds)):
         seed = seeds[i]
-        # An early cancel (before any remote handle existed) sets `cancelled`;
-        # do not overwrite it with `running` and submit the GPU job anyway.
-        if get_status(spec.run_id).state == "cancelled":
-            raise _RunCancelled(f"run {spec.run_id} was cancelled")
+        # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped
+        # into ANY terminal state — not just `cancelled` — by a concurrent thread/process
+        # (e.g. another recovery marking it failed/done) between the resume decision and here.
+        # Bail before _update + _submit_seed_supervised so we never submit PAID GPU work for an
+        # already-terminal run. (The `running` _update below would be CAS-rejected anyway, but
+        # the supervised submit would still have spent.) _RunCancelled is the loop's terminal
+        # signal; its callers already swallow it / leave the existing terminal state intact.
+        if get_status(spec.run_id).state in TERMINAL_STATES:
+            raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting seed")
         _update(spec.run_id, "running")
         print(
             f"starting seed={seed} phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",

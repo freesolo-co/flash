@@ -123,11 +123,24 @@ def _deploy_lock(run_id: str) -> _RunLock:
         return lk
 
 
+def _append_run_log(run_id: str, message: str) -> None:
+    """Append a timestamped note to a run's log so it surfaces in `flash logs`."""
+    import time
+
+    with open(runs_file_path(run_id, ".log"), "a") as f:
+        f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
+
+
 def recover_runs() -> None:
-    """Re-attach to in-flight runs after a server restart (per-run daemon threads)."""
-    from flash.runner import _gc_run_endpoints, _update, attach_run, resume_run
+    """Recover every in-flight run after a restart so a redeploy never loses a training session:
+    re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
+    ``queued``/``provisioning`` runs that never reached a worker."""
+    from flash.runner import _gc_run_endpoints, _run_job, _update, attach_run, resume_run
 
     active: set[str] = set()
+    # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
+    # attempt is reaped without racing the resubmit's fresh allocation.
+    resubmit: list[JobSpec] = []
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
@@ -136,39 +149,63 @@ def recover_runs() -> None:
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
-            # Only remote-backed runs are "active" (kept by the orphan sweep). A run
-            # with no handle is being failed below; if it had already rented a Vast
-            # instance (crash between rent and on_handle), it must NOT shield that
-            # instance from the sweep.
+            # Only handle-backed runs are kept by the sweep; a handle-less run is being
+            # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
         elif status.resume_seed_index is not None:
-            # Multi-seed run that restarted in the inter-seed gap: the completed seed's
-            # handle was deliberately cleared and the next index recorded. There is no
-            # live job to reattach to, so resume the remaining seeds rather than failing
-            # the run and discarding the already-completed work. Keep it in `active` so
-            # the orphan sweep below doesn't reap the label its next seed will reuse.
+            # Restarted between seeds: resume the remaining seeds, preserving the finished ones.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
-            # The first attempt may have registered its uniquely-named RunPod
-            # endpoint before on_handle() persisted the handle. GC it (by
-            # reconstructed name) before failing, so it doesn't hold worker quota
-            # until manual cleanup. Best-effort; vast orphans are swept below.
+            # No handle yet: the restart hit the submit->provisioning window, so no worker exists.
+            # A spec that won't parse can never be resubmitted -> mark it terminally failed
+            # (operator-visible, dropped from _RECOVERABLE so it isn't re-skipped every restart);
+            # otherwise GC any half-made endpoint and resubmit from scratch.
+            try:
+                spec = JobSpec.from_dict(status.spec)
+            except Exception as exc:
+                _log.warning(
+                    "marking run %s failed: persisted spec could not be parsed",
+                    status.run_id,
+                    exc_info=True,
+                )
+                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                with contextlib.suppress(Exception):
+                    _update(status.run_id, "failed", error=detail)
+                with contextlib.suppress(Exception):
+                    _append_run_log(status.run_id, detail)
+                # The aborted attempt may STILL have registered its uniquely-named RunPod
+                # endpoint before crashing (the exact leak the good-spec branch's
+                # `_gc_run_endpoints` guards against). The orphan sweep below won't reap it —
+                # RunPod's `sweep_orphans` is a no-op — so do a best-effort RunPod GC HERE.
+                # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
+                # endpoint name is derived deterministically from the run id + GPU class
+                # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
+                # persisted status without parsing the spec. Terminate by that reconstructed
+                # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
+                with contextlib.suppress(Exception):
+                    gpu_type = (status.spec.get("gpu") or {}).get("type")
+                    if gpu_type:
+                        from flash.providers.runpod.train import terminate_endpoint
+
+                        terminate_endpoint(gpu_type, status.run_id)
+                continue
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(JobSpec.from_dict(status.spec))
-            _update(status.run_id, "failed", error="server restarted before job submission")
-    # Standing per-run billing (Vast instances) survives a crash until destroyed:
-    # anything labeled ours that no recoverable run owns is an orphan. Each available
-    # provider's ``sweep_orphans`` hook reaps its own (RunPod's is a no-op). Dispatched
-    # generically through the registry — ``sweep_orphans`` is part of base.Provider, so
-    # no provider is special-cased. ``active`` carries raw run ids; each provider applies
-    # its own label-prefix transform. Best-effort: never raises.
+                _gc_run_endpoints(spec)
+            resubmit.append(spec)
+    # Reap orphaned per-run instances (Vast bills until destroyed); each provider sweeps its own.
     from flash.providers import configured_providers
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):
             prov.sweep_orphans(active_labels=active)
+
+    for spec in resubmit:
+        _log.info("resubmitting run %s after control-plane restart", spec.run_id)
+        with contextlib.suppress(Exception):
+            _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
+        threading.Thread(target=lambda s=spec: _run_job(s), daemon=True).start()
 
 
 def create_app():
