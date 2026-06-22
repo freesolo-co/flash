@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     login.add_argument(
         "--freesolo-url",
         dest="freesolo_url",
-        help="freesolo backend base URL (default: FREESOLO_BASE_URL or https://api-dev.freesolo.co)",
+        help="freesolo backend base URL (default: FREESOLO_BASE_URL or https://api.freesolo.co)",
     )
     login.add_argument(
         "--api-url", help="flash control-plane URL for training calls (default: FLASH_API_URL)"
@@ -137,6 +137,11 @@ def main(argv: list[str] | None = None) -> int:
         help="override a config value; repeatable",
     )
     train.add_argument("--dry-run", action="store_true")
+    train.add_argument(
+        "--cost",
+        action="store_true",
+        help="print the pre-flight USD cost for the config and exit (no submit)",
+    )
     train.add_argument(
         "--background",
         action="store_true",
