@@ -43,7 +43,14 @@ def _cmd_reward(args: argparse.Namespace) -> int:
     if not attr:
         print("scorer must be 'module.path:callable'", file=sys.stderr)
         return 2
-    scorer = getattr(importlib.import_module(mod_name), attr)
+    try:
+        scorer = getattr(importlib.import_module(mod_name), attr)
+    except (ImportError, AttributeError) as e:
+        print(f"could not load scorer {args.scorer!r}: {e}", file=sys.stderr)
+        return 2
+    if not callable(scorer):
+        print(f"scorer {args.scorer!r} is not callable", file=sys.stderr)
+        return 2
     app = create_reward_app(scorer, reward_id=args.reward_id)
     print(f"[flash-pool] reward worker [{args.reward_id}] on {args.host}:{args.port}", flush=True)
     uvicorn.run(app, host=args.host, port=args.port)

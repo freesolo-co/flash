@@ -16,8 +16,6 @@ import urllib.request
 BASE = "https://rest.runpod.io/v1/pods"
 KEY = os.environ["RUNPOD_API_KEY"]
 IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
-with open(os.path.expanduser(os.environ.get("BENCH_SSH_PUBKEY", "~/.ssh/chalk_pod.pub"))) as _f:
-    PUBKEY = _f.read().strip()
 HF = os.environ.get("HF_TOKEN", "")
 H = {"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}
 
@@ -33,9 +31,13 @@ def call(method: str, url: str, body=None):
 
 
 def create(gpu: str, name: str, disk: str) -> None:
+    # Read the SSH pubkey lazily here (only create needs it) so status/terminate don't fail when the
+    # key file is absent.
+    with open(os.path.expanduser(os.environ.get("BENCH_SSH_PUBKEY", "~/.ssh/chalk_pod.pub"))) as _f:
+        pubkey = _f.read().strip()
     start = (
         "apt-get update -qq && apt-get install -y -qq openssh-server >/dev/null 2>&1; "
-        "mkdir -p /run/sshd /root/.ssh; echo '" + PUBKEY + "' >> /root/.ssh/authorized_keys; "
+        "mkdir -p /run/sshd /root/.ssh; echo '" + pubkey + "' >> /root/.ssh/authorized_keys; "
         "chmod 600 /root/.ssh/authorized_keys; /usr/sbin/sshd -D -p 22"
     )
     body = {
