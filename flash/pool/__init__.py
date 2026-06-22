@@ -28,7 +28,7 @@ Layout
 * :mod:`flash.pool.router`    — the FastAPI app (``create_pool_app``) — the nginx-equivalent
 * :mod:`flash.pool.rewards`   — off-GPU reward-worker registry + dispatch
 * :mod:`flash.pool.client`    — trainer-side ``RolloutPoolClient`` (generate / score / sync_weights)
-* :mod:`flash.pool.config`    — ``PoolConfig`` from env / TOML
+* :mod:`flash.pool.config`    — ``RouterConfig`` (from env) + ``PoolPlan``/``PoolMember`` (from TOML)
 * :mod:`flash.pool.provision` — rent a pool via the allocator and register it with the router
 * :mod:`flash.pool.server`    — uvicorn entrypoint (``flash-pool serve``)
 

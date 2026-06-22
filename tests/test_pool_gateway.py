@@ -26,7 +26,11 @@ from flash.pool.state import Backend
 def _gateway_for(app: FastAPI) -> BackendGateway:
     transport = httpx.ASGITransport(app=app)
     client = httpx.AsyncClient(transport=transport, base_url="http://backend")
-    return BackendGateway(client=client)
+    gw = BackendGateway(client=client)
+    # This client is created solely for the test gateway, so let gw.aclose() close it (production
+    # aclose() only closes a client it OWNS, i.e. one it created — an injected client is the caller's).
+    gw._owns_client = True
+    return gw
 
 
 def _backend() -> Backend:
