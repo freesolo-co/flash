@@ -100,11 +100,11 @@ PHASE = os.environ.get(
 
 
 def _load_active_env():
-    """Load the run's verifiers environment from the JobSpec; require an explicit env.
+    """Load the run's Freesolo environment from the JobSpec; require an explicit env.
 
-    There is no default/builtin environment (verifiers-only): a run MUST name a verifiers/
-    Prime Hub env id. Failing here (instead of falling back to some default) prevents a paid
-    worker from training/evaluating the wrong task.
+    There is no default/builtin environment: a run MUST name a GitHub-backed Freesolo
+    environment ref. Failing here prevents a paid worker from training/evaluating the
+    wrong task.
     """
     if JOB_SPEC is None:
         # No JobSpec at all (e.g. the module imported for a non-run path / a unit test). There
@@ -113,12 +113,12 @@ def _load_active_env():
         return None
     env_id = JOB_SPEC.environment.id
     if not env_id:
-        # Every supported algorithm (sft/grpo) trains/evaluates against a verifiers env, so a
+        # Every supported algorithm (sft/grpo) trains/evaluates against a Freesolo env, so a
         # missing env is always a misconfigured spec. Fail loudly rather than fall back to a
         # default and burn a paid worker on the wrong task.
         raise RuntimeError(
-            "JobSpec sets no environment: provide [environment] id (a verifiers/Prime Hub "
-            "slug, e.g. 'owner/name')."
+            "JobSpec sets no environment: provide [environment] id (a GitHub Freesolo "
+            "environment ref, e.g. 'github:owner/repo@main:freesolo/environment.py')."
         )
     return load_environment(env_id, JOB_SPEC.environment.params)
 
@@ -140,8 +140,8 @@ def require_active_env():
         raise RuntimeError(
             "no environment is loaded: this worker was started without a JobSpec "
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
-            "carry a JobSpec naming [environment] id (a verifiers/Prime Hub slug, e.g. "
-            "'owner/name')."
+            "carry a JobSpec naming [environment] id (a GitHub Freesolo environment ref, "
+            "e.g. 'github:owner/repo@main:freesolo/environment.py')."
         )
     return ACTIVE_ENV
 
@@ -685,7 +685,7 @@ def run_sft():
     # collapsed single-turn target). Warn loudly so it is not mistaken for proper multi-turn SFT.
     if getattr(ACTIVE_ENV, "multi_turn", False):
         print(
-            "[sft][warn] this is a multi-turn / tool verifiers environment, but SFT only fits "
+            "[sft][warn] this is a multi-turn Freesolo environment, but SFT only fits "
             "the single assistant target per row (tool/env turns are ignored). The model will be "
             "trained on collapsed single-turn targets; multi-turn SFT is not supported. Use a "
             "single-turn environment, or expect a single-turn-only fit."
@@ -1156,7 +1156,7 @@ def grpo_overrides() -> dict:
     Knobs: group_size, temperature, max_tokens (completion budget), kl_penalty_coef (the KL
     beta), advantage_clip (centered-advantage clip), and thinking_length_penalty_coef
     (a per-<think>-token reward deduction). These live in ``[train]`` — NOT in
-    ``[environment.params]``, which is forwarded verbatim to the verifiers env loader."""
+    ``[environment.params]``, which is forwarded verbatim to the Freesolo env loader."""
     if not JOB_SPEC:
         return {}
     train = JOB_SPEC.train
@@ -1421,7 +1421,8 @@ def run_rl():
         for comp, ex in zip(completions, examples, strict=False):
             if isinstance(comp, list):
                 # Tool / conversational transcript (TRL passes a list of messages): score the
-                # whole transcript via the rubric (no <think> stripping — multi-turn content).
+                # whole transcript via the environment reward (no <think> stripping —
+                # multi-turn content).
                 rewards.append(ACTIVE_ENV.reward_from_messages(comp, ex))
                 continue
             r = ACTIVE_ENV.reward(graded_text(comp), ex)
@@ -1968,5 +1969,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

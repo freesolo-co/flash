@@ -163,16 +163,18 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     from flash.client.specs import spec_payload
     from flash.spec import EnvironmentSpec, JobSpec
 
-    # An unrecorded env resolves to just verifiers (the worker pip-installs verifiers; the
-    # Hub env itself is installed on the worker via `prime env install` — no local path / pip
-    # wheel delivery).
-    spec = JobSpec(model="Qwen/Qwen3.5-0.8B", environment=EnvironmentSpec(id="owner/env"))
-    assert spec_payload(spec)["environment"]["pip"] == ["verifiers"]
+    # An unrecorded env resolves to the Freesolo SDK; the GitHub ref is loaded lazily by the
+    # worker at environment load time.
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-0.8B",
+        environment=EnvironmentSpec(id="github:owner/repo@main:env/freesolo/environment.py"),
+    )
+    assert spec_payload(spec)["environment"]["pip"] == ["freesolo"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        environment=EnvironmentSpec(id="owner/env", pip=("custom==1",)),
+        environment=EnvironmentSpec(id="github:owner/repo@main:env/freesolo/environment.py", pip=("custom==1",)),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
 
