@@ -190,6 +190,21 @@ def recover_runs() -> None:
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
                     _append_run_log(status.run_id, detail)
+                # The aborted attempt may STILL have registered its uniquely-named RunPod
+                # endpoint before crashing (the exact leak the good-spec branch's
+                # `_gc_run_endpoints` guards against). The orphan sweep below won't reap it —
+                # RunPod's `sweep_orphans` is a no-op — so do a best-effort RunPod GC HERE.
+                # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
+                # endpoint name is derived deterministically from the run id + GPU class
+                # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
+                # persisted status without parsing the spec. Terminate by that reconstructed
+                # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
+                with contextlib.suppress(Exception):
+                    gpu_type = (status.spec.get("gpu") or {}).get("type")
+                    if gpu_type:
+                        from flash.providers.runpod.train import terminate_endpoint
+
+                        terminate_endpoint(gpu_type, status.run_id)
                 continue
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
