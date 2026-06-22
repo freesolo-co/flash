@@ -128,7 +128,7 @@ def recover_runs() -> None:
       from the start; nothing is lost because no remote work had happened. The org was already
       charged at submit, and resubmit does not re-charge.
     """
-    from flash.runner import _gc_run_endpoints, _run_job, attach_run, resume_run
+    from flash.runner import _gc_run_endpoints, _run_job, _update, attach_run, resume_run
 
     active: set[str] = set()
     # Pre-handle runs to resubmit. Deferred until AFTER the orphan sweep: a crash between
@@ -167,16 +167,29 @@ def recover_runs() -> None:
             # Parse the persisted spec ONCE, fault-isolated: a malformed spec (e.g. a legacy
             # `environment.path`, or a bad type that makes `from_dict` raise) must only skip
             # THIS run, not abort recovery of every other in-flight run and the orphan sweep
-            # below. Log it so a stuck-recoverable run is diagnosable, skip it, and continue.
+            # below.
             try:
                 spec = JobSpec.from_dict(status.spec)
-            except Exception:
+            except Exception as exc:
+                # An unparseable persisted spec can never be resubmitted, so don't just log and
+                # leave it in a recoverable state — that hides the failure from the user (only
+                # server logs show it) and re-tries-then-skips it on EVERY restart forever.
+                # Instead persist it as terminal `failed` with an operator-visible note via the
+                # SAME status API the runner uses on any other failure. `failed` is terminal, so
+                # it drops out of `_RECOVERABLE` and is never re-attempted. Marking-failed is
+                # itself best-effort: if it raises it must not re-abort recovery of other runs or
+                # the orphan sweep, so suppress and still `continue` (skip resubmitting it).
                 _log.warning(
-                    "skipping recovery of run %s: its persisted spec could not be parsed "
+                    "marking run %s failed: its persisted spec could not be parsed "
                     "(malformed/legacy spec); recovery of other runs continues",
                     status.run_id,
                     exc_info=True,
                 )
+                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                with contextlib.suppress(Exception):
+                    _update(status.run_id, "failed", error=detail)
+                with contextlib.suppress(Exception):
+                    _append_run_log(status.run_id, detail)
                 continue
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
