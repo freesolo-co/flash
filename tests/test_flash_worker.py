@@ -380,6 +380,15 @@ def test_local_env_wheel_must_be_wheel(monkeypatch, tmp_path):
         local_env_extra_pip()
 
 
+def test_runpod_live_function_flag_disables_baked_image(monkeypatch):
+    import flash.providers.runpod.jobs as jobs
+
+    monkeypatch.delenv("FLASH_RUNPOD_LIVE_FUNCTION", raising=False)
+    assert jobs._use_baked_worker_image() is True
+    monkeypatch.setenv("FLASH_RUNPOD_LIVE_FUNCTION", "1")
+    assert jobs._use_baked_worker_image() is False
+
+
 def test_build_worker_env_drops_reserved_disagg_parallel(monkeypatch):
     """Review fix: FLASH_DISAGG_PARALLEL is topology-owned. The allocator's required_vram_gb()
     sizes the inference card from the SUBMITTER os.environ (tp divides the server footprint by

@@ -149,6 +149,23 @@ class JobHandle:
         return cls(d["endpoint_id"], d.get("endpoint_name", ""), d["job_id"])
 
 
+def _env_true(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _use_baked_worker_image() -> bool:
+    """Whether RunPod should use the prebuilt serverless worker image.
+
+    The baked image is the production fast path. ``FLASH_RUNPOD_LIVE_FUNCTION=1`` is an operator
+    validation escape hatch: deploy the current source as a live RunPod function instead, useful
+    when validating staged wheels before a fresh worker image containing the latest rp_handler.py is
+    published.
+    """
+    if _env_true("FLASH_RUNPOD_LIVE_FUNCTION"):
+        return False
+    return bool(os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE)
+
+
 def deploy_train_endpoint(
     friendly_gpu: str,
     execution_timeout_ms: int | None = None,
@@ -166,13 +183,11 @@ def deploy_train_endpoint(
     _patch_runpod_backoff()
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
-    # The baked WORKER_IMAGE is now a self-contained RunPod Serverless worker (its CMD runs
-    # rp_handler.py, which reads job["input"] and runs the training) — deploy it directly (Flash
-    # "client mode"). build_function_input then sends the payload as the job input. FLASH_WORKER_IMAGE
-    # overrides the baked image (e.g. a hotfix tag); since WORKER_IMAGE is a non-empty constant the
-    # image is always set, so the boot-install/live-function path is only reachable if both are
-    # explicitly cleared (not a normal configuration).
-    image = os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
+    # The baked WORKER_IMAGE is the production fast path: a self-contained RunPod Serverless worker
+    # whose CMD runs rp_handler.py, reads job["input"], and trains. build_function_input() then sends
+    # the raw payload. FLASH_WORKER_IMAGE overrides the image tag. FLASH_RUNPOD_LIVE_FUNCTION=1 is a
+    # source-validation path that skips the image and ships the current _train_body source instead.
+    image = (os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE) if _use_baked_worker_image() else ""
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
     # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
@@ -223,7 +238,7 @@ def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict
     worker's _ensure_fla_fastpath_on_hopper makes fla correct+fast via its tilelang backend (fla #640),
     so there is no longer a per-GPU drop here. (``friendly_gpu`` retained for signature parity.)
     """
-    if os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE:
+    if _use_baked_worker_image():
         # Baked serverless-worker image (client mode): the image's rp_handler reads job["input"]
         # and calls _train_body, so the job input IS the train payload (submit_job wraps it in
         # {"input": ...}). No live-function source, no boot-install deps.
