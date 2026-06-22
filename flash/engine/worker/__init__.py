@@ -45,12 +45,15 @@ from flash.engine.recipe import RECIPE
 # by the retained readers are imported plainly; names re-exported only for API / test access
 # (no retained reader uses them) are marked unused for the linter.
 from flash.engine.worker.lora import (
+    _LM_SYNC_REMAP_ON,
     _VL_EXCLUDE_SEGMENTS,  # noqa: F401
     _patch_peft_weight_converter_compat,
-    is_vl_checkpoint,  # noqa: F401
+    _remap_vl_sync_weights,  # noqa: F401
+    is_vl_checkpoint,
     lora_exclude_modules,
     model_quant,
     patch_vllm_language_model_only,
+    patch_vllm_lm_weight_sync,
     vllm_language_model_only_kwargs,  # noqa: F401
 )
 from flash.engine.worker.perf import (
@@ -2328,6 +2331,13 @@ def run_rl():
         # with a TRL patch / --hf-overrides shim only if one must run disaggregated on a smaller GPU.)
         if use_vllm and not disaggregated:
             patch_vllm_language_model_only(model_id)
+            # Install (but do NOT yet activate) the TRL->vLLM weight-sync name remap for Qwen3.5/3.6:
+            # the trainer pushes ``model.*`` names but the colocate VL engine's LM params live under
+            # ``language_model.*``, so the first sync_weights() would raise without this. Activated
+            # below, after the trainer + its initial checkpoint load are built. Colocate-only for the
+            # same reason as the language-model-only patch above: the disaggregated `trl vllm-serve`
+            # server is a separate process this monkeypatch can't reach (and serves the full model).
+            patch_vllm_lm_weight_sync(model_id)
         hb_cb = make_reward_heartbeat_callback()
         # Multi-turn / tool wiring (trl 1.6): tool envs hand TRL the tool callables so it runs the
         # tool-call loop natively; pure multi-turn envs hand TRL a rollout_func that drives the
@@ -2436,6 +2446,14 @@ def run_rl():
             # freesolo-chalk is installed. Capture the install report so the engaged kernels land in
             # metrics (chalk_kernels via active_kernels below).
             _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+            # The trainer (and its colocated vLLM engine + initial checkpoint load) is now built.
+            # Activate the TRL->vLLM weight-sync name remap ONLY now (see patch_vllm_lm_weight_sync)
+            # so the initial checkpoint load stayed untouched while the train-time syncs get remapped.
+            # No-op unless the VL patch above was installed (colocate, non-disaggregated path only).
+            if use_vllm and not disaggregated:
+                _LM_SYNC_REMAP_ON["on"] = True
+                if is_vl_checkpoint(model_id):
+                    print("[vllm] LM weight-sync remap activated for training syncs")
             # Mid-run eval is intentionally NOT run during training: held-out evaluation happens on
             # the deploy/serving side (against the trained adapter), keeping training pure (no
             # eval-phase cost or eval-boundary stalls). Training streams only the per-step reward

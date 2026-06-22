@@ -1558,3 +1558,105 @@ def test_build_function_input_fallback_ships_live_function(monkeypatch):
     assert out["accelerate_downloads"] is True
     # GPU-scoped deps are attached for boot-install on first use.
     assert isinstance(out["dependencies"], list)
+
+
+# ---------------------------------------------------------------------------
+# worker_image_override() + get_train_endpoint() honor the SAME disable sentinels
+# (regression for PR #4 review thread PRRT_kwDOS-63f86LI6kj: get_train_endpoint used to
+#  treat ANY non-empty FLASH_WORKER_IMAGE as a literal image, so a disable sentinel like
+#  "none" would be deployed as a bogus image ref instead of selecting boot-install.)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_image_override_unset_is_empty(monkeypatch):
+    """No override (unset/whitespace) -> "" (the caller boot-installs; NO baked default here)."""
+    from flash.providers.runpod.train import deps
+
+    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
+    assert deps.worker_image_override() == ""
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "   ")
+    assert deps.worker_image_override() == ""
+
+
+def test_worker_image_override_real_image(monkeypatch):
+    """A non-sentinel value is returned verbatim (operator-supplied serverless image)."""
+    from flash.providers.runpod.train import deps
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/x/flash-worker:rp")
+    assert deps.worker_image_override() == "ghcr.io/x/flash-worker:rp"
+
+
+@pytest.mark.parametrize("sentinel", ["none", "NONE", "0", "off", "Off", "false", "no"])
+def test_worker_image_override_sentinel_is_empty(monkeypatch, sentinel):
+    """Every disable sentinel -> "" (no custom image), matching worker_image()'s sentinel set."""
+    from flash.providers.runpod.train import deps
+
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", sentinel)
+    assert deps.worker_image_override() == ""
+
+
+def _fake_endpoint_kwargs_recorder(monkeypatch):
+    """Stub get_train_endpoint's whole RunPod surface and return a dict the fake Endpoint
+    fills with the kwargs it was constructed with (so we can assert on `image` vs `dependencies`)."""
+    import types
+
+    from flash.providers.runpod import auth as rp_auth
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod.train import endpoints as ep_mod
+
+    recorded: dict = {}
+
+    class _FakeEndpoint:
+        def __init__(self, **kwargs):
+            recorded.update(kwargs)
+
+        def __call__(self, fn):
+            return fn  # the registered handler (unused by the assertion)
+
+        def _build_resource_config(self):
+            return {}
+
+    monkeypatch.setitem(sys.modules, "runpod_flash", types.SimpleNamespace(Endpoint=_FakeEndpoint))
+    # Neutralize auth / SDK-state / network side effects.
+    monkeypatch.setattr(rp_auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(rp_jobs, "volume_endpoint_kwargs", lambda spec: {})
+    monkeypatch.setattr(rp_jobs, "apply_disk_gb", lambda cfg, disk_gb: None)
+    monkeypatch.setattr(ep_mod, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda scope=None: None)
+    monkeypatch.setattr(ep_mod, "canonical_gpu", lambda g: g)
+    monkeypatch.setattr(ep_mod, "flash_gpu", lambda g: g)
+    monkeypatch.setattr(ep_mod, "min_cuda_for", lambda g: "12.8")
+    # Unique endpoint name per call so the module-level _ENDPOINT_CACHE never short-circuits.
+    monkeypatch.setattr(ep_mod, "endpoint_name", lambda g, suffix=None: f"flash-{g}-{suffix}")
+    return ep_mod, recorded
+
+
+def test_get_train_endpoint_real_image_sets_image(monkeypatch):
+    """A real FLASH_WORKER_IMAGE flows through to the Endpoint's `image=` (baked-image deploy)."""
+    ep_mod, recorded = _fake_endpoint_kwargs_recorder(monkeypatch)
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/x/flash-worker:rp")
+    ep_mod.get_train_endpoint("5090", name_suffix="real")
+    assert recorded["image"] == "ghcr.io/x/flash-worker:rp"
+    assert "dependencies" not in recorded  # baked image -> no boot-install deps
+
+
+@pytest.mark.parametrize("sentinel", ["none", "off", "0", "false", "no"])
+def test_get_train_endpoint_sentinel_means_no_image(monkeypatch, sentinel):
+    """A disable sentinel selects boot-install (deps), NOT a literal image named "none"/"off"."""
+    ep_mod, recorded = _fake_endpoint_kwargs_recorder(monkeypatch)
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", sentinel)
+    ep_mod.get_train_endpoint("5090", name_suffix=f"sent-{sentinel}")
+    assert "image" not in recorded  # sentinel != literal image
+    assert isinstance(recorded["dependencies"], list)
+    assert recorded["dependencies"]  # boot-install deps attached
+    assert recorded["system_dependencies"]
+
+
+def test_get_train_endpoint_unset_boot_installs(monkeypatch):
+    """Unset FLASH_WORKER_IMAGE -> boot-install fallback (RunPod Flash needs its own runtime)."""
+    ep_mod, recorded = _fake_endpoint_kwargs_recorder(monkeypatch)
+    monkeypatch.delenv("FLASH_WORKER_IMAGE", raising=False)
+    ep_mod.get_train_endpoint("5090", name_suffix="unset")
+    assert "image" not in recorded
+    assert isinstance(recorded["dependencies"], list)
+    assert recorded["dependencies"]  # boot-install deps attached

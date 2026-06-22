@@ -22,6 +22,7 @@ from flash.providers.runpod.train.deps import (
     WORKER_SYSTEM_DEPS,
     logger,
     resolve_worker_deps,
+    worker_image_override,
 )
 
 # The control plane runs each training run in its own thread. All runpod_flash deploy/
@@ -345,7 +346,11 @@ def get_train_endpoint(
     # WORKER_IMAGE is Vast's cold-start image (no Flash runtime) and leaves the worker unhealthy if
     # forced. RunPod boot-installs WORKER_DEPS on Flash's default template instead (cached as a
     # Flash artifact). Optional FLASH_WORKER_IMAGE override for a RunPod-serverless-compatible image.
-    image = (os.environ.get("FLASH_WORKER_IMAGE") or "").strip()
+    # Route through worker_image_override() so the SAME disable sentinels worker_image() honors
+    # ("none"/"off"/"0"/"false"/"no") mean "no custom image -> boot-install", NOT a literal image
+    # named "none": an operator forcing the boot-install fallback globally must not deploy here with
+    # a bogus image ref. A real image string is still used verbatim.
+    image = worker_image_override()
     if image:
         kwargs["image"] = image
     else:

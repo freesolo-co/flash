@@ -110,6 +110,24 @@ WORKER_IMAGE = (
 _IMAGE_DISABLE = {"0", "false", "no", "off", "none"}
 
 
+def worker_image_override() -> str:
+    """The operator ``FLASH_WORKER_IMAGE`` override as a REAL image ref, or ``""`` for no override.
+
+    Canonical sentinel parser shared by every RunPod path that reads ``FLASH_WORKER_IMAGE`` — the
+    single source of truth for "is this a real image, or a disable sentinel / unset?". Returns:
+      * the override image when ``FLASH_WORKER_IMAGE`` is a real (non-sentinel) value;
+      * ``""`` when it is unset/whitespace OR a disable sentinel ("none"/"0"/"off"/"false"/"no").
+
+    So callers that fall back to boot-install when there is no custom image (``get_train_endpoint``)
+    can simply gate on a truthy return, and a sentinel correctly means "no custom image" rather than
+    a literal image named "none"/"off". ``worker_image()`` layers the baked-default fallback on top.
+    """
+    override = (os.environ.get("FLASH_WORKER_IMAGE") or "").strip()
+    if not override or override.lower() in _IMAGE_DISABLE:
+        return ""
+    return override
+
+
 def worker_image() -> str:
     """The effective baked RunPod-serverless worker image, or ``""`` to boot-install instead.
 
@@ -126,6 +144,8 @@ def worker_image() -> str:
     Returning ``""`` is what makes the boot-install fallback actually reachable: ``WORKER_IMAGE`` is
     a non-empty constant, so the previous ``... or WORKER_IMAGE`` gate could never select it.
     """
+    # Shares the sentinel parse with worker_image_override() so the two stay in lockstep; the only
+    # difference is the no-override fallback (baked default here vs "" / boot-install there).
     override = (os.environ.get("FLASH_WORKER_IMAGE") or "").strip()
     if override:
         return "" if override.lower() in _IMAGE_DISABLE else override
