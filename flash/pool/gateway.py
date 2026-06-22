@@ -59,7 +59,8 @@ class BackendGateway:
             protocol.LOAD_LORA_PATH,
             protocol.load_lora_body(lora_name, lora_path),
             self.control_timeout,
-            tolerate_already=True,
+            # idempotent re-load only; a 400 "not found" (bad LoRA path/URI) is a REAL load failure.
+            tolerate_400=("already",),
             expect_json=False,
         )
 
@@ -69,7 +70,7 @@ class BackendGateway:
             protocol.UNLOAD_LORA_PATH,
             protocol.unload_lora_body(lora_name),
             self.control_timeout,
-            tolerate_already=True,
+            tolerate_400=("not found",),  # idempotent double-unload of an already-absent adapter
             expect_json=False,
         )
 
@@ -91,7 +92,7 @@ class BackendGateway:
         body: dict,
         timeout: float,
         *,
-        tolerate_already: bool = False,
+        tolerate_400: tuple[str, ...] = (),
         expect_json: bool = True,
     ) -> dict:
         return await self._post_url(
@@ -99,7 +100,7 @@ class BackendGateway:
             protocol.join(be.url, path),
             body,
             timeout,
-            tolerate_already=tolerate_already,
+            tolerate_400=tolerate_400,
             expect_json=expect_json,
         )
 
@@ -110,7 +111,7 @@ class BackendGateway:
         body: dict,
         timeout: float,
         *,
-        tolerate_already: bool = False,
+        tolerate_400: tuple[str, ...] = (),
         expect_json: bool = True,
     ) -> dict:
         try:
@@ -118,20 +119,15 @@ class BackendGateway:
         except httpx.HTTPError as e:  # transport-level (connect/read/timeout)
             raise GatewayError(f"{label} {url}: {type(e).__name__}: {e}") from e
         if r.status_code >= 400:
-            # vLLM returns 400 "has already been loaded" / "not found" (the adapter, in its body) on
-            # an idempotent re-load / double-unload; tolerate THOSE so reloads and double-unloads are
-            # no-ops. The tolerance is gated on EXACTLY 400 (vLLM's dynamic-LoRA contract for these
-            # cases): a bare 404 means the route itself is missing (wrong backend URL / a vLLM
-            # without the dynamic-LoRA API), and auth/server errors (401/403/5xx) are real failures —
-            # all must surface. Matching the "already"/"not found" substring on ANY non-404 would
-            # swallow e.g. a 401 or a 500 whose body happens to contain those words, letting the
-            # router believe an adapter is loaded and then fail every generation.
+            # Op-specific 400 tolerance (tolerate_400): load tolerates "already (been) loaded" (an
+            # idempotent re-load); unload tolerates "not found" (an idempotent double-unload). Gated on
+            # EXACTLY 400 (vLLM's dynamic-LoRA contract): a bare 404 means the route itself is missing
+            # (wrong backend URL / a vLLM without the dynamic-LoRA API), and auth/server errors
+            # (401/403/5xx) are real failures — all surface. Crucially load does NOT tolerate
+            # "not found": a bad LoRA path/URI is a REAL load failure that a blanket substring match
+            # would have wrongly swallowed (router thinks an adapter loaded, then every gen fails).
             text = _safe_text(r)
-            if (
-                tolerate_already
-                and r.status_code == 400
-                and ("already" in text.lower() or "not found" in text.lower())
-            ):
+            if r.status_code == 400 and any(s in text.lower() for s in tolerate_400):
                 return {"ok": True, "note": text[:200]}
             raise GatewayError(f"{label} {url}: HTTP {r.status_code}: {text[:300]}", status=r.status_code)
         try:

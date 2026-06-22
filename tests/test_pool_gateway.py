@@ -54,6 +54,26 @@ def test_load_lora_tolerates_already_loaded_400():
     asyncio.run(scenario())  # no GatewayError -> the idempotent 400 is tolerated
 
 
+def test_load_lora_400_not_found_does_not_swallow():
+    # load tolerates "already loaded" but NOT "not found": a 400 "not found" on LOAD means a bad LoRA
+    # path/URI (a real failure) — swallowing it would let the router believe the adapter loaded.
+    app = FastAPI()
+
+    @app.post("/v1/load_lora_adapter")
+    async def load(body: dict) -> dict:
+        raise HTTPException(status_code=400, detail=f"lora path {body['lora_name']} not found")
+
+    async def scenario():
+        gw = _gateway_for(app)
+        try:
+            with pytest.raises(GatewayError):
+                await gw.load_lora(_backend(), "run", "/bad/path")
+        finally:
+            await gw.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_unload_lora_tolerates_not_found_400():
     app = FastAPI()
 

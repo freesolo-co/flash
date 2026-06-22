@@ -30,8 +30,15 @@ def _maybe_seed_backends(app) -> None:
     router = app.state.router
     for spec in raw.split(","):
         spec = spec.strip()
-        if not spec or "=" not in spec or "@" not in spec:
-            continue
+        if not spec:
+            continue  # tolerate a trailing/empty comma segment
+        if "=" not in spec or "@" not in spec:
+            # Fail loudly: a typo'd entry would otherwise silently start the pool WITHOUT the
+            # intended backend, which is far harder to diagnose than an explicit config error.
+            raise ValueError(
+                f"FLASH_POOL_BACKENDS entry {spec!r} is malformed; expected 'id=url@base_model' "
+                "(comma-separated)"
+            )
         bid, rest = spec.split("=", 1)
         url, base = rest.rsplit("@", 1)
         router.state.add_backend(Backend(id=bid.strip(), url=url.strip(), base_model=base.strip()))

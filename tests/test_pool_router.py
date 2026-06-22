@@ -315,3 +315,14 @@ def test_load_failure_fails_over_instead_of_looping_reloads():
     assert chats == ["gpu1"], gw.events
     gpu0_loads = sum(1 for bid, op, _ in gw.events if op == "load" and bid == "gpu0")
     assert gpu0_loads == 1, f"gpu0 load should be attempted once then failed over, not looped: {gw.events}"
+
+
+def test_maybe_seed_backends_rejects_malformed_entry(monkeypatch):
+    # A typo'd FLASH_POOL_BACKENDS entry must fail loudly — silently dropping it would start the pool
+    # WITHOUT the intended backend, which is much harder to diagnose than an explicit config error.
+    from flash.pool.server import _maybe_seed_backends, build_app
+
+    app = build_app()
+    monkeypatch.setenv("FLASH_POOL_BACKENDS", "broken-entry-no-delimiters")
+    with pytest.raises(ValueError, match="FLASH_POOL_BACKENDS"):
+        _maybe_seed_backends(app)
