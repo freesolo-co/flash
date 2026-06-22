@@ -657,7 +657,10 @@ def make_lora(model_id: str | None = None):
         kwargs["init_lora_weights"] = True
         print("[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)")
     # rsLoRA scaling (convergence lever, default-on: measured -47% train loss in A/B (gpu-bench)).
-    # FLASH_USE_RSLORA=0 disables it for A/B quality testing (e.g. the linkd-search re-check).
+    # NOTE: dev #82 found rsLoRA (alpha/sqrt(r), ~5.6x larger than alpha/r for r=32/alpha=64) can
+    # diverge SFT to a degenerate adapter at the usual LoRA LR (2e-4). Keep it env-gated and default-on
+    # per maintainer decision; FLASH_USE_RSLORA=0 disables it for A/B quality testing (e.g. when the
+    # catalog LR needs to stay sane / the linkd-search re-check / a serve-safety re-check).
     kwargs["use_rslora"] = os.environ.get("FLASH_USE_RSLORA", "1").strip().lower() not in ("0", "false", "no")
     print(f"[lora] use_rslora={kwargs['use_rslora']}")
     if model_id and targets == "all-linear":

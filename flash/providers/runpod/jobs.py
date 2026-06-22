@@ -75,9 +75,11 @@ _SETUP_HEARTBEAT_STAGES = frozenset(
 def stall_kwargs() -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
     run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
-    window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat.
+    window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat;
+    ``queue_grace_s`` = how long a job may sit IN_QUEUE (no worker assigned) before we treat the
+    pinned GPU class as out of capacity and walk to the next-best one.
     """
-    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0}
+    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 900.0}
 
 
 def volume_endpoint_kwargs(spec) -> dict:
@@ -288,6 +290,7 @@ def poll_job(
     setup_grace_s: float = 3000.0,
     unhealthy_grace_s: float = 240.0,
     throttled_grace_s: float = 300.0,
+    queue_grace_s: float = 900.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
@@ -302,6 +305,13 @@ def poll_job(
     ``throttled_grace_s`` bounds how long we wait on a worker stuck THROTTLED (no RunPod
     capacity for the pinned GPU class) before returning a retryable stall so the runner
     walks to the next-best GPU.
+
+    ``queue_grace_s`` is the capacity backstop for that same walk when RunPod *doesn't* surface
+    a THROTTLED/UNHEALTHY worker: a job can sit IN_QUEUE with zero workers assigned (or one stuck
+    INITIALIZING, or while ``endpoint_health`` errors are swallowed below) and the throttled/
+    unhealthy fast-fails never arm — so without this it would burn the full ``setup_grace_s``
+    (~50 min). Keyed off the authoritative job status (robust to a failing health probe), it
+    returns a retryable stall once a job has been IN_QUEUE longer than ``queue_grace_s``.
     """
 
     say = make_say(log)
@@ -315,6 +325,7 @@ def poll_job(
     last_health_probe = 0.0
     unhealthy_since: float | None = None  # first time the worker was seen stuck UNHEALTHY
     throttled_since: float | None = None  # first time the worker was seen stuck THROTTLED
+    queued_since: float | None = None  # first time the job was seen IN_QUEUE with no worker yet
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
@@ -365,10 +376,30 @@ def poll_job(
                 detail=f"[{status}] {detail}",
                 exclude_class=exclude_class,
             )
+        # Capacity backstop: bound how long the job may sit IN_QUEUE (no worker has accepted it).
+        # The throttled/unhealthy fast-fails below only arm when endpoint_health succeeds AND RunPod
+        # reports a THROTTLED/UNHEALTHY worker; a queue with zero workers, one stuck INITIALIZING, or
+        # a health probe that keeps erroring (its block is wrapped in `except: pass`) bypasses them and
+        # would otherwise wait the full setup_grace_s (~50 min). Keyed off the authoritative job status
+        # so it holds even when the health probe is blind: once IN_QUEUE exceeds queue_grace_s, return a
+        # retryable stall so the runner's gpu-walk re-provisions on the next-best (in-capacity) class.
+        now = time.time()
+        if status == "IN_QUEUE":
+            if queued_since is None:
+                queued_since = now
+            elif now - queued_since > queue_grace_s:
+                return PollResult(
+                    False,
+                    failure="stalled",
+                    detail=f"job stuck IN_QUEUE for {int(now - queued_since)}s (no RunPod capacity "
+                    f"for the pinned GPU class); retrying on the next-best GPU",
+                )
+        else:
+            queued_since = None
         # While queued, surface worker availability (throttled hosts are the common
         # cause of silent multi-minute waits — make them visible in the run log).
-        if status == "IN_QUEUE" and time.time() - last_health_probe > 90:
-            last_health_probe = time.time()
+        if status == "IN_QUEUE" and now - last_health_probe > 90:
+            last_health_probe = now
             try:
                 h = runpod_api.endpoint_health(handle.endpoint_id)
                 workers = h.get("workers") or {}
