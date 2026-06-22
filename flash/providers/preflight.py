@@ -23,13 +23,12 @@ __all__ = [
 
 def _missing_hf_credentials() -> list[str]:
     """Shared run infra every substrate needs: the HF write token, plus PRIME_API_KEY (the
-    worker ``prime env install``s the run's Hub env regardless of the GPU provider). The HF
+    worker installs the run's published environment regardless of the GPU provider). The HF
     dataset repo is per-run (``[train] hf_repo``), not an operator var."""
     problems: list[str] = []
     if not os.environ.get("PRIME_API_KEY"):
         problems.append(
-            "  - PRIME_API_KEY: a Prime Intellect API key; the GPU worker uses it to "
-            "`prime env install` the run's Hub environment (public + private), e.g. "
+            "  - PRIME_API_KEY: environment install credentials for the GPU worker, e.g. "
             "`export PRIME_API_KEY=pit_...`"
         )
     if not os.environ.get("HF_TOKEN"):

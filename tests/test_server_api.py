@@ -77,9 +77,12 @@ def test_me(api):
     key = _login()
     me = api.get("/v1/me", headers=_bearer(key))
     assert me.status_code == 200
-    # A verified freesolo user key resolves to a per-token "freesolo" identity.
-    assert me.json()["email"] == "freesolo-user"
-    assert me.json()["key_prefix"] == "freesolo"
+    # A verified freesolo user key resolves to a per-token identity without inventing an email.
+    payload = me.json()
+    assert payload["kind"] == "freesolo_api_key"
+    assert payload["key_prefix"].startswith("fslo_")
+    assert payload["key_prefix"] != key[:12]
+    assert "email" not in payload
 
 
 def test_requests_without_key_are_rejected(api):
@@ -136,12 +139,78 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
 
     row = auth_mod.authenticate("Bearer fslo-user-good")
     assert row is not None
-    assert row["email"] == "freesolo-user"
+    assert row["email"] is None
+    assert row["auth_kind"] == "freesolo_api_key"
+    assert row["key_prefix"].startswith("fslo_")
+    assert row["key_prefix"] != "fslo-user-go"
     # An unverified token returns None (401).
     assert auth_mod.authenticate("Bearer fslo-user-bad") is None
     # The same key resolves to the same identity across requests (stable per-token row).
     again = auth_mod.authenticate("Bearer fslo-user-good")
     assert again["id"] == row["id"]
+
+
+def test_freesolo_user_identity_from_verify_response(api, monkeypatch):
+    import flash.server.auth as auth_mod
+
+    auth_mod._verify_cache.clear()
+    auth_mod._identity_cache["fslo_abc123_secret"] = (
+        {
+            "user_id": "user-123",
+            "org_id": "org-456",
+            "api_key_id": "key-789",
+            "key_prefix": "fslo_abc123",
+        },
+        time.time() + auth_mod._VERIFY_CACHE_TTL_S,
+    )
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token == "fslo_abc123_secret")
+
+    row = auth_mod.authenticate("Bearer fslo_abc123_secret")
+    assert row is not None
+    assert row["user_id"] == "user-123"
+    assert row["org_id"] == "org-456"
+    assert row["api_key_id"] == "key-789"
+    assert row["key_prefix"] == "fslo_abc123"
+
+
+def test_freesolo_verify_identity_parser_is_tolerant():
+    import flash.server.auth as auth_mod
+
+    importlib.reload(auth_mod)
+
+    assert auth_mod._identity_from_verify_body(b"") == {}
+    assert auth_mod._identity_from_verify_body(b"not json") == {}
+    assert auth_mod._identity_from_verify_body(json.dumps(["not", "an", "object"]).encode()) == {}
+
+    identity = auth_mod._identity_from_verify_body(
+        json.dumps(
+            {
+                "email": " ",
+                "id": "top-level-not-api-key-id",
+                "user": {"id": "user-nested", "email": "user@example.com"},
+                "org": {"id": "org-nested"},
+                "api_key": {"id": "key-nested", "key_prefix": "fslo_nested"},
+                "training_agent_job_id": "job-123",
+                "project_id": "project-456",
+                "ignored": 123,
+            }
+        ).encode()
+    )
+
+    assert identity == {
+        "email": "user@example.com",
+        "user_id": "user-nested",
+        "org_id": "org-nested",
+        "api_key_id": "key-nested",
+        "key_prefix": "fslo_nested",
+        "training_agent_job_id": "job-123",
+        "project_id": "project-456",
+    }
+
+    without_api_key_id = auth_mod._identity_from_verify_body(
+        json.dumps({"id": "top-level-id", "user": {"id": "user-nested"}}).encode()
+    )
+    assert without_api_key_id == {"user_id": "user-nested"}
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
@@ -375,17 +444,21 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
 
 
 def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
-    # The verify cache keys by the raw bearer token, so a stream of distinct tokens could
-    # grow it without bound. Each write prunes expired entries and caps the cache size.
+    # The verify/identity caches key by the raw bearer token, so a stream of distinct tokens
+    # could grow them without bound. Each write prunes expired entries and caps both caches.
     import time
 
     import flash.server.auth as auth_mod
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
+    auth_mod._identity_cache.clear()
 
     class _Resp:
         status = 200
+
+        def __init__(self, token: str) -> None:
+            self._token = token
 
         def __enter__(self):
             return self
@@ -393,22 +466,37 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+        def read(self) -> bytes:
+            return json.dumps({"user_id": self._token}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        token = req.get_header("Authorization").removeprefix("Bearer ")
+        return _Resp(token)
+
+    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
 
     # An already-expired entry must be removed on the next write (no longer reachable).
     auth_mod._verify_cache["stale"] = (True, time.time() - 1)
+    auth_mod._identity_cache["stale"] = ({"user_id": "old"}, time.time() - 1)
     auth_mod._freesolo_verify("fresh-token")
     assert "stale" not in auth_mod._verify_cache
+    assert "stale" not in auth_mod._identity_cache
     assert "fresh-token" in auth_mod._verify_cache
+    assert auth_mod._identity_cache["fresh-token"][0] == {"user_id": "fresh-token"}
 
-    # Verifying many distinct (live) tokens never grows the cache past the cap.
+    # Verifying many distinct (live) tokens never grows either cache past the cap.
     monkeypatch.setattr(auth_mod, "_VERIFY_CACHE_MAX", 8)
     auth_mod._verify_cache.clear()
+    auth_mod._identity_cache.clear()
     for i in range(50):
         auth_mod._freesolo_verify(f"tok-{i}")
         assert len(auth_mod._verify_cache) <= auth_mod._VERIFY_CACHE_MAX
+        assert len(auth_mod._identity_cache) <= auth_mod._VERIFY_CACHE_MAX
     assert len(auth_mod._verify_cache) <= auth_mod._VERIFY_CACHE_MAX
+    assert len(auth_mod._identity_cache) <= auth_mod._VERIFY_CACHE_MAX
+    assert set(auth_mod._identity_cache).issubset(auth_mod._verify_cache)
     auth_mod._verify_cache.clear()
+    auth_mod._identity_cache.clear()
 
 
 def test_keys_are_hashed_at_rest(api):
@@ -493,7 +581,7 @@ def test_logs_offset_paging(api):
 
 
 def test_local_env_path_rejected(api):
-    # Prime Hub-only: a local [environment] path is rejected on the managed service.
+    # Managed service only accepts published environment ids, not local paths.
     key = _login()
     bad = {**SPEC, "environment": {"id": "custom", "path": "/home/user/env.py"}}
     r = api.post("/v1/runs", json={"spec": bad, "dry_run": True}, headers=_bearer(key))
@@ -827,15 +915,15 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
-    """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
-    plane's PRIME_API_KEY), namespaced per identity — so the user needs no Prime account."""
+    """POST /v1/envs publishes an uploaded package under FreeSolo's managed account,
+    namespaced per identity."""
     import base64
     import io
     import tarfile
 
     import flash.server.envs as envs_mod
 
-    # Stub the actual `prime env push` so the test doesn't hit Prime; echo the namespaced name.
+    # Stub the actual environment publish so the test doesn't hit the external publisher.
     monkeypatch.setattr(
         envs_mod, "_prime_push", lambda env_dir, *, name, is_new: f"freesolo-co/{name}"
     )

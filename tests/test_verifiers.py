@@ -1,4 +1,4 @@
-"""Tests for the verifiers/Hub adapter + install manifest (no network/GPU)."""
+"""Tests for the verifiers adapter + install manifest (no network/GPU)."""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ def test_install_manifest_and_worker_deps():
 
         importlib.reload(registry)
         # The worker only pip-installs `verifiers`; the env itself is installed via the
-        # authenticated `prime env install` (see worker_hub_env_ids), not pip.
+        # authenticated private installer (see worker_hub_env_ids), not pip.
         assert registry.worker_pip_for_env("owner/env") == ["verifiers"]
         assert registry.worker_hub_env_ids("owner/env") == ["owner/env"]
 
@@ -73,7 +73,7 @@ def test_install_manifest_and_worker_deps():
 
 
 # ---------------------------------------------------------------------------
-# Regression tests for the Prime Intellect Hub interop defects fixed in this PR.
+# Regression tests for published-env interop defects fixed in this PR.
 # ---------------------------------------------------------------------------
 def test_vf_load_id_strips_owner_slug():
     """DEFECT: the adapter passed the full ``owner/name`` slug to verifiers, which only
@@ -267,7 +267,7 @@ def test_group_reward_func_is_rejected_at_construction():
 
 
 def test_reward_parses_json_string_info():
-    """A Hub row may store `info` as a JSON string; reward funcs that index it must
+    """A published env row may store `info` as a JSON string; reward funcs that index it must
     receive a dict, not raise TypeError (swallowed as 0.0)."""
     from flash.envs.adapter import VerifiersEnvironment
 
@@ -292,7 +292,7 @@ def test_reward_parses_json_string_info():
 
 
 def test_dataset_getter_requiring_args_is_called_correctly():
-    """A Hub env exposing get_dataset(n, seed) without defaults must be called with
+    """A published env exposing get_dataset(n, seed) without defaults must be called with
     those args, not no-arg (which raised TypeError -> swallowed -> empty train set)."""
     from flash.envs.adapter import VerifiersEnvironment
 
@@ -343,11 +343,11 @@ def test_dataset_returns_train_split_only_no_split_arg():
 
 
 def test_worker_installs_env_via_prime():
-    """The Flash worker pip-installs only verifiers; the Hub env installs via `prime`."""
+    """The Flash worker pip-installs only verifiers; the published env installs separately."""
     import flash.envs.registry as registry
 
     assert registry.worker_pip_for_env("primeintellect/hendrycks-math") == ["verifiers"]
-    # The env id is handed to the worker to `prime env install` (authenticated, public+private).
+    # The env id is handed to the worker for authenticated install.
     assert registry.worker_hub_env_ids("primeintellect/hendrycks-math") == [
         "primeintellect/hendrycks-math"
     ]

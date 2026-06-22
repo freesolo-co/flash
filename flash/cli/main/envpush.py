@@ -1,8 +1,4 @@
-"""Environment publish/install machinery for the `flash env` subcommands.
-
-`flash env install` records a published Prime Hub env locally; `flash env push` packages a
-local verifiers env and publishes it (always PRIVATE) to the Prime Environments Hub.
-"""
+"""Environment publish/install machinery for the `flash env` subcommands."""
 
 from __future__ import annotations
 
@@ -10,15 +6,23 @@ import ast
 import sys
 from pathlib import Path
 
-# Prime Intellect Environments Hub pip index. Each org's wheels live under ITS OWN namespace
+# Published environment wheel index. Each org's wheels live under ITS OWN namespace
 # (e.g. freesolo-co/flash-bench -> .../freesolo-co/simple/), so derive the index from the
-# slug owner — a hardcoded `primeintellect` index 404s on any non-primeintellect env.
+# slug owner; a single hardcoded owner index 404s for other orgs.
 PRIME_HUB_INDEX_TMPL = "https://hub.primeintellect.ai/{owner}/simple/"
+_INSTALL_ERROR_LIMIT = 4000
 
 
 def _prime_hub_index(env_id: str) -> str:
     owner = env_id.split("/", 1)[0] if "/" in env_id else "primeintellect"
     return PRIME_HUB_INDEX_TMPL.format(owner=owner)
+
+
+def _trim_install_output(stdout: str | None, stderr: str | None) -> str:
+    detail = "\n".join(part.strip() for part in (stderr, stdout) if part and part.strip())
+    if len(detail) > _INSTALL_ERROR_LIMIT:
+        return f"...\n{detail[-_INSTALL_ERROR_LIMIT:]}"
+    return detail
 
 
 def cmd_env_install(args) -> int:
@@ -28,35 +32,28 @@ def cmd_env_install(args) -> int:
     from flash.envs.registry import _bare_wheel_name, record_installed_env
 
     env_id = args.env_id
-    # Managed envs are Prime Hub slugs: exactly one `/` with non-empty owner and name. A bare
-    # id (`gsm8k`) or a malformed slug can't be resolved on the Hub, so reject it up front
-    # rather than letting `prime`/pip fail with an opaque error.
+    # Managed envs are published environment ids: exactly one `/` with non-empty owner and name.
+    # A bare id (`gsm8k`) or a malformed id can't be resolved, so reject it up front
+    # rather than letting the installer fail with an opaque error.
     parts = env_id.split("/")
     if len(parts) != 2 or not parts[0] or not parts[1]:
         print(
-            f'env id must be a Prime Hub slug "owner/name" (got {env_id!r})',
+            f'env id must be "owner/name" (got {env_id!r})',
             file=sys.stderr,
         )
         return 1
     # `flash env install` is a LOCAL-client convenience: it installs the env into the client's
     # interpreter and records it in ~/.flash/envs.json for local authoring/dry-run. The
-    # managed worker does NOT reinstall from this record — it installs Hub envs itself via an
-    # authenticated `prime env install` on the GPU box. A Hub slug `owner/name` maps to the pip
-    # wheel `name` on the Prime Intellect Hub index; we record that index alongside the env.
+    # managed worker does NOT reinstall from this record; it installs published envs itself on the
+    # GPU box. A published id `owner/name` maps to the pip wheel `name`; we record the index
+    # alongside the env.
     extras = {"extra_index_url": _prime_hub_index(env_id)}
     if shutil.which("prime"):
-        # The `prime` CLI resolves the Hub + index itself (and is the only path that can fetch a
-        # PRIVATE Hub env — flash publishes envs PRIVATE).
+        # The private installer resolves the environment + index itself, and is the only path that
+        # can fetch private env wheels.
         cmd = ["prime", "env", "install", env_id]
     else:
-        # The pip fallback hits the PUBLIC Hub index only; it cannot fetch PRIVATE Hub envs
-        # (the public index never serves private wheels). Be explicit instead of letting a
-        # private install fail confusingly, but still attempt pip for the public case.
-        print(
-            f"note: `prime` CLI not found; attempting a pip install of {env_id} from the "
-            "PUBLIC Hub index. PRIVATE Hub envs require the `prime` CLI — install it "
-            "(https://docs.primeintellect.ai) to install a private env."
-        )
+        print(f"installing {env_id} locally")
         installer = (
             # `uv pip install` outside an active venv errors with "No virtual environment
             # found"; --python targets the CLI's own interpreter so a global/pipx `flash`
@@ -66,10 +63,13 @@ def cmd_env_install(args) -> int:
             else [sys.executable, "-m", "pip", "install"]
         )
         cmd = [*installer, _bare_wheel_name(env_id), "--extra-index-url", extras["extra_index_url"]]
-    print("running:", " ".join(cmd))
-    rc = subprocess.run(cmd).returncode
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    rc = proc.returncode
     if rc != 0:
-        print("install failed")
+        print("install failed", file=sys.stderr)
+        detail = _trim_install_output(getattr(proc, "stdout", None), getattr(proc, "stderr", None))
+        if detail:
+            print(detail, file=sys.stderr)
         return rc
     record_installed_env(env_id, package=_bare_wheel_name(env_id), extras=extras)
     print(f"installed {env_id}; recorded in ~/.flash/envs.json")
@@ -77,7 +77,7 @@ def cmd_env_install(args) -> int:
     return 0
 
 
-# A verifiers env packaged for the Prime Hub is a pyproject + an importable module exposing
+# A packaged verifiers env is a pyproject + an importable module exposing
 # load_environment(). When `flash env push` is pointed at a bare module (a single `.py`, as the
 # freesolo training agent emits, or a dir without a pyproject), we wrap it in this layout so the
 # push Just Works instead of erroring on "pyproject.toml not found".
@@ -110,9 +110,9 @@ def _push_env_name(raw: str) -> str:
 def _config_env_name(config_path) -> str | None:
     """The `name` part of a sibling flash.toml's `[environment] id = "owner/name"`, or None.
 
-    Used so a bare `environment.py` re-publishes under its EXISTING Hub env (minting a new
+    Used so a bare `environment.py` re-publishes under its EXISTING env (minting a new
     version) instead of deriving a fresh name from the file stem. Owner still comes from the
-    authenticated Prime account/team, so only the name part is consumed here."""
+    authenticated managed account/team, so only the name part is consumed here."""
     import tomllib
 
     path = Path(config_path)
@@ -131,7 +131,7 @@ def _config_env_name(config_path) -> str | None:
 
 
 def _config_env_name_from_dir(config_dir) -> str | None:
-    """The Hub env name declared by the sibling per-phase flash configs
+    """The published env name declared by the sibling per-phase flash configs
     (``flash_grpo.toml``/``flash_sft.toml``). Without this, pushing ``environment.py`` finds
     no id and mints a brand-new env, so the run trains against the stale id in the configs.
     """
@@ -146,7 +146,7 @@ def _config_env_name_from_dir(config_dir) -> str | None:
 def _with_syspath_bootstrap(env_source: str) -> str:
     """Prepend a sys.path bootstrap so a published env (run as the package __init__) can resolve
     BARE absolute imports of its shipped sibling helpers (`import config` / `from utils import x`)
-    even without its own sys.path.insert — otherwise `prime env install`/load_environment fails
+    even without its own sys.path.insert — otherwise install/load_environment fails
     with ModuleNotFoundError. Inserted AFTER the module docstring and any `from __future__` imports
     (which must stay first). Mirrors the platform hub publisher."""
     bootstrap = (
@@ -176,7 +176,7 @@ def _with_syspath_bootstrap(env_source: str) -> str:
 
 
 # Tool/cache dirs that aren't part of the environment SOURCE. We never ship them: `.prime/` in
-# particular carries Prime CLI metadata (.env-metadata.json) from a prior local push — shipping it
+# particular carries installer metadata (.env-metadata.json) from a prior local push — shipping it
 # bloats the upload and could let stale client metadata confuse server-side slug discovery (the
 # server also strips it defensively, but don't send it in the first place).
 _TAR_EXCLUDE_DIRS = frozenset({".prime", ".git", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"})
@@ -185,7 +185,7 @@ _TAR_EXCLUDE_DIRS = frozenset({".prime", ".git", "__pycache__", ".venv", ".mypy_
 def _tar_b64(directory: Path) -> str:
     """Pack a directory's contents into a base64 ``.tar.gz`` (members rooted at the top level)
     for upload, skipping tool/cache dirs (``.prime/``, ``.git/``, ``__pycache__``, ...). Packaging
-    is pure file I/O — no `prime` CLI or Prime account needed locally.
+    is pure file I/O; no external env CLI or account is needed locally.
 
     We walk with ``os.walk`` and PRUNE excluded directories in place (``dirs[:] = ...``) so we never
     descend into them: a plain ``rglob('*')`` would still recurse into (and stat every entry under)
@@ -221,7 +221,7 @@ def _tar_b64(directory: Path) -> str:
 
 
 def _pyproject_name(env_dir: Path) -> str | None:
-    """The ``[project] name`` of a ready-made env dir, used to name the managed Hub env."""
+    """The ``[project] name`` of a ready-made env dir, used to name the managed env."""
     import tomllib
 
     try:
@@ -233,8 +233,7 @@ def _pyproject_name(env_dir: Path) -> str | None:
 
 
 def _upload_and_report(name: str, *, is_new: bool, package_b64: str) -> int:
-    """Upload a packaged env to the managed Environments Hub (the control plane publishes it
-    under FreeSolo's Prime account) and print the returned id."""
+    """Upload a packaged env to the managed service and print the returned id."""
     from flash.client import ClientError, client_from_config
 
     try:
@@ -261,19 +260,19 @@ def cmd_env_push(args) -> int:
         return 1
 
     # A ready-made env directory (has a pyproject.toml) is uploaded as-is; its name comes from
-    # the pyproject. Publishing happens server-side under FreeSolo's managed Prime account, so no
-    # local `prime` CLI or Prime Intellect account is required.
+    # the pyproject. Publishing happens server-side under FreeSolo's managed account, so no
+    # separate environment account is required.
     if src.is_dir() and (src / "pyproject.toml").is_file():
         env_name = _pyproject_name(src) or _push_env_name(src.name)
         return _upload_and_report(env_name, is_new=True, package_b64=_tar_b64(src))
 
-    # Wrap a bare verifiers module (a single .py, or a one-module dir) into a Prime-compatible
+    # Wrap a bare verifiers module (a single .py, or a one-module dir) into a compatible
     # env package and upload that. `data_dir` is a committed `datasets/` sibling of the module
     # (if any); we ship it inside the package so an env that reads a `__file__`-relative data
     # file still resolves once installed.
     if src.is_file() and src.suffix == ".py":
         module_source = src.read_text()
-        # Re-publish to the SAME Hub env when a sibling flash config names one: use its
+        # Re-publish to the SAME env when a sibling flash config names one: use its
         # `[environment] id` name part so an edited environment.py mints a new version of the
         # existing env instead of creating a fresh env from the file stem.
         sibling_name = _config_env_name_from_dir(src.parent)
@@ -284,7 +283,7 @@ def cmd_env_push(args) -> int:
         sibling_modules = [
             p for p in sorted(src.parent.glob("*.py")) if p != src and not p.name.startswith("__")
         ]
-        # A sibling config id means we're re-publishing an EXISTING Hub env: auto-bump from the
+        # A sibling config id means we're re-publishing an EXISTING env: auto-bump from the
         # first attempt so it doesn't restart at 0.1.0 and climb through version conflicts.
         is_new = sibling_name is None
     elif src.is_dir():
@@ -307,7 +306,7 @@ def cmd_env_push(args) -> int:
         return 1
 
     # The module dir name must be a valid Python identifier. `env_name` may be a sibling config's
-    # Hub slug name (`_config_env_name`), which is NOT sanitized and can contain `.`/other chars
+    # published id name (`_config_env_name`), which is NOT sanitized and can contain `.`/other chars
     # invalid in a package dir (and would mismatch `[tool.hatch...] packages = ["<module>"]`,
     # breaking the build). Normalize through `_push_env_name` (collapses non-[a-z0-9] runs to `-`)
     # before mapping `-`->`_`, so the module is always [a-z0-9_].
