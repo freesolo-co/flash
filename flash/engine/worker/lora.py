@@ -179,15 +179,35 @@ def patch_vllm_lm_weight_sync(model_id: str) -> bool:
     try:
         import importlib
 
-        for mod_name, cls_name in (
-            ("vllm.model_executor.models.qwen3_5", "Qwen3_5ForConditionalGeneration"),
-            ("vllm.model_executor.models.qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        # The dense class is REQUIRED for the whole Qwen3.5/3.6 family — if its module/class can't
+        # be imported (vLLM not installed where it should be, or the class renamed in a new vLLM)
+        # we must NOT silently no-op: the run would crash again at the first ``sync_weights()`` with
+        # a far less actionable error. Log loudly for the required one; the MoE class is OPTIONAL
+        # (only some models are MoE, and older vLLM lacks the module) so its absence stays quiet.
+        for mod_name, cls_name, required in (
+            ("vllm.model_executor.models.qwen3_5", "Qwen3_5ForConditionalGeneration", True),
+            ("vllm.model_executor.models.qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration", False),
         ):
             try:
-                cls = getattr(importlib.import_module(mod_name), cls_name, None)
-            except Exception:
-                cls = None
-            if cls is None or getattr(cls.load_weights, "_flash_sync_patched", False):
+                mod = importlib.import_module(mod_name)
+            except Exception as e:
+                mod = None
+                if required:
+                    print(
+                        f"[vllm] WARN patch_vllm_lm_weight_sync: could not import required module "
+                        f"{mod_name} ({e!r}); GRPO weight-sync will NOT be remapped and the run may "
+                        f"crash at the first sync_weights() for this VL checkpoint."
+                    )
+            cls = getattr(mod, cls_name, None) if mod is not None else None
+            if cls is None:
+                if required and mod is not None:
+                    print(
+                        f"[vllm] WARN patch_vllm_lm_weight_sync: module {mod_name} imported but has "
+                        f"no {cls_name} (vLLM API changed?); GRPO weight-sync will NOT be remapped "
+                        f"and the run may crash at the first sync_weights() for this VL checkpoint."
+                    )
+                continue
+            if getattr(cls.load_weights, "_flash_sync_patched", False):
                 continue
             orig_load = cls.load_weights
 
