@@ -19,6 +19,12 @@ class _FakeProc:
     returncode = 0
 
 
+class _FailedProc:
+    returncode = 7
+    stdout = "stdout detail"
+    stderr = "pip could not find the package"
+
+
 def test_env_install_prime_hub_slug(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         import flash.envs.registry as registry
@@ -51,6 +57,24 @@ def test_env_install_prime_hub_slug(monkeypatch):
         entry = manifest["primeintellect/hendrycks-math"]
         assert entry["package"] == "hendrycks-math"
         assert "hub.primeintellect.ai" in entry["extra_index_url"]
+
+
+def test_env_install_failure_surfaces_installer_output(monkeypatch, capsys):
+    import flash.envs.registry as registry
+    from flash.cli import main as cli
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(registry, "INSTALLED_MANIFEST", Path(tmp) / "envs.json")
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _FailedProc())
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+        rc = cli.cmd_env_install(argparse.Namespace(env_id="owner/missing-env"))
+
+    assert rc == 7
+    err = capsys.readouterr().err
+    assert "install failed" in err
+    assert "pip could not find the package" in err
+    assert "stdout detail" in err
 
 
 def test_env_install_rejects_bare_id(monkeypatch, capsys):

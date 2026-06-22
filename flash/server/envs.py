@@ -87,10 +87,9 @@ class EnvPublishError(Exception):
 def namespace_for(key: dict) -> str:
     """Stable prefix isolating one identity's envs under the shared FreeSolo managed account.
 
-    It MUST be per-key distinct: the server DB stores the SAME placeholder email for every external
-    key ("freesolo-user") and the internal key ("freesolo-internal") — see ``db.ensure_external_key``
-    / ``ensure_internal_key`` — so namespacing on ``email`` would collapse every external user into
-    one namespace and let them collide on env names. So we only trust ``email`` when it's a real,
+    It MUST be per-key distinct. Older rows may still carry placeholder emails such as
+    "freesolo-user"/"freesolo-internal", and newer external rows may have ``email = NULL`` until the
+    Freesolo verify endpoint returns a real address. So we only trust ``email`` when it's a real,
     user-specific address (contains ``@``); otherwise we fall back to the per-key primary-key ``id``
     (each external token gets its own ``api_keys`` row), then a non-placeholder ``key_prefix``. The
     chosen identifier is stable across re-publishes, so a user's re-push bumps the SAME env."""
@@ -315,7 +314,10 @@ def _prime_push(env_dir: Path, *, name: str, is_new: bool) -> str:
             status=503,
         )
     if not shutil.which("prime"):
-        raise EnvPublishError("the managed environment publisher is not installed", status=503)
+        raise EnvPublishError(
+            "the managed environment publisher (`prime` CLI) is not installed",
+            status=503,
+        )
     # The env dir is unpacked from a CLIENT-uploaded tarball, so a preexisting ``.prime/`` (and its
     # ``.env-metadata.json``) is UNTRUSTED — a client could ship one naming another owner/name to
     # spoof the published slug. Remove it so the ONLY metadata we read back is what THIS push writes

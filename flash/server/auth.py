@@ -119,7 +119,6 @@ def _identity_from_verify_body(raw: bytes) -> dict[str, Any]:
             _str_field(body.get("api_key_id"))
             or _str_field(body.get("key_id"))
             or _str_field(api_key.get("id"))
-            or _str_field(body.get("id"))
         ),
         "key_prefix": _str_field(body.get("key_prefix")) or _str_field(api_key.get("key_prefix")),
         "training_agent_job_id": _str_field(body.get("training_agent_job_id")),
