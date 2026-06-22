@@ -685,10 +685,16 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
     def _pip(*args: str) -> bool:
         """Run pip install; return True only if pip exited 0. A failed install (network/build/
-        resolver) must NOT be silently treated as success — the caller gates ``ok`` on this."""
+        resolver) must NOT be silently treated as success — the caller gates ``ok`` on this.
+        ``--break-system-packages``: the torch base image's python is PEP-668 externally-managed,
+        so a bare ``pip install`` ABORTS there (measured on a fresh worker whose env lacked the
+        PIP_BREAK_SYSTEM_PACKAGES the Dockerfile/bootstrap normally set) -> tilelang never lands and
+        the Hopper fast path silently degrades to the slow delta. The flag forces it through and is a
+        harmless no-op on an unmanaged python, so the safety-net install can't be defeated by env."""
         try:
             rc = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-q", *args], check=False
+                [sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", *args],
+                check=False,
             ).returncode
         except Exception:
             return False

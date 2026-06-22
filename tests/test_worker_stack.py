@@ -537,8 +537,10 @@ def _patch_hopper_stack(
     # CompletedProcess so _pip can read .returncode (the install-success gate).
     def _fake_run(cmd, *a, **k):
         if record_pip is not None:
-            # cmd == [sys.executable, "-m", "pip", "install", "-q", *specs]
-            record_pip.append(" ".join(str(c) for c in cmd[5:]))
+            # cmd == [sys.executable, "-m", "pip", "install", *flags, *specs]; record just the
+            # specs (everything after "install" that isn't a -flag, so adding pip flags like
+            # -q / --break-system-packages / --no-deps doesn't shift what the asserts match).
+            record_pip.append(" ".join(str(c) for c in cmd[4:] if not str(c).startswith("-")))
         return _FakeCompleted(pip_rc)
 
     monkeypatch.setattr(subprocess, "run", _fake_run, raising=True)
