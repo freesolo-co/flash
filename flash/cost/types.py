@@ -124,7 +124,7 @@ class CostEstimate:
     gpu_vram_gb: int
     required_vram_gb: int
     gpu_hourly_usd: float
-    setup_seconds: float  # cold start: boot + deps + download (+ vLLM init for GRPO)
+    setup_seconds: float  # cold start: boot + deps + model load (+ vLLM init for GRPO)
     seconds_per_step: float
     train_seconds: float  # steps * seconds_per_step (post wall-clock cap)
     wall_clock_seconds: float
@@ -143,7 +143,7 @@ class CostEstimate:
             f"GPU        : {self.gpu} on {self.provider} "
             f"({self.gpu_vram_gb} GB; run needs >= {self.required_vram_gb} GB) "
             f"@ ${self.gpu_hourly_usd:.2f}/hr",
-            f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + download"
+            f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + model load"
             + (" + vLLM init" if self.method == "grpo" else "")
             + ")",
             f"Per step   : {self.seconds_per_step:.2f} s",
