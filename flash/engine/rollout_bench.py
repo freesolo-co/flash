@@ -110,8 +110,11 @@ def validate_disaggregated_requirement(
     algo = (algorithm or "").lower()
     if requires_disaggregated and algo == "grpo" and inference_gpus <= 0:
         raise ValueError(
-            "this model requires the disaggregated GRPO path: set [train].inference_gpus>0 on a "
-            "multi-GPU node ([gpu] count = train_gpus + inference_gpus). Colocated GRPO OOMs for it."
+            "this model requires the disaggregated GRPO path: set [train].inference_gpus >= 1 so the "
+            "vLLM rollout gets its own GPU(s). The node size is derived as one trainer card + "
+            "[train].inference_gpus, so inference_gpus >= 1 provisions a multi-GPU node "
+            "automatically. Colocated GRPO (inference_gpus = 0, trainer + rollout on one GPU) OOMs "
+            "for it."
         )
     if (
         single_trainer_only
@@ -122,11 +125,13 @@ def validate_disaggregated_requirement(
     ):
         train_gpus = gpu_count - inference_gpus
         raise ValueError(
-            f"this model only supports a SINGLE-trainer disaggregated split (1:N), but [gpu] count "
-            f"({gpu_count}) - [train].inference_gpus ({inference_gpus}) = {train_gpus} trainer GPUs. "
-            f"The disaggregated trainer replicates the whole policy on every trainer card (plain DDP), "
-            f"which OOMs for a model this large. Set [gpu] count = inference_gpus + 1 (e.g. a 1:1 or "
-            f"1:2 split) — one trainer card, the rest for the rollout server."
+            f"this model only supports a SINGLE-trainer disaggregated split (1:N), but the node "
+            f"size ({gpu_count}) - [train].inference_gpus ({inference_gpus}) = {train_gpus} trainer "
+            f"GPUs. The disaggregated trainer replicates the whole policy on every trainer card "
+            f"(plain DDP), which OOMs for a model this large. The node size is derived as one "
+            f"trainer card + [train].inference_gpus, so this only happens if you over-provision "
+            f"trainer GPUs — keep it to one trainer card (a 1:N split, e.g. 1:1 or 1:2): the node "
+            f"gets inference_gpus + 1 GPUs, one trainer card and the rest for the rollout server."
         )
 
 

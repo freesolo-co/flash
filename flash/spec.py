@@ -176,7 +176,7 @@ class TrainSpec:
     stop_sequences: tuple[str, ...] = ()
     # Disaggregated (async) GRPO rollout: number of GPUs in the node dedicated to the vLLM rollout
     # server, the rest train (see engine.rollout_bench.select_rollout_split). 0 = colocate (the
-    # current single-GPU TRL path). >0 requires a multi-GPU node ([gpu] count = train + inference).
+    # current single-GPU TRL path). >0 gets a multi-GPU node (size derived = one trainer + inference).
     inference_gpus: int = 0
 
 
@@ -323,7 +323,7 @@ def gpus_per_node(spec: Any) -> int:
     colocated run (``inference_gpus == 0``, the single-process TRL path) needs 1 GPU; a
     disaggregated async-GRPO run (``inference_gpus == N > 0``) needs ``N + 1`` — N cards for the
     vLLM rollout server and one trainer card (see engine.rollout_bench.select_rollout_split, whose
-    ``train_gpus = total_gpus - inference_gpus``, and the "Set [gpu] count = inference_gpus + 1"
+    ``train_gpus = total_gpus - inference_gpus``, and the "keep it to one trainer card"
     guidance in validate_disaggregated_requirement). Used to set the RunPod endpoint's ``gpu_count``
     and the worker's ``FLASH_GPU_COUNT`` so multi-GPU jobs actually request multiple GPUs instead of
     silently falling back to 1. Tolerant of a missing/partial spec (defaults to 1).
