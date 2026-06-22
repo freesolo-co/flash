@@ -412,7 +412,8 @@ def test_assert_usable_gpu_full_card_ok(monkeypatch):
 
 def test_assert_usable_gpu_mig_name_raises_retriable(monkeypatch):
     """A MIG slice (name contains 'MIG') raises the RETRIABLE infra error with the marker
-    so the control plane resubmits on a fresh worker (the NVML-assert crash we hit live)."""
+    so the control plane resubmits on a fresh worker (the NVML-assert crash we hit live).
+    A MIG slice is a CLASS-level fault -> exclude_class=True (blacklist the class, retry off it)."""
     from flash.engine.worker import perf
 
     monkeypatch.setitem(
@@ -423,18 +424,48 @@ def test_assert_usable_gpu_mig_name_raises_retriable(monkeypatch):
     with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER) as exc:
         perf.assert_usable_gpu()
     assert "MIG" in str(exc.value)
+    # CLASS-level fault: blacklist the whole GPU class and retry on a different one.
+    assert exc.value.exclude_class is True
 
 
 def test_assert_usable_gpu_no_cuda_raises_retriable(monkeypatch):
-    """No CUDA device at boot -> retriable infra (resubmit on a fresh host), not a job_failed."""
+    """No CUDA device at boot -> retriable infra (resubmit on a fresh host), not a job_failed.
+    CUDA-unavailable is a HOST/NODE fault (driver/image), NOT the GPU class being bad, so it must
+    NOT exclude_class -> retry (likely a fresh node of the SAME class), don't blacklist the class."""
     from flash.engine.worker import perf
 
     monkeypatch.setitem(sys.modules, "torch", _fake_torch_named("", available=False))
     # Shrink the startup-grace poll so the test doesn't actually sleep through the retries.
     monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_RETRIES", 1)
     monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_DELAY_S", 0)
-    with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER):
+    with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER) as exc:
         perf.assert_usable_gpu()
+    # HOST/NODE fault: retry on a fresh host but DON'T blacklist the (healthy) GPU class.
+    assert exc.value.exclude_class is False
+
+
+def test_assert_usable_gpu_device_name_query_failure_no_exclude_class(monkeypatch):
+    """Failing to query the device name is a per-node CUDA/driver issue, NOT a class-level MIG
+    slice: it must raise retriable infra WITHOUT exclude_class so the runner retries on a fresh
+    host instead of avoiding an otherwise-healthy GPU class after one transient/bad node."""
+    from flash.engine.worker import perf
+
+    t = types.ModuleType("torch")
+
+    def _boom_name(*_a):
+        raise RuntimeError("device name query failed")
+
+    t.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_name=_boom_name,
+    )
+    monkeypatch.setitem(sys.modules, "torch", t)
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_RETRIES", 1)
+    monkeypatch.setattr(perf, "_GPU_GUARD_AVAIL_DELAY_S", 0)
+    with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER) as exc:
+        perf.assert_usable_gpu()
+    # HOST/NODE fault: retriable, but do NOT blacklist the GPU class.
+    assert exc.value.exclude_class is False
 
 
 def test_assert_usable_gpu_cuda_ready_after_grace(monkeypatch):
@@ -490,8 +521,10 @@ def test_assert_usable_gpu_nvml_probe_failure_raises_retriable(monkeypatch):
 
     fake_nvml.nvmlDeviceGetMemoryInfo = _boom
     monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
-    with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER):
+    with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER) as exc:
         perf.assert_usable_gpu()
+    # CLASS-level fault (sliced/MIG-restricted GPU): blacklist the class and retry off it.
+    assert exc.value.exclude_class is True
 
 
 def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):
