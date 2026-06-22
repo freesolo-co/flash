@@ -25,6 +25,7 @@ from flash.client import (
     verify_freesolo_key,
 )
 from flash.client.config import load_credentials
+from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES, new_run_id
@@ -299,7 +300,10 @@ def cmd_train(args) -> int:
         )
         return 0
     client = client_from_config()
-    status = client.create_run(spec_payload(spec))
+    status = client.create_run(
+        spec_payload(spec),
+        runtime_secrets=runtime_secrets_from_local_env(args.config),
+    )
     run_id = status["run_id"]
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s seeds=%s",
