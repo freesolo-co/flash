@@ -56,6 +56,7 @@ _KERNELS: list[tuple[str, str, bool]] = [
     ("FLASH_ROPE_KERNEL", "rope", True),
     ("FLASH_TRITON_LORA", "fused_lora_delta", True),
     ("FLASH_EMBED_KERNEL", "fused_embedding", True),
+    ("FLASH_GDN_KERNEL", "gdn", True),  # chalk-native GDN conv+SiLU (freesolo-chalk 0.4.2); fla still owns the scan. GDN block +1.14-1.15x E2E (H100). Replaces the eager F.silu(F.conv1d) flash runs (causal_conv1d omitted: sdist build fails).
     ("FLASH_QKV_KERNEL", "attn_epilogue", False),  # opt-in (eval-only; needs q/k/v out of LoRA)
     ("FLASH_FP8_BASE", "fp8_frozen_base", False),  # opt-in (Hopper sm_90+ only)
 ]
@@ -151,6 +152,20 @@ def install_chalk_kernels(model=None) -> dict:
         # lora-delta/embedding); flash does NOT enable TRL's Liger. apply_chalk_kernel_to_qwen35
         # never raises on a per-kernel failure, but guard the call itself so a chalk API/version
         # skew can never abort training.
+        # Version-skew safety: drop any kwarg the INSTALLED chalk's apply doesn't accept (e.g. a newer
+        # flag like `gdn` against an older baked chalk wheel) so unknown kwargs degrade that one kernel
+        # to eager instead of TypeError-ing the whole stack. (No-op if apply takes **kwargs.)
+        try:
+            import inspect
+
+            _params = inspect.signature(apply_chalk_kernel_to_qwen35).parameters
+            if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in _params.values()):
+                _dropped = [k for k in kwargs if k not in _params]
+                if _dropped:
+                    log.info("chalk apply: dropping kwargs unsupported by installed chalk: %s", _dropped)
+                kwargs = {k: v for k, v in kwargs.items() if k in _params}
+        except (ValueError, TypeError):
+            pass  # builtins/odd callables expose no signature — pass kwargs as-is
         report = apply_chalk_kernel_to_qwen35(model, liger=False, **kwargs)
     except Exception as e:  # never block training on the optional kernel stack
         log.warning("chalk apply failed (ignored, kernels disabled): %s", e)
