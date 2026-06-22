@@ -360,7 +360,8 @@ def test_chat_raises_serving_error_on_deadline(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_CHAT_TIMEOUT_S", "5")  # tiny budget
     monkeypatch.setattr(d.time, "sleep", lambda *_a: None)
-    # A monotonic clock that jumps past the deadline after the first poll.
+    # A monotonic clock already past the deadline at the first guard check, so chat() raises on the
+    # deadline before issuing any poll GET (the test just needs it to NEVER hang).
     ticks = iter([0.0, 100.0, 200.0, 300.0])
     monkeypatch.setattr(d.time, "monotonic", lambda: next(ticks))
 
@@ -375,6 +376,23 @@ def test_chat_raises_serving_error_on_deadline(monkeypatch):
     with pytest.raises(d.ServingError) as exc:
         d.chat(run_id="flash-7-abcd", messages=[{"role": "user", "content": "hi"}])
     assert "timed out" in str(exc.value)
+
+
+def test_chat_refuses_cross_origin_async_redirect(monkeypatch):
+    """A modal-looking async-result redirect to a DIFFERENT origin must be refused, not followed —
+    the poll GET carries the internal key, so chasing it cross-origin would leak the internal key."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setattr(d.time, "sleep", lambda *_a: None)
+    # 303 to an ABSOLUTE off-origin URL that still carries the modal marker.
+    evil = "https://evil.example/v1/chat/completions?__modal_function_call_id=fc-XYZ"
+    seen = _install_fake_chat_client(monkeypatch, post_resp=_ChatResp(303, location=evil))
+
+    with pytest.raises(d.ServingError, match="cross-origin"):
+        d.chat(run_id="flash-7-abcd", messages=[{"role": "user", "content": "hi"}])
+    # Refused BEFORE issuing the cross-origin poll GET — the internal key was never sent off-origin.
+    assert seen["polls"] == []
 
 
 def test_chat_translates_transport_error_to_serving_error(monkeypatch):

@@ -318,8 +318,10 @@ def chat(
         # completions diverge from training behavior even though the caller passes thinking=.
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},
     }
-    deadline = time.monotonic() + _chat_deadline_s()
+    _deadline_s = _chat_deadline_s()
+    deadline = time.monotonic() + _deadline_s
     url = f"{base}/v1/chat/completions"
+    _base_url = httpx.URL(url)  # origin reference for the same-origin guard on the poll redirect
     # follow_redirects=False: we never let httpx chase Modal's async-result redirect chain (it has
     # no global deadline and the poll URL long-polls). We handle the one redirect ourselves below.
     with httpx.Client(follow_redirects=False, timeout=CHAT_HTTP_TIMEOUT_S) as client:
@@ -329,10 +331,19 @@ def chat(
             while _is_modal_async_redirect(resp):
                 if time.monotonic() >= deadline:
                     raise ServingError(
-                        f"chat for {run_id} timed out after {_chat_deadline_s():.0f}s waiting on the "
+                        f"chat for {run_id} timed out after {_deadline_s:.0f}s waiting on the "
                         "serving backend (cold start did not finish); retry once the engine is warm"
                     )
                 poll_url = str(resp.url.join(resp.headers["location"]))
+                # The poll GET carries the internal key — NEVER send it off-origin. Modal's
+                # async-result redirect is same-origin; refuse a redirect to a different scheme/host/
+                # port (an absolute cross-origin Location would otherwise leak FREESOLO_INTERNAL_KEY).
+                _pu = httpx.URL(poll_url)
+                if (_pu.scheme, _pu.host, _pu.port) != (_base_url.scheme, _base_url.host, _base_url.port):
+                    raise ServingError(
+                        f"chat for {run_id} refused a cross-origin async-result redirect to "
+                        f"{_pu.host!r} (expected {_base_url.host!r}); not sending the internal key off-origin"
+                    )
                 time.sleep(_CHAT_POLL_INTERVAL_S)
                 # Modal's async-result poll is a GET; it returns 200 when ready, or redirects again.
                 resp = client.get(poll_url, headers=_internal_key_header())
