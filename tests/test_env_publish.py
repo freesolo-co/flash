@@ -47,7 +47,7 @@ def test_namespace_distinct_for_placeholder_emails():
 
 def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setenv("FLASH_ENV_GITHUB_REPO", "freesolo-co/flash-environments")
+    monkeypatch.setenv("FLASH_ENV_GITHUB_REPO", "freesolo-co/environment-hub")
     monkeypatch.setenv("FLASH_ENV_GITHUB_BRANCH", "dev")
     uploaded: list[tuple[str, bytes]] = []
 
@@ -64,7 +64,7 @@ def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
 
     root = "environments/dev-clado-ai/my-env"
     assert ref == (
-        "github:freesolo-co/flash-environments@dev:"
+        "github:freesolo-co/environment-hub@dev:"
         f"{root}/freesolo/environment.py"
     )
     assert (f"{root}/freesolo/environment.py", _MINIMAL["freesolo/environment.py"].encode()) in uploaded
@@ -139,3 +139,43 @@ def test_safe_extract_rejects_special_members(tmp_path):
         with pytest.raises(envs.EnvPublishError, match="special file"):
             envs._safe_extract(buf.getvalue(), tmp_path)
         assert not (tmp_path / f"evil-{label}").exists()
+
+
+def test_safe_extract_rejects_workflow_control_paths(tmp_path):
+    for label in (".github", ".git"):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            d = tarfile.TarInfo(f"{label}/workflows")
+            d.type = tarfile.DIRTYPE
+            tar.addfile(d)
+        with pytest.raises(envs.EnvPublishError, match="top-level paths"):
+            envs._safe_extract(buf.getvalue(), tmp_path)
+
+
+def test_put_github_file_rejects_oversized_blob():
+    with pytest.raises(envs.EnvPublishError, match="exceeds GitHub Contents API limit"):
+        envs._put_github_file(
+            repo="owner/repo",
+            branch="main",
+            path="environments/sample.txt",
+            data=b"x" * (envs._MAX_GITHUB_FILE_BYTES + 1),
+            token="test",
+            message="upload",
+        )
+
+
+def test_existing_file_sha_returns_none_for_404(monkeypatch):
+    def fake_github_json(method: str, url: str, *, token: str, body: dict | None = None):
+        raise envs._GitHubApiError("missing", status=404)
+
+    monkeypatch.setattr(envs, "_github_json", fake_github_json)
+    assert envs._existing_file_sha("owner/repo", "main", "f.txt", "token") is None
+
+
+def test_existing_file_sha_propagates_non_404(monkeypatch):
+    def fake_github_json(method: str, url: str, *, token: str, body: dict | None = None):
+        raise envs._GitHubApiError("forbidden", status=403)
+
+    monkeypatch.setattr(envs, "_github_json", fake_github_json)
+    with pytest.raises(envs.EnvPublishError, match="forbidden"):
+        envs._existing_file_sha("owner/repo", "main", "f.txt", "token")

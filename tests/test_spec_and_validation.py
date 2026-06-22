@@ -104,7 +104,15 @@ def test_environment_path_is_rejected() -> None:
 def test_bare_environment_id_is_rejected() -> None:
     # A bare id like "gsm8k" passes the presence check but is not a GitHub Freesolo ref;
     # reject it up front.
-    for bad in ("gsm8k", "owner/", "/name", "a/b/c"):
+    for bad in (
+        "gsm8k",
+        "owner/",
+        "/name",
+        "a/b/c",
+        "github:owner/repo@main:../x.py",
+        "github:owner/repo@main:/etc/passwd",
+        "https://github.com/owner/repo/blob/main/../x.py",
+    ):
         raw = _raw()
         raw["environment"] = {"id": bad}
         with pytest.raises(ConfigError, match=r"GitHub Freesolo environment ref"):

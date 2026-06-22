@@ -22,7 +22,8 @@ from pathlib import Path
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_MEMBERS = 5000
-_DEFAULT_GITHUB_REPO = "freesolo-co/flash-environments"
+_MAX_GITHUB_FILE_BYTES = 1024 * 1024
+_DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _DEFAULT_GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "freesolo/environment.py"
 
@@ -35,6 +36,11 @@ class EnvPublishError(Exception):
     def __init__(self, message: str, *, status: int = 400):
         super().__init__(message)
         self.status = status
+
+
+class _GitHubApiError(EnvPublishError):
+    def __init__(self, message: str, status: int):
+        super().__init__(message, status=status)
 
 
 def namespace_for(key: dict) -> str:
@@ -67,6 +73,14 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                 target = (dest / member.name).resolve()
                 if target != root and root not in target.parents:
                     raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
+                member_path = member.name.replace("\\", "/")
+                segments = [segment for segment in member_path.split("/") if segment]
+                if not segments:
+                    continue
+                if segments[0] in {".github", ".git"}:
+                    raise EnvPublishError(
+                        "env packages must not contain .github or .git top-level paths"
+                    )
                 if member.islnk() or member.issym():
                     raise EnvPublishError(f"links are not allowed in env packages: {member.name!r}")
                 if not (member.isreg() or member.isdir()):
@@ -124,9 +138,9 @@ def _github_json(
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
-        raise EnvPublishError(
+        raise _GitHubApiError(
             f"GitHub environment upload failed ({exc.code}): {detail[:500]}",
-            status=502 if exc.code >= 500 else 400,
+            status=exc.code,
         ) from exc
     except urllib.error.URLError as exc:
         raise EnvPublishError(
@@ -140,8 +154,8 @@ def _existing_file_sha(repo: str, branch: str, path: str, token: str) -> str | N
     url = f"https://api.github.com/repos/{repo}/contents/{quoted}?ref={urllib.parse.quote(branch)}"
     try:
         data = _github_json("GET", url, token=token)
-    except EnvPublishError as exc:
-        if "failed (404)" in str(exc):
+    except _GitHubApiError as exc:
+        if exc.status == 404:
             return None
         raise
     sha = data.get("sha")
@@ -158,6 +172,12 @@ def _put_github_file(
     message: str,
 ) -> None:
     quoted = urllib.parse.quote(path, safe="/")
+    if len(data) > _MAX_GITHUB_FILE_BYTES:
+        raise EnvPublishError(
+            f"environment upload file {path!r} exceeds GitHub Contents API limit "
+            f"({_MAX_GITHUB_FILE_BYTES} bytes)",
+            status=413,
+        )
     url = f"https://api.github.com/repos/{repo}/contents/{quoted}"
     body = {
         "message": message,
