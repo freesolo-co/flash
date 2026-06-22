@@ -208,6 +208,9 @@ def _submit_seed_supervised(
                 # and OOMs the card it picks.
                 train=spec.train,
                 thinking=spec.thinking,
+                # Optional per-run provider pin ([gpu] provider): restrict allocation to one
+                # substrate (vast / runpod) for A/B-ing; None keeps cross-provider cheapest-wins.
+                provider=spec.gpu.provider,
             )
         except Exception as exc:
             from flash.providers.base import UnsupportedGpuError

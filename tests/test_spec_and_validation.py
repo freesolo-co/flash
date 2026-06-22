@@ -214,6 +214,29 @@ def test_job_spec_json_round_trip() -> None:
     assert restored.phase == "rl"  # grpo's internal phase id
 
 
+def test_gpu_provider_pin_parses_and_round_trips() -> None:
+    # The opt-in [gpu] provider pin is a real user knob: it parses, normalizes (case/whitespace),
+    # and round-trips through the worker JSON. Unset -> None (cross-provider cheapest-wins default).
+    assert spec_from_dict(_raw()).gpu.provider is None
+    for raw_val, want in (("vast", "vast"), ("runpod", "runpod"), (" VAST ", "vast")):
+        spec = spec_from_dict(_raw(**{"gpu.provider": raw_val}), run_id="pin-1")
+        assert spec.gpu.provider == want
+        # survives the spec.to_json() -> worker re-parse round trip (asdict carries the field)
+        assert JobSpec.from_json(spec.to_json()).gpu.provider == want
+
+
+@pytest.mark.parametrize("bad", ["aws", "lambda", "", "RUNPOD;rm", 1])
+def test_gpu_provider_pin_rejects_unknown_value(bad) -> None:
+    # A typo / non-{runpod,vast} value must fail at parse time, not as an opaque submit-time error.
+    # Empty string normalizes to None (unset), so it is NOT rejected — assert that separately.
+    if bad == "":
+        assert spec_from_dict(_raw(**{"gpu.provider": ""})).gpu.provider is None
+        return
+    match = "must be a string" if isinstance(bad, int) else "provider must be one of"
+    with pytest.raises(ConfigError, match=match):
+        spec_from_dict(_raw(**{"gpu.provider": bad}))
+
+
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
     spec = spec_from_dict(_raw(), run_id="env-1")
 
