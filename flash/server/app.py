@@ -106,11 +106,36 @@ def _deploy_lock(run_id: str) -> _RunLock:
         return lk
 
 
+def _append_run_log(run_id: str, message: str) -> None:
+    """Append a timestamped operator note to a run's log so it surfaces in `flash logs`."""
+    import time
+
+    with open(runs_file_path(run_id, ".log"), "a") as f:
+        f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
+
+
 def recover_runs() -> None:
-    """Re-attach to in-flight runs after a server restart (per-run daemon threads)."""
-    from flash.runner import _gc_run_endpoints, _update, attach_run, resume_run
+    """Recover every in-flight run after a control-plane restart so a redeploy never loses
+    a training session (per-run daemon threads). Each recoverable run takes one of three paths:
+
+    - ``running`` with a live remote handle -> reattach and keep polling that exact GPU job
+      (it kept running on the provider while the control plane was down).
+    - multi-seed run restarted in the inter-seed gap (``resume_seed_index`` set) -> resume the
+      remaining seeds; the finished seeds' work is preserved.
+    - ``queued``/``provisioning`` with no handle yet -> the crash landed before any worker was
+      provisioned, so there is no remote job to reattach to. RESUBMIT it from scratch instead of
+      failing it (the old behavior). A fresh ``_run_job`` allocates a GPU and runs the seed loop
+      from the start; nothing is lost because no remote work had happened. The org was already
+      charged at submit, and resubmit does not re-charge.
+    """
+    from flash.runner import _gc_run_endpoints, _run_job, attach_run, resume_run
 
     active: set[str] = set()
+    # Pre-handle runs to resubmit. Deferred until AFTER the orphan sweep: a crash between
+    # renting a Vast instance and persisting the handle can leave that instance orphaned, and
+    # these runs are deliberately kept OUT of `active` so the sweep reaps it — launching the
+    # resubmit only after the sweep keeps it from racing (and reaping) the fresh allocation.
+    resubmit: list[JobSpec] = []
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
@@ -119,10 +144,9 @@ def recover_runs() -> None:
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
-            # Only remote-backed runs are "active" (kept by the orphan sweep). A run
-            # with no handle is being failed below; if it had already rented a Vast
-            # instance (crash between rent and on_handle), it must NOT shield that
-            # instance from the sweep.
+            # Only remote-backed runs are "active" (kept by the orphan sweep). A run with no
+            # handle is being resubmitted (fresh allocation); if it had already rented a Vast
+            # instance (crash between rent and on_handle), that stale one must NOT be shielded.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
         elif status.resume_seed_index is not None:
@@ -134,13 +158,14 @@ def recover_runs() -> None:
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
-            # The first attempt may have registered its uniquely-named RunPod
-            # endpoint before on_handle() persisted the handle. GC it (by
-            # reconstructed name) before failing, so it doesn't hold worker quota
-            # until manual cleanup. Best-effort; vast orphans are swept below.
+            # No handle and no completed seed: the restart hit the window between submit and the
+            # first on_handle (allocation / provisioning), so no worker exists. The aborted
+            # attempt may have registered its uniquely-named RunPod endpoint before crashing;
+            # GC it (by reconstructed name) so it doesn't hold worker quota, then resubmit the
+            # run from scratch (below, after the sweep) instead of throwing the session away.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(JobSpec.from_dict(status.spec))
-            _update(status.run_id, "failed", error="server restarted before job submission")
+            resubmit.append(JobSpec.from_dict(status.spec))
     # Standing per-run billing (Vast instances) survives a crash until destroyed:
     # anything labeled ours that no recoverable run owns is an orphan. Each available
     # provider's ``sweep_orphans`` hook reaps its own (RunPod's is a no-op). Dispatched
@@ -152,6 +177,20 @@ def recover_runs() -> None:
     for prov in configured_providers():
         with contextlib.suppress(Exception):
             prov.sweep_orphans(active_labels=active)
+
+    # Resubmit the pre-handle runs only now — after the sweep has reaped any instance their
+    # aborted attempt orphaned — so the fresh allocation can't be swept out from under them.
+    for spec in resubmit:
+        _log.info(
+            "resubmitting run %s after control-plane restart "
+            "(it had not provisioned a worker yet, so nothing was lost)",
+            spec.run_id,
+        )
+        with contextlib.suppress(Exception):
+            _append_run_log(
+                spec.run_id, "control plane restarted before a worker was provisioned; resubmitting"
+            )
+        threading.Thread(target=lambda s=spec: _run_job(s), daemon=True).start()
 
 
 def create_app():
