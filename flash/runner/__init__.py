@@ -126,13 +126,39 @@ def _with_model_disk(spec: JobSpec, info: ModelInfo) -> dict:
     return d
 
 
+# The HF namespace the control plane creates per-run artifact repos under: the operator org whose
+# HF_TOKEN the control plane runs with. An operator-infra constant, not a user/env knob.
+_ARTIFACT_NAMESPACE = "Freesolo-Co"
+
+
+def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
+    """Assign the run's HF artifact repo server-side — it is platform-managed, never user-set.
+
+    Each run gets its own private dataset repo ``Freesolo-Co/flashrun-<run_id>``. The control-plane
+    HF_TOKEN creates and writes it (code, adapters, checkpoints, telemetry); a user-chosen namespace
+    would 403 that token at ``upload_code``. Any inbound ``train.hf_repo`` is overwritten. The
+    run_id must be finalized first: a per-run repo keyed on the placeholder ``"local"`` would
+    collide across runs and overwrite each other's code/adapters/state.
+    """
+    if not spec.run_id or spec.run_id == "local":
+        raise ValueError("run_id must be finalized before assigning the per-run artifact repo")
+    repo = f"{_ARTIFACT_NAMESPACE}/flashrun-{spec.run_id}"
+    d = spec.to_dict()
+    d["train"] = {**d["train"], "hf_repo": repo}
+    return JobSpec.from_dict(d)
+
+
 def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     across the configured providers (RunPod Flash or Vast); dry-run only records state."""
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
-    spec = JobSpec.from_dict(
-        {**_with_model_disk(spec, info), "run_id": spec.run_id or new_run_id()}
-    )
+    # Finalize the run_id BEFORE assigning the per-run artifact repo. The JobSpec default run_id is
+    # the placeholder "local" (truthy), so `or new_run_id()` alone would keep it; treat "local" as
+    # unset so programmatic/test callers also get a unique id and per-run repos never collide.
+    run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else new_run_id()
+    spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
+    # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
+    spec = _assign_managed_hf_repo(spec)
     status = RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
     _save_status(status)
     if dry_run:
