@@ -78,10 +78,11 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def fake_post(url, json=None, headers=None, timeout=None):
+    def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
         seen["url"] = url
         seen["json"] = json
         seen["headers"] = headers
+        seen["follow_redirects"] = follow_redirects
         return _Resp()
 
     monkeypatch.setattr(d.httpx, "post", fake_post)
@@ -99,16 +100,22 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch):
         "repoId": "org/repo",
         "baseModel": "Qwen/Qwen3.5-0.8B",
         "subfolder": "sft/flash-7-abcd/seed0/adapter",
+        # flash always uploads adapters to HF *dataset* repos, so serving must be told to
+        # pull from the dataset namespace (else snapshot_download 404s on the model namespace).
+        "repoType": "dataset",
         "status": "ready",
     }
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+    # Modal 303-redirects slow requests to an async-result poll URL, so registration follows them.
+    assert seen["follow_redirects"] is True
     assert dep.openai_model == "flash-7-abcd"
     assert dep.endpoint_name == "https://serve.example"
     assert dep.state == "ready"
 
 
 def test_deploy_propagates_serving_error(monkeypatch):
-    """A non-2xx from the serving app surfaces (the server maps it to a 5xx)."""
+    """A non-2xx from the serving app surfaces as a ServingError (the server maps it to a 502)
+    instead of swallowing it or letting a raw httpx error escape as an unhandled 500."""
     import flash.serve.deploy as d
 
     class _Resp:
@@ -118,7 +125,7 @@ def test_deploy_propagates_serving_error(monkeypatch):
             raise d.httpx.HTTPStatusError("boom", request=None, response=None)
 
     monkeypatch.setattr(d.httpx, "post", lambda *a, **k: _Resp())
-    with pytest.raises(d.httpx.HTTPStatusError):
+    with pytest.raises(d.ServingError):
         d.deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", "RTX 5090")
 
 
@@ -139,9 +146,10 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def fake_delete(url, headers=None, timeout=None):
+    def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
         seen["url"] = url
         seen["headers"] = headers
+        seen["follow_redirects"] = follow_redirects
         return _Resp(200)
 
     monkeypatch.setattr(d.httpx, "delete", fake_delete)
@@ -149,8 +157,49 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
     assert out == ["flash-7-abcd"]
     assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
+    # Modal 303-redirects slow requests to an async-result poll URL, so undeploy follows them too.
+    assert seen["follow_redirects"] is True
 
     # A 404 (already gone) returns an empty list, not an error.
+    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
+    assert d.undeploy_adapter("flash-7-abcd") == []
+
+
+def test_undeploy_propagates_serving_error(monkeypatch):
+    """A non-404 failure from the serving app surfaces as a ServingError (carrying the upstream
+    status, so the server maps it to a 502) — exactly like deploy — instead of letting a raw
+    httpx error escape as an unhandled 500. A 404 still no-ops (already-gone is success)."""
+    import flash.serve.deploy as d
+
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+            self.text = "kaboom"
+
+        def raise_for_status(self):
+            raise d.httpx.HTTPStatusError("boom", request=None, response=self)
+
+    # Non-404 (500) → ServingError carrying the upstream status, not a raw httpx error.
+    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(500))
+    with pytest.raises(d.ServingError) as ei:
+        d.undeploy_adapter("flash-7-abcd")
+    assert ei.value.status_code == 500
+
+    # A transport error (never reached the backend) is also translated into a ServingError.
+    # httpx.RequestError must carry the originating request (httpx>=0.27); building it with only a
+    # message can raise TypeError before undeploy_adapter() can translate it, so mirror the real
+    # undeploy call (DELETE {serving}/adapters/{run_id}).
+    def _boom_delete(*a, **k):
+        raise d.httpx.RequestError(
+            "no route to host",
+            request=d.httpx.Request("DELETE", "https://serve.example/adapters/flash-7-abcd"),
+        )
+
+    monkeypatch.setattr(d.httpx, "delete", _boom_delete)
+    with pytest.raises(d.ServingError):
+        d.undeploy_adapter("flash-7-abcd")
+
+    # A 404 short-circuits before raise_for_status(), so it stays a no-op success (not a ServingError).
     monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
     assert d.undeploy_adapter("flash-7-abcd") == []
 
@@ -178,12 +227,24 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
         def json(self):
             return completion
 
-    def fake_post(url, json=None, timeout=None):
-        seen["url"] = url
-        seen["json"] = json
-        return _Resp()
+    class _FakeClient:
+        # chat() uses an explicit httpx.Client (context manager) so it can follow Modal's 303
+        # async-result redirects; the fake records the call and the client kwargs.
+        def __init__(self, *args, **kwargs):
+            seen["client_kwargs"] = kwargs
 
-    monkeypatch.setattr(d.httpx, "post", fake_post)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, json=None):
+            seen["url"] = url
+            seen["json"] = json
+            return _Resp()
+
+    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
     out = d.chat(
         run_id="flash-7-abcd",
         messages=[{"role": "user", "content": "2+2?"}],
@@ -192,6 +253,9 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
         thinking=True,
     )
     assert seen["url"] == "https://serve.example/v1/chat/completions"
+    # Modal 303-redirects slow ASGI requests to an async-result poll URL, so the chat client
+    # MUST follow redirects (else httpx raises on the 303 mid cold-start).
+    assert seen["client_kwargs"]["follow_redirects"] is True
     assert seen["json"]["model"] == "flash-7-abcd"
     assert seen["json"]["max_tokens"] == 8
     assert seen["json"]["messages"] == [{"role": "user", "content": "2+2?"}]
