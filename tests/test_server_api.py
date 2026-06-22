@@ -733,6 +733,19 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     assert resubmitted == ["good-2"], "only the valid run resubmits; the malformed one is skipped"
     assert swept.is_set(), "a malformed spec must not abort the orphan sweep that follows the loop"
 
+    # The malformed run must NOT be silently skipped and left recoverable (it would be
+    # retried-then-skipped on every restart forever, invisible to the user). It must be
+    # persisted as terminal `failed` with an operator-visible error note, so it surfaces to
+    # the user AND drops out of the recoverable set (never re-attempted).
+    bad_status = runner.get_status("bad-1")
+    assert bad_status.state == "failed", "an unparseable persisted spec must be marked failed"
+    assert bad_status.state in runner.TERMINAL_STATES, "failed is terminal, so it won't recover again"
+    assert bad_status.state not in app_mod._RECOVERABLE, "the failed run leaves the recoverable set"
+    assert bad_status.error, "the failed run must carry an operator-visible error note"
+    assert "unrecoverable" in bad_status.error, (
+        "the failure note must explain the malformed spec to the operator"
+    )
+
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
