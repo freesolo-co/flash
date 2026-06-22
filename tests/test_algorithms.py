@@ -29,7 +29,6 @@ def test_grpo_capability_still_enforced():
         params="1B",
         algos=("sft",),
         min_vram_gb=12,
-        thinking="hybrid",  # tolerate the now-default-ON thinking flag
     )
     try:
         with pytest.raises(ConfigError):
