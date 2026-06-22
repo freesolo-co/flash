@@ -107,3 +107,39 @@ def cancel_job(endpoint_id: str, job_id: str) -> dict:
     return request_with_retries(
         f"{QUEUE_BASE}/{endpoint_id}/cancel/{job_id}", method="POST", retries=2
     )
+
+
+# ---------------------------------------------------------------------------
+# Realized billing (COGS) -- what RunPod actually charged, for estimator accuracy.
+# ---------------------------------------------------------------------------
+def billing_endpoints(
+    *,
+    start_time: str,
+    end_time: str,
+    endpoint_id: str | None = None,
+    bucket_size: str = "day",
+) -> list[dict]:
+    """Realized serverless spend per endpoint over [start_time, end_time] (ISO-8601).
+
+    GET /v1/billing/endpoints -> records of {endpointId, time, amount (USD), timeBilledMs, ...}.
+    RunPod has no per-job cost; the finest realized granularity is per-endpoint per time bucket.
+    Flash provisions one endpoint per run, so filtering by ``endpoint_id`` yields that run's
+    realized cost even after the endpoint is torn down (billing history survives deletion).
+    """
+    from urllib.parse import urlencode
+
+    params: dict[str, str] = {
+        "startTime": start_time,
+        "endTime": end_time,
+        "bucketSize": bucket_size,
+    }
+    if endpoint_id:
+        params["endpointId"] = endpoint_id
+    out = request_with_retries(f"{REST_BASE}/billing/endpoints?{urlencode(params)}")
+    if isinstance(out, list):
+        return out
+    # Defensive: some RunPod list responses wrap rows under a key.
+    if isinstance(out, dict):
+        rows = out.get("data") or out.get("endpoints") or out.get("billing")
+        return rows if isinstance(rows, list) else []
+    return []
