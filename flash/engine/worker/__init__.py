@@ -68,6 +68,7 @@ from flash.engine.worker.perf import (
     _remove_fla_from_disk,  # noqa: F401
     _reset_peak_gpu,
     _sdpa_cudnn_ctx,
+    assert_usable_gpu,
     free_gpu,
     fused_optim_name,
     gpu_diagnostics,
@@ -80,6 +81,16 @@ from flash.engine.worker.perf import (
 )
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
+
+# Disable PyTorch's NVML-based CUDA availability check BEFORE any torch/CUDA import. On a
+# MIG slice / permission-restricted host (RunPod has fulfilled full-GPU requests with a MIG
+# partition whose nvidia-smi reads "[Insufficient Permissions]"), the NVML-based check makes
+# the caching allocator HARD-ASSERT mid-backward ("NVML_SUCCESS == r INTERNAL ASSERT FAILED
+# ... CUDACachingAllocator"). Falling back to the non-NVML check lets the dedicated boot guard
+# (assert_usable_gpu) detect the bad host and raise a RETRIABLE infra error instead of crashing
+# opaquely deep in training. setdefault so an explicit operator/launcher value still wins. Read
+# lazily by torch at first CUDA use, so setting it at import (before any torch import) is in time.
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "0")
 
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
@@ -1907,8 +1918,13 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
-        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
         heartbeat("boot")
+        # Boot guard: a MIG slice / NVML-restricted host (RunPod has fulfilled a full-GPU request
+        # with a MIG partition) makes PyTorch's allocator NVML-assert mid-backward. Detect it now
+        # and raise the RETRIABLE infra error so the control plane resubmits on a fresh worker,
+        # instead of crashing opaquely deep in training as a non-retried job_failed.
+        assert_usable_gpu()
+        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
