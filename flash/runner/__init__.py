@@ -151,7 +151,9 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
 def submit_job(spec: JobSpec, dry_run: bool = False, background: bool = False) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     across the configured providers (RunPod Flash or Vast); dry-run only records state."""
-    info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
+    info = resolve_model(
+        spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type, train=spec.train
+    )
     # Finalize the run_id BEFORE assigning the per-run artifact repo. The JobSpec default run_id is
     # the placeholder "local" (truthy), so `or new_run_id()` alone would keep it; treat "local" as
     # unset so programmatic/test callers also get a unique id and per-run repos never collide.

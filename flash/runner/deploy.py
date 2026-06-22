@@ -138,6 +138,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         _persist_metrics,
         _run_seed_loop,
         _RunCancelled,
+        _submit_seed_supervised,
         _update,
         artifacts_dir,
         get_status,
@@ -171,6 +172,65 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # failure (or a late worker may still succeed) — either way, re-read the state
         # first so a recovery thread can't overwrite the user's terminal `cancelled`.
         if get_status(run_id).state == "cancelled":
+            return get_status(run_id)
+        if not res.ok and res.failure == "no_capacity":
+            # The recovered job is stuck IN_QUEUE on a capacity-starved / throttled class with no
+            # usable worker (a control-plane restart landed mid-queue). The fresh-submit path WALKS
+            # to the next-cheapest / larger available class on no_capacity; recovery must do the same
+            # instead of terminally failing on a transient market condition. Tear down the stale
+            # endpoint (its worker never started, so nothing is lost) and RE-PROVISION this seed
+            # through the supervised submit, which owns the capacity walk + crash budget.
+            with contextlib.suppress(Exception):
+                get_provider(handle.provider).destroy(handle)
+            with contextlib.suppress(Exception):
+                _gc_run_endpoints(spec)
+            # Carry the recovered (provider, class) into the re-provision's capacity-walk exclusion:
+            # it just proved ``no_capacity``, so the FIRST allocation must not re-pick the starved
+            # class and burn another queue grace before walking. Scoped to the failing provider
+            # (matching the fresh-submit path), so the same class on another provider stays usable.
+            starved = (
+                frozenset({(handle.provider, allocated_gpu)}) if allocated_gpu else frozenset()
+            )
+            # Drop the now-dead handle so a cancel / restart in the re-provision gap can't reattach
+            # to the deleted endpoint. Bail if the run raced to terminal during the long poll above.
+            if not _update(run_id, "running", remote=None):
+                print(f"attach: {run_id} went terminal during recovery; not re-provisioning", file=log)
+                return get_status(run_id)
+            print(
+                f"attach: {run_id} seed {seed} was IN_QUEUE with no capacity; "
+                "re-provisioning via the capacity walk instead of failing",
+                file=log,
+            )
+            metrics = _submit_seed_supervised(spec, seed, log, initial_starved=starved)
+            if get_status(run_id).state == "cancelled":
+                raise _RunCancelled(f"run {run_id} was cancelled")
+            total = float(status.cost_usd or 0.0) + _persist_metrics(spec, seed, metrics)
+            # The reattached handle only identifies the in-flight seed; resume any remaining ones
+            # rather than terminally completing the whole run after just this one (mirrors the
+            # success path).
+            try:
+                resumed_index = list(spec.train.seeds).index(seed) + 1
+            except ValueError:
+                resumed_index = len(spec.train.seeds)
+            more_seeds = resumed_index < len(spec.train.seeds)
+            applied = _update(
+                run_id,
+                "running",
+                cost_usd=total,
+                artifacts_dir=artifacts_dir(spec),
+                **({"remote": None, "resume_seed_index": resumed_index} if more_seeds else {}),
+            )
+            if more_seeds:
+                if not applied:
+                    print(
+                        f"attach: {run_id} went terminal during recovery; "
+                        "not resuming the remaining seeds",
+                        file=log,
+                    )
+                    return get_status(run_id)
+                _run_seed_loop(spec, log, start_index=resumed_index, prior_cost=total)
+            else:
+                _update(run_id, "done", cost_usd=total, artifacts_dir=artifacts_dir(spec))
             return get_status(run_id)
         if not res.ok:
             # Job ended not-ok — usually because it was abandoned during the redeploy. Resume the

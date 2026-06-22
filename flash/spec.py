@@ -149,6 +149,10 @@ class TrainSpec:
     advantage_clip: float | None = None
     thinking_length_penalty_coef: float | None = None
     stop_sequences: tuple[str, ...] = ()
+    # Disaggregated (async) GRPO rollout: number of GPUs in the node dedicated to the vLLM rollout
+    # server, the rest train (see engine.rollout_bench.select_rollout_split). 0 = colocate (the
+    # current single-GPU TRL path). >0 requires a multi-GPU node ([gpu] count = train + inference).
+    inference_gpus: int = 0
 
 
 @dataclass(frozen=True)
@@ -260,6 +264,7 @@ class JobSpec:
                 advantage_clip=_opt_float(train.get("advantage_clip")),
                 thinking_length_penalty_coef=_opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=_str_tuple(train.get("stop_sequences")),
+                inference_gpus=_opt_int(train.get("inference_gpus")) or 0,
             ),
             gpu=GpuSpec(
                 type=gpu.get("type", DEFAULT_GPU),

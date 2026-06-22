@@ -44,13 +44,14 @@ def _is_qwen35(model_id: str) -> bool:
 @dataclass
 class OptConfig:
     """Which of dev's training optimizations are on for this run (same set + defaults as
-    origin/dev's worker: Liger, Chalk, FLA-drop on Hopper for Qwen3.5/3.6, QLoRA per the catalog
-    quant tier, and the 8-bit paged AdamW optimizer)."""
+    origin/dev's worker: Chalk standalone (Liger faded — flash#66), FLA-drop on Hopper for
+    Qwen3.5/3.6, and the 8-bit paged AdamW optimizer). QLoRA was removed in #74 — the catalog is
+    bf16 everywhere because GRPO merges the LoRA into the 4-bit base and collapses the importance
+    ratio (no learning)."""
 
     liger: bool
     chalk: bool
     drop_fla: bool
-    qlora: bool
     optim_8bit: bool
     target_modules: object
 
@@ -61,21 +62,15 @@ def resolve_opt_config(
     liger: bool | None = None,
     chalk: bool | None = None,
     drop_fla: bool | None = None,
-    qlora: bool | None = None,
     optim_8bit: bool | None = None,
     target_modules: object | None = None,
 ) -> OptConfig:
-    """Resolve the optimization set for ``model_id`` with dev's defaults (each overridable). QLoRA
-    defaults to ON for catalog 4-bit tiers (9B / 35B-A3B); FLA-drop defaults ON for Qwen3.5/3.6."""
-    from flash.engine.worker.lora import model_quant
-
-    quant = model_quant(model_id)
-    qlora_default = ("4bit" in quant) or ("qlora" in quant)
+    """Resolve the optimization set for ``model_id`` with dev's defaults (each overridable). FLA-drop
+    defaults ON for Qwen3.5/3.6. (QLoRA removed in #74 — bf16 everywhere.)"""
     return OptConfig(
         liger=False if liger is None else liger,  # FADED: chalk standalone replaces Liger (flash#66)
         chalk=True if chalk is None else chalk,
         drop_fla=_is_qwen35(model_id) if drop_fla is None else drop_fla,
-        qlora=qlora_default if qlora is None else qlora,
         optim_8bit=True if optim_8bit is None else optim_8bit,
         target_modules=target_modules or (_LANG_TARGETS if _is_qwen35(model_id) else "all-linear"),
     )
@@ -83,14 +78,14 @@ def resolve_opt_config(
 
 def pool_gpu_plan(model_id: str, *, opt: OptConfig | None = None) -> dict:
     """Pick the cheapest GPU class for the pool's TRAINER (LoRA only, NO colocated vLLM) and for the
-    shared INFERENCE (vLLM rollout) — the disaggregation is exactly why the pool runs 35B where dev's
-    colocate can't: a QLoRA 4-bit 35B trainer needs ~20 GB (fits an ordinary card), and only the
-    shared rollout needs the big card."""
+    shared INFERENCE (vLLM rollout) — the disaggregation is why the pool can land 35B on a cheaper
+    card than dev's H200 colocate: the LoRA-only trainer carries no colocated vLLM, so only the
+    shared rollout needs the big card. (Bases are bf16 — QLoRA was removed in #74.)"""
     from flash.providers.base import GPU_INFO
 
     opt = opt or resolve_opt_config(model_id)
     p = _params_b(model_id)
-    bytes_per_param = 0.6 if opt.qlora else 2.0  # 4-bit nf4 (~0.5) + overhead, else bf16
+    bytes_per_param = 2.0  # bf16 base (QLoRA removed in #74)
     # trainer: base + LoRA + 8-bit optimizer state (small) + activations under grad checkpointing.
     trainer_gb = p * bytes_per_param * 1.15 + 5.0
     # inference (vLLM): the served base + KV cache, and vLLM only uses ~0.85 of VRAM, so size up;
@@ -110,7 +105,7 @@ def pool_gpu_plan(model_id: str, *, opt: OptConfig | None = None) -> dict:
     return {
         "model": model_id,
         "params_b": p,
-        "qlora": opt.qlora,
+        "qlora": False,  # QLoRA removed in #74 — bf16 everywhere
         "trainer_gpu": t_gpu,
         "trainer_vram_gb": round(trainer_gb),
         "trainer_usd_hr": t_usd,
@@ -157,10 +152,10 @@ def build_lora_policy_update(
     the latest adapter dir (the initial, untrained adapter before any step).
 
     Applies the SAME optimization stack as origin/dev's worker (resolved by :func:`resolve_opt_config`,
-    overridable via ``opt_config``): FLA-drop on Hopper for Qwen3.5/3.6, QLoRA 4-bit base (catalog
-    4-bit tiers — what lets a 35B trainer fit one card), Liger kernels, Chalk kernels, and the 8-bit
-    paged AdamW optimizer. ``target_modules`` defaults to language-only for VL bases (so a vLLM
-    rollout server loads the adapter cleanly)."""
+    overridable via ``opt_config``): FLA-drop on Hopper for Qwen3.5/3.6, Chalk kernels (standalone —
+    Liger faded per flash#66), and the 8-bit paged AdamW optimizer. Bases load in bf16 (QLoRA was
+    removed in #74). ``target_modules`` defaults to language-only for VL bases (so a vLLM rollout
+    server loads the adapter cleanly)."""
     import torch
 
     oc = opt_config or resolve_opt_config(model_id, target_modules=target_modules)
@@ -177,35 +172,21 @@ def build_lora_policy_update(
         except Exception as e:  # never abort training on the guard
             print(f"[pool_policy] drop_fla skipped: {e}", flush=True)
 
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    # (2) QLoRA: load the frozen base in 4-bit NF4 (the COST/feasibility lever — 35B ~70GB bf16 ->
-    # ~18-20GB, so the trainer fits an ordinary card; only the shared rollout needs the big GPU).
-    load_kwargs = {"trust_remote_code": True}
-    if oc.qlora and on_gpu:
-        from transformers import BitsAndBytesConfig
-
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-    else:
-        load_kwargs["torch_dtype"] = torch.bfloat16 if on_gpu else torch.float32
+    # (2) Load the frozen base in bf16 (QLoRA removed in #74 — GRPO merges the LoRA into the 4-bit
+    # base and collapses the importance ratio, so there is no learning under 4-bit).
+    load_kwargs = {"trust_remote_code": True, "torch_dtype": torch.bfloat16 if on_gpu else torch.float32}
 
     model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-    if not (oc.qlora and on_gpu):
-        model = model.to(dev)
+    model = model.to(dev)
     if grad_checkpointing:
         model.gradient_checkpointing_enable()
-    if oc.qlora and on_gpu:
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=grad_checkpointing)
 
     peft_cfg = LoraConfig(
         r=lora_rank,

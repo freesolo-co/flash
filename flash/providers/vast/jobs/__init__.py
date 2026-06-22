@@ -33,6 +33,7 @@ from flash._logging import get_logger
 from flash.providers._poll import PollErrorTracker, make_say, surface_heartbeat
 from flash.providers.base import GPU_INFO, PollResult, min_cuda_modern, vast_gpu_for_offer
 from flash.providers.runpod.jobs import (
+    _SETUP_HEARTBEAT_STAGES,
     make_hf_heartbeat_reader,
     make_hf_text_reader,
     worker_flagged_retriable,
@@ -269,6 +270,7 @@ def poll_vast_job(
     interval_s: float = 15.0,
     heartbeat_reader=None,
     stall_after_s: float = 1500.0,
+    setup_grace_s: float = 3000.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll instance status + HF artifacts to a terminal state (cf. jobs.poll_job).
@@ -276,8 +278,16 @@ def poll_vast_job(
     COMPLETED  fresh DONE sentinel on HF -> metrics.json (cost stamped from the
                offer's real $/hr).
     FAILED     attempt marker with ok=false, or instance dead without DONE.
-    STALLED    never left loading within LOAD_TIMEOUT_S, heartbeat frozen for
-               stall_after_s, or the client-side deadline passed.
+    STALLED    never left loading within LOAD_TIMEOUT_S, heartbeat frozen past the active
+               stall window, or the client-side deadline passed.
+
+    Two stall windows, mirroring runpod ``poll_job``: cold start (worker boot + the long weight
+    prefetch — at Vast's 200 Mbps floor a 70 GB+ checkpoint can exceed 25 min — + vLLM init) only
+    emits *setup* heartbeats (``_SETUP_HEARTBEAT_STAGES``; ``run_rl()`` emits ``rl_start`` BEFORE the
+    prefetch even begins). Until a *training* heartbeat arrives we apply the larger ``setup_grace_s``
+    so a healthy slow setup isn't misread as a stall and the instance destroyed; after it we use the
+    tight ``stall_after_s``. Without a ``heartbeat_reader`` we can't tell the phases apart, so we keep
+    ``stall_after_s`` throughout (no regression).
     """
 
     say = make_say(log)
@@ -338,6 +348,7 @@ def poll_vast_job(
     last_hb_key = None
     last_progress = time.time()
     became_running = False
+    seen_heartbeat = False  # a TRAINING-phase heartbeat has arrived (cold-start setup is done)
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
@@ -418,16 +429,30 @@ def poll_vast_job(
                 f"(image pull / host issue)",
             )
 
-        new_key, _stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
+        new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
             last_progress = time.time()
-        if became_running and time.time() - last_progress > stall_after_s:
+            # Only a KNOWN training-phase heartbeat means cold-start setup (the slow weight prefetch
+            # + vLLM boot) is done and we can switch to the tight window; setup heartbeats keep the
+            # larger grace budget. A missing/invalid ``stage`` arrives as None (surface_heartbeat
+            # returns hb.get("stage")); ``None not in _SETUP_HEARTBEAT_STAGES`` is True, so treating
+            # it as training would flip out of setup-grace early and could kill a still-downloading /
+            # still-booting instance. Stay conservative: only an UNAMBIGUOUS non-setup stage exits.
+            if stage is not None and stage not in _SETUP_HEARTBEAT_STAGES:
+                seen_heartbeat = True
+        # Cold start (before any training-phase heartbeat) gets the larger setup_grace_s, but only
+        # when a heartbeat_reader lets us tell setup from training; without one we can't, so stay on
+        # stall_after_s (no regression).
+        in_setup = heartbeat_reader is not None and not seen_heartbeat
+        stall_limit = setup_grace_s if in_setup else stall_after_s
+        if became_running and time.time() - last_progress > stall_limit:
+            phase = "setup" if in_setup else "training"
             return PollResult(
                 False,
                 failure="stalled",
                 detail=f"no worker progress for {int(time.time() - last_progress)}s "
-                f"(instance status {status})",
+                f"during {phase} (instance status {status}, limit {int(stall_limit)}s)",
             )
         time.sleep(interval_s)
 
@@ -479,6 +504,10 @@ def submit_run_vast(
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
         stall = 1500.0
+        # Larger cold-start window: the weight prefetch over Vast's 200 Mbps floor (a 70 GB+
+        # checkpoint can take 25+ min) + vLLM boot only emit SETUP heartbeats, so don't trip the
+        # tight ``stall`` until a training heartbeat proves setup is done (mirrors runpod).
+        setup_grace = 3000.0
         # Wall cap + provision/install grace; Vast has no server-side execution
         # timeout, so the client deadline (and the bootstrap's own cap) bound spend.
         deadline = max(60, int(spec.gpu.max_wall_seconds)) + 1800
@@ -489,6 +518,7 @@ def submit_run_vast(
             log=log,
             heartbeat_reader=reader,
             stall_after_s=stall,
+            setup_grace_s=setup_grace,
             deadline_s=deadline,
         )
     finally:

@@ -1086,7 +1086,9 @@ def run_sft():
 # ---------------------------------------------------------------------------
 # RL (GRPO) with TRL + colocated vLLM
 # ---------------------------------------------------------------------------
-def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_comps: int) -> dict:
+def compute_grpo_batching(
+    prompts_per_step: int, group_size: int, per_device_comps: int, num_processes: int = 1
+) -> dict:
     """Translate an intended ``prompts_per_step`` into a TRL GRPO batch configuration.
 
     TRL's GRPO batch sizing is denominated in **completions (prompt-completion pairs), not
@@ -1110,20 +1112,40 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     prompts_per_step = max(1, int(prompts_per_step))
     per_device = max(1, int(per_device_comps))
     target_comps = prompts_per_step * group_size  # total completions / optimizer step
-    # Never let the per-device completion micro-batch exceed the target completion batch:
-    # a small prompts_per_step would otherwise overshoot it (mirrors run_sft's
-    # `min(per_device_bs, effective_batch)`). No-op at the default (prompts_per_step=64).
-    per_device = max(1, min(per_device, target_comps))
-    grad_accum = max(1, target_comps // per_device)
-    # TRL rejects a global completion batch (per_device * grad_accum) that is not
-    # divisible by num_generations (= group_size), failing only AFTER the paid worker
-    # is provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the
-    # next multiple that makes the batch divisible (grad_accum must be a multiple of
-    # group_size // gcd(per_device, group_size)). This only ever raises the effective
-    # batch slightly; the common per_device|group_size cases are unchanged.
-    accum_step = group_size // math.gcd(per_device, group_size)
+    nproc = max(1, int(num_processes))
+    # Never let the per-device completion micro-batch exceed the PER-RANK share of the target
+    # completion batch. The smallest GLOBAL micro-batch is per_device * num_processes, so capping at
+    # the full target_comps (ignoring rank count) would let an num_processes>1 FSDP run overshoot
+    # prompts_per_step*group_size and inflate unique_prompts/step. Cap at target_comps // nproc
+    # (mirrors run_sft's `min(per_device_bs, effective_batch)`; no-op at the default nproc=1).
+    per_device = max(1, min(per_device, max(1, target_comps // nproc)))
+    # The GLOBAL completion batch TRL optimizes is per_device * grad_accum * num_processes —
+    # accelerate/TRL multiply by the data-parallel world size (FSDP trainer ranks). To still optimize
+    # `prompts_per_step` prompts/step under an `num_processes`-rank FSDP trainer, grad_accum must be
+    # divided by num_processes; otherwise the effective batch (and unique_prompts/step) scales with
+    # the rank count, and a small dataset can't fill even one step (the FSDP 0-real-steps bug seen on
+    # 2:2). num_processes=1 (colocate / single-trainer 1:1/1:2) is unchanged.
+    # Round UP (ceil), not floor: when target_comps is not an exact multiple of the global
+    # micro-batch (per_device * nproc) — e.g. batch_size=5, group=8, per_device=8, nproc=2 targets
+    # 40 completions but 40 // 16 == 2 yields only 32 (4 prompts, not the configured 5) — floor
+    # division silently trains a SMALLER batch than [train].batch_size requested. Ceiling reaches at
+    # least the configured prompts/step; the divisibility rounding below only ever raises it further.
+    _global_micro = per_device * nproc
+    grad_accum = max(1, -(-target_comps // _global_micro))
+    # TRL rejects a GLOBAL completion batch (per_device * grad_accum * num_processes) that is not
+    # divisible by num_generations (= group_size), failing only AFTER the paid worker is
+    # provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the next multiple
+    # that makes the GLOBAL batch divisible. The divisibility multiple must use per_device * nproc
+    # (the global micro-batch), not per_device alone — otherwise a multi-trainer (nproc>1) run whose
+    # global micro-batch already divides group_size still gets grad_accum inflated, training MORE
+    # prompts/step than configured (e.g. group_size=8, nproc=2, per_device=4: global micro-batch 8
+    # is already one full group, but gcd(per_device, group_size) would force grad_accum=2 -> 2
+    # prompts/step instead of 1). nproc=1 (colocate / single-trainer) is unchanged.
+    accum_step = group_size // math.gcd(per_device * nproc, group_size)
     grad_accum = ((grad_accum + accum_step - 1) // accum_step) * accum_step
-    generations_per_step = per_device * grad_accum
+    # generations_per_step / unique_prompts_per_step are reported GLOBALLY (across all ranks) so the
+    # metric matches the intended prompts_per_step regardless of the trainer world size.
+    generations_per_step = per_device * grad_accum * nproc
     unique_prompts_per_step = generations_per_step // group_size
     return {
         "per_device_train_batch_size": per_device,
@@ -1132,6 +1154,15 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
         "unique_prompts_per_step": unique_prompts_per_step,
         # TRL requires the global completion batch be divisible by num_generations.
         "divisible_by_group": (generations_per_step % group_size == 0),
+        # Whether the run actually optimizes the REQUESTED prompts/step. The ceil + group-divisibility
+        # rounding above can only RAISE the effective batch: on a multi-trainer split whose target
+        # completion batch (prompts_per_step * group_size) isn't a multiple of the global micro-batch
+        # (per_device * nproc), the run trains MORE prompts/step than [train].batch_size requested
+        # (e.g. a 3:1 split with batch=64/group=8/per_device=8 targets 512 completions but rounds to
+        # 528 -> 66 prompts). The caller surfaces this so a benchmark doesn't silently compare splits
+        # at DIFFERENT effective batches. False only when the rounding inflated the batch.
+        "effective_matches_target": (unique_prompts_per_step == prompts_per_step),
+        "target_prompts_per_step": prompts_per_step,
     }
 
 
@@ -1140,6 +1171,7 @@ def rl_per_device_comps(
     vocab: int = 248_320,
     *,
     use_vllm: bool = True,
+    colocated: bool = True,
     params_b: float | None = None,
 ) -> int:
     """Per-device *completion* micro-batch for GRPO (TRL counts completions, not prompts).
@@ -1160,6 +1192,12 @@ def rl_per_device_comps(
     MEASURED: Qwen3.5-2B (width ~1.41) group8 seq2048 OOMs a 32 GB card at per_device=8 but
     TRAINS at 4. So for colocate, additionally cap per_device to the live card's VRAM scaled
     by model width (~sqrt(params)): ~vram_gb/8 at 2B-width, tightened for wider models (4B/9B).
+
+    ``colocated`` gates ONLY that activation cap. In DISAGGREGATED mode the vLLM rollout server
+    runs on a SEPARATE GPU, so the trainer card carries neither the engine nor its KV pool/2nd
+    weight copy — the colocate activation cap would needlessly shrink per_device, inflating
+    grad-accum and undermining the very throughput the split is meant to measure. The logits
+    budget (a real per-device VRAM term) still applies in both modes. Defaults True (colocate).
     """
     # Default prompts/step; the auto-caps below (logits budget + colocate VRAM/width) handle OOM.
     base = 2 if THINKING else 8
@@ -1167,7 +1205,7 @@ def rl_per_device_comps(
         budget = 6.0 * 1e9
         cap = max(1, int(budget / (max(1, completion_len) * vocab * 4)))
         base = min(base, cap)
-    if use_vllm:
+    if use_vllm and colocated:
         try:
             import torch
 
@@ -1201,7 +1239,17 @@ def make_reward_heartbeat_callback():
                 r = float(r)
             except (TypeError, ValueError):
                 return
+            # Record the reward metric on EVERY rank: in a disaggregated multi-trainer (DDP) group
+            # the post-train no-op guard (run_rl) checks reward_history on each rank BEFORE the
+            # is_main_rank() return, so a non-zero rank with an empty history would wrongly raise
+            # "GRPO scored no reward" and crash the accelerate child group even though rank 0 trained
+            # fine. Keeping the local history non-empty on all ranks keeps that guard accurate.
             self.reward_history.append(r)
+            # Only rank 0 (world-process-zero) UPLOADS the heartbeat: it commits heartbeat.json to
+            # the SAME HF path, so N ranks would race / duplicate-commit. Single-process and
+            # train_gpus==1 paths are always rank 0, so their behavior is unchanged.
+            if not getattr(state, "is_world_process_zero", True):
+                return
             step = int(getattr(state, "global_step", len(self.reward_history)))
             heartbeat("rl_step", step=step, reward=r, reward_last=self.reward_history[-8:])
 
@@ -1347,6 +1395,60 @@ def _env_inference_gpus(default: int) -> int:
             f"using inference_gpus={default}"
         )
         return default
+
+
+def _bind_trainer_rank_local(where: str) -> None:
+    """Bind THIS accelerate rank to its LOCAL_RANK CUDA device before any CUDA context forms.
+
+    ``accelerate launch`` sets ONE comma-separated CUDA_VISIBLE_DEVICES for the whole trainer-only
+    child group and selects each rank's GPU via LOCAL_RANK — it does NOT slice CVD per rank. So
+    without an explicit set_device, every CUDA probe (e.g. _drop_fla_on_hopper's
+    get_device_capability in main(), wait_for_gpu, setup_perf_backends) lands on the group's cuda:0,
+    stacking every rank's startup context on the FIRST train GPU and starving/OOMing rank 0 on tight
+    DDP ratios. Idempotent — safe to call once early (main()) and again in run_rl (the Trainer later
+    selects the same device)."""
+    _local_rank = os.environ.get("LOCAL_RANK")
+    if _local_rank is None or not _local_rank.isdigit():
+        return
+    try:
+        import torch as _torch_rank
+
+        _torch_rank.cuda.set_device(int(_local_rank))
+        print(f"[rl][disagg] trainer-only child bound to cuda:{_local_rank} (LOCAL_RANK, {where})")
+    except Exception as _e:
+        print(f"[rl][disagg][warn] could not set_device(LOCAL_RANK={_local_rank}, {where}): {_e}")
+
+
+def _fp8_native_no_cuda_context() -> bool | None:
+    """Is this node's GPU fp8-native (compute capability >= 8.9) WITHOUT creating a CUDA context?
+
+    ``torch.cuda.get_device_capability()`` binds (and RETAINS) a CUDA context on the current device.
+    On the disaggregated DDP LAUNCHER that context lands on the first TRAINER card and stays alive
+    while the accelerate child trains on that same card — stealing VRAM / OOMing rank 0 on a tight
+    2:1/2:2 ratio (same hazard the launcher already avoids by skipping wait_for_gpu/perf_backends).
+    So read compute_cap from ``nvidia-smi`` (CUDA-free) instead. The trainer card is the same class
+    as the inference card (whole-machine node), so it is a valid proxy for the rollout server's fp8
+    KV decision. Returns True/False on a clean read, or None when nvidia-smi is unavailable/unparsable
+    (caller then falls back to the safe default — no fp8)."""
+    import subprocess as _sp
+
+    try:
+        out = _sp.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        for ln in out.stdout.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            major_s, _, minor_s = ln.partition(".")
+            return (int(major_s), int(minor_s or 0)) >= (8, 9)
+    except Exception:
+        return None
+    return None
+
 
 def _is_disaggregated_ddp_launcher() -> bool:
     """True when THIS main() process is the multi-trainer (train_gpus>1) disaggregated DDP launcher.
@@ -1742,12 +1844,21 @@ def run_rl():
         # fp8 KV cache only where the silicon has native fp8 (compute capability >= 8.9: Ada /
         # Hopper / Blackwell) — ~halves the rollout KV pool. Ampere (A100/A5000/3090, sm80) lacks
         # fp8, so it stays fp16 there (forcing it on would error / silently emulate).
-        try:
-            import torch as _torch
+        # On the disaggregated DDP LAUNCHER a torch CUDA probe here would bind a context on the first
+        # trainer card that lingers while the accelerate child trains on it (VRAM theft / rank-0 OOM
+        # on tight ratios — the same reason wait_for_gpu/perf_backends are skipped on the launcher).
+        # Use the CUDA-free nvidia-smi compute_cap read there; only the single-process / trainer-child
+        # paths (already bound to their own device) take the torch probe. nvidia-smi unavailable ->
+        # default to no fp8 (safe: a larger fp16 KV pool, never OOM).
+        if _is_disaggregated_ddp_launcher():
+            _want_fp8 = bool(_fp8_native_no_cuda_context())
+        else:
+            try:
+                import torch as _torch
 
-            _want_fp8 = _torch.cuda.get_device_capability() >= (8, 9)
-        except Exception:
-            _want_fp8 = False
+                _want_fp8 = _torch.cuda.get_device_capability() >= (8, 9)
+            except Exception:
+                _want_fp8 = False
         if _want_fp8:
             _set_vllm_field(("vllm_kv_cache_dtype", "kv_cache_dtype"), "fp8", "fp8 KV cache")
         # PREFIX CACHING: every GRPO group of `num_generations` rollouts shares the SAME prompt

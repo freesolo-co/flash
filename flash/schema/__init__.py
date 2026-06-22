@@ -98,7 +98,7 @@ _TRAIN_KEYS = frozenset(
     {"steps", "epochs", "lora_rank", "lora_alpha", "seeds", "init_from_adapter", "hf_repo",
      "learning_rate", "batch_size", "max_length", "save_every", "group_size", "temperature",
      "max_tokens", "kl_penalty_coef", "advantage_clip", "thinking_length_penalty_coef",
-     "stop_sequences", "max_steps", "max_examples"}
+     "stop_sequences", "max_steps", "max_examples", "inference_gpus"}
 )
 
 
@@ -197,7 +197,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
     try:
-        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type)
+        # Pass [train] so the open-model ("allow") fit check is disaggregated-aware: an
+        # inference_gpus>0 run sizes per-GPU (a big HF model fits as a split), matching the
+        # disaggregated-aware provisional_gpu above instead of rejecting it on the colocate total.
+        info = resolve_model(model, algorithm, policy=model_policy, gpu=gpu_type, train=train_raw)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if thinking and info.thinking == "none":
@@ -264,6 +267,10 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             # TrainSpec "None/0 -> no cap" contract); the worker reads these from [train].
             max_steps=_train_int(train_raw, "max_steps", minimum=0),
             max_examples=_train_int(train_raw, "max_examples", minimum=0),
+            # Disaggregated (async) GRPO rollout split: GPUs in the node dedicated to the vLLM
+            # rollout server, the rest train. minimum=0 so an explicit `inference_gpus = 0`
+            # (colocate) is accepted, not rejected as below-minimum.
+            inference_gpus=_train_int(train_raw, "inference_gpus", minimum=0) or 0,
         ),
         # GPU allocation, disk sizing, retry budget, and network volumes are all platform-managed:
         # the submit-time allocator picks the cheapest fitting validated GPU across providers, disk
