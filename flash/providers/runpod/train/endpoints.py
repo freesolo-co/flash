@@ -145,7 +145,9 @@ def _train_body(input_data: dict) -> dict:
                 f.seek(0, os.SEEK_END)
                 f.seek(max(0, f.tell() - tail_bytes))
                 tail = f.read().decode("utf-8", "replace")
-            with open(console + ".tail", "w") as f:
+            # utf-8 + replace so a non-ASCII console tail can't raise UnicodeEncodeError under a
+            # minimal-container ASCII locale (LANG=C); the tail itself was decoded utf-8/replace.
+            with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
                 f.write(tail)
             HfApi(token=env.get("HF_TOKEN")).upload_file(
                 path_or_fileobj=console + ".tail",
