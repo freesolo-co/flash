@@ -10,43 +10,27 @@ is absent or every kernel is disabled; and that a chalk apply error never aborts
 import sys
 import types
 
-from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels, is_chalk_enabled
+from flash.engine.chalk_kernels import (
+    _KERNELS,
+    active_kernels,
+    install_chalk_kernels,
+    is_chalk_enabled,
+)
 
 # Every FLASH_* kernel flag (so a test can clear leftovers from the environment).
 # Every FLASH_* kernel flag. The first seven are DEFAULT-ON (chalk's standalone stack: rms_norm,
 # swiglu, FLCE + the gap-fillers rope/lora-delta/embedding + the GDN conv+SiLU); the rest are opt-in.
-_DEFAULT_ON_FLAGS = (
-    "FLASH_RMSNORM_KERNEL",
-    "FLASH_SWIGLU_KERNEL",
-    "FLASH_FLCE_KERNEL",
-    "FLASH_ROPE_KERNEL",
-    "FLASH_TRITON_LORA",
-    "FLASH_EMBED_KERNEL",
-    "FLASH_GDN_KERNEL",
-    "FLASH_TRAINABLE_QKV",
-)
-_ALL_FLAGS = (
-    *_DEFAULT_ON_FLAGS,
-    "FLASH_QKV_KERNEL",
-    "FLASH_FP8_BASE",
-)
+_DEFAULT_ON_FLAGS = tuple(flag for flag, _kw, on in _KERNELS if on)
+# Derived from _KERNELS so adding a new opt-in flag (e.g. FLASH_FP8_DX) can't leave this stale.
+_ALL_FLAGS = tuple(flag for flag, _kw, _on in _KERNELS)
 
 # The apply kwargs flash should pass for a DEFAULT run: chalk runs STANDALONE (replaces Liger) so
 # its own rms_norm/swiglu/FLCE are ON alongside the gap-fillers; only the situational kernels
 # (eval-only attn epilogue / Hopper-only FP8 base) stay off. (The bf16 fused-MLP kernel was removed
 # in freesolo-chalk 0.3.2 — verified net-negative + eval-only; swiglu already fuses its activation.)
-_DEFAULT_KWARGS = {
-    "rmsnorm": True,
-    "swiglu": True,
-    "fused_linear_cross_entropy": True,
-    "rope": True,
-    "fused_lora_delta": True,
-    "fused_embedding": True,
-    "gdn": True,
-    "trainable_attn_epilogue": True,
-    "attn_epilogue": False,
-    "fp8_frozen_base": False,
-}
+# Derived from _KERNELS (kw -> default_on) so a new opt-in kwarg (e.g. fp8_dx) can't leave this
+# stale: the default apply call must pass every _KERNELS kwarg at its default.
+_DEFAULT_KWARGS = {kw: on for _flag, kw, on in _KERNELS}
 
 
 def _clear_flags(monkeypatch):

@@ -395,6 +395,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "FLASH_SWIGLU_KERNEL",
         "FLASH_FLCE_KERNEL",
         "FLASH_FP8_BASE",
+        "FLASH_FP8_DX",
         "FLASH_TRITON_LORA",
         "FLASH_EMBED_KERNEL",
         "FLASH_QKV_KERNEL",
