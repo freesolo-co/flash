@@ -13,8 +13,8 @@ import types
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels, is_chalk_enabled
 
 # Every FLASH_* kernel flag (so a test can clear leftovers from the environment).
-# Every FLASH_* kernel flag. The first six are DEFAULT-ON (chalk's standalone stack: rms_norm,
-# swiglu, FLCE + the gap-fillers rope/lora-delta/embedding); the last three are opt-in.
+# Every FLASH_* kernel flag. The first seven are DEFAULT-ON (chalk's standalone stack: rms_norm,
+# swiglu, FLCE + the gap-fillers rope/lora-delta/embedding + the GDN conv+SiLU); the rest are opt-in.
 _DEFAULT_ON_FLAGS = (
     "FLASH_RMSNORM_KERNEL",
     "FLASH_SWIGLU_KERNEL",
@@ -22,6 +22,7 @@ _DEFAULT_ON_FLAGS = (
     "FLASH_ROPE_KERNEL",
     "FLASH_TRITON_LORA",
     "FLASH_EMBED_KERNEL",
+    "FLASH_GDN_KERNEL",
 )
 _ALL_FLAGS = (
     *_DEFAULT_ON_FLAGS,
@@ -40,6 +41,7 @@ _DEFAULT_KWARGS = {
     "rope": True,
     "fused_lora_delta": True,
     "fused_embedding": True,
+    "gdn": True,
     "attn_epilogue": False,
     "fp8_frozen_base": False,
 }
