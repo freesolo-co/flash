@@ -79,7 +79,14 @@ def _freesolo_key_prefix(token: str) -> str:
     parts = token.split("_", 2)
     if len(parts) >= 2 and parts[0] == "fslo" and parts[1]:
         return f"fslo_{parts[1]}"
-    return token[:12]
+    return f"fslo_{db.hash_key(token)[:12]}"
+
+
+def _external_key_prefix(token: str, identity: dict[str, Any]) -> str:
+    prefix = _str_field(identity.get("key_prefix"))
+    if prefix and prefix.startswith("fslo_"):
+        return prefix
+    return _freesolo_key_prefix(token)
 
 
 def _str_field(value: Any) -> str | None:
@@ -150,7 +157,8 @@ def _cached_identity(token: str) -> dict[str, Any]:
 
 def _external_row(row: dict, token: str, identity: dict[str, Any]) -> dict:
     out = dict(row)
-    out["key_prefix"] = identity.get("key_prefix") or _freesolo_key_prefix(token)
+    out["auth_kind"] = "freesolo_api_key"
+    out["key_prefix"] = _external_key_prefix(token, identity)
     if identity.get("email"):
         out["email"] = identity["email"]
     elif out.get("email") == "freesolo-user":
@@ -230,14 +238,17 @@ def authenticate(authorization: str | None) -> dict | None:
     token = authorization.removeprefix("Bearer ").strip()
     internal = os.environ.get(INTERNAL_KEY_ENV)
     if internal and token == internal:
-        return db.lookup_key(token) or db.ensure_internal_key(token)
+        row = db.lookup_key(token) or db.ensure_internal_key(token)
+        out = dict(row)
+        out["auth_kind"] = "internal"
+        return out
     # Any non-internal token is a freesolo USER key: verify it against the freesolo backend.
     if _freesolo_verify(token):
         # A verified freesolo key gets its own per-token run-ownership identity.
         identity = _cached_identity(token)
         row = db.lookup_key(token) or db.ensure_external_key(
             token,
-            key_prefix=identity.get("key_prefix") or _freesolo_key_prefix(token),
+            key_prefix=_external_key_prefix(token, identity),
             email=identity.get("email"),
         )
         return _external_row(row, token, identity) if row is not None else None
