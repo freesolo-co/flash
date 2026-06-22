@@ -8,6 +8,7 @@ reference the rest of the schema package; the package ``__init__`` re-exports th
 from __future__ import annotations
 
 import math
+import urllib.parse
 from typing import Any
 
 from flash.spec import WandbSpec
@@ -96,11 +97,37 @@ def _require_environment_ref(value: str, message: str) -> None:
         repo_ref, sep, path = body.partition(":")
         repo, _, _ref = repo_ref.partition("@")
         owner_repo = repo.split("/", 1)
-        if len(owner_repo) == 2 and all(owner_repo) and (not sep or path.strip()):
+        if len(owner_repo) == 2 and all(owner_repo) and (not sep or _is_safe_environment_path(path)):
             return
     if value.startswith("https://github.com/") or value.startswith("http://github.com/"):
-        return
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "github.com":
+            parts = [part for part in urllib.parse.unquote(parsed.path).strip("/").split("/") if part]
+            if len(parts) >= 2 and _is_safe_github_path_parts(parts):
+                return
     raise ConfigError(message)
+
+
+def _is_safe_environment_path(path: str) -> bool:
+    if not path:
+        return True
+    raw = path.strip().replace("\\", "/")
+    if raw.startswith("/"):
+        return False
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        return True
+    if any(part in {".", ".."} for part in parts):
+        return False
+    return True
+
+
+def _is_safe_github_path_parts(parts: list[str]) -> bool:
+    if any(part in {".", "..", ""} for part in parts):
+        return False
+    if any("\\" in part for part in parts):
+        return False
+    return True
 
 
 def _coerce_scalar(value: str):

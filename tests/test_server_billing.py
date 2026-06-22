@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import io
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -272,6 +273,34 @@ def test_internal_identity_skips_billing(api, monkeypatch):
 
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-internal-secret"))
     assert res.status_code == 200, res.text
+
+
+def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch):
+    import flash.server.auth as auth_mod
+
+    token = "fslo-user-spoof"
+    auth_mod._identity_cache[token] = (
+        {"key_prefix": "internal", "email": "user@example.com"},
+        time.time() + auth_mod._VERIFY_CACHE_TTL_S,
+    )
+    calls = []
+
+    def fake_charge(*, token, spec):
+        calls.append((token, spec.run_id))
+        return {"amountCents": 123}
+
+    monkeypatch.setattr("flash.server.billing.charge_run_estimate", fake_charge)
+
+    me = api.get("/v1/me", headers=_bearer(token))
+    assert me.status_code == 200
+    assert me.json()["kind"] == "freesolo_api_key"
+    assert me.json()["key_prefix"].startswith("fslo_")
+    assert me.json()["key_prefix"] != "internal"
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer(token))
+    assert res.status_code == 200, res.text
+    assert len(calls) == 1
+    assert calls[0] == (token, res.json()["run_id"])
 
 
 def test_submit_failure_after_charge_reverses_the_debit(api, monkeypatch):
