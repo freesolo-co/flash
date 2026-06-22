@@ -138,8 +138,13 @@ def _train_body(input_data: dict) -> dict:
             spec = json.loads(input_data["job_spec_json"])
             phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
             prefix = f"{phase_ns}/{spec['run_id']}/seed{input_data['seed']}"
-            with open(console) as f:
-                tail = f.read()[-64_000:]
+            # Read only the last 64 KB (seek from the end) — the console can be very large on long
+            # runs, so f.read()[-64_000:] would pull the whole file into memory just to slice it.
+            tail_bytes = 64_000
+            with open(console, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - tail_bytes))
+                tail = f.read().decode("utf-8", "replace")
             with open(console + ".tail", "w") as f:
                 f.write(tail)
             HfApi(token=env.get("HF_TOKEN")).upload_file(

@@ -405,6 +405,7 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
     even when the worker exited 0 — run_mode only uploads on a non-zero exit, so an OOM/segfault or
     silent early-exit otherwise leaves the failure undebuggable (no metrics, often no error_<phase>,
     and the message points at a console that was never uploaded)."""
+    import os
     import subprocess
 
     import huggingface_hub
@@ -444,10 +445,19 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         "env": {"HF_TOKEN": "tok", "PYTHONPATH": ""},
     }
 
-    with pytest.raises(RuntimeError, match=r"produced no /tmp/metrics\.json"):
-        endpoints._train_body(input_data)
+    try:
+        with pytest.raises(RuntimeError, match=r"produced no /tmp/metrics\.json"):
+            endpoints._train_body(input_data)
 
-    # The fix: the console for the crashed phase is uploaded so the failure is root-causable.
-    console_uploads = [u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")]
-    assert console_uploads, f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
-    assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/seed0/console_sft.txt"
+        # The fix: the console for the crashed phase is uploaded so the failure is root-causable.
+        console_uploads = [u for u in uploads if str(u.get("path_in_repo", "")).endswith("console_sft.txt")]
+        assert console_uploads, f"console_sft.txt was not uploaded on the no-metrics crash path: {uploads}"
+        assert console_uploads[0]["path_in_repo"] == "sft/flash-test-run/seed0/console_sft.txt"
+    finally:
+        # _train_body writes the hardcoded /tmp/console_sft.txt(.tail); remove them so this test
+        # doesn't leak state across tests (flaky under isolated/parallel runners).
+        for _p in ("/tmp/console_sft.txt", "/tmp/console_sft.txt.tail"):
+            try:
+                os.remove(_p)
+            except FileNotFoundError:
+                pass
