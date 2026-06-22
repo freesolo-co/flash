@@ -356,16 +356,18 @@ def build_worker_env(
     # env(s), public + private) + optional reward-judge/live-data creds: a verifiers env whose
     # rubric calls an LLM judge or a live data source needs those secrets ON THE WORKER, where the
     # reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env reads
-    # (agents/common/prompt.py) to pick the JudgeRubric client model; LINKD_* are consumed by the
-    # linkd-search live-quality env. Forward operator control-plane overrides so SFT-eval/
-    # GRPO-reward/rejection-sampling judges don't silently fall back to generated defaults, and so
-    # secret values do not need to be serialized into the run's [worker_env] block.
+    # (agents/common/prompt.py) to pick the JudgeRubric client model; MONGO_URL and LINKD_* are
+    # consumed by the linkd-search/linkd-profilematch live-quality envs. Forward operator
+    # control-plane overrides so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
+    # back to generated defaults, and so secret values do not need to be serialized into the run's
+    # [worker_env] block.
     for key in (
         "HF_TOKEN",
         "PRIME_API_KEY",
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "FLASH_JUDGE_MODEL",
+        "MONGO_URL",
         "LINKD_MONGO_URL",
         "LINKD_JUDGE_AUTH",
         "LINKD_JUDGE_MODEL",

@@ -85,11 +85,16 @@ def test_build_worker_env_forwards_judge_model(monkeypatch):
 
 
 def test_build_worker_env_forwards_linkd_live_quality_env(monkeypatch):
-    """The linkd live-quality env reads these aliases on the worker; forward them from the
-    control-plane process so secrets do not need to be serialized into a run's [worker_env]."""
+    """The linkd live-quality envs read these aliases on the worker; forward them from the
+    control-plane process so secrets do not need to be serialized into a run's [worker_env].
+
+    ``freesolo-co/linkd-profilematch`` reads MONGO_URL directly, while the older linkd-search env
+    reads LINKD_MONGO_URL.
+    """
     from flash.providers.runpod.train import build_worker_env
 
     linkd_env = {
+        "MONGO_URL": "mongodb://example.invalid/db",
         "LINKD_MONGO_URL": "mongodb://example.invalid/db",
         "LINKD_JUDGE_AUTH": "judge-secret",
         "LINKD_JUDGE_MODEL": "accounts/fireworks/models/gpt-oss-120b",
