@@ -211,7 +211,7 @@ def recover_runs() -> None:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         with contextlib.suppress(Exception):
             _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
-        threading.Thread(target=lambda s=spec: _run_job_background(s), daemon=True).start()
+        threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
 
 
 def create_app():
