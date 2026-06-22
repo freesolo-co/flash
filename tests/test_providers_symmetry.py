@@ -193,13 +193,12 @@ def test_allocator_prefers_runpod_on_price_tie(monkeypatch):
 
     _mock_both_available(monkeypatch)
     # Same class at the same price on both providers: runpod wins the tie (registry order).
-    # Allocation is restricted to the live-validated pool, so 0.8B SFT's cheapest fitting
-    # VALIDATED class is RTX A5000 (24 GB @ $0.27 static; cheaper unvalidated cards like RTX 2000
-    # Ada are excluded). Offer the identical class+price on vast so the tie is genuinely between
-    # providers.
-    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX A5000", dph=0.27)])
+    # Allocation is restricted to the live-validated pool; post-2026-06-22-expansion 0.8B SFT's
+    # cheapest fitting VALIDATED class is the 16 GB RTX 2000 Ada ($0.24 static). Offer the identical
+    # class+price on vast so the tie is genuinely between providers.
+    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 2000 Ada", dph=0.24)])
     a = allocate("Qwen/Qwen3.5-0.8B", "sft")
-    assert (a.provider, a.gpu) == ("runpod", "RTX A5000")
+    assert (a.provider, a.gpu) == ("runpod", "RTX 2000 Ada")
 
 
 def test_allocator_falls_back_to_runpod_when_vast_search_fails(monkeypatch):

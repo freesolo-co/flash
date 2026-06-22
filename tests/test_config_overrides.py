@@ -34,9 +34,10 @@ def test_set_overrides_scalar_and_list():
         assert spec.train.steps == 7
         assert spec.train.seeds == (0, 1, 2)
         # GPU pinning is gone: a gpu.type override is parsed but IGNORED — the schema always
-        # resolves the cheapest fitting VALIDATED class for the model (4B GRPO -> A100 PCIe; the
-        # cheaper unvalidated A40 is excluded), not the override.
-        assert spec.gpu.type == "A100 PCIe"
+        # resolves the cheapest fitting VALIDATED class for the model (4B GRPO ~35 GB -> the 48 GB
+        # RTX A6000, live-validated 2026-06-22 @ $0.49, cheaper than the 80 GB A100 PCIe), not the
+        # override. (A40 stays unvalidated.)
+        assert spec.gpu.type == "RTX A6000"
 
 
 def test_composed_config_deep_merge():
@@ -49,8 +50,9 @@ def test_composed_config_deep_merge():
         assert spec.train.steps == 250  # deep-merged override of a scalar
         assert spec.environment.id == "primeintellect/gsm8k"  # untouched key preserved
         # The merged [gpu] type is IGNORED (no pin): the schema resolves the cheapest fitting
-        # VALIDATED class for the model (4B GRPO -> A100 PCIe), regardless of the composed gpu.type.
-        assert spec.gpu.type == "A100 PCIe"
+        # VALIDATED class for the model (4B GRPO ~35 GB -> the 48 GB RTX A6000, $0.49), regardless
+        # of the composed gpu.type.
+        assert spec.gpu.type == "RTX A6000"
 
 
 def test_set_requires_key_value():

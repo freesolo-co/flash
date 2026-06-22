@@ -792,7 +792,12 @@ def run_sft():
     # below, so the cap binds exactly when the worker won't fuse the CE.
     _sft_params_b = resolve_params_b(model_id)  # catalog stat else HF safetensors (open models)
     _sft_vocab = vocab_size_for(model_id)
-    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len)
+    # Actual fused-CE decision == what `use_liger_kernel` is set from below (line ~879). sft_logits_fused
+    # is the offline size/ctx mirror; liger_on(...) adds the runtime CUDA + liger_kernel-importable
+    # check, so the cap binds exactly when the fused CE is NOT really taken.
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and liger_on(
+        _memory_mode(model_id, sft_max_len)
+    )
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
     )
