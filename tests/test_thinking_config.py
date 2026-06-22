@@ -67,9 +67,9 @@ def test_always_thinking_model_requires_flag(monkeypatch):
     # An always-thinker can't run with thinking OFF (the default); the rejection triggers on the
     # default-off as well as an explicit thinking=false.
     with pytest.raises(ConfigError) as ei:
-        spec_from_dict(_raw(model="acme/r1-distill", model_policy="allow", thinking=False))
+        spec_from_dict(_raw(model="acme/r1-distill", thinking=False))
     assert "thinking = true" in str(ei.value)
-    spec = spec_from_dict(_raw(model="acme/r1-distill", model_policy="allow", thinking=True))
+    spec = spec_from_dict(_raw(model="acme/r1-distill", thinking=True))
     assert spec.thinking is True
 
 
@@ -86,7 +86,7 @@ def test_thinking_unknown_capability_warns_but_allows(monkeypatch, capsys):
     )
     monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
     monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "RTX 5090")
-    spec = spec_from_dict(_raw(model="acme/tiny-1b", model_policy="allow", thinking=True))
+    spec = spec_from_dict(_raw(model="acme/tiny-1b", thinking=True))
     assert spec.thinking is True
     captured = capsys.readouterr()
     # Warning goes to stderr (stdout is reserved for the MCP server's JSON protocol).
