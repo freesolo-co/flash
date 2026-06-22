@@ -14,6 +14,11 @@ import os
 import sys
 import time
 
+# Fused-CE (Liger) gate thresholds live in ONE place — flash.engine.vram — so the worker's run-time
+# gate and the cost estimator's offline mirror (sft_logits_fused) can never drift. vram is a pure
+# leaf (no worker import), so this is cycle-free.
+from flash.engine.vram import _LIGER_LONG_CTX_TOKENS, _LIGER_MIN_PARAMS_B
+
 
 def _attn_impl_for_capability(major: int) -> str | None:
     """Map a CUDA compute capability to the trainer ``attn_implementation``.
@@ -72,7 +77,9 @@ def optimal_attn_impl() -> str | None:
 # RTX 4090 0.83x, RTX 5090 0.79x) — the per-step Triton overhead isn't repaid because the small
 # model's logits don't dominate memory. Its value appears on LARGE models (lets a bigger batch
 # fit / avoids OOM). So gate by estimated model size.
-_LIGER_MIN_PARAMS = 3e9  # ~3B; 1B-class models measured net-negative -> Liger off below this
+# ~3B in raw param count; the canonical threshold (in billions) lives in flash.engine.vram.
+# 1B-class models measured net-negative -> Liger off below this.
+_LIGER_MIN_PARAMS = _LIGER_MIN_PARAMS_B * 1e9
 
 
 def _estimate_params(cfg) -> float:
@@ -186,7 +193,7 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
 # Long-context runs are memory-bound (activations + vLLM KV cache scale with sequence length), so
 # they need the memory features even on a SMALL model — PR #174 measured a 1B model OOM on GRPO at
 # 4096 ctx in speed mode, but it fits in memory mode. So "memory mode" = large model OR long ctx.
-_LONG_CONTEXT_TOKENS = 2048
+_LONG_CONTEXT_TOKENS = _LIGER_LONG_CTX_TOKENS  # canonical value in flash.engine.vram
 
 
 def _memory_mode(model_id: str, max_length: int = 0) -> bool:
