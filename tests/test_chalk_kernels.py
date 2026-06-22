@@ -13,17 +13,30 @@ import types
 from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels, is_chalk_enabled
 
 # Every FLASH_* kernel flag (so a test can clear leftovers from the environment).
-_ALL_FLAGS = (
+# Every FLASH_* kernel flag. The first six are DEFAULT-ON (chalk's standalone stack: rms_norm,
+# swiglu, FLCE + the gap-fillers rope/lora-delta/embedding); the last three are opt-in.
+_DEFAULT_ON_FLAGS = (
+    "FLASH_RMSNORM_KERNEL",
+    "FLASH_SWIGLU_KERNEL",
+    "FLASH_FLCE_KERNEL",
     "FLASH_ROPE_KERNEL",
     "FLASH_TRITON_LORA",
     "FLASH_EMBED_KERNEL",
+)
+_ALL_FLAGS = (
+    *_DEFAULT_ON_FLAGS,
     "FLASH_MLP_KERNEL",
     "FLASH_QKV_KERNEL",
     "FLASH_FP8_BASE",
 )
 
-# The apply kwargs flash should pass for a DEFAULT run (gap-fillers on, overlap/situational off).
+# The apply kwargs flash should pass for a DEFAULT run: chalk runs STANDALONE (replaces Liger) so
+# its own rms_norm/swiglu/FLCE are ON alongside the gap-fillers; only the overlap/situational
+# kernels (fused MLP / eval-only attn epilogue / Hopper-only FP8 base) stay off.
 _DEFAULT_KWARGS = {
+    "rmsnorm": True,
+    "swiglu": True,
+    "fused_linear_cross_entropy": True,
     "rope": True,
     "fused_lora_delta": True,
     "fused_embedding": True,
@@ -66,7 +79,7 @@ def test_default_on_applies_gap_fillers(monkeypatch):
     assert len(calls) == 1
     got_model, kwargs = calls[0]
     assert got_model is model
-    assert kwargs.pop("liger") is False  # TRL owns Liger; chalk composes on top
+    assert kwargs.pop("liger") is False  # chalk STANDALONE (its own rms/swiglu/FLCE); flash uses no Liger
     assert kwargs == _DEFAULT_KWARGS
 
 
@@ -116,9 +129,9 @@ def test_optin_flag_enables_extra_kernel(monkeypatch):
 
 
 def test_all_kernels_disabled_is_noop(monkeypatch):
-    """Disabling every gap-filler (FLASH_<K>=0) -> apply is never called, returns {}."""
+    """Disabling every default-on kernel (FLASH_<K>=0) -> apply is never called, returns {}."""
     _clear_flags(monkeypatch)
-    for k in ("FLASH_ROPE_KERNEL", "FLASH_TRITON_LORA", "FLASH_EMBED_KERNEL"):
+    for k in _DEFAULT_ON_FLAGS:
         monkeypatch.setenv(k, "0")
     calls = []
     _install_fake_chalk(monkeypatch, calls)
@@ -150,7 +163,7 @@ def test_is_chalk_enabled(monkeypatch):
     import os
 
     assert is_chalk_enabled(os.environ) is True
-    disabled = {"FLASH_ROPE_KERNEL": "0", "FLASH_TRITON_LORA": "0", "FLASH_EMBED_KERNEL": "0"}
+    disabled = dict.fromkeys(_DEFAULT_ON_FLAGS, "0")
     assert is_chalk_enabled(disabled) is False
     # a single opt-in flag is enough to need chalk installed
     assert is_chalk_enabled({**disabled, "FLASH_MLP_KERNEL": "1"}) is True
@@ -159,7 +172,7 @@ def test_is_chalk_enabled(monkeypatch):
 def test_active_kernels_filters_report():
     """active_kernels keeps only the kernels that ENGAGED (truthy, non-error) and drops liger."""
     rep = {
-        "liger": False,  # TRL owns Liger — excluded
+        "liger": False,  # chalk runs standalone — its report carries liger=False; excluded
         "rope": True,
         "fused_lora_delta": 12,  # a count is "engaged"
         "fused_embedding": False,  # fell back

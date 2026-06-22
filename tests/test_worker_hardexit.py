@@ -35,7 +35,7 @@ def _patch_common(monkeypatch, fake_exit):
     # and raises on a missing/uninitialized CUDA device — both true in a torch-less / GPU-less CI
     # box — so it must be mocked here rather than relied on to silently return.)
     monkeypatch.setattr(worker, "assert_usable_gpu", lambda: None)
-    monkeypatch.setattr(worker, "_drop_fla_on_hopper", lambda: None)
+    monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
     monkeypatch.setattr(worker, "finalize_alloc_conf_for_sleep", lambda: None)
 
 

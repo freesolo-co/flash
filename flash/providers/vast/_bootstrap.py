@@ -205,9 +205,9 @@ def main() -> int:
                     )
         except Exception as _e:
             print("wandb setup skipped:", _e)
-        # NB: the Hopper fla guard lives in engine.worker._drop_fla_on_hopper (runs in the worker
-        # process after all installs, before any model import) — not here, where a later
-        # install could pull fla back in. The bootstrap just fetches code and runs the worker.
+        # NB: the Hopper fla fast-path setup lives in flash.engine.worker._ensure_fla_fastpath_on_hopper
+        # (runs in the worker process after all installs, before any model import) — not here, where
+        # a later install could pull fla back in. The bootstrap just fetches code and runs the worker.
 
         extra_pip = payload.get("extra_pip") or []
         if extra_pip:
@@ -215,9 +215,10 @@ def main() -> int:
             # / verifiers extras) must stop NOW with an actionable error, not proceed to
             # a later import crash while the paid instance runs (matches the RunPod path).
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
-        # NB: fla is dropped on Hopper (sm90) automatically by engine.worker._drop_fla_on_hopper at
-        # worker startup (fla's GDN backward is miscomputed on sm90, #640) — no bootstrap uninstall
-        # or env toggle. fla only ever runs on the consumer archs where its Triton kernel is correct.
+        # NB: fla's tilelang GDN fast path is ensured on Hopper (sm90) by
+        # flash.engine.worker._ensure_fla_fastpath_on_hopper at worker startup (fla's GDN backward is
+        # miscomputed on sm90 with Triton>=3.4, #640; tilelang is the correct backend) — no bootstrap
+        # uninstall or env toggle. fla is kept on every arch.
         # Install the run's verifiers environment(s) from the Prime Hub via the
         # authenticated `prime` CLI (mirrors runpod/train.py:_train_body). The public pip
         # index does not serve PRIVATE env wheels; `prime env install` pulls/builds/installs

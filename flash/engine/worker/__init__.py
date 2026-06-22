@@ -63,7 +63,7 @@ from flash.engine.worker.lora import (
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,  # noqa: F401
-    _drop_fla_on_hopper,
+    _ensure_fla_fastpath_on_hopper,
     _estimate_params,  # noqa: F401
     _flash_attn_available,
     _GpuPeakSampler,
@@ -75,12 +75,13 @@ from flash.engine.worker.perf import (
     _reset_peak_gpu,
     _sdpa_cudnn_ctx,
     assert_usable_gpu,
+    flex_attn_status,
     free_gpu,
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
-    liger_on,
     loraplus_optimizer_cls,
+    model_supports_flex_attn,  # noqa: F401
     optimal_attn_impl,
     setup_perf_backends,
     wait_for_gpu,
@@ -784,20 +785,22 @@ def run_sft():
     effective_batch = (
         _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
     )
-    # Large-vocab OOM guard: when the fused CE (Liger) is OFF, the SFTTrainer materializes the full
+    # Large-vocab OOM guard: when the fused CE (chalk's FLCE) is OFF, the SFTTrainer materializes the full
     # [per_device, seq, vocab] fp32 logits + grad — at Qwen3.5's ~248k vocab a 0.8B SFT OOM'd a
     # 24 GB card in backward. Cap the per-device micro-batch by the real model vocab + seq so those
     # logits stay within the logits budget; grad-accum rises to keep the effective batch unchanged
-    # (the SFT mirror of rl_per_device_comps' GRPO cap). fused mirrors liger_on(_memory_mode(...))
-    # below, so the cap binds exactly when the worker won't fuse the CE.
+    # (the SFT mirror of rl_per_device_comps' GRPO cap). fused = sft_logits_fused, the CONSERVATIVE
+    # >=3B / >=2048-ctx gate: chalk's FLCE actually fuses every run, but the cap still binds for a
+    # small short-context run (where the allocator doesn't bank on the saving) so it's never OOM if
+    # the fused path is unavailable.
     _sft_params_b = resolve_params_b(model_id)  # catalog stat else HF safetensors (open models)
     _sft_vocab = vocab_size_for(model_id)
-    # Actual fused-CE decision == what `use_liger_kernel` is set from below (line ~879). sft_logits_fused
-    # is the offline size/ctx mirror; liger_on(...) adds the runtime CUDA + liger_kernel-importable
-    # check, so the cap binds exactly when the fused CE is NOT really taken.
-    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and liger_on(
-        _memory_mode(model_id, sft_max_len)
-    )
+    # chalk's FLCE fuses EVERY run (standalone, no size / liger_kernel-importable gate), so the
+    # fused-CE memory saving is always really taken. The allocator just stays CONSERVATIVE about
+    # banking on it: sft_logits_fused is the >=3B / >=2048-ctx mirror, so the large-vocab logits cap
+    # below binds only for small short-context runs where it doesn't bank on the saving (a GPU is
+    # never undersized). (Was `... and liger_on(_memory_mode(...))`; liger_on went away with Liger.)
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len)
     per_device_bs, grad_accum = sft_grad_accum(
         effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
     )
@@ -857,31 +860,51 @@ def run_sft():
     # cross-contaminate (silent quality loss). The boundary-correct backend is FlashAttention-2
     # varlen (reads position_ids); but flash-attn has NO prebuilt wheel for torch 2.10 (PyPI
     # sdist-only; Dao-AILab wheels stop at torch 2.9) so it would build from source on every cold
-    # start (~20 min, fragile) — it is NOT in the worker image. So _fa_ok is False on the current
-    # stack and packing is effectively unavailable until flash-attn is baked into a prebuilt image.
-    # Packing is ON when FA2 is importable (varlen keeps 'bfd' example boundaries correct); else
-    # SKIP — without a boundary-correct attn backend examples would cross-contaminate under SDPA.
+    # start (~20 min, fragile) — it is NOT in the worker image, so _fa_ok is False on the current
+    # stack. That alone used to disable packing — but flex_attention (block-diagonal doc mask) is a
+    # SECOND boundary-correct backend that needs NO flash-attn, so it enables 'bfd' packing on archs
+    # that support it even on torch 2.10 / sm120 where FA2 is absent. MEASURED ~1.7x SFT throughput
+    # at equal VRAM on a Llama-arch 0.5B (5090). flex support is per-arch (Llama/Qwen2/3 yes;
+    # Qwen3.5/3.6 hybrid-GDN no — HF #34809), so we only enable flex packing when the arch supports it.
     _fa_ok = _flash_attn_available()
+    # When FA2 is absent, flex is the fallback boundary-correct backend — but only if the model's
+    # arch supports it. Capture WHY it's unavailable so the SKIPPED message is accurate (a real arch
+    # limitation vs a possibly-transient config-probe failure), instead of always blaming the arch.
+    _flex_status = "unsupported" if _fa_ok else flex_attn_status(model_id)
+    _flex_ok = _flex_status == "supported"
     if _fa_ok:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
+    elif _flex_ok:
+        cfg_kwargs["packing"] = True
+        print("[sft] example packing enabled (flex_attention block-diagonal mask)")
     else:
-        print(
-            "[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
-            "2.10). Bake flash-attn into the worker image to enable FA2 varlen packing."
+        # flash-attn is absent on torch 2.10; distinguish the flex fallback reason so the diagnosis
+        # isn't misleading when the config probe merely failed (offline / transient HF error).
+        _flex_reason = (
+            "the model's arch lacks flex_attention support"
+            if _flex_status == "unsupported"
+            else "the flex_attention support probe failed (offline / transient HF error)"
         )
-    # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
-    # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
-    if liger_on(_memory_mode(model_id, sft_max_len)):
-        cfg_kwargs["use_liger_kernel"] = True
-        print("[sft] liger fused kernels enabled")
+        print(
+            f"[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
+            f"2.10 and {_flex_reason}). Bake flash-attn into the worker image, or use a flex-capable "
+            f"arch (with a reachable config), to enable packing."
+        )
+    # Fused CE/RMSNorm/SwiGLU come from chalk (STANDALONE), NOT Liger: install_chalk_kernels patches
+    # the live model AFTER the trainer builds it, with chalk's FLCE on by default — so the big
+    # large-vocab (Qwen3.5 ~248k) memory/throughput win is preserved without use_liger_kernel.
     _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
-    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen attn.
-    # With FA2 importable force flash_attention_2 — a pure win over the SDPA default which would
-    # cross-contaminate packed examples.
-    if cfg_kwargs.get("packing") and _fa_ok:
-        _attn = "flash_attention_2"
-        print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen/masked attn.
+    # Force the boundary-correct backend whenever packing is on, over the SDPA default which would
+    # cross-contaminate packed examples: FA2 varlen if available, else flex_attention's doc mask.
+    if cfg_kwargs.get("packing"):
+        if _fa_ok:
+            _attn = "flash_attention_2"
+            print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+        elif _flex_ok:
+            _attn = "flex_attention"
+            print("[sft] attn_implementation=flex_attention (packing boundary-correct block mask)")
     quant = model_quant(model_id)
     if quant == "4bit-qlora":
         # QLoRA tier: 4-bit NF4 base + bf16 LoRA adapters (e.g. Qwen3.5-9B on a 5090).
@@ -1683,16 +1706,12 @@ def run_rl():
         # colocated GRPO (trainer + vLLM on one GPU) is memory-tight, so this is the right default.
         "optim": fused_optim_name(),
     }
-    # Liger fused GRPO loss: fuses the lm_head + per-token logprob so the fp32
-    # [batch, seq, ~248k vocab] logits never materialize — the documented GRPO OOM driver.
-    # TRL 1.6's GRPOConfig flag is `use_liger_kernel` (NOT `use_liger_loss`, which doesn't
-    # exist in 1.6). DEFAULT ON for the GRPO path regardless of model size: MEASURED that
-    # WITHOUT it even Qwen3.5-0.8B GRPO OOMs a 24 GB (and 32 GB) card because the per-completion
-    # logits over the 248k vocab dominate — the small-scale JIT cost is far cheaper than the OOM.
-    # (This differs from SFT, where Liger is gated by size since 1B-class SFT can be net-negative.)
-    if liger_on(True):
-        grpo_kwargs["use_liger_kernel"] = True
-        print("[rl] liger fused GRPO loss enabled")
+    # Fused GRPO loss comes from chalk's FLCE (STANDALONE), NOT Liger: install_chalk_kernels patches
+    # the live model after the trainer builds it, with chalk's fused-linear-CE on by default. That
+    # fuses the lm_head + per-token logprob so the fp32 [batch, seq, ~248k vocab] logits never
+    # materialize — the documented GRPO OOM driver (MEASURED: without a fused CE even Qwen3.5-0.8B
+    # GRPO OOMs a 24/32 GB card because the per-completion 248k-vocab logits dominate). flash no
+    # longer sets TRL's use_liger_kernel; chalk's FLCE beats Liger's and carries this protection.
     if use_vllm:
         # RTX 5090 / sm120: pin a PTX-independent vLLM attention backend (FLASHINFER) BEFORE TRL
         # builds the colocated engine — else the rollout can silently produce no completions on
@@ -2062,8 +2081,8 @@ def main():
     try:
         # Idempotency FIRST — before any env-mutating pip install / package removal: a re-delivered
         # job whose DONE already exists must return the persisted metrics and exit WITHOUT running
-        # _drop_fla_on_hopper() (pip-uninstalls fla) — that wasted a worker mutating its env on an
-        # already-complete run. It is called after the DONE check below (see _drop_fla_on_hopper()).
+        # _ensure_fla_fastpath_on_hopper() (mutates the env: pip-installs tilelang/fla) — that wasted
+        # a worker mutating its env on an already-complete run. It runs after the DONE check below.
         if HF_REPO:
             from huggingface_hub import hf_hub_download
 
@@ -2095,22 +2114,25 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
-        # Pin the trainer to its devices for the disaggregated/pool GRPO path BEFORE any CUDA
-        # context (CUDA_VISIBLE_DEVICES is honored only before the first context).
+        # Pin the trainer to its devices for the disaggregated/pool GRPO path BEFORE any CUDA context
+        # (CUDA_VISIBLE_DEVICES is honored only before the first context). _pin is CUDA-free.
         _pin_trainer_devices_for_disaggregated()
-        heartbeat("boot")
+        heartbeat("boot")  # signal liveness before any slow setup (Hopper fla/tilelang install)
         # Boot guard: a MIG slice / NVML-restricted host (RunPod has fulfilled a full-GPU request
         # with a MIG partition) makes PyTorch's allocator NVML-assert mid-backward. Detect it now
         # and raise the RETRIABLE infra error so the control plane resubmits on a fresh worker,
         # instead of crashing opaquely deep in training as a non-retried job_failed.
         assert_usable_gpu()
-        # Hopper fla guard. SKIP on the multi-trainer DDP launcher (it trains nothing — re-execs
-        # under accelerate; children drop fla rank-local), else the probe binds a CUDA context
-        # on rank 0 and OOMs it on a tight split.
+        # Hopper: enable the fla+tilelang GDN FAST PATH (#66 — keep fla via tilelang instead of the
+        # lossy _drop_fla). SKIP on the multi-trainer DDP launcher (it trains nothing — re-execs under
+        # accelerate; children handle fla rank-local), else the probe binds a CUDA context on rank 0
+        # and OOMs it on a tight split. AFTER the GPU guard so a MIG/unusable host bails RETRIABLE
+        # before the multi-minute tilelang/fla install; before any model import (transformers gates
+        # GDN on is_fla_available() at load).
         if _is_disaggregated_ddp_launcher():
-            print("[hopper] disaggregated DDP launcher: skip fla probe (children drop it rank-local)")
+            print("[hopper] disaggregated DDP launcher: skip fla fast-path (children handle it rank-local)")
         else:
-            _drop_fla_on_hopper()
+            _ensure_fla_fastpath_on_hopper()
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {

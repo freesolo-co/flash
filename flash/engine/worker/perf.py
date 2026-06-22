@@ -53,6 +53,51 @@ def _flash_attn_available() -> bool:
         return False
 
 
+def flex_attn_status(model_id: str) -> str:
+    """Why flex_attention packing is / isn't available for this model's arch.
+
+    Returns one of:
+      - ``"supported"``    — an arch in the config sets ``_supports_flex_attn=True``.
+      - ``"unsupported"``  — the probe succeeded but no arch supports flex (e.g. the Qwen3.5/3.6
+        hybrid-GDN ``Qwen3_5ForConditionalGeneration``; HF issue #34809).
+      - ``"probe_failed"`` — the config probe raised (offline / transient HF error / unknown model).
+
+    The two not-``"supported"`` cases are deliberately distinct so the caller can report an ACCURATE
+    reason: ``"unsupported"`` is a real arch limitation, but ``"probe_failed"`` may be transient and
+    flex could actually work once the config is reachable. Best-effort: reads the config only (no
+    instantiate, no weights).
+    """
+    try:
+        import transformers
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        for arch in getattr(cfg, "architectures", None) or []:
+            cls = getattr(transformers, arch, None)
+            if cls is not None and getattr(cls, "_supports_flex_attn", False):
+                return "supported"
+        return "unsupported"
+    except Exception:
+        # Pure status helper: the caller (worker / bench) logs the SKIPPED reason exactly once, so
+        # this doesn't double-log — it returns the status and lets the caller decide what to report.
+        return "probe_failed"
+
+
+def model_supports_flex_attn(model_id: str) -> bool:
+    """True when this model's transformers architecture supports ``attn_implementation='flex_attention'``.
+
+    FlexAttention is the OTHER boundary-correct packing backend (it builds a block-diagonal document
+    mask from position_ids), so it enables 'bfd' packing on GPUs where FlashAttention-2 is absent —
+    e.g. the RTX 5090 (sm120). MEASURED: ~1.7x SFT throughput at equal VRAM vs no-packing on a
+    Llama-arch 0.5B (5090). But support is PER-ARCHITECTURE: standard decoders (Llama / Qwen2 /
+    Qwen3) set ``_supports_flex_attn=True``, while the Qwen3.5/3.6 hybrid-GDN multimodal class
+    (``Qwen3_5ForConditionalGeneration``) does NOT (transformers ValueError; HF issue #34809). So
+    this gates flex packing to the arches that actually support it. Best-effort: reads the config
+    only (no instantiate, no weights); returns False on any error / offline so packing stays off.
+    """
+    return flex_attn_status(model_id) == "supported"
+
+
 def optimal_attn_impl() -> str | None:
     """Best ``attn_implementation`` for the live GPU (None = leave transformers' default)."""
     try:
@@ -99,35 +144,18 @@ def _estimate_params(cfg) -> float:
 
 
 def _liger_default_for_model(model_id: str) -> bool:
-    """Default Liger ON only for models large enough that fused-CE's memory win pays off
-    (≥ _LIGER_MIN_PARAMS, ~3B). 1B-class models measured net-negative -> default OFF."""
+    """True when the model is large enough (≥ _LIGER_MIN_PARAMS, ~3B) to warrant the memory-mode
+    optimizations (sleep, grad checkpointing) — the worker's size gate, read via ``_memory_mode``.
+    (The ~3B cutoff is the old Liger fused-CE threshold this shared; flash now runs chalk
+    standalone — chalk's FLCE is unconditionally on regardless of size — but the memory cutoff
+    that the sleep/grad-checkpointing decisions key off is the same number, so the helper stays.)"""
     try:
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         return _estimate_params(cfg) >= _LIGER_MIN_PARAMS
     except Exception as e:
-        print("liger model-size probe failed (default off):", e)
-        return False
-
-
-def liger_on(default_on: bool) -> bool:
-    """Whether to enable a Liger kernel path. ``default_on`` is the model-size decision (on only
-    for models large enough that fused-CE's memory win pays off; 1B-class is a measured net loss).
-    Even when on, require a CUDA GPU AND that ``liger_kernel`` is importable — the local
-    ``flash[gpu]`` extra doesn't ship it, so blindly setting use_liger_kernel would crash a
-    local GPU run. No GPU / absent -> off."""
-    if not default_on:
-        return False
-    try:
-        import importlib.util
-
-        import torch
-
-        return bool(
-            torch.cuda.is_available() and importlib.util.find_spec("liger_kernel") is not None
-        )
-    except Exception:
+        print("model size probe failed (default off):", e)
         return False
 
 
@@ -152,6 +180,49 @@ def setup_perf_backends() -> None:
 
 
 
+def _remove_fla_dist_metadata(site_dirs: set[str]) -> list[str]:
+    """Delete ``flash-linear-attention``'s distribution metadata from each given site dir.
+
+    The import package is ``fla`` but the *distribution* is ``flash-linear-attention``, so removing
+    only the ``fla/`` dir leaves ``flash_linear_attention*.dist-info`` (plus any ``*.egg-info`` /
+    ``*.egg-link`` / ``__editable__.*.pth`` from a broken or editable install) behind. pip reads
+    that metadata as "requirement already satisfied" and SKIPS the git reinstall — so the package
+    dir never gets laid back down. Glob those metadata artifacts out of every scanned site dir so a
+    subsequent ``pip install <git url>`` actually reinstalls. Best-effort per path; returns removed.
+    """
+    import glob
+    import shutil
+
+    removed: list[str] = []
+    # Match both naming conventions: pip normalizes the dist name to flash_linear_attention, but
+    # legacy/egg tooling can leave the original hyphenated/underscored forms too.
+    patterns = (
+        "flash_linear_attention*.dist-info",
+        "flash-linear-attention*.dist-info",
+        "flash_linear_attention*.egg-info",
+        "flash-linear-attention*.egg-info",
+        "flash_linear_attention*.egg-link",
+        "flash-linear-attention*.egg-link",
+        "__editable__.flash_linear_attention*.pth",
+        "__editable__.flash-linear-attention*.pth",
+        "__editable___flash_linear_attention*.pth",
+    )
+    for site in site_dirs:
+        if not site or not os.path.isdir(site):
+            continue
+        for pat in patterns:
+            for path in glob.glob(os.path.join(site, pat)):
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                    removed.append(path)
+                except Exception as e:
+                    print(f"[fla] could not remove metadata {path}: {e}", flush=True)
+    return removed
+
+
 def _remove_fla_from_disk() -> tuple[list[str], bool]:
     """Physically delete every importable ``fla`` package dir from the worker's REAL sys.path.
 
@@ -159,13 +230,21 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
     the path) and invalidates import caches so transformers' is_fla_available() probe sees it
     gone. ``pip uninstall`` alone is unreliable here — it targets one site-packages but the base
     image bakes ``fla`` into another dir on the path (and can report success while leaving the
-    package dir). Returns ``(removed_dirs, still_importable)``. Used by the Hopper auto-drop.
+    package dir). ALSO removes ``flash-linear-attention``'s distribution metadata
+    (``*.dist-info``/``*.egg-info``/``*.egg-link``/editable ``.pth``) from every site dir it scans,
+    so pip doesn't see "requirement already satisfied" and skip the git reinstall (copilot PR #32).
+    Returns ``(removed_dirs, still_importable)``. Used by the Hopper fla fast-path setup
+    (and as its fail-closed fallback).
     """
     import importlib
     import importlib.util
     import shutil
 
     removed: list[str] = []
+    # Every site-packages root we touch — the PARENT of each removed `fla/` dir holds the matching
+    # dist-info — plus the active sys.path dirs (editable .pth / egg-link can live in any of them,
+    # and metadata may persist after the package dir is already gone). Scan all of them for metadata.
+    site_dirs: set[str] = {p for p in sys.path if p and os.path.isdir(p)}
     for _ in range(6):  # a few passes: removing one copy can reveal another earlier on the path
         importlib.invalidate_caches()
         spec = importlib.util.find_spec("fla")
@@ -178,6 +257,7 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
         progressed = False
         for loc in locs:
             if loc and os.path.isdir(loc) and os.path.basename(loc.rstrip("/")) == "fla":
+                site_dirs.add(os.path.dirname(loc))  # parent site-packages holds the dist-info
                 try:
                     shutil.rmtree(loc)
                     removed.append(loc)
@@ -186,6 +266,8 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
                     print(f"[fla] could not remove {loc}: {e}", flush=True)
         if not progressed:
             break
+    # Strip the leftover distribution metadata so pip can't short-circuit the git reinstall.
+    removed.extend(_remove_fla_dist_metadata(site_dirs))
     importlib.invalidate_caches()
     return removed, importlib.util.find_spec("fla") is not None
 
@@ -545,18 +627,31 @@ def _metric_curve(trainer, key: str) -> list:
         return []
 
 
-def _drop_fla_on_hopper() -> None:
-    """Remove flash-linear-attention when running on a Hopper GPU (sm90, H100).
+def _ensure_fla_fastpath_on_hopper() -> None:
+    """Make flash-linear-attention's GatedDeltaNet fast path CORRECT + fast on Hopper (sm90)
+    instead of dropping it.
 
-    fla's gated chunk_bwd Triton kernel is miscomputed on Hopper with Triton>=3.4 and
-    HARD-RAISES (fla #640), so every gated-delta (Qwen3.5/3.6 family) GRPO backward crashes.
-    The worker base image BAKES fla in, and per-run installs (extra_pip / `prime env install`)
-    can pull it back, so the only reliable place to drop it is HERE: in the worker process,
-    after all installs and BEFORE any model import. transformers then uses the correct
-    pure-PyTorch delta rule (2-3x slower but it RUNS). Runs on BOTH substrates (RunPod and
-    Vast both exec this module). importlib caches are invalidated so the later
-    is_fla_available() probe sees it gone. Ampere/Ada/Blackwell keep fla for the speedup.
+    fla's gated chunk_bwd Triton kernel is miscomputed on Hopper with Triton>=3.4 and HARD-RAISES
+    (fla #640). The worker historically DROPPED fla here and fell back to the pure-PyTorch delta
+    rule — correct but slow + memory-heavy. The real fix is fla's **tilelang** backend, which is
+    correct on Triton>=3.4. So on Hopper we ensure the working stack is present rather than
+    removing fla:
+      * the pinned ``tilelang==0.1.11`` (the correct GDN chunk_bwd backend) + the pinned
+        ``apache-tvm-ffi==0.1.11`` (0.1.12 double-registers the TVM-FFI runtime -> ``import
+        tilelang`` aborts; and tilelang's own ``apache-tvm-ffi~=0.1.0`` range would let 0.1.12
+        back in, so the pin is force-installed last and its resolved version is verified), and
+      * a COMPLETE ``fla`` (the PyPI ``flash-linear-attention`` wheel is a broken stub missing
+        ``fla.modules``; reinstall from git if the resident copy is incomplete).
+    Validated A/B (H100 SXM, Qwen3.5 hidden-2560 LoRA, controlled fla on/off): seq4096 435->105
+    ms/step & 9.9->6.1 GB (4.2x / 1.6x); seq8192 7.1x; seq16384 3106->247 ms & 32->17 GB (12.6x /
+    1.9x). Forward loss matches the torch delta to 1.8e-4 (correct). Runs on BOTH substrates
+    (RunPod + Vast exec this module), after all installs and BEFORE any model import. Non-Hopper:
+    no-op (fla's Triton kernel is correct there). Best-effort + FAIL-CLOSED: a failed install
+    (pip rc!=0), a missing module, or the wrong resolved ``apache-tvm-ffi`` version all flip the
+    gate off and DISABLE fla, leaving the (correct) pure-PyTorch delta rule in place — a worker
+    never crashes on a dep hiccup, and it never silently runs fla's broken Hopper GDN kernel.
     """
+    import importlib
     import importlib.util
     import subprocess
 
@@ -564,21 +659,141 @@ def _drop_fla_on_hopper() -> None:
         import torch
 
         if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
-            return  # not Hopper: fla's Triton kernel is correct here, keep it.
+            return  # not Hopper: fla's Triton kernel is correct here.
     except Exception:
         return
 
-    if importlib.util.find_spec("fla") is None:
-        return
-    # pip first (clears metadata); _remove_fla_from_disk then deletes any package dir pip left
-    # behind (incomplete RECORD / non-pip base-image install / a copy on another sys.path entry).
-    subprocess.run(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "flash-linear-attention"], check=False
-    )
-    removed, still = _remove_fla_from_disk()
-    print(
-        f"[hopper] fla removed {removed or 'nothing'} (still_importable={still}) -> "
-        f"{'WARNING fla remains' if still else 'pure-PyTorch delta rule'} (fla #640)",
-        flush=True,
-    )
+    def _have(mod: str) -> bool:
+        try:
+            return importlib.util.find_spec(mod) is not None
+        except Exception:
+            return False
 
+    def _ver(dist: str) -> str | None:
+        """Installed version of a distribution (by metadata), or None if absent/unreadable.
+
+        Distinct from _have (a find_spec import probe): the install can silently leave the WRONG
+        version resolved (e.g. tilelang's ``apache-tvm-ffi~=0.1.0`` range happily keeps 0.1.12,
+        which still find_spec-imports but aborts ``import tilelang``), so the gate must check the
+        actual installed version, not just importability.
+        """
+        try:
+            import importlib.metadata as _md
+
+            return _md.version(dist)
+        except Exception:
+            return None
+
+    def _pip(*args: str) -> bool:
+        """Run pip install; return True only if pip exited 0. A failed install (network/build/
+        resolver) must NOT be silently treated as success — the caller gates ``ok`` on this.
+        ``--break-system-packages``: the torch base image's python is PEP-668 externally-managed,
+        so a bare ``pip install`` ABORTS there (measured on a fresh worker whose env lacked the
+        PIP_BREAK_SYSTEM_PACKAGES the Dockerfile/bootstrap normally set) -> tilelang never lands and
+        the Hopper fast path silently degrades to the slow delta. The flag forces it through and is a
+        harmless no-op on an unmanaged python, so the safety-net install can't be defeated by env."""
+        try:
+            rc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", *args],
+                check=False,
+            ).returncode
+        except Exception:
+            return False
+        return rc == 0
+
+    # The exact apache-tvm-ffi pin the tilelang backend needs (0.1.12 double-registers the TVM-FFI
+    # runtime -> `import tilelang` aborts). Kept as a constant so the install spec and the post-
+    # install version gate below can't drift apart. Keep in lockstep with WORKER_DEPS / Dockerfile.
+    TVM_FFI_PIN = "0.1.11"
+    TILELANG_PIN = "0.1.11"  # pin the GDN backend too (same rationale as the fla SHA pin)
+
+    try:
+        # 1. tilelang backend (correct GDN chunk_bwd on Triton>=3.4) + the pinned tvm-ffi.
+        #    Track whether each install actually succeeded — a failed pip (rc!=0) must flip the
+        #    gate to the pure-PyTorch fallback rather than be ignored. (_have-only would also pass
+        #    on a stale/partial copy from a previous boot.) tilelang pulls apache-tvm-ffi via a
+        #    range that allows the broken 0.1.12, so force-reinstall the exact pin AFTER tilelang
+        #    and verify the resolved version below.
+        # Enforce the EXACT pin: (re)install when tilelang is absent OR a different version is
+        # resident (a job or the base image may carry another tilelang; _have-only would treat that
+        # as healthy and skip the install, leaving the wrong/uncertain GDN backend in place). Mirror
+        # the apache-tvm-ffi handling: check the installed version via _ver and reinstall on mismatch.
+        tilelang_ok = True
+        tilelang_reinstalled = False
+        if _ver("tilelang") != TILELANG_PIN:
+            tilelang_ok = _pip(f"tilelang=={TILELANG_PIN}")
+            tilelang_reinstalled = True
+        # Only force the tvm-ffi pin when it's actually wrong OR tilelang was just (re)installed
+        # (tilelang's apache-tvm-ffi~=0.1.0 range can have pulled the broken 0.1.12). Skipping the pip
+        # when the exact pin is already resident avoids avoidable cold-start latency and a spurious
+        # disable on a transient network/resolver failure — the ok gate still re-verifies the version.
+        # If this install runs and fails we DON'T trust the resident copy — tvm_ffi_ok gates `ok` below.
+        if _ver("apache-tvm-ffi") != TVM_FFI_PIN or tilelang_reinstalled:
+            tvm_ffi_ok = _pip(f"apache-tvm-ffi=={TVM_FFI_PIN}")
+        else:
+            tvm_ffi_ok = True
+        # 2. a COMPLETE fla — the PyPI wheel ships a stub without `fla.modules`. Reinstall from git
+        #    when the resident copy is missing the real package (or absent entirely).
+        fla_ok = True
+        if not (_have("fla") and _have("fla.modules")):
+            _remove_fla_from_disk()  # clear any broken stub before the git install
+            # Pinned to the same commit as WORKER_DEPS / Dockerfile.worker so a runtime reinstall is
+            # reproducible (the moving default branch could pull a broken/incompatible fla).
+            fla_ok = _pip(
+                "--no-deps",
+                "git+https://github.com/fla-org/flash-linear-attention.git"
+                "@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
+            )
+        importlib.invalidate_caches()
+        # Gate on BOTH (a) every install we ran exiting 0 — a failed pip (network/build/resolver)
+        # must NOT be treated as healthy just because a stale/partial copy still find_spec-imports —
+        # AND (b) the modules importing AND (c) the resolved apache-tvm-ffi being exactly the pin.
+        # (c) matters because tilelang depends on `apache-tvm-ffi~=0.1.0`, so the resolver can keep
+        # the broken 0.1.12 (which find_spec-imports fine but aborts `import tilelang`); checking the
+        # version is the only reliable signal the pin actually landed.
+        tvm_ffi_ver = _ver("apache-tvm-ffi")
+        tilelang_ver = _ver("tilelang")
+        installs_ok = tilelang_ok and tvm_ffi_ok and fla_ok
+        ok = (
+            installs_ok
+            and _have("fla")
+            and _have("fla.modules")
+            and _have("tilelang")
+            and tilelang_ver == TILELANG_PIN
+            and tvm_ffi_ver == TVM_FFI_PIN
+        )
+        if not ok:
+            # The healthy fla+tilelang stack could not be assembled, so fla's GDN chunk_bwd would
+            # still hit the broken Triton>=3.4 path on Hopper (fla #640) and HARD-RAISE. A print
+            # alone does NOT prevent that: transformers gates GDN on is_fla_available() (a
+            # find_spec('fla') probe), so as long as fla stays importable it gets engaged. PHYSICALLY
+            # remove fla so the probe sees it gone and transformers uses the correct pure-PyTorch
+            # delta rule instead of crashing. _remove_fla_from_disk loops over the real sys.path +
+            # invalidates caches, so find_spec('fla') is None afterwards (the gate flips off).
+            _removed, _still = _remove_fla_from_disk()
+            print(
+                "[hopper] fla GDN fast path unavailable -> DISABLING fla "
+                f"(installs_ok={installs_ok} [tilelang={tilelang_ok} tvm_ffi={tvm_ffi_ok} "
+                f"fla={fla_ok}], tilelang_ver={tilelang_ver!r} (want {TILELANG_PIN}), "
+                f"tvm_ffi_ver={tvm_ffi_ver!r} (want {TVM_FFI_PIN}); "
+                f"removed {len(_removed)} copy(ies); still_importable={_still}); "
+                "pure-PyTorch delta fallback",
+                flush=True,
+            )
+        else:
+            print(
+                "[hopper] fla GDN fast path ENABLED (fla+tilelang "
+                f"{tilelang_ver}/tvm-ffi {tvm_ffi_ver}, fla #640 fixed)",
+                flush=True,
+            )
+    except Exception as e:  # never let a dep hiccup crash the worker — torch delta still runs
+        # Fail-closed: an unexpected error mid-setup must still leave Hopper on the correct
+        # pure-PyTorch delta path, not a half-configured fla that transformers would engage and
+        # crash on (#640). Best-effort disable fla; never re-raise.
+        with contextlib.suppress(Exception):
+            _remove_fla_from_disk()
+        print(
+            f"[hopper] fla fast-path setup errored ({type(e).__name__}: {e}); "
+            "disabled fla -> pure-PyTorch delta",
+            flush=True,
+        )

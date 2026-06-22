@@ -116,7 +116,7 @@ _VOCAB_DEFAULT = 248_320
 _LOGITS_BUDGET_GB = 6.0
 
 # ---- SFT big-vocab logits: the SFT analog of the GRPO fp32-logits term above ----
-# When the worker's fused cross-entropy (Liger) is OFF, an SFT forward materializes the FULL-sequence
+# If the worker's fused cross-entropy (chalk's FLCE) were OFF, an SFT forward would materialize the FULL-sequence
 # [per_device, seq_len, vocab] logits AND keeps their gradient live through the backward. At
 # Qwen3.5's ~248k vocab this is the documented big-vocab SFT OOM driver (a 0.8B SFT OOM'd a 24 GB
 # card). The worker fuses CE only for a >=3B model OR a >=2048-token context (mirrors
@@ -140,11 +140,12 @@ _LIGER_LONG_CTX_TOKENS = 2048
 
 
 def sft_logits_fused(params_b: float | None, seq_len: int) -> bool:
-    """Whether the worker fuses the SFT cross-entropy (Liger), so the [per_device, seq, vocab] logits
-    never materialize. Mirrors engine.worker.perf._memory_mode without a network probe: fused for a
-    >=3B model OR a >=2048-token context. (The worker image bakes liger-kernel, so True here means
-    the fused kernel is actually used; if it were ever absent the per-device cap still bounds the
-    logits.)"""
+    """CONSERVATIVE estimate of whether the SFT cross-entropy is fused, so the
+    [per_device, seq, vocab] fp32 logits never materialize. flash now runs chalk's fused-linear-CE
+    (FLCE) for every model, but the ALLOCATOR only banks on that saving for a >=3B model OR a
+    >=2048-token context — a small short-context run is sized as if un-fused so the GPU is never
+    undersized if the fused path is ever unavailable (FLCE self-test fallback). Same >=3B / >=2048
+    threshold as engine.worker.perf._memory_mode; the worker's micro-batch cap keys off the same."""
     if seq_len >= _LIGER_LONG_CTX_TOKENS:
         return True
     return (params_b or 0.0) >= _LIGER_MIN_PARAMS_B

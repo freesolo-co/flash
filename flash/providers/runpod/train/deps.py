@@ -47,28 +47,39 @@ WORKER_DEPS = [
     # compatible with torch2.10 break transformers 5.6-5.10's hub_kernels integration at IMPORT
     # (LayerRepository now requires a version; transformers passes none -> ValueError on every
     # `import transformers`). FlashAttention via the Hub is therefore disabled; attention uses
-    # SDPA (already a flash/efficient backend on Ampere/Ada) + the Liger fused kernels below,
+    # SDPA (already a flash/efficient backend on Ampere/Ada) + the chalk fused kernels below,
     # which are the dominant LoRA speedup anyway. (FA via a pinned flash-attn wheel is a future
     # per-arch experiment, kept out of the default deps to avoid a fragile cold-start install.)
-    # Liger fused Triton kernels (pure Triton -> JITs on every arch incl. Blackwell): fused
-    # linear cross-entropy for SFT (use_liger_kernel) and the chunked GRPO loss
-    # (use_liger_loss) — the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
     "wandb>=0.17",
-    "liger-kernel>=0.5",
-    # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this,
-    # transformers falls back to a pure-PyTorch delta rule and GRPO trainer steps are
-    # 2-3x slower (measured A/B on Qwen3.5-2B: ~65 s/step -> ~20 s/step steady).
-    "flash-linear-attention==0.5.0",
-    # NB: fla's gated chunk_bwd is broken on HOPPER (H100) with Triton >= 3.4 (fla #640), so
-    # resolve_worker_deps DROPS fla on sm90 (the correct pure-PyTorch delta rule runs instead). The
-    # dense Qwen3.5 GDN models route to consumer cards by default, where fla works.
-    # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
-    # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
-    # (chalk_extra_pip) appends the version-pinned ``freesolo-chalk`` (DEFAULT_CHALK_SPEC) from PyPI
-    # to the worker's `extra_pip` for EVERY job by default — installed + applied automatically, like
-    # Liger. Override the source with FLASH_CHALK_SPEC (an exact version / git URL / wheel), or
-    # disable every kernel (FLASH_<K>=0) to skip the install. The worker pip-installs extra_pip for
-    # EVERY job (baked-image RunPod
+    # freesolo-chalk: flash's STANDALONE fused-kernel stack — it REPLACES Liger entirely. chalk
+    # supplies its OWN RMSNorm + SwiGLU + fused-linear-CE (the FLCE is the big large-vocab
+    # Qwen3.5 ~248k memory/throughput win that keeps the logits from materializing), PLUS the
+    # kernels Liger never had (RoPE / LoRA-delta / embedding). Pure Triton/CUDA, JITs on every arch
+    # incl. Blackwell. Baked in (as Liger was) so cold starts don't pip-install it. Keep this spec
+    # in lockstep with DEFAULT_CHALK_SPEC below + the freesolo-chalk install in Dockerfile.worker.
+    "freesolo-chalk>=0.2.0,<0.3.0",
+    # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this, transformers
+    # falls back to a pure-PyTorch delta rule that is dramatically slower + memory-heavier (measured
+    # A/B, Vast H100 SXM, Qwen3.5-0.8B LoRA: seq4096 4413->371 ms/step = 11.9x; seq8192 13.7x;
+    # seq16384 14498->945 ms = 15.3x; forward loss matches to ~6e-4). Installed from git: the PyPI
+    # ``flash-linear-attention`` wheel is a broken stub missing ``fla.modules``. PINNED to a specific
+    # commit (not the moving default branch) so cold-start installs are reproducible and a breaking
+    # upstream change can't silently land on a run; bump intentionally. Keep this SHA in lockstep
+    # with Dockerfile.worker + perf.py's runtime reinstall.
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
+    # fla's gated chunk_bwd is INCORRECT on Hopper (H100) with Triton>=3.4 (fla #640); its
+    # ``tilelang`` backend is the correct path there, so we KEEP fla on every arch (the worker's
+    # _ensure_fla_fastpath_on_hopper ensures tilelang is live on sm90 before any model import) rather
+    # than dropping it to the slow pure-PyTorch delta. PINNED (like the fla SHA) so cold-start
+    # installs / image rebuilds are reproducible. Keep in lockstep with Dockerfile.worker + perf.py.
+    "tilelang==0.1.11",
+    "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
+    # NB: freesolo-chalk is baked into the base deps above (it's REQUIRED now — chalk runs every
+    # fused kernel, standalone). The submit path (chalk_extra_pip) ALSO appends the resolved chalk
+    # spec to the worker's `extra_pip` so an operator can OVERRIDE the version/source per-run via
+    # FLASH_CHALK_SPEC (an exact version / git URL / wheel) — e.g. pin to the chalk standalone commit
+    # before 0.2.0 lands on PyPI; a redundant install matching the baked version is harmless. The
+    # worker pip-installs extra_pip for EVERY job (baked-image RunPod
     # _train_body + Vast bootstrap). Do NOT rely on
     # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS for this: the durable baked-image submit path
     # (jobs.build_function_input) returns the raw payload and never consults resolve_worker_deps, so
@@ -109,10 +120,11 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
 
     Precedence: FLASH_WORKER_DEPS (explicit list) > the pinned ``WORKER_DEPS``.
 
-    GPU-specific: on HOPPER (sm90, H100), DROP flash-linear-attention — its gated
-    chunk_bwd Triton kernel is miscomputed there (Triton>=3.4, fla #640). Without fla,
-    transformers uses the correct pure-PyTorch delta rule (slower but correct).
-    Ampere/Ada/Blackwell keep fla for the speedup.
+    fla is kept on ALL arches now (including Hopper): the worker's
+    _ensure_fla_fastpath_on_hopper ensures fla's correct ``tilelang`` backend is live on sm90
+    before any model import (fla #640's Triton>=3.4 miscompute is a tilelang-backend fix, not a
+    reason to drop fla). This makes Hopper GDN training ~4-13x faster + ~2x less memory than the
+    pure-PyTorch delta fallback.
     """
     explicit = os.environ.get("FLASH_WORKER_DEPS")
     if explicit:
@@ -131,18 +143,10 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
         if deps:
             return deps
     deps = list(WORKER_DEPS)
-    # Hopper (sm90) fla strategy: DROP flash-linear-attention -> the correct pure-PyTorch delta
-    # rule. fla's gated chunk_bwd Triton kernel is miscomputed on Hopper (Triton>=3.4, fla #640),
-    # so on H100 we run without it (the dense Qwen3.5 GDN models route to consumer cards by
-    # default, where fla stays). Ampere/Ada/Blackwell keep fla for the speedup.
-    if friendly_gpu:
-        try:
-            from flash.providers.base import get_gpu_info
-
-            if get_gpu_info(friendly_gpu).sm == "sm90":
-                deps = [d for d in deps if not d.startswith("flash-linear-attention")]
-        except Exception:
-            pass
+    # fla is kept on ALL arches (incl. Hopper sm90). On Hopper the correctness fix is fla's
+    # tilelang backend (baked into WORKER_DEPS + ensured by _ensure_fla_fastpath_on_hopper), NOT
+    # dropping fla — keeping it gives the ~4-13x faster / ~2x lighter GDN training the pure-PyTorch
+    # delta fallback can't. (friendly_gpu retained for signature/back-compat; no longer drops fla.)
     # Additive per-run extras (e.g. an extra pinned wheel for an A/B) without
     # restating the whole pinned stack the way FLASH_WORKER_DEPS requires.
     extra = os.environ.get("FLASH_WORKER_EXTRA_DEPS")
@@ -192,9 +196,11 @@ def _chalk_selected(spec=None) -> bool:
 
 # Default chalk install spec when FLASH_CHALK_SPEC is unset. VERSION-PINNED (bounded range, like the
 # rest of WORKER_DEPS) so a default run is reproducible and a breaking freesolo-chalk release can't
-# silently land on production jobs — 0.1.x patches are allowed, 0.2 is not. Bump intentionally after
-# validating a new line; an operator can pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z.
-DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.1.0,<0.2.0"
+# silently land on production jobs — 0.2.x patches are allowed, 0.3 is not. 0.2.0 is the STANDALONE
+# line (chalk's own RMSNorm/SwiGLU/FLCE, replacing Liger); keep in lockstep with the freesolo-chalk
+# pin in WORKER_DEPS + Dockerfile.worker. Bump intentionally after validating a new line; an operator
+# can pin exactly via FLASH_CHALK_SPEC=freesolo-chalk==X.Y.Z (or a git URL before 0.2.0 is on PyPI).
+DEFAULT_CHALK_SPEC = "freesolo-chalk>=0.2.0,<0.3.0"
 
 
 def chalk_extra_pip(spec=None) -> list[str]:
@@ -365,6 +371,13 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # (one per apply_chalk_kernel_to_qwen35 keyword); FLASH_<K>=0/1 overrides the kernel's
         # default. FLASH_CHALK_SPEC is the install spec install_chalk_kernels points operators at
         # (and is also consumed at submit time to add chalk to the worker's extra_pip).
+        # Default-on chalk standalone kernels (replace Liger's rms_norm/swiglu/FLCE):
+        # forwarding these is what lets an operator/per-run FLASH_<K>=0 actually DISABLE one on
+        # the worker — without them a control-plane override silently no-ops and the kernel
+        # stays on regardless of the flag.
+        "FLASH_RMSNORM_KERNEL",
+        "FLASH_SWIGLU_KERNEL",
+        "FLASH_FLCE_KERNEL",
         "FLASH_MLP_KERNEL",
         "FLASH_FP8_BASE",
         "FLASH_TRITON_LORA",

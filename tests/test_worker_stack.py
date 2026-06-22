@@ -19,6 +19,28 @@ def test_resolve_worker_deps_default(monkeypatch):
     assert resolve_worker_deps() == WORKER_DEPS
 
 
+def test_gdn_fastpath_deps_present_and_kept_on_hopper(monkeypatch):
+    """The GDN fast-path stack (fla-from-git + tilelang + pinned apache-tvm-ffi) is baked in, and
+    fla is KEPT on Hopper (sm90) — the #640 fix is fla's tilelang backend, not dropping fla."""
+    monkeypatch.delenv("FLASH_WORKER_DEPS", raising=False)
+    monkeypatch.delenv("FLASH_WORKER_EXTRA_DEPS", raising=False)
+    joined = " ".join(WORKER_DEPS)
+    assert (
+        "git+https://github.com/fla-org/flash-linear-attention" in joined
+    )  # complete fla, not the broken PyPI stub
+    assert any(
+        d.startswith("tilelang==") for d in WORKER_DEPS
+    )  # correct GDN backend on Triton>=3.4, PINNED for reproducibility
+    assert any(
+        d.startswith("apache-tvm-ffi==0.1.11") for d in WORKER_DEPS
+    )  # pin (0.1.12 aborts tilelang import)
+    # fla must NOT be dropped on Hopper anymore (it was, pre-fix).
+    deps_h100 = resolve_worker_deps("H100")
+    assert any("flash-linear-attention" in d for d in deps_h100), (
+        "fla must be kept on Hopper for the tilelang fast path"
+    )
+
+
 def test_resolve_worker_deps_explicit_list_wins(monkeypatch):
     # Whitespace-separated; a comma is part of a PEP 440 range, not a delimiter.
     monkeypatch.setenv("FLASH_WORKER_DEPS", "torch==2.99  vllm==9.9.9   transformers>=5.6,<5.11")
@@ -270,21 +292,84 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
     assert w.optimal_attn_impl() is None
 
 
-def test_liger_on_requires_default_and_gpu(monkeypatch):
-    """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
-    liger_kernel (both absent in CI), so it's off here too."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+def test_model_supports_flex_attn_gates_on_arch(monkeypatch):
+    """flex packing is enabled only for arches whose transformers class sets _supports_flex_attn:
+    Llama/Qwen2/Qwen3 yes; the Qwen3.5/3.6 hybrid-GDN class no (HF #34809). Probe reads the config
+    only and is safe (False) on any error. Uses an injected fake transformers (CPU venv has none)."""
+    from flash.engine.worker import perf
 
-    assert w.liger_on(False) is False
-    assert w.liger_on(True) is False  # no CUDA / liger_kernel in CI
+    class _SupportsFlex:
+        _supports_flex_attn = True
+
+    class _NoFlex:
+        _supports_flex_attn = False
+
+    def fake_transformers(arch=None, raise_on_cfg=False):
+        mod = types.ModuleType("transformers")
+
+        def _from_pretrained(*a, **k):
+            if raise_on_cfg:
+                raise RuntimeError("offline")
+            return types.SimpleNamespace(architectures=[arch])
+
+        mod.AutoConfig = types.SimpleNamespace(from_pretrained=_from_pretrained)
+        mod.LlamaForCausalLM = _SupportsFlex
+        mod.Qwen3_5ForConditionalGeneration = _NoFlex
+        return mod
+
+    # Llama-arch (e.g. MiniCPM5-1B) -> flex supported -> packing eligible
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers("LlamaForCausalLM"))
+    assert perf.model_supports_flex_attn("openbmb/MiniCPM5-1B") is True
+    # Qwen3.5 hybrid arch -> flex NOT supported -> packing stays off (correctly)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers("Qwen3_5ForConditionalGeneration"))
+    assert perf.model_supports_flex_attn("Qwen/Qwen3.5-4B") is False
+    # Any error (offline / unknown model) -> False, so packing never turns on unsafely
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers(raise_on_cfg=True))
+    assert perf.model_supports_flex_attn("whatever") is False
+
+
+def test_flex_attn_status_distinguishes_unsupported_from_probe_failure(monkeypatch):
+    """flex_attn_status() must separate a real arch limitation ('unsupported') from a possibly
+    transient config-probe failure ('probe_failed') so the worker's packing-SKIPPED diagnosis is
+    accurate (it shouldn't blame the arch when the model config merely couldn't be fetched)."""
+    from flash.engine.worker import perf
+
+    class _SupportsFlex:
+        _supports_flex_attn = True
+
+    class _NoFlex:
+        _supports_flex_attn = False
+
+    def fake_transformers(arch=None, raise_on_cfg=False):
+        mod = types.ModuleType("transformers")
+
+        def _from_pretrained(*a, **k):
+            if raise_on_cfg:
+                raise RuntimeError("offline")
+            return types.SimpleNamespace(architectures=[arch])
+
+        mod.AutoConfig = types.SimpleNamespace(from_pretrained=_from_pretrained)
+        mod.LlamaForCausalLM = _SupportsFlex
+        mod.Qwen3_5ForConditionalGeneration = _NoFlex
+        return mod
+
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers("LlamaForCausalLM"))
+    assert perf.flex_attn_status("openbmb/MiniCPM5-1B") == "supported"
+    # Probe SUCCEEDED but the arch genuinely lacks flex support.
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers("Qwen3_5ForConditionalGeneration"))
+    assert perf.flex_attn_status("Qwen/Qwen3.5-4B") == "unsupported"
+    # Probe FAILED (offline / transient) -> must NOT be reported as an arch limitation.
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers(raise_on_cfg=True))
+    assert perf.flex_attn_status("whatever") == "probe_failed"
 
 
 def test_liger_default_model_size_gate(monkeypatch):
-    """Liger default is OFF for small models (1B-class, measured net loss PR #174) and ON only
-    for models ≥ ~3B where fused-CE's memory win pays off."""
+    """The model-size gate (_liger_default_for_model) drives the memory-mode behaviors — sleep and
+    grad checkpointing: OFF for small models (1B-class, speed mode — measured net loss PR #174) and
+    ON for models ≥ ~3B where the memory headroom pays off. (chalk runs standalone and its FLCE is
+    unconditionally on regardless of size; this ~3B cutoff is the old Liger threshold the memory
+    decisions still share, hence the helper name.) Context-aware: a small model at long context is
+    memory-bound, so memory mode flips ON."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
@@ -384,6 +469,22 @@ def test_force_vllm_backend_for_sm120(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Hopper fla GDN fast-path fallback: when the healthy fla+tilelang stack can't be
+# assembled (probe `ok` false), fla must be DISABLED (physically removed) so transformers'
+# is_fla_available() gate flips off and the model uses the correct pure-PyTorch delta rule
+# instead of fla's broken Triton>=3.4 GDN chunk_bwd (fla #640). A print alone is not enough.
+# ---------------------------------------------------------------------------
+def _hopper_torch():
+    """A stub ``torch`` that looks like Hopper (sm90) with CUDA available."""
+    t = types.ModuleType("torch")
+    t.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_capability=lambda *a: (9, 0),
+    )
+    return t
+
+
+# ---------------------------------------------------------------------------
 # MIG / NVML boot guard (assert_usable_gpu): retriable-infra detection of a partition /
 # permission-restricted host before any real CUDA work (the NVML-assert crash class).
 # ---------------------------------------------------------------------------
@@ -394,6 +495,396 @@ def _fake_torch_named(name, available=True):
         get_device_name=lambda *a: name,
     )
     return t
+
+
+class _FakeCompleted:
+    """Minimal stand-in for subprocess.CompletedProcess so _pip can read .returncode."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+
+
+def _patch_hopper_stack(
+    monkeypatch,
+    *,
+    pip_rc: int = 0,
+    find_spec_ok: bool = True,
+    tvm_ffi_version: str | None = "0.1.11",
+    tilelang_version: str | None = "0.1.11",
+    record_pip: list[str] | None = None,
+):
+    """Wire the perf helper's external touchpoints for the Hopper fast-path tests and return the
+    list that records _remove_fla_from_disk (fla-disable) calls.
+
+    * ``pip_rc`` -> the return code every mocked ``pip install`` reports (non-zero = failed install).
+    * ``find_spec_ok`` -> whether the post-install import probe finds fla/fla.modules/tilelang.
+    * ``tvm_ffi_version`` -> what importlib.metadata.version('apache-tvm-ffi') reports (None=absent).
+    * ``tilelang_version`` -> what importlib.metadata.version('tilelang') reports (None=absent). The
+      helper gates the tilelang (re)install AND the final ``ok`` on this exact version, so a value
+      != the pin models a present-but-wrong-version stack.
+    * ``record_pip`` -> if given, every mocked ``pip install`` appends its joined spec args here (so
+      a test can assert WHICH packages were reinstalled).
+    """
+    import importlib.metadata
+    import importlib.util
+    import subprocess
+
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", _hopper_torch())
+
+    # subprocess is imported locally inside the helper, so patch the real module. Return a fake
+    # CompletedProcess so _pip can read .returncode (the install-success gate).
+    def _fake_run(cmd, *a, **k):
+        if record_pip is not None:
+            # cmd == [sys.executable, "-m", "pip", "install", *flags, *specs]; record just the
+            # specs (everything after "install" that isn't a -flag, so adding pip flags like
+            # -q / --break-system-packages / --no-deps doesn't shift what the asserts match).
+            record_pip.append(" ".join(str(c) for c in cmd[4:] if not str(c).startswith("-")))
+        return _FakeCompleted(pip_rc)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run, raising=True)
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        (lambda name: object()) if find_spec_ok else (lambda name: None),
+        raising=True,
+    )
+
+    def _fake_version(dist: str) -> str:
+        ver = {"apache-tvm-ffi": tvm_ffi_version, "tilelang": tilelang_version}.get(dist)
+        if ver is None:
+            raise importlib.metadata.PackageNotFoundError(dist)
+        return ver
+
+    monkeypatch.setattr(importlib.metadata, "version", _fake_version, raising=True)
+
+    removed: list[int] = []
+    monkeypatch.setattr(
+        perf, "_remove_fla_from_disk", lambda: (removed.append(1), (["/x/fla"], False))[1]
+    )
+    return perf, removed
+
+
+def test_hopper_fla_fallback_disables_fla_when_stack_unavailable(monkeypatch):
+    """Probe fails (fla absent after install attempt) -> _remove_fla_from_disk IS called so the
+    fla gate flips off and the worker uses the pure-PyTorch delta path (not the broken fla kernel)."""
+    perf, removed = _patch_hopper_stack(monkeypatch, find_spec_ok=False)
+
+    perf._ensure_fla_fastpath_on_hopper()
+
+    # The fallback gating actually fired: fla was disabled (the gate, not just a print).
+    assert removed, "fallback must DISABLE fla (call _remove_fla_from_disk) when ok is false"
+
+
+def test_hopper_fla_fallback_when_install_fails(monkeypatch):
+    """A FAILED pip install (rc!=0) must flip the gate off + disable fla EVEN IF find_spec still
+    succeeds on a stale/partial resident copy — a failed install is not silently treated as healthy
+    (Copilot review on perf.py:~487). Without the rc check, find_spec alone would wrongly keep fla.
+    A wrong tvm-ffi version makes the helper ATTEMPT the pinned reinstall (the conditional-install
+    gate), so pip_rc=1 exercises the failed-install path."""
+    perf, removed = _patch_hopper_stack(
+        monkeypatch, pip_rc=1, find_spec_ok=True, tvm_ffi_version="0.1.12"
+    )
+
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert removed, "a failed install (rc!=0) must DISABLE fla even when find_spec passes"
+
+
+def test_hopper_fla_fallback_when_tvm_ffi_pin_did_not_land(monkeypatch):
+    """tilelang's apache-tvm-ffi~=0.1.0 range can keep the BROKEN 0.1.12 (find_spec-importable but
+    aborts `import tilelang`). The gate verifies the RESOLVED tvm-ffi version, so a wrong version
+    disables fla even though every install 'succeeded' and every module imports."""
+    perf, removed = _patch_hopper_stack(
+        monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.12"
+    )
+
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert removed, "wrong resolved apache-tvm-ffi version must DISABLE fla (pin didn't land)"
+
+
+def test_hopper_fla_kept_when_stack_healthy(monkeypatch):
+    """Success path: every install exits 0, fla + fla.modules + tilelang all import, AND the
+    resolved apache-tvm-ffi is exactly the pin -> fla is KEPT (the fast path is engaged, not
+    removed)."""
+    perf, removed = _patch_hopper_stack(
+        monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.11"
+    )
+
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert not removed, "healthy stack must KEEP fla (no disable on the success path)"
+
+
+def test_hopper_tilelang_present_but_wrong_version_is_reinstalled(monkeypatch):
+    """Regression (Copilot review on perf.py:~511): a DIFFERENT tilelang already resident (a job or
+    the base image carries one) must NOT be treated as healthy. The helper gates on the installed
+    version, so it (re)installs the exact pin; once the pin lands fla is KEPT."""
+    pip_calls: list[str] = []
+    # Resident wrong version first; after the (mocked) reinstall the metadata reports the pin.
+    perf, removed = _patch_hopper_stack(
+        monkeypatch,
+        pip_rc=0,
+        find_spec_ok=True,
+        tvm_ffi_version="0.1.11",
+        tilelang_version="0.1.11",  # post-reinstall resolved version
+        record_pip=pip_calls,
+    )
+    # Make the FIRST _ver('tilelang') read (the install gate) see a stale wrong version, while the
+    # final ok-gate read sees the pin — i.e. the reinstall corrected it.
+    import importlib.metadata as _md
+
+    gate_reads = iter(["0.1.9"])  # first read = stale; later reads -> pin (reinstall corrected it)
+    orig_version = _md.version
+
+    def _versioned(dist: str) -> str:
+        if dist == "tilelang":
+            return next(gate_reads, "0.1.11")
+        return orig_version(dist)
+
+    monkeypatch.setattr(_md, "version", _versioned, raising=True)
+
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert any(c.startswith("tilelang==0.1.11") for c in pip_calls), (
+        f"present-but-wrong tilelang must trigger a pinned reinstall, got pip calls: {pip_calls}"
+    )
+    assert not removed, "after the pin reinstall lands, fla must be KEPT"
+
+
+def test_hopper_tilelang_wrong_version_persists_disables_fla(monkeypatch):
+    """If the resident tilelang is the WRONG version AND the reinstall doesn't land the pin (version
+    still != pin), the final gate must DISABLE fla — the uncertain GDN backend is not trusted."""
+    pip_calls: list[str] = []
+    perf, removed = _patch_hopper_stack(
+        monkeypatch,
+        pip_rc=0,
+        find_spec_ok=True,
+        tvm_ffi_version="0.1.11",
+        tilelang_version="0.1.9",  # wrong version throughout (reinstall didn't correct it)
+        record_pip=pip_calls,
+    )
+
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert any(c.startswith("tilelang==0.1.11") for c in pip_calls), (
+        "wrong resident tilelang must still attempt the pinned reinstall"
+    )
+    assert removed, "tilelang version != pin after install must DISABLE fla (pin didn't land)"
+
+
+def test_hopper_tvm_ffi_pip_skipped_when_pin_already_present(monkeypatch):
+    """Regression (Copilot review on perf.py:~521): when the EXACT apache-tvm-ffi pin is already
+    resident AND tilelang was NOT (re)installed this invocation, the helper must SKIP the tvm-ffi
+    pip — re-running it unconditionally adds avoidable cold-start latency and could spuriously
+    disable fla on a transient network/resolver hiccup. The ok gate still re-verifies the version,
+    so fla stays KEPT."""
+    pip_calls: list[str] = []
+    perf, removed = _patch_hopper_stack(
+        monkeypatch,
+        pip_rc=0,
+        find_spec_ok=True,
+        tvm_ffi_version="0.1.11",  # exact pin already resident
+        tilelang_version="0.1.11",  # exact pin -> tilelang NOT reinstalled this invocation
+        record_pip=pip_calls,
+    )
+
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert not any("apache-tvm-ffi" in c for c in pip_calls), (
+        "tvm-ffi pin already resident + tilelang not reinstalled must SKIP the tvm-ffi pip, "
+        f"got pip calls: {pip_calls}"
+    )
+    assert not removed, "the pin being resident is the healthy path -> fla must be KEPT"
+
+
+def test_hopper_outer_exception_disables_fla(monkeypatch):
+    """Regression (Copilot review on perf.py:~580): an unexpected error mid-setup (AFTER the Hopper
+    check passes) must FAIL-CLOSED — best-effort disable fla so transformers can't engage the broken
+    Triton GDN path (#640) on a half-configured fla. The outer handler must call _remove_fla_from_disk
+    and never re-raise."""
+    import importlib
+
+    perf, removed = _patch_hopper_stack(
+        monkeypatch, pip_rc=0, find_spec_ok=True, tvm_ffi_version="0.1.11"
+    )
+
+    # Make a call inside the try (after the Hopper guard + installs) blow up. invalidate_caches runs
+    # right before the import-probe gate, so this drives the outer `except`.
+    def _boom() -> None:
+        raise RuntimeError("invalidate_caches exploded")
+
+    monkeypatch.setattr(importlib, "invalidate_caches", _boom, raising=True)
+
+    # Must NOT propagate (the worker keeps running on the pure-PyTorch delta path).
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert removed, "outer exception path must FAIL-CLOSED: disable fla (call _remove_fla_from_disk)"
+
+
+def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
+    """On a non-Hopper arch (fla's Triton kernel is correct there) the helper is a no-op — it must
+    NOT touch fla at all (neither install nor disable)."""
+    import importlib.util
+    import subprocess
+
+    from flash.engine.worker import perf
+
+    t = types.ModuleType("torch")
+    t.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_capability=lambda *a: (12, 0),  # Blackwell consumer (sm120) — not Hopper
+    )
+    monkeypatch.setitem(sys.modules, "torch", t)
+    touched: list[str] = []
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: touched.append("pip"), raising=True
+    )
+    monkeypatch.setattr(
+        perf, "_remove_fla_from_disk", lambda: (touched.append("remove"), ([], False))[1]
+    )
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None, raising=True)
+
+    perf._ensure_fla_fastpath_on_hopper()
+
+    assert touched == [], "non-Hopper must be a no-op (don't install or disable fla)"
+
+
+def test_fla_git_pin_is_consistent_and_pinned():
+    """The fla git dependency is PINNED to an exact commit (not the moving default branch) and the
+    SAME SHA is used in both WORKER_DEPS and Dockerfile.worker (worker venv == baked image)."""
+    import pathlib
+    import re
+
+    spec = next(d for d in WORKER_DEPS if "flash-linear-attention" in d)
+    m = re.search(r"flash-linear-attention\.git@([0-9a-f]{40})\b", spec)
+    assert m, f"fla dep must be pinned to a 40-char commit SHA, got: {spec!r}"
+    deps_sha = m.group(1)
+
+    # repo root: tests/ -> repo root is the parent.
+    root = pathlib.Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile.worker").read_text()
+    dm = re.search(r"flash-linear-attention\.git@([0-9a-f]{40})\b", dockerfile)
+    assert dm, "Dockerfile.worker fla install must be pinned to a 40-char commit SHA"
+    assert dm.group(1) == deps_sha, (
+        "Dockerfile.worker fla SHA must match WORKER_DEPS so the baked image and the worker "
+        f"venv agree (deps={deps_sha}, dockerfile={dm.group(1)})"
+    )
+
+    # The worker's runtime fla reinstall (perf._ensure_fla_fastpath_on_hopper) must use the SAME pin —
+    # an unpinned reinstall would pull the moving default branch and defeat reproducibility.
+    perf_src = (root / "flash" / "engine" / "worker" / "perf.py").read_text()
+    # The URL is built via implicit string concatenation across lines:
+    #   "...flash-linear-attention.git"\n        "@<sha>" — so allow quotes/newline/space between.
+    pm = re.search(r"flash-linear-attention\.git[\"'\s]*@([0-9a-f]{40})\b", perf_src)
+    assert pm, "perf.py runtime fla reinstall must be pinned to a 40-char commit SHA"
+    assert pm.group(1) == deps_sha, (
+        f"perf.py fla SHA must match WORKER_DEPS (deps={deps_sha}, perf={pm.group(1)})"
+    )
+
+
+def test_tilelang_pin_is_consistent_and_pinned():
+    """tilelang (the Hopper GDN correctness backend) is PINNED to an exact version (not unversioned)
+    and the SAME pin is used in WORKER_DEPS, Dockerfile.worker, and perf.py's runtime reinstall, so
+    cold-start installs / image rebuilds / runtime reinstalls all resolve the identical backend
+    (Copilot review on deps.py:~70)."""
+    import pathlib
+    import re
+
+    spec = next(d for d in WORKER_DEPS if d.split("==")[0].split(">")[0].strip() == "tilelang")
+    m = re.match(r"tilelang==([0-9][0-9A-Za-z.\-]*)$", spec.strip())
+    assert m, f"tilelang must be pinned to an exact version (tilelang==X.Y.Z), got: {spec!r}"
+    pin = m.group(1)
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile.worker").read_text()
+    dm = re.search(r'"tilelang==([0-9][0-9A-Za-z.\-]*)"', dockerfile)
+    assert dm, "Dockerfile.worker must install a PINNED tilelang==X.Y.Z (not unversioned)"
+    assert dm.group(1) == pin, (
+        f"Dockerfile.worker tilelang pin must match WORKER_DEPS (deps={pin}, dockerfile={dm.group(1)})"
+    )
+
+    perf_src = (root / "flash" / "engine" / "worker" / "perf.py").read_text()
+    # perf.py builds the spec via an f-string `f"tilelang=={TILELANG_PIN}"`, so assert the constant.
+    pm = re.search(r'TILELANG_PIN\s*=\s*"([0-9][0-9A-Za-z.\-]*)"', perf_src)
+    assert pm, "perf.py must define a pinned TILELANG_PIN constant for the runtime reinstall"
+    assert pm.group(1) == pin, (
+        f"perf.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _remove_fla_from_disk: also strips flash-linear-attention dist metadata so a
+# stale/broken install is fully removed and `pip install <git url>` reinstalls
+# (Copilot PR #32 review on perf.py:~541).
+# ---------------------------------------------------------------------------
+def test_remove_fla_dist_metadata_strips_all_artifact_kinds(tmp_path):
+    """The metadata helper removes every distribution-metadata artifact kind for
+    flash-linear-attention from each scanned site dir (dist-info, egg-info, egg-link, editable .pth)
+    — both the normalized (underscore) and legacy (hyphen) name forms — best-effort per path."""
+    from flash.engine.worker import perf
+
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    distinfo = site / "flash_linear_attention-0.1.dot0.dist-info"
+    distinfo.mkdir()
+    (distinfo / "METADATA").write_text("Name: flash-linear-attention\n")
+    egginfo = site / "flash_linear_attention.egg-info"
+    egginfo.mkdir()
+    egglink = site / "flash-linear-attention.egg-link"
+    egglink.write_text("/somewhere/src\n")
+    editable_pth = site / "__editable__.flash_linear_attention-0.1.dot0.pth"
+    editable_pth.write_text("/somewhere/src\n")
+    # An UNRELATED package's metadata must be left untouched.
+    keep = site / "torch-2.10.dist-info"
+    keep.mkdir()
+
+    removed = perf._remove_fla_dist_metadata({str(site)})
+
+    assert not distinfo.exists(), "dist-info must be removed"
+    assert not egginfo.exists(), "egg-info must be removed"
+    assert not egglink.exists(), "egg-link must be removed"
+    assert not editable_pth.exists(), "editable .pth must be removed"
+    assert keep.exists(), "unrelated package metadata must NOT be touched"
+    assert str(distinfo) in removed
+    assert str(egginfo) in removed
+
+
+def test_remove_fla_from_disk_removes_package_dir_and_dist_info(tmp_path, monkeypatch):
+    """End-to-end: seeding a fake site-packages with BOTH a `fla/` package dir and a
+    `flash_linear_attention-*.dist-info/` and running `_remove_fla_from_disk()` removes BOTH — so
+    pip can no longer see "requirement already satisfied" and skip the runtime git reinstall."""
+    import importlib
+
+    from flash.engine.worker import perf
+
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    # A real importable `fla` package so find_spec('fla') resolves it from our temp path.
+    fla_pkg = site / "fla"
+    fla_pkg.mkdir()
+    (fla_pkg / "__init__.py").write_text("# fake fla\n")
+    dist_info = site / "flash_linear_attention-0.1.dot0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text("Name: flash-linear-attention\nVersion: 0.1.dot0\n")
+
+    # Put our fake site-packages FIRST on sys.path so the spec resolves there, and clear any cached
+    # `fla` import so find_spec re-resolves from disk.
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.delitem(sys.modules, "fla", raising=False)
+    importlib.invalidate_caches()
+
+    removed, still_importable = perf._remove_fla_from_disk()
+
+    assert not fla_pkg.exists(), "the fla/ package dir must be removed"
+    assert not dist_info.exists(), (
+        "the flash_linear_attention*.dist-info metadata must ALSO be removed so pip reinstalls"
+    )
+    assert str(fla_pkg) in removed
+    assert str(dist_info) in removed
+    assert not still_importable, "fla must no longer be importable from disk"
 
 
 def test_assert_usable_gpu_full_card_ok(monkeypatch):
