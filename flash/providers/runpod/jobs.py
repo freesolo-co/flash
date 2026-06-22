@@ -354,13 +354,17 @@ def poll_job(
             elif not detail:
                 detail = str(out)[:1500]
             # Structural classification only ([{status}] prefix is for human-readable logs).
+            # A platform termination (CANCELLED/TIMED_OUT) is already retryable — skip the worker
+            # heartbeat read entirely (no worker error there, and it may not even exist yet).
+            if status in PLATFORM_TERMINATIONS:
+                return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
+            # A worker FAILED: consult the structured worker flags (one forced heartbeat read).
             retriable, exclude_class = worker_retry_flags(heartbeat_reader)
-            if status in PLATFORM_TERMINATIONS or retriable:
-                failure = "job_preempted"
-            else:
-                failure = "job_failed"
             return PollResult(
-                False, failure=failure, detail=f"[{status}] {detail}", exclude_class=exclude_class
+                False,
+                failure="job_preempted" if retriable else "job_failed",
+                detail=f"[{status}] {detail}",
+                exclude_class=exclude_class,
             )
         # While queued, surface worker availability (throttled hosts are the common
         # cause of silent multi-minute waits — make them visible in the run log).
