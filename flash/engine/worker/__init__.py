@@ -850,16 +850,12 @@ def run_sft():
     # cross-contaminate (silent quality loss). The boundary-correct backend is FlashAttention-2
     # varlen (reads position_ids); but flash-attn has NO prebuilt wheel for torch 2.10 (PyPI
     # sdist-only; Dao-AILab wheels stop at torch 2.9) so it would build from source on every cold
-    # start (~20 min, fragile) — it is NOT in the worker image. So _fa_ok is False on the current
-    # stack and packing is effectively unavailable until flash-attn is baked into a prebuilt image.
-    # Packing is ON when FA2 is importable (varlen keeps 'bfd' example boundaries correct); else
-    # SKIP — without a boundary-correct attn backend examples would cross-contaminate under SDPA.
-    # Packing needs a boundary-correct attn so 'bfd'-packed examples don't cross-contaminate.
-    # FA2 varlen is one such backend; flex_attention (block-diagonal doc mask) is the other, and it
-    # works WITHOUT flash-attn — so it enables packing on archs that support it even on torch 2.10 /
-    # sm120 where FA2 is absent. MEASURED ~1.7x SFT throughput at equal VRAM on a Llama-arch 0.5B
-    # (5090). flex support is per-arch (Llama/Qwen2/3 yes; Qwen3.5/3.6 hybrid-GDN no — HF #34809),
-    # so we only turn flex packing on when the model's arch supports it.
+    # start (~20 min, fragile) — it is NOT in the worker image, so _fa_ok is False on the current
+    # stack. That alone used to disable packing — but flex_attention (block-diagonal doc mask) is a
+    # SECOND boundary-correct backend that needs NO flash-attn, so it enables 'bfd' packing on archs
+    # that support it even on torch 2.10 / sm120 where FA2 is absent. MEASURED ~1.7x SFT throughput
+    # at equal VRAM on a Llama-arch 0.5B (5090). flex support is per-arch (Llama/Qwen2/3 yes;
+    # Qwen3.5/3.6 hybrid-GDN no — HF #34809), so we only enable flex packing when the arch supports it.
     _fa_ok = _flash_attn_available()
     # When FA2 is absent, flex is the fallback boundary-correct backend — but only if the model's
     # arch supports it. Capture WHY it's unavailable so the SKIPPED message is accurate (a real arch
@@ -1977,14 +1973,17 @@ def main():
                     os._exit(0)
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
-        # Not a DONE re-delivery -> this worker will train. These must run before any model import:
-        _ensure_fla_fastpath_on_hopper()  # Hopper: enable fla+tilelang GDN fast path (see perf.py)
-        heartbeat("boot")
+        # Not a DONE re-delivery -> this worker will train. These must run before any model import.
+        heartbeat("boot")  # FIRST: signal liveness before any slow setup (Hopper fla/tilelang install)
         # Boot guard: a MIG slice / NVML-restricted host (RunPod has fulfilled a full-GPU request
         # with a MIG partition) makes PyTorch's allocator NVML-assert mid-backward. Detect it now
         # and raise the RETRIABLE infra error so the control plane resubmits on a fresh worker,
         # instead of crashing opaquely deep in training as a non-retried job_failed.
         assert_usable_gpu()
+        # Hopper: enable fla+tilelang GDN fast path (see perf.py). AFTER the GPU guard so a MIG /
+        # unusable host bails RETRIABLE without first paying the multi-minute tilelang/fla install;
+        # still before any model import (transformers gates GDN on is_fla_available() at load).
+        _ensure_fla_fastpath_on_hopper()
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
