@@ -1978,8 +1978,10 @@ def main():
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
-        # Structured retry signal both pollers read: infra failure -> retry on a fresh worker.
+        # Structured retry signal both pollers read: infra failure -> retry on a fresh worker;
+        # exclude_class -> the GPU class is at fault (MIG), so re-allocate OFF it.
         retriable = isinstance(e, RetriableInfraError)
+        exclude_class = bool(getattr(e, "exclude_class", False))
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
@@ -1990,10 +1992,11 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
+        hb_flags = {"retriable": retriable, "exclude_class": exclude_class}
         try:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], retriable=retriable, diag=gpu_diagnostics())
+            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], retriable=retriable)
+            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags)
         # keep container alive briefly so logs flush, then exit non-zero -> restart
         time.sleep(10)
         raise
