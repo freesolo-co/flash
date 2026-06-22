@@ -59,7 +59,7 @@ def test_worker_stack_pins_qwen35_capable_versions():
     assert "vllm==0.19" in joined  # first transformers-5-compatible vllm line
     assert "transformers>=5" in joined  # qwen3_5 model types need transformers 5.x
     assert "trl>=1.6" in joined  # 1.6 adds the GRPO tools=/rollout_func multi-turn hooks
-    assert "bitsandbytes" in joined  # QLoRA tier for the 35B-A3B MoE
+    assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
 
 
 # ---------------------------------------------------------------------------
@@ -404,10 +404,9 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B", 4096) is True
 
 
-def test_make_lora_skips_pissa_on_4bit_qlora(monkeypatch):
-    """PiSSA init raises on a 4-bit base (peft TypeError -> the whole run crashed), so make_lora
-    must SKIP PiSSA on the QLoRA tier (catalog 9B) and keep it on the bf16/LoRA tier. rsLoRA stays
-    on for both. Regression for the Qwen3.5-9B QLoRA training crash."""
+def test_make_lora_enables_pissa_and_rslora(monkeypatch):
+    """The whole catalog is bf16 (4-bit QLoRA dropped), so PiSSA's SVD always has the unquantized
+    base it needs: make_lora enables PiSSA + rsLoRA unconditionally for every model."""
     captured = {}
     fake_peft = types.ModuleType("peft")
     fake_peft.LoraConfig = lambda **kw: (captured.update(kw), kw)[1]
@@ -416,21 +415,11 @@ def test_make_lora_skips_pissa_on_4bit_qlora(monkeypatch):
     worker = _import_worker(monkeypatch)
     monkeypatch.setattr(worker, "lora_exclude_modules", lambda m: None)
 
-    # 4-bit QLoRA tier -> NO PiSSA of ANY variant (any pissa_* init crashes on a 4-bit base);
-    # rsLoRA still on.
-    monkeypatch.setattr(worker, "model_quant", lambda m: "4bit-qlora")
-    captured.clear()
-    worker.make_lora("Qwen/Qwen3.5-9B")
-    _init = str(captured.get("init_lora_weights", "")).lower()
-    assert not _init.startswith("pissa"), f"PiSSA must be skipped on 4-bit, got {_init!r}"
-    assert captured.get("use_rslora") is True
-
-    # bf16/LoRA tier -> PiSSA on
-    monkeypatch.setattr(worker, "model_quant", lambda m: "bf16")
-    captured.clear()
-    worker.make_lora("Qwen/Qwen3.5-0.8B")
-    assert captured.get("init_lora_weights") == "pissa_niter_16"
-    assert captured.get("use_rslora") is True
+    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
+        captured.clear()
+        worker.make_lora(model_id)
+        assert captured.get("init_lora_weights") == "pissa_niter_16"
+        assert captured.get("use_rslora") is True
 
 
 def test_force_vllm_backend_for_sm120(monkeypatch):

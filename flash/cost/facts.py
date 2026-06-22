@@ -105,7 +105,7 @@ def total_params_b(model_id: str) -> float:
 
 
 def model_quant(model_id: str) -> str:
-    """Quantization of the catalog entry (``"bf16"`` or ``"4bit-qlora"``); bf16 default."""
+    """Quantization of the catalog entry; ``"bf16"`` for the whole catalog today (bf16 default)."""
     info = MODELS.get(model_id)
     return (info.quant or "bf16") if info is not None else "bf16"
 

@@ -47,12 +47,12 @@ from flash.engine.recipe import RECIPE
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     _VL_EXCLUDE_SEGMENTS,  # noqa: F401
-    _patch_peft_weight_converter_compat,
+    _patch_peft_weight_converter_compat,  # noqa: F401
     _remap_vl_sync_weights,  # noqa: F401
     assert_lora_applied,
     is_vl_checkpoint,
     lora_exclude_modules,
-    model_quant,
+    model_quant,  # noqa: F401
     patch_vllm_language_model_only,
     patch_vllm_lm_weight_sync,
     remap_adapter_keys,  # noqa: F401
@@ -644,18 +644,11 @@ def make_lora(model_id: str | None = None):
     # PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds) so LoRA
     # converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
     # NOTE: PiSSA mutates the effective base, so the saved adapter is a PiSSA-residual unless
-    # converted — fine for our train+eval+serve-same-stack flow.
-    # BUT PiSSA's SVD needs an UNQUANTIZED base: on the 4-bit QLoRA tier peft raises "Please
-    # initialize PiSSA under float32/float16/bfloat16" and the whole run crashes at adapter init.
-    # The catalog's 9B is 4bit-qlora by default, so every 9B run died here. Fall back to the
-    # default LoRA init on the QLoRA tier; PiSSA stays on for the bf16/LoRA tier.
-    if model_id and model_quant(model_id) == "4bit-qlora":
-        print("[lora] 4-bit QLoRA base -> default LoRA init (PiSSA needs an fp base)")
-    else:
-        kwargs["init_lora_weights"] = "pissa_niter_16"
-        print("[lora] init_lora_weights=pissa_niter_16")
+    # converted — fine for our train+eval+serve-same-stack flow. The whole catalog is bf16, so
+    # PiSSA's SVD always has the unquantized base it needs and is on unconditionally.
+    kwargs["init_lora_weights"] = "pissa_niter_16"
+    print("[lora] init_lora_weights=pissa_niter_16")
     # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
-    # Quant-independent (just the alpha/sqrt(r) scale), so on for both tiers.
     kwargs["use_rslora"] = True
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
@@ -665,23 +658,6 @@ def make_lora(model_id: str | None = None):
     return LoraConfig(**kwargs)
 
 
-
-
-def qlora_model_init_kwargs() -> dict:
-    """Model-load kwargs for the 4-bit QLoRA tier: bf16 compute + a bitsandbytes NF4
-    (double-quant) config so the frozen base loads in 4-bit and only the LoRA adapter trains."""
-    import torch
-    from transformers import BitsAndBytesConfig
-
-    return {
-        "dtype": torch.bfloat16,
-        "quantization_config": BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        ),
-    }
 
 
 def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_id: str) -> None:
@@ -898,6 +874,8 @@ def run_sft():
     # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen/masked attn.
     # Force the boundary-correct backend whenever packing is on, over the SDPA default which would
     # cross-contaminate packed examples: FA2 varlen if available, else flex_attention's doc mask.
+    # (Merge: keep this PR's flex_attention fallback; QLoRA tier dropped per dev #74 — catalog is
+    # all bf16 — so model_init_kwargs is plain bf16.)
     if cfg_kwargs.get("packing"):
         if _fa_ok:
             _attn = "flash_attention_2"
@@ -905,18 +883,11 @@ def run_sft():
         elif _flex_ok:
             _attn = "flex_attention"
             print("[sft] attn_implementation=flex_attention (packing boundary-correct block mask)")
-    quant = model_quant(model_id)
-    if quant == "4bit-qlora":
-        # QLoRA tier: 4-bit NF4 base + bf16 LoRA adapters (e.g. Qwen3.5-9B on a 5090).
-        _patch_peft_weight_converter_compat()  # adapter (re)load, e.g. ckpt resume
-        mik = qlora_model_init_kwargs()
-        print(f"[sft] loading {model_id} in 4-bit (QLoRA tier)")
-    else:
-        # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
-        # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
-        # accelerate-offload large models to meta ("expected device meta but got
-        # cuda:0" in backward on the 9B).
-        mik = {"dtype": "bfloat16", "device_map": None}
+    # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
+    # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
+    # accelerate-offload large models to meta ("expected device meta but got
+    # cuda:0" in backward on the 9B).
+    mik = {"dtype": "bfloat16", "device_map": None}
     if _attn:
         mik["attn_implementation"] = _attn
     cfg_kwargs["model_init_kwargs"] = mik
@@ -1276,28 +1247,13 @@ def _init_adapter_model(model_id: str):
     # otherwise peft only WARNS about missing keys and silently trains a fresh LoRA, discarding the
     # SFT. No-op for non-VL checkpoints. See flash/engine/worker/lora.py.
     remap_vl_adapter_dir(adir, model_id)
-    # 4-bit-QLoRA tier: load the frozen base in NF4 so a continued-adapter GRPO run fits
-    # the same memory budget as a fresh-LoRA one (and TRL still sees Linear4bit modules ->
-    # bitsandbytes vLLM rollout).
-    if model_quant(model_id) == "4bit-qlora":
-        _patch_peft_weight_converter_compat()
-        _attn = optimal_attn_impl()  # arch-aware attention on the QLoRA path too
-        _mik = qlora_model_init_kwargs()
-        if _attn:  # else leave transformers' default (sdpa)
-            _mik["attn_implementation"] = _attn
-        base = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            **_mik,
-        )
-    else:
-        _attn = optimal_attn_impl()
-        base = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            dtype="bfloat16",
-            trust_remote_code=True,
-            **({"attn_implementation": _attn} if _attn else {}),
-        )
+    _attn = optimal_attn_impl()
+    base = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        **({"attn_implementation": _attn} if _attn else {}),
+    )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
     # Fail loudly if the adapter didn't actually apply (a future key-mismatch regression would
     # otherwise silently start GRPO from the base model again).
@@ -1352,8 +1308,6 @@ def run_rl():
     wait_for_gpu()
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
-    # QLoRA tier loads the base bf16 checkpoint; vLLM/transformers quantize it to 4-bit NF4 at load.
-    quant = model_quant(model_id)
     download_seconds = prefetch_model(model_id)
     rl = RECIPE.rl
     # Steps come from the run's [train] steps (already in JOB_SPEC), else the recipe default.
@@ -1655,19 +1609,9 @@ def run_rl():
     # authoritative target.
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
-        # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
-        # bnb.Linear4bit modules and brings up its colocated vLLM rollout engine with
-        # quantization="bitsandbytes" (so a 36B MoE fits an 80 GB GPU in 4-bit on both the
-        # trainer and rollout sides). Otherwise force bf16 (TRL string-loading can fall
-        # back to fp32 and double VRAM).
+        # adapter. Force bf16 (TRL string-loading can fall back to fp32 and double VRAM).
         _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
-        if quant == "4bit-qlora":
-            _patch_peft_weight_converter_compat()  # adapter (re)load compatibility
-            grpo_kwargs["model_init_kwargs"] = qlora_model_init_kwargs()
-            _vllm_note = "; vLLM rollout -> bitsandbytes" if use_vllm else ""
-            print(f"[rl] loading {model_id} in 4-bit (QLoRA tier){_vllm_note}")
-        else:
-            grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
+        grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
         if _attn:
             grpo_kwargs["model_init_kwargs"]["attn_implementation"] = _attn
     else:
@@ -1920,18 +1864,33 @@ def write_train_meta(
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
-    if not (adapter_prefix and HF_REPO):
+    """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
+
+    Two forms of ``adapter_prefix``:
+      * ``"<prefix>"``            -> read from THIS run's own artifact repo (HF_REPO).
+      * ``"<owner>/<repo>:<prefix>"`` -> CROSS-REPO warm-start: read the SFT adapter from
+        another run's managed artifact repo. Required since hf_repo is now a per-run managed
+        repo (Freesolo-Co/flashrun-<run_id>), so an SFT adapter never lives in the GRPO run's
+        own repo. The control-plane HF_TOKEN can read sibling managed repos.
+    """
+    if not adapter_prefix:
+        return None
+    if ":" in adapter_prefix:
+        repo, prefix = adapter_prefix.split(":", 1)
+    else:
+        repo, prefix = HF_REPO, adapter_prefix
+    if not (repo and prefix):
         return None
     from huggingface_hub import snapshot_download
 
     snapshot_download(
-        repo_id=HF_REPO,
+        repo_id=repo,
         repo_type="dataset",
-        allow_patterns=[f"{adapter_prefix}/adapter/*"],
+        allow_patterns=[f"{prefix}/adapter/*"],
         local_dir="/tmp/evdl",
         token=os.environ.get("HF_TOKEN"),
     )
-    adir = os.path.join("/tmp/evdl", adapter_prefix, "adapter")
+    adir = os.path.join("/tmp/evdl", prefix, "adapter")
     return adir if os.path.isdir(adir) else None
 
 
