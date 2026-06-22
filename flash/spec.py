@@ -151,10 +151,11 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
-    # The parse-time provisional GPU class (cheapest that fits the model). GPU pinning is gone:
-    # the submit-time allocator always re-picks the cheapest fitting class across ALL providers,
-    # so a config's gpu.type does NOT pin — ``type`` is just the offline sizing/display default
-    # and the carrier the runner overwrites with the actually-allocated class.
+    # The parse-time provisional GPU class (cheapest VALIDATED class that fits the model). GPU
+    # pinning is gone: the submit-time allocator always re-picks the cheapest fitting validated
+    # class across ALL providers, so a config's gpu.type does NOT pin — ``type`` is just the
+    # offline sizing/display default and the carrier the runner overwrites with the
+    # actually-allocated class.
     type: str = DEFAULT_GPU
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600

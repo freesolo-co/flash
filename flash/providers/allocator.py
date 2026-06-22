@@ -71,22 +71,27 @@ def required_vram_gb(
 
 
 def _runpod_candidates(need: int) -> list[Candidate]:
-    """RunPod's fitting classes priced live (static fallback). Every fitting class is eligible."""
+    """RunPod's fitting, live-validated classes priced live (static fallback).
+
+    Restricted to the validated pool (``g.validated``): the deployed control plane rejects a submit
+    for any non-validated class, so allocating one would only fail at submit time."""
     provider = get_provider("runpod")
     return [
         Candidate("runpod", g.name, provider.hourly_rate(g.name), g.vram_gb)
         for g in provider.gpu_classes()
-        if g.vram_gb >= need
+        if g.vram_gb >= need and g.validated
     ]
 
 
 def _vast_candidates(need: int, disk_gb: int, exclude_machine_ids) -> tuple[list[Candidate], tuple]:
-    """Vast's fitting classes from the live offer book (cheapest per class).
+    """Vast's fitting, live-validated classes from the live offer book (cheapest per class).
 
-    Returns (candidates, full_offer_book). A Vast offer-search failure is caught and degrades to
-    the other providers (RunPod): it is non-fatal AS LONG AS another provider can supply a fitting
-    class. If Vast is the only available provider, the empty result means ``allocate`` then raises
-    (nothing across any provider fits) — i.e. it is only fatal when Vast was the sole option.
+    Returns (candidates, full_offer_book). Restricted to the validated pool (``GPU_INFO[gpu]
+    .validated``) — the deployed control plane rejects a submit for any non-validated class. A Vast
+    offer-search failure is caught and degrades to the other providers (RunPod): it is non-fatal AS
+    LONG AS another provider can supply a fitting class. If Vast is the only available provider, the
+    empty result means ``allocate`` then raises (nothing across any provider fits) — i.e. it is only
+    fatal when Vast was the sole option.
     """
     from flash.providers.base import GPU_INFO
     from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
@@ -105,6 +110,8 @@ def _vast_candidates(need: int, disk_gb: int, exclude_machine_ids) -> tuple[list
     for o in book:
         if o.gpu in seen:  # offers are price-sorted; keep the cheapest per class
             continue
+        if not GPU_INFO[o.gpu].validated:  # only offer live-validated classes the server accepts
+            continue
         seen.add(o.gpu)
         out.append(Candidate("vast", o.gpu, o.dph_total, GPU_INFO[o.gpu].vram_gb, offer=o))
     return out, tuple(book)
@@ -121,9 +128,12 @@ def allocate(
 ) -> Allocation:
     """Pick the cheapest (provider, GPU class) able to run the job across ALL providers.
 
-    There is no GPU pin and no provider pin — every fitting class on every live provider is
-    eligible, and the cheapest wins. ``train``/``thinking`` size the requirement to the run's
-    actual knobs (context, group, rank, batch) via the matrix.
+    There is no GPU pin and no provider pin — every fitting, LIVE-VALIDATED class on every live
+    provider is eligible, and the cheapest wins. Allocation is restricted to the validated pool
+    (``GpuClass.validated``) because the deployed control plane rejects a submit for any
+    non-validated class, so picking the absolute-cheapest fitting class (e.g. an unvalidated "RTX
+    2000 Ada") would just make the server refuse the run. ``train``/``thinking`` size the
+    requirement to the run's actual knobs (context, group, rank, batch) via the matrix.
     """
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
     live = available_providers()
