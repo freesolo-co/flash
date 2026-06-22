@@ -96,7 +96,13 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         validated=True,
     ),
     # ---- Ampere/Ada workstation + datacenter cards (cheap capacity pools) ----
-    GpuClass("RTX A4000", "NVIDIA_RTX_A4000", 16, "a4000", "sm86", 0.25, vast_name="RTX A4000"),
+    # Live-validated 2026-06-22: Qwen3.5-0.8B SFT train smoke (RunPod). 16 GB SFT-only tier (GRPO's
+    # 24 GB floor never routes here).
+    GpuClass(
+        "RTX A4000", "NVIDIA_RTX_A4000", 16, "a4000", "sm86", 0.25, vast_name="RTX A4000",
+        validated=True,
+    ),
+    # Live-validated 2026-06-22: Qwen3.5-0.8B/2B SFT train smokes (RunPod). 16 GB SFT-only tier.
     GpuClass(
         "RTX 2000 Ada",
         "NVIDIA_RTX_2000_ADA_GENERATION",
@@ -105,6 +111,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm89",
         0.24,
         vast_name="RTX 2000Ada",
+        validated=True,
     ),
     GpuClass("RTX A4500", "NVIDIA_RTX_A4500", 20, "a4500", "sm86", 0.25, vast_name="RTX A4500"),
     GpuClass(
@@ -153,7 +160,12 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         vast_name="RTX PRO 4000",
         validated=True,
     ),
-    GpuClass("RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49, vast_name="RTX A6000"),
+    # Live-validated 2026-06-22: Qwen3.5-0.8B/9B SFT+GRPO train smokes (RunPod). The 48 GB tier that
+    # fills the 32->80 GB gap (e.g. 4B GRPO @ 35 GB) ~55% cheaper than the A100.
+    GpuClass(
+        "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49, vast_name="RTX A6000",
+        validated=True,
+    ),
     GpuClass("A40", "NVIDIA_A40", 48, "a40", "sm86", 0.44, vast_name="A40"),
     GpuClass(
         "RTX 6000 Ada",
@@ -181,16 +193,23 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         vast_name="A100 PCIE",
         validated=True,
     ),
+    # Live-validated 2026-06-22: Qwen3.5 0.8B/MiniCPM/2B/9B SFT+GRPO train smokes (RunPod).
     GpuClass(
-        "A100 SXM", "NVIDIA_A100_SXM4_80GB", 80, "a100sxm", "sm80", 1.49, vast_name="A100 SXM4"
+        "A100 SXM", "NVIDIA_A100_SXM4_80GB", 80, "a100sxm", "sm80", 1.49, vast_name="A100 SXM4",
+        validated=True,
     ),
-    GpuClass("H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29, vast_name="H100 SXM"),
+    # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod).
+    GpuClass(
+        "H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29, vast_name="H100 SXM",
+        validated=True,
+    ),
     # H100 NVL (94 GB) has no RunPod Flash GpuType member -> Vast-only. Cheaper than the
     # 80 GB SXM H100 on the live market and carries 14 GB more VRAM, so it's a strong
     # cost/VRAM pick for big-context GRPO tiers.
     GpuClass(
         "H100 NVL", None, 94, "h100nvl", "sm90", 2.39, vast_name="H100 NVL", validated=True
     ),
+    # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod, sm120/CUDA-13).
     GpuClass(
         "RTX Pro 6000",
         "NVIDIA_RTX_PRO_6000_BLACKWELL_SERVER_EDITION",
@@ -199,6 +218,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm120",
         2.09,
         min_cuda_modern="13.0",
+        validated=True,
     ),
     # RTX Pro 6000 Blackwell Workstation Edition: same 96 GB die as the Server Edition,
     # a distinct RunPod GpuType, typically a touch cheaper. Also offered on Vast. The
@@ -428,6 +448,9 @@ class PollResult:
     # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
     failure: str | None = None
     detail: str | None = None
+    # job_preempted only: the GPU CLASS is at fault (a MIG slice), so the retry must re-allocate
+    # OFF it, not just onto a fresh host of the same class. Set from the worker's heartbeat.
+    exclude_class: bool = False
 
 
 # ---------------------------------------------------------------------------
