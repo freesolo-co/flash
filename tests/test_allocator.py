@@ -133,7 +133,7 @@ def test_estimator_matches_measured_seq_boundaries():
     assert e(4.7, "grpo", seq_len=32768, max_tokens=8192) > 32
     # 9B GRPO is weights-driven: exceeds a 48 GB card -> the 80 GB tier (measured: A100)
     assert e(9.7, "grpo", seq_len=1024) > 48
-    # a 36B model in bf16 never fits 32 GB (the 4-bit MoE is floored in model_required)
+    # a 36B model in bf16 never fits 32 GB (~72 GB of weights alone)
     assert e(36.0, "sft", seq_len=4096) > 32
 
 
