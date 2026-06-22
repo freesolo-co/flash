@@ -83,8 +83,12 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
 
 
 def select_gpu(config: RunConfig) -> tuple[str, int]:
-    """(chosen GPU class, required VRAM GB): the cheapest fitting class, like the allocator
-    (no pin, no validation gate). Catalog sizing is offline/deterministic."""
+    """(chosen GPU class, required VRAM GB): the cheapest fitting class for the cost estimate.
+
+    Uses ``pick_gpu``, which (unlike the submit-time allocator) intentionally stays gate-free —
+    it considers every fitting class, validated or not — so the estimate reflects the cheapest
+    card that *could* run the job. The live allocator restricts to the validated pool, so the
+    actually-provisioned class can be pricier than this. Catalog sizing is offline/deterministic."""
     total_params_b(config.model_id)  # catalog-only: reject a non-catalog model before any (HF) sizing
     need = required_vram_gb(
         config.model_id,
