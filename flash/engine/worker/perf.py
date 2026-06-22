@@ -421,9 +421,10 @@ def assert_usable_gpu() -> None:
     Detection (any one trips it):
       * the device name contains "MIG" (a MIG partition), or
       * a minimal NVML probe (memory query) raises (driver/permission restricted), or
-      * CUDA reports no device at all.
-    The NVML check is best-effort: a probe that simply can't run (pynvml absent) is NOT treated as
-    a failure — we only fail on a name match or an NVML call that actively raises.
+      * CUDA reports no device even after a transient-startup grace poll.
+    A torch import failure is re-raised (an image problem, not retriable infra). The NVML check is
+    best-effort: a probe that simply can't run (pynvml absent) is NOT treated as a failure — we
+    only fail on a name match or an NVML call that actively raises.
     """
     try:
         import torch
