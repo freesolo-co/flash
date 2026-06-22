@@ -22,7 +22,8 @@ logger = get_logger("flash.providers.runpod.train")
 # multi-turn hooks used for verifiers ToolEnv / MultiTurnEnv training), vllm 0.19.1
 # (Qwen3.5/3.6 archs, native RL APIs, transformers-5
 # compatible metadata), transformers 5.x (qwen3_5/qwen3_5_moe model types),
-# bitsandbytes (8-bit paged AdamW optimizer). trl 1.6 requires transformers>=4.56,
+# bitsandbytes (the 8-bit paged AdamW optimizer state — LoRA+ coexists with it).
+# trl 1.6 requires transformers>=4.56,
 # satisfied by the 5.6+ pin; GRPOConfig is field-compatible with the 1.5 usage here.
 # Resolver/driver notes: vllm 0.17/0.18 hard-pin transformers<5 (uv refuses the
 # combo), so the first transformers-5-compatible vllm line is 0.19.1. vllm >=0.20

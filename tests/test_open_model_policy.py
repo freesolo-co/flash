@@ -128,6 +128,7 @@ def test_allow_policy_unknown_size_warns_but_allows(monkeypatch, capsys):
         (4.0, "sft", "bf16", "RTX 4090", "fits"),
         (9.65, "sft", "bf16", "RTX 5090", "fits"),  # Qwen3.5-9B SFT
         (36.0, "sft", "bf16", "RTX 5090", "too_big"),  # 72 GB of weights
+        (36.0, "grpo", "bf16", "RTX 5090", "too_big"),  # 2 bf16 copies + KV >> 32 GB
     ],
 )
 def test_estimator_anchors(monkeypatch, params_b, algo, quant, gpu, expected):

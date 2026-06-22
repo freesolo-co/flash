@@ -642,12 +642,12 @@ def make_lora(model_id: str | None = None):
     }
     # Adapter initialization: standard zero-B init (the LoRA delta starts at zero, so the saved
     # adapter is a plain residual that loads correctly onto the ORIGINAL base).
-    # PiSSA was removed (sync with origin/dev #78/#79): it mutates the effective base during
-    # training, so its saved adapter only reconstructs against the PiSSA-residual base. Loading that
-    # adapter onto the unmodified base at SERVING or GRPO WARM-START (which is exactly our flow)
-    # corrupts the model -> the served model emits only whitespace and warm-start GRPO hangs. peft
-    # can convert PiSSA->standard on save, but the simpler, robust choice is the default init (the
-    # convergence gain isn't worth silently breaking serve + warm-start).
+    # PiSSA was removed: it mutates the effective base during training, so its saved adapter only
+    # reconstructs against the PiSSA-residual base. Loading that adapter onto the unmodified base
+    # at SERVING or GRPO WARM-START (which is exactly our flow) corrupts the model -> the served
+    # model emits only whitespace and warm-start GRPO hangs. peft can convert PiSSA->standard on
+    # save, but the simpler, robust choice is the default init (the convergence gain isn't worth
+    # silently breaking serve + warm-start).
     kwargs["init_lora_weights"] = True
     print("[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)")
     # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
@@ -658,6 +658,8 @@ def make_lora(model_id: str | None = None):
             kwargs["exclude_modules"] = exclude
             print(f"[lora] excluding modules for {model_id}: {exclude}")
     return LoraConfig(**kwargs)
+
+
 
 
 def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_id: str) -> None:
@@ -1844,7 +1846,7 @@ def run_rl():
     # authoritative target.
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
-        # adapter. Force bf16 (TRL string-loading can otherwise fall back to fp32 and double VRAM).
+        # adapter. Force bf16 (TRL string-loading can fall back to fp32 and double VRAM).
         _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
         grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
         if _attn:
@@ -2099,18 +2101,33 @@ def write_train_meta(
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
-    if not (adapter_prefix and HF_REPO):
+    """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
+
+    Two forms of ``adapter_prefix``:
+      * ``"<prefix>"``            -> read from THIS run's own artifact repo (HF_REPO).
+      * ``"<owner>/<repo>:<prefix>"`` -> CROSS-REPO warm-start: read the SFT adapter from
+        another run's managed artifact repo. Required since hf_repo is now a per-run managed
+        repo (Freesolo-Co/flashrun-<run_id>), so an SFT adapter never lives in the GRPO run's
+        own repo. The control-plane HF_TOKEN can read sibling managed repos.
+    """
+    if not adapter_prefix:
+        return None
+    if ":" in adapter_prefix:
+        repo, prefix = adapter_prefix.split(":", 1)
+    else:
+        repo, prefix = HF_REPO, adapter_prefix
+    if not (repo and prefix):
         return None
     from huggingface_hub import snapshot_download
 
     snapshot_download(
-        repo_id=HF_REPO,
+        repo_id=repo,
         repo_type="dataset",
-        allow_patterns=[f"{adapter_prefix}/adapter/*"],
+        allow_patterns=[f"{prefix}/adapter/*"],
         local_dir="/tmp/evdl",
         token=os.environ.get("HF_TOKEN"),
     )
-    adir = os.path.join("/tmp/evdl", adapter_prefix, "adapter")
+    adir = os.path.join("/tmp/evdl", prefix, "adapter")
     return adir if os.path.isdir(adir) else None
 
 

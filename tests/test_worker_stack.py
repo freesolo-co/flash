@@ -59,7 +59,7 @@ def test_worker_stack_pins_qwen35_capable_versions():
     assert "vllm==0.19" in joined  # first transformers-5-compatible vllm line
     assert "transformers>=5" in joined  # qwen3_5 model types need transformers 5.x
     assert "trl>=1.6" in joined  # 1.6 adds the GRPO tools=/rollout_func multi-turn hooks
-    assert "bitsandbytes" in joined  # QLoRA tier for the 35B-A3B MoE
+    assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
 
 
 # ---------------------------------------------------------------------------
@@ -405,9 +405,9 @@ def test_liger_default_model_size_gate(monkeypatch):
 
 
 def test_make_lora_uses_standard_init_and_rslora(monkeypatch):
-    """PiSSA was removed (sync with origin/dev #78/#79): its saved adapter is a residual against the
-    PiSSA-mutated base, which corrupts serving + GRPO warm-start that load it onto the ORIGINAL base.
-    make_lora uses the standard zero-B init (serve/warm-start safe) and keeps rsLoRA, for every model."""
+    """PiSSA was removed (its saved adapter is a residual against the PiSSA-mutated base, which
+    corrupts serving + GRPO warm-start that load it onto the ORIGINAL base). make_lora uses the
+    standard zero-B init (serve/warm-start safe) and keeps rsLoRA, for every model."""
     captured = {}
     fake_peft = types.ModuleType("peft")
     fake_peft.LoraConfig = lambda **kw: (captured.update(kw), kw)[1]
