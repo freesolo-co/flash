@@ -151,6 +151,22 @@ def _submit_seed_supervised(
     # market-wide: the SAME class on another provider may have free capacity. Seeded from the
     # caller's ``initial_starved`` (recovery carries the reattached class's starvation in).
     starved_classes: set = set(initial_starved)
+    # Operator escape hatch: seed the exclusion set from a control-plane env so a KNOWN-starved
+    # (provider, class) — e.g. RunPod that silently accepts the job into an all-zero IN_QUEUE with
+    # no worker and would otherwise burn the full ~50-min setup grace before escalating — is skipped
+    # from the FIRST allocation. ``FLASH_EXCLUDE_CLASSES`` is comma-separated; an entry with a
+    # ``provider:gpu`` form is provider-SCOPED (a (provider, gpu) tuple, same form the no_capacity
+    # path uses), a bare ``gpu`` excludes the class market-wide. Inert on the worker (allocation is
+    # control-plane-side only).
+    for _raw in (os.environ.get("FLASH_EXCLUDE_CLASSES") or "").split(","):
+        _raw = _raw.strip()
+        if not _raw:
+            continue
+        if ":" in _raw:
+            _prov, _gpu = _raw.split(":", 1)
+            starved_classes.add((_prov.strip().lower(), _gpu.strip()))
+        else:
+            bad_gpu_classes.add(_raw)
     # Index into the ranked candidate list. It advances only after an attempt that
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
