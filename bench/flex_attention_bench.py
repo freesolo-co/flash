@@ -58,10 +58,10 @@ def build(model_id: str, attn: str, packing: bool, max_len: int, bsz: int, grad_
 
     mik = {"dtype": "bfloat16", "device_map": None, "attn_implementation": attn}
     return SFTConfig(
-        output_dir="/tmp/flexbench",
-        # The bench reuses this output_dir across multiple configs in one run; without this the
-        # HF/TRL Trainer errors ("output directory exists and is not empty") on the 2nd config.
-        overwrite_output_dir=True,
+        # Per-config output_dir so reusing the bench across configs in one run can't collide
+        # ("output directory exists and is not empty"). (overwrite_output_dir was dropped from
+        # SFTConfig in the worker's TRL/transformers-5 stack, so a unique dir is the portable fix.)
+        output_dir=f"/tmp/flexbench/{attn}-{'pack' if packing else 'nopack'}",
         per_device_train_batch_size=bsz,
         gradient_accumulation_steps=grad_accum,
         max_length=max_len,
@@ -130,70 +130,72 @@ def bench_one(model_id, attn, packing, steps, max_len, bsz, grad_accum, n_exampl
     tok = AutoTokenizer.from_pretrained(model_id)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    ds, lengths = make_dataset(tok, n_examples)
+    ds, _ = make_dataset(tok, n_examples)
     cfg = build(model_id, attn, packing, max_len, bsz, grad_accum, steps)
 
     timings: list[float] = []
+    step_tokens: list[int] = []  # ground-truth real (supervised) tokens per optimizer step
     losses: list[float] = []
-
-    class Timer:
-        def __init__(self):
-            self.t = None
-
-        def on_step_begin(self, *a, **k):
-            torch.cuda.synchronize()
-            self.t = time.time()
-
-        def on_step_end(self, args, state, control, **k):
-            torch.cuda.synchronize()
-            if self.t is not None:
-                timings.append(time.time() - self.t)
-            if state.log_history:
-                last = state.log_history[-1]
-                if "loss" in last:
-                    losses.append(last["loss"])
 
     from transformers import TrainerCallback
 
-    cb = type("CB", (TrainerCallback,), {
-        "on_step_begin": lambda self, *a, **k: Timer.on_step_begin(timer, *a, **k),
-        "on_step_end": lambda self, *a, **k: Timer.on_step_end(timer, *a, **k),
-    })()
-    timer = Timer()
+    class StepTimer(TrainerCallback):
+        def on_step_begin(self, *a, **k):
+            torch.cuda.synchronize()
+            self._t = time.time()
+
+        def on_step_end(self, args, state, control, **k):
+            torch.cuda.synchronize()
+            timings.append(time.time() - getattr(self, "_t", time.time()))
+            if state.log_history and "loss" in state.log_history[-1]:
+                losses.append(state.log_history[-1]["loss"])
+
+    # Count REAL tokens per step from the COLLATED batch — the ground truth for BOTH modes: padded
+    # / prompt positions are -100, packed positions are all-real. Counting in training_step (once
+    # per optimizer step, BEFORE backward) means gradient-checkpointing's forward recompute can't
+    # double-count, and packing's denser batches get credited correctly. The old metric estimated
+    # real_tokens as mean_len * (n_steps*bsz), i.e. it counted batch ROWS as examples — right for
+    # no-packing, but a packed row holds MANY examples, so it undercounted packed tokens ~Nx and
+    # made packing look slower than it is. This counts what the model actually trained on.
+    class CountingTrainer(SFTTrainer):
+        def training_step(self, model, inputs, *targs, **tkw):
+            labels = inputs.get("labels")
+            step_tokens.append(int((labels != -100).sum().item()) if labels is not None else 0)
+            return super().training_step(model, inputs, *targs, **tkw)
 
     # Mirror flash: LoRA adapters (not full fine-tune) keep optimizer memory tiny. (Attention impl
     # and packing — what we're measuring — are orthogonal to LoRA.)
     from peft import LoraConfig
 
     lora = LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM")
-    trainer = SFTTrainer(model=model_id, args=cfg, train_dataset=ds, callbacks=[cb], peft_config=lora)
+    trainer = CountingTrainer(
+        model=model_id, args=cfg, train_dataset=ds, callbacks=[StepTimer()], peft_config=lora
+    )
     torch.cuda.reset_peak_memory_stats()
-    t0 = time.time()
     trainer.train()
-    wall = time.time() - t0
     peak_gb = torch.cuda.max_memory_allocated() / 1e9
 
-    # THE decision metric: real (non-padding) content tokens processed per second. Count only what
-    # the model ACTUALLY trains on: (a) lengths are CLAMPED to max_len, since SFTConfig(max_length)
-    # truncates longer examples (summing raw lengths would inflate the token count / throughput);
-    # and (b) when --steps bounds the run we don't see the whole dataset, so scale by the examples
-    # actually consumed (steps * bsz * grad_accum, capped at one epoch). Using the MEAN truncated
-    # length keeps this correct regardless of dataloader shuffling. Higher real_tokens_per_s = better.
+    # THE decision metric: real (non-padding) supervised tokens / sec, measured on a STEADY-STATE
+    # window. Drop the first few steps: flex_attention compiles its block-mask kernel on the first
+    # call (torch.compile), so the opening steps are dramatically slower and would otherwise tax
+    # flex-pack for a one-time cost the real (multi-thousand-step) SFT run amortizes to nothing.
+    # real_tokens is the ground-truth sum of label!=-100 tokens over exactly those timed steps, so
+    # packed (dense) and unpacked (padded) batches are compared on the SAME basis. Higher = better.
     n_steps = len(timings)
-    trunc_lengths = [min(L, max_len) for L in lengths]
-    consumed = min(n_steps * bsz * grad_accum, len(trunc_lengths)) if n_steps else len(trunc_lengths)
-    mean_len = (sum(trunc_lengths) / len(trunc_lengths)) if trunc_lengths else 0.0
-    real_tokens = round(mean_len * consumed)
-    warm = timings[2:] if len(timings) > 4 else timings
-    step_med = statistics.median(warm) if warm else float("nan")
-    train_s = sum(timings) if timings else wall
+    warm = 5 if n_steps > 8 else (2 if n_steps > 4 else 0)
+    st = timings[warm:] or timings
+    tk = step_tokens[warm:warm + len(st)]
+    real_tokens = sum(tk)
+    train_s = sum(st)
+    step_med = statistics.median(st) if st else float("nan")
     return {
         "attn": attn,
         "packing": packing,
         "steps": n_steps,
+        "steady_steps": len(st),
         "real_tokens": real_tokens,
         "train_s": round(train_s, 2),
-        "real_tokens_per_s": round(real_tokens / train_s) if train_s else None,
+        "real_tokens_per_s": round(real_tokens / train_s) if (train_s and real_tokens) else None,
         "median_step_s": round(step_med, 4),
         "peak_vram_gb": round(peak_gb, 2),
         "final_loss": round(losses[-1], 4) if losses else None,
