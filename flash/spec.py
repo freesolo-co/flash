@@ -119,8 +119,10 @@ class TrainSpec:
     # LoRA from instead of training fresh — e.g. a GRPO run continuing an SFT adapter.
     init_from_adapter: str = ""
     # Per-run HuggingFace artifact repo ("owner/name") for this run's adapter/checkpoint/
-    # code storage AND serving. REQUIRED (validated in schema._validate_spec); there is no
-    # operator-wide default. The operator's HF_TOKEN must have write access to it.
+    # code storage AND serving. PLATFORM-MANAGED, not a user field: the control plane assigns
+    # it server-side in runner.submit_job (a per-run private dataset under the operator's
+    # namespace, written by the operator HF_TOKEN). A user-supplied value is ignored by
+    # schema.spec_from_dict; this field carries the control-plane-assigned repo to the worker.
     hf_repo: str = ""
     # Optimizer/batching knobs (SFT + GRPO). None -> the worker's tuned recipe default.
     # batch_size is the GLOBAL/effective batch (SFT: grad-accum is sized to hit it; GRPO:
