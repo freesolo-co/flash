@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 import types
 
+import pytest
+
 from flash.providers.runpod.train import (
     WORKER_DEPS,
     resolve_worker_deps,
@@ -419,6 +421,19 @@ def _hopper_torch():
     return t
 
 
+# ---------------------------------------------------------------------------
+# MIG / NVML boot guard (assert_usable_gpu): retriable-infra detection of a partition /
+# permission-restricted host before any real CUDA work (the NVML-assert crash class).
+# ---------------------------------------------------------------------------
+def _fake_torch_named(name, available=True):
+    t = types.ModuleType("torch")
+    t.cuda = types.SimpleNamespace(
+        is_available=lambda: available,
+        get_device_name=lambda *a: name,
+    )
+    return t
+
+
 class _FakeCompleted:
     """Minimal stand-in for subprocess.CompletedProcess so _pip can read .returncode."""
 
@@ -805,3 +820,72 @@ def test_remove_fla_from_disk_removes_package_dir_and_dist_info(tmp_path, monkey
     assert str(fla_pkg) in removed
     assert str(dist_info) in removed
     assert not still_importable, "fla must no longer be importable from disk"
+
+
+def test_assert_usable_gpu_full_card_ok(monkeypatch):
+    """A normal full GPU (no MIG in the name, NVML bindings absent so no probe) passes."""
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch_named("NVIDIA RTX A5000"))
+    monkeypatch.delitem(sys.modules, "pynvml", raising=False)
+    # No pynvml installed in the offline test env -> the import inside fails (ImportError),
+    # which the guard treats as "can't probe", not a failure. Name has no "MIG" -> usable.
+    perf.assert_usable_gpu()  # must NOT raise
+
+
+def test_assert_usable_gpu_mig_name_raises_retriable(monkeypatch):
+    """A MIG slice (name contains 'MIG') raises the RETRIABLE infra error with the marker
+    so the control plane resubmits on a fresh worker (the NVML-assert crash we hit live)."""
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        _fake_torch_named("NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"),
+    )
+    with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER) as exc:
+        perf.assert_usable_gpu()
+    assert "MIG" in str(exc.value)
+
+
+def test_assert_usable_gpu_no_cuda_raises_retriable(monkeypatch):
+    """No CUDA device at boot -> retriable infra (resubmit on a fresh host), not a job_failed."""
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch_named("", available=False))
+    with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER):
+        perf.assert_usable_gpu()
+
+
+def test_assert_usable_gpu_nvml_probe_failure_raises_retriable(monkeypatch):
+    """An NVML probe that actively RAISES (permission-restricted MIG host whose name looks
+    normal) trips the guard — this is the case nvidia-smi shows '[Insufficient Permissions]'."""
+    from flash.engine.worker import perf
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch_named("NVIDIA RTX A5000"))
+
+    fake_nvml = types.ModuleType("pynvml")
+    fake_nvml.nvmlInit = lambda: None
+    fake_nvml.nvmlShutdown = lambda: None
+    fake_nvml.nvmlDeviceGetHandleByIndex = lambda i: object()
+
+    def _boom(_h):
+        raise RuntimeError("Insufficient Permissions")
+
+    fake_nvml.nvmlDeviceGetMemoryInfo = _boom
+    monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
+    with pytest.raises(perf.RetriableInfraError, match=perf.RETRIABLE_INFRA_MARKER):
+        perf.assert_usable_gpu()
+
+
+def test_retriable_infra_marker_is_an_infra_retry_marker():
+    """The worker's marker phrase MUST be in the runner's infra-retry set, or a MIG host would
+    be mis-classified as a non-retried job_failed (the live regression). Lock-step contract."""
+    from flash.engine.worker.perf import RETRIABLE_INFRA_MARKER
+
+    src = (
+        __import__("pathlib")
+        .Path(__import__("flash.runner.lifecycle", fromlist=["__file__"]).__file__)
+        .read_text()
+    )
+    assert RETRIABLE_INFRA_MARKER in src
