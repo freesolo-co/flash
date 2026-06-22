@@ -438,15 +438,17 @@ def assert_usable_gpu() -> None:
     # first is_available() check would preempt that polling and spuriously resubmit a host whose
     # CUDA comes up a moment later. Poll a few times (constants are module-level so tests shrink
     # them) before declaring the host device-less.
-    import time as _t
+    # Normalize to a single, sane loop bound so the poll/sleep logic stays consistent.
+    tries = max(1, int(_GPU_GUARD_AVAIL_RETRIES))
+    delay_s = float(_GPU_GUARD_AVAIL_DELAY_S)
 
     cuda_ready = False
-    for _i in range(max(1, _GPU_GUARD_AVAIL_RETRIES)):
+    for i in range(tries):
         cuda_ready = bool(torch.cuda.is_available())
         if cuda_ready:
             break
-        if _i + 1 < _GPU_GUARD_AVAIL_RETRIES:
-            _t.sleep(_GPU_GUARD_AVAIL_DELAY_S)
+        if i + 1 < tries:
+            time.sleep(delay_s)
     if not cuda_ready:
         raise RetriableInfraError(
             "CUDA reports no available device after the worker-boot startup grace"
