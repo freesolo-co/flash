@@ -100,21 +100,21 @@ def main(argv: list[str] | None = None) -> int:
     gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
     gpus.set_defaults(func=cmd_gpus)
 
-    env = sub.add_parser("env", help="manage verifiers environments")
+    env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
-    init = env_sub.add_parser("init", help="scaffold a new local verifiers environment")
+    init = env_sub.add_parser("init", help="scaffold a new local Freesolo environment")
     init.add_argument("name")
     init.set_defaults(func=cmd_env_init)
 
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
-    env_install = env_sub.add_parser("install", help="install a published Prime Hub environment")
-    env_install.add_argument("env_id", help='the env id to install (a Hub slug, "owner/name")')
+    env_install = env_sub.add_parser("install", help="record a GitHub Freesolo environment")
+    env_install.add_argument("env_id", help="the GitHub environment id to record")
     env_install.set_defaults(func=cmd_env_install)
 
     env_push = env_sub.add_parser(
-        "push", help="publish a local verifiers env to the Prime Hub (private); prints its env id"
+        "push", help="upload a local Freesolo env to GitHub; prints its env id"
     )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)

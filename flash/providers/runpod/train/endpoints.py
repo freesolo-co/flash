@@ -44,7 +44,6 @@ def _train_body(input_data: dict) -> dict:
     import contextlib
     import json
     import os
-    import shutil
     import subprocess
     import sys
 
@@ -52,9 +51,9 @@ def _train_body(input_data: dict) -> dict:
 
     # NB: the Hopper fla guard lives in engine.worker._drop_fla_on_hopper (runs in the worker
     # process AFTER all installs, before any model import) — doing it here would be undone by a
-    # later extra_pip / `prime env install` that pulls fla back, and depends on a handler redeploy.
+    # later extra_pip that pulls fla back, and depends on a handler redeploy.
 
-    # Extra pip deps for verifiers / Prime Hub environments (installed per-run).
+    # Extra pip deps for Freesolo environments (installed per-run).
     extra_pip = input_data.get("extra_pip") or []
     if extra_pip:
         # check=True: a deterministic dependency failure should fail fast here,
@@ -65,38 +64,6 @@ def _train_body(input_data: dict) -> dict:
     # install list, and engine.worker._drop_fla_on_hopper removes any baked-in copy at worker
     # startup (fla's GDN backward is miscomputed on sm90, #640). No env toggle: fla only ever runs
     # on the consumer archs where its Triton kernel is correct.
-
-    # Install the run's verifiers environment(s) from the Prime Hub via the authenticated
-    # `prime` CLI. The public pip index does not serve PRIVATE env wheels, so a plain pip
-    # install can't fetch them; `prime env install` pulls/builds/installs public + private
-    # alike, authenticated by PRIME_API_KEY forwarded from the control plane.
-    hub_env_ids = input_data.get("hub_env_ids") or []
-    if hub_env_ids:
-        worker_env = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
-        prime_key = worker_env.get("PRIME_API_KEY") or os.environ.get("PRIME_API_KEY")
-        if not prime_key:
-            raise RuntimeError(
-                "PRIME_API_KEY is required to install the Prime Hub environment on the worker"
-            )
-        # Only install `prime` when it isn't already on the worker (it's often baked into
-        # the worker image) — an unconditional install adds latency and a per-run PyPI
-        # failure point every run.
-        if shutil.which("prime") is None:
-            subprocess.run([sys.executable, "-m", "pip", "install", "prime"], check=True)
-        # --with pip: install the env into THIS (the trainer's) python via pip. The default
-        # (`--with uv`) installs into prime's own isolated uv env, so the trainer then can't
-        # import the env module (ModuleNotFoundError at load_environment). PIP_BREAK_SYSTEM_PACKAGES
-        # lets pip write to a PEP-668 "externally-managed" base python (the worker image's).
-        install_env = {
-            **os.environ,
-            "PRIME_API_KEY": prime_key,
-            "PRIME_DISABLE_VERSION_CHECK": "1",
-            "PIP_BREAK_SYSTEM_PACKAGES": "1",
-        }
-        for env_id in hub_env_ids:
-            subprocess.run(
-                ["prime", "env", "install", env_id, "--with", "pip"], check=True, env=install_env
-            )
 
     overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
     snapshot_download(

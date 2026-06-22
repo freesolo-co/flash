@@ -83,12 +83,24 @@ class ConfigError(ValueError):
 
 
 def _require_slug(value: str, message: str) -> None:
-    """Require a Prime Hub-style "owner/name" slug: exactly one slash, both parts
-    non-empty. Raises ConfigError(message) otherwise. Centralizes the rule used for
-    [environment] id and train.hf_repo so they cannot drift apart."""
+    """Require an ``owner/name`` slug."""
     parts = value.split("/")
     if len(parts) != 2 or not all(parts):
         raise ConfigError(message)
+
+
+def _require_environment_ref(value: str, message: str) -> None:
+    """Require a GitHub-backed Freesolo environment reference."""
+    if value.startswith("github:"):
+        body = value[len("github:") :]
+        repo_ref, sep, path = body.partition(":")
+        repo, _, _ref = repo_ref.partition("@")
+        owner_repo = repo.split("/", 1)
+        if len(owner_repo) == 2 and all(owner_repo) and (not sep or path.strip()):
+            return
+    if value.startswith("https://github.com/") or value.startswith("http://github.com/"):
+        return
+    raise ConfigError(message)
 
 
 def _coerce_scalar(value: str):

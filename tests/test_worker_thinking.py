@@ -68,7 +68,7 @@ def test_strip_think_unit():
 
 def test_thinking_budget_selection(monkeypatch):
     # A JobSpec with an env id makes the worker resolve ACTIVE_ENV at import; stub the loader so
-    # this CPU dry-run doesn't reach the Prime Hub. We only exercise THINKING / micro-batch here.
+    # this CPU dry-run doesn't reach the GitHub Freesolo. We only exercise THINKING / micro-batch here.
     monkeypatch.setattr("flash.envs.registry.load_environment", lambda *a, **k: object())
     saved = _set_thinking_worker_env()
     import flash.engine.worker as ne

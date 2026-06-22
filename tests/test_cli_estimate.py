@@ -16,7 +16,7 @@ from flash.schema import spec_from_dict
 GRPO_RAW = {
     "model": "Qwen/Qwen3.5-9B",
     "algorithm": "grpo",
-    "environment": {"id": "primeintellect/gsm8k"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
     "train": {
         "steps": 50,
         "group_size": 8,
@@ -51,7 +51,7 @@ def test_runconfig_from_grpo_spec_maps_fields():
     assert cfg.group_size == 8
     assert cfg.completion_len == 512  # GRPO max_tokens
     assert cfg.seq_len == 2048
-    assert cfg.environment == "primeintellect/gsm8k"
+    assert cfg.environment == "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"
 
 
 def test_multi_seed_scales_steps_and_setup():
@@ -71,7 +71,7 @@ def test_sft_steps_derived_from_examples():
         {
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "sft",
-            "environment": {"id": "acme/sft-data"},
+            "environment": {"id": "github:acme/envs@main:sft-data/freesolo/environment.py"},
             "train": {
                 "max_examples": 320,
                 "batch_size": 16,
@@ -95,7 +95,7 @@ def _sft_spec(**train):
     raw = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "sft",
-        "environment": {"id": "acme/sft-data"},
+        "environment": {"id": "github:acme/envs@main:sft-data/freesolo/environment.py"},
         "train": {"seeds": [0], "hf_repo": "owner/runs", **train},
         "gpu": {"type": "RTX 4090"},
     }
@@ -158,8 +158,8 @@ def test_sft_steps_max_examples_zero_means_no_cap(monkeypatch):
 
 
 def test_sft_steps_unpinned_falls_back_when_env_cannot_be_counted(monkeypatch, capsys):
-    # A Hub env usually isn't importable in the cost path's venv (`flash env install` puts it in a
-    # separate `prime` env), so counting returns None. Pricing must NOT hard-fail: it falls back to
+    # A private GitHub env may not be importable in the local cost path, so counting returns None.
+    # Pricing must NOT hard-fail: it falls back to
     # a representative default example count (with a clear warning) so `flash train --cost` still
     # produces a quote without pinning [train].max_examples.
     from flash.cost.spec import DEFAULT_UNCOUNTED_SFT_EXAMPLES
@@ -208,7 +208,7 @@ def test_sft_steps_honor_big_vocab_per_device_cap():
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "environment": {"id": "acme/sft-data"},
+        "environment": {"id": "github:acme/envs@main:sft-data/freesolo/environment.py"},
         "train": {
             "seeds": [0], "hf_repo": "owner/runs",
             "max_examples": 320, "batch_size": 6, "epochs": 2, "max_length": 1024,
@@ -231,7 +231,7 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
         'model = "Qwen/Qwen3.5-9B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
-        'id = "primeintellect/gsm8k"\n'
+        'id = "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"\n'
         "[train]\n"
         "steps = 50\n"
         'hf_repo = "owner/runs"\n'
@@ -265,7 +265,7 @@ def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
         'model_policy = "allow"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
-        'id = "primeintellect/gsm8k"\n'
+        'id = "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"\n'
         "[train]\n"
         "steps = 10\n"
         'hf_repo = "owner/runs"\n'
@@ -275,4 +275,3 @@ def test_cmd_train_cost_rejects_unlisted_model(tmp_path):
     )
     with pytest.raises((KeyError, ValueError)):
         cmd_train(args)
-
