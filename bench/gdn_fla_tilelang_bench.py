@@ -31,6 +31,10 @@ FLA_GIT = "git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b
 
 
 def _run(*a: str) -> int:
+    # PEP-668 externally-managed envs (the worker base image) reject pip install/uninstall without
+    # --break-system-packages; inject it so the bench runs there too (mirrors the worker's net).
+    if a and a[0] in ("install", "uninstall"):
+        a = (a[0], "--break-system-packages", *a[1:])
     return subprocess.run([sys.executable, "-m", "pip", *a], check=False).returncode
 
 

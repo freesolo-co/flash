@@ -15,17 +15,35 @@ import sys
 import urllib.request
 
 BASE = "https://rest.runpod.io/v1/pods"
-KEY = os.environ["RUNPOD_API_KEY"]
 IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
-with open(os.path.expanduser(os.environ.get("BENCH_SSH_PUBKEY", "~/.ssh/chalk_pod.pub"))) as _f:
-    PUBKEY = _f.read().strip()
 HF = os.environ.get("HF_TOKEN", "")
-H = {"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}
+
+
+# Read auth + pubkey lazily (not at import) so `status`/`--help`/argparse don't crash with
+# KeyError/FileNotFoundError before they even run; fail with a clear message when actually needed.
+def _key() -> str:
+    k = os.environ.get("RUNPOD_API_KEY")
+    if not k:
+        raise SystemExit("RUNPOD_API_KEY is not set")
+    return k
+
+
+def _pubkey() -> str:
+    p = os.path.expanduser(os.environ.get("BENCH_SSH_PUBKEY", "~/.ssh/chalk_pod.pub"))
+    try:
+        with open(p) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        raise SystemExit(f"SSH pubkey not found at {p} (set BENCH_SSH_PUBKEY)")
+
+
+def _headers() -> dict:
+    return {"Authorization": "Bearer " + _key(), "Content-Type": "application/json"}
 
 
 def call(method: str, url: str, body=None):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, headers=H, method=method)
+    req = urllib.request.Request(url, data=data, headers=_headers(), method=method)
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read() or "{}")
@@ -36,7 +54,7 @@ def call(method: str, url: str, body=None):
 def create(gpu: str, name: str, disk: str) -> None:
     start = (
         "apt-get update -qq && apt-get install -y -qq openssh-server >/dev/null 2>&1; "
-        "mkdir -p /run/sshd /root/.ssh; echo " + shlex.quote(PUBKEY) + " >> /root/.ssh/authorized_keys; "
+        "mkdir -p /run/sshd /root/.ssh; echo " + shlex.quote(_pubkey()) + " >> /root/.ssh/authorized_keys; "
         "chmod 600 /root/.ssh/authorized_keys; /usr/sbin/sshd -D -p 22"
     )
     body = {
