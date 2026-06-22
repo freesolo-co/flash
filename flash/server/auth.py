@@ -96,10 +96,10 @@ def _str_field(value: Any) -> str | None:
 
 
 def _identity_from_verify_body(raw: bytes) -> dict[str, Any]:
-    """Extract optional identity fields from the Freesolo verify response.
+    """Extract optional identity fields from the freesolo verify response.
 
-    The current backend contract only guarantees ``{"ok": true}``. This parser is deliberately
-    tolerant so Flash starts surfacing real fields as soon as the backend includes them.
+    The backend historically returned only ``{"ok": true}``. This parser is deliberately
+    tolerant so Flash surfaces real fields when the backend includes them.
     """
     if not raw:
         return {}

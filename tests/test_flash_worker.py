@@ -62,7 +62,7 @@ def test_build_worker_env_forwards_judge_model(monkeypatch):
 
 
 def test_build_worker_env_forwards_prime_api_key(monkeypatch):
-    """The worker needs PRIME_API_KEY to `prime env install` the run's Hub env(s)."""
+    """The worker needs PRIME_API_KEY to install the run's published env(s)."""
     from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("PRIME_API_KEY", "pit-secret")
