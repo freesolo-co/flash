@@ -138,16 +138,17 @@ MODELS: dict[str, ModelInfo] = {
         params_b=9.7,
         vocab_size=248_320,
         algos=("sft", "grpo"),
-        min_vram_gb=16,
-        # MEMORY-OPTIMIZED: 4-bit NF4 frozen base + bf16 LoRA adapter (QLoRA). The base
-        # drops from ~19 GB bf16 to ~5.3 GB, so colocated GRPO holds two 4-bit copies
-        # (trainer + bnb-quantized vLLM rollout) instead of two bf16 copies -> it fits a
-        # ~24-32 GB card instead of an 80 GB A100. NF4 is near-lossless for adapter training
-        # (QLoRA paper + follow-ups), a small quality trade for a ~3x cheaper GPU. No GRPO
-        # floor: the matrix sizes the (much smaller) 4-bit footprint directly.
-        grpo_min_vram_gb=0,
-        quant="4bit-qlora",
-        recommended_gpu="RTX 5090",
+        min_vram_gb=48,
+        # bf16 LoRA (NOT QLoRA). 4-bit QLoRA was abandoned for the 9B because the GRPO vLLM
+        # rollout MERGES the LoRA into the 4-bit base (peft bnb merge), and that rounding makes
+        # the sampler policy diverge from the bf16 trainer -> TRL importance-sampling ratio
+        # collapses to 0 (no learning) + runaway/non-terminating generations. bf16 keeps the
+        # rollout and trainer in the same precision so GRPO actually learns. Costs a bigger GPU:
+        # ~19 GB weights; SFT fits a 48 GB card, colocated GRPO (two bf16 copies + KV + the
+        # 248k-vocab fp32 logits) needs an 80 GB class -> grpo_min_vram_gb floor below.
+        grpo_min_vram_gb=80,
+        quant="bf16",
+        recommended_gpu="A100 PCIe",
         thinking="hybrid",
         notes="QLoRA (4-bit NF4 base + bf16 LoRA). GRPO's colocated vLLM rollout loads the "
         "base 4-bit via bitsandbytes too, so both copies are 4-bit -> fits ~24-32 GB "
