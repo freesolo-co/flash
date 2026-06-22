@@ -422,7 +422,11 @@ class JobHandle:
 class PollResult:
     ok: bool
     metrics: dict | None = None
-    failure: str | None = None  # "job_failed" | "stalled" | "poll_error"
+    # "job_failed"    : genuine worker/job code error (NOT retried)
+    # "job_preempted" : provider killed the worker (platform termination) -> infra-shaped, retried
+    # "stalled"       : no worker progress within the budget -> infra-shaped, retried
+    # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
+    failure: str | None = None
     detail: str | None = None
 
 
