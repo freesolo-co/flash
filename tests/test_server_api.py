@@ -170,6 +170,14 @@ def test_freesolo_user_identity_from_verify_response(api, monkeypatch):
     assert row["key_prefix"] == "fslo_abc123"
 
 
+def test_freesolo_verify_parser_does_not_treat_top_level_id_as_api_key_id():
+    import flash.server.auth as auth_mod
+
+    identity = auth_mod._identity_from_verify_body(b'{"id":"user-or-session-1","org_id":"org-1"}')
+
+    assert identity == {"org_id": "org-1"}
+
+
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     # A freesolo key that verifies with the backend but whose db row was disabled (revoked)
     # must be rejected as 401 (authenticate -> None), not raise a 500.
