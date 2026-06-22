@@ -95,13 +95,9 @@ def upload_code(repo: str | None = None) -> str:
         repo_id=repo,
         repo_type="dataset",
         ignore_patterns=["__pycache__/*", "*.pyc"],
-        # Mirror the local package EXACTLY: delete every remote file under code/flash that isn't in
-        # this upload (delete_patterns are relative to path_in_repo, so "**" scopes to code/flash/**
-        # only). The "don't delete what we re-add" optimization in upload_folder keeps unchanged
-        # files; this only removes ORPHANS — modules renamed/deleted between releases, or a stale
-        # snapshot a prior partial/diff commit left behind. Without it, a purely additive upload
-        # leaves dead .py files in code/flash that the worker still imports, so a run can pick up
-        # OLD code (the "missing recent fixes" symptom) even after a clean redeploy.
+        # Exact-mirror code/flash so the worker never re-imports an orphaned/renamed module a prior
+        # additive upload left behind. delete_patterns are relative to path_in_repo, so "**" is
+        # scoped to code/flash (only orphans there are purged; unchanged files are kept).
         delete_patterns=["**"],
     )
     return repo
