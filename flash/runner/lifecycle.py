@@ -18,7 +18,7 @@ import time
 from flash.spec import JobSpec
 
 
-def _run_job(spec: JobSpec) -> None:
+def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     # Lazy import so dry-run / unit tests never construct a Flash endpoint.
     from flash.providers.runpod.train import upload_code
     from flash.runner import (
@@ -38,7 +38,7 @@ def _run_job(spec: JobSpec) -> None:
     _update(spec.run_id, "provisioning")
     log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
     try:
-        _run_job_inner(spec, log_path, upload_code)
+        _run_job_inner(spec, log_path, upload_code, runtime_secrets=runtime_secrets)
     finally:
         # Endpoint GC: every run leaves its uniquely-named endpoint registered, and the
         # account-wide *max workers quota* (5 by default) counts registered endpoints —
@@ -63,6 +63,7 @@ def _submit_seed_supervised(
     log,
     *,
     initial_starved: frozenset = frozenset(),
+    runtime_secrets: dict[str, str] | None = None,
 ) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
@@ -286,17 +287,18 @@ def _submit_seed_supervised(
                     key=lambda o: (o.gpu != chosen.gpu, o.dph_total),
                 )
             try:
-                res = provider.submit_run(
-                    run_spec,
-                    seed,
-                    log=log,
-                    on_handle=on_handle,
-                    attempt=attempt,
-                    offers=offers,
+                submit_kwargs = {
+                    "log": log,
+                    "on_handle": on_handle,
+                    "attempt": attempt,
+                    "offers": offers,
                     # The run's machine blacklist must reach the provider so an in-provider
                     # offer REFRESH (Vast) keeps stalled/sick machines excluded.
-                    exclude_machine_ids=frozenset(bad_machines),
-                )
+                    "exclude_machine_ids": frozenset(bad_machines),
+                }
+                if runtime_secrets:
+                    submit_kwargs["runtime_secrets"] = runtime_secrets
+                res = provider.submit_run(run_spec, seed, **submit_kwargs)
             except Exception as exc:
                 # Deploy/submit themselves can fail transiently (observed: RunPod
                 # GraphQL "Something went wrong" x3 during a retry deploy; a vast offer
@@ -377,7 +379,12 @@ def _submit_seed_supervised(
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
 
 
-def _run_job_inner(spec: JobSpec, log_path: str, upload_code) -> None:
+def _run_job_inner(
+    spec: JobSpec,
+    log_path: str,
+    upload_code,
+    runtime_secrets: dict[str, str] | None = None,
+) -> None:
     from flash.runner import _run_seed_loop, _RunCancelled, _update, get_status
 
     try:
@@ -385,7 +392,13 @@ def _run_job_inner(spec: JobSpec, log_path: str, upload_code) -> None:
         # worker — which fetches code/** from that same repo — can run it.
         upload_code(spec.train.hf_repo)
         with open(log_path, "a") as log:
-            _run_seed_loop(spec, log, start_index=0, prior_cost=0.0)
+            _run_seed_loop(
+                spec,
+                log,
+                start_index=0,
+                prior_cost=0.0,
+                runtime_secrets=runtime_secrets,
+            )
     except _RunCancelled:
         return  # cancel_run already set the terminal state
     except Exception as exc:
@@ -394,7 +407,14 @@ def _run_job_inner(spec: JobSpec, log_path: str, upload_code) -> None:
         raise
 
 
-def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -> None:
+def _run_seed_loop(
+    spec: JobSpec,
+    log,
+    *,
+    start_index: int,
+    prior_cost: float,
+    runtime_secrets: dict[str, str] | None = None,
+) -> None:
     """Run spec.train.seeds[start_index:] under supervision; finalize the run.
 
     Shared by a fresh submit (start_index=0) and post-restart recovery, which
@@ -428,7 +448,7 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
             file=log,
             flush=True,
         )
-        metrics = _submit_seed_supervised(spec, seed, log)
+        metrics = _submit_seed_supervised(spec, seed, log, runtime_secrets=runtime_secrets)
         total_cost += _persist_metrics(spec, seed, metrics)
         # A cancel can land while this thread writes metrics — after the supervised
         # late-cancel check. Re-read before the post-seed status writes so a late

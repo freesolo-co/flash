@@ -272,8 +272,20 @@ def chalk_extra_pip(spec=None) -> list[str]:
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
 
 
-def build_worker_env(spec: JobSpec, seed: int) -> dict:
-    """Per-run env passed to the worker (secrets + recipe overrides)."""
+_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
+
+
+def build_worker_env(
+    spec: JobSpec,
+    seed: int,
+    runtime_secrets: dict[str, str] | None = None,
+) -> dict:
+    """Per-run env passed to the worker (platform creds + recipe overrides).
+
+    Provider and artifact credentials still come from the control-plane process environment.
+    User-owned W&B is the one supported client runtime secret, injected from ``runtime_secrets``
+    below so the control plane does not need a platform W&B key.
+    """
     # CUDA allocator conf. Colocate (TRL trainer + vLLM on one GPU) fragments over a long run,
     # so expandable_segments (which reclaims fragmentation) is the right default — EXCEPT under
     # GRPO vLLM sleep mode, whose CuMemAllocator memory pool is incompatible with
@@ -397,15 +409,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         "RL_VLLM_SERVER_UTIL",
         "FLASH_DISAGG_PARALLEL",
         "FLASH_RL_VLLM_ENFORCE_EAGER",
-        # W&B credential that enables logging. Project + run name come from the spec's typed
-        # [wandb] config (NOT env vars); the run's entity is the API key's default account/team
-        # (wandb_report_to does not pass entity=).
-        "WANDB_API_KEY",
         # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
         # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
         # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a
         # control-plane `FLASH_UPLOAD_CONSOLE=1` only reaches run_mode if it's forwarded here.
-        # Without this it silently no-ops on success.
         "FLASH_UPLOAD_CONSOLE",
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
         # the WORKER decides which kernels to enable from these flags. install_chalk_kernels runs
@@ -487,4 +494,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         if str(k).upper() in _RESERVED_WORKER_ENV:
             continue  # control plane owns run identity; a per-run override would orphan artifacts
         env[str(k)] = str(v)
+    for k, v in (runtime_secrets or {}).items():
+        if k in _RUNTIME_SECRET_KEYS and v:
+            env[k] = str(v)
     return env

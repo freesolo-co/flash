@@ -493,6 +493,7 @@ class Provider(Protocol):
         attempt: int = 0,
         offers: Any = None,
         exclude_machine_ids: Any = frozenset(),
+        runtime_secrets: dict[str, str] | None = None,
     ) -> PollResult:
         """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll.
 

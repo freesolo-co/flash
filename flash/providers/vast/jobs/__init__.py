@@ -164,6 +164,7 @@ def deploy_and_submit(
     attempt: int = 0,
     log=None,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
+    runtime_secrets: dict[str, str] | None = None,
 ) -> VastJobHandle:
     """Rent the cheapest offer that will actually take the job; walk on rejection.
 
@@ -179,7 +180,7 @@ def deploy_and_submit(
 
     if not offers:
         raise vast_api.VastApiError("no usable vast offers (verified datacenter pool empty)")
-    payload = build_payload(spec, seed, attempt)
+    payload = build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets)
     label = instance_label(spec.run_id, seed, attempt)
     from flash.providers.runpod.train import WORKER_IMAGE
 
@@ -482,6 +483,7 @@ def submit_run_vast(
     attempt: int = 0,
     offers: list[VastOffer] | None = None,
     exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
+    runtime_secrets: dict[str, str] | None = None,
 ) -> PollResult:
     """Vast equivalent of ``runpod.jobs.submit_run``: rent, persist, poll.
 
@@ -510,7 +512,13 @@ def submit_run_vast(
             if o.gpu == spec.gpu.type
         ]
     handle = deploy_and_submit(
-        spec, seed, offers, attempt=attempt, log=log, exclude_machine_ids=exclude_machine_ids
+        spec,
+        seed,
+        offers,
+        attempt=attempt,
+        log=log,
+        exclude_machine_ids=exclude_machine_ids,
+        runtime_secrets=runtime_secrets,
     )
     # The instance is rented and billing the MOMENT deploy_and_submit returns; the
     # teardown ``finally`` must guard EVERYTHING after that point — including

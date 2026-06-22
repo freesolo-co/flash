@@ -118,6 +118,22 @@ def test_build_worker_env_forwards_prime_api_key(monkeypatch):
     assert "PRIME_API_KEY" not in build_worker_env(_spec(), 0)
 
 
+def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(monkeypatch):
+    """Provider/platform creds are supplied by the control plane, but W&B belongs to the user.
+
+    WANDB_API_KEY must therefore come from the per-submit runtime secret path, not from the
+    control-plane process env.
+    """
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.setenv("WANDB_API_KEY", "platform-should-not-forward")
+    env = build_worker_env(_spec(), 0)
+    assert "WANDB_API_KEY" not in env
+
+    env = build_worker_env(_spec(), 0, runtime_secrets={"WANDB_API_KEY": "user-wb"})
+    assert env["WANDB_API_KEY"] == "user-wb"
+
+
 def test_build_worker_env_forwards_upload_console(monkeypatch):
     """FLASH_UPLOAD_CONSOLE (upload the worker console on SUCCESS, not just on crash) is read on the
     worker by run_mode() from the forwarded env dict — RunPod _train_body AND the Vast bootstrap,

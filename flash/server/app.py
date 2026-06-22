@@ -39,6 +39,7 @@ from flash.spec import JobSpec, coerce_bool
 
 from . import auth, db
 
+_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
@@ -135,7 +136,13 @@ def recover_runs() -> None:
     """Recover every in-flight run after a restart so a redeploy never loses a training session:
     re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
     ``queued``/``provisioning`` runs that never reached a worker."""
-    from flash.runner import _gc_run_endpoints, _run_job, _update, attach_run, resume_run
+    from flash.runner import (
+        _gc_run_endpoints,
+        _run_job_background,
+        _update,
+        attach_run,
+        resume_run,
+    )
 
     active: set[str] = set()
     # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
@@ -205,7 +212,7 @@ def recover_runs() -> None:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         with contextlib.suppress(Exception):
             _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
-        threading.Thread(target=lambda s=spec: _run_job(s), daemon=True).start()
+        threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
 
 
 def create_app():
@@ -310,6 +317,30 @@ def create_app():
         except (ConfigError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    def _runtime_secrets(payload: dict) -> dict[str, str]:
+        raw = payload.get("runtime_secrets") or {}
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="runtime_secrets must be a JSON object")
+        unknown = sorted(set(raw) - _RUNTIME_SECRET_KEYS)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "unsupported runtime secret(s): "
+                    f"{', '.join(unknown)} (allowed: {', '.join(sorted(_RUNTIME_SECRET_KEYS))})"
+                ),
+            )
+        out: dict[str, str] = {}
+        for key, value in raw.items():
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise HTTPException(status_code=400, detail=f"runtime_secrets.{key} must be a string")
+            value = value.strip()
+            if value:
+                out[key] = value
+        return out
+
     @app.post("/v1/runs")
     def create_run(
         payload: dict,
@@ -317,6 +348,7 @@ def create_app():
         authorization: str | None = Header(default=None),
     ):
         spec = _parse_spec(payload, run_id=new_run_id())
+        runtime_secrets = _runtime_secrets(payload)
         dry_run = bool(payload.get("dry_run", False))
         # Charge the pre-flight estimate to the user's org BEFORE accepting the run, so it's gated
         # on balance and never starts unpaid. Skipped for --dry-run and the internal service
@@ -340,7 +372,10 @@ def create_app():
         # debit — the org must never pay for a run that didn't start.
         try:
             db.record_run(spec.run_id, key["id"])
-            status = submit_job(spec, dry_run=dry_run, background=True)
+            submit_kwargs = {"dry_run": dry_run, "background": True}
+            if runtime_secrets:
+                submit_kwargs["runtime_secrets"] = runtime_secrets
+            status = submit_job(spec, **submit_kwargs)
         except Exception as exc:
             db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
             # The run never started — reverse the charge so the org isn't billed for it.

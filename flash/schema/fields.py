@@ -171,7 +171,8 @@ def _worker_env(raw: Any) -> dict[str, str]:
     if secrets:
         raise ConfigError(
             f"[worker_env] must not contain secret-bearing keys ({', '.join(secrets)}); these are "
-            "serialized into run artifacts — set them as real environment variables instead"
+            "serialized into run artifacts; use provider process env or supported runtime secrets "
+            "instead"
         )
     return env
 
