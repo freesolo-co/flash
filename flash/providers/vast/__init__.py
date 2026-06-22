@@ -54,18 +54,20 @@ class VastProvider:
         attempt: int = 0,
         offers: Any = None,
         exclude_machine_ids: Any = frozenset(),
+        runtime_secrets: dict[str, str] | None = None,
     ) -> PollResult:
         from flash.providers.vast.jobs import submit_run_vast
 
-        return submit_run_vast(
-            spec,
-            seed,
-            log=log,
-            on_handle=on_handle,
-            attempt=attempt,
-            offers=offers,
-            exclude_machine_ids=exclude_machine_ids,
-        )
+        kwargs = {
+            "log": log,
+            "on_handle": on_handle,
+            "attempt": attempt,
+            "offers": offers,
+            "exclude_machine_ids": exclude_machine_ids,
+        }
+        if runtime_secrets:
+            kwargs["runtime_secrets"] = runtime_secrets
+        return submit_run_vast(spec, seed, **kwargs)
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
         from flash.providers.runpod.jobs import make_hf_heartbeat_reader
