@@ -319,10 +319,11 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B", 4096) is True
 
 
-def test_make_lora_uses_standard_init_and_rslora(monkeypatch):
-    """PiSSA was removed (its saved adapter is a residual against the PiSSA-mutated base, which
-    corrupts serving + GRPO warm-start that load it onto the ORIGINAL base). make_lora uses the
-    standard zero-B init (serve/warm-start safe) and keeps rsLoRA, for every model."""
+def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
+    """make_lora uses serve-safe, convergence-stable LoRA defaults for every model:
+    standard zero-B init (PiSSA removed — its residual corrupts serve + GRPO warm-start) and
+    standard alpha/r scaling (rsLoRA removed — alpha/sqrt(r) is ~5.6x larger and diverges the
+    SFT at the usual LoRA LR -> degenerate served adapter)."""
     captured = {}
     fake_peft = types.ModuleType("peft")
     fake_peft.LoraConfig = lambda **kw: (captured.update(kw), kw)[1]
@@ -336,7 +337,7 @@ def test_make_lora_uses_standard_init_and_rslora(monkeypatch):
         worker.make_lora(model_id)
         assert captured.get("init_lora_weights") is True
         assert "pissa" not in str(captured.get("init_lora_weights")).lower()
-        assert captured.get("use_rslora") is True
+        assert captured.get("use_rslora") is False
 
 
 def test_force_vllm_backend_for_sm120(monkeypatch):
