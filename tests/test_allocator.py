@@ -177,6 +177,10 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
     grid = [
         ("Qwen/Qwen3.5-0.8B", "grpo", {"max_length": 1024, "group_size": 4}),
         ("Qwen/Qwen3.5-0.8B", "grpo", {"max_length": 32768, "group_size": 16}),
+        # un-fused big-vocab SFT (the documented OOM case): a <3B model at a <2048-token ctx, where
+        # the lm_head materializes the [per_device, seq, ~248k] fp32 logits the SFT branch once ignored.
+        ("Qwen/Qwen3.5-0.8B", "sft", {"max_length": 1024}),
+        ("Qwen/Qwen3.5-2B", "sft", {"max_length": 1536}),  # near the Liger threshold
         ("Qwen/Qwen3.5-2B", "sft", {"max_length": 8192}),
         ("Qwen/Qwen3.5-4B", "grpo", {"max_length": 1024, "group_size": 4}),
         ("Qwen/Qwen3.5-4B", "grpo", {"max_length": 16384, "max_tokens": 4096, "group_size": 8}),
@@ -187,6 +191,56 @@ def test_allocate_never_selects_below_matrix_need(monkeypatch):
         need = required_vram_gb(model, algo, train=tr)
         alloc = allocate(model, algo, train=tr)
         assert get_gpu_info(alloc.gpu).vram_gb >= need, (model, algo, tr, alloc.gpu, need)
+
+
+def test_sft_big_vocab_logits_term_present_and_bounded():
+    """SFT must reserve the [per_device, seq, vocab] fp32-logits VRAM whenever the worker's fused CE
+    is OFF (a <3B model AND a <2048-token ctx) -- the big-vocab SFT OOM driver the SFT branch
+    previously ignored entirely. The term is bounded by the logits budget (the per-device cap keeps
+    it there) and VANISHES once the worker fuses the CE, so it can't OOM and never over-reserves."""
+    from flash.engine import vram
+    from flash.engine.vram import estimate_vram_gb as e
+
+    V = 248_320  # Qwen3.5's padded vocab
+    # un-fused (0.9B, seq 1024): a big-vocab run reserves real logits vs a ~zero-vocab run ...
+    with_logits = e(0.9, "sft", seq_len=1024, vocab=V, batch_size=4)
+    no_logits = e(0.9, "sft", seq_len=1024, vocab=1, batch_size=4)
+    assert with_logits > no_logits
+    # ... but never by more than the budget (the per-device cap bounds the term, like GRPO)
+    assert with_logits - no_logits <= vram._LOGITS_BUDGET_GB + 1e-6
+    # fused gate: at seq >= 2048 the fused CE removes the term -> vocab no longer moves the estimate
+    assert e(0.9, "sft", seq_len=2048, vocab=V) == e(0.9, "sft", seq_len=2048, vocab=1)
+    # ... and a >= 3B model fuses at any ctx -> vocab-independent there too (unchanged from before)
+    assert e(4.7, "sft", seq_len=1024, vocab=V) == e(4.7, "sft", seq_len=1024, vocab=1)
+
+
+def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
+    """The worker's SFT per-device cap (sft_per_device) keeps the un-fused [pd, seq, vocab] fp32
+    logits within _LOGITS_BUDGET_GB at every sub-2048 ctx -- the SFT mirror of rl_per_device_comps.
+    The estimator and worker call this SAME helper, so what the allocator reserves == what runs."""
+    from flash.engine import vram
+
+    V = 248_320
+    for seq in (256, 512, 1024, 1536, 2000):  # all < 2048 -> un-fused for a small model
+        pd = vram.sft_per_device(4, seq_len=seq, vocab=V, fused=False)
+        logits_gb = pd * seq * V * vram._SFT_LOGITS_BYTES_PER_ELEM / 1e9
+        assert 1 <= pd <= 4
+        assert logits_gb <= vram._LOGITS_BUDGET_GB + 1e-6, (seq, pd, logits_gb)
+    # fused -> no cap, the full micro-batch runs (no needless throughput loss)
+    assert vram.sft_per_device(4, seq_len=4096, vocab=V, fused=True) == 4
+
+
+def test_required_vram_sft_small_model_includes_big_vocab_logits():
+    """REGRESSION (big-vocab SFT OOM): a sub-3B short-ctx SFT on a ~248k-vocab model must size for
+    its lm_head logits. Pre-fix the SFT branch ignored them (need ~8 GB for a ~17 GB real peak that
+    OOMs a 24 GB card near the Liger threshold); now the equation reserves the logits-inclusive need
+    so the allocator can't under-provision. A >=2048 ctx fuses the CE, dropping the term back out."""
+    from flash.providers.allocator import required_vram_gb
+
+    n_short = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_length": 1024})
+    assert n_short >= 12  # base+act (~7) + capped logits (~4), x1.1 -- well above the pre-fix ~8
+    n_fused = required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", train={"max_length": 2048})
+    assert n_fused < n_short  # the fused CE removes the logits term at >= 2048 ctx
 
 
 # ---------------------------------------------------------------------------
