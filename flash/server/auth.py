@@ -25,7 +25,7 @@ INTERNAL_KEY_ENV = "FREESOLO_INTERNAL_KEY"
 # the bearer to this control plane. Any non-internal token is verified against the freesolo
 # backend and (on success) resolved to a per-token identity.
 FREESOLO_BASE_URL_ENV = "FREESOLO_BASE_URL"
-DEFAULT_FREESOLO_BASE_URL = "https://api-dev.freesolo.co"
+DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 _VERIFY_TIMEOUT_S = 5.0
 _VERIFY_CACHE_TTL_S = 300.0  # short TTL so it isn't a backend round-trip per request
 # Negative verdicts get a much SHORTER TTL than positives. The freesolo verify endpoint
