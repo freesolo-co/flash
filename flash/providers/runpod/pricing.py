@@ -1,6 +1,6 @@
 """Per-GPU hourly rates: RunPod live pricing with a static fallback.
 
-Cost projection (runner, serve) and the ``gpu.type = "cheapest"`` policy both
+Cost projection (runner, serve) and the cheapest-validated-class allocation both
 need $/hr per GPU class. Rates move with the market, so we read them live from the
 RunPod pricing API (the ``runpod`` SDK's GraphQL wrapper — the plain REST surface has
 no GPU-types route and direct GraphQL is 403 for scoped keys) and cache them on disk;

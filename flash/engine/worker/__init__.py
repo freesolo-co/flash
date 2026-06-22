@@ -68,6 +68,7 @@ from flash.engine.worker.perf import (
     _remove_fla_from_disk,  # noqa: F401
     _reset_peak_gpu,
     _sdpa_cudnn_ctx,
+    assert_usable_gpu,
     free_gpu,
     fused_optim_name,
     gpu_diagnostics,
@@ -80,6 +81,16 @@ from flash.engine.worker.perf import (
 )
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
+
+# Disable PyTorch's NVML-based CUDA availability check BEFORE any torch/CUDA import. On a
+# MIG slice / permission-restricted host (RunPod has fulfilled full-GPU requests with a MIG
+# partition whose nvidia-smi reads "[Insufficient Permissions]"), the NVML-based check makes
+# the caching allocator HARD-ASSERT mid-backward ("NVML_SUCCESS == r INTERNAL ASSERT FAILED
+# ... CUDACachingAllocator"). Falling back to the non-NVML check lets the dedicated boot guard
+# (assert_usable_gpu) detect the bad host and raise a RETRIABLE infra error instead of crashing
+# opaquely deep in training. setdefault so an explicit operator/launcher value still wins. Read
+# lazily by torch at first CUDA use, so setting it at import (before any torch import) is in time.
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "0")
 
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
@@ -751,21 +762,52 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     # SDK [train] knobs override the recipe default.
-    from flash.engine.vram import sft_grad_accum
+    from flash.catalog import MODELS as _SFT_CATALOG
+    from flash.catalog import vocab_size_for
+    from flash.engine.vram import (
+        fetch_hf_params_b,
+        params_b_from_str,
+        sft_grad_accum,
+        sft_logits_fused,
+    )
 
     _t = JOB_SPEC.train if JOB_SPEC else None
-    # batch_size is the GLOBAL/effective batch; sft_grad_accum sizes the per-device micro-batch +
-    # grad-accum to realize it (shared with the cost estimator's step count, see engine.vram).
-    effective_batch = (
-        _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
-    )
-    per_device_bs, grad_accum = sft_grad_accum(effective_batch)
     sft_lr = _t.learning_rate if _t and _t.learning_rate is not None else RECIPE.sft.learning_rate
     sft_max_len = (
         _t.max_length
         if _t and _t.max_length is not None
         else (RECIPE.sft.max_seq_len_thinking if THINKING else RECIPE.sft.max_seq_len)
     )
+    # batch_size is the GLOBAL/effective batch; sft_grad_accum sizes the per-device micro-batch +
+    # grad-accum to realize it (shared with the cost estimator's step count, see engine.vram).
+    effective_batch = (
+        _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
+    )
+    # Large-vocab OOM guard: when the fused CE (Liger) is OFF, the SFTTrainer materializes the full
+    # [per_device, seq, vocab] fp32 logits + grad — at Qwen3.5's ~248k vocab a 0.8B SFT OOM'd a
+    # 24 GB card in backward. Cap the per-device micro-batch by the real model vocab + seq so those
+    # logits stay within the logits budget; grad-accum rises to keep the effective batch unchanged
+    # (the SFT mirror of rl_per_device_comps' GRPO cap). fused mirrors liger_on(_memory_mode(...))
+    # below, so the cap binds exactly when the worker won't fuse the CE.
+    _sft_info = _SFT_CATALOG.get(model_id)
+    _sft_params_b = (
+        (getattr(_sft_info, "params_b", 0.0) or params_b_from_str(getattr(_sft_info, "params", None)))
+        if _sft_info
+        else None
+    )
+    if not _sft_params_b:
+        _sft_params_b = fetch_hf_params_b(model_id)  # uncataloged: HF safetensors metadata
+    _sft_vocab = vocab_size_for(model_id)
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len)
+    per_device_bs, grad_accum = sft_grad_accum(
+        effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
+    )
+    if not _sft_fused and per_device_bs < min(effective_batch, 4):
+        print(
+            f"[sft] large-vocab logits cap: per_device={per_device_bs} grad_accum={grad_accum} "
+            f"(seq={sft_max_len}, vocab={_sft_vocab}; realized batch "
+            f"{per_device_bs * grad_accum} >= requested {effective_batch})"
+        )
     sft_save_default = _t.save_every if _t and _t.save_every is not None else 50
     out_dir = f"/tmp/sft_seed{SEED}"
     resume_ckpt = hf_resume_checkpoint()
@@ -1907,8 +1949,13 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
-        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
         heartbeat("boot")
+        # Boot guard: a MIG slice / NVML-restricted host (RunPod has fulfilled a full-GPU request
+        # with a MIG partition) makes PyTorch's allocator NVML-assert mid-backward. Detect it now
+        # and raise the RETRIABLE infra error so the control plane resubmits on a fresh worker,
+        # instead of crashing opaquely deep in training as a non-retried job_failed.
+        assert_usable_gpu()
+        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
