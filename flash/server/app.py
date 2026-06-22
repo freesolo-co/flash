@@ -267,11 +267,14 @@ def create_app():
 
     @app.get("/v1/me")
     def me(key: dict = Depends(require_key)):
-        return {
+        payload = {
+            "kind": "internal" if key["key_prefix"] == "internal" else "freesolo_api_key",
             "key_prefix": key["key_prefix"],
-            "email": key["email"],
-            "created_at": key["created_at"],
         }
+        for field in ("email", "user_id", "org_id", "api_key_id", "training_agent_job_id", "project_id"):
+            if key.get(field):
+                payload[field] = key[field]
+        return payload
 
     @app.get("/v1/models")
     def models(_: dict = Depends(require_key)):
