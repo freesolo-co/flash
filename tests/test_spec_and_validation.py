@@ -16,7 +16,7 @@ from flash.spec import JobSpec, load_job_spec_from_env
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
-    "environment": {"id": "primeintellect/gsm8k"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
     "train": {"steps": 10, "lora_rank": 8, "seeds": [0], "hf_repo": "owner/runs"},
     "gpu": {"type": "RTX 4090"},
 }
@@ -102,12 +102,12 @@ def test_environment_path_is_rejected() -> None:
 
 
 def test_bare_environment_id_is_rejected() -> None:
-    # A bare id like "gsm8k" passes the presence check but the worker would run
-    # `prime env install gsm8k` (invalid — Prime needs owner/name); reject it up front.
+    # A bare id like "gsm8k" passes the presence check but is not a GitHub Freesolo ref;
+    # reject it up front.
     for bad in ("gsm8k", "owner/", "/name", "a/b/c"):
         raw = _raw()
         raw["environment"] = {"id": bad}
-        with pytest.raises(ConfigError, match=r"owner/name"):
+        with pytest.raises(ConfigError, match=r"GitHub Freesolo environment ref"):
             spec_from_dict(raw)
 
 
@@ -138,16 +138,16 @@ def test_environment_subfields_reject_wrong_types() -> None:
     # `environment = false` must fail rather than silently coerce to {} and bypass intent.
     for bad in ("notatable", 123, False):
         raw = _raw()
-        raw["environment"] = {"id": "primeintellect/gsm8k", "params": bad}
+        raw["environment"] = {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py", "params": bad}
         with pytest.raises(ConfigError, match=r"\[environment\] params must be a table"):
             spec_from_dict(raw)
     for bad in ("notalist", 123, False):
         raw = _raw()
-        raw["environment"] = {"id": "primeintellect/gsm8k", "pip": bad}
+        raw["environment"] = {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py", "pip": bad}
         with pytest.raises(ConfigError, match=r"\[environment\] pip must be a list of strings"):
             spec_from_dict(raw)
     raw = _raw()
-    raw["environment"] = {"id": "primeintellect/gsm8k", "pip": ["ok", 123]}
+    raw["environment"] = {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py", "pip": ["ok", 123]}
     with pytest.raises(ConfigError, match=r"\[environment\] pip entries must be strings"):
         spec_from_dict(raw)
 
@@ -155,13 +155,13 @@ def test_environment_subfields_reject_wrong_types() -> None:
 def test_environment_subfields_accept_valid_and_missing() -> None:
     # Missing sub-fields keep their defaults, and valid values pass through unchanged.
     raw = _raw()
-    raw["environment"] = {"id": "primeintellect/gsm8k"}
+    raw["environment"] = {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"}
     spec = spec_from_dict(raw)
     assert spec.environment.params == {}
     assert spec.environment.pip == ()
     raw = _raw()
     raw["environment"] = {
-        "id": "primeintellect/gsm8k",
+        "id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py",
         "params": {"k": "v"},
         "pip": ["pkg==1.0"],
     }
@@ -170,7 +170,7 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     assert spec.environment.pip == ("pkg==1.0",)
     # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
     raw = _raw()
-    raw["environment"] = {"id": "primeintellect/gsm8k", "params": None, "pip": None}
+    raw["environment"] = {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py", "params": None, "pip": None}
     spec = spec_from_dict(raw)
     assert spec.environment.params == {}
     assert spec.environment.pip == ()
@@ -377,7 +377,8 @@ def test_configure_logging_verbosity() -> None:
         "OPENAI_API_KEY",  # KEY qualified by API
         "AWS_SECRET_ACCESS_KEY",  # SECRET word + KEY qualified by SECRET/ACCESS
         "DB_PASSWORD",  # PASSWORD word
-        "PRIME_API_KEY",
+        "GITHUB_TOKEN",
+        "FLASH_ENV_GITHUB_TOKEN",
         "WANDB_API_KEY",
         "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
         "MY_CREDENTIAL",
