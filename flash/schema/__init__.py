@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import tomllib
 from typing import Any
@@ -83,11 +84,10 @@ def _apply_override(raw: dict, item: str) -> None:
 
 
 def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
-    ref = str(train_raw.get("init_from_adapter") or "")
+    ref = str(train_raw.get("init_from_adapter") or "").strip()
     if not ref:
         return ""
-    repo, sep, prefix = ref.partition(":")
-    if sep and repo.count("/") == 1 and prefix.startswith(("sft/", "rl/")):
+    if re.match(r"^[^/]+/[^/:]+:(sft|rl)/[^/]+/seed\d+$", ref):
         return ref
     raise ConfigError(
         "train.init_from_adapter must be the full adapter_ref emitted by `flash status` "
