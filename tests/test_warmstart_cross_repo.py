@@ -1,4 +1,4 @@
-"""init_from_adapter warm-start reference resolution."""
+"""init_from_adapter uses the adapter_ref form emitted by flash status."""
 
 import os
 import shutil
@@ -29,7 +29,7 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
         shutil.rmtree("/tmp/evdl", ignore_errors=True)
 
 
-def test_cross_repo_prefix_downloads_from_other_repo(monkeypatch):
+def test_status_adapter_ref_downloads_from_other_repo(monkeypatch):
     calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-sftX:sft/flash-sftX/seed0")
     assert calls["repo_id"] == "Freesolo-Co/flashrun-sftX"
     assert calls["allow_patterns"] == ["sft/flash-sftX/seed0/adapter/*"]
@@ -37,15 +37,13 @@ def test_cross_repo_prefix_downloads_from_other_repo(monkeypatch):
     assert out.endswith("sft/flash-sftX/seed0/adapter")
 
 
-def test_bare_prefix_uses_own_repo(monkeypatch):
-    calls, _out = _capture(monkeypatch, "sft/flash-self/seed0")
-    assert calls["repo_id"] == "Freesolo-Co/flashrun-self"
-    assert calls["allow_patterns"] == ["sft/flash-self/seed0/adapter/*"]
+def test_bare_prefix_is_not_a_public_init_adapter_ref(monkeypatch):
+    calls, out = _capture(monkeypatch, "sft/flash-self/seed0")
+    assert calls == {}
+    assert out is None
 
 
-def test_managed_repo_shorthand_uses_sft_seed0(monkeypatch):
+def test_managed_repo_without_prefix_is_not_a_public_init_adapter_ref(monkeypatch):
     calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff")
-    assert calls["repo_id"] == "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff"
-    assert calls["allow_patterns"] == ["sft/flash-1782194170-ce1cfcff/seed0/adapter/*"]
-    assert out is not None
-    assert out.endswith("sft/flash-1782194170-ce1cfcff/seed0/adapter")
+    assert calls == {}
+    assert out is None
