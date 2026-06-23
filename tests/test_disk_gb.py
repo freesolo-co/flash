@@ -76,7 +76,7 @@ def test_submit_raises_disk_to_model_min(monkeypatch):
             {
                 "model": "test/big-disk",
                 "algorithm": "sft",
-                "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
+                "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
                 "gpu": {"type": "RTX 5090", "disk_gb": 60},
             }
         )
@@ -87,7 +87,7 @@ def test_submit_raises_disk_to_model_min(monkeypatch):
             {
                 "model": "test/big-disk",
                 "algorithm": "sft",
-                "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
+                "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
                 "gpu": {"type": "RTX 5090", "disk_gb": 200},
             }
         )

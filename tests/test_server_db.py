@@ -54,13 +54,26 @@ def test_internal_key_provisioning_is_idempotent_and_hashed(isolated_db) -> None
 
     assert second["id"] == first["id"]
     assert second["key_prefix"] == "internal"
-    assert second["email"] == "freesolo-internal"
+    assert second["email"] == "internal@freesolo.co"
     with sqlite3.connect(isolated_db.db_path()) as conn:
         stored = conn.execute(
             "SELECT key_hash FROM api_keys WHERE id = ?", (first["id"],)
         ).fetchone()[0]
     assert stored == isolated_db.hash_key("internal-secret")
     assert stored != "internal-secret"
+
+
+def test_internal_key_email_is_migrated_to_service_email(isolated_db) -> None:
+    key_hash = isolated_db.hash_key("internal-secret")
+    with isolated_db._connect() as conn:
+        conn.execute(
+            "INSERT INTO api_keys (key_hash, key_prefix, email, created_at) VALUES (?, ?, ?, ?)",
+            (key_hash, "internal", "freesolo-internal", 1.0),
+        )
+
+    row = isolated_db.ensure_internal_key("internal-secret")
+
+    assert row["email"] == "internal@freesolo.co"
 
 
 def test_disabled_external_key_is_not_recreated_or_revived(isolated_db) -> None:
