@@ -70,13 +70,19 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     raise EnvPublishError(
                         f"env package has too many members (limit {_MAX_MEMBERS})"
                     )
-                target = (dest / member.name).resolve()
-                if target != root and root not in target.parents:
-                    raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
-                member_path = member.name.replace("\\", "/")
-                segments = [segment for segment in member_path.split("/") if segment]
+                segments: list[str] = []
+                for segment in member.name.replace("\\", "/").split("/"):
+                    if not segment or segment == ".":
+                        continue
+                    if segment == "..":
+                        raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
+                    segments.append(segment)
                 if not segments:
                     continue
+                normalized_name = "/".join(segments)
+                target = (dest / normalized_name).resolve()
+                if target != root and root not in target.parents:
+                    raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
                 if segments[0] in {".github", ".git"}:
                     raise EnvPublishError(
                         "env packages must not contain .github or .git top-level paths"
@@ -94,6 +100,7 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                         "env package is too large uncompressed "
                         f"(limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})"
                     )
+                member.name = normalized_name
                 tar.extract(member, dest)
     except tarfile.TarError as exc:
         raise EnvPublishError(f"env package is not a valid .tar.gz archive: {exc}") from exc

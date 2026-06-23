@@ -9,7 +9,7 @@ end-to-end tests import across packages). When that import can't resolve, the
 agent-side assertions are skipped rather than failing the flash suite.
 
 Run: cd flash && .venv/bin/python -m pytest \
-        tests/test_agent_slm_cli_contract.py -q
+        tests/test_agent_flash_cli_contract.py -q
 """
 
 from __future__ import annotations
@@ -103,9 +103,9 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
     config = tmp_path / "flash_grpo.toml"
     config.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
-            'algorithm = "grpo"\n'
-            "[environment]\n"
-            'id = "github:owner/repo@main:env/freesolo/environment.py"\n'
+        'algorithm = "grpo"\n'
+        "[environment]\n"
+        'id = "github:owner/repo@main:env/freesolo/environment.py"\n'
         "[train]\n"
         'hf_repo = "owner/runs"\n'
         "steps = 10\n"
@@ -125,6 +125,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
 
 
 # --- new_run_id format vs the agent's run-id expectations ---------------------
+
 
 def test_new_run_id_format_is_filesystem_safe_and_stable() -> None:
     """flash.runner.new_run_id() must stay within the safe run-id alphabet (it flows

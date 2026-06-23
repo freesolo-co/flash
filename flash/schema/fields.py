@@ -95,17 +95,23 @@ def _require_environment_ref(value: str, message: str) -> None:
     if value.startswith("github:"):
         body = value[len("github:") :]
         repo_ref, sep, path = body.partition(":")
-        repo, _, _ = repo_ref.partition("@")
-        owner_repo = repo.split("/", 1)
-        if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo) and (
-            not sep or _is_safe_environment_path(path)
+        repo, at, ref = repo_ref.partition("@")
+        if at and not ref:
+            raise ConfigError(message)
+        owner_repo = repo.split("/")
+        if (
+            len(owner_repo) == 2
+            and _is_safe_github_path_parts(owner_repo)
+            and (not sep or _is_safe_environment_path(path))
         ):
             return
         raise ConfigError(message)
     if value.startswith("https://github.com/") or value.startswith("http://github.com/"):
         parsed = urllib.parse.urlparse(value)
         if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "github.com":
-            parts = [part for part in urllib.parse.unquote(parsed.path).strip("/").split("/") if part]
+            parts = [
+                part for part in urllib.parse.unquote(parsed.path).strip("/").split("/") if part
+            ]
             if len(parts) < 2:
                 raise ConfigError(message)
             owner, repo = parts[0], parts[1]
@@ -115,7 +121,7 @@ def _require_environment_ref(value: str, message: str) -> None:
                     raise ConfigError(message)
             elif len(parts) >= 5 and parts[2] in {"blob", "tree"}:
                 ref = parts[3]
-                if ":" in ref:
+                if not ref or ref in {".", ".."} or ":" in ref or "\\" in ref:
                     raise ConfigError(message)
                 raw_path = "/".join(parts[4:])
                 if not _is_safe_environment_path(raw_path):
