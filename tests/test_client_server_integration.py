@@ -55,6 +55,13 @@ def _token() -> str:
     return f"{_USER_PREFIX}{next(_counter)}"
 
 
+def _identity_for_token(token: str) -> dict[str, str]:
+    if not token.startswith(_USER_PREFIX):
+        return {}
+    suffix = token.removeprefix(_USER_PREFIX)
+    return {"email": f"user-{suffix}@example.com", "key_prefix": "fslo_test"}
+
+
 class _FakeUrlResponse:
     """Mimics the ``urllib`` response object ``ApiClient._request`` consumes."""
 
@@ -99,6 +106,7 @@ def make_client(tmp_path, monkeypatch):
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
     # The submit-time org charge (server/billing) talks to the freesolo backend; it has its own
     # suite (test_server_billing.py). Stub that boundary (both the charge and its reversal) so this
     # cross-component test stays focused on the client<->server CONTRACT and isn't routed through

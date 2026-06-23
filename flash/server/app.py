@@ -310,7 +310,7 @@ def create_app():
             raise HTTPException(
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
-                "publish the environment with `flash env push`, then reference it "
+                "publish the environment with `flash env push --name <name>`, then reference it "
                 "by the returned environment id",
             )
         try:

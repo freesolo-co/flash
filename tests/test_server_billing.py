@@ -26,6 +26,13 @@ SPEC = {
 _USER_PREFIX = "fslo-user-"
 
 
+def _identity_for_token(token: str) -> dict[str, str]:
+    if not token.startswith(_USER_PREFIX):
+        return {}
+    suffix = token.removeprefix(_USER_PREFIX)
+    return {"email": f"user-{suffix}@example.com", "key_prefix": "fslo_test"}
+
+
 def _bearer(key: str) -> dict:
     return {"Authorization": f"Bearer {key}"}
 
@@ -214,6 +221,7 @@ def api(tmp_path, monkeypatch):
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
     with TestClient(app_mod.create_app()) as client:
         yield client
 
