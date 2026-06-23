@@ -19,7 +19,7 @@ def _spec(**train) -> JobSpec:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
-            "environment": {"id": "owner/env"},
+            "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
             "train": {"epochs": 1, "seeds": [0], **train},
             "run_id": "flash-managed-1",
         }
@@ -55,7 +55,7 @@ def test_managed_hf_repo_finalizes_local_run_id(monkeypatch):
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
-            "environment": {"id": "owner/env"},
+            "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
             "train": {"epochs": 1, "seeds": [0]},
         }
     )

@@ -495,10 +495,8 @@ def submit_run(
     suffix = _run_suffix(spec.run_id)
     if attempt:
         suffix = f"{suffix}r{attempt}"
-    # Resolve the worker env BEFORE provisioning: an unrecorded published env raises here, and
-    # doing it after deploy_train_endpoint() would leak the just-created endpoint (its
-    # rN-suffixed name can't be reconstructed from the run id later) against the account
-    # quota — the runner would also treat the raise as a retryable poll_error.
+    # Resolve worker pip deps BEFORE provisioning, so deterministic dependency issues surface
+    # before the endpoint exists.
     # extra_pip runs for EVERY job here (the durable baked-image path skips resolve_worker_deps /
     # FLASH_WORKER_EXTRA_DEPS in build_function_input, but _train_body always pip-installs
     # extra_pip), so the opt-in chalk spec is appended here to reach default runs.

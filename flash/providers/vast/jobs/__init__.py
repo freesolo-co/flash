@@ -96,7 +96,7 @@ def usable_offers(
         min_reliability=RELIABILITY_FLOOR,
     )
     # Host tier: ALWAYS datacenter-only (hosting_type==1). The onstart payload ships run secrets
-    # (HF_TOKEN, PRIME_API_KEY, OpenRouter/OpenAI/W&B creds) to the box, so verified-but-lower-trust
+    # (HF_TOKEN, GitHub env-source tokens, OpenRouter/OpenAI/W&B creds) to the box, so verified-but-lower-trust
     # community/marketplace hosts (hosting_type 0) are never used — even verified + reliability-
     # floored, they're a lower trust tier we don't ship secrets to.
     out: list[VastOffer] = []

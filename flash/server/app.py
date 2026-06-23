@@ -1,10 +1,9 @@
 """FastAPI control plane for the managed Flash service.
 
-This is the operator-side component. It holds the
-provider credentials (``RUNPOD_API_KEY``, ``HF_TOKEN``, ``PRIME_API_KEY`` —
-the worker needs the last to install the run's published environment) and
-exposes the full run lifecycle to clients that authenticate with their freesolo API
-key (verified against the freesolo backend) — clients never see provider credentials.
+This is the operator-side component. It holds the provider credentials
+(``RUNPOD_API_KEY``, ``HF_TOKEN``, and environment source tokens) and exposes the
+full run lifecycle to clients that authenticate with their freesolo API key
+(verified against the freesolo backend) — clients never see provider credentials.
 
 Run state truth stays in the runner's JSON files; SQLite (server/db.py) holds
 keys and run ownership. Runs the server owns are recovered on startup by re-attaching
@@ -247,8 +246,8 @@ def create_app():
         if key is None:
             raise HTTPException(
                 status_code=401,
-                detail="invalid or missing API key; create or copy one at "
-                "https://freesolo.co/sign-in, then log in with `flash login`",
+                detail="invalid or missing API key; log in with `flash login` using your "
+                "freesolo API key",
             )
         return key
 
@@ -282,8 +281,8 @@ def create_app():
 
     @app.post("/v1/envs")
     def publish_env(payload: dict, key: dict = Depends(require_key)):
-        # Publish a client-built verifiers env package to the managed environment account,
-        # namespaced per identity and private. The client just packages local source and uploads it.
+        # Publish a client-built Freesolo environment package to the managed
+        # environment repository. Users never need direct repository credentials.
         from flash.server import envs
 
         # Default to "" only when the key is missing/None — pass a present-but-falsy
@@ -312,7 +311,7 @@ def create_app():
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
                 "publish the environment with `flash env push`, then reference it "
-                'by id (`[environment] id = "owner/name"`)',
+                "by the returned environment id",
             )
         try:
             return spec_from_dict(spec_raw, run_id=run_id)
@@ -355,7 +354,7 @@ def create_app():
         # Charge the pre-flight estimate to the user's org BEFORE accepting the run, so it's gated
         # on balance and never starts unpaid. Skipped for --dry-run and the internal service
         # identity (no user org to bill).
-        billed = not dry_run and key.get("auth_kind") != "internal"
+        billed = not dry_run and key.get("key_prefix") != "internal"
         token = (authorization or "").removeprefix("Bearer ").strip()
         charge: dict = {}
         if billed:
