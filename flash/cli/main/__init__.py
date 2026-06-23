@@ -25,18 +25,14 @@ from flash.cli.main.commands import (  # noqa: F401
     _follow_run,
     _poll_logs,
     client_from_config,
-    cmd_attach,
     cmd_cancel,
     cmd_chat,
-    cmd_cost,
     cmd_deploy,
     cmd_deployments,
-    cmd_env_init,
     cmd_env_list,
     cmd_env_setup,
     cmd_gpus,
     cmd_login,
-    cmd_logs,
     cmd_models,
     cmd_ps,
     cmd_status,
@@ -77,10 +73,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     login.add_argument(
         "--api-key",
-        help=(
-            "your freesolo API key (default: FREESOLO_API_KEY); create or copy one at "
-            "https://freesolo.co/sign-in"
-        ),
+        help="your freesolo API key (default: FREESOLO_API_KEY); create it at "
+        "https://freesolo.co/sign-in",
     )
     login.add_argument(
         "--freesolo-url",
@@ -101,24 +95,23 @@ def main(argv: list[str] | None = None) -> int:
     gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
     gpus.set_defaults(func=cmd_gpus)
 
-    env = sub.add_parser("env", help="manage verifiers environments")
+    env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
-    setup = env_sub.add_parser("setup", help="scaffold environments/ + configs/ in the cwd")
+    setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
     setup.set_defaults(func=cmd_env_setup)
-
-    init = env_sub.add_parser("init", help="scaffold a new local verifiers environment")
-    init.add_argument("name")
-    init.set_defaults(func=cmd_env_init)
 
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
-    env_install = env_sub.add_parser("install", help="install a published verifiers environment")
-    env_install.add_argument("env_id", help='the environment id to install ("owner/name")')
+    env_install = env_sub.add_parser("install", help="record a Freesolo environment")
+    env_install.add_argument("env_id", help="the Freesolo environment id to record")
     env_install.set_defaults(func=cmd_env_install)
 
-    env_push = env_sub.add_parser(
-        "push", help="publish a local verifiers environment; prints its environment id"
+    env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
+    env_push.add_argument(
+        "--name",
+        required=True,
+        help="Freesolo environment name to publish or update",
     )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
@@ -153,47 +146,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     train.set_defaults(func=cmd_train)
 
-    status = sub.add_parser("status", help="show a run's full status JSON")
+    status = sub.add_parser("status", help="show a run's status, logs, or follow logs")
     status.add_argument("run_id")
-    status.set_defaults(func=cmd_status)
-
-    attach = sub.add_parser(
-        "attach", help="follow a running job's logs to completion (resumable any time)"
+    status.add_argument("--logs", action="store_true", help="print current logs before status")
+    status.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="stream logs until the run ends, then print final status",
     )
-    attach.add_argument("run_id")
-    attach.set_defaults(func=cmd_attach)
+    status.set_defaults(func=cmd_status)
 
     ps = sub.add_parser("ps", help="list runs and their state/cost")
     ps.set_defaults(func=cmd_ps)
 
-    cost = sub.add_parser("cost", help="show a run's accrued cost (USD)")
-    cost.add_argument("run_id")
-    cost.set_defaults(func=cmd_cost)
-
-    cancel = sub.add_parser("cancel", help="cancel a run (best-effort)")
+    cancel = sub.add_parser("cancel", help="cancel a run")
     cancel.add_argument("run_id")
     cancel.set_defaults(func=cmd_cancel)
 
-    logs = sub.add_parser("logs")
-    logs.add_argument("run_id")
-    logs.add_argument("-f", "--follow", action="store_true", help="stream new log lines")
-    logs.set_defaults(func=cmd_logs)
-
     deploy = sub.add_parser("deploy")
     deploy.add_argument("run_id")
-    deploy.add_argument(
-        "--mode",
-        choices=["dev", "always-on"],
-        default="dev",
-        help="dev: scale-to-zero, cold start after idle, $0 when unused (default). "
-        "always-on: one warm worker 24/7, no cold starts, continuous billing.",
-    )
-    deploy.add_argument(
-        "--idle-timeout",
-        type=int,
-        default=300,
-        help="dev mode: seconds of inactivity before the worker scales to zero (default 300)",
-    )
     deploy.add_argument("--dry-run", action="store_true")
     deploy.set_defaults(func=cmd_deploy)
 
@@ -211,8 +183,8 @@ def main(argv: list[str] | None = None) -> int:
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
 
-    # The control plane is operator-only and run as a separate one-off service via
-    # `python -m flash.server`, not a `flash` subcommand.
+    # The control plane is operator-only and run as a separate one-off service via the
+    # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
 
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))

@@ -120,6 +120,45 @@ def test_poll_job_failure(monkeypatch):
     assert "worker exploded" in res.detail
 
 
+def test_poll_job_failure_appends_worker_artifacts(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    seq = iter(
+        [
+            {"status": "IN_PROGRESS"},
+            {
+                "status": "FAILED",
+                "error": "train phase 'sft' produced no /tmp/metrics.json (it crashed before finishing)",
+            },
+        ]
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid: next(seq))
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    calls = {"force": None}
+
+    def failure_detail_reader(force=False):
+        calls["force"] = force
+        return (
+            "--- error_sft.txt ---\n"
+            "Traceback (most recent call last):\nImportError: no module named flash_attn\n"
+            "--- console_sft.txt ---\nworker console tail"
+        )
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: None,
+        failure_detail_reader=failure_detail_reader,
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert calls["force"] is True
+    assert "produced no /tmp/metrics.json" in res.detail
+    assert "ImportError: no module named flash_attn" in res.detail
+    assert "worker console tail" in res.detail
+
+
 def test_poll_job_platform_preempt_maps_to_job_preempted(monkeypatch):
     # Platform terminations -> structured "job_preempted" (retried), not "job_failed".
     for status in ("CANCELLED", "TIMED_OUT"):
@@ -130,6 +169,29 @@ def test_poll_job_platform_preempt_maps_to_job_preempted(monkeypatch):
         assert not res.ok
         assert res.failure == "job_preempted", status
         assert f"[{status}]" in res.detail
+
+
+def test_poll_job_platform_preempt_does_not_read_worker_artifacts(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(
+        runpod_api, "job_status", lambda eid, jid: {"status": "TIMED_OUT", "error": "timeout"}
+    )
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+
+    def failure_detail_reader(force=False):
+        raise AssertionError("platform terminations should not read worker artifacts")
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: None,
+        failure_detail_reader=failure_detail_reader,
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"
+    assert "timeout" in res.detail
 
 
 def _poll_failed_with_heartbeat(monkeypatch, hb):
@@ -178,8 +240,10 @@ def test_poll_job_completed_decode_error_consults_worker_flags(monkeypatch):
         jobs.JobHandle("ep", "name", "job"),
         interval_s=0,
         heartbeat_reader=lambda force=False: {"retriable": True},
+        failure_detail_reader=lambda force=False: "--- error_sft.txt ---\nCUDA out of memory",
     )
     assert res.failure == "job_preempted"
+    assert "CUDA out of memory" in res.detail
 
 
 def test_poll_job_stall_detection(monkeypatch):
@@ -649,13 +713,8 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-        # Force the deterministic static ranking (no live pricing fetch) so successive attempts
-        # step through the validated-only pool in ascending $/hr order.
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
 
         gpus_seen: list[str] = []
 
@@ -698,11 +757,9 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         calls = {"n": 0}
 
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
@@ -741,11 +798,9 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         # Need 80 GB; the validated 80 GB+ RunPod pool is A100 PCIe ($1.39), A100 SXM ($1.49), RTX
         # Pro 6000 Server ($2.09), H100 ($3.29). Trim the ranked candidates to the two cheapest so
         # exactly TWO candidates remain for a clean walk+clamp assertion.
@@ -797,11 +852,8 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
 
         real_allocate = allocator.allocate
         alloc_calls = {"n": 0}
@@ -847,10 +899,8 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
 
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         status = orch.RunStatus(
             run_id="walked",
             state="running",

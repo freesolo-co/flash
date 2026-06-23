@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from .config import load_credentials
+from .config import load_credentials_with_source
 
 
 class ClientError(RuntimeError):
@@ -53,7 +53,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
     """Verify a freesolo API key against the freesolo backend's ``/api/auth/verify``.
 
     Raises :class:`ClientError`/:class:`ApiError` if the key is rejected or the backend is
-    unreachable; returns ``None`` on success. Keys are issued at https://freesolo.co/sign-in.
+    unreachable; returns ``None`` on success. Keys are issued from the freesolo sign-in page.
     """
     base = freesolo_base_url(base_url)
     url = f"{base}{FREESOLO_AUTH_VERIFY_PATH}"
@@ -69,8 +69,8 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
         if exc.code in (401, 403):
             raise ClientError(
                 "freesolo rejected this API key — create or copy a valid key at "
-                "https://freesolo.co/sign-in, then pass it with "
-                "`flash login --api-key` (or FREESOLO_API_KEY)"
+                "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
+                "(or FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
     except urllib.error.URLError as exc:
@@ -81,10 +81,25 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
 
 
 class ApiClient:
-    def __init__(self, api_url: str, api_key: str | None = None, timeout: float = 60.0):
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str | None = None,
+        timeout: float = 60.0,
+        key_source: str | None = None,
+    ):
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.key_source = key_source
+
+    def _auth_error_detail(self, status: int, detail: str) -> str:
+        if status not in {401, 403} or self.key_source != "FREESOLO_API_KEY":
+            return detail
+        return (
+            f"{detail}; FREESOLO_API_KEY is set and overrides the key saved by "
+            "`flash login`. Unset FREESOLO_API_KEY or update it to a valid freesolo API key."
+        )
 
     def _request(
         self,
@@ -107,7 +122,8 @@ class ApiClient:
                 raw = resp.read()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:
-            raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            raise ApiError(exc.code, detail) from exc
         except urllib.error.URLError as exc:
             raise ClientError(
                 f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
@@ -122,17 +138,12 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     # -- environments ------------------------------------------------------------------
-    def publish_env(self, *, name: str, is_new: bool, package_b64: str) -> dict:
-        """Upload a packaged verifiers env to the managed service; returns
-        ``{"id": "owner/name"}``.
-
-        The server may retry the publish up to its own bound, so the client timeout must
-        comfortably exceed that — otherwise the client gives up while the publish is still
-        running server-side."""
+    def publish_env(self, *, name: str, package_b64: str) -> dict:
+        """Upload a packaged Freesolo environment to the managed Environments Hub."""
         return self._request(
             "POST",
             "/v1/envs",
-            body={"name": name, "is_new": is_new, "package_b64": package_b64},
+            body={"name": name, "package_b64": package_b64},
             timeout=1800.0,
         )
 
@@ -159,18 +170,14 @@ class ApiClient:
     def deploy(
         self,
         run_id: str,
-        mode: str = "dev",
-        idle_timeout_s: int = 300,
         dry_run: bool = False,
     ) -> dict:
-        # always-on blocks on the server until the worker has downloaded the
-        # model/adapter and vLLM is healthy (the no-cold-start guarantee), which can
-        # take many minutes — use the serve-scale timeout, not the default 60s.
-        deploy_timeout = 30 * 60 if (mode == "always-on" and not dry_run) else None
+        # Deploy blocks on registration and serving warmup, which can take many minutes.
+        deploy_timeout = 30 * 60 if not dry_run else None
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/deploy",
-            body={"mode": mode, "idle_timeout_s": idle_timeout_s, "dry_run": dry_run},
+            body={"dry_run": dry_run},
             timeout=deploy_timeout,
         )
 
@@ -187,7 +194,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> dict:
-        # Cold starts in dev mode can take minutes; give inference a generous timeout.
+        # Serving warmup can take minutes; give inference a generous timeout.
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/chat",
@@ -198,10 +205,9 @@ class ApiClient:
 
 def client_from_config(require_key: bool = True) -> ApiClient:
     """Build a client from the stored credentials; fail with a clear hint when logged out."""
-    api_url, api_key = load_credentials()
+    api_url, api_key, key_source = load_credentials_with_source()
     if require_key and not api_key:
         raise ClientError(
-            "not logged in — create or copy a freesolo API key at https://freesolo.co/sign-in, "
-            "then run `flash login` (or set FREESOLO_API_KEY)"
+            "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
-    return ApiClient(api_url, api_key)
+    return ApiClient(api_url, api_key, key_source=key_source)
