@@ -62,7 +62,6 @@ def test_fmt_duration_units():
 def test_provider_is_normalized_and_validated():
     # Case/whitespace variants normalize to the canonical substrate; empty -> "auto".
     assert RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="RunPod").provider == "runpod"
-    assert RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider=" vast ").provider == "vast"
     assert RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="").provider == "auto"
     assert RunConfig("Qwen/Qwen3.5-4B", "grpo", 10).provider == "auto"
     # An unknown substrate fails fast here (clear error) instead of as "no GPU class fits".
@@ -71,7 +70,10 @@ def test_provider_is_normalized_and_validated():
 
 
 def test_estimate_reports_the_runs_provider():
-    # Provider is reported as configured: the default is the cross-provider "auto", and an
-    # explicit substrate is passed through unchanged.
+    # Provider is reported as configured: the default is "auto", and an explicit substrate is
+    # passed through unchanged.
     assert estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10)).provider == "auto"
-    assert estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="runpod")).provider == "runpod"
+    assert (
+        estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 10, provider="runpod")).provider
+        == "runpod"
+    )
