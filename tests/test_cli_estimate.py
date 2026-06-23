@@ -158,7 +158,7 @@ def test_sft_steps_max_examples_zero_means_no_cap(monkeypatch):
 
 
 def test_sft_steps_unpinned_falls_back_when_env_cannot_be_counted(monkeypatch, capsys):
-    # A private GitHub env may not be importable in the local cost path, so counting returns None.
+    # A managed Freesolo env may not be importable in the local cost path, so counting returns None.
     # Pricing must NOT hard-fail: it falls back to
     # a representative default example count (with a clear warning) so `flash train --cost` still
     # produces a quote without pinning [train].max_examples.

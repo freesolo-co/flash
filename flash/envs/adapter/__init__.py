@@ -1,7 +1,8 @@
 """Adapter that runs Freesolo SDK environments on Flash.
 
 Flash environment ids are Freesolo Hub slugs (``namespace/name``). Explicit
-low-level refs remain parseable for compatibility. The canonical generated environment file is ``environment.py`` and its
+low-level refs remain parseable for compatibility. The canonical generated environment file is
+``environment.py`` and its
 ``load_environment`` function must return a Freesolo SDK environment:
 ``EnvironmentSingleTurn`` or ``EnvironmentMultiTurn``.
 """
@@ -210,12 +211,10 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
     try:
         payload = json.loads(data)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"Failed to resolve commit for {parsed.canonical()}: invalid GitHub response"
-        ) from exc
+        raise RuntimeError("Failed to resolve managed environment version: invalid response") from exc
     sha = payload.get("sha")
     if not isinstance(sha, str) or not _is_commit_sha(sha):
-        raise RuntimeError(f"Failed to resolve commit for {parsed.canonical()}")
+        raise RuntimeError("Failed to resolve managed environment version")
     return sha
 
 
@@ -225,9 +224,9 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
             return resp.read()
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"GitHub request failed ({exc.code}): {body[:500]}") from exc
+        raise RuntimeError(f"managed environment request failed ({exc.code}): {body[:500]}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"GitHub request failed: {exc.reason}") from exc
+        raise RuntimeError(f"managed environment request failed: {exc.reason}") from exc
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
@@ -242,7 +241,7 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
     if len(data) > _MAX_ARCHIVE_BYTES:
         raise RuntimeError(
-            f"GitHub environment archive is too large ({len(data)} bytes; "
+            f"managed environment package is too large ({len(data)} bytes; "
             f"limit {_MAX_ARCHIVE_BYTES} bytes)"
         )
     return data
@@ -265,31 +264,29 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
                 if not part or part == ".":
                     continue
                 if part == "..":
-                    raise RuntimeError(
-                        f"unsafe path in GitHub environment archive: {member.name!r}"
-                    )
+                    raise RuntimeError(f"unsafe path in managed environment package: {member.name!r}")
                 parts.append(part)
             if not parts:
                 continue
             normalized_name = "/".join(parts)
             target = (dest / normalized_name).resolve()
             if target != root and root not in target.parents:
-                raise RuntimeError(f"unsafe path in GitHub environment archive: {member.name!r}")
+                raise RuntimeError(f"unsafe path in managed environment package: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
             top_dirs.add(parts[0])
             total += max(0, member.size)
             if total > _MAX_ARCHIVE_BYTES:
                 raise RuntimeError(
-                    f"GitHub environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+                    f"managed environment package is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
                 )
             member.name = normalized_name
             tar.extract(member, dest)
     if len(top_dirs) != 1:
-        raise RuntimeError("GitHub environment archive had an unexpected layout")
+        raise RuntimeError("managed environment package had an unexpected layout")
     extracted = dest / next(iter(top_dirs))
     if not extracted.is_dir():
-        raise RuntimeError("GitHub environment archive did not extract to a directory")
+        raise RuntimeError("managed environment package did not extract to a directory")
     return extracted
 
 
@@ -319,7 +316,7 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
         if not candidate.is_file():
             raise FileNotFoundError(
-                f"GitHub environment {parsed.canonical()} did not contain {parsed.path!r}"
+                f"managed environment did not contain required entrypoint {parsed.path!r}"
             )
         cache_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
