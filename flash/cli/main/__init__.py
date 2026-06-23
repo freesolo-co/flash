@@ -34,7 +34,7 @@ from flash.cli.main.commands import (  # noqa: F401
     cmd_gpus,
     cmd_login,
     cmd_models,
-    cmd_ps,
+    cmd_runs,
     cmd_status,
     cmd_train,
     cmd_undeploy,
@@ -157,8 +157,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     status.set_defaults(func=cmd_status)
 
-    ps = sub.add_parser("ps", help="list runs and their state/cost")
-    ps.set_defaults(func=cmd_ps)
+    runs = sub.add_parser("runs", help="list runs and their state/cost")
+    runs.set_defaults(func=cmd_runs)
 
     cancel = sub.add_parser("cancel", help="cancel a run")
     cancel.add_argument("run_id")
