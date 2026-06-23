@@ -256,6 +256,49 @@ def test_init_from_adapter_rejects_repo_without_status_prefix() -> None:
         spec_from_dict(raw, run_id="grpo-x")
 
 
+@pytest.mark.parametrize(
+    "bad_adapter_ref",
+    [
+        "owner:evil/flashrun-run:sft/seed0",
+        "Freesolo-Co/flashrun-sftX:sft/../seed0",
+    ],
+)
+def test_init_from_adapter_rejects_invalid_shape_or_path_traversal_ref(bad_adapter_ref: str) -> None:
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "gpu": {"type": "cheapest"},
+        "train": {"seeds": [0], "steps": 10, "init_from_adapter": bad_adapter_ref},
+    }
+    with pytest.raises(ConfigError, match="full adapter_ref emitted by `flash status`"):
+        spec_from_dict(raw, run_id="grpo-x")
+
+
+@pytest.mark.parametrize(
+    "bad_ref",
+    [
+        123,
+        False,
+        ["owner/repo:sft/run/seed0"],
+    ],
+)
+def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "gpu": {"type": "cheapest"},
+        "train": {
+            "seeds": [0],
+            "steps": 10,
+            "init_from_adapter": bad_ref,
+        },
+    }
+    with pytest.raises(ConfigError, match=r"train\.init_from_adapter must be a string"):
+        spec_from_dict(raw, run_id="grpo-x")
+
+
 def test_hf_repo_is_managed_not_user_set() -> None:
     # [train] hf_repo is the platform-managed per-run HF artifact repo: the control plane assigns
     # it server-side at submit (see runner.submit_job). It is NOT required and a user-supplied

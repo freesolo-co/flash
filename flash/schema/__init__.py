@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import tomllib
 from typing import Any
@@ -24,6 +25,13 @@ from flash.schema.fields import (
     _worker_env,
 )
 from flash.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+
+_OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+_RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+_ADAPTER_REF_RE = re.compile(
+    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl)/"
+    rf"(?P<run_id>{_RUN_ID_RE})/seed(?P<seed>\d+)$"
+)
 
 
 def load_toml(path: str) -> dict[str, Any]:
@@ -83,11 +91,15 @@ def _apply_override(raw: dict, item: str) -> None:
 
 
 def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
-    ref = str(train_raw.get("init_from_adapter") or "")
+    ref_raw = train_raw.get("init_from_adapter")
+    if ref_raw is None:
+        return ""
+    if not isinstance(ref_raw, str):
+        raise ConfigError("train.init_from_adapter must be a string")
+    ref = ref_raw.strip()
     if not ref:
         return ""
-    repo, sep, prefix = ref.partition(":")
-    if sep and repo.count("/") == 1 and prefix.startswith(("sft/", "rl/")):
+    if _ADAPTER_REF_RE.match(ref):
         return ref
     raise ConfigError(
         "train.init_from_adapter must be the full adapter_ref emitted by `flash status` "
