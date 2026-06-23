@@ -34,7 +34,7 @@ class RunConfig:
 
     max_wall_seconds: int | None = None  # per-seed wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
-    environment: str | None = None  # Freesolo GitHub environment ref; descriptive only
+    environment: str | None = None  # Freesolo environment id; descriptive only
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))

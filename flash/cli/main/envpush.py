@@ -39,14 +39,27 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         ".venv",
         ".mypy_cache",
         ".pytest_cache",
-        "data",
-        "databases",
-        "datasets",
-        "db",
         "source",
     }
 )
-_ENV_PUSH_SIDECAR_DIRS = frozenset({"assets"})
+_ENV_PUSH_SIDECAR_DIRS = frozenset({"assets", "data", "databases", "datasets", "db"})
+_ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
+    {
+        ".csv",
+        ".db",
+        ".json",
+        ".jsonl",
+        ".parquet",
+        ".pkl",
+        ".sqlite",
+        ".sqlite3",
+        ".sql",
+        ".tsv",
+        ".txt",
+        ".yaml",
+        ".yml",
+    }
+)
 
 
 def _normalize_env_name(raw: str) -> str | None:
@@ -90,7 +103,7 @@ _TAR_EXCLUDE_DIRS = _ENV_PUSH_IGNORED_NAMES
 
 
 def _tar_b64(directory: Path) -> str:
-    """Pack a directory into a base64 tarball, excluding caches and local data directories."""
+    """Pack a directory into a base64 tarball, excluding caches and metadata directories."""
     import base64
     import io
     import os
@@ -111,7 +124,7 @@ def _tar_b64(directory: Path) -> str:
 
 
 def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
-    """Copy helper code and non-dataset assets beside environment.py."""
+    """Copy helper code and data sidecars beside environment.py."""
     import shutil
 
     for child in sorted(env_root.iterdir()):
@@ -130,7 +143,9 @@ def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
             continue
         if not child.is_file():
             continue
-        if child.suffix == ".py" and not child.name.startswith("__"):
+        if (
+            child.suffix == ".py" and not child.name.startswith("__")
+        ) or child.suffix.lower() in _ENV_PUSH_SIDECAR_SUFFIXES:
             shutil.copy2(child, target)
 
 

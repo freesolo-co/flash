@@ -25,9 +25,7 @@ def _missing_hf_credentials() -> list[str]:
     """Shared run infra every substrate needs."""
     problems: list[str] = []
     if not os.environ.get("GITHUB_TOKEN"):
-        problems.append(
-            "  - GITHUB_TOKEN: server token with read access to private Freesolo environments"
-        )
+        problems.append("  - GITHUB_TOKEN: server token with access to managed Freesolo environments")
     if not os.environ.get("HF_TOKEN"):
         problems.append(
             "  - HF_TOKEN: a token with write access to each run's "
