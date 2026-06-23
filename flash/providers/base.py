@@ -50,7 +50,7 @@ class GpuClass:
     vram_gb: int
     short: str  # endpoint-name-safe token (e.g. "4090", "a5000")
     sm: str  # CUDA arch (informational; sm80+ only)
-    hourly_usd: float  # static fallback rate; live pricing overrides (pricing.py)
+    hourly_usd: float  # static rate used by pricing, cost projection, and ranking
     # Min host CUDA (driver) on the modern stack. None -> 12.8. Blackwell (sm120/sm100)
     # needs CUDA-13 drivers to JIT the wheels' PTX (no SASS shipped).
     min_cuda_modern: str | None = None
@@ -68,9 +68,8 @@ class GpuClass:
     validated: bool = False
 
 
-# Fallback hourly rates are RunPod secure-cloud on-demand (snapshot 2026-06-11); live
-# rates from the provider pricing module override them. Vast-only classes
-# (enum_member=None) carry a Vast verified-datacenter snapshot instead.
+# Static hourly rates are RunPod secure-cloud on-demand snapshots for RunPod classes.
+# Vast-only classes (enum_member=None) carry a Vast verified-datacenter snapshot instead.
 GPU_CLASSES: tuple[GpuClass, ...] = (
     GpuClass(
         "RTX 4090",
@@ -331,13 +330,12 @@ def min_cuda_modern(name: str) -> str:
 
 
 def cheapest_gpu(min_vram_gb: int) -> str:
-    """Cheapest live-validated RunPod GPU class with at least ``min_vram_gb`` VRAM (live rates,
-    cached).
+    """Cheapest validated RunPod GPU class with at least ``min_vram_gb`` VRAM.
 
     RunPod-static by design (the cross-provider equivalent lives in
     ``flash.providers.allocator``): Vast-only classes are excluded so the result is
     always deployable via Flash, and offline resolution stays deterministic. Restricted to the
-    live-validated pool so the picked class matches what the deployed control plane will actually
+    validated pool so the picked class matches what the deployed control plane will actually
     accept — a non-validated class submits then gets rejected.
     """
     pool = [
@@ -368,9 +366,9 @@ def provisional_gpu(
     """The cheapest VALIDATED GPU class whose VRAM covers the model -- a parse-time provisional.
 
     GPU pinning is gone: this picks the cheapest RunPod-provisionable class whose VRAM covers the
-    model, restricted to the live-validated pool (``cheapest_gpu``'s default) so the provisional
+    model, restricted to the validated pool (``cheapest_gpu``'s default) so the provisional
     matches what the deployed control plane will accept. The submit-time allocator
-    (``flash.providers.allocator``) ALWAYS re-resolves the cheapest fitting VALIDATED class live
+    (``flash.providers.allocator``) ALWAYS re-resolves the cheapest fitting VALIDATED class
     across all providers; this is the RunPod-static, offline-deterministic equivalent the schema
     uses for sizing/display.
     """
@@ -447,7 +445,7 @@ class Allocation:
     min_vram_gb: int
     candidates: tuple[Candidate, ...]  # full ranked list (retry walks this)
     offer: Any = None  # the chosen provider's provisioning hint (vast offer | None)
-    # Per-provider book of provisioning hints for the live-market walk (vast offers).
+    # Per-provider book of provisioning hints for the Vast offer walk.
     provider_offers: tuple[Any, ...] = ()
 
 
@@ -480,7 +478,7 @@ class Provider(Protocol):
         ...
 
     def hourly_rate(self, gpu: str) -> float:
-        """$/hr for one friendly GPU name (live if available, else static)."""
+        """Static $/hr for one friendly GPU name."""
         ...
 
     def submit_run(

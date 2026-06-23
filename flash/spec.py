@@ -106,6 +106,10 @@ class EnvironmentSpec:
     # Filled in client-side from the local install manifest so the managed control
     # plane never depends on client-local state; empty means "derive on the server".
     pip: tuple[str, ...] = ()
+    # Secret env var names the environment requires on the worker. Values are never stored in the
+    # spec; the client reads matching local env/.env values and sends them out-of-band via
+    # runtime_secrets.
+    secrets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -246,6 +250,7 @@ class JobSpec:
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
+                secrets=_str_tuple(env.get("secrets")),
             ),
             train=TrainSpec(
                 steps=_opt_int(train.get("steps")),
