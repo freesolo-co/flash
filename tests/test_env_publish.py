@@ -71,7 +71,6 @@ def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
     ref = envs.publish_package(
         package_b64=_pkg_b64(_MINIMAL),
         name="My Env!",
-        is_new=True,
         key={"email": "dev@clado.ai"},
     )
 
@@ -88,16 +87,15 @@ def test_publish_rejects_bad_input(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)
     with pytest.raises(envs.EnvPublishError, match="base64"):
-        envs.publish_package(package_b64="not base64!!!", name="e", is_new=True, key={})
+        envs.publish_package(package_b64="not base64!!!", name="e", key={})
     with pytest.raises(envs.EnvPublishError, match="empty"):
-        envs.publish_package(package_b64="", name="e", is_new=True, key={})
+        envs.publish_package(package_b64="", name="e", key={})
     with pytest.raises(envs.EnvPublishError, match="name"):
-        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="", is_new=True, key={})
+        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="", key={})
     with pytest.raises(envs.EnvPublishError, match=r"environment\.py"):
         envs.publish_package(
             package_b64=_pkg_b64({"pyproject.toml": "[project]\nname='e'\n"}),
             name="e",
-            is_new=True,
             key={"email": "dev@clado.ai"},
         )
 
@@ -105,7 +103,7 @@ def test_publish_rejects_bad_input(monkeypatch):
 def test_publish_requires_github_token(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", is_new=True, key={})
+        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", key={})
     assert excinfo.value.status == 503
     assert "GITHUB_TOKEN" in str(excinfo.value)
 
@@ -114,7 +112,7 @@ def test_publish_does_not_accept_github_pat_alias(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("GITHUB_PAT", "github_pat_test")
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", is_new=True, key={})
+        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", key={})
     assert excinfo.value.status == 503
     assert "GITHUB_TOKEN" in str(excinfo.value)
 

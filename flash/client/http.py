@@ -122,12 +122,12 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     # -- environments ------------------------------------------------------------------
-    def publish_env(self, *, name: str, is_new: bool, package_b64: str) -> dict:
+    def publish_env(self, *, name: str, package_b64: str) -> dict:
         """Upload a packaged Freesolo environment to managed GitHub storage."""
         return self._request(
             "POST",
             "/v1/envs",
-            body={"name": name, "is_new": is_new, "package_b64": package_b64},
+            body={"name": name, "package_b64": package_b64},
             timeout=1800.0,
         )
 

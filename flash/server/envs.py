@@ -323,7 +323,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     raise last_error
 
 
-def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> str:
+def publish_package(*, package_b64: str, name: str, key: dict) -> str:
     if not isinstance(name, str):
         raise EnvPublishError("env name must be a string")
     if not isinstance(package_b64, str):
