@@ -191,12 +191,11 @@ def test_safe_extract_rejects_repo_control_and_source_paths(tmp_path):
             envs._safe_extract(buf.getvalue(), tmp_path)
 
 
-def test_safe_extract_allows_data_sidecars(tmp_path):
+def test_safe_extract_allows_environment_sidecars(tmp_path):
     files = {
         "datasets/train.jsonl": '{"x": 1}\n',
-        "data/config.json": "{}\n",
-        "db/state.sqlite": "sqlite bytes",
-        "databases/cache.txt": "cache\n",
+        "assets/labels.json": "{}\n",
+        "configs/env.toml": "[env]\n",
     }
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
