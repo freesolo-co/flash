@@ -244,7 +244,6 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
             raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
-    raise RuntimeError("GitHub environment request failed: rate limit retries exhausted")
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
