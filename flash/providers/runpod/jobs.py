@@ -157,7 +157,7 @@ class JobHandle:
 def _is_workers_quota_error(exc: Exception) -> bool:
     """True when a RunPod exception signals the account worker quota is exhausted."""
     msg = str(exc).lower()
-    return "workers quota" in msg or "max workers across all endpoints" in msg
+    return "max workers across all endpoints" in msg
 
 
 def _sweep_idle_flash_endpoints(skip_name: str) -> int:
@@ -173,6 +173,7 @@ def _sweep_idle_flash_endpoints(skip_name: str) -> int:
     try:
         endpoints = runpod_api.list_endpoints()
     except Exception:
+        logger.debug("quota-sweep: failed to list endpoints", exc_info=True)
         return 0
     for ep in endpoints:
         ep_name = ep.get("name") or ""
@@ -195,11 +196,11 @@ def _sweep_idle_flash_endpoints(skip_name: str) -> int:
                 for k in ("running", "ready", "idle", "initializing")
             )
             in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
-            if active_workers == 0 and in_flight == 0:
-                if runpod_api.delete_endpoint(eid):
-                    deleted += 1
-                    logger.info("quota-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
+            if active_workers == 0 and in_flight == 0 and runpod_api.delete_endpoint(eid):
+                deleted += 1
+                logger.info("quota-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
         except Exception:
+            logger.debug("quota-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True)
             continue
     return deleted
 
@@ -245,7 +246,7 @@ def deploy_train_endpoint(
             logger.warning(
                 "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
                 "retrying in %ds",
-                quota_attempt, _QUOTA_MAX_RETRIES, swept, wait_s,
+                quota_attempt + 1, _QUOTA_MAX_RETRIES, swept, wait_s,
             )
             time.sleep(wait_s)
         # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
