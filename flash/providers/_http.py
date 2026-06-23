@@ -1,12 +1,9 @@
-"""Shared stdlib REST client for the provider API modules.
+"""Shared stdlib REST client for provider API modules.
 
-Both ``providers/runpod/api.py`` and ``providers/vast/api.py`` are thin, no-SDK-state
-clients with the SAME hardened-retry shape: a Bearer/Content-Type urllib request, a
-jittered exponential backoff that retries 5xx/429 and fast-fails other 4xx with the
-response body as the actionable detail, and a "failed after N attempts" raise. They
-differ only in: the env var that holds the key, the error class, and whether the caller
-passes a full URL (RunPod) or a path joined onto a base (Vast). This module factors that
-common core out so the backoff math lives in one place.
+Provider API clients use the same hardened-retry shape: a Bearer/Content-Type urllib
+request, a jittered exponential backoff that retries 5xx/429 and fast-fails other 4xx
+with the response body as the actionable detail, and a "failed after N attempts" raise.
+This module factors that common core out so the backoff math lives in one place.
 """
 
 from __future__ import annotations
@@ -24,10 +21,9 @@ from typing import Any
 class RestClient:
     """Parametrized urllib REST client with jittered-backoff retries.
 
-    ``base_url`` is prefixed onto the ``target`` passed to each call (empty for the
-    RunPod client, which passes full URLs; the Vast base for the Vast client). The key
-    is read from ``env_var`` on each request (env-only by design — never persisted) and
-    failures raise ``error_cls``.
+    ``base_url`` is prefixed onto the ``target`` passed to each call. The key is read
+    from ``env_var`` on each request (env-only by design — never persisted) and failures
+    raise ``error_cls``.
     """
 
     def __init__(

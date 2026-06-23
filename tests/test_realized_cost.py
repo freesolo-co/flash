@@ -1,13 +1,13 @@
-"""Realized provider-cost reconciliation: pure cost shaping (RunPod / Vast), the provider
-dispatch, and the reconcile selection/report logic. Offline -- the provider HTTP calls and the
-backend POST are stubbed, so nothing touches the network."""
+"""Realized provider-cost reconciliation: RunPod shaping, dispatch, and reporting.
+
+Offline -- the provider HTTP calls and backend POST are stubbed, so nothing touches the network.
+"""
 
 from __future__ import annotations
 
 from flash import runner
 from flash.providers import realized
 from flash.providers.runpod.cost import shape_endpoint_cost
-from flash.providers.vast.cost import shape_instance_cost
 from flash.server import reconcile
 
 
@@ -32,34 +32,6 @@ def test_runpod_shape_empty_is_zero():
     assert rc.wall_seconds is None
 
 
-# --------------------------------------------------------------------------- Vast shaping
-def test_vast_shape_matches_instance_and_itemizes():
-    rows = [
-        {
-            "source": "instance-12345",
-            "amount": 9.87,
-            "items": [
-                {"type": "gpu", "amount": 9.5},
-                {"type": "disk", "amount": 0.3},
-                {"type": "bwd", "amount": 0.07},
-            ],
-        },
-        {"source": "instance-99999", "amount": 50.0, "items": []},  # different run
-    ]
-    rc = shape_instance_cost(rows, instance_id=12345)
-    assert rc.provider == "vast"
-    assert rc.realized_usd == 9.87
-    assert rc.by_resource == {"gpu": 9.5, "disk": 0.3, "bwd": 0.07}  # captures storage + bandwidth
-    assert rc.source == {"instance_id": 12345}
-
-
-def test_vast_shape_unitemized_falls_back_to_gpu():
-    rows = [{"source": "instance-7", "amount": 2.0}]
-    rc = shape_instance_cost(rows, instance_id=7)
-    assert rc.realized_usd == 2.0
-    assert rc.by_resource == {"gpu": 2.0}
-
-
 # --------------------------------------------------------------------------- provider dispatch
 def test_dispatch_runpod(monkeypatch):
     from flash.providers.runpod import api
@@ -73,16 +45,6 @@ def test_dispatch_runpod(monkeypatch):
     assert rc is not None
     assert rc.provider == "runpod"
     assert rc.realized_usd == 3.0
-
-
-def test_dispatch_vast(monkeypatch):
-    from flash.providers.vast import api
-
-    monkeypatch.setattr(api, "get_charges", lambda **kw: [{"source": "instance-5", "amount": 1.5}])
-    rc = realized.realized_cost_for_remote({"provider": "vast", "instance_id": 5}, start=0, end=100)
-    assert rc is not None
-    assert rc.provider == "vast"
-    assert rc.realized_usd == 1.5
 
 
 def test_dispatch_none_when_no_handle_or_unknown_provider():
@@ -129,13 +91,13 @@ def test_reconcile_run_reports_and_persists(monkeypatch):
     status = _status(
         run_id="r-pos",
         updated_at=now - 7200,
-        remote={"provider": "vast", "instance_id": 5, "allocated_gpu": "RTX 5090"},
+        remote={"provider": "runpod", "endpoint_id": "ep-5", "allocated_gpu": "RTX 5090"},
     )
     monkeypatch.setattr(
         reconcile,
         "realized_cost_for_remote",
         lambda remote, **kw: realized.RealizedCost(
-            provider="vast", realized_usd=4.2, by_resource={"gpu": 4.0, "disk": 0.2}
+            provider="runpod", realized_usd=4.2, by_resource={"gpu": 4.2}
         ),
     )
     posted: dict = {}
@@ -150,7 +112,7 @@ def test_reconcile_run_reports_and_persists(monkeypatch):
     assert reconcile.reconcile_run(status, now=now) is True
     assert posted["runId"] == "r-pos"
     assert posted["realizedCostUsd"] == 4.2
-    assert posted["provider"] == "vast"
+    assert posted["provider"] == "runpod"
     assert posted["gpu"] == "RTX 5090"
     assert posted["costBasis"] == "realized"
     # persisted locally via the cost-only writer (never touches state) with the realized figure

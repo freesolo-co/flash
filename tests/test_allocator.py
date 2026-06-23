@@ -108,43 +108,6 @@ def test_offline_allocates_static_cheapest(monkeypatch):
     assert a.gpu == cheapest_gpu(24)
 
 
-def test_provider_pin_restricts_or_raises(monkeypatch):
-    """The opt-in provider pin restricts allocation to one substrate: provider="runpod" stays on
-    RunPod; provider=None is unchanged (cross-provider cheapest); provider="vast" without a key
-    raises a clear UnsupportedGpuError instead of silently falling back to RunPod."""
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
-
-    # Offline harness: only RunPod is configured (VAST_API_KEY deleted in conftest).
-    # provider=None -> unchanged cross-provider cheapest-wins (here: the static RunPod cheapest).
-    base = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    pinned_rp = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="runpod")
-    assert pinned_rp.provider == "runpod"
-    assert pinned_rp.gpu == base.gpu  # RunPod-only either way offline, so identical
-
-    # Pinning an unavailable provider is a CLEAN config error, never a silent RunPod fall-through.
-    with pytest.raises(UnsupportedGpuError, match=r"provider 'vast' pinned but not available"):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="vast")
-
-
-def test_provider_pin_vast_returns_vast_allocation(monkeypatch):
-    """With VAST_API_KEY present and a fitting offer, provider="vast" allocates on Vast (and
-    excludes RunPod from the candidate pool entirely)."""
-    from flash.providers import allocator
-    from flash.providers.vast import jobs as vast_jobs
-    from tests._helpers.vast import make_vast_offer
-
-    # Make Vast "available" and feed the allocator a single fitting, validated offer.
-    monkeypatch.setenv("VAST_API_KEY", "x")
-    offer = make_vast_offer(gpu="RTX 3090", vram_gb=24, dph_total=0.20)
-    monkeypatch.setattr(vast_jobs, "usable_offers", lambda *a, **k: [offer])
-
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="vast")
-    assert a.provider == "vast"
-    assert a.gpu == "RTX 3090"
-    assert all(c.provider == "vast" for c in a.candidates)  # RunPod excluded by the pin
-
-
 def test_nothing_fits_names_constraint(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import UnsupportedGpuError
