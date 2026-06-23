@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "primeintellect/gsm8k"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
@@ -50,7 +50,7 @@ def _login() -> str:
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("PRIME_API_KEY", "pit-test")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     import flash.runner as runner
     import flash.server.auth as auth_mod
@@ -77,12 +77,9 @@ def test_me(api):
     key = _login()
     me = api.get("/v1/me", headers=_bearer(key))
     assert me.status_code == 200
-    # A verified freesolo user key resolves to a per-token identity without inventing an email.
-    payload = me.json()
-    assert payload["kind"] == "freesolo_api_key"
-    assert payload["key_prefix"].startswith("fslo_")
-    assert payload["key_prefix"] != key[:12]
-    assert "email" not in payload
+    # A verified freesolo user key resolves to a per-token "freesolo" identity.
+    assert me.json()["email"] == "freesolo-user"
+    assert me.json()["key_prefix"] == "freesolo"
 
 
 def test_requests_without_key_are_rejected(api):
@@ -139,78 +136,12 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
 
     row = auth_mod.authenticate("Bearer fslo-user-good")
     assert row is not None
-    assert row["email"] is None
-    assert row["auth_kind"] == "freesolo_api_key"
-    assert row["key_prefix"].startswith("fslo_")
-    assert row["key_prefix"] != "fslo-user-go"
+    assert row["email"] == "freesolo-user"
     # An unverified token returns None (401).
     assert auth_mod.authenticate("Bearer fslo-user-bad") is None
     # The same key resolves to the same identity across requests (stable per-token row).
     again = auth_mod.authenticate("Bearer fslo-user-good")
     assert again["id"] == row["id"]
-
-
-def test_freesolo_user_identity_from_verify_response(api, monkeypatch):
-    import flash.server.auth as auth_mod
-
-    auth_mod._verify_cache.clear()
-    auth_mod._identity_cache["fslo_abc123_secret"] = (
-        {
-            "user_id": "user-123",
-            "org_id": "org-456",
-            "api_key_id": "key-789",
-            "key_prefix": "fslo_abc123",
-        },
-        time.time() + auth_mod._VERIFY_CACHE_TTL_S,
-    )
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token == "fslo_abc123_secret")
-
-    row = auth_mod.authenticate("Bearer fslo_abc123_secret")
-    assert row is not None
-    assert row["user_id"] == "user-123"
-    assert row["org_id"] == "org-456"
-    assert row["api_key_id"] == "key-789"
-    assert row["key_prefix"] == "fslo_abc123"
-
-
-def test_freesolo_verify_identity_parser_is_tolerant():
-    import flash.server.auth as auth_mod
-
-    importlib.reload(auth_mod)
-
-    assert auth_mod._identity_from_verify_body(b"") == {}
-    assert auth_mod._identity_from_verify_body(b"not json") == {}
-    assert auth_mod._identity_from_verify_body(json.dumps(["not", "an", "object"]).encode()) == {}
-
-    identity = auth_mod._identity_from_verify_body(
-        json.dumps(
-            {
-                "email": " ",
-                "id": "top-level-not-api-key-id",
-                "user": {"id": "user-nested", "email": "user@example.com"},
-                "org": {"id": "org-nested"},
-                "api_key": {"id": "key-nested", "key_prefix": "fslo_nested"},
-                "training_agent_job_id": "job-123",
-                "project_id": "project-456",
-                "ignored": 123,
-            }
-        ).encode()
-    )
-
-    assert identity == {
-        "email": "user@example.com",
-        "user_id": "user-nested",
-        "org_id": "org-nested",
-        "api_key_id": "key-nested",
-        "key_prefix": "fslo_nested",
-        "training_agent_job_id": "job-123",
-        "project_id": "project-456",
-    }
-
-    without_api_key_id = auth_mod._identity_from_verify_body(
-        json.dumps({"id": "top-level-id", "user": {"id": "user-nested"}}).encode()
-    )
-    assert without_api_key_id == {"user_id": "user-nested"}
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
@@ -444,21 +375,17 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
 
 
 def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
-    # The verify/identity caches key by the raw bearer token, so a stream of distinct tokens
-    # could grow them without bound. Each write prunes expired entries and caps both caches.
+    # The verify cache keys by the raw bearer token, so a stream of distinct tokens could
+    # grow it without bound. Each write prunes expired entries and caps the cache size.
     import time
 
     import flash.server.auth as auth_mod
 
     importlib.reload(auth_mod)
     auth_mod._verify_cache.clear()
-    auth_mod._identity_cache.clear()
 
     class _Resp:
         status = 200
-
-        def __init__(self, token: str) -> None:
-            self._token = token
 
         def __enter__(self):
             return self
@@ -466,37 +393,22 @@ def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
         def __exit__(self, *a):
             return False
 
-        def read(self) -> bytes:
-            return json.dumps({"user_id": self._token}).encode()
-
-    def fake_urlopen(req, timeout=None):
-        token = req.get_header("Authorization").removeprefix("Bearer ")
-        return _Resp(token)
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
 
     # An already-expired entry must be removed on the next write (no longer reachable).
     auth_mod._verify_cache["stale"] = (True, time.time() - 1)
-    auth_mod._identity_cache["stale"] = ({"user_id": "old"}, time.time() - 1)
     auth_mod._freesolo_verify("fresh-token")
     assert "stale" not in auth_mod._verify_cache
-    assert "stale" not in auth_mod._identity_cache
     assert "fresh-token" in auth_mod._verify_cache
-    assert auth_mod._identity_cache["fresh-token"][0] == {"user_id": "fresh-token"}
 
-    # Verifying many distinct (live) tokens never grows either cache past the cap.
+    # Verifying many distinct (live) tokens never grows the cache past the cap.
     monkeypatch.setattr(auth_mod, "_VERIFY_CACHE_MAX", 8)
     auth_mod._verify_cache.clear()
-    auth_mod._identity_cache.clear()
     for i in range(50):
         auth_mod._freesolo_verify(f"tok-{i}")
         assert len(auth_mod._verify_cache) <= auth_mod._VERIFY_CACHE_MAX
-        assert len(auth_mod._identity_cache) <= auth_mod._VERIFY_CACHE_MAX
     assert len(auth_mod._verify_cache) <= auth_mod._VERIFY_CACHE_MAX
-    assert len(auth_mod._identity_cache) <= auth_mod._VERIFY_CACHE_MAX
-    assert set(auth_mod._identity_cache).issubset(auth_mod._verify_cache)
     auth_mod._verify_cache.clear()
-    auth_mod._identity_cache.clear()
 
 
 def test_keys_are_hashed_at_rest(api):
@@ -581,7 +493,7 @@ def test_logs_offset_paging(api):
 
 
 def test_local_env_path_rejected(api):
-    # Managed service only accepts published environment ids, not local paths.
+    # GitHub Freesolo-only: a local [environment] path is rejected on the managed service.
     key = _login()
     bad = {**SPEC, "environment": {"id": "custom", "path": "/home/user/env.py"}}
     r = api.post("/v1/runs", json={"spec": bad, "dry_run": True}, headers=_bearer(key))
@@ -637,9 +549,7 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
 
     monkeypatch.setattr(app_mod, "deploy_adapter", boom)
 
-    resp = api.post(
-        f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key)
-    )
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key))
     assert resp.status_code == 502, resp.text
     # The 502 carries the upstream reason verbatim, not a generic/unhandled-500 body.
     assert "serving backend unreachable" in resp.json()["detail"]
@@ -843,9 +753,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         runner.RunStatus(run_id="good-2", state="provisioning", spec=good_spec, remote=None)
     )
     # Order matters: the bad run is iterated FIRST, so an unguarded parse would abort here.
-    monkeypatch.setattr(
-        app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}]
-    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}])
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
 
     # A malformed spec can't be parsed into a JobSpec, so the good-spec branch's
@@ -895,7 +803,9 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # the user AND drops out of the recoverable set (never re-attempted).
     bad_status = runner.get_status("bad-1")
     assert bad_status.state == "failed", "an unparseable persisted spec must be marked failed"
-    assert bad_status.state in runner.TERMINAL_STATES, "failed is terminal, so it won't recover again"
+    assert bad_status.state in runner.TERMINAL_STATES, (
+        "failed is terminal, so it won't recover again"
+    )
     assert bad_status.state not in app_mod._RECOVERABLE, "the failed run leaves the recoverable set"
     assert bad_status.error, "the failed run must carry an operator-visible error note"
     assert "unrecoverable" in bad_status.error, (
@@ -915,24 +825,26 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
-    """POST /v1/envs publishes an uploaded package under FreeSolo's managed account,
-    namespaced per identity."""
+    """POST /v1/envs publishes an uploaded package to the managed GitHub environment repo."""
     import base64
     import io
     import tarfile
 
     import flash.server.envs as envs_mod
 
-    # Stub the actual environment publish so the test doesn't hit the external publisher.
+    published_roots: list[str] = []
     monkeypatch.setattr(
-        envs_mod, "_prime_push", lambda env_dir, *, name, is_new: f"freesolo-co/{name}"
+        envs_mod,
+        "_github_publish_once",
+        lambda *, publish_root, **_kwargs: published_roots.append(publish_root),
     )
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for name, content in (
             ("pyproject.toml", b"[project]\nname='e'\n"),
-            ("e/__init__.py", b"x=1\n"),
+            ("freesolo/__init__.py", b""),
+            ("freesolo/environment.py", b"def load_environment(**kwargs): return None\n"),
         ):
             info = tarfile.TarInfo(name)
             info.size = len(content)
@@ -945,9 +857,10 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
         json={"name": "MyEnv", "is_new": True, "package_b64": pkg},
     )
     assert resp.status_code == 200
-    slug = resp.json()["id"]
-    assert slug.startswith("freesolo-co/")  # published under the managed account
-    assert slug.endswith("-myenv")  # per-identity namespaced + sanitized
+    ref = resp.json()["id"]
+    assert ref.startswith("github:")
+    assert ref.endswith("/myenv/freesolo/environment.py")
+    assert any(root.endswith("/myenv") for root in published_roots)
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
@@ -964,15 +877,19 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
 
     seen: dict = {}
 
-    def fake_push(env_dir, *, name, is_new):
-        seen["is_new"] = is_new
-        return f"freesolo-co/{name}"
+    def fake_publish_package(*, package_b64, name, is_new, key):
+        seen.update(package_b64=package_b64, name=name, is_new=is_new, key=key)
+        return "github:freesolo-co/envs@main:environments/key-1/e/freesolo/environment.py"
 
-    monkeypatch.setattr(envs_mod, "_prime_push", fake_push)
+    monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for nm, content in (("pyproject.toml", b"[project]\nname='e'\n"), ("e/__init__.py", b"x=1\n")):
+        for nm, content in (
+            ("pyproject.toml", b"[project]\nname='e'\n"),
+            ("freesolo/__init__.py", b""),
+            ("freesolo/environment.py", b"def load_environment(**kwargs): return None\n"),
+        ):
             info = tarfile.TarInfo(nm)
             info.size = len(content)
             tar.addfile(info, io.BytesIO(content))
