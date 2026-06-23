@@ -77,10 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     login.add_argument(
         "--api-key",
-        help=(
-            "your freesolo API key (default: FREESOLO_API_KEY); create or copy one at "
-            "https://freesolo.co/sign-in"
-        ),
+        help="your freesolo API key (default: FREESOLO_API_KEY); create it at "
+        "https://freesolo.co/sign-in",
     )
     login.add_argument(
         "--freesolo-url",
@@ -101,25 +99,23 @@ def main(argv: list[str] | None = None) -> int:
     gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
     gpus.set_defaults(func=cmd_gpus)
 
-    env = sub.add_parser("env", help="manage verifiers environments")
+    env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
-    setup = env_sub.add_parser("setup", help="scaffold environments/ + configs/ in the cwd")
+    setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
     setup.set_defaults(func=cmd_env_setup)
 
-    init = env_sub.add_parser("init", help="scaffold a new local verifiers environment")
+    init = env_sub.add_parser("init", help="scaffold a new local Freesolo environment")
     init.add_argument("name")
     init.set_defaults(func=cmd_env_init)
 
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
-    env_install = env_sub.add_parser("install", help="install a published verifiers environment")
-    env_install.add_argument("env_id", help='the environment id to install ("owner/name")')
+    env_install = env_sub.add_parser("install", help="record a Freesolo environment")
+    env_install.add_argument("env_id", help="the Freesolo environment id to record")
     env_install.set_defaults(func=cmd_env_install)
 
-    env_push = env_sub.add_parser(
-        "push", help="publish a local verifiers environment; prints its environment id"
-    )
+    env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
 
@@ -211,8 +207,8 @@ def main(argv: list[str] | None = None) -> int:
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
 
-    # The control plane is operator-only and run as a separate one-off service via
-    # `python -m flash.server`, not a `flash` subcommand.
+    # The control plane is operator-only and run as a separate one-off service via the
+    # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
 
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
