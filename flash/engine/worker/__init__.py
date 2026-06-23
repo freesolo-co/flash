@@ -27,6 +27,7 @@ import contextlib
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -1997,12 +1998,16 @@ def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     The only public form is the exact adapter_ref emitted by ``flash status``:
     ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
     """
-    repo, sep, prefix = adapter_ref.partition(":")
-    if not (sep and repo and prefix):
+    adapter_ref = adapter_ref.strip()
+    match = re.fullmatch(
+        r"(?P<repo>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*):"
+        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})/seed(?P<seed>\d+)",
+        adapter_ref,
+    )
+    if not match:
         return None
-    if repo.count("/") != 1 or not prefix.startswith(("sft/", "rl/")):
-        return None
-    return repo, prefix
+    repo, phase, run_id, seed = match.groups()
+    return repo, f"{phase}/{run_id}/seed{seed}"
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
