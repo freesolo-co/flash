@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import random
+import time
 import urllib.error
 import urllib.request
 
@@ -29,9 +31,6 @@ _RATE_LIMIT_BODY = (
 
 
 def test_urlopen_retries_on_rate_limit_then_succeeds(monkeypatch):
-    import time as _time
-    import random as _random
-
     calls = []
 
     def fake_urlopen(req, timeout):
@@ -41,8 +40,8 @@ def test_urlopen_retries_on_rate_limit_then_succeeds(monkeypatch):
         return io.BytesIO(b"ok")
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(_time, "sleep", lambda _: None)
-    monkeypatch.setattr(_random, "uniform", lambda a, b: 1.0)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
 
     result = _urlopen(urllib.request.Request("https://api.github.com/test"))
     assert result == b"ok"
@@ -50,15 +49,12 @@ def test_urlopen_retries_on_rate_limit_then_succeeds(monkeypatch):
 
 
 def test_urlopen_raises_after_max_retries(monkeypatch):
-    import time as _time
-    import random as _random
-
     def fake_urlopen(req, timeout):
         raise _http_error(403, _RATE_LIMIT_BODY)
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(_time, "sleep", lambda _: None)
-    monkeypatch.setattr(_random, "uniform", lambda a, b: 1.0)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
 
     with pytest.raises(RuntimeError, match="GitHub environment request failed \\(403\\)"):
         _urlopen(urllib.request.Request("https://api.github.com/test"))
@@ -95,9 +91,6 @@ def test_urlopen_does_not_retry_404(monkeypatch):
 
 
 def test_urlopen_sleep_called_with_jitter(monkeypatch):
-    import time as _time
-    import random as _random
-
     sleep_calls = []
     attempt_count = []
 
@@ -108,8 +101,8 @@ def test_urlopen_sleep_called_with_jitter(monkeypatch):
         return io.BytesIO(b"data")
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(_time, "sleep", lambda s: sleep_calls.append(s))
-    monkeypatch.setattr(_random, "uniform", lambda a, b: 1.2)
+    monkeypatch.setattr(time, "sleep", lambda s: sleep_calls.append(s))
+    monkeypatch.setattr(random, "uniform", lambda a, b: 1.2)
 
     _urlopen(urllib.request.Request("https://api.github.com/test"))
 
