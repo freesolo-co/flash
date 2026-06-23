@@ -37,10 +37,12 @@ def _import_agent(modpath: str):
 from flash.cli.main import main
 from flash.runner import (
     TERMINAL_STATES,
+    RunStatus,
     get_status,
     new_run_id,
     require_safe_run_id,
 )
+from flash.spec import JobSpec
 
 
 @pytest.mark.parametrize(
@@ -189,10 +191,38 @@ def test_get_status_returns_fields_the_agent_reads(tmp_path, monkeypatch) -> Non
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     rid = new_run_id()
-    status = runner.RunStatus(run_id=rid, state="done", spec={"model": "m"})
+    status = RunStatus(run_id=rid, state="done", spec={"model": "m"})
     runner._save_status(status)
 
     loaded = get_status(rid).to_dict()
-    for key in ("run_id", "state", "spec", "cost_usd", "updated_at", "created_at"):
+    for key in ("run_id", "state", "spec", "cost_usd", "updated_at", "created_at", "adapter_ref"):
         assert key in loaded, f"RunStatus dropped {key!r} that the CLI/agent reads"
     assert loaded["state"] in (TERMINAL_STATES | {"queued", "running", "provisioning", "deployed"})
+    assert loaded["adapter_ref"] is None
+
+
+def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
+    from flash import runner
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    rid = "flash-status-adapter-ref"
+    spec = JobSpec.from_dict(
+        {
+            "run_id": rid,
+            "algorithm": "sft",
+            "model": "Qwen/Qwen3.5-2B",
+            "train": {
+                "epochs": 1,
+                "seeds": [0],
+                "hf_repo": f"Freesolo-Co/flashrun-{rid}",
+            },
+        }
+    )
+    runner._save_status(RunStatus(run_id=rid, state="running", spec=spec.to_dict()))
+    assert get_status(rid).to_dict()["adapter_ref"] is None
+
+    runner._save_status(RunStatus(run_id=rid, state="done", spec=spec.to_dict()))
+    assert (
+        get_status(rid).to_dict()["adapter_ref"]
+        == f"Freesolo-Co/flashrun-{rid}:sft/{rid}/seed0"
+    )
