@@ -51,13 +51,8 @@ class RunpodProvider:
         log: Any = None,
         on_handle: Any = None,
         attempt: int = 0,
-        offers: Any = None,
-        exclude_machine_ids: Any = frozenset(),
         runtime_secrets: dict[str, str] | None = None,
     ) -> PollResult:
-        # ``offers``/``exclude_machine_ids`` are Vast live-market concerns; RunPod
-        # provisions a fresh serverless endpoint and never re-searches a market, so it
-        # ignores both (kept in the signature for cross-provider symmetry).
         from flash.providers.runpod.jobs import submit_run
 
         kwargs = {"log": log, "on_handle": on_handle, "attempt": attempt}
@@ -114,7 +109,7 @@ class RunpodProvider:
     def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
         # No-op: RunPod serverless endpoints have no standing per-run billing to reap on
         # crash recovery (a failed-before-submit endpoint is GC'd by reconstructed name in
-        # recover_runs). Present for ``base.Provider`` symmetry with Vast's instance sweep.
+        # recover_runs). Present for the ``base.Provider`` protocol.
         return []
 
 
