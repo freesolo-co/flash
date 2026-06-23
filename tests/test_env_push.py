@@ -90,11 +90,11 @@ def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
 
 
 def test_push_single_py_uses_sibling_config_id_name(monkeypatch, tmp_path):
-    # A bare environment.py with a sibling flash_grpo.toml whose [environment] id points at
+    # A bare environment.py with a sibling grpo.toml whose [environment] id points at
     # envs/myenv/freesolo/environment.py re-publishes to that SAME logical env.
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "flash_grpo.toml").write_text(
+    (tmp_path / "grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\n'
         'id = "github:owner/repo@main:envs/myenv/freesolo/environment.py"\n'
     )
@@ -112,7 +112,7 @@ def test_push_sibling_config_id_with_dot_yields_valid_module(monkeypatch, tmp_pa
     # regardless of the logical environment name.
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "flash_grpo.toml").write_text(
+    (tmp_path / "grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\n'
         'id = "github:owner/repo@main:envs/my.weird.env/freesolo/environment.py"\n'
     )
@@ -130,7 +130,7 @@ def test_push_sibling_config_repo_root_refs_do_not_override_name(monkeypatch, tm
     for env_id in ("github:owner/repo", "github:owner/repo@main", "https://github.com/owner/repo"):
         env_file = tmp_path / "my_task.py"
         env_file.write_text("def load_environment(**k):\n    return None\n")
-        (tmp_path / "flash_grpo.toml").write_text(
+        (tmp_path / "grpo.toml").write_text(
             f'model = "m"\nalgorithm = "grpo"\n[environment]\nid = "{env_id}"\n'
         )
         cap: dict = {}
@@ -144,7 +144,7 @@ def test_push_sibling_config_repo_root_refs_do_not_override_name(monkeypatch, tm
 def test_push_sibling_config_github_url_path_derives_name(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "flash_grpo.toml").write_text(
+    (tmp_path / "grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\n'
         'id = "https://github.com/owner/repo/blob/main/envs/urlenv/freesolo/environment.py"\n'
     )

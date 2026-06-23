@@ -113,8 +113,11 @@ def test_bare_environment_id_is_rejected() -> None:
         "github:owner/repo@:x/freesolo/environment.py",
         "github:owner/repo@main:../x.py",
         "github:owner/repo@main:/etc/passwd",
+        "github:owner /repo@main:x/freesolo/environment.py",
+        "github:owner/repo@bad/ref:x/freesolo/environment.py",
         "https://github.com/owner/repo/blob/main/../x.py",
         "https://github.com/owner/repo/blob/main:/etc/passwd",
+        "https://github.com/owner/repo/blob/bad ref/x.py",
         "https://github.com/owner/repo/issues/1",
     ):
         raw = _raw()

@@ -110,7 +110,7 @@ def build_payload(
 ) -> dict:
     """The bootstrap's input — field-compatible with _train_body's, plus the bits the
     instance can't infer (HF prefix for markers, wall cap, attempt)."""
-    from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
+    from flash.envs.registry import worker_pip_for_env
     from flash.providers.runpod.train import build_worker_env, chalk_extra_pip
 
     return {
@@ -123,7 +123,6 @@ def build_payload(
         # so the opt-in chalk spec rides along here to reach default runs — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
         + chalk_extra_pip(spec),
-        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
         "hf_prefix": f"{spec.phase}/{spec.run_id}/seed{seed}",
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
         "attempt": int(attempt),

@@ -13,7 +13,7 @@ from pathlib import Path
 
 def cmd_env_install(args) -> int:
     from flash.envs.adapter import is_github_environment_ref
-    from flash.envs.registry import record_installed_env
+    from flash.envs.registry import INSTALLED_MANIFEST, record_installed_env
 
     env_id = args.env_id
     if not is_github_environment_ref(env_id):
@@ -24,7 +24,7 @@ def cmd_env_install(args) -> int:
         )
         return 1
     record_installed_env(env_id, package="freesolo")
-    print(f"installed {env_id}; recorded in ~/.flash/envs.json")
+    print(f"installed {env_id}; recorded in {INSTALLED_MANIFEST}")
     print(f'use it via:  [environment]\\nid = "{env_id}"')
     return 0
 
@@ -105,11 +105,11 @@ def _config_env_name(config_path) -> str | None:
 
 def _config_env_name_from_dir(config_dir) -> str | None:
     """The environment name declared by the sibling per-phase flash configs
-    (``flash_grpo.toml``/``flash_sft.toml``). Without this, pushing ``environment.py`` finds
-    no id and mints a brand-new env, so the run trains against the stale id in the configs.
+    (``grpo.toml``/``sft.toml``). Without this, pushing ``environment.py`` finds no id
+    and mints a brand-new env, so the run trains against the stale id in the configs.
     """
     config_dir = Path(config_dir)
-    for cfg in ("flash_grpo.toml", "flash_sft.toml"):
+    for cfg in ("grpo.toml", "sft.toml"):
         name = _config_env_name(config_dir / cfg)
         if name:
             return name

@@ -147,6 +147,23 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert fake_client.calls[-1][0] == "chat"
 
 
+def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup"]) == 0
+
+    assert (tmp_path / "environments/freesolo/environment.py").is_file()
+    grpo = tmp_path / "configs/grpo.toml"
+    sft = tmp_path / "configs/sft.toml"
+    assert grpo.is_file()
+    assert sft.is_file()
+    assert 'algorithm = "grpo"' in grpo.read_text()
+    assert "steps = 150" in grpo.read_text()
+    assert 'algorithm = "sft"' in sft.read_text()
+    assert "epochs = 1" in sft.read_text()
+    assert "configs/grpo.toml" in capsys.readouterr().out
+
+
 def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None:
     from flash.client import ApiError
 
@@ -174,7 +191,9 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        environment=EnvironmentSpec(id="github:owner/repo@main:env/freesolo/environment.py", pip=("custom==1",)),
+        environment=EnvironmentSpec(
+            id="github:owner/repo@main:env/freesolo/environment.py", pip=("custom==1",)
+        ),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
 
