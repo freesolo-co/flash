@@ -515,3 +515,152 @@ def test_update_returns_false_when_terminal_sticky(tmp_path, monkeypatch):
     # Now terminal: a non-terminal transition is rejected and reported False.
     assert orch._update(spec.run_id, "running") is False
     assert orch.get_status(spec.run_id).state == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Quota-slot release in terminate_endpoint: release ONLY when the remote endpoint is
+# provably gone — never on an undeploy failure (would oversubscribe RunPod's quota), but
+# DO release when we positively verify nothing exists (else the slot leaks → queue deadlock).
+# ---------------------------------------------------------------------------
+def target_for(run_id):
+    """The endpoint name terminate_endpoint reconstructs for ``run_id`` on RTX 5090."""
+    from flash.providers.base import canonical_gpu
+
+    return endpoint_name(canonical_gpu("RTX 5090"), _run_suffix(run_id))
+
+
+def _install_fake_sdk(monkeypatch, *, resources, undeploy, rest_find, rest_delete=lambda _id: True):
+    """Stub the runpod_flash ResourceManager + the RunPod REST API for terminate_endpoint.
+
+    ``resources`` is the registry dict returned by list_all_resources(); ``undeploy`` is an
+    async fn called per uid; ``rest_find``/``rest_delete`` back the registry-less REST fallback
+    (``rest_find`` may raise to simulate an unreachable API). Also drops the quota semaphore +
+    tracking set to a fresh pair (monkeypatch restores them) so the test owns one acquired slot.
+    Returns ``(ep_mod, target)``.
+    """
+    import sys
+    import threading
+    import types as _types
+
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.auth as auth
+    import flash.providers.runpod.train.endpoints as ep_mod
+    from flash.providers.base import canonical_gpu
+
+    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda *a, **k: None)
+
+    fake_rm = _types.SimpleNamespace(
+        list_all_resources=lambda: resources,
+        undeploy_resource=undeploy,
+    )
+    fake_rm_mod = _types.ModuleType("runpod_flash.core.resources.resource_manager")
+    fake_rm_mod.ResourceManager = lambda: fake_rm
+    for mod_name in (
+        "runpod_flash",
+        "runpod_flash.core",
+        "runpod_flash.core.resources",
+        "runpod_flash.core.resources.resource_manager",
+    ):
+        if mod_name not in sys.modules:
+            stub = _types.ModuleType(mod_name)
+            stub.__path__ = []
+            monkeypatch.setitem(sys.modules, mod_name, stub)
+    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod)
+
+    monkeypatch.setattr(runpod_api, "find_endpoints_by_name", rest_find)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", rest_delete)
+
+    # Fresh semaphore + tracking set, with one slot already "acquired" for this run's endpoint
+    # (as get_train_endpoint would have done). monkeypatch restores the module globals after.
+    target = endpoint_name(canonical_gpu("RTX 5090"), _run_suffix("flash-q-1"))
+    monkeypatch.setattr(ep_mod, "_ENDPOINT_SLOTS", threading.Semaphore(28))
+    monkeypatch.setattr(ep_mod, "_ACQUIRED_NAMES", set())
+    ep_mod._ACQUIRED_NAMES.add(target)
+    ep_mod._ENDPOINT_SLOTS.acquire()  # 27 free; releasing puts it back to 28
+    return ep_mod, target
+
+
+async def _undeploy_ok(uid, **_):
+    return {"success": True}
+
+
+async def _undeploy_fail(uid, **_):
+    raise RuntimeError("undeploy boom")
+
+
+def test_terminate_releases_slot_when_undeploy_succeeds(monkeypatch):
+    # (a) at least one undeploy succeeded → the endpoint is gone → release the slot.
+    ep_mod, target = _install_fake_sdk(
+        monkeypatch,
+        resources={"u1": types.SimpleNamespace(name=f"live-{target_for('flash-q-1')}")},
+        undeploy=_undeploy_ok,
+        rest_find=lambda _s: [],
+    )
+    ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+    assert target not in ep_mod._ACQUIRED_NAMES, "a successful undeploy must release the slot"
+
+
+def test_terminate_does_not_release_slot_on_undeploy_failure(monkeypatch):
+    # The endpoint exists (a uid was found) but undeploy FAILED — it may still be alive and
+    # counting against the RunPod quota. Releasing here would oversubscribe the quota, so the
+    # slot MUST stay held until a later teardown confirms the endpoint is actually gone.
+    ep_mod, target = _install_fake_sdk(
+        monkeypatch,
+        resources={"u1": types.SimpleNamespace(name=f"live-{target_for('flash-q-1')}")},
+        undeploy=_undeploy_fail,
+        rest_find=lambda _s: [],  # not consulted: uids was non-empty
+    )
+    ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+    assert target in ep_mod._ACQUIRED_NAMES, "a failed undeploy must NOT release the slot"
+
+
+def test_terminate_releases_slot_when_no_remote_endpoint_exists(monkeypatch):
+    # (b) registry returned no uids AND the REST lookup confirms no endpoint of this name —
+    # the endpoint provably does not exist (e.g. it never finished deploying). Release the slot;
+    # otherwise it leaks forever and eventually deadlocks the queue.
+    ep_mod, target = _install_fake_sdk(
+        monkeypatch,
+        resources={},  # registry finds nothing
+        undeploy=_undeploy_ok,  # never called
+        rest_find=lambda _s: [],  # REST confirms nothing remote
+    )
+    ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+    assert target not in ep_mod._ACQUIRED_NAMES, (
+        "a positively-verified-absent endpoint must release the slot (else the queue deadlocks)"
+    )
+
+
+def test_terminate_does_not_release_slot_when_rest_lookup_unreachable(monkeypatch):
+    # No uids in the registry, but the REST lookup RAISES (API unreachable) — we cannot prove
+    # the endpoint is gone. Releasing on an unverified absence risks oversubscribing the quota,
+    # so the slot stays held.
+    def _boom(_s):
+        raise RuntimeError("REST API down")
+
+    ep_mod, target = _install_fake_sdk(
+        monkeypatch,
+        resources={},
+        undeploy=_undeploy_ok,
+        rest_find=_boom,
+    )
+    out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+    assert target in ep_mod._ACQUIRED_NAMES, (
+        "an unverifiable absence (REST unreachable) must NOT release the slot"
+    )
+    assert isinstance(out, list)  # still never raises
+
+
+def test_terminate_releases_slot_when_rest_deletes_orphan(monkeypatch):
+    # No uids in the registry, but the REST fallback FINDS and deletes a live orphan endpoint
+    # (e.g. the registry entry was lost across a container restart). That delete succeeds →
+    # the endpoint is gone → release the slot.
+    ep_mod, target = _install_fake_sdk(
+        monkeypatch,
+        resources={},
+        undeploy=_undeploy_ok,
+        rest_find=lambda _s: [{"id": "ep-orphan", "name": target_for("flash-q-1")}],
+        rest_delete=lambda _id: True,
+    )
+    ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+    assert target not in ep_mod._ACQUIRED_NAMES, "a REST-deleted orphan must release the slot"
