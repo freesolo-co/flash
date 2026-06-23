@@ -29,8 +29,8 @@ def coerce_bool(value: Any) -> bool:
     """Parse a bool from loosely-typed sources (JSON request bodies / env / persisted dicts).
 
     bool(...) on a string is truthy for ANY non-empty string, so "false"/"0"/"no" would
-    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False, so
-    e.g. JSON ``"is_new": "false"`` is parsed as False. An already-bool value passes through.
+    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False.
+    An already-bool value passes through.
     """
     if isinstance(value, str):
         return value.strip().lower() not in _FALSE_STRINGS
