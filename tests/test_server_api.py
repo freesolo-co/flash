@@ -627,6 +627,42 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_chat_streams_deployed_run(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    runner.mark_deployed(run_id, {"state": "ready", "endpoint_name": "https://serve.example"})
+
+    seen = {}
+
+    def fake_stream(**kwargs):
+        seen.update(kwargs)
+        yield "hi"
+        yield " there"
+
+    monkeypatch.setattr(app_mod, "serve_chat_stream", fake_stream)
+
+    with api.stream(
+        "POST",
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    ) as resp:
+        text = resp.read().decode()
+
+    assert resp.status_code == 200, text
+    assert text == "hi there"
+    assert seen["run_id"] == run_id
+    assert seen["messages"] == [{"role": "user", "content": "hello"}]
+
+
 def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     """An undeploy that hits a serving-backend failure surfaces as a clean 502 (same as deploy),
     not an unhandled 500: ServingError from undeploy_adapter is translated to HTTPException(502)."""
