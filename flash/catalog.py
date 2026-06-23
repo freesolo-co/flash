@@ -74,7 +74,7 @@ class ModelInfo:
 
 # The default model Flash trains when a config omits one. A current-gen dense 4B
 # (text-only fine-tune) on the modern worker stack — the safe out-of-the-box choice for
-# the average developer. It is thinking-"hybrid"; the thinking flag now defaults ON.
+# the average developer. It is thinking-"hybrid"; the thinking flag defaults OFF.
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 MODELS: dict[str, ModelInfo] = {

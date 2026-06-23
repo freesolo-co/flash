@@ -346,7 +346,7 @@ def test_config_gpu_fields(monkeypatch):
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
-        "environment": {"id": "owner/env"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
     # GPU pinning is gone: gpu.type is always the cheapest-fitting VALIDATED provisional regardless
     # of what the config says. Omitted gpu.type -> the deterministic offline cheapest validated

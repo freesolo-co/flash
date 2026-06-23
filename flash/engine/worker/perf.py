@@ -458,7 +458,7 @@ def _drop_fla_on_hopper() -> None:
 
     fla's gated chunk_bwd Triton kernel is miscomputed on Hopper with Triton>=3.4 and
     HARD-RAISES (fla #640), so every gated-delta (Qwen3.5/3.6 family) GRPO backward crashes.
-    The worker base image BAKES fla in, and per-run installs (extra_pip / `prime env install`)
+    The worker base image BAKES fla in, and per-run installs (extra_pip)
     can pull it back, so the only reliable place to drop it is HERE: in the worker process,
     after all installs and BEFORE any model import. transformers then uses the correct
     pure-PyTorch delta rule (2-3x slower but it RUNS). Runs on BOTH substrates (RunPod and
@@ -489,4 +489,3 @@ def _drop_fla_on_hopper() -> None:
         f"{'WARNING fla remains' if still else 'pure-PyTorch delta rule'} (fla #640)",
         flush=True,
     )
-
