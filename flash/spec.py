@@ -119,8 +119,8 @@ class TrainSpec:
     lora_rank: int = 32
     lora_alpha: int = 64
     seeds: tuple[int, ...] = (0,)
-    # Artifact-store adapter prefix (``<phase>/<run_id>/seed<N>``) to initialize the
-    # LoRA from instead of training fresh — e.g. a GRPO run continuing an SFT adapter.
+    # Artifact-store adapter ref output by `flash status`:
+    # ``<hf_repo>:<phase>/<run_id>/seed<N>``.
     init_from_adapter: str = ""
     # Per-run HuggingFace artifact repo ("owner/name") for this run's adapter/checkpoint/
     # code storage AND serving. PLATFORM-MANAGED, not a user field: the control plane assigns
