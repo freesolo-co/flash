@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "primeintellect/gsm8k"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
@@ -196,7 +196,7 @@ def test_reverse_run_charge_posts_reversal(monkeypatch):
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("PRIME_API_KEY", "pit-test")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     import flash.runner as runner
     import flash.server.auth as auth_mod
