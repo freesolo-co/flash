@@ -94,7 +94,7 @@ def seconds_per_step(config: RunConfig, gpu: str) -> float:
 
 
 def select_gpu(config: RunConfig) -> tuple[str, int]:
-    """(chosen GPU class, required VRAM GB): the cheapest fitting class for the cost estimate.
+    """(chosen GPU class, required VRAM GB): the cheapest fitting class for the cost.
 
     Uses ``pick_gpu``, which (unlike the submit-time allocator) intentionally stays gate-free —
     it considers every fitting class, validated or not — so the estimate reflects the cheapest
@@ -136,7 +136,7 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
 
 
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
-    """Deterministic pre-flight cost estimate -- the analytical ground truth."""
+    """Deterministic pre-flight cost calculation."""
     gpu, need = select_gpu(config)
     hourly = realized_hourly_usd(gpu)
     # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.

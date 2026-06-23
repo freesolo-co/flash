@@ -9,7 +9,7 @@ the run. This module owns the lifecycle instead:
   build_function_input()   -> the exact FunctionRequest payload Flash workers expect
   submit + poll_job()      -> REST queue API with hardened retries; the job handle
                               {endpoint_id, job_id} is persisted by the runner so
-                              any process can re-attach (`flash attach`).
+                              any process can re-attach (`flash status --follow`).
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ __all__ = [
     "build_function_input",
     "decode_output",
     "deploy_train_endpoint",
+    "make_hf_failure_detail_reader",
     "make_hf_heartbeat_reader",
     "make_hf_text_reader",
     "poll_job",
@@ -282,11 +283,24 @@ def decode_output(output) -> dict:
     return output
 
 
+def _append_failure_artifacts(detail: str, failure_detail_reader) -> str:
+    """Append worker-uploaded failure artifacts to a RunPod terminal-status detail."""
+    if failure_detail_reader is None:
+        return detail
+    extra = failure_detail_reader(force=True)
+    if not extra:
+        return detail
+    if detail:
+        return f"{detail}\n{extra}"
+    return extra
+
+
 def poll_job(
     handle: JobHandle,
     log=None,
     interval_s: float = 10.0,
     heartbeat_reader=None,
+    failure_detail_reader=None,
     stall_after_s: float = 1200.0,
     setup_grace_s: float = 3000.0,
     unhealthy_grace_s: float = 240.0,
@@ -302,6 +316,10 @@ def poll_job(
     slow cold start isn't misread as a stall; after it we use the tight ``stall_after_s``.
     Needs a ``heartbeat_reader`` to tell the phases apart — without one we keep
     ``stall_after_s`` throughout (no regression).
+
+    ``failure_detail_reader`` force-reads worker-uploaded artifacts (``error_<phase>.txt`` and
+    ``console_<phase>.txt``) after a worker terminal failure so a generic RunPod handler wrapper
+    does not hide the real traceback.
 
     ``throttled_grace_s`` bounds how long we wait on a worker stuck THROTTLED (no RunPod
     capacity for the pinned GPU class) before returning a retryable stall so the runner
@@ -349,10 +367,11 @@ def poll_job(
                 # COMPLETED but the output decodes as an error (a handler exception). Consult the
                 # worker flag too: an infra failure can surface here and must still retry.
                 retriable = worker_flagged_retriable(heartbeat_reader)
+                detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
                     False,
                     failure="job_preempted" if retriable else "job_failed",
-                    detail=str(e),
+                    detail=detail,
                 )
         if status in TERMINAL_FAIL:
             detail = str(st.get("error") or "")[:1500]
@@ -370,6 +389,7 @@ def poll_job(
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
             # A worker FAILED: consult the structured worker flag (one forced heartbeat read).
             retriable = worker_flagged_retriable(heartbeat_reader)
+            detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
                 False,
                 failure="job_preempted" if retriable else "job_failed",
@@ -545,7 +565,16 @@ def submit_run(
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
-    return poll_job(handle, log=log, heartbeat_reader=reader, **stall_kwargs())
+    failure_reader = (
+        make_hf_failure_detail_reader(hf_repo, prefix, spec.phase) if hf_repo else None
+    )
+    return poll_job(
+        handle,
+        log=log,
+        heartbeat_reader=reader,
+        failure_detail_reader=failure_reader,
+        **stall_kwargs(),
+    )
 
 
 def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float = 45.0):
@@ -597,6 +626,36 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
             return json.loads(raw)
         except (ValueError, TypeError):
             return None
+
+    return read
+
+
+def make_hf_failure_detail_reader(
+    hf_repo: str,
+    prefix: str,
+    phase: str,
+    min_interval_s: float = 45.0,
+):
+    """Reader for worker-uploaded RunPod failure artifacts on HF.
+
+    The RunPod queue often reports only the outer handler error (for example, "produced no
+    /tmp/metrics.json"). The worker writes the actual traceback and console tail to HF; this
+    reader lets ``poll_job`` force-download those files after a terminal worker failure.
+    """
+    error_reader = make_hf_text_reader(hf_repo, f"{prefix}/error_{phase}.txt", min_interval_s)
+    console_reader = make_hf_text_reader(
+        hf_repo, f"{prefix}/console_{phase}.txt", min_interval_s
+    )
+
+    def read(force: bool = False) -> str | None:
+        parts: list[str] = []
+        error_text = error_reader(force=force)
+        if error_text:
+            parts.append(f"--- error_{phase}.txt ---\n{error_text[-4000:]}")
+        console_text = console_reader(force=force)
+        if console_text:
+            parts.append(f"--- console_{phase}.txt ---\n{console_text[-4000:]}")
+        return "\n".join(parts) if parts else None
 
     return read
 
