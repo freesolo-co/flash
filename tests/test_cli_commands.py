@@ -173,8 +173,11 @@ def test_models_table(fake_client, capsys) -> None:
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
-    assert "Qwen/Qwen3.5-2B\t2.3B" in out
-    assert "openbmb/MiniCPM5-1B\t1.2B dense" in out
+    assert "Qwen/Qwen3.5-2B" in out
+    assert "openbmb/MiniCPM5-1B" in out
+    # only bare model ids, none of the extra per-model detail columns
+    assert "2.3B" not in out
+    assert "dense" not in out
     assert "(text-only fine-tune)" not in out
     assert "algos=" not in out
     assert "bf16" not in out
