@@ -46,6 +46,17 @@ def stub_server():
                 ok = self.headers.get("Authorization") == "Bearer fs-stub-key"
                 self._send(200 if ok else 401, {"ok": ok})
                 return
+            if self.path == "/v1/me":
+                # After storing the key, login fetches the identity card from the control plane.
+                self._send(
+                    200,
+                    {
+                        "kind": "freesolo_api_key",
+                        "key_prefix": "fs-stub",
+                        "email": "stub@example.com",
+                    },
+                )
+                return
             if self.path == "/v1/runs":
                 self._send(
                     200,
@@ -103,6 +114,9 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     assert "saved to" not in proc.stdout
     assert ".flash" not in proc.stdout
     assert "you're ready to train" not in proc.stdout
+    # Login shows who you are straight away, so a separate `whoami` isn't needed.
+    assert "logged in to flash" in proc.stdout
+    assert "stub@example.com" in proc.stdout
 
     cfg = os.path.join(home, ".flash", "config.json")
     with open(cfg) as f:

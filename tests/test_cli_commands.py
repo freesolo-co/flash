@@ -101,6 +101,34 @@ def test_whoami_prints_identity(fake_client, capsys) -> None:
     out = capsys.readouterr().out
     assert "freesolo" in out
     assert "t@example.com" in out
+    # Rendered as a human card, not raw JSON.
+    assert "{" not in out
+
+
+def test_login_shows_who_you_are(monkeypatch, fake_client, capsys) -> None:
+    # Verify + store are stubbed; login should still surface the identity card itself so the
+    # user sees who they are without a separate `flash whoami`.
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    assert _run(["login", "--api-key", "fs-secret-key"]) == 0
+    out = capsys.readouterr().out
+    assert "logged in to flash" in out
+    assert "t@example.com" in out
+    assert "fs-secret-key" not in out  # never echo the key
+
+
+def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> None:
+    from flash.client import ClientError
+
+    def _reject(api_key, base_url=None):
+        raise ClientError("freesolo rejected this API key")
+
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _reject)
+    assert _run(["login", "--api-key", "bad-key"]) == 1
+    err = capsys.readouterr().err
+    assert "login failed" in err
+    assert "try again" in err
+    assert "bad-key" not in err
 
 
 def test_env_setup_replaces_lab_setup(tmp_path, monkeypatch, capsys) -> None:
