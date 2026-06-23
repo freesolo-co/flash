@@ -1,9 +1,7 @@
 # Flash
 
-Managed LoRA post-training service: SFT and GRPO on managed GPUs across multiple
-providers — RunPod Flash (serverless queue; RTX 4090/5090 classes) and Vast.ai
-(rented verified-datacenter instances; L40S / RTX Pro 4000 / A100 classes). The
-allocator picks the cheapest GPU class that fits the run across both providers.
+Managed LoRA post-training service: SFT and GRPO on managed RunPod Flash GPUs.
+The allocator picks the cheapest validated RunPod GPU class that fits the run.
 
 ## Scope
 
@@ -12,10 +10,11 @@ allocator picks the cheapest GPU class that fits the run across both providers.
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
 - `flash deploy`, `flash chat` — serving for trained adapters.
 - **Freesolo SDK environments.** Every run names a Freesolo environment id.
-  Scaffold `environment.py`, upload `.` or another folder with
-  `flash env push --name <name> <folder>`, then reference the returned id. The
-  worker loads it through `freesolo.environments`. There are no built-in task
-  environments. Single-turn and bounded multi-turn environments are supported.
+  Scaffold `environment.py` plus `datasets/train.jsonl`, upload `.` or another
+  folder with `flash env push --name <name> <folder>`, then reference the
+  returned id. The worker loads it through `freesolo.environments`. There are no
+  built-in task environments. Single-turn and bounded multi-turn environments are
+  supported.
 
 ## Layout
 
@@ -25,16 +24,16 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash/schema.py`, `flash/spec.py` — TOML → `JobSpec`
 - `flash/runner.py` — server-side run supervisor (durable job handle,
   retries, cost guard, endpoint GC)
-- `flash/providers/` — RunPod Flash + Vast.ai provider subtrees (pricing,
-  gpus, durable submit/poll, preflight) behind one `base.Provider` protocol,
-  with a cross-provider `allocator.py` that picks the cheapest fitting class
+- `flash/providers/` — RunPod Flash provider code (pricing, gpus, durable
+  submit/poll, preflight) behind the `base.Provider` protocol, with an
+  `allocator.py` that picks the cheapest fitting class
 - `flash/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
   shared recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
 - `flash/envs/` — environment machinery: registry and the adapter that loads
   Freesolo SDK environments onto the worker's interface
-- `flash env setup` — scaffold a starter local Freesolo env and a ready-to-run
-  config to start from
+- `flash env setup` — scaffold a starter local Freesolo env, `datasets/train.jsonl`,
+  and ready-to-run configs to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
   plane (run operator-side via the separate `flash-server` command)
 - `flash/mcp/` — stdio MCP bridge for coding agents
@@ -52,8 +51,7 @@ uv run flash --help
 uv run flash-server                      # control plane (operator-side, run once)
 ```
 
-The control plane owns provider credentials: `RUNPOD_API_KEY` is always required
-(RunPod is the default substrate), `VAST_API_KEY` is opt-in (only checked when set),
+The control plane owns provider credentials: `RUNPOD_API_KEY` is always required,
 plus the shared `HF_TOKEN`.
 The artifact repo is per-run (the run TOML's `[train] hf_repo`), not an
 operator-wide env var. Clients authenticate with their freesolo API key (`flash login`).

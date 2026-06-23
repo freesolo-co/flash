@@ -186,7 +186,7 @@ def recover_runs() -> None:
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
             resubmit.append(spec)
-    # Reap orphaned per-run instances (Vast bills until destroyed); each provider sweeps its own.
+    # Reap orphaned per-run provider resources; each provider sweeps its own.
     from flash.providers import configured_providers
 
     for prov in configured_providers():
@@ -413,7 +413,14 @@ def create_app():
                 f.seek(end)
                 chunk = f.read()
                 end = f.tell()
-        return {"run_id": run_id, "logs": chunk, "offset": end, "state": status.state}
+        return {
+            "run_id": run_id,
+            "logs": chunk,
+            "offset": end,
+            "state": status.state,
+            "last_heartbeat": status.last_heartbeat,
+            "gpu_status": status.gpu_status,
+        }
 
     @app.post("/v1/runs/{run_id}/cancel")
     def cancel(run_id: str, key: dict = Depends(require_key)):

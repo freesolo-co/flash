@@ -5,17 +5,19 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import sys
 import tarfile
 
 from flash.cli import main as cli
+from flash.cli.main.envpush import _human_bytes, _UploadProgress
 
 
 def _fake_client(capture: dict, *, slug: str = "acme/environment"):
     """A stand-in ApiClient that records the publish_env call and returns an env id."""
 
     class _C:
-        def publish_env(self, *, name, package_b64):
-            capture.update(name=name, package_b64=package_b64)
+        def publish_env(self, *, name, package_b64, progress=None):
+            capture.update(name=name, package_b64=package_b64, progress=progress)
             return {"id": slug}
 
     return lambda: _C()
@@ -112,7 +114,7 @@ def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
     (tmp_path / "db" / "state.sqlite").write_text("sqlite bytes")
     (tmp_path / "configs").mkdir()
     (tmp_path / "configs" / "env.toml").write_text("[env]\n")
-    (tmp_path / "grpo.toml").write_text('algorithm = "grpo"\n')
+    (tmp_path / "rl.toml").write_text('algorithm = "grpo"\n')
     (tmp_path / "assets").mkdir()
     (tmp_path / "assets" / "labels.json").write_text("{}\n")
     cap: dict = {}
@@ -123,7 +125,7 @@ def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
     assert "state.sqlite" not in files
     assert "db/state.sqlite" not in files
     assert "configs/env.toml" not in files
-    assert "grpo.toml" not in files
+    assert "rl.toml" not in files
     assert "assets/labels.json" not in files
 
 
@@ -161,7 +163,7 @@ def test_push_requires_explicit_name(tmp_path, capsys):
 def test_push_sibling_config_does_not_override_explicit_name(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "grpo.toml").write_text(
+    (tmp_path / "rl.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\nid = "user/old-name"\n'
     )
     cap: dict = {}
@@ -223,3 +225,90 @@ def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
     assert "environment.py" in names
     assert not any(n.startswith(".prime") for n in names)
     assert not any("__pycache__" in n for n in names)
+
+
+class _FakeTTY(io.StringIO):
+    """A captured stderr that claims to be interactive, so the progress bar renders."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_push_off_tty_passes_no_progress_callback(monkeypatch, tmp_path):
+    # Under pytest stderr is not a TTY, so the upload stays on the plain single-shot path.
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file, name="starter")) == 0
+    assert cap["progress"] is None
+
+
+def test_push_renders_and_forwards_upload_progress(monkeypatch, tmp_path):
+    fake_err = _FakeTTY()
+    monkeypatch.setattr(sys, "stderr", fake_err)
+
+    seen: dict = {}
+
+    class _C:
+        def publish_env(self, *, name, package_b64, progress=None):
+            # On a TTY the CLI hands us a real callback; drive it from 0 to 100%.
+            assert progress is not None
+            progress(0, 10)
+            progress(10, 10)
+            seen["progressed"] = True
+            return {"id": "acme/starter"}
+
+    monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
+
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    assert cli.cmd_env_push(_args(env_file, name="starter")) == 0
+    assert seen.get("progressed")
+    rendered = fake_err.getvalue()
+    assert "packaging environment" in rendered
+    assert "uploading starter" in rendered
+    assert "100%" in rendered
+
+
+def test_upload_progress_renders_bar_and_clears(monkeypatch):
+    fake_err = _FakeTTY()
+    monkeypatch.setattr(sys, "stderr", fake_err)
+
+    bar = _UploadProgress("starter")
+    assert bar.enabled
+    assert bar.callback == bar.update  # a bound method; enabled -> not None
+    bar.update(0, 100)
+    bar.update(50, 100)
+    bar.update(100, 100)
+    out = fake_err.getvalue()
+    assert "uploading starter" in out
+    assert " 50%" in out
+    assert "100%" in out
+    # clear() must blank exactly the last line's width, else stale bar text shows on a real
+    # terminal. Assert the precise wipe sequence (\r, last_len spaces, \r), not just a tail \r.
+    last_len = bar._last_len
+    bar.clear()
+    assert fake_err.getvalue() == out + "\r" + " " * last_len + "\r"
+
+
+def test_upload_progress_is_noop_off_tty(monkeypatch):
+    fake_err = io.StringIO()  # StringIO.isatty() is False
+    monkeypatch.setattr(sys, "stderr", fake_err)
+
+    bar = _UploadProgress("starter")
+    assert not bar.enabled
+    assert bar.callback is None
+    bar.status("packaging environment")
+    bar.update(1, 2)
+    bar.clear()
+    assert fake_err.getvalue() == ""
+
+
+def test_human_bytes_scales_units():
+    assert _human_bytes(0) == "0 B"
+    assert _human_bytes(512) == "512 B"
+    assert _human_bytes(1536) == "1.5 KB"
+    assert _human_bytes(5 * 1024 * 1024) == "5.0 MB"
+    assert _human_bytes(3 * 1024 * 1024 * 1024) == "3.0 GB"
