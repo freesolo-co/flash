@@ -358,9 +358,9 @@ def get_train_endpoint(
     # occupied, making new runs queue here instead of failing with RunPod's worker-quota
     # error.  The slot is released by terminate_endpoint (or stop_endpoint as a safety net)
     # when the remote endpoint is torn down.
-    if _ENDPOINT_SLOTS._value == 0:
+    if not _ENDPOINT_SLOTS.acquire(blocking=False):
         logger.info("Quota full (28/28 slots occupied) — waiting for a free slot...")
-    _ENDPOINT_SLOTS.acquire()
+        _ENDPOINT_SLOTS.acquire()
     with _ACQUIRED_NAMES_LOCK:
         _ACQUIRED_NAMES.add(name)
     try:
