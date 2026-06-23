@@ -22,7 +22,7 @@ import inspect
 import os
 
 # Re-export the package's public surface so ``from flash.providers.runpod.train import <name>``
-# (callers in providers/runpod, providers/vast, runner, and the tests) keeps working unchanged.
+# keeps working unchanged for callers and tests.
 from flash.providers.runpod.train.deps import (  # noqa: F401
     DEFAULT_CHALK_SPEC,
     DEFAULT_EXECUTION_TIMEOUT_MS,
@@ -121,9 +121,8 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         "phase": spec.phase,
         "seed": int(seed),
         "env": build_worker_env(spec, seed),
-        # extra_pip is installed by the worker for EVERY job (baked-image RunPod _train_body and
-        # Vast bootstrap both pip-install it), so it's where the chalk spec must go to reach a
-        # default run — see chalk_extra_pip().
+        # extra_pip is installed by the worker for EVERY job, so it's where the chalk spec must
+        # go to reach a default run — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
         + chalk_extra_pip(spec),
     }
