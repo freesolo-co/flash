@@ -43,6 +43,20 @@ def adapter_prefix(spec: JobSpec, seed: int | None = None) -> str:
     return f"{spec.phase}/{spec.run_id}/seed{chosen}"
 
 
+def adapter_ref(spec: JobSpec, seed: int | None = None) -> str | None:
+    """Full init_from_adapter reference for a run's trained adapter."""
+    if not spec.train.hf_repo:
+        return None
+    return f"{spec.train.hf_repo}:{adapter_prefix(spec, seed=seed)}"
+
+
+def _adapter_ref_from_status_spec(raw: dict) -> str | None:
+    try:
+        return adapter_ref(JobSpec.from_dict(raw))
+    except Exception:
+        return None
+
+
 def _gpu_rate(gpu_type: str) -> float:
     """Static representative $/hr for cost projection;
     the worker also records wall time so cost = wall_hours * rate."""
@@ -64,6 +78,7 @@ class RunStatus:
     cost_usd: float = 0.0
     error: str | None = None
     artifacts_dir: str | None = None
+    adapter_ref: str | None = None
     deployment: dict | None = None
     # Durable job handle {endpoint_id, endpoint_name, job_id} — lets any process
     # reattach to / cancel the remote job (see `flash status --follow`).
@@ -87,7 +102,13 @@ class RunStatus:
     billing_charge: dict | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data["adapter_ref"] = (
+            _adapter_ref_from_status_spec(self.spec)
+            if self.state in {"done", "deployed"}
+            else None
+        )
+        return data
 
 
 class _RunCancelled(RuntimeError):

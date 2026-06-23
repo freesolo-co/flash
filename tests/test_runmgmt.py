@@ -1,4 +1,4 @@
-"""Tests for run-management helpers (ps/cost/cancel) — no GPU/network."""
+"""Tests for run-management helpers (runs/cost/cancel) — no GPU/network."""
 
 from __future__ import annotations
 
