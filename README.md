@@ -13,7 +13,7 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash deploy` (scale-to-zero or always-on), `flash chat` —
   serving for trained adapters.
 - **Freesolo SDK environments.** Every run names a Freesolo environment id
-  (for example `[environment] id = "github:owner/repo@main:path/to/freesolo/environment.py"`).
+  (for example `[environment] id = "github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py"`).
   Scaffold a local env, publish it with `flash env push`, then reference the
   returned id. The worker loads it through `freesolo.environments`. There are no
   built-in task environments. Single-turn and bounded multi-turn environments are

@@ -118,7 +118,8 @@ def _load_active_env():
         # default and burn a paid worker on the wrong task.
         raise RuntimeError(
             "JobSpec sets no environment: provide [environment] id (a GitHub Freesolo "
-            "environment ref, e.g. 'github:owner/repo@main:freesolo/environment.py')."
+            "environment ref, e.g. "
+            "'github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py')."
         )
     return load_environment(env_id, JOB_SPEC.environment.params)
 
@@ -141,7 +142,8 @@ def require_active_env():
             "no environment is loaded: this worker was started without a JobSpec "
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
             "carry a JobSpec naming [environment] id (a GitHub Freesolo environment ref, "
-            "e.g. 'github:owner/repo@main:freesolo/environment.py')."
+            "e.g. "
+            "'github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py')."
         )
     return ACTIVE_ENV
 
@@ -466,12 +468,9 @@ def graded_text(completion: str | None) -> str | None:
     return strip_think(completion) if THINKING else completion
 
 
-
-
 # ---------------------------------------------------------------------------
 # SFT
 # ---------------------------------------------------------------------------
-
 
 
 def force_vllm_backend_for_sm120() -> str | None:
@@ -495,10 +494,11 @@ def force_vllm_backend_for_sm120() -> str | None:
         print("[rl] sm120 vLLM backend probe skipped:", e)
         return None
     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
-    print("[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
-          "on consumer Blackwell hosts -> empty-rollout failures)")
+    print(
+        "[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
+        "on consumer Blackwell hosts -> empty-rollout failures)"
+    )
     return "FLASHINFER"
-
 
 
 def finalize_alloc_conf_for_sleep() -> None:
@@ -536,10 +536,6 @@ def finalize_alloc_conf_for_sleep() -> None:
         print("[alloc] auto-conf skipped:", e)
 
 
-
-
-
-
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
@@ -568,7 +564,9 @@ def wandb_report_to() -> list[str]:
             project = (JOB_SPEC.wandb.project if JOB_SPEC else None) or "flash"
             wandb.init(project=project, name=wandb_run_name())
     except Exception as e:
-        print(f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)")
+        print(
+            f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)"
+        )
         return []
     return ["wandb"]
 
@@ -604,9 +602,6 @@ def wandb_run_info() -> dict:
         return {}
 
 
-
-
-
 def make_lora(model_id: str | None = None):
     """LoRA config. We target 'all-linear' (every nn.Linear) rather than a hardcoded
     q/k/v/o list: it is architecture-agnostic, so the same recipe works for the dense
@@ -637,7 +632,9 @@ def make_lora(model_id: str | None = None):
     # save, but the simpler, robust choice is the default init (the convergence gain isn't worth
     # silently breaking serve + warm-start).
     kwargs["init_lora_weights"] = True
-    print("[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)")
+    print(
+        "[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)"
+    )
     # Standard LoRA scaling (alpha/r). rsLoRA was removed: it scales by alpha/sqrt(r) (~5.6x larger
     # for r=32/alpha=64), so with the usual LoRA LR (e.g. 2e-4) the effective update is ~5.6x too
     # large -> SFT diverges to a degenerate adapter (served model repeats a single token / emits
@@ -650,8 +647,6 @@ def make_lora(model_id: str | None = None):
             kwargs["exclude_modules"] = exclude
             print(f"[lora] excluding modules for {model_id}: {exclude}")
     return LoraConfig(**kwargs)
-
-
 
 
 def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_id: str) -> None:
@@ -1240,9 +1235,7 @@ def _grpo_resume_already_complete(resume_ckpt, target_steps: int, steps_run: int
     return bool(resume_ckpt) and target_steps > 0 and steps_run >= target_steps
 
 
-def _grpo_is_no_op_failure(
-    reward_history, resume_ckpt, target_steps: int, steps_run: int
-) -> bool:
+def _grpo_is_no_op_failure(reward_history, resume_ckpt, target_steps: int, steps_run: int) -> bool:
     """True when a GRPO run trained NOTHING and must fail loudly instead of reporting as done.
 
     An empty ``reward_history`` means the reward callback never fired — the rollout scored nothing
@@ -1292,7 +1285,9 @@ def run_rl():
     _t = JOB_SPEC.train if JOB_SPEC else None
     # batch_size = prompts per optimizer step for GRPO.
     # prompts per optimizer step = the run config's [train].batch_size (recipe default otherwise).
-    prompts_per_step = int(_t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step)
+    prompts_per_step = int(
+        _t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step
+    )
     group_size = int(gcfg.get("group_size") or rl.group_size)
     # temperature: explicit None check, NOT `or` — a configured 0.0 (greedy/deterministic
     # rollouts) must be honored, not fall back to the recipe sampling temperature.
@@ -1449,7 +1444,9 @@ def run_rl():
     )
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
-        print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
+        print(
+            "WARN: generation batch not divisible by group size; check prompts_per_step/group_size"
+        )
     print(
         f"[rl] GRPO batching: per_device={batching['per_device_train_batch_size']} "
         f"grad_accum={batching['gradient_accumulation_steps']} "
@@ -1879,7 +1876,6 @@ def _finalize(metrics: RunMetrics):
     hf_upload_file("/tmp/DONE", "DONE", required=True)
     heartbeat("done")
     print("NODE DONE:", metrics.to_json())
-
 
 
 def main():
