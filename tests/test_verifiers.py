@@ -154,6 +154,26 @@ class _BudgetMultiTurnEnv(_EnvironmentMultiTurn):
         return [_RewardResult(score=0.0, success=False, metrics=()) for _ in episodes]
 
 
+def test_freesolo_sft_messages_full_gold_trajectory(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
+    # A record whose `output` is a chat-message list -> the full gold trajectory (multi-turn SFT).
+    gold = [
+        {"role": "assistant", "content": "<tool_call>...</tool_call>"},
+        {"role": "user", "content": "<tool_result>...</tool_result>"},
+        {"role": "assistant", "content": "done"},
+    ]
+    assert env.sft_messages({"input": "x", "output": gold}) == gold
+    # ...and sft_target still collapses to the final assistant turn for back-compat.
+    assert env.sft_target({"input": "x", "output": gold}) == "done"
+    # A scalar `output` is single-turn SFT -> no gold trajectory.
+    assert env.sft_messages({"input": "x", "output": "4"}) is None
+    assert env.sft_messages({"input": "x"}) is None
+
+
 def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):
     _install_fake_freesolo(monkeypatch, sdk_env=_BudgetMultiTurnEnv())
 

@@ -549,6 +549,19 @@ class FreesoloEnvironment(BaseEnvironment):
             return str(value)
         return ""
 
+    def sft_messages(self, example: dict) -> list[dict] | None:
+        """Full gold trajectory (assistant + tool/env messages) for multi-turn SFT, or None.
+
+        When a record's ``output`` is a chat-message LIST (e.g. a distilled gold support
+        transcript), return it so the worker can train SFT on the whole multi-turn trajectory
+        instead of collapsing it to the single final assistant turn (:meth:`sft_target`). The
+        returned messages are appended after :meth:`prompt_messages` to form the SFT example.
+        Returns None when the record carries only a scalar target (single-turn SFT)."""
+        value = example.get(_CANONICAL_OUTPUT_KEY)
+        if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
+            return [dict(m) for m in value]
+        return None
+
     def scores_breakdown(
         self, completion: str, example: dict, state: dict | None = None
     ) -> dict[str, float]:

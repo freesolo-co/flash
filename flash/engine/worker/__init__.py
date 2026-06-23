@@ -774,16 +774,10 @@ def run_sft():
     env = require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
     heartbeat("sft_start", gpu=gpu_diagnostics())
-    # SFT only fits the single assistant `sft_target` per row; a multi-turn/ToolEnv env's
-    # tool/env turns are not represented, so SFT on one would silently mis-train (imitating a
-    # collapsed single-turn target). Warn loudly so it is not mistaken for proper multi-turn SFT.
-    if getattr(env, "multi_turn", False):
-        print(
-            "[sft][warn] this is a multi-turn Freesolo environment, but SFT only fits "
-            "the single assistant target per row (tool/env turns are ignored). The model will be "
-            "trained on collapsed single-turn targets; multi-turn SFT is not supported. Use a "
-            "single-turn environment, or expect a single-turn-only fit."
-        )
+    # SFT on a multi-turn env: rows that ship a full gold trajectory (sft_messages) train on the
+    # whole transcript (proper multi-turn SFT, handled below); rows with only a scalar sft_target
+    # collapse to a single assistant turn. Warn only for the collapsing case (computed during the
+    # dataset build below), not unconditionally.
     wait_for_gpu()
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
@@ -804,17 +798,32 @@ def run_sft():
     if max_examples > 0:
         train = train[:max_examples]
     texts = []
+    gold_multiturn = 0
     for ex in train:
-        msgs = [
-            *env.prompt_messages(ex),
-            {"role": "assistant", "content": env.sft_target(ex)},
-        ]
+        # A multi-turn env can ship a full gold trajectory (assistant + tool/env turns) per row
+        # via sft_messages; train on the WHOLE transcript then, instead of collapsing to the
+        # single final assistant target (sft_target) — that is what makes SFT actually multi-turn
+        # (teaching the tool-call protocol + replies), the warm start the GRPO recipe expects.
+        gold = env.sft_messages(ex) if hasattr(env, "sft_messages") else None
+        if gold:
+            msgs = [*env.prompt_messages(ex), *gold]
+            gold_multiturn += 1
+        else:
+            msgs = [*env.prompt_messages(ex), {"role": "assistant", "content": env.sft_target(ex)}]
         texts.append(
             {
                 "text": tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=False, enable_thinking=THINKING
                 )
             }
+        )
+    if gold_multiturn:
+        print(f"[sft] multi-turn SFT: {gold_multiturn}/{len(train)} rows train on a full gold transcript")
+    elif getattr(env, "multi_turn", False):
+        print(
+            "[sft][warn] this is a multi-turn Freesolo environment but no row ships a gold "
+            "trajectory (sft_messages); SFT collapses to the single final assistant target per row "
+            "(tool/env turns ignored). Provide gold transcripts for proper multi-turn SFT."
         )
     if THINKING and not any("<think>" in t["text"] for t in texts[:256]):
         print(
