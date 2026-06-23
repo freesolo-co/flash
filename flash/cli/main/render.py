@@ -32,7 +32,14 @@ def _flag(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None:
         return None
-    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+    val = raw.strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"", "0", "false", "no", "off"}:
+        return False
+    # Unrecognized value (e.g. a typo): stay tri-state None so styled() falls back to isatty
+    # rather than silently forcing the theme on.
+    return None
 
 
 def styled() -> bool:
@@ -238,7 +245,7 @@ def money(value: float, decimals: int = 4) -> str:
     return _paint(f"${value:.{decimals}f}", _TEAL)
 
 
-def _kv(pairs: list[tuple[str, str]], indent: int = 2) -> str:
+def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
     """Aligned ``key · value`` panel; keys dimmed and padded to a common width."""
     rows = [(k, v) for k, v in pairs if v is not None]
     if not rows:
