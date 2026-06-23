@@ -222,12 +222,13 @@ def cmd_env_setup(args) -> int:
     return 0
 
 
+def _model_dimension(params: str) -> str:
+    return params.split(" (", 1)[0]
+
+
 def cmd_models(args) -> int:
     for row in public_model_rows():
-        print(
-            f"{row['id']}\t{row['params']}\talgos={','.join(row['algos'])}\t{row['quant']}"
-            f"\tthinking={row.get('thinking', 'none')}"
-        )
+        print(f"{row['id']}\t{_model_dimension(row['params'])}")
     return 0
 
 
@@ -253,8 +254,7 @@ def cmd_gpus(args) -> int:
     print(
         "\nTip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
         "cheapest validated class that fits the model across all providers, so you don't pin a\n"
-        "GPU type. You can still tune the run via the [gpu] config table (disk_gb, max_wall_seconds,\n"
-        "max_retries, network_volume / network_volume_gb, datacenter)."
+        "GPU type."
     )
     return 0
 
