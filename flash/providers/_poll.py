@@ -157,8 +157,11 @@ def format_gpu_status(gpu: Any) -> str:
             proc_parts.append(label)
         if proc_parts:
             parts.append("procs=" + ",".join(proc_parts))
-    if not parts and gpu.get("nvidia_smi"):
-        parts.append(str(gpu["nvidia_smi"])[:160])
+    if not parts:
+        if gpu.get("nvidia_smi"):
+            parts.append(str(gpu["nvidia_smi"])[:160])
+        elif gpu.get("nvidia_smi_err"):
+            parts.append(str(gpu["nvidia_smi_err"])[:160])
     return " gpu[" + " ".join(parts) + "]" if parts else ""
 
 
