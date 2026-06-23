@@ -152,18 +152,34 @@ def login_failed(reason: str) -> str:
 
 # The Freesolo brand palette, pulled from the website (frontend/app/globals.css): navy
 # `--special` #1b1b4b, periwinkle `--periwinkle` #5f72ff (the accent/ring), green `--green`
-# #57ff8f, and the deep teal `--green-deep` #00695c. Each entry is (hex, xterm-256 fallback):
-# truecolor terminals (and the docs gallery) get the exact brand hex, everything else the
-# nearest 256-color approximation. Periwinkle is the accent; green is success; a brightened
-# teal carries amounts; a soft indigo (between navy and periwinkle) marks JSON literals.
-_ACCENT = ("5f72ff", 63)  # periwinkle — brand accent
-_ACCENT2 = ("97a3ff", 111)  # light periwinkle — keys, ids, links, snippets
-_GREEN = ("57ff8f", 84)  # brand green — success
-_TEAL = ("24c2a8", 43)  # brightened green-deep — amounts / numbers
-_RED = ("ff6b6b", 203)  # destructive
-_VIOLET = ("9a8cff", 105)  # navy→periwinkle indigo — JSON literals
-_GRAY = ("8a93a8", 245)  # cool neutral
-_FAINT = ("4d5470", 240)  # muted indigo-grey — rules, punctuation
+# #57ff8f, and the deep teal `--green-deep` #00695c. The site ships a light and a dark theme,
+# so the CLI mirrors that: each semantic color carries a (hex, xterm-256 fallback) for each
+# mode. On a dark terminal periwinkle accents and the bright green read well; on a light
+# terminal those wash out, so — exactly as the website does — green falls back to the deep
+# teal and the accents deepen. Truecolor terminals (and the docs gallery) get the exact hex;
+# everything else the nearest 256-color approximation.
+_PALETTE: dict[str, dict[str, tuple[str, int]]] = {
+    # role            dark (on navy)        light (on white)
+    "accent": {"dark": ("5f72ff", 63), "light": ("5f72ff", 63)},  # periwinkle — brand accent
+    "accent2": {"dark": ("97a3ff", 111), "light": ("3a46c8", 62)},  # keys, ids, links, snippets
+    "green": {"dark": ("57ff8f", 84), "light": ("00695c", 23)},  # success (deep teal on light)
+    "teal": {"dark": ("24c2a8", 43), "light": ("0e7490", 30)},  # amounts / numbers
+    "red": {"dark": ("ff6b6b", 203), "light": ("cc3b3b", 160)},  # destructive
+    "violet": {"dark": ("9a8cff", 105), "light": ("6d28d9", 92)},  # JSON literals
+    "gray": {"dark": ("8a93a8", 245), "light": ("5b6472", 242)},  # neutral
+    "faint": {"dark": ("4d5470", 240), "light": ("9aa1b5", 248)},  # rules, punctuation
+}
+# semantic handles used throughout the renderers (resolved per mode at paint time)
+_ACCENT, _ACCENT2, _GREEN, _TEAL, _RED, _VIOLET, _GRAY, _FAINT = (
+    "accent",
+    "accent2",
+    "green",
+    "teal",
+    "red",
+    "violet",
+    "gray",
+    "faint",
+)
 
 
 def _truecolor() -> bool:
@@ -171,19 +187,38 @@ def _truecolor() -> bool:
     return os.environ.get("COLORTERM", "").lower() in {"truecolor", "24bit"}
 
 
-def _sgr(part: str | tuple[str, int]) -> str:
-    """Resolve one style token to an SGR parameter: a raw code (``"1"``) passes through; a
-    ``(hex, fallback)`` color becomes a truecolor or 256-color foreground."""
-    if isinstance(part, tuple):
-        hex6, fallback = part
-        if _truecolor():
-            return f"38;2;{int(hex6[0:2], 16)};{int(hex6[2:4], 16)};{int(hex6[4:6], 16)}"
-        return f"38;5;{fallback}"
-    return part
+def _theme() -> str:
+    """Active theme: ``light`` or ``dark``. ``FLASH_THEME`` wins; otherwise a light terminal
+    background (via the de-facto ``COLORFGBG`` env) selects light. Defaults to ``dark`` (the
+    safe default for the colors, and unchanged behavior when nothing is set)."""
+    forced = os.environ.get("FLASH_THEME", "").strip().lower()
+    if forced in {"light", "dark"}:
+        return forced
+    fgbg = os.environ.get("COLORFGBG", "")
+    if fgbg:
+        try:
+            bg = int(fgbg.split(";")[-1])
+        except ValueError:
+            return "dark"
+        # ANSI bg 7 (light grey) and 11-15 (bright/white) mean a light terminal background
+        return "light" if bg == 7 or bg >= 11 else "dark"
+    return "dark"
 
 
-def _paint(text: str, *codes: str | tuple[str, int]) -> str:
-    """Apply one or more style tokens (raw SGR codes and/or brand colors), honoring the gate."""
+def _sgr(part: str) -> str:
+    """Resolve one style token to an SGR parameter: a brand color name resolves to a truecolor
+    or 256-color foreground for the active theme; any other code (e.g. ``"1"``) passes through."""
+    color = _PALETTE.get(part)
+    if color is None:
+        return part
+    hex6, fallback = color[_theme()]
+    if _truecolor():
+        return f"38;2;{int(hex6[0:2], 16)};{int(hex6[2:4], 16)};{int(hex6[4:6], 16)}"
+    return f"38;5;{fallback}"
+
+
+def _paint(text: str, *codes: str) -> str:
+    """Apply one or more style tokens (raw SGR codes and/or brand color names), honoring the gate."""
     if not codes or not _color():
         return text
     return f"\x1b[{';'.join(_sgr(c) for c in codes)}m{text}\x1b[0m"
