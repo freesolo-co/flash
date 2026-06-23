@@ -47,10 +47,46 @@ class FakeClient:
 
     def list_runs(self):
         return [
-            _run("flash-1718903000-e5f6a7b8", "running", 0.4210, "Qwen/Qwen3.5-9B", "sft", "vast", "L40S", 1718903000.0),
-            _run("flash-1718900000-a1b2c3d4", "done", 1.8421, "Qwen/Qwen3.5-4B", "grpo", "runpod", "RTX 5090", 1718900000.0),
-            _run("flash-1718800000-99887766", "failed", 0.0712, "Qwen/Qwen3.5-2B", "grpo", None, None, 1718800000.0),
-            _run("flash-1718700000-12ab34cd", "queued", 0.0, "openbmb/MiniCPM5-1B", "sft", None, None, 1718700000.0),
+            _run(
+                "flash-1718903000-e5f6a7b8",
+                "running",
+                0.4210,
+                "Qwen/Qwen3.5-9B",
+                "sft",
+                "vast",
+                "L40S",
+                1718903000.0,
+            ),
+            _run(
+                "flash-1718900000-a1b2c3d4",
+                "done",
+                1.8421,
+                "Qwen/Qwen3.5-4B",
+                "grpo",
+                "runpod",
+                "RTX 5090",
+                1718900000.0,
+            ),
+            _run(
+                "flash-1718800000-99887766",
+                "failed",
+                0.0712,
+                "Qwen/Qwen3.5-2B",
+                "grpo",
+                None,
+                None,
+                1718800000.0,
+            ),
+            _run(
+                "flash-1718700000-12ab34cd",
+                "queued",
+                0.0,
+                "openbmb/MiniCPM5-1B",
+                "sft",
+                None,
+                None,
+                1718700000.0,
+            ),
         ]
 
     def get_run(self, run_id):
@@ -123,6 +159,8 @@ def _set_style(styled: bool) -> None:
     os.environ["FLASH_STYLE"] = "1" if styled else "0"
     os.environ.pop("NO_COLOR", None)
     os.environ["COLUMNS"] = "76"
+    # advertise truecolor so the theme emits the exact brand hex (not the 256-color fallback)
+    os.environ["COLORTERM"] = "truecolor"
 
 
 def _capture_argv(argv, *, styled, cwd=None) -> str:
@@ -154,8 +192,22 @@ def _capture_text(styled_text: str, plain_text: str, *, styled: bool) -> str:
 def _xterm_hex(n: int) -> str:
     if n < 16:
         base = [
-            "000000", "800000", "008000", "808000", "000080", "800080", "008080", "c0c0c0",
-            "808080", "ff0000", "00ff00", "ffff00", "0000ff", "ff00ff", "00ffff", "ffffff",
+            "000000",
+            "800000",
+            "008000",
+            "808000",
+            "000080",
+            "800080",
+            "008080",
+            "c0c0c0",
+            "808080",
+            "ff0000",
+            "00ff00",
+            "ffff00",
+            "0000ff",
+            "ff00ff",
+            "00ffff",
+            "ffffff",
         ]
         return base[n]
     if n >= 232:
@@ -202,6 +254,10 @@ def ansi_to_html(text: str) -> str:
             elif c == "38" and i + 2 < len(codes) and codes[i + 1] == "5":
                 fg = _xterm_hex(int(codes[i + 2]))
                 i += 2
+            elif c == "38" and i + 4 < len(codes) and codes[i + 1] == "2":
+                r, g, b = (int(codes[i + 2]), int(codes[i + 3]), int(codes[i + 4]))
+                fg = f"{r:02x}{g:02x}{b:02x}"
+                i += 4
             i += 1
         if open_span:
             out.append("</span>")
@@ -250,8 +306,14 @@ def build_cases(tmp: Path):
     cases = []
 
     def add_argv(title, sub, argv, cwd=None):
-        cases.append((title, sub, _capture_argv(argv, styled=False, cwd=cwd),
-                      _capture_argv(argv, styled=True, cwd=cwd)))
+        cases.append(
+            (
+                title,
+                sub,
+                _capture_argv(argv, styled=False, cwd=cwd),
+                _capture_argv(argv, styled=True, cwd=cwd),
+            )
+        )
 
     def add_text(title, sub, styled_fn, plain_text):
         _set_style(False)
@@ -261,28 +323,54 @@ def build_cases(tmp: Path):
         cases.append((title, sub, plain, styled))
 
     add_argv("flash version", "package version", ["version"])
-    add_text("flash login", "verify + store your freesolo key",
-             lambda: render.login_ok(FAKE.me()), render.login_ok(FAKE.me()))
+    add_text(
+        "flash login",
+        "verify + store your freesolo key",
+        lambda: render.login_ok(FAKE.me()),
+        render.login_ok(FAKE.me()),
+    )
     add_argv("flash whoami", "identity behind the stored key", ["whoami"])
     add_argv("flash models", "supported base models", ["models"])
     add_argv("flash gpus", "managed GPU classes + $/hr", ["gpus"])
     add_argv("flash env setup", "scaffold a starter environment", ["env", "setup"], cwd=setup_dir)
     add_argv("flash env list", "installed + local environments", ["env", "list"], cwd=list_dir)
-    add_text("flash env install acme/math-grader", "record a published environment",
-             lambda: render.env_installed("acme/math-grader", "/Users/you/.flash/environments.json"),
-             install_plain)
-    add_text("flash env push --name math-grader .", "package + upload a local environment",
-             lambda: render.env_published("acme/math-grader"), push_plain)
-    add_argv("flash train --cost rl.toml", "pre-flight cost estimate", ["train", str(cost_cfg), "--cost"])
-    add_argv("flash train --dry-run sft.toml", "validate a config locally", ["train", str(dry_cfg), "--dry-run"])
+    add_text(
+        "flash env install acme/math-grader",
+        "record a published environment",
+        lambda: render.env_installed("acme/math-grader", "/Users/you/.flash/environments.json"),
+        install_plain,
+    )
+    add_text(
+        "flash env push --name math-grader .",
+        "package + upload a local environment",
+        lambda: render.env_published("acme/math-grader"),
+        push_plain,
+    )
+    add_argv(
+        "flash train --cost rl.toml", "pre-flight cost estimate", ["train", str(cost_cfg), "--cost"]
+    )
+    add_argv(
+        "flash train --dry-run sft.toml",
+        "validate a config locally",
+        ["train", str(dry_cfg), "--dry-run"],
+    )
     add_argv("flash status <run>", "a run's full status", ["status", "flash-1718900000-a1b2c3d4"])
     add_argv("flash runs", "all runs and their state/cost", ["runs"])
     add_argv("flash cancel <run>", "cancel a run", ["cancel", "flash-1718903000-e5f6a7b8"])
-    add_argv("flash deploy <run>", "serve a trained adapter", ["deploy", "flash-1718900000-a1b2c3d4"])
-    add_argv("flash undeploy <run>", "tear down a serving endpoint", ["undeploy", "flash-1718900000-a1b2c3d4"])
+    add_argv(
+        "flash deploy <run>", "serve a trained adapter", ["deploy", "flash-1718900000-a1b2c3d4"]
+    )
+    add_argv(
+        "flash undeploy <run>",
+        "tear down a serving endpoint",
+        ["undeploy", "flash-1718900000-a1b2c3d4"],
+    )
     add_argv("flash deployments", "active serving deployments", ["deployments"])
-    add_argv("flash chat <run> -m ...", "chat with a deployed adapter",
-             ["chat", "flash-1718900000-a1b2c3d4", "-m", "What is the capital of France?"])
+    add_argv(
+        "flash chat <run> -m ...",
+        "chat with a deployed adapter",
+        ["chat", "flash-1718900000-a1b2c3d4", "-m", "What is the capital of France?"],
+    )
     return cases
 
 
@@ -291,9 +379,9 @@ HEAD = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Flash CLI - output style</title>
 <style>
-:root{--bg:#0b0e14;--ink:#c8d3e0;--mut:#7a8699;--line:#1c2330;--accent:#00afff;--accent2:#5fd7d7;--green:#5fd787}
+:root{--navy:#1b1b4b;--bg:#0a0a16;--ink:#cdd2e6;--mut:#8a93a8;--line:#23244a;--accent:#5f72ff;--accent2:#97a3ff;--green:#57ff8f}
 *{box-sizing:border-box}
-body{margin:0;background:radial-gradient(1200px 600px at 50% -10%,#10213a33,transparent),var(--bg);
+body{margin:0;background:radial-gradient(1200px 600px at 50% -10%,#5f72ff22,transparent),var(--bg);
   color:var(--ink);font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Inter,sans-serif}
 .wrap{max-width:1120px;margin:0 auto;padding:56px 24px 80px}
 .brand{display:inline-flex;align-items:center;gap:10px;font-weight:700}
@@ -312,14 +400,14 @@ h1{font-size:30px;margin:18px 0 8px;letter-spacing:-.4px}
 .cols{display:grid;grid-template-columns:1fr 1fr}
 .col+.col{border-left:1px solid var(--line)}
 .col .tag{display:flex;align-items:center;gap:8px;padding:9px 16px;color:var(--mut);font-size:11px;
-  letter-spacing:.14em;text-transform:uppercase;border-bottom:1px solid var(--line);background:#0c0f17}
+  letter-spacing:.14em;text-transform:uppercase;border-bottom:1px solid var(--line);background:#0d0d22}
 .col .tag .pill{width:7px;height:7px;border-radius:50%}
-.before .pill{background:#3b4252}
-.after .pill{background:var(--green);box-shadow:0 0 10px #5fd78788}
+.before .pill{background:#3a3c63}
+.after .pill{background:var(--green);box-shadow:0 0 10px #57ff8f88}
 pre{margin:0;padding:18px;overflow-x:auto;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,"Cascadia Code",monospace;
-  color:#aeb9c7;background:#0c0f17}
-.after pre{background:#0a0d14}
-.before pre{color:#8b93a3}
+  color:#aeb6cf;background:#0d0d22}
+.after pre{background:#09091a}
+.before pre{color:#868eaa}
 @media(max-width:760px){.cols{grid-template-columns:1fr}.col+.col{border-left:0;border-top:1px solid var(--line)}}
 footer{color:var(--mut);font-size:13px;margin-top:48px;border-top:1px solid var(--line);padding-top:20px}
 footer code{color:var(--accent2)}
@@ -327,17 +415,18 @@ footer code{color:var(--accent2)}
 <header>
   <div class="brand"><span class="dot"></span><span><b>flash</b> cli</span></div>
   <h1>A standardized output theme for every command</h1>
-  <p class="lede">One visual language across the whole CLI: a brand header, colored status badges,
-  aligned tables, key/value panels, and syntax-highlighted JSON. The themed view renders on an
-  interactive terminal; piped or scripted output stays byte-for-byte plain, so <code>jq</code>,
-  scripts, and the agent contract are untouched.</p>
+  <p class="lede">One visual language across the whole CLI, in the Freesolo website palette
+  (navy <code>#1b1b4b</code>, periwinkle <code>#5f72ff</code>, green <code>#57ff8f</code>): a brand
+  header, colored status badges, aligned tables, key/value panels, and syntax-highlighted JSON. The
+  themed view renders on an interactive terminal; piped or scripted output stays byte-for-byte
+  plain, so <code>jq</code>, scripts, and the agent contract are untouched.</p>
   <div class="legend">
-    <span><i class="sw" style="background:#00afff"></i>accent / links</span>
-    <span><i class="sw" style="background:#5fd787"></i>success / done</span>
-    <span><i class="sw" style="background:#ffaf00"></i>cost / numbers</span>
-    <span><i class="sw" style="background:#af87ff"></i>literals</span>
-    <span><i class="sw" style="background:#ff5f5f"></i>failure</span>
-    <span><i class="sw" style="background:#585858"></i>structure</span>
+    <span><i class="sw" style="background:#5f72ff"></i>periwinkle &mdash; accent / links</span>
+    <span><i class="sw" style="background:#57ff8f"></i>green &mdash; success / done</span>
+    <span><i class="sw" style="background:#24c2a8"></i>teal &mdash; amounts</span>
+    <span><i class="sw" style="background:#9a8cff"></i>indigo &mdash; literals</span>
+    <span><i class="sw" style="background:#ff6b6b"></i>red &mdash; failure</span>
+    <span><i class="sw" style="background:#4d5470"></i>structure</span>
   </div>
 </header>
 """

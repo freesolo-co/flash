@@ -112,7 +112,7 @@ def format_identity(me: dict) -> str:
 
 
 def login_ok(me: dict | None) -> str:
-    head = f"{_style('32', _glyph('✓', 'ok:'))} {_bold('logged in to flash')}"
+    head = f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {_bold('logged in to flash')}"
     if not me:
         # The key is verified and stored; we just couldn't fetch the account card right now.
         return _safe(
@@ -127,7 +127,7 @@ def whoami(me: dict) -> str:
 
 def login_failed(reason: str) -> str:
     return _safe(
-        f"{_style('31', _glyph('✗', 'x:'))} {_bold('login failed')}\n"
+        f"{_paint(_glyph('✗', 'x:'), _RED, '1')} {_bold('login failed')}\n"
         f"  {reason}\n"
         f"  {_dim('then run `flash login --api-key <key>` to try again')}\n"
         f"  {_dim('if it keeps failing, email founders@freesolo.co')}"
@@ -143,26 +143,49 @@ def login_failed(reason: str) -> str:
 # 256-color SGR keeps the palette readable on essentially every modern terminal.
 # ---------------------------------------------------------------------------
 
-# palette (256-color)
-_ACCENT = "38;5;39"  # electric blue — the brand accent
-_ACCENT2 = "38;5;80"  # cyan — secondary structure, keys, snippets
-_GREEN = "38;5;78"
-_AMBER = "38;5;214"
-_RED = "38;5;203"
-_VIOLET = "38;5;141"
-_GRAY = "38;5;245"
-_FAINT = "38;5;240"
+# The Freesolo brand palette, pulled from the website (frontend/app/globals.css): navy
+# `--special` #1b1b4b, periwinkle `--periwinkle` #5f72ff (the accent/ring), green `--green`
+# #57ff8f, and the deep teal `--green-deep` #00695c. Each entry is (hex, xterm-256 fallback):
+# truecolor terminals (and the docs gallery) get the exact brand hex, everything else the
+# nearest 256-color approximation. Periwinkle is the accent; green is success; a brightened
+# teal carries amounts; a soft indigo (between navy and periwinkle) marks JSON literals.
+_ACCENT = ("5f72ff", 63)  # periwinkle — brand accent
+_ACCENT2 = ("97a3ff", 111)  # light periwinkle — keys, ids, links, snippets
+_GREEN = ("57ff8f", 84)  # brand green — success
+_TEAL = ("24c2a8", 43)  # brightened green-deep — amounts / numbers
+_RED = ("ff6b6b", 203)  # destructive
+_VIOLET = ("9a8cff", 105)  # navy→periwinkle indigo — JSON literals
+_GRAY = ("8a93a8", 245)  # cool neutral
+_FAINT = ("4d5470", 240)  # muted indigo-grey — rules, punctuation
 
 
-def _paint(text: str, *codes: str) -> str:
-    """Apply one or more SGR codes (combined), honoring the color gate."""
-    return _style(";".join(codes), text)
+def _truecolor() -> bool:
+    """Whether the terminal advertises 24-bit color (so we can emit exact brand hex)."""
+    return os.environ.get("COLORTERM", "").lower() in {"truecolor", "24bit"}
+
+
+def _sgr(part: str | tuple[str, int]) -> str:
+    """Resolve one style token to an SGR parameter: a raw code (``"1"``) passes through; a
+    ``(hex, fallback)`` color becomes a truecolor or 256-color foreground."""
+    if isinstance(part, tuple):
+        hex6, fallback = part
+        if _truecolor():
+            return f"38;2;{int(hex6[0:2], 16)};{int(hex6[2:4], 16)};{int(hex6[4:6], 16)}"
+        return f"38;5;{fallback}"
+    return part
+
+
+def _paint(text: str, *codes: str | tuple[str, int]) -> str:
+    """Apply one or more style tokens (raw SGR codes and/or brand colors), honoring the gate."""
+    if not codes or not _color():
+        return text
+    return f"\x1b[{';'.join(_sgr(c) for c in codes)}m{text}\x1b[0m"
 
 
 # state -> (color, unicode dot, ascii dot) for status badges
 _STATE_STYLE: dict[str, tuple[str, str, str]] = {
     "queued": (_GRAY, "○", "o"),
-    "provisioning": (_AMBER, "◐", "o"),
+    "provisioning": (_TEAL, "◐", "o"),
     "running": (_ACCENT, "●", "*"),
     "done": (_GREEN, "●", "*"),
     "deployed": (_VIOLET, "●", "*"),
@@ -206,17 +229,13 @@ def ok(msg: str) -> str:
     return _safe(f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {msg}")
 
 
-def warn(msg: str) -> str:
-    return _safe(f"{_paint(_glyph('▲', '!'), _AMBER, '1')} {msg}")
-
-
 def arrow(msg: str) -> str:
     """A de-emphasized pointer / next-step line."""
     return _safe(f"{_paint(_glyph('→', '->'), _ACCENT2)} {_dim(msg)}")
 
 
 def money(value: float, decimals: int = 4) -> str:
-    return _paint(f"${value:.{decimals}f}", _AMBER)
+    return _paint(f"${value:.{decimals}f}", _TEAL)
 
 
 def _kv(pairs: list[tuple[str, str]], indent: int = 2) -> str:
@@ -297,7 +316,7 @@ def _color_json(obj, depth: int) -> str:
     if isinstance(obj, bool):
         return _paint("true" if obj else "false", _VIOLET)
     if isinstance(obj, (int, float)):
-        return _paint(json.dumps(obj), _AMBER)
+        return _paint(json.dumps(obj), _TEAL)
     return _paint(json.dumps(obj), _GREEN)
 
 
@@ -313,39 +332,17 @@ def version(value: str) -> str:
 
 
 def models_table(rows: list[dict]) -> str:
-    """Supported base models as an aligned table."""
-
-    def dimension(params: str) -> str:
-        return params.split(" (", 1)[0]
-
-    body = []
-    for r in rows:
-        algos = ", ".join(r.get("algos") or [])
-        thinking = r.get("thinking") or "none"
-        vram = f"{r.get('min_vram_gb', 0)} GB" if r.get("min_vram_gb") else "-"
-        body.append(
-            [
-                (r["id"], _ACCENT2),
-                dimension(r.get("params", "")),
-                (algos, _GRAY),
-                (vram, _GRAY),
-                (thinking, _VIOLET) if thinking != "none" else (thinking, _FAINT),
-            ]
-        )
-    table = _table(
-        ["MODEL", "PARAMS", "ALGOS", "MIN VRAM", "THINKING"],
-        body,
-        aligns=["l", "l", "l", "r", "l"],
-    )
+    """Supported base models — a clean themed list of ids (the CLI lists ids only)."""
+    ids = "\n".join(f"  {_paint('•', _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
     foot = arrow("train one with: flash train configs/rl.toml")
-    return f"{header('models', 'supported base models')}\n{table}\n\n{foot}"
+    return f"{header('models', 'supported base models')}\n{ids}\n\n{foot}"
 
 
 def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     """GPU classes: (name, vram_gb, $/hr or None)."""
     body = []
     for name, vram, rate in rows:
-        rate_cell = (f"${rate:.2f}", _AMBER) if rate else ("-", _FAINT)
+        rate_cell = (f"${rate:.2f}", _TEAL) if rate else ("-", _FAINT)
         body.append([(name, _ACCENT2), (f"{vram} GB", _GRAY), rate_cell])
     table = _table(["GPU", "VRAM", "$/HR"], body, aligns=["l", "r", "r"])
     return f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}"
@@ -370,7 +367,7 @@ def runs_table(runs: list[dict]) -> str:
                 (r["run_id"], _ACCENT2),
                 (f"{_glyph(uni, ascii_dot)} {r.get('state', '')}", color),
                 (algorithm, _GRAY),
-                (f"${r.get('cost_usd', 0.0):.4f}", _AMBER),
+                (f"${r.get('cost_usd', 0.0):.4f}", _TEAL),
                 (where, _GRAY),
                 model,
             ]
@@ -477,12 +474,12 @@ def cost_panel(est) -> str:
         (
             "train",
             f"{est.train_seconds / 60:.1f} min"
-            + (_paint("  [capped at wall-clock limit]", _AMBER) if est.wall_capped else ""),
+            + (_paint("  [capped at wall-clock limit]", _RED) if est.wall_capped else ""),
         ),
         ("wall clock", f"{est.wall_clock_hours:.2f} h"),
     ]
     panel = _kv(pairs)
-    total = f"  {_paint('TOTAL'.ljust(10), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} {_paint(f'${est.total_usd:.2f}', _AMBER, '1')}"
+    total = f"  {_paint('TOTAL'.ljust(10), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} {_paint(f'${est.total_usd:.2f}', _TEAL, '1')}"
     out = f"{header('train', 'pre-flight cost estimate')}\n{panel}\n{_rule()}\n{total}"
     if est.notes:
         notes = "\n".join(f"  {_paint(_glyph('·', '-'), _FAINT)} {_dim(n)}" for n in est.notes)
