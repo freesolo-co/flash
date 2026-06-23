@@ -302,5 +302,8 @@ def cmd_env_push(args) -> int:
         # packaging (walk + gzip, slow for large datasets) and the upload itself.
         bar = _UploadProgress(env_name)
         bar.status("packaging environment")
-        package_b64 = _tar_b64(pkg)
-        return _upload_and_report(env_name, package_b64=package_b64, bar=bar)
+        try:
+            package_b64 = _tar_b64(pkg)
+            return _upload_and_report(env_name, package_b64=package_b64, bar=bar)
+        finally:
+            bar.clear()
