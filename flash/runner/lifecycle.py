@@ -426,11 +426,21 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
     internal_key = os.environ.get(INTERNAL_KEY_ENV, "").strip()
     if not internal_key:
         detail = f"{INTERNAL_KEY_ENV} is not configured; completed run was not billed"
-        _update(spec.run_id, "done", billing_state="failed", billing_error=detail)
+        _update(
+            spec.run_id,
+            get_status(spec.run_id).state,
+            billing_state="failed",
+            billing_error=detail,
+        )
         print(f"billing failed: {detail}", file=log, flush=True)
         return
 
-    _update(spec.run_id, "done", billing_state="charging", billing_error=None)
+    _update(
+        spec.run_id,
+        get_status(spec.run_id).state,
+        billing_state="charging",
+        billing_error=None,
+    )
     status = get_status(spec.run_id)
     try:
         charge = charge_completed_run(internal_key=internal_key, status=status)
