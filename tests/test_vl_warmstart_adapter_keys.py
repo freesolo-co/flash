@@ -264,6 +264,17 @@ def test_assert_adapter_load_clean_raises_on_unexpected_only():
         assert_adapter_load_clean(lr, "Qwen/Qwen3.5-4B")
 
 
+def test_assert_adapter_load_clean_ignores_benign_base_misses():
+    # An adapter-only checkpoint loaded with strict=False can report base-model params (no 'lora_'
+    # prefix) as missing even when every LoRA weight matched. Those must NOT abort a correct
+    # warm-start -- only LoRA-key mismatches are fatal.
+    base_misses = [
+        "base_model.model.model.layers.0.self_attn.q_proj.weight",
+        "base_model.model.model.embed_tokens.weight",
+    ]
+    assert assert_adapter_load_clean(_LoadResult(base_misses, []), "Qwen/Qwen3.5-4B") is None
+
+
 # ---------------------------------------------------------------------------
 # Non-zero-delta backstop: a silently-discarded adapter keeps zero-init lora_B, so its delta is
 # identically zero. This is API-independent (no peft load_result needed). Needs real tensors for the
