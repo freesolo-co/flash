@@ -181,7 +181,6 @@ def _bootstrap_with_extra_pip(monkeypatch):
             "seed": 0,
             "env": {"GITHUB_TOKEN": "ghp-test"},
             "extra_pip": ["freesolo"],
-            "hub_env_ids": [],
             "hf_prefix": "sft/x/seed0",
             "max_wall_s": 60,
             "attempt": 0,
@@ -593,9 +592,7 @@ def test_run_label_prefix_matches_instance_label():
     assert instance_label("fail-fast", 0, 0).startswith(run_label_prefix("fail-fast"))
     # an already-prefixed run id is idempotent
     assert run_label_prefix("flash-1700-abcd") == "flash-1700-abcd"
-    assert instance_label("flash-1700-abcd", 1, 2).startswith(
-        run_label_prefix("flash-1700-abcd")
-    )
+    assert instance_label("flash-1700-abcd", 1, 2).startswith(run_label_prefix("flash-1700-abcd"))
 
 
 def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):

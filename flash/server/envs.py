@@ -1,9 +1,8 @@
 """Managed Freesolo environment publishing.
 
 ``POST /v1/envs`` accepts a packaged Freesolo environment and uploads it to the
-managed ``freesolo-co/environment-hub`` GitHub repository. The returned id is a
-GitHub-backed environment ref that the worker resolves through
-``freesolo.environments``.
+managed environment hub. The returned id is a Freesolo environment slug
+(``namespace/name``) that Flash resolves internally.
 """
 
 from __future__ import annotations
@@ -25,7 +24,12 @@ _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_MEMBERS = 5000
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
-_DEFAULT_ENVIRONMENT_FILE = "freesolo/environment.py"
+_DEFAULT_ENVIRONMENT_FILE = "environment.py"
+_BLOCKED_TOP_LEVEL_PATHS = {
+    ".github",
+    ".git",
+    "source",
+}
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
@@ -42,13 +46,9 @@ class EnvPublishError(Exception):
 
 def namespace_for(key: dict) -> str:
     email = str(key.get("email") or "")
-    if "@" in email:
-        raw = email
-    elif key.get("id") is not None:
-        raw = f"key-{key['id']}"
-    else:
-        raw = str(key.get("key_prefix") or "user")
-    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    if "@" not in email:
+        raise EnvPublishError("authenticated Freesolo key must include an email")
+    slug = re.sub(r"[^a-z0-9]+", "-", email.lower()).strip("-")
     return slug or "user"
 
 
@@ -82,9 +82,9 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                 target = (dest / normalized_name).resolve()
                 if target != root and root not in target.parents:
                     raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
-                if segments[0] in {".github", ".git"}:
+                if segments[0] in _BLOCKED_TOP_LEVEL_PATHS:
                     raise EnvPublishError(
-                        "env packages must not contain .github or .git top-level paths"
+                        "env packages must not contain repo-control or source top-level paths"
                     )
                 if member.islnk() or member.issym():
                     raise EnvPublishError(f"links are not allowed in env packages: {member.name!r}")
@@ -272,12 +272,7 @@ def _environment_file_relative_path(root: Path) -> str:
     canonical = root / _DEFAULT_ENVIRONMENT_FILE
     if canonical.is_file():
         return _DEFAULT_ENVIRONMENT_FILE
-    matches = sorted(path for path in root.rglob("environment.py") if path.is_file())
-    if matches:
-        return matches[0].relative_to(root).as_posix()
-    raise EnvPublishError(
-        "env package must contain freesolo/environment.py or another environment.py entrypoint"
-    )
+    raise EnvPublishError("env package must contain environment.py")
 
 
 def _github_publish(dest: Path, *, name: str, key: dict) -> str:
@@ -290,10 +285,9 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     repo = _github_repo()
     ns = namespace_for(key)
     clean = _sanitize_name(name)
-    publish_root = f"environments/{ns}/{clean}"
-    env_rel = _environment_file_relative_path(dest)
-    files = sorted(path for path in dest.rglob("*") if path.is_file())
-    if not files:
+    publish_root = f"{ns}/{clean}"
+    _environment_file_relative_path(dest)
+    if not any(path.is_file() for path in dest.rglob("*")):
         raise EnvPublishError("env package contains no files")
     message = f"Upload Flash environment {ns}/{clean}"
 
@@ -310,7 +304,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
                 publish_root=publish_root,
                 message=message,
             )
-            return f"github:{repo}@{_GITHUB_BRANCH}:{publish_root}/{env_rel}"
+            return f"{ns}/{clean}"
         except EnvPublishError as exc:
             last_error = exc
             if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
@@ -319,7 +313,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     raise last_error
 
 
-def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> str:
+def publish_package(*, package_b64: str, name: str, key: dict) -> str:
     if not isinstance(name, str):
         raise EnvPublishError("env name must be a string")
     if not isinstance(package_b64, str):

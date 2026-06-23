@@ -82,10 +82,13 @@ _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
 Edit the dataset and reward code, then upload with
-`flash env push environments/freesolo/environment.py`.
+`flash env push --name my-env .`.
 
 A managed run should use the returned [environment] id from
-`flash env push`.
+`flash env push --name my-env .`.
+
+Keep real SFT/RL datasets in Freesolo or Hugging Face dataset storage. This
+inline dataset is only a smoke-test fixture.
 """
 
 from __future__ import annotations
@@ -95,9 +98,15 @@ from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 
 DATASET = [
-    {"task": "What is 2 + 2?", "expected_output": "4"},
-    {"task": "What is 3 + 5?", "expected_output": "8"},
+    {"input": "What is 2 + 2?", "output": "4"},
+    {"input": "What is 3 + 5?", "output": "8"},
 ]
+
+
+def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult:
+    expected = str(example.expected_output or "").strip()
+    score = 1.0 if expected and expected in response_text else 0.0
+    return RewardResult(score=score, threshold=1.0)
 
 
 class StarterEnv(EnvironmentSingleTurn):
@@ -107,43 +116,34 @@ class StarterEnv(EnvironmentSingleTurn):
         return [{"role": "user", "content": example.task}]
 
     def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
-        expected = str(example.expected_output or "").strip()
-        score = 1.0 if expected and expected in response_text else 0.0
-        return RewardResult(score=score, threshold=1.0)
+        return exact_match_reward(example, response_text)
 
 
-def load_environment(
-    contract_path: str | None = None,
-    dataset_path: str | None = None,
-    reward_command: str | None = None,
-    mode: str = "eval",
-    **_: object,
-) -> StarterEnv:
+def load_environment(**kwargs) -> StarterEnv:
     return StarterEnv()
 '''
 
 
 def cmd_env_setup(args) -> int:
-    Path("environments").mkdir(exist_ok=True)
     Path("configs").mkdir(exist_ok=True)
     Path("configs/endpoints.toml").write_text(
         "# OpenAI-compatible endpoints returned by `flash deploy` can be stored here.\n"
     )
-    starter_env_dir = Path("environments/freesolo")
-    starter_env_dir.mkdir(exist_ok=True, parents=True)
-    Path(starter_env_dir / "__init__.py").write_text("", encoding="utf-8")
-    starter_env = Path(starter_env_dir / "environment.py")
+    starter_env = Path("environment.py")
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
-    sample = Path("configs/freesolo_grpo.toml")
-    if not sample.exists():
-        sample.write_text(
+    env_comment = (
+        "# Environment: upload this project folder with\n"
+        "# `flash env push --name my-env .`, then paste the returned id below.\n"
+        "[environment]\n"
+        'id = ""\n\n'
+    )
+    grpo = Path("configs/grpo.toml")
+    if not grpo.exists():
+        grpo.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
-            "# Environment: upload the scaffolded environments/freesolo/environment.py with\n"
-            "# `flash env push environments/freesolo/environment.py`, then paste the returned id below.\n"
-            "[environment]\n"
-            'id = ""\n\n'
+            f"{env_comment}"
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
@@ -151,9 +151,22 @@ def cmd_env_setup(args) -> int:
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
+    sft = Path("configs/sft.toml")
+    if not sft.exists():
+        sft.write_text(
+            'model = "Qwen/Qwen3.5-4B"\n'
+            'algorithm = "sft"\n\n'
+            f"{env_comment}"
+            "[train]\n"
+            "epochs = 1\n"
+            "lora_rank = 32\n"
+            "seeds = [0]\n"
+            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
+        )
     print(
-        "created environments/freesolo/environment.py, configs/, "
-        "configs/freesolo_grpo.toml, configs/endpoints.toml"
+        "ensured environment.py, configs/, "
+        "configs/grpo.toml, configs/sft.toml, configs/endpoints.toml"
     )
     return 0
 
@@ -204,44 +217,6 @@ def cmd_gpus(args) -> int:
     return 0
 
 
-def cmd_env_init(args) -> int:
-    mod = args.name.replace("-", "_")
-    root = Path("environments") / mod
-    root.mkdir(parents=True, exist_ok=True)
-    # Scaffold a real Freesolo SDK environment whose load_environment returns an
-    # EnvironmentSingleTurn.
-    (root / f"{mod}.py").write_text(
-        f'"""Custom Freesolo environment ({args.name}).\n\n'
-        "Replace the dataset and reward with your task, then upload it\n"
-        f"with `flash env push environments/{mod}/{mod}.py` and reference the returned id\n"
-        "in your config.\n"
-        '"""\n\n'
-        "from freesolo.datasets.types import TaskExample\n"
-        "from freesolo.environments import EnvironmentSingleTurn, RewardResult\n\n\n"
-        "DATASET = [\n"
-        '    {"task": "What is 2 + 2?", "expected_output": "4"},\n'
-        '    {"task": "What is 3 + 5?", "expected_output": "8"},\n'
-        "]\n\n\n"
-        "class CustomEnv(EnvironmentSingleTurn):\n"
-        "    dataset = DATASET\n\n"
-        "    def build_prompt_messages(self, example: TaskExample, prompt_text: str):\n"
-        '        return [{"role": "user", "content": example.task}]\n\n'
-        "    def score_response(self, example: TaskExample, response_text: str) -> RewardResult:\n"
-        '        expected = str(example.expected_output or "").strip()\n'
-        "        score = 1.0 if expected and expected in response_text else 0.0\n"
-        "        return RewardResult(score=score, threshold=1.0)\n\n\n"
-        "def load_environment(**kwargs) -> CustomEnv:\n"
-        "    return CustomEnv()\n"
-    )
-    (root / "README.md").write_text(f"# {args.name}\n\nCustom Freesolo environment for Flash.\n")
-    print(f"created {root}")
-    print(
-        f"upload it with `flash env push environments/{mod}/{mod}.py`, then reference "
-        "the returned id in your config."
-    )
-    return 0
-
-
 def cmd_env_list(args) -> int:
     from flash.envs.registry import list_installed_environments
 
@@ -250,30 +225,27 @@ def cmd_env_list(args) -> int:
         print("installed environments:")
         for env_id in installed:
             print(f"  {env_id}")
+    paths: list[str] = []
+    if Path("environment.py").is_file():
+        paths.append(".")
     local = Path("environments")
     if local.is_dir():
-        # Both directory envs (environments/<name>/...) and single-file modules
-        # (environments/<name>.py). These are local env SOURCES — publish one with
-        # `flash env push <path>` to run it on the managed service by its
-        # environment id.
-        paths: list[str] = []
+        # Prefer publishing folders. Single-file modules remain supported for small smoke tests.
         for p in local.iterdir():
             if p.name.startswith("__"):
                 continue
             if p.is_dir():
                 stem = p.name.replace("-", "_")
                 module = p / f"{stem}.py"
-                canonical = p / "freesolo" / "environment.py"
-                if canonical.is_file():
-                    paths.append(f"environments/{p.name}/freesolo/environment.py")
-                elif module.is_file():
-                    paths.append(f"environments/{p.name}/{stem}.py")
+                canonical = p / "environment.py"
+                if canonical.is_file() or module.is_file():
+                    paths.append(f"environments/{p.name}")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
-        if paths:
-            print("local env sources (publish with `flash env push <path>`):")
-            for path in sorted(paths):
-                print(f"  {path}")
+    if paths:
+        print("local env sources (publish with `flash env push --name <name> <path>`):")
+        for path in sorted(paths):
+            print(f"  {path}")
     return 0
 
 
@@ -422,18 +394,14 @@ def cmd_logs(args) -> int:
 def cmd_deploy(args) -> int:
     dep = client_from_config().deploy(
         args.run_id,
-        mode=args.mode,
-        idle_timeout_s=args.idle_timeout,
         dry_run=args.dry_run,
     )
     print(json.dumps(dep, indent=2))
-    if dep.get("mode") == "always-on":
-        print(
-            f"note: always-on keeps a {dep.get('gpu')} warm 24/7 "
-            f"(~${dep.get('est_idle_cost_usd_per_day')}/day). Use `flash undeploy {args.run_id}` "
-            "to stop billing.",
-            file=sys.stderr,
-        )
+    print(
+        "note: serving is billed per token only; use "
+        f"`flash undeploy {args.run_id}` to deregister the adapter.",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -447,13 +415,10 @@ def cmd_deployments(args) -> int:
     if not rows:
         print("no active deployments")
         return 0
-    print(f"{'RUN_ID':<32}  {'MODE':<10}  {'GPU':<9}  {'$/DAY':>7}  ENDPOINT")
+    print(f"{'RUN_ID':<32}  {'GPU':<9}  ENDPOINT")
     for r in rows:
         d = r.get("deployment") or {}
-        print(
-            f"{r['run_id']:<32}  {d.get('mode', '?'):<10}  {d.get('gpu', '?'):<9}  "
-            f"{d.get('est_idle_cost_usd_per_day', 0):>7}  {d.get('endpoint_name', '')}"
-        )
+        print(f"{r['run_id']:<32}  {d.get('gpu', '?'):<9}  {d.get('endpoint_name', '')}")
     return 0
 
 
