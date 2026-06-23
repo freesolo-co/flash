@@ -1,23 +1,22 @@
-"""Cross-provider GPU allocation: the cheapest class that comfortably fits the run.
+"""Cross-provider GPU allocation: the cheapest static-priced class that fits the run.
 
 Given a base model (+ algorithm), compute the VRAM the FULL run needs — sized for the
 heavier phase, GRPO, since the typical pipeline is SFT followed by GRPO — then rank
-every provisionable candidate across ALL registered providers by live $/hr and pick the
+every provisionable candidate across ALL registered providers by static $/hr and pick the
 cheapest:
 
-  runpod  every Flash-provisionable class (live pricing, cached; static fallback)
-  vast    live verified-datacenter offers (usable_offers' quality floors applied)
+  runpod  every Flash-provisionable class
+  vast    verified-datacenter offers for provisioning, priced by the static class table
 
-Allocation happens at SUBMIT time in the runner (offers are a volatile market);
+Allocation happens at SUBMIT time in the runner (Vast offers are a volatile market);
 the parse-time resolution in schema is a RunPod-static provisional for
-validation/dry-run display. With no live pricing/offers reachable (no network, or no
-``VAST_API_KEY``) the allocator degrades to exactly ``cheapest_gpu``'s deterministic
-static-rate answer (RunPod only — Vast is off without its key).
+validation/dry-run display. With no ``VAST_API_KEY`` the allocator degrades to exactly
+``cheapest_gpu``'s deterministic static-rate answer (RunPod only).
 
 Provider-agnostic by construction: it walks the registered providers and asks each for
 its ``gpu_classes()`` + ``hourly_rate()``; the only provider-specific knowledge is that
-Vast classes come from a live offer book (collected through the provider's
-``usable_offers`` and carried opaquely on ``Candidate.offer``).
+Vast classes come from an offer book (collected through the provider's ``usable_offers``
+and carried opaquely on ``Candidate.offer``).
 """
 
 from __future__ import annotations
@@ -71,7 +70,7 @@ def required_vram_gb(
 
 
 def _runpod_candidates(need: int) -> list[Candidate]:
-    """RunPod's fitting, live-validated classes priced live (static fallback).
+    """RunPod's fitting, validated classes priced by the static table.
 
     Restricted to the validated pool (``g.validated``): the deployed control plane rejects a submit
     for any non-validated class, so allocating one would only fail at submit time.
@@ -87,7 +86,7 @@ def _runpod_candidates(need: int) -> list[Candidate]:
 def _vast_candidates(
     need: int, disk_gb: int, exclude_machine_ids
 ) -> tuple[list[Candidate], tuple]:
-    """Vast's fitting, live-validated classes from the live offer book (cheapest per class).
+    """Vast's fitting, validated classes from the offer book (cheapest offer per class).
 
     Returns (candidates, full_offer_book). Restricted to the validated pool (``GPU_INFO[gpu]
     .validated``) — the deployed control plane rejects a submit for any non-validated class. A Vast
@@ -99,6 +98,7 @@ def _vast_candidates(
     from flash.providers.base import GPU_INFO
     from flash.providers.vast.jobs import MIN_DISK_GB, usable_offers
 
+    provider = get_provider("vast")
     book: list = []
     try:
         # The offer search must use the SAME disk floor instances are actually provisioned with
@@ -113,10 +113,12 @@ def _vast_candidates(
     for o in book:
         if o.gpu in seen:  # offers are price-sorted; keep the cheapest per class
             continue
-        if not GPU_INFO[o.gpu].validated:  # only offer live-validated classes the server accepts
+        if not GPU_INFO[o.gpu].validated:  # only offer validated classes the server accepts
             continue
         seen.add(o.gpu)
-        out.append(Candidate("vast", o.gpu, o.dph_total, GPU_INFO[o.gpu].vram_gb, offer=o))
+        out.append(
+            Candidate("vast", o.gpu, provider.hourly_rate(o.gpu), GPU_INFO[o.gpu].vram_gb, offer=o)
+        )
     return out, tuple(book)
 
 
@@ -130,13 +132,13 @@ def allocate(
     thinking: bool = False,
     provider: str | None = None,
 ) -> Allocation:
-    """Pick the cheapest (provider, GPU class) able to run the job across the live providers.
+    """Pick the cheapest (provider, GPU class) able to run the job across available providers.
 
-    By default there is no GPU pin and no provider pin — every fitting, LIVE-VALIDATED class on
-    every live provider is eligible, and the cheapest wins. An OPT-IN ``provider`` pin ("vast" /
+    By default there is no GPU pin and no provider pin — every fitting, validated class on
+    every available provider is eligible, and the cheapest wins. An OPT-IN ``provider`` pin ("vast" /
     "runpod") restricts the candidate pool to that single substrate (for A/B-ing one provider
     against the full pool); ``None`` keeps the cross-provider cheapest-wins behavior. A pin to a
-    provider that isn't live/configured raises ``UnsupportedGpuError``.
+    provider that isn't available/configured raises ``UnsupportedGpuError``.
 
     Allocation is restricted to the validated pool
     (``GpuClass.validated``) because the deployed control plane rejects a submit for any
@@ -145,30 +147,30 @@ def allocate(
     requirement to the run's actual knobs (context, group, rank, batch) via the matrix.
     """
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
-    live = available_providers()
+    available = available_providers()
     if provider is not None:
         # OPT-IN provider pin: restrict the candidate pool to the one named substrate. A pin to a
-        # provider that isn't live/configured (e.g. "vast" without VAST_API_KEY) is a clear config
-        # error, not a silent fall-through to the other provider — A/B "vast-only" must NOT quietly
-        # run on RunPod.
-        live = tuple(p for p in live if p == provider)
-        if not live:
+        # provider that isn't available/configured (e.g. "vast" without VAST_API_KEY) is a clear
+        # config error, not a silent fall-through to the other provider — A/B "vast-only" must NOT
+        # quietly run on RunPod.
+        available = tuple(p for p in available if p == provider)
+        if not available:
             raise UnsupportedGpuError(
                 f"provider {provider!r} pinned but not available/configured "
-                f"(live: {available_providers() or '(none)'}); "
+                f"(available: {available_providers() or '(none)'}); "
                 "set its credentials (e.g. VAST_API_KEY for vast) or remove the [gpu] provider pin"
             )
     candidates: list[Candidate] = []
     offer_book: tuple = ()
-    if "runpod" in live:
+    if "runpod" in available:
         candidates += _runpod_candidates(need)
-    if "vast" in live:
+    if "vast" in available:
         vcands, offer_book = _vast_candidates(need, disk_gb, exclude_machine_ids)
         candidates += vcands
     if not candidates:
         raise UnsupportedGpuError(
-            f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any live provider "
-            f"({', '.join(live) or '(none)'}); add VAST_API_KEY for more classes, or the "
+            f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "
+            f"({', '.join(available) or '(none)'}); add VAST_API_KEY for more classes, or the "
             "run genuinely exceeds every available GPU class"
         )
     # Cheapest first; equal rates prefer less VRAM (don't burn a big card on a small job),

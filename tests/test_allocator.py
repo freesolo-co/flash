@@ -32,7 +32,7 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
     from flash.providers.base import VALIDATED
 
     # The deployed control plane rejects a submit for any non-validated class, so client-side
-    # allocation must only ever pick a class in the live-validated pool — across ALL candidates,
+    # allocation must only ever pick a class in the validated pool — across ALL candidates,
     # not just the chosen one. Offline only RunPod is available; 0.8B GRPO needs the 24 GB tier
     # whose cheapest VALIDATED RunPod class is RTX 3090 @ $0.46 (cheaper unvalidated 24 GB classes
     # like L4 are excluded). 16 GB unvalidated classes (RTX 2000 Ada @ $0.24) never appear.
@@ -102,7 +102,7 @@ def test_offline_allocates_static_cheapest(monkeypatch):
     from flash.providers import allocator
     from flash.providers.base import cheapest_gpu
 
-    # No live pricing/offers (RunPod-only, static rates): allocation matches cheapest_gpu.
+    # RunPod-only static rates: allocation matches cheapest_gpu.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert a.gpu == cheapest_gpu(24)

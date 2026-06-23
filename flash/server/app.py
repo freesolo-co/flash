@@ -21,6 +21,7 @@ import weakref
 
 from flash import __version__
 from flash.catalog import public_model_rows
+from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.runner import (
     adapter_prefix,
     cancel_run,
@@ -38,7 +39,7 @@ from flash.spec import JobSpec
 
 from . import auth, db
 
-_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
+_RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
@@ -324,17 +325,20 @@ def create_app():
         except (ConfigError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    def _runtime_secrets(payload: dict) -> dict[str, str]:
+    def _runtime_secrets(
+        payload: dict, spec: JobSpec, *, require_environment_secrets: bool
+    ) -> dict[str, str]:
         raw = payload.get("runtime_secrets") or {}
         if not isinstance(raw, dict):
             raise HTTPException(status_code=400, detail="runtime_secrets must be a JSON object")
-        unknown = sorted(set(raw) - _RUNTIME_SECRET_KEYS)
+        allowed = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
+        unknown = sorted(set(raw) - allowed)
         if unknown:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "unsupported runtime secret(s): "
-                    f"{', '.join(unknown)} (allowed: {', '.join(sorted(_RUNTIME_SECRET_KEYS))})"
+                    f"{', '.join(unknown)} (allowed: {', '.join(sorted(allowed))})"
                 ),
             )
         out: dict[str, str] = {}
@@ -348,6 +352,16 @@ def create_app():
             value = value.strip()
             if value:
                 out[key] = value
+        if require_environment_secrets:
+            missing = sorted(set(spec.environment.secrets) - set(out))
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "missing runtime secret(s) required by [environment] secrets: "
+                        f"{', '.join(missing)}"
+                    ),
+                )
         return out
 
     @app.post("/v1/runs")
@@ -357,8 +371,10 @@ def create_app():
         authorization: str | None = Header(default=None),
     ):
         spec = _parse_spec(payload, run_id=new_run_id())
-        runtime_secrets = _runtime_secrets(payload)
         dry_run = bool(payload.get("dry_run", False))
+        runtime_secrets = _runtime_secrets(
+            payload, spec, require_environment_secrets=not dry_run
+        )
         # Charge the pre-flight estimate to the user's org BEFORE accepting the run, so it's gated
         # on balance and never starts unpaid. Skipped for --dry-run and the internal service
         # identity (no user org to bill).

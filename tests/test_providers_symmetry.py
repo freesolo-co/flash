@@ -114,25 +114,15 @@ def test_sweep_orphans_is_part_of_the_protocol():
 
 
 @pytest.mark.parametrize("provider", ["runpod", "vast"])
-def test_static_pricing_offline(provider, monkeypatch):
-    """Offline, every provider's hourly_rate falls back to the static snapshot."""
+def test_static_pricing(provider, monkeypatch):
+    """Every provider's hourly_rate uses the static snapshot."""
     pricing = importlib.import_module(f"flash.providers.{provider}.pricing")
     rate = pricing.hourly_rate("RTX 5090")
     assert rate == pytest.approx(0.99)  # the static GpuClass.hourly_usd snapshot
 
 
-def test_runpod_live_pricing_mock(monkeypatch):
-    """Live RunPod rates override the static snapshot (mocked SDK)."""
-    from flash.providers.runpod import pricing
-
-    monkeypatch.setattr(pricing, "_fetch_live_rates", lambda: {"RTX 5090": 1.23})
-    monkeypatch.setattr(pricing, "_CACHE_PATH", __import__("pathlib").Path("/nonexistent/x.json"))
-    pricing._MEM.update(ts=0.0, rates={})
-    assert pricing.hourly_rate("RTX 5090") == 1.23
-
-
-def test_vast_live_pricing_from_offers_mock(monkeypatch):
-    """Vast's hourly_rate is the cheapest live offer for the class (mocked offers)."""
+def test_static_pricing_ignores_vast_offer_prices(monkeypatch):
+    """Vast's hourly_rate is static; offer prices are only provisioning hints."""
     from flash.providers.vast import jobs, pricing
 
     monkeypatch.setenv("VAST_API_KEY", "vk")
@@ -146,7 +136,7 @@ def test_vast_live_pricing_from_offers_mock(monkeypatch):
         ]
 
     monkeypatch.setattr(jobs, "usable_offers", fake_offers)
-    assert pricing.hourly_rate("RTX 3090") == 0.19  # cheapest live offer wins
+    assert pricing.hourly_rate("RTX 3090") == 0.46  # static GpuClass snapshot wins
 
 
 # ---------------------------------------------------------------------------
@@ -175,17 +165,19 @@ def _offer(gpu="RTX 3090", dph=0.10, oid=1, mid=1):
     return make_vast_offer(offer_id=oid, machine_id=mid, gpu=gpu, dph_total=dph)
 
 
-def test_allocator_picks_cheaper_vast_over_runpod(monkeypatch):
+def test_allocator_picks_static_cheaper_vast_over_runpod(monkeypatch):
     from flash.providers.allocator import allocate
 
     _mock_both_available(monkeypatch)
-    # a cheap vast RTX 3090 offer undercuts the cheapest runpod validated 24 GB class
-    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 3090", dph=0.10)])
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft")
+    # Offer price is ignored for ranking: the Vast-only RTX Pro 4000 static rate ($0.34)
+    # undercuts the cheapest fitting RunPod 24 GB class for GRPO (RTX 3090 at $0.46).
+    _mock_vast_offers(monkeypatch, [_offer(gpu="RTX Pro 4000", dph=9.99)])
+    a = allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "vast"
-    assert a.gpu == "RTX 3090"
+    assert a.gpu == "RTX Pro 4000"
+    assert a.hourly_usd == pytest.approx(0.34)
     assert a.offer is not None  # the chosen offer is carried for provisioning
-    assert a.provider_offers  # full offer book preserved for the live-market walk
+    assert a.provider_offers  # full offer book preserved for provisioning
 
 
 def test_allocator_prefers_runpod_on_price_tie(monkeypatch):
@@ -193,7 +185,7 @@ def test_allocator_prefers_runpod_on_price_tie(monkeypatch):
 
     _mock_both_available(monkeypatch)
     # Same class at the same price on both providers: runpod wins the tie (registry order).
-    # Allocation is restricted to the live-validated pool; post-2026-06-22-expansion 0.8B SFT's
+    # Allocation is restricted to the validated pool; post-2026-06-22-expansion 0.8B SFT's
     # cheapest fitting VALIDATED class is the 16 GB RTX 2000 Ada ($0.24 static). Offer the identical
     # class+price on vast so the tie is genuinely between providers.
     _mock_vast_offers(monkeypatch, [_offer(gpu="RTX 2000 Ada", dph=0.24)])

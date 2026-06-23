@@ -15,6 +15,7 @@ from flash.providers.base import (
 from flash.schema.fields import (
     ConfigError,
     _coerce_scalar,
+    _environment_secrets,
     _require_environment_ref,
     _train_float,
     _train_int,
@@ -199,6 +200,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         raise ConfigError("[environment] pip must be a list of strings")
     if env_raw.get("pip") is not None and not all(isinstance(p, str) for p in env_raw["pip"]):
         raise ConfigError("[environment] pip entries must be strings")
+    environment_secrets = _environment_secrets(env_raw.get("secrets"))
     train_raw = raw.get("train")
     if train_raw is None:
         train_raw = {}
@@ -233,13 +235,13 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         )
 
     # GPU allocation is fully automatic: the submit-time allocator always picks the cheapest
-    # fitting LIVE-VALIDATED class across ALL providers — there is no GPU pin. A config's gpu.type
+    # fitting validated class across ALL providers — there is no GPU pin. A config's gpu.type
     # is not a user knob. ``provisional_gpu`` computes the offline RunPod-static
-    # cheapest-validated-that-fits for sizing/display only; the live allocator re-resolves it at
+    # cheapest-validated-that-fits for sizing/display only; the allocator re-resolves it at
     # submit time.
     try:
         # No GPU pin: the cheapest fitting VALIDATED class (the pool the deployed control plane
-        # accepts). The submit-time allocator re-resolves it live across providers.
+        # accepts). The submit-time allocator re-resolves it across providers.
         gpu_type = provisional_gpu(model, algorithm=algorithm, train=train_raw, thinking=thinking)
     except UnsupportedGpuError as exc:
         raise ConfigError(str(exc)) from exc
@@ -281,6 +283,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             id=str(env_raw.get("id") or ""),
             params=dict(env_raw.get("params") or {}),
             pip=tuple(str(p) for p in env_raw.get("pip") or ()),
+            secrets=environment_secrets,
         ),
         train=TrainSpec(
             steps=_train_int(train_raw, "steps", minimum=1),
@@ -316,7 +319,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         # the submit-time allocator picks the cheapest fitting validated GPU across providers, disk
         # is raised to the model's minimum server-side, and the infra knobs are operator defaults.
         # A user [gpu] table is ignored EXCEPT the opt-in provider pin (validated above); gpu_type
-        # here is the offline sizing/display provisional, re-resolved live at submit.
+        # here is the offline sizing/display provisional, re-resolved at submit.
         gpu=GpuSpec(type=gpu_type, provider=gpu_provider),
         run_id=run_id or "local",  # server-assigned (new_run_id at create_run); never user-set
         worker_env=worker_env,
