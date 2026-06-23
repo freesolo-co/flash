@@ -6,7 +6,6 @@ import importlib
 
 import pytest
 
-
 PROVIDER_MODULES = ("api", "auth", "pricing", "gpus", "jobs", "train", "preflight")
 PROVIDER_METHODS = (
     "is_configured",
