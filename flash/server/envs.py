@@ -175,7 +175,8 @@ def _put_github_file(
     if len(data) > _MAX_GITHUB_FILE_BYTES:
         raise EnvPublishError(
             f"environment upload file {path!r} exceeds GitHub Contents API limit "
-            f"({_MAX_GITHUB_FILE_BYTES} bytes)",
+            f"per-file cap ({_MAX_GITHUB_FILE_BYTES} bytes). Keep environment packages focused on code; "
+            "put large datasets in external storage and load from dataset_path or dataset URLs.",
             status=413,
         )
     url = f"https://api.github.com/repos/{repo}/contents/{quoted}"
