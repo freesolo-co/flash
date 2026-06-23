@@ -1,5 +1,4 @@
-"""init_from_adapter cross-repo warm-start: '<owner>/<repo>:<prefix>' downloads from a
-sibling managed artifact repo; a bare '<prefix>' uses the run's own HF_REPO."""
+"""init_from_adapter uses the adapter_ref form emitted by flash status."""
 
 import os
 import shutil
@@ -17,7 +16,8 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
 
     def fake_snapshot_download(**kw):
         calls.update(kw)
-        os.makedirs(os.path.join(kw["local_dir"], prefix.split(":", 1)[-1], "adapter"), exist_ok=True)
+        adapter_prefix = kw["allow_patterns"][0].removesuffix("/adapter/*")
+        os.makedirs(os.path.join(kw["local_dir"], adapter_prefix, "adapter"), exist_ok=True)
 
     monkeypatch.setattr(W, "HF_REPO", hf_repo, raising=False)
     import huggingface_hub
@@ -29,7 +29,7 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
         shutil.rmtree("/tmp/evdl", ignore_errors=True)
 
 
-def test_cross_repo_prefix_downloads_from_other_repo(monkeypatch):
+def test_status_adapter_ref_downloads_from_other_repo(monkeypatch):
     calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-sftX:sft/flash-sftX/seed0")
     assert calls["repo_id"] == "Freesolo-Co/flashrun-sftX"
     assert calls["allow_patterns"] == ["sft/flash-sftX/seed0/adapter/*"]
@@ -37,7 +37,13 @@ def test_cross_repo_prefix_downloads_from_other_repo(monkeypatch):
     assert out.endswith("sft/flash-sftX/seed0/adapter")
 
 
-def test_bare_prefix_uses_own_repo(monkeypatch):
-    calls, _out = _capture(monkeypatch, "sft/flash-self/seed0")
-    assert calls["repo_id"] == "Freesolo-Co/flashrun-self"
-    assert calls["allow_patterns"] == ["sft/flash-self/seed0/adapter/*"]
+def test_bare_prefix_is_not_a_public_init_adapter_ref(monkeypatch):
+    calls, out = _capture(monkeypatch, "sft/flash-self/seed0")
+    assert calls == {}
+    assert out is None
+
+
+def test_managed_repo_without_prefix_is_not_a_public_init_adapter_ref(monkeypatch):
+    calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff")
+    assert calls == {}
+    assert out is None

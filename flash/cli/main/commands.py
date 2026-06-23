@@ -163,26 +163,36 @@ def cmd_whoami(args) -> int:
 _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
-Edit the dataset and reward code, then upload with
+Edit datasets/train.jsonl and the reward code, then upload with
 `flash env push --name my-env .`.
 
 A managed run should use the returned [environment] id from
 `flash env push --name my-env .`.
 
-Keep real SFT/RL datasets in Freesolo or Hugging Face dataset storage. This
-inline dataset is only a smoke-test fixture.
+This starter keeps a tiny smoke-test dataset in datasets/train.jsonl. Replace it
+with your real training rows before a real run.
 """
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 
-DATASET = [
-    {"input": "What is 2 + 2?", "output": "4"},
-    {"input": "What is 3 + 5?", "output": "8"},
-]
+DEFAULT_DATASET_PATH = Path(__file__).parent / "datasets" / "train.jsonl"
+
+
+def load_jsonl(path: str | Path):
+    rows = []
+    with Path(path).open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
 
 
 def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult:
@@ -192,7 +202,7 @@ def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult
 
 
 class StarterEnv(EnvironmentSingleTurn):
-    dataset = DATASET
+    dataset = load_jsonl(DEFAULT_DATASET_PATH)
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
         return [{"role": "user", "content": example.task}]
@@ -201,13 +211,25 @@ class StarterEnv(EnvironmentSingleTurn):
         return exact_match_reward(example, response_text)
 
 
-def load_environment(**kwargs) -> StarterEnv:
-    return StarterEnv()
+def load_environment(dataset_path: str | None = None, **kwargs) -> StarterEnv:
+    env = StarterEnv()
+    if dataset_path:
+        env.dataset = load_jsonl(dataset_path)
+    return env
 '''
+
+_STARTER_DATASET_JSONL = """\
+{"input":"What is 2 + 2?","output":"4"}
+{"input":"What is 3 + 5?","output":"8"}
+"""
 
 
 def cmd_env_setup(args) -> int:
     Path("configs").mkdir(exist_ok=True)
+    Path("datasets").mkdir(exist_ok=True)
+    dataset = Path("datasets/train.jsonl")
+    if not dataset.exists():
+        dataset.write_text(_STARTER_DATASET_JSONL)
     starter_env = Path("environment.py")
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
@@ -220,9 +242,9 @@ def cmd_env_setup(args) -> int:
         'id = ""\n\n'
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
-    grpo = Path("configs/grpo.toml")
-    if not grpo.exists():
-        grpo.write_text(
+    rl = Path("configs/rl.toml")
+    if not rl.exists():
+        rl.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
             f"{env_comment}"
@@ -246,7 +268,10 @@ def cmd_env_setup(args) -> int:
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
-    print("ensured environment.py, configs/, configs/grpo.toml, configs/sft.toml")
+    print(
+        "ensured environment.py, datasets/train.jsonl, configs/, "
+        "configs/rl.toml, configs/sft.toml"
+    )
     return 0
 
 
@@ -261,28 +286,23 @@ def cmd_models(args) -> int:
 
 
 def cmd_gpus(args) -> int:
-    """List GPU classes, VRAM, and per-provider $/hr."""
+    """List RunPod GPU classes, VRAM, and $/hr."""
     from flash.providers.base import GPU_INFO
     from flash.providers.runpod.pricing import static_rates as runpod_static_rates
-    from flash.providers.vast.pricing import static_rates as vast_static_rates
 
     runpod_rates = runpod_static_rates()
-    vast_rates = vast_static_rates()
 
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
-    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}")
-    for info in sorted(GPU_INFO.values(), key=lambda g: g.hourly_usd):
+    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}")
+    infos = [info for info in GPU_INFO.values() if info.enum_member]
+    for info in sorted(infos, key=lambda g: g.hourly_usd):
         runpod_rate = runpod_rates.get(info.name) if info.enum_member else None
-        print(
-            f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}"
-            f"{fmt_rate(vast_rates.get(info.name))}"
-        )
+        print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}")
     print(
         "\nTip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest validated class that fits the model across all providers, so you don't pin a\n"
-        "GPU type."
+        "cheapest validated RunPod class that fits the model, so you don't pin a GPU type."
     )
     return 0
 
