@@ -1,11 +1,9 @@
-# Flash prebuilt WORKER image — the full training stack baked in so Vast/RunPod cold-start
-# skips the per-host dep install (the dominant cold-start cost; measured 7-86s on fresh Vast).
+# Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
 # The worker still fetches the flash `code/**` from HF at runtime, so only DEPS live here.
 #
-# This image is the default worker image — Vast always uses it; on RunPod, FLASH_WORKER_IMAGE
-# overrides it and the Flash live-endpoint path boot-installs deps instead. It is referenced by name
-# in providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be published to GHCR and the package set PUBLIC
-# (no registry login is configured) — otherwise Vast/RunPod can't pull it. Normally built by
+# This image is referenced by name in providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be
+# published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
+# pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
 #
 #   docker build -f Dockerfile.worker -t ghcr.io/freesolo-co/flash-worker:cu128 .
@@ -91,9 +89,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
 # from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;
 # _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
-# image is a self-contained RunPod Serverless worker. On Vast the image is launched in args-mode
-# (`bash -c <onstart>`), which OVERRIDES this CMD — so ONE image serves both providers (Vast bash
-# bootstrap vs RunPod serverless handler reading job["input"]). Build context is the repo root.
+# image is a self-contained RunPod Serverless worker. Build context is the repo root.
 COPY flash/providers/runpod/train/endpoints.py docker/make_rp_handler.py /tmp/rpgen/
 RUN python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /rp_handler.py \
     && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"

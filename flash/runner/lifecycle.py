@@ -65,15 +65,13 @@ def _submit_seed_supervised(
 ) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
-    Each attempt first ALLOCATES the GPU: the cheapest validated class across providers
-    that fits the model, priced from the static GPU table. Vast offers are re-resolved fresh
-    per attempt because those machines are a live market. There is no GPU pin and no provider
-    pin — the cheapest fitting class in the validated pool always wins.
+    Each attempt first ALLOCATES the GPU: the cheapest active RunPod class that fits the model,
+    priced from the static GPU table. There is no GPU pin — the cheapest fitting class in the
+    validated pool always wins.
 
-    Retries (fresh job on a fresh host; worker resumes from the latest HF
-    checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
-    client polling breakdown, or a platform TIMED_OUT/worker-loss. Sick Vast machines
-    are blacklisted for the run; failover naturally crosses providers.
+    Retries (fresh job on a fresh host; worker resumes from the latest HF checkpoint) when the
+    failure looks infra-shaped: a stall (heartbeat frozen), a client polling breakdown, or a
+    platform TIMED_OUT/worker-loss.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
     immediately.
     """
@@ -115,7 +113,6 @@ def _submit_seed_supervised(
 
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
-    bad_machines: set[int] = set()
     # Index into the ranked candidate list. It advances only after an attempt that
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
@@ -124,23 +121,7 @@ def _submit_seed_supervised(
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
-            # Dispatched generically via the handle's provider.
-            if last_handle.get("provider") == "vast":
-                with contextlib.suppress(Exception):
-                    from flash.providers import get_provider
-                    from flash.providers.base import JobHandle
-
-                    get_provider("vast").destroy(JobHandle.from_dict(last_handle))
-                if last_handle.get("machine_id"):
-                    bad_machines.add(int(last_handle["machine_id"]))
-                print(
-                    f"retry {attempt}: destroyed vast instance "
-                    f"{last_handle.get('instance_id')} (machine "
-                    f"{last_handle.get('machine_id')} blacklisted for this run)",
-                    file=log,
-                    flush=True,
-                )
-            elif last_handle.get("endpoint_id"):
+            if last_handle.get("endpoint_id"):
                 try:
                     from flash.providers.runpod import api as runpod_api
 
@@ -177,17 +158,12 @@ def _submit_seed_supervised(
             alloc = allocate(
                 spec.model,
                 spec.algorithm,
-                disk_gb=spec.gpu.disk_gb,
-                exclude_machine_ids=frozenset(bad_machines),
                 # Pass the run's train knobs + thinking so the VRAM estimate reflects THIS job's
                 # max_length / group_size / batch_size / lora_rank (and the seq escalation) instead
                 # of the generic defaults — else a long-context / big-group run is sized at seq=1024
                 # and OOMs the card it picks.
                 train=spec.train,
                 thinking=spec.thinking,
-                # Optional per-run provider pin ([gpu] provider): restrict allocation to one
-                # substrate (vast / runpod) for A/B-ing; None keeps cross-provider cheapest-wins.
-                provider=spec.gpu.provider,
             )
         except Exception as exc:
             from flash.providers.base import UnsupportedGpuError
@@ -196,17 +172,15 @@ def _submit_seed_supervised(
                 raise  # config-shaped: no GPU anywhere can run this job
             res = PollResult(False, failure="poll_error", detail=f"allocation: {exc}")
         if alloc is not None:
-            # allocate() above may have searched Vast offers; re-check cancellation
-            # right before provisioning so a cancel during allocation doesn't still
-            # launch a paid worker.
+            # Re-check cancellation right before provisioning so a cancel during allocation
+            # doesn't still launch a paid worker.
             with contextlib.suppress(FileNotFoundError):
                 if get_status(spec.run_id).state == "cancelled":
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
             # Walk down the ranked candidates by the walk offset (clamped to the last): the
             # first attempt takes the cheapest; each retry that provisioned a class and lost
             # it to an infra failure steps to the next-cheapest, so a capacity-starved class
-            # can't burn the whole budget. A concrete pin yields a single candidate, so the
-            # clamp keeps a pinned run on its class.
+            # can't burn the whole budget.
             chosen = alloc.candidates[min(gpu_walk_offset, len(alloc.candidates) - 1)]
             print(allocation_summary(alloc), file=log, flush=True)
             if chosen.gpu != alloc.gpu:
@@ -219,33 +193,19 @@ def _submit_seed_supervised(
             run_spec = _spec_with_gpu(spec, chosen.gpu)
             current_gpu["name"] = chosen.gpu
             provider = get_provider(chosen.provider)
-            # Vast needs the offer book for the chosen class first, then the
-            # other allocator-approved classes by price; RunPod ignores ``offers``.
-            offers = None
-            if chosen.provider == "vast":
-                ok_classes = {c.gpu for c in alloc.candidates if c.provider == "vast"}
-                offers = sorted(
-                    (o for o in alloc.provider_offers if o.gpu in ok_classes),
-                    key=lambda o: (o.gpu != chosen.gpu, o.dph_total),
-                )
             try:
                 submit_kwargs = {
                     "log": log,
                     "on_handle": on_handle,
                     "attempt": attempt,
-                    "offers": offers,
-                    # The run's machine blacklist must reach the provider so an in-provider
-                    # offer REFRESH (Vast) keeps stalled/sick machines excluded.
-                    "exclude_machine_ids": frozenset(bad_machines),
                 }
                 if runtime_secrets:
                     submit_kwargs["runtime_secrets"] = runtime_secrets
                 res = provider.submit_run(run_spec, seed, **submit_kwargs)
             except Exception as exc:
                 # Deploy/submit themselves can fail transiently (observed: RunPod
-                # GraphQL "Something went wrong" x3 during a retry deploy; a vast offer
-                # pool emptying between search and rent). That must consume a retry, not
-                # kill the run — the budget exists precisely for flakes.
+                # GraphQL "Something went wrong" x3 during a retry deploy). That must
+                # consume a retry, not kill the run — the budget exists precisely for flakes.
                 res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
                 if attempt < max_retries:
                     time.sleep(10 * (attempt + 1))  # let the transient clear
@@ -499,11 +459,3 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     except Exception:
         # Best-effort GC; an undeleted endpoint only holds worker quota, never blocks the run.
         pass
-    # Vast instances bill until destroyed: the runner's per-attempt `finally` already
-    # destroys them, but a crashed supervisor thread can leave one behind. Reap any
-    # instance still labeled for this run via the provider's gc (best-effort).
-    from flash.providers import available_providers, get_provider
-
-    if "vast" in available_providers():
-        with contextlib.suppress(Exception):
-            get_provider("vast").gc(spec)

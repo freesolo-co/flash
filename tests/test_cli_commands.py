@@ -173,8 +173,11 @@ def test_models_table(fake_client, capsys) -> None:
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
-    assert "Qwen/Qwen3.5-2B\t2.3B" in out
-    assert "openbmb/MiniCPM5-1B\t1.2B dense" in out
+    assert "Qwen/Qwen3.5-2B" in out
+    assert "openbmb/MiniCPM5-1B" in out
+    # only bare model ids, none of the extra per-model detail columns
+    assert "2.3B" not in out
+    assert "dense" not in out
     assert "(text-only fine-tune)" not in out
     assert "algos=" not in out
     assert "bf16" not in out
@@ -294,7 +297,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     dataset = tmp_path / "datasets/train.jsonl"
     assert dataset.is_file()
     assert '"input":"What is 2 + 2?"' in dataset.read_text()
-    grpo = tmp_path / "configs/grpo.toml"
+    grpo = tmp_path / "configs/rl.toml"
     sft = tmp_path / "configs/sft.toml"
     assert grpo.is_file()
     assert sft.is_file()
@@ -305,7 +308,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "epochs = 1" in sft.read_text()
     out = capsys.readouterr().out
     assert "datasets/train.jsonl" in out
-    assert "configs/grpo.toml" in out
+    assert "configs/rl.toml" in out
 
 
 def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None:
