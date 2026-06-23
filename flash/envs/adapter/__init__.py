@@ -103,7 +103,9 @@ def _normalize_env_path(path: str | None) -> str:
     raw = path.strip()
     if not raw:
         return _DEFAULT_ENVIRONMENT_PATH
-    raw = raw.replace("\\", "/").lstrip("/")
+    raw = raw.replace("\\", "/")
+    if raw.startswith("/"):
+        raise ValueError(f"unsafe environment path: {path!r}")
     if not raw:
         return _DEFAULT_ENVIRONMENT_PATH
     parts = [part for part in raw.split("/") if part]
