@@ -14,8 +14,7 @@ from flash.server import envs
 
 _MINIMAL = {
     "pyproject.toml": "[project]\nname = 'e'\n",
-    "freesolo/__init__.py": "",
-    "freesolo/environment.py": "def load_environment(**k):\n    return None\n",
+    "environment.py": "def load_environment(**k):\n    return None\n",
 }
 
 
@@ -56,6 +55,11 @@ def test_sanitize_name_never_returns_path_segments():
 
 def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setattr(
+        envs,
+        "_new_publish_id",
+        lambda: "12345678-1234-4321-abcd-123456789abc",
+    )
     captured: dict[str, object] = {}
 
     def fake_publish_once(*, dest, repo, token, publish_root, message):
@@ -77,17 +81,13 @@ def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
         key={"email": "dev@clado.ai"},
     )
 
-    root = "environments/dev-clado-ai/my-env"
-    assert ref == f"github:freesolo-co/environment-hub@main:{root}/freesolo/environment.py"
+    root = "dev-clado-ai/my-env/12345678-1234-4321-abcd-123456789abc"
+    assert ref == (f"github:freesolo-co/environment-hub@main:{root}/environment.py")
     assert captured["repo"] == "freesolo-co/environment-hub"
     assert captured["token"] == "ghp-test"
     assert captured["publish_root"] == root
     assert captured["message"] == "Upload Flash environment dev-clado-ai/my-env"
-    assert captured["files"] == [
-        "freesolo/__init__.py",
-        "freesolo/environment.py",
-        "pyproject.toml",
-    ]
+    assert captured["files"] == ["environment.py", "pyproject.toml"]
 
 
 def test_publish_rejects_bad_input(monkeypatch):
@@ -187,7 +187,7 @@ def test_safe_extract_rejects_special_members(tmp_path):
 
 
 def test_safe_extract_rejects_workflow_control_paths(tmp_path):
-    for label in (".github", ".git", "./.github", "./.git"):
+    for label in (".github", ".git", "source", "./.github", "./.git", "./source"):
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             d = tarfile.TarInfo(f"{label}/workflows")
@@ -215,8 +215,8 @@ def test_push_environment_commit_rebases_before_push(monkeypatch, tmp_path):
 
 def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    (tmp_path / "freesolo").mkdir()
-    (tmp_path / "freesolo" / "environment.py").write_text("def load_environment(**k): pass\n")
+    (tmp_path / "environment.py").write_text("def load_environment(**k): pass\n")
+    monkeypatch.setattr(envs, "_new_publish_id", lambda: "publish-1")
     calls = {"count": 0}
 
     def fake_publish_once(**_kwargs):
@@ -230,10 +230,7 @@ def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
     ref = envs._github_publish(tmp_path, name="e", key={"id": 1})
 
     assert calls["count"] == 2
-    assert (
-        ref
-        == "github:freesolo-co/environment-hub@main:environments/key-1/e/freesolo/environment.py"
-    )
+    assert ref == "github:freesolo-co/environment-hub@main:key-1/e/publish-1/environment.py"
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -241,7 +238,7 @@ def _git(cwd: Path, *args: str) -> None:
 
 
 def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypatch):
-    remote = tmp_path / "environment-hub.git"
+    remote = tmp_path / "training.git"
     seed = tmp_path / "seed"
     seed.mkdir()
     _git(seed, "init", "--initial-branch", "main")
@@ -255,8 +252,8 @@ def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypat
     _git(seed, "push", "origin", "main")
 
     package = tmp_path / "package"
-    (package / "freesolo").mkdir(parents=True)
-    (package / "freesolo" / "environment.py").write_text("def load_environment(**k): pass\n")
+    package.mkdir()
+    (package / "environment.py").write_text("def load_environment(**k): pass\n")
 
     monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
 
@@ -264,12 +261,12 @@ def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypat
         dest=package,
         repo="ignored/repo",
         token="tok",
-        publish_root="environments/ns/env",
+        publish_root="ns/env/publish-1",
         message="Upload test env",
     )
 
     verify = tmp_path / "verify"
     _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
-    assert (verify / "environments/ns/env/freesolo/environment.py").read_text() == (
+    assert (verify / "ns/env/publish-1/environment.py").read_text() == (
         "def load_environment(**k): pass\n"
     )

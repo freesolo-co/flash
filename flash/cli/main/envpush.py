@@ -18,7 +18,8 @@ def cmd_env_install(args) -> int:
     env_id = args.env_id
     if not is_github_environment_ref(env_id):
         print(
-            "env id must be a Freesolo environment id returned by `flash env push` "
+            "env id must be a Freesolo environment id / GitHub ref, e.g. "
+            '"github:freesolo-co/environment-hub@main:user/project/publish-id/environment.py" '
             f"(got {env_id!r})",
             file=sys.stderr,
         )
@@ -29,25 +30,37 @@ def cmd_env_install(args) -> int:
     return 0
 
 
-# A Freesolo environment package is uploaded in canonical generated-repo layout:
-# freesolo/environment.py exposes load_environment().
-_ENV_PUSH_PYPROJECT = """\
-[project]
-name = "{name}"
-version = "{version}"
-description = "Flash Freesolo environment ({name})."
-requires-python = ">=3.10"
-dependencies = ["freesolo"]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["freesolo"]
-"""
-
-_PUSH_INITIAL_VERSION = "0.1.0"
+_ENV_ENTRYPOINT = "environment.py"
+_ENV_PUSH_IGNORED_NAMES = frozenset(
+    {
+        ".prime",
+        ".git",
+        ".github",
+        "__pycache__",
+        ".venv",
+        ".mypy_cache",
+        ".pytest_cache",
+        "source",
+    }
+)
+_ENV_PUSH_SIDECAR_DIRS = frozenset({"assets", "data", "datasets", "db", "databases"})
+_ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
+    {
+        ".csv",
+        ".db",
+        ".json",
+        ".jsonl",
+        ".parquet",
+        ".pkl",
+        ".sqlite",
+        ".sqlite3",
+        ".sql",
+        ".tsv",
+        ".txt",
+        ".yaml",
+        ".yml",
+    }
+)
 
 
 def _push_env_name(raw: str) -> str:
@@ -62,8 +75,10 @@ def _env_name_from_ref_path(raw_path: str) -> str | None:
     if not path_text:
         return None
     path = Path(path_text)
-    if path.name == "environment.py" and path.parent.name == "freesolo":
-        name = path.parent.parent.name
+    parts = path.as_posix().split("/")
+    if path.name == _ENV_ENTRYPOINT and len(parts) >= 4:
+        # Training-style refs are <namespace>/<project>/<publish-id>/environment.py.
+        name = parts[-3]
     elif path.suffix == ".py":
         name = path.parent.name or path.stem
     else:
@@ -150,9 +165,7 @@ def _with_syspath_bootstrap(env_source: str) -> str:
     return "".join(lines[:insert_after]) + bootstrap + "".join(lines[insert_after:])
 
 
-_TAR_EXCLUDE_DIRS = frozenset(
-    {".prime", ".git", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"}
-)
+_TAR_EXCLUDE_DIRS = _ENV_PUSH_IGNORED_NAMES
 
 
 def _tar_b64(directory: Path) -> str:
@@ -205,6 +218,32 @@ def _pyproject_name(env_dir: Path) -> str | None:
         return None
 
 
+def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
+    """Copy environment helpers and data sidecars, but not the agent source workspace."""
+    import shutil
+
+    for child in sorted(env_root.iterdir()):
+        if child == entrypoint or child.name in _ENV_PUSH_IGNORED_NAMES:
+            continue
+        if child.name.startswith("."):
+            continue
+        target = dest / child.name
+        if child.is_dir():
+            if child.name in _ENV_PUSH_SIDECAR_DIRS:
+                shutil.copytree(
+                    child,
+                    target,
+                    ignore=shutil.ignore_patterns(*_ENV_PUSH_IGNORED_NAMES),
+                )
+            continue
+        if not child.is_file():
+            continue
+        if (
+            child.suffix == ".py" and not child.name.startswith("__")
+        ) or child.suffix.lower() in _ENV_PUSH_SIDECAR_SUFFIXES:
+            shutil.copy2(child, target)
+
+
 def _upload_and_report(name: str, *, is_new: bool, package_b64: str) -> int:
     """Upload a packaged env to the managed control plane and print the returned id."""
     from flash.client import ClientError, client_from_config
@@ -224,7 +263,6 @@ def _upload_and_report(name: str, *, is_new: bool, package_b64: str) -> int:
 
 
 def cmd_env_push(args) -> int:
-    import shutil
     import tempfile
 
     src = Path(args.path)
@@ -232,32 +270,30 @@ def cmd_env_push(args) -> int:
         print(f"no such path: {src}", file=sys.stderr)
         return 1
 
-    # A ready-made generated repo/package is uploaded as-is when it already carries the canonical
-    # Freesolo environment file.
+    # A ready-made generated repo/package is reduced to the environment artifact. We intentionally
+    # do not upload the agent-facing source workspace.
     if src.is_dir() and (src / "pyproject.toml").is_file():
-        if not (src / "freesolo" / "environment.py").is_file():
+        root_entrypoint = src / _ENV_ENTRYPOINT
+        if root_entrypoint.is_file():
+            env_root = src
+            entrypoint = root_entrypoint
+        else:
             print(
-                f"{src} has a pyproject.toml but no freesolo/environment.py entrypoint",
+                f"{src} has a pyproject.toml but no environment.py entrypoint",
                 file=sys.stderr,
             )
             return 1
         env_name = _pyproject_name(src) or _push_env_name(src.name)
-        return _upload_and_report(env_name, is_new=True, package_b64=_tar_b64(src))
+        is_new = True
 
-    # Wrap a bare Freesolo environment module (a single .py, or a one-module dir) into the
-    # canonical generated-repo layout and upload that. `data_dir` is a committed `datasets/`
-    # sibling of the module; it ships beside the environment.
-    if src.is_file() and src.suffix == ".py":
-        module_source = src.read_text()
+    # Wrap a bare Freesolo environment module (a single .py, or a one-module dir) into a compact
+    # environment artifact and upload that. Sidecar datasets/DB files ship beside environment.py.
+    elif src.is_file() and src.suffix == ".py":
+        env_root = src.parent
+        entrypoint = src
         # Re-publish to the same logical environment when sibling configs name one.
         sibling_name = _config_env_name_from_dir(src.parent)
         env_name = sibling_name or _push_env_name(src.stem)
-        data_dir = src.parent / "datasets"
-        # Ship the env's sibling helper modules (config.py/utils.py/...) so an environment.py that
-        # does `sys.path.insert(0, dir(__file__)); import utils` resolves once installed.
-        sibling_modules = [
-            p for p in sorted(src.parent.glob("*.py")) if p != src and not p.name.startswith("__")
-        ]
         is_new = sibling_name is None
     elif src.is_dir():
         modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
@@ -269,10 +305,9 @@ def cmd_env_push(args) -> int:
                 file=sys.stderr,
             )
             return 1
-        module_source = modules[0].read_text()
+        env_root = src
+        entrypoint = modules[0]
         env_name = _push_env_name(src.name)
-        data_dir = src / "datasets"
-        sibling_modules = []
         is_new = True
     else:
         print(f"cannot publish {src}: expected a Freesolo .py module or an env directory.")
@@ -280,17 +315,8 @@ def cmd_env_push(args) -> int:
 
     with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
-        env_pkg = pkg / "freesolo"
-        env_pkg.mkdir()
-        (env_pkg / "__init__.py").write_text("")
-        (env_pkg / "environment.py").write_text(_with_syspath_bootstrap(module_source))
-        # Ship committed sibling data inside the canonical freesolo package dir.
-        if data_dir.is_dir() and any(data_dir.iterdir()):
-            shutil.copytree(data_dir, env_pkg / "datasets")
-        for mod in sibling_modules:
-            shutil.copy2(mod, env_pkg / mod.name)
-        (pkg / "pyproject.toml").write_text(
-            _ENV_PUSH_PYPROJECT.format(name=env_name, version=_PUSH_INITIAL_VERSION)
-        )
+        module_source = entrypoint.read_text()
+        (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
+        _copy_env_sidecars(env_root, pkg, entrypoint=entrypoint)
         (pkg / "README.md").write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
         return _upload_and_report(env_name, is_new=is_new, package_b64=_tar_b64(pkg))

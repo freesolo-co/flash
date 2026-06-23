@@ -2,8 +2,7 @@
 
 ``POST /v1/envs`` accepts a packaged Freesolo environment and uploads it to the
 managed ``freesolo-co/environment-hub`` GitHub repository. The returned id is a
-GitHub-backed environment ref that the worker resolves through
-``freesolo.environments``.
+GitHub-backed environment ref that the worker resolves through ``freesolo.environments``.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ import tarfile
 import tempfile
 import time
 import urllib.parse
+import uuid
 from pathlib import Path
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
@@ -25,7 +25,8 @@ _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_MEMBERS = 5000
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
-_DEFAULT_ENVIRONMENT_FILE = "freesolo/environment.py"
+_DEFAULT_ENVIRONMENT_FILE = "environment.py"
+_BLOCKED_TOP_LEVEL_PATHS = {".github", ".git", "source"}
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
@@ -59,6 +60,10 @@ def _sanitize_name(name: str) -> str:
     return slug or "env"
 
 
+def _new_publish_id() -> str:
+    return str(uuid.uuid4())
+
+
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
     root = dest.resolve()
     try:
@@ -82,9 +87,9 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                 target = (dest / normalized_name).resolve()
                 if target != root and root not in target.parents:
                     raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
-                if segments[0] in {".github", ".git"}:
+                if segments[0] in _BLOCKED_TOP_LEVEL_PATHS:
                     raise EnvPublishError(
-                        "env packages must not contain .github or .git top-level paths"
+                        "env packages must not contain .github, .git, or source top-level paths"
                     )
                 if member.islnk() or member.issym():
                     raise EnvPublishError(f"links are not allowed in env packages: {member.name!r}")
@@ -245,7 +250,7 @@ def _github_publish_once(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
         tmp_path = Path(tmp)
-        checkout = tmp_path / "environment-hub"
+        checkout = tmp_path / "training"
         _run_git(
             tmp_path,
             [
@@ -272,12 +277,7 @@ def _environment_file_relative_path(root: Path) -> str:
     canonical = root / _DEFAULT_ENVIRONMENT_FILE
     if canonical.is_file():
         return _DEFAULT_ENVIRONMENT_FILE
-    matches = sorted(path for path in root.rglob("environment.py") if path.is_file())
-    if matches:
-        return matches[0].relative_to(root).as_posix()
-    raise EnvPublishError(
-        "env package must contain freesolo/environment.py or another environment.py entrypoint"
-    )
+    raise EnvPublishError("env package must contain environment.py")
 
 
 def _github_publish(dest: Path, *, name: str, key: dict) -> str:
@@ -290,7 +290,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     repo = _github_repo()
     ns = namespace_for(key)
     clean = _sanitize_name(name)
-    publish_root = f"environments/{ns}/{clean}"
+    publish_root = f"{ns}/{clean}/{_new_publish_id()}"
     env_rel = _environment_file_relative_path(dest)
     files = sorted(path for path in dest.rglob("*") if path.is_file())
     if not files:
