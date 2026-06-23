@@ -122,12 +122,12 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     # -- environments ------------------------------------------------------------------
-    def publish_env(self, *, name: str, is_new: bool, package_b64: str) -> dict:
-        """Upload a packaged Freesolo environment to managed GitHub storage."""
+    def publish_env(self, *, name: str, package_b64: str) -> dict:
+        """Upload a packaged Freesolo environment to the managed Environments Hub."""
         return self._request(
             "POST",
             "/v1/envs",
-            body={"name": name, "is_new": is_new, "package_b64": package_b64},
+            body={"name": name, "package_b64": package_b64},
             timeout=1800.0,
         )
 
@@ -154,18 +154,14 @@ class ApiClient:
     def deploy(
         self,
         run_id: str,
-        mode: str = "dev",
-        idle_timeout_s: int = 300,
         dry_run: bool = False,
     ) -> dict:
-        # always-on blocks on the server until the worker has downloaded the
-        # model/adapter and vLLM is healthy (the no-cold-start guarantee), which can
-        # take many minutes — use the serve-scale timeout, not the default 60s.
-        deploy_timeout = 30 * 60 if (mode == "always-on" and not dry_run) else None
+        # Deploy blocks on registration and serving warmup, which can take many minutes.
+        deploy_timeout = 30 * 60 if not dry_run else None
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/deploy",
-            body={"mode": mode, "idle_timeout_s": idle_timeout_s, "dry_run": dry_run},
+            body={"dry_run": dry_run},
             timeout=deploy_timeout,
         )
 
@@ -182,7 +178,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> dict:
-        # Cold starts in dev mode can take minutes; give inference a generous timeout.
+        # Serving warmup can take minutes; give inference a generous timeout.
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/chat",

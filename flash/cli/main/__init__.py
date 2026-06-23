@@ -31,7 +31,6 @@ from flash.cli.main.commands import (  # noqa: F401
     cmd_cost,
     cmd_deploy,
     cmd_deployments,
-    cmd_env_init,
     cmd_env_list,
     cmd_env_setup,
     cmd_gpus,
@@ -104,10 +103,6 @@ def main(argv: list[str] | None = None) -> int:
     setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
     setup.set_defaults(func=cmd_env_setup)
 
-    init = env_sub.add_parser("init", help="scaffold a new local Freesolo environment")
-    init.add_argument("name")
-    init.set_defaults(func=cmd_env_init)
-
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
@@ -116,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
     env_install.set_defaults(func=cmd_env_install)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
+    env_push.add_argument(
+        "--name",
+        required=True,
+        help="Freesolo environment name to publish or update",
+    )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
 
@@ -177,19 +177,6 @@ def main(argv: list[str] | None = None) -> int:
 
     deploy = sub.add_parser("deploy")
     deploy.add_argument("run_id")
-    deploy.add_argument(
-        "--mode",
-        choices=["dev", "always-on"],
-        default="dev",
-        help="dev: scale-to-zero, cold start after idle, $0 when unused (default). "
-        "always-on: one warm worker 24/7, no cold starts, continuous billing.",
-    )
-    deploy.add_argument(
-        "--idle-timeout",
-        type=int,
-        default=300,
-        help="dev mode: seconds of inactivity before the worker scales to zero (default 300)",
-    )
     deploy.add_argument("--dry-run", action="store_true")
     deploy.set_defaults(func=cmd_deploy)
 

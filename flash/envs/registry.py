@@ -1,8 +1,7 @@
 """Environment registry used by specs, worker, CLI, and server.
 
-Every managed run names a Freesolo SDK environment by a published environment id.
-The canonical generated environment entrypoint is
-``freesolo/environment.py:load_environment``.
+Every managed run names a Freesolo SDK environment by Hub slug.
+The canonical generated environment entrypoint is ``environment.py:load_environment``.
 """
 
 from __future__ import annotations
@@ -40,15 +39,6 @@ def worker_pip_for_env(env_id: str) -> list[str]:
     return ["freesolo"]
 
 
-def worker_hub_env_ids(env_id: str, params: dict | None = None) -> list[str]:
-    """Backward-compatible name for worker environment refs.
-
-    The worker resolves Freesolo environment ids lazily through :func:`load_environment`,
-    so there is nothing to pre-install here.
-    """
-    return []
-
-
 def load_environment(env_id: str, params: dict | None = None) -> Environment:
     """Load a Freesolo SDK environment and wrap it in Flash's protocol."""
     params = params or {}
@@ -56,6 +46,7 @@ def load_environment(env_id: str, params: dict | None = None) -> Environment:
 
     if not env_id:
         raise ValueError(
-            "no environment specified: set [environment] id to the id returned by `flash env push`"
+            "no environment specified: set [environment] id to the id returned by "
+            "`flash env push --name <name>` (for example 'your-name/your-env')"
         )
     return load_freesolo_environment(env_id, **params)

@@ -1,7 +1,8 @@
 """Adapter that runs Freesolo SDK environments on Flash.
 
-Flash environment ids now reference source in GitHub instead of package wheels.
-The canonical generated environment file is ``freesolo/environment.py`` and its
+Flash environment ids are Freesolo Hub slugs (``namespace/name``). Explicit
+low-level refs remain parseable for compatibility. The canonical generated environment file is
+``environment.py`` and its
 ``load_environment`` function must return a Freesolo SDK environment:
 ``EnvironmentSingleTurn`` or ``EnvironmentMultiTurn``.
 """
@@ -26,17 +27,21 @@ from typing import Any
 from flash.envs.base import BaseEnvironment
 
 _DEFAULT_GITHUB_REF = "main"
-_DEFAULT_ENVIRONMENT_PATH = "freesolo/environment.py"
+_DEFAULT_ENVIRONMENT_PATH = "environment.py"
+_DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _TAR_METADATA_TYPES = {
     tarfile.XHDTYPE,
     tarfile.XGLTYPE,
     tarfile.GNUTYPE_LONGNAME,
     tarfile.GNUTYPE_LONGLINK,
 }
+_CANONICAL_INPUT_KEY = "input"
+_CANONICAL_OUTPUT_KEY = "output"
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,38 @@ def is_github_environment_ref(value: str) -> bool:
     return _parse_github_environment_ref(value) is not None
 
 
+def is_managed_environment_slug(value: str) -> bool:
+    return _parse_managed_environment_slug(value) is not None
+
+
+def is_freesolo_environment_id(value: str) -> bool:
+    return is_managed_environment_slug(value) or is_github_environment_ref(value)
+
+
+def managed_slug_to_github_ref(value: str) -> str:
+    parsed = _parse_managed_environment_slug(value)
+    if parsed is None:
+        raise ValueError(f"not a Freesolo environment slug: {value!r}")
+    namespace, name = parsed
+    return (
+        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
+        f"{namespace}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
+    )
+
+
+def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
+    text = (value or "").strip()
+    if not text or ":" in text:
+        return None
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        return None
+    parts = text.split("/")
+    if len(parts) != 2 or not _is_safe_github_path_parts(tuple(parts)):
+        return None
+    return parts[0], parts[1]
+
+
 def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
     text = (value or "").strip()
     if not text:
@@ -76,6 +113,8 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
             ref = _DEFAULT_GITHUB_REF
         if not ref:
             return None
+        if not _is_safe_github_path_parts((ref,)):
+            return None
         owner_repo = repo_part.split("/")
         if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo):
             return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
@@ -93,7 +132,7 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
         return None
     if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
         ref = parts[3]
-        if not ref or ref in {".", ".."} or ":" in ref or "\\" in ref:
+        if not _is_safe_github_path_parts((ref,)):
             return None
         raw_path = "/".join(parts[4:])
         if not _is_safe_environment_path(raw_path):
@@ -150,7 +189,7 @@ def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
         return False
     if any(part in {".", "..", ""} for part in parts):
         return False
-    return not any("\\" in part for part in parts)
+    return all(_GITHUB_SAFE_PART_RE.fullmatch(part) for part in parts)
 
 
 def _github_token() -> str | None:
@@ -175,11 +214,11 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
         payload = json.loads(data)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"Failed to resolve commit for {parsed.canonical()}: invalid GitHub response"
+            f"Failed to resolve GitHub environment ref {parsed.canonical()}: invalid response"
         ) from exc
     sha = payload.get("sha")
     if not isinstance(sha, str) or not _is_commit_sha(sha):
-        raise RuntimeError(f"Failed to resolve commit for {parsed.canonical()}")
+        raise RuntimeError(f"Failed to resolve GitHub environment ref {parsed.canonical()}")
     return sha
 
 
@@ -189,9 +228,9 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
             return resp.read()
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"GitHub request failed ({exc.code}): {body[:500]}") from exc
+        raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"GitHub request failed: {exc.reason}") from exc
+        raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
@@ -206,7 +245,7 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
     if len(data) > _MAX_ARCHIVE_BYTES:
         raise RuntimeError(
-            f"GitHub environment archive is too large ({len(data)} bytes; "
+            f"environment archive is too large ({len(data)} bytes; "
             f"limit {_MAX_ARCHIVE_BYTES} bytes)"
         )
     return data
@@ -229,31 +268,29 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
                 if not part or part == ".":
                     continue
                 if part == "..":
-                    raise RuntimeError(
-                        f"unsafe path in GitHub environment archive: {member.name!r}"
-                    )
+                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
                 parts.append(part)
             if not parts:
                 continue
             normalized_name = "/".join(parts)
             target = (dest / normalized_name).resolve()
             if target != root and root not in target.parents:
-                raise RuntimeError(f"unsafe path in GitHub environment archive: {member.name!r}")
+                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
             top_dirs.add(parts[0])
             total += max(0, member.size)
             if total > _MAX_ARCHIVE_BYTES:
                 raise RuntimeError(
-                    f"GitHub environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+                    f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
                 )
             member.name = normalized_name
             tar.extract(member, dest)
     if len(top_dirs) != 1:
-        raise RuntimeError("GitHub environment archive had an unexpected layout")
+        raise RuntimeError("environment archive had an unexpected layout")
     extracted = dest / next(iter(top_dirs))
     if not extracted.is_dir():
-        raise RuntimeError("GitHub environment archive did not extract to a directory")
+        raise RuntimeError("environment archive did not extract to a directory")
     return extracted
 
 
@@ -267,6 +304,8 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
     ).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
     env_file = cache_dir / parsed.path
+    if env_file.is_dir():
+        env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
     if env_file.is_file():
         return env_file
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
@@ -280,12 +319,11 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
         extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
-            nested = candidate / _DEFAULT_ENVIRONMENT_PATH
-            flat = candidate / "environment.py"
-            candidate = nested if nested.is_file() else flat
+            candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
+        required_entrypoint = candidate.relative_to(extracted).as_posix()
         if not candidate.is_file():
             raise FileNotFoundError(
-                f"GitHub environment {parsed.canonical()} did not contain {parsed.path!r}"
+                f"environment archive did not contain required entrypoint {required_entrypoint!r}"
             )
         cache_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -296,6 +334,8 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
 
 
 def _resolve_environment_reference(env_ref: str) -> str:
+    if is_managed_environment_slug(env_ref):
+        return str(_resolve_github_environment_file(managed_slug_to_github_ref(env_ref)))
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         path = Path(env_ref)
@@ -389,7 +429,23 @@ class FreesoloEnvironment(BaseEnvironment):
         self.max_turns = 8
 
     def _task_example(self, example: dict):
-        return self._task_example_from_record(example)
+        return self._task_example_from_record(self._canonical_record(example))
+
+    @staticmethod
+    def _canonical_record(record: dict) -> dict:
+        raw = dict(record)
+        canonical = {}
+        if _CANONICAL_INPUT_KEY not in raw:
+            raise ValueError("Freesolo dataset records must contain an input field")
+        canonical[_CANONICAL_INPUT_KEY] = raw[_CANONICAL_INPUT_KEY]
+        if _CANONICAL_OUTPUT_KEY in raw:
+            canonical[_CANONICAL_OUTPUT_KEY] = raw[_CANONICAL_OUTPUT_KEY]
+        if raw.get("id") is not None:
+            canonical["id"] = raw["id"]
+        metadata = raw.get("metadata")
+        if isinstance(metadata, dict) and metadata:
+            canonical["metadata"] = metadata
+        return canonical
 
     def _reward_to_breakdown(self, reward) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -419,17 +475,20 @@ class FreesoloEnvironment(BaseEnvironment):
             examples = self._load_task_examples(self._source)
         records = []
         for example in examples:
-            record = dict(getattr(example, "record", {}) or {})
-            record.setdefault("task", getattr(example, "task", ""))
+            raw = dict(getattr(example, "record", {}) or {})
+            task = getattr(example, "task", None)
+            if _CANONICAL_INPUT_KEY not in raw and task is not None:
+                raw[_CANONICAL_INPUT_KEY] = task
             task_id = getattr(example, "task_id", None)
             if task_id is not None:
-                record.setdefault("id", task_id)
+                raw.setdefault("id", task_id)
             expected = getattr(example, "expected_output", None)
             if expected is not None:
-                record.setdefault("expected_output", _json_safe(expected))
+                raw.setdefault(_CANONICAL_OUTPUT_KEY, _json_safe(expected))
             metadata = getattr(example, "metadata", None)
             if isinstance(metadata, dict) and metadata:
-                record.setdefault("metadata", metadata)
+                raw.setdefault("metadata", metadata)
+            record = self._canonical_record(raw)
             records.append(record)
         return records
 
@@ -438,12 +497,11 @@ class FreesoloEnvironment(BaseEnvironment):
         return [dict(message) for message in messages]
 
     def sft_target(self, example: dict) -> str:
-        for key in ("completion", "expected_output", "output", "target", "answer"):
-            if example.get(key) is not None:
-                value = example[key]
-                if isinstance(value, list) and value and isinstance(value[-1], dict):
-                    return str(value[-1].get("content", ""))
-                return str(value)
+        value = example.get(_CANONICAL_OUTPUT_KEY)
+        if value is not None:
+            if isinstance(value, list) and value and isinstance(value[-1], dict):
+                return str(value[-1].get("content", ""))
+            return str(value)
         return ""
 
     def scores_breakdown(
@@ -476,10 +534,11 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def new_rollout_state(self, example: dict) -> dict:
         task = self._task_example(example)
-        messages = [dict(message) for message in self._env.start_episode(task, self._contract_text)]
+        prompt = [dict(message) for message in self._env.start_episode(task, self._contract_text)]
         return {
             "task": task,
-            "messages": messages,
+            "prompt": [dict(message) for message in prompt],
+            "messages": [dict(message) for message in prompt],
             "turns": [],
             "done": False,
             "response_text": "",
@@ -614,6 +673,9 @@ def load_freesolo_environment(env_id: str, **kwargs) -> FreesoloEnvironment:
 __all__ = [
     "FreesoloEnvironment",
     "GitHubEnvironmentRef",
+    "is_freesolo_environment_id",
     "is_github_environment_ref",
+    "is_managed_environment_slug",
     "load_freesolo_environment",
+    "managed_slug_to_github_ref",
 ]
