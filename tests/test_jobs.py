@@ -1219,7 +1219,7 @@ def test_update_will_not_overwrite_terminal_with_lifecycle_state(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _make_runpod_flash_mocks(monkeypatch, FakeRM, quota_error_msg=None):
+def _make_runpod_flash_mocks(monkeypatch, FakeRM):
     """Inject fake runpod_flash modules so deploy_train_endpoint can be called without the SDK."""
     import sys
     import types
@@ -1299,7 +1299,7 @@ def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
 
     monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", fake_sweep)
 
-    ep_id, ep_name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    ep_id, _ep_name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
 
     assert ep_id == "ep-new"
     assert attempts["count"] == 3, "should take 3 attempts (2 quota failures + 1 success)"
