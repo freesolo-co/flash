@@ -47,6 +47,13 @@ def _login() -> str:
     return f"{_USER_PREFIX}{next(_counter)}"
 
 
+def _identity_for_token(token: str) -> dict[str, str]:
+    if not token.startswith(_USER_PREFIX):
+        return {}
+    suffix = token.removeprefix(_USER_PREFIX)
+    return {"email": f"user-{suffix}@example.com", "key_prefix": "fslo_test"}
+
+
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
@@ -69,6 +76,7 @@ def api(tmp_path, monkeypatch):
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
     with TestClient(app_mod.create_app()) as client:
         yield client
 
@@ -77,9 +85,9 @@ def test_me(api):
     key = _login()
     me = api.get("/v1/me", headers=_bearer(key))
     assert me.status_code == 200
-    # A verified freesolo user key resolves to a per-token "freesolo" identity.
-    assert me.json()["email"] == "freesolo-user"
-    assert me.json()["key_prefix"] == "freesolo"
+    # A verified freesolo user key resolves to the Freesolo identity returned by verify.
+    assert me.json()["email"] == f"user-{key.removeprefix(_USER_PREFIX)}@example.com"
+    assert me.json()["key_prefix"] == "fslo_test"
 
 
 def test_requests_without_key_are_rejected(api):
@@ -133,10 +141,17 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
         return token == "fslo-user-good"
 
     monkeypatch.setattr(auth_mod, "_freesolo_verify", fake_verify)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {"email": "user-good@example.com", "key_prefix": "fslo_good"}
+        if token == "fslo-user-good"
+        else {},
+    )
 
     row = auth_mod.authenticate("Bearer fslo-user-good")
     assert row is not None
-    assert row["email"] == "freesolo-user"
+    assert row["email"] == "user-good@example.com"
     # An unverified token returns None (401).
     assert auth_mod.authenticate("Bearer fslo-user-bad") is None
     # The same key resolves to the same identity across requests (stable per-token row).
@@ -885,7 +900,7 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
 
     def fake_publish_package(*, package_b64, name, is_new, key):
         seen.update(package_b64=package_b64, name=name, is_new=is_new, key=key)
-        return "github:freesolo-co/environment-hub@main:key-1/e/publish-1/environment.py"
+        return "github:freesolo-co/environment-hub@main:user-example-com/e/publish-1/environment.py"
 
     monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
 

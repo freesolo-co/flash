@@ -181,7 +181,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
     if env_raw.get("path"):
         raise ConfigError(
             "local environment paths are no longer supported — remove `path` and reference a "
-            "Freesolo environment `id` returned by `flash env push`"
+            "Freesolo environment `id` returned by `flash env push --name <name>`"
         )
     # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
     # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
@@ -346,14 +346,14 @@ def _validate_spec(spec: JobSpec) -> None:
     # There is no default environment and no local path mode.
     if not spec.environment.id:
         raise ConfigError(
-            "config must set [environment] id (a GitHub Freesolo environment ref, "
-            'e.g. "github:freesolo-co/environment-hub@main:user/project/publish-id/environment.py"); '
+            "config must set [environment] id (upload an environment with "
+            "`flash env push --name <name>` and paste the returned id); "
             "there is no local path mode"
         )
     _require_environment_ref(
         spec.environment.id,
-        "[environment] id must be a Freesolo environment id / GitHub ref "
-        '(for example "github:freesolo-co/environment-hub@main:user/project/publish-id/environment.py")',
+        "[environment] id must be a Freesolo environment id returned by "
+        "`flash env push --name <name>`",
     )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")

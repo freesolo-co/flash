@@ -46,8 +46,7 @@ def load_environment(env_id: str, params: dict | None = None) -> Environment:
 
     if not env_id:
         raise ValueError(
-            "no environment specified: set [environment] id to a GitHub Freesolo "
-            "environment ref, e.g. "
-            "'github:freesolo-co/environment-hub@main:user/project/publish-id/environment.py'"
+            "no environment specified: set [environment] id to the id returned by "
+            "`flash env push --name <name>`"
         )
     return load_freesolo_environment(env_id, **params)
