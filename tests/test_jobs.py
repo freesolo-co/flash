@@ -1225,21 +1225,30 @@ def _make_runpod_flash_mocks(monkeypatch, FakeRM, quota_error_msg=None):
     import types
 
     class FakeEndpoint:
-        def __init__(self, **kwargs): pass
-        def _build_resource_config(self): return {}
+        def __init__(self, **kwargs):
+            pass
 
+        def _build_resource_config(self):
+            return {}
+
+    # Mark every stub as a package (via __path__) so Python allows dotted imports from them,
+    # e.g. `from runpod_flash.core.resources.resource_manager import ResourceManager`.
     rf_mod = types.ModuleType("runpod_flash")
+    rf_mod.__path__ = []
     rf_mod.Endpoint = FakeEndpoint
     monkeypatch.setitem(sys.modules, "runpod_flash", rf_mod)
+
+    core_mod = types.ModuleType("runpod_flash.core")
+    core_mod.__path__ = []
+    monkeypatch.setitem(sys.modules, "runpod_flash.core", core_mod)
+
+    res_mod = types.ModuleType("runpod_flash.core.resources")
+    res_mod.__path__ = []
+    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources", res_mod)
 
     rm_mod = types.ModuleType("runpod_flash.core.resources.resource_manager")
     rm_mod.ResourceManager = FakeRM
     monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", rm_mod)
-
-    core_mod = types.ModuleType("runpod_flash.core")
-    monkeypatch.setitem(sys.modules, "runpod_flash.core", core_mod)
-    res_mod = types.ModuleType("runpod_flash.core.resources")
-    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources", res_mod)
 
 
 def _patch_deploy_deps(monkeypatch, jobs):

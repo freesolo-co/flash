@@ -157,7 +157,7 @@ class JobHandle:
 def _is_workers_quota_error(exc: Exception) -> bool:
     """True when a RunPod exception signals the account worker quota is exhausted."""
     msg = str(exc).lower()
-    return "workers quota" in msg or "max workers" in msg
+    return "workers quota" in msg or "max workers across all endpoints" in msg
 
 
 def _sweep_idle_flash_endpoints(skip_name: str) -> int:
@@ -184,17 +184,21 @@ def _sweep_idle_flash_endpoints(skip_name: str) -> int:
             continue
         try:
             health = runpod_api.endpoint_health(eid) or {}
-            workers = health.get("workers") or {}
-            jobs_info = health.get("jobs") or {}
+            workers = health.get("workers")
+            jobs_info = health.get("jobs")
+            # If health is missing either section, we can't confirm the endpoint is idle —
+            # skip it rather than risk deleting an endpoint whose state is unknown.
+            if workers is None or jobs_info is None:
+                continue
             active_workers = sum(
                 workers.get(k, 0) or 0
                 for k in ("running", "ready", "idle", "initializing")
             )
             in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
             if active_workers == 0 and in_flight == 0:
-                runpod_api.delete_endpoint(eid)
-                deleted += 1
-                logger.info("quota-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
+                if runpod_api.delete_endpoint(eid):
+                    deleted += 1
+                    logger.info("quota-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
         except Exception:
             continue
     return deleted
