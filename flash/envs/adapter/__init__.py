@@ -82,6 +82,8 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
     repo = repo[:-4] if repo.endswith(".git") else repo
     if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
         ref = parts[3]
+        if ":" in ref:
+            return None
         raw_path = "/".join(parts[4:])
         try:
             path = _normalize_env_path(raw_path)
