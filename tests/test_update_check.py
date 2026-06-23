@@ -143,6 +143,13 @@ def test_fetch_latest_version_missing_field_returns_none(monkeypatch):
     assert uc._fetch_latest_version() is None
 
 
+@pytest.mark.parametrize("payload", [[], {"info": None}, "just a string", {"info": [1, 2]}])
+def test_fetch_latest_version_tolerates_odd_json(payload, monkeypatch):
+    # a wrong-shaped (but valid) JSON response must not raise out of the fetch
+    monkeypatch.setattr(uc.urllib.request, "urlopen", _fake_urlopen(payload))
+    assert uc._fetch_latest_version() is None
+
+
 def test_refresh_cache_writes_latest(cache_path, monkeypatch):
     monkeypatch.setattr(uc, "_fetch_latest_version", lambda: "9.9.9")
     uc._refresh_cache()
@@ -151,23 +158,44 @@ def test_refresh_cache_writes_latest(cache_path, monkeypatch):
     assert isinstance(saved["checked_at"], (int, float))
 
 
-def test_refresh_cache_stamps_time_on_failure(cache_path, monkeypatch):
-    # a failed lookup must still record checked_at (so offline users don't re-check every command)
+def test_refresh_cache_noop_on_failure(cache_path, monkeypatch):
+    # the attempt time is stamped synchronously elsewhere, so a failed lookup just leaves the cache
+    cache_path.write_text(json.dumps({"checked_at": 1.0, "pypi_version": "9.9.9"}))
     monkeypatch.setattr(uc, "_fetch_latest_version", lambda: None)
     uc._refresh_cache()
+    assert json.loads(cache_path.read_text()) == {"checked_at": 1.0, "pypi_version": "9.9.9"}
+
+
+def test_stamp_check_time_records_timestamp(cache_path):
+    uc._stamp_check_time()
     saved = json.loads(cache_path.read_text())
     assert isinstance(saved["checked_at"], (int, float))
     assert "pypi_version" not in saved
 
 
-def test_refresh_cache_keeps_known_version_on_failure(cache_path, monkeypatch):
-    # a later failed lookup must not drop the version a previous success recorded
+def test_stamp_check_time_preserves_known_version(cache_path):
     cache_path.write_text(json.dumps({"checked_at": 1.0, "pypi_version": "9.9.9"}))
-    monkeypatch.setattr(uc, "_fetch_latest_version", lambda: None)
-    uc._refresh_cache()
+    uc._stamp_check_time()
     saved = json.loads(cache_path.read_text())
-    assert saved["pypi_version"] == "9.9.9"
-    assert saved["checked_at"] > 1.0
+    assert saved["pypi_version"] == "9.9.9"  # not dropped
+    assert saved["checked_at"] > 1.0  # but refreshed
+
+
+def test_join_timeout_covers_fetch_timeout():
+    # the once-a-day refresh must be able to finish (and record its result) within the join wait,
+    # otherwise the daemon worker is killed at process exit and the cache stays stale
+    assert uc._JOIN_TIMEOUT_S >= uc._FETCH_TIMEOUT_S
+
+
+def test_maybe_start_stamps_check_time_synchronously(cache_path, monkeypatch):
+    # back-off must be recorded even if the worker thread never gets to write (here it's a no-op)
+    monkeypatch.setattr(uc, "_enabled", lambda: True)
+    monkeypatch.setattr(uc, "_refresh_cache", lambda: None)
+    thread = uc.maybe_start_update_check()
+    if thread is not None:
+        thread.join(timeout=2.0)
+    saved = json.loads(cache_path.read_text())
+    assert isinstance(saved["checked_at"], (int, float))
 
 
 def test_read_cache_coerces_non_object(cache_path):

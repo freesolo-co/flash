@@ -5,11 +5,14 @@ with ``urllib`` and compares the published version against the installed ``__ver
 
 Design constraints that keep it from ever getting in the way:
 
-- **Never blocks or breaks a command.** The PyPI lookup runs in a daemon thread and every
-  failure (offline, timeout, bad JSON) is swallowed. The notice is built from a cached
-  result, so the common path does zero network I/O.
+- **Stays out of the way.** The PyPI lookup runs in a daemon thread (so it overlaps the
+  command) and every failure (offline, timeout, bad JSON) is swallowed. Only the once-a-day
+  refresh waits briefly for that thread; every other command builds the notice from cache with
+  zero network I/O.
 - **Cached once per day.** The latest version is stored in ``~/.flash/update_check.json``;
-  we only hit PyPI when that cache is older than :data:`_CHECK_INTERVAL_S`.
+  we only hit PyPI when that cache is older than :data:`_CHECK_INTERVAL_S`. The check time is
+  stamped synchronously before the lookup so the daily back-off holds even if the worker thread
+  is killed at process exit before it records a result.
 - **stderr only, TTY only.** The notice prints to stderr (never stdout), so it can't corrupt
   JSON piped to ``jq`` or captured output, and it's suppressed entirely when stderr isn't a
   terminal (pipes, redirects, CI, tests). Color is dropped when ``NO_COLOR`` is set.
@@ -44,9 +47,11 @@ CACHE_PATH = CONFIG_DIR / "update_check.json"
 
 # Re-check PyPI at most once a day; the notice itself is shown on every command from cache.
 _CHECK_INTERVAL_S = 24 * 60 * 60
-# How long the lookup itself may take, and how long we'll wait for it at the end of a command.
-_FETCH_TIMEOUT_S = 2.0
-_JOIN_TIMEOUT_S = 1.0
+# How long the lookup may take, and how long the once-a-day refresh waits for it at the end of a
+# command. Keep the join >= the fetch timeout so the worker thread finishes (and records its
+# result) within the wait instead of being killed at process exit mid-write.
+_FETCH_TIMEOUT_S = 1.5
+_JOIN_TIMEOUT_S = 2.0
 
 _OPT_OUT_ENV = "FLASH_NO_UPDATE_CHECK"
 
@@ -122,9 +127,9 @@ def _is_newer(latest: str, current: str) -> bool:
 def _clean_version(value: object) -> str | None:
     """Return ``value`` only if it's a safe, escape-free version string, else ``None``.
 
-    Guards both the PyPI response and the on-disk cache: ``_release_tuple`` parses just the
-    numeric prefix, so without this an injected suffix (ANSI codes, newlines) could reach the
-    terminal. Non-strings (and anything outside the PEP 440 charset) are rejected.
+    Guards both the PyPI response and the on-disk cache: ``_version_key`` parses just the
+    numeric/marker prefix, so without this an injected suffix (ANSI codes, newlines) could reach
+    the terminal. Non-strings (and anything outside the PEP 440 charset) are rejected.
     """
     return value if isinstance(value, str) and _SAFE_VERSION.match(value) else None
 
@@ -147,7 +152,7 @@ def _check_due(now: float) -> bool:
 
 
 def _fetch_latest_version(timeout: float = _FETCH_TIMEOUT_S) -> str | None:
-    """Return PyPI's latest stable version for the package, or ``None`` on any failure."""
+    """Return PyPI's latest version for the package, or ``None`` on any failure/odd response."""
     req = urllib.request.Request(
         _PYPI_JSON_URL,
         headers={
@@ -157,24 +162,44 @@ def _fetch_latest_version(timeout: float = _FETCH_TIMEOUT_S) -> str | None:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            version = json.loads(resp.read()).get("info", {}).get("version")
+            payload = json.loads(resp.read())
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
         logger.debug("update check: PyPI lookup failed: %s", exc)
         return None
+    # Expected shape is {"info": {"version": ...}}; tolerate anything else (a proxy error page,
+    # ``[]``, ``{"info": null}``, ...) instead of letting a dereference raise into the caller.
+    info = payload.get("info") if isinstance(payload, dict) else None
+    version = info.get("version") if isinstance(info, dict) else None
     return _clean_version(version)
 
 
-def _refresh_cache() -> None:
-    """Hit PyPI and persist the result; runs in a daemon thread, so never raises out."""
-    try:
-        latest = _fetch_latest_version()
-        # Always stamp the attempt time, even on failure: otherwise _check_due stays true and a
-        # firewalled/offline user would re-run the lookup (and pay the join wait) on every
-        # command instead of once a day. Keep any previously known version when the fetch fails.
+def _stamp_check_time() -> None:
+    """Record "checked just now" (keeping any cached version), synchronously and best-effort.
+
+    Done before the background lookup starts so the daily back-off holds even if the daemon worker
+    is killed at process exit before it records its own result — otherwise a stale/missing cache
+    would make every command re-run (and wait on) the lookup. Never raises (runs before main()'s
+    error handling).
+    """
+    with contextlib.suppress(Exception):
         cache = _read_cache()
         cache["checked_at"] = time.time()
-        if latest:
-            cache["pypi_version"] = latest
+        secure_json_write(CACHE_PATH, cache)
+
+
+def _refresh_cache() -> None:
+    """Fetch from PyPI and persist the version on success; runs in a daemon thread, never raises.
+
+    The attempt time is already stamped by :func:`_stamp_check_time`, so a failed lookup just
+    returns and lets the daily back-off (set there) stand.
+    """
+    try:
+        latest = _fetch_latest_version()
+        if not latest:
+            return
+        cache = _read_cache()
+        cache["checked_at"] = time.time()
+        cache["pypi_version"] = latest
         secure_json_write(CACHE_PATH, cache)
     except Exception as exc:  # truly never let a background thread escape
         logger.debug("update check: refresh failed: %s", exc)
@@ -208,6 +233,9 @@ def maybe_start_update_check() -> threading.Thread | None:
     """
     if not _enabled() or not _check_due(time.time()):
         return None
+    # Stamp the attempt synchronously before spawning the worker, so the daily back-off holds even
+    # if the daemon is killed at process exit before it writes (see _stamp_check_time).
+    _stamp_check_time()
     thread = threading.Thread(target=_refresh_cache, name="flash-update-check", daemon=True)
     try:
         thread.start()
