@@ -410,6 +410,48 @@ def _run_seed_loop(
         artifacts_dir=artifacts_dir(spec),
         resume_seed_index=None,
     )
+    _charge_completed_run_best_effort(spec, log)
+
+
+def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
+    """Bill a successfully completed external run without changing its training result."""
+    from flash.runner import _update, get_status
+    from flash.server.auth import INTERNAL_KEY_ENV
+    from flash.server.billing import BillingError, charge_completed_run
+
+    status = get_status(spec.run_id)
+    if not status.billing_context or status.billing_state == "charged":
+        return
+
+    internal_key = os.environ.get(INTERNAL_KEY_ENV, "").strip()
+    if not internal_key:
+        detail = f"{INTERNAL_KEY_ENV} is not configured; completed run was not billed"
+        _update(spec.run_id, "done", billing_state="failed", billing_error=detail)
+        print(f"billing failed: {detail}", file=log, flush=True)
+        return
+
+    _update(spec.run_id, "done", billing_state="charging", billing_error=None)
+    status = get_status(spec.run_id)
+    try:
+        charge = charge_completed_run(internal_key=internal_key, status=status)
+    except BillingError as exc:
+        _update(spec.run_id, "done", billing_state="failed", billing_error=exc.detail)
+        print(f"billing failed: {exc.detail}", file=log, flush=True)
+        return
+
+    _update(
+        spec.run_id,
+        "done",
+        billing_state="charged",
+        billing_error=None,
+        billing_charge=charge,
+    )
+    print(
+        f"billing charged: amount_cents={charge.get('amountCents')} "
+        f"replay={bool(charge.get('replay'))}",
+        file=log,
+        flush=True,
+    )
 
 
 def _gc_run_endpoints(spec: JobSpec) -> None:
