@@ -72,7 +72,7 @@ def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
     assert cap["name"] == "explicit-env"
 
 
-def test_push_single_py_does_not_ship_sibling_datasets(monkeypatch, tmp_path):
+def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "datasets").mkdir()
@@ -81,10 +81,10 @@ def test_push_single_py_does_not_ship_sibling_datasets(monkeypatch, tmp_path):
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     assert cli.cmd_env_push(_args(env_file)) == 0
-    assert "datasets/train.jsonl" not in _members(cap["package_b64"])
+    assert "datasets/train.jsonl" in _members(cap["package_b64"])
 
 
-def test_push_single_py_does_not_ship_sibling_database(monkeypatch, tmp_path):
+def test_push_single_py_ships_sibling_database(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "state.sqlite").write_text("sqlite bytes")
@@ -92,7 +92,7 @@ def test_push_single_py_does_not_ship_sibling_database(monkeypatch, tmp_path):
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     assert cli.cmd_env_push(_args(env_file)) == 0
-    assert "state.sqlite" not in _members(cap["package_b64"])
+    assert "state.sqlite" in _members(cap["package_b64"])
 
 
 def test_push_single_py_ships_sibling_helper_modules(monkeypatch, tmp_path):
