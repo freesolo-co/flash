@@ -453,40 +453,65 @@ def _metric_curve(trainer, key: str) -> list:
         return []
 
 
-def _drop_fla_on_hopper() -> None:
-    """Remove flash-linear-attention when running on a Hopper GPU (sm90, H100).
+def _force_torch_delta() -> bool:
+    """True when the operator forced the pure-PyTorch delta rule via FLASH_FORCE_TORCH_DELTA.
 
-    fla's gated chunk_bwd Triton kernel is miscomputed on Hopper with Triton>=3.4 and
-    HARD-RAISES (fla #640), so every gated-delta (Qwen3.5/3.6 family) GRPO backward crashes.
-    The worker base image BAKES fla in, and per-run installs (extra_pip / `prime env install`)
-    can pull it back, so the only reliable place to drop it is HERE: in the worker process,
-    after all installs and BEFORE any model import. transformers then uses the correct
-    pure-PyTorch delta rule (2-3x slower but it RUNS). Runs on BOTH substrates (RunPod and
-    Vast both exec this module). importlib caches are invalidated so the later
-    is_fla_available() probe sees it gone. Ampere/Ada/Blackwell keep fla for the speedup.
+    Mirrors ``providers.runpod.train.deps._force_torch_delta`` (the control-plane copy) so the
+    runtime backstop and the dep list agree on when to drop fla. Kept local on purpose: the worker
+    process must not import the providers/control-plane layer.
+    """
+    return os.environ.get("FLASH_FORCE_TORCH_DELTA", "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _maybe_drop_fla() -> None:
+    """Remove flash-linear-attention when its GDN backward is unsafe on this worker's GPU.
+
+    Drops fla (transformers then uses the correct, 2-3x slower pure-PyTorch delta rule) when EITHER:
+      * the operator forced it via FLASH_FORCE_TORCH_DELTA (any arch) — the escape hatch for a GPU
+        where fla's GDN backward is suspect, e.g. consumer Blackwell sm120 (RTX 5090) before the
+        gradcheck (tests/test_gdn_parity_gpu.py) confirms parity, OR
+      * the GPU is HOPPER (sm90, H100): fla's gated chunk_bwd is miscomputed there (Triton>=3.4,
+        fla #640).
+    Ampere/Ada/Blackwell otherwise keep fla for the speedup. This mirrors the control-plane
+    ``resolve_worker_deps`` rule, but it is the only RELIABLE place to enforce it: the base image
+    BAKES fla in and per-run installs (extra_pip / `prime env install`) can pull it back, so the
+    drop must happen HERE in the worker process, after all installs and BEFORE any model import.
+    Runs on BOTH substrates (RunPod and Vast exec this module). importlib caches are invalidated so
+    the later is_fla_available() probe sees it gone.
     """
     import importlib.util
     import subprocess
 
-    try:
-        import torch
+    forced = _force_torch_delta()
+    if not forced:
+        try:
+            import torch
 
-        if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
-            return  # not Hopper: fla's Triton kernel is correct here, keep it.
-    except Exception:
-        return
+            if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
+                return  # not forced and not Hopper: fla's Triton kernel is kept here.
+        except Exception:
+            return
 
     if importlib.util.find_spec("fla") is None:
         return
     # pip first (clears metadata); _remove_fla_from_disk then deletes any package dir pip left
     # behind (incomplete RECORD / non-pip base-image install / a copy on another sys.path entry).
+    # 0.5.1 split the package, so uninstall both the meta-package and fla-core (the importable `fla`).
     subprocess.run(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "flash-linear-attention"], check=False
+        [sys.executable, "-m", "pip", "uninstall", "-y", "flash-linear-attention", "fla-core"],
+        check=False,
     )
     removed, still = _remove_fla_from_disk()
+    reason = "FLASH_FORCE_TORCH_DELTA" if forced else "Hopper sm90 (fla #640)"
     print(
-        f"[hopper] fla removed {removed or 'nothing'} (still_importable={still}) -> "
-        f"{'WARNING fla remains' if still else 'pure-PyTorch delta rule'} (fla #640)",
+        f"[fla-drop] {reason}: fla removed {removed or 'nothing'} (still_importable={still}) -> "
+        f"{'WARNING fla remains' if still else 'pure-PyTorch delta rule'}",
         flush=True,
     )
 

@@ -59,10 +59,19 @@ WORKER_DEPS = [
     # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this,
     # transformers falls back to a pure-PyTorch delta rule and GRPO trainer steps are
     # 2-3x slower (measured A/B on Qwen3.5-2B: ~65 s/step -> ~20 s/step steady).
-    "flash-linear-attention==0.5.0",
-    # NB: fla's gated chunk_bwd is broken on HOPPER (H100) with Triton >= 3.4 (fla #640), so
-    # resolve_worker_deps DROPS fla on sm90 (the correct pure-PyTorch delta rule runs instead). The
-    # dense Qwen3.5 GDN models route to consumer cards by default, where fla works.
+    # The [cuda] extra is REQUIRED on 0.5.1+: fla split into fla-core with torch/triton behind
+    # extras, so the bare name no longer pulls them (the worker has both from the base image, but
+    # the extra is the documented-correct spec and re-locks cleanly).
+    "flash-linear-attention[cuda]==0.5.1",
+    # NB on correctness: fla #640 is a Triton>=3.4 PRECISION miscompute of the gated chunk_bwd on
+    # HOPPER (sm90) at tile BK=64; resolve_worker_deps DROPS fla on sm90 so the correct pure-PyTorch
+    # delta rule runs instead. 0.5.1 adds consumer-Blackwell (sm120 / RTX 5090) detection (fla #940)
+    # so the 5090 finally receives fla's Blackwell codegen workarounds (0.5.0 classified ONLY sm100
+    # datacenter Blackwell, so the 5090 got none). But GDN-on-Blackwell codegen bugs are NOT fully
+    # fixed upstream (fla #913 open; the real fixes #946/#948 still unreleased), so sm120 GDN backward
+    # is smoke-tested, NOT gradient-parity-validated. Set FLASH_FORCE_TORCH_DELTA=1 to force the
+    # pure-PyTorch fallback on ANY arch (e.g. a 5090 run you don't trust) until the 5090 gradcheck
+    # (tests/test_gdn_parity_gpu.py) confirms parity. Ampere/Ada otherwise keep fla for the speedup.
     # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
     # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
     # (chalk_extra_pip) appends the version-pinned ``freesolo-chalk`` (DEFAULT_CHALK_SPEC) from PyPI
@@ -98,15 +107,35 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 
 
+def _force_torch_delta() -> bool:
+    """True when the operator forced the pure-PyTorch delta rule via FLASH_FORCE_TORCH_DELTA.
+
+    The escape hatch to DROP flash-linear-attention on ANY arch (so transformers uses the correct,
+    slower delta rule) without a redeploy — for a GPU where fla's GDN backward is suspect, e.g. a
+    5090 (sm120) before the gradcheck confirms parity. The worker mirrors this exact predicate in
+    ``engine.worker.perf`` so the control-plane dep list and the runtime backstop agree.
+    """
+    return os.environ.get("FLASH_FORCE_TORCH_DELTA", "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
     """The dependency list Flash installs on the GPU worker for this run.
 
     Precedence: FLASH_WORKER_DEPS (explicit list) > the pinned ``WORKER_DEPS``.
 
-    GPU-specific: on HOPPER (sm90, H100), DROP flash-linear-attention — its gated
-    chunk_bwd Triton kernel is miscomputed there (Triton>=3.4, fla #640). Without fla,
-    transformers uses the correct pure-PyTorch delta rule (slower but correct).
-    Ampere/Ada/Blackwell keep fla for the speedup.
+    fla-drop: DROP flash-linear-attention (transformers then uses the correct, slower
+    pure-PyTorch delta rule) when EITHER the operator forces it via FLASH_FORCE_TORCH_DELTA
+    (any arch — the escape hatch for a GPU where fla's GDN backward is suspect, e.g. sm120
+    before the gradcheck confirms parity) OR the GPU is HOPPER (sm90, H100), where fla's gated
+    chunk_bwd is miscomputed (Triton>=3.4, fla #640). Ampere/Ada/Blackwell otherwise keep fla
+    for the speedup. The worker-side ``_maybe_drop_fla`` backstop applies the SAME rule at
+    runtime (removes a baked-in/reinstalled copy the dep list alone can't).
     """
     explicit = os.environ.get("FLASH_WORKER_DEPS")
     if explicit:
@@ -125,18 +154,20 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
         if deps:
             return deps
     deps = list(WORKER_DEPS)
-    # Hopper (sm90) fla strategy: DROP flash-linear-attention -> the correct pure-PyTorch delta
-    # rule. fla's gated chunk_bwd Triton kernel is miscomputed on Hopper (Triton>=3.4, fla #640),
-    # so on H100 we run without it (the dense Qwen3.5 GDN models route to consumer cards by
-    # default, where fla stays). Ampere/Ada/Blackwell keep fla for the speedup.
-    if friendly_gpu:
+    # fla-drop -> the correct (slower) pure-PyTorch delta rule. Drop when the operator forces it on
+    # ANY arch (FLASH_FORCE_TORCH_DELTA), or when the GPU is HOPPER (sm90): fla's gated chunk_bwd is
+    # miscomputed there (Triton>=3.4, fla #640). Ampere/Ada/Blackwell otherwise keep fla for the
+    # speedup. _maybe_drop_fla is the worker-side backstop for the same rule.
+    drop_fla = _force_torch_delta()
+    if friendly_gpu and not drop_fla:
         try:
             from flash.providers.base import get_gpu_info
 
-            if get_gpu_info(friendly_gpu).sm == "sm90":
-                deps = [d for d in deps if not d.startswith("flash-linear-attention")]
+            drop_fla = get_gpu_info(friendly_gpu).sm == "sm90"
         except Exception:
-            pass
+            drop_fla = False
+    if drop_fla:
+        deps = [d for d in deps if not d.startswith("flash-linear-attention")]
     # Additive per-run extras (e.g. an extra pinned wheel for an A/B) without
     # restating the whole pinned stack the way FLASH_WORKER_DEPS requires.
     extra = os.environ.get("FLASH_WORKER_EXTRA_DEPS")
@@ -360,6 +391,11 @@ def build_worker_env(
         # The chalk install spec itself — install_chalk_kernels warns pointing at it when a
         # FLASH_* flag is set but chalk is absent.
         "FLASH_CHALK_SPEC",
+        # The fla escape hatch: forward the operator's FLASH_FORCE_TORCH_DELTA so the WORKER's
+        # _maybe_drop_fla (which reads its own process env, sourced from this forwarded allowlist)
+        # drops fla -> the correct pure-PyTorch delta rule. A per-run [worker_env] override also
+        # works (merged below; not a reserved key).
+        "FLASH_FORCE_TORCH_DELTA",
     ):
         # Forward when SET, even if empty: an explicit "" is a meaningful override.
         if os.environ.get(k) is not None:

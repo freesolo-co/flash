@@ -63,11 +63,11 @@ from flash.engine.worker.lora import (
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,  # noqa: F401
-    _drop_fla_on_hopper,
     _estimate_params,  # noqa: F401
     _flash_attn_available,
     _GpuPeakSampler,
     _liger_default_for_model,  # noqa: F401
+    _maybe_drop_fla,
     _memory_mode,
     _metric_curve,
     _peak_gpu_gb,
@@ -1888,8 +1888,8 @@ def main():
     try:
         # Idempotency FIRST — before any env-mutating pip install / package removal: a re-delivered
         # job whose DONE already exists must return the persisted metrics and exit WITHOUT running
-        # _drop_fla_on_hopper() (pip-uninstalls fla) — that wasted a worker mutating its env on an
-        # already-complete run. It is called after the DONE check below (see _drop_fla_on_hopper()).
+        # _maybe_drop_fla() (pip-uninstalls fla) — that wasted a worker mutating its env on an
+        # already-complete run. It is called after the DONE check below (see _maybe_drop_fla()).
         if HF_REPO:
             from huggingface_hub import hf_hub_download
 
@@ -1922,7 +1922,7 @@ def main():
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
         heartbeat("boot")
-        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
+        _maybe_drop_fla()  # fla guard: drop on Hopper sm90 or FLASH_FORCE_TORCH_DELTA (see _maybe_drop_fla)
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {

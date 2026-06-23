@@ -40,6 +40,47 @@ def test_worker_stack_pins_qwen35_capable_versions():
     assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
 
 
+def test_worker_stack_pins_fla_cuda_extra_051():
+    # 0.5.1 split packaging needs the [cuda] extra to pull torch/triton; 0.5.1 is the first
+    # release with consumer-Blackwell (sm120) detection (fla #940). A bare/stale pin regresses.
+    assert "flash-linear-attention[cuda]==0.5.1" in " ".join(WORKER_DEPS)
+
+
+def _has_fla(deps):
+    return any(d.startswith("flash-linear-attention") for d in deps)
+
+
+def test_resolve_worker_deps_drops_fla_on_hopper(monkeypatch):
+    # sm90 (H100): fla's gated chunk_bwd is miscomputed (fla #640) -> drop it so transformers uses
+    # the correct pure-PyTorch delta rule. Consumer cards keep fla for the speedup.
+    monkeypatch.delenv("FLASH_WORKER_DEPS", raising=False)
+    monkeypatch.delenv("FLASH_FORCE_TORCH_DELTA", raising=False)
+    assert not _has_fla(resolve_worker_deps("H100"))
+    assert _has_fla(resolve_worker_deps("RTX 5090"))
+
+
+def test_resolve_worker_deps_force_torch_delta_drops_fla_any_arch(monkeypatch):
+    # The escape hatch: FLASH_FORCE_TORCH_DELTA drops fla regardless of GPU (e.g. an untrusted
+    # 5090 run before the gradcheck confirms sm120 parity).
+    monkeypatch.delenv("FLASH_WORKER_DEPS", raising=False)
+    monkeypatch.setenv("FLASH_FORCE_TORCH_DELTA", "1")
+    assert not _has_fla(resolve_worker_deps("RTX 5090"))
+    assert not _has_fla(resolve_worker_deps())  # no gpu hint either
+
+
+def test_force_torch_delta_truthiness(monkeypatch):
+    from flash.providers.runpod.train.deps import _force_torch_delta
+
+    for off in ("", "0", "false", "False", "no", "off", "   "):
+        monkeypatch.setenv("FLASH_FORCE_TORCH_DELTA", off)
+        assert _force_torch_delta() is False
+    for on in ("1", "true", "yes", "on", "anything"):
+        monkeypatch.setenv("FLASH_FORCE_TORCH_DELTA", on)
+        assert _force_torch_delta() is True
+    monkeypatch.delenv("FLASH_FORCE_TORCH_DELTA", raising=False)
+    assert _force_torch_delta() is False
+
+
 # ---------------------------------------------------------------------------
 # lora_exclude_modules: vision tower excluded for qwen3_5*, none for text models
 # ---------------------------------------------------------------------------

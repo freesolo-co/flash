@@ -130,6 +130,18 @@ def test_build_worker_env_forwards_chalk_kernel_flags(monkeypatch):
     assert not any(k in env2 for k in flags)
 
 
+def test_build_worker_env_forwards_force_torch_delta(monkeypatch):
+    """The fla escape hatch FLASH_FORCE_TORCH_DELTA is read by the WORKER's _maybe_drop_fla from
+    its own process env, so an operator-set value must be forwarded by the allowlist (else it
+    silently no-ops on every remote run and a suspect-on-sm120 fla can't be dropped)."""
+    from flash.providers.runpod.train import build_worker_env
+
+    monkeypatch.setenv("FLASH_FORCE_TORCH_DELTA", "1")
+    assert build_worker_env(_spec(), 0).get("FLASH_FORCE_TORCH_DELTA") == "1"
+    monkeypatch.delenv("FLASH_FORCE_TORCH_DELTA", raising=False)
+    assert "FLASH_FORCE_TORCH_DELTA" not in build_worker_env(_spec(), 0)
+
+
 def _clear_chalk_flags(monkeypatch):
     for k in (
         "FLASH_MLP_KERNEL",

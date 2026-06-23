@@ -38,17 +38,20 @@ RUN pip install --no-cache-dir \
     "accelerate>=1.4" \
     "wandb>=0.17" \
     "liger-kernel>=0.5" \
-    "flash-linear-attention==0.5.0" \
+    "flash-linear-attention[cuda]==0.5.1" \
     "hf_transfer" \
     "verifiers>=0.1.10" \
     "prime" \
     "runpod"
-# Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels, which are correct
-# on consumer cards (Ampere/Ada/Blackwell). On Hopper (sm90) fla's GDN chunk_bwd is miscomputed
-# (fla #640) and its cumsum kernels hit a num_warps=8 LinearLayout assertion (fla #734); both fixes
-# are unreleased (post-0.5.0 git main) and #640's backward correctness is unconfirmed, so on Hopper
-# the worker DROPS fla (engine.worker._drop_fla_on_hopper) and transformers uses its native
-# pure-PyTorch delta rule — slower but correct.
+# Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. The [cuda] extra is
+# required on 0.5.1+ (fla split into fla-core with torch/triton behind extras; torch/triton are
+# already in the base image, so pip is a no-op for them, but the extra is the correct spec). On
+# Hopper (sm90) fla's GDN chunk_bwd is miscomputed (fla #640, Triton>=3.4) so the worker DROPS fla
+# (engine.worker._maybe_drop_fla) and transformers uses its native pure-PyTorch delta rule — slower
+# but correct. 0.5.1 adds consumer-Blackwell (sm120/RTX 5090) detection (fla #940), but GDN-on-
+# Blackwell codegen bugs are NOT fully fixed upstream (fla #913 open; fixes #946/#948 unreleased),
+# so sm120 GDN backward is smoke-tested, NOT parity-validated. Set FLASH_FORCE_TORCH_DELTA=1 to drop
+# fla on any arch (the escape hatch) until the 5090 gradcheck confirms parity.
 
 # FlashAttention: PREFER a prebuilt wheel. There is no OFFICIAL Dao-AILab wheel for torch 2.10 yet,
 # but community CI publishes matching wheels (cu128/torch2.10/cp312); CI passes one as FLASH_ATTN_SPEC

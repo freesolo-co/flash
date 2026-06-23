@@ -50,7 +50,7 @@ def _train_body(input_data: dict) -> dict:
 
     from huggingface_hub import snapshot_download
 
-    # NB: the Hopper fla guard lives in engine.worker._drop_fla_on_hopper (runs in the worker
+    # NB: the fla guard lives in engine.worker._maybe_drop_fla (runs in the worker
     # process AFTER all installs, before any model import) — doing it here would be undone by a
     # later env install that pulls fla back, and depends on a handler redeploy.
 
@@ -61,10 +61,11 @@ def _train_body(input_data: dict) -> dict:
         # not after model download + worker startup with a less actionable error.
         subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
 
-    # NB: fla is dropped on Hopper (sm90) automatically — resolve_worker_deps omits it from the
-    # install list, and engine.worker._drop_fla_on_hopper removes any baked-in copy at worker
-    # startup (fla's GDN backward is miscomputed on sm90, #640). No env toggle: fla only ever runs
-    # on the consumer archs where its Triton kernel is correct.
+    # NB: fla is dropped automatically on Hopper (sm90; GDN backward miscomputed, #640) or when the
+    # operator sets FLASH_FORCE_TORCH_DELTA — resolve_worker_deps omits it from the install list and
+    # engine.worker._maybe_drop_fla removes any baked-in copy at worker startup. sm120 (5090) keeps
+    # fla by default, but its GDN backward is smoke-tested, NOT parity-validated (#913); the
+    # force-toggle is the escape hatch until the 5090 gradcheck confirms parity.
 
     # Install the run's verifiers environment(s) through the authenticated private installer.
     # The public pip index does not serve private env wheels, so a plain pip install can't fetch

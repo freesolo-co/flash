@@ -205,7 +205,7 @@ def main() -> int:
                     )
         except Exception as _e:
             print("wandb setup skipped:", _e)
-        # NB: the Hopper fla guard lives in engine.worker._drop_fla_on_hopper (runs in the worker
+        # NB: the fla guard lives in engine.worker._maybe_drop_fla (runs in the worker
         # process after all installs, before any model import) — not here, where a later
         # install could pull fla back in. The bootstrap just fetches code and runs the worker.
 
@@ -215,9 +215,10 @@ def main() -> int:
             # / verifiers extras) must stop NOW with an actionable error, not proceed to
             # a later import crash while the paid instance runs (matches the RunPod path).
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
-        # NB: fla is dropped on Hopper (sm90) automatically by engine.worker._drop_fla_on_hopper at
-        # worker startup (fla's GDN backward is miscomputed on sm90, #640) — no bootstrap uninstall
-        # or env toggle. fla only ever runs on the consumer archs where its Triton kernel is correct.
+        # NB: fla is dropped automatically on Hopper (sm90; GDN backward miscomputed, #640) or when
+        # the operator sets FLASH_FORCE_TORCH_DELTA, via engine.worker._maybe_drop_fla at worker
+        # startup — no bootstrap uninstall needed. sm120 (5090) keeps fla by default, but its GDN
+        # backward is smoke-tested, NOT parity-validated (#913); the force-toggle is the escape hatch.
         # Install the run's verifiers environment(s) through the authenticated private installer
         # (mirrors runpod/train.py:_train_body). The public pip index does not serve private env
         # wheels; this path pulls/builds/installs public + private alike.
