@@ -29,8 +29,8 @@ def coerce_bool(value: Any) -> bool:
     """Parse a bool from loosely-typed sources (JSON request bodies / env / persisted dicts).
 
     bool(...) on a string is truthy for ANY non-empty string, so "false"/"0"/"no" would
-    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False, so
-    e.g. JSON ``"is_new": "false"`` is parsed as False. An already-bool value passes through.
+    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False.
+    An already-bool value passes through.
     """
     if isinstance(value, str):
         return value.strip().lower() not in _FALSE_STRINGS
@@ -98,7 +98,7 @@ def _opt_float(value: Any) -> float | None:
 
 @dataclass(frozen=True)
 class EnvironmentSpec:
-    # Published verifiers environment id ("owner/name") or installed/local env id. No default:
+    # Freesolo environment id. No default:
     # a run must name an environment explicitly (validated in schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
@@ -106,6 +106,10 @@ class EnvironmentSpec:
     # Filled in client-side from the local install manifest so the managed control
     # plane never depends on client-local state; empty means "derive on the server".
     pip: tuple[str, ...] = ()
+    # Secret env var names the environment requires on the worker. Values are never stored in the
+    # spec; the client reads matching local env/.env values and sends them out-of-band via
+    # runtime_secrets.
+    secrets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -137,7 +141,7 @@ class TrainSpec:
     max_steps: int | None = None
     max_examples: int | None = None
     # GRPO recipe knobs (datums parity), shipped by the SDK in [train] (NOT in
-    # [environment.params], which is forwarded verbatim to the verifiers env loader).
+    # [environment.params], which is forwarded verbatim to the Freesolo env loader).
     # None/() -> recipe default. group_size = completions per prompt; temperature = rollout
     # sampling temp; max_tokens = completion budget; kl_penalty_coef = KL beta;
     # advantage_clip = centered-advantage clamp; thinking_length_penalty_coef =
@@ -230,11 +234,12 @@ class JobSpec:
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
         env = data.get("environment") or {}
         # Defense-in-depth: a stale/older payload may still carry a local `path`. The worker only
-        # runs published environment ids, so reject it here rather than silently dropping it.
+        # runs published Freesolo environment ids, so reject it here rather than silently
+        # dropping it.
         if isinstance(env, dict) and env.get("path"):
             raise ValueError(
                 "local environment paths are no longer supported; the worker only runs "
-                "published verifiers environment ids"
+                "published Freesolo environment ids"
             )
         train = data.get("train") or {}
         gpu = data.get("gpu") or {}
@@ -245,6 +250,7 @@ class JobSpec:
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
+                secrets=_str_tuple(env.get("secrets")),
             ),
             train=TrainSpec(
                 steps=_opt_int(train.get("steps")),

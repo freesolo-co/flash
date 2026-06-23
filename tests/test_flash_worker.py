@@ -61,14 +61,14 @@ def test_build_worker_env_forwards_judge_model(monkeypatch):
     assert "FLASH_JUDGE_MODEL" not in build_worker_env(_spec(), 0)
 
 
-def test_build_worker_env_forwards_prime_api_key(monkeypatch):
-    """The worker needs PRIME_API_KEY to install the run's published env(s)."""
+def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
+    """The worker receives the control-plane token used for managed Freesolo environments."""
     from flash.providers.runpod.train import build_worker_env
 
-    monkeypatch.setenv("PRIME_API_KEY", "pit-secret")
-    assert build_worker_env(_spec(), 0).get("PRIME_API_KEY") == "pit-secret"
-    monkeypatch.delenv("PRIME_API_KEY", raising=False)
-    assert "PRIME_API_KEY" not in build_worker_env(_spec(), 0)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
+    assert build_worker_env(_spec(), 0).get("GITHUB_TOKEN") == "ghp-secret"
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    assert "GITHUB_TOKEN" not in build_worker_env(_spec(), 0)
 
 
 def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(monkeypatch):
@@ -85,6 +85,29 @@ def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(mon
 
     env = build_worker_env(_spec(), 0, runtime_secrets={"WANDB_API_KEY": "user-wb"})
     assert env["WANDB_API_KEY"] == "user-wb"
+
+
+def test_build_worker_env_forwards_declared_environment_runtime_secrets():
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/env", secrets=("SERPAPI_API_KEY",)),
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+    )
+
+    env = build_worker_env(
+        spec,
+        0,
+        runtime_secrets={
+            "SERPAPI_API_KEY": "serp-user",
+            "UNDECLARED_API_KEY": "must-not-forward",
+        },
+    )
+    assert env["SERPAPI_API_KEY"] == "serp-user"
+    assert "UNDECLARED_API_KEY" not in env
 
 
 def test_build_worker_env_forwards_upload_console(monkeypatch):
@@ -394,26 +417,19 @@ def test_train_body_imports_every_name_it_uses():
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in node.names
     }
-    # Names that must be locally imported (regression: contextlib was missing). shutil is used
-    # to gate the conditional `prime` install, so it must also be imported locally.
-    for name in ("contextlib", "json", "os", "shutil", "subprocess", "sys"):
+    # Names that must be locally imported (regression: contextlib was missing).
+    for name in ("contextlib", "json", "os", "subprocess", "sys"):
         assert name in imported, f"_train_body uses {name!r} without a local import"
 
 
-def test_train_body_installs_prime_only_when_absent():
-    """`prime` is often baked into the worker image; an unconditional `pip install prime`
-    every run adds latency + a per-run PyPI failure point. The handler must guard the install
-    behind `shutil.which("prime") is None`."""
+def test_train_body_has_no_prime_install_path():
     import inspect
 
     from flash.providers.runpod import train
 
     src = inspect.getsource(train._train_body)
-    assert 'shutil.which("prime")' in src
-    # The pip install of `prime` must be conditional, not at module/handler top level.
-    install_idx = src.index('"install", "prime"')
-    guard_idx = src.index('shutil.which("prime") is None')
-    assert guard_idx < install_idx, "the prime install must be gated by the which() check"
+    assert '"install", "prime"' not in src
+    assert 'shutil.which("prime")' not in src
 
 
 def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):

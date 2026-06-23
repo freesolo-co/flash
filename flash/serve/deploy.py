@@ -2,8 +2,8 @@
 
 Flash no longer runs its own per-run vLLM endpoint. Instead the control plane is a
 thin client of the freesolo serving service (a Modal multi-LoRA app that serves every
-adapter on a single GPU per base model, scaling to zero when idle — so there is no
-flash-side idle billing to track). The same CLI commands and control-plane endpoints
+adapter on shared base-model capacity — so there is no flash-side idle billing to
+track). The same CLI commands and control-plane endpoints
 (`deploy`/`undeploy`/`chat`/`deployments`) stay; only what they do under the hood
 changed.
 
@@ -33,9 +33,6 @@ logger = get_logger(__name__)
 
 # Default freesolo serving base URL (the Modal multi-LoRA app). Overridable per-env.
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
-
-MODES = ("dev", "always-on")
-DEFAULT_IDLE_TIMEOUT_S = 300
 
 
 class ServingError(RuntimeError):
@@ -119,11 +116,6 @@ class Deployment:
     gpu: str
     openai_model: str
     endpoint_name: str
-    mode: str = "dev"
-    idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S
-    # freesolo serving scales to zero per base model, so flash never bills for idle
-    # serving — there is no flash-side per-run endpoint to keep warm.
-    est_idle_cost_usd_per_day: float = 0.0
     state: str = "ready"
 
     def to_dict(self) -> dict:
@@ -159,8 +151,6 @@ def deploy_adapter(
     hf_repo: str,
     adapter_prefix: str,
     gpu_name: str = "RTX 5090",
-    mode: str = "dev",
-    idle_timeout_s: int = DEFAULT_IDLE_TIMEOUT_S,
     dry_run: bool = False,
     thinking: bool = False,
 ) -> Deployment:
@@ -171,8 +161,6 @@ def deploy_adapter(
     ``{hf_repo}:{adapter_prefix}/adapter``. ``dry_run`` validates/shapes the deployment
     without making the network call.
     """
-    if mode not in MODES:
-        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
     friendly = servable_gpu(gpu_name)
     subfolder = f"{adapter_prefix}/adapter"
     dep = Deployment(
@@ -182,9 +170,6 @@ def deploy_adapter(
         gpu=friendly,
         openai_model=run_id,
         endpoint_name=serving_base_url(),
-        mode=mode,
-        idle_timeout_s=idle_timeout_s,
-        est_idle_cost_usd_per_day=0.0,
         state="dry_run" if dry_run else "ready",
     )
     if dry_run:
