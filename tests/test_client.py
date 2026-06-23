@@ -38,8 +38,22 @@ def stub():
 
         def do_POST(self):
             seen["auth"] = self.headers.get("Authorization")
+            seen["path"] = self.path
             n = int(self.headers.get("Content-Length") or 0)
             seen["body"] = json.loads(self.rfile.read(n) or b"{}")
+            if self.path == "/v1/runs/json-chat/chat":
+                self._send(200, {"choices": [{"message": {"content": "json reply"}}]})
+                return
+            if self.path == "/v1/runs/r1/chat":
+                body = "héllo".encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                for byte in body:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                return
             self._send(200, {"run_id": "r1", "state": "queued"})
 
         def log_message(self, *a):
@@ -99,6 +113,30 @@ def test_logs_offset_in_query(stub):
     assert page["offset"] == 3
     assert page["logs"] == "hi\n"
     assert seen["path"].endswith("/v1/runs/r1/logs?offset=3")
+
+
+def test_chat_stream_sends_stream_request_and_yields_text(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    chunks = list(
+        client.chat_stream("r1", [{"role": "user", "content": "hi"}], temperature=0.2, max_tokens=7)
+    )
+    assert "".join(chunks) == "héllo"
+    assert seen["path"] == "/v1/runs/r1/chat"
+    assert seen["auth"] == "Bearer fslo-user-test"
+    assert seen["body"] == {
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.2,
+        "max_tokens": 7,
+        "stream": True,
+    }
+
+
+def test_chat_stream_accepts_json_fallback(stub):
+    url, _ = stub
+    client = ApiClient(url, "fslo-user-test")
+    chunks = list(client.chat_stream("json-chat", [{"role": "user", "content": "hi"}]))
+    assert chunks == ["json reply"]
 
 
 def test_unreachable_server_is_actionable():
