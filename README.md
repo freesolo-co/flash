@@ -35,7 +35,7 @@ allocator picks the cheapest GPU class that fits the run across both providers.
   (task-specific grading lives with its example, not in the engine)
 - `flash/envs/` — environment machinery: registry and the adapter that loads
   Freesolo SDK environments from GitHub refs onto the worker's interface
-- `flash lab setup` / `flash env init` — scaffold a starter local Freesolo env and a
+- `flash env setup` / `flash env init` — scaffold a starter local Freesolo env and a
   ready-to-run config to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
   plane (run operator-side via the separate `flash-server` command)

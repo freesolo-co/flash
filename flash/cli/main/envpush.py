@@ -72,6 +72,8 @@ def _config_env_name(config_path) -> str | None:
     env = data.get("environment")
     env_id = str(env.get("id") or "").strip() if isinstance(env, dict) else ""
     if ":" in env_id:
+        if env_id.startswith("github:") and ":" not in env_id[len("github:") :]:
+            return None
         path = Path(env_id.rsplit(":", 1)[1].strip())
         if path.name == "environment.py" and path.parent.name == "freesolo":
             name = path.parent.parent.name

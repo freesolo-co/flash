@@ -1,4 +1,4 @@
-"""`slm train --cost`: map a training config to a pre-flight cost estimate."""
+"""`flash train --cost`: map a training config to a pre-flight cost estimate."""
 
 from __future__ import annotations
 

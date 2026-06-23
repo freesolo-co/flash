@@ -29,6 +29,7 @@ _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "freesolo/environment.py"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+_MAX_ARCHIVE_MEMBERS = 5000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 
 
@@ -68,7 +69,7 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
         if not at:
             ref = _DEFAULT_GITHUB_REF
         owner_repo = repo_part.split("/", 1)
-        if len(owner_repo) == 2 and all(owner_repo):
+        if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo):
             return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
         return None
 
@@ -80,11 +81,15 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
         return None
     owner, repo = parts[0], parts[1]
     repo = repo[:-4] if repo.endswith(".git") else repo
+    if not _is_safe_github_path_parts((owner, repo)):
+        return None
     if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
         ref = parts[3]
         if ":" in ref:
             return None
         raw_path = "/".join(parts[4:])
+        if not _is_safe_environment_path(raw_path):
+            return None
         try:
             path = _normalize_env_path(raw_path)
         except ValueError:
@@ -93,9 +98,11 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
             path = _DEFAULT_ENVIRONMENT_PATH
         if parts[2] == "tree" and raw_path and not path.endswith(".py"):
             path = f"{path.rstrip('/')}/{_DEFAULT_ENVIRONMENT_PATH}"
-    else:
+    elif len(parts) == 2:
         ref = _DEFAULT_GITHUB_REF
         path = _DEFAULT_ENVIRONMENT_PATH
+    else:
+        return None
     return GitHubEnvironmentRef(owner, repo, ref, path)
 
 
@@ -116,6 +123,26 @@ def _normalize_env_path(path: str | None) -> str:
     if any(part == ".." or part == "." for part in parts):
         raise ValueError(f"unsafe environment path: {path!r}")
     return "/".join(parts)
+
+
+def _is_safe_environment_path(path: str) -> bool:
+    if not path:
+        return True
+    raw = path.strip().replace("\\", "/")
+    if raw.startswith("/"):
+        return False
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        return True
+    return not any(part in {".", ".."} for part in parts)
+
+
+def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
+    if not parts:
+        return False
+    if any(part in {".", "..", ""} for part in parts):
+        return False
+    return not any("\\" in part for part in parts)
 
 
 def _github_token() -> str | None:
@@ -180,8 +207,11 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
 def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
     root = dest.resolve()
     top_dirs: set[str] = set()
+    total = 0
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
-        for member in tar:
+        for count, member in enumerate(tar, start=1):
+            if count > _MAX_ARCHIVE_MEMBERS:
+                raise RuntimeError(f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})")
             parts = Path(member.name).parts
             if not parts:
                 continue
@@ -191,6 +221,11 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
                 raise RuntimeError(f"unsafe path in GitHub environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
+            total += max(0, member.size)
+            if total > _MAX_ARCHIVE_BYTES:
+                raise RuntimeError(
+                    f"GitHub environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+                )
             tar.extract(member, dest)
     if len(top_dirs) != 1:
         raise RuntimeError("GitHub environment archive had an unexpected layout")
@@ -213,8 +248,14 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
     if env_file.is_file():
         return env_file
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
+    resolved = GitHubEnvironmentRef(
+        parsed.owner,
+        parsed.repo,
+        resolved_ref,
+        parsed.path,
+    )
     try:
-        extracted = _safe_extract_archive(_download_github_tarball(parsed), tmp_parent)
+        extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
             nested = candidate / _DEFAULT_ENVIRONMENT_PATH
