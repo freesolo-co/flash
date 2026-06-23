@@ -1,8 +1,8 @@
 """Managed Freesolo environment publishing.
 
 ``POST /v1/envs`` accepts a packaged Freesolo environment and uploads it to the
-managed ``freesolo-co/environment-hub`` GitHub repository. The returned id is a
-GitHub-backed environment ref that the worker resolves through ``freesolo.environments``.
+managed environment hub. The returned id is a Freesolo environment slug
+(``namespace/name``) that Flash resolves internally.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import tarfile
 import tempfile
 import time
 import urllib.parse
-import uuid
 from pathlib import Path
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
@@ -62,10 +61,6 @@ def _sanitize_name(name: str) -> str:
     if slug in {".", ".."} or not re.search(r"[a-z0-9]", slug):
         return "env"
     return slug or "env"
-
-
-def _new_publish_id() -> str:
-    return str(uuid.uuid4())
 
 
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
@@ -294,8 +289,8 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     repo = _github_repo()
     ns = namespace_for(key)
     clean = _sanitize_name(name)
-    publish_root = f"{ns}/{clean}/{_new_publish_id()}"
-    env_rel = _environment_file_relative_path(dest)
+    publish_root = f"{ns}/{clean}"
+    _environment_file_relative_path(dest)
     files = sorted(path for path in dest.rglob("*") if path.is_file())
     if not files:
         raise EnvPublishError("env package contains no files")
@@ -314,7 +309,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
                 publish_root=publish_root,
                 message=message,
             )
-            return f"github:{repo}@{_GITHUB_BRANCH}:{publish_root}/{env_rel}"
+            return f"{ns}/{clean}"
         except EnvPublishError as exc:
             last_error = exc
             if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
