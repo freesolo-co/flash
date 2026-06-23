@@ -228,7 +228,8 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
 
     _MAX_RATE_LIMIT_RETRIES = 5
     _RATE_LIMIT_BASE_DELAY = 10.0
-    for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
+    attempt = 0
+    while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
@@ -240,6 +241,7 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
                 # Retry with jitter so concurrent workers don't all retry at once.
                 delay = _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)
                 time.sleep(delay)
+                attempt += 1
                 continue
             raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
         except urllib.error.URLError as exc:
