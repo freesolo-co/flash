@@ -179,6 +179,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     sft = tmp_path / "configs/sft.toml"
     assert grpo.is_file()
     assert sft.is_file()
+    assert not (tmp_path / "configs/endpoints.toml").exists()
     assert 'algorithm = "grpo"' in grpo.read_text()
     assert "steps = 150" in grpo.read_text()
     assert 'algorithm = "sft"' in sft.read_text()

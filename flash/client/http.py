@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from .config import load_credentials
+from .config import load_credentials_with_source
 
 
 class ClientError(RuntimeError):
@@ -81,10 +81,25 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
 
 
 class ApiClient:
-    def __init__(self, api_url: str, api_key: str | None = None, timeout: float = 60.0):
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str | None = None,
+        timeout: float = 60.0,
+        key_source: str | None = None,
+    ):
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.key_source = key_source
+
+    def _auth_error_detail(self, status: int, detail: str) -> str:
+        if status not in {401, 403} or self.key_source != "FREESOLO_API_KEY":
+            return detail
+        return (
+            f"{detail}; FREESOLO_API_KEY is set and overrides the key saved by "
+            "`flash login`. Unset FREESOLO_API_KEY or update it to a valid freesolo API key."
+        )
 
     def _request(
         self,
@@ -107,7 +122,8 @@ class ApiClient:
                 raw = resp.read()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:
-            raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            raise ApiError(exc.code, detail) from exc
         except urllib.error.URLError as exc:
             raise ClientError(
                 f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
@@ -189,9 +205,9 @@ class ApiClient:
 
 def client_from_config(require_key: bool = True) -> ApiClient:
     """Build a client from the stored credentials; fail with a clear hint when logged out."""
-    api_url, api_key = load_credentials()
+    api_url, api_key, key_source = load_credentials_with_source()
     if require_key and not api_key:
         raise ClientError(
             "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
-    return ApiClient(api_url, api_key)
+    return ApiClient(api_url, api_key, key_source=key_source)

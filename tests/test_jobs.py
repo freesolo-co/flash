@@ -713,13 +713,8 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-        # Force the deterministic static ranking (no live pricing fetch) so successive attempts
-        # step through the validated-only pool in ascending $/hr order.
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
 
         gpus_seen: list[str] = []
 
@@ -762,11 +757,9 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         calls = {"n": 0}
 
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
@@ -805,11 +798,9 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
 
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         # Need 80 GB; the validated 80 GB+ RunPod pool is A100 PCIe ($1.39), A100 SXM ($1.49), RTX
         # Pro 6000 Server ($2.09), H100 ($3.29). Trim the ranked candidates to the two cheapest so
         # exactly TWO candidates remain for a clean walk+clamp assertion.
@@ -861,11 +852,8 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.allocator as allocator
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
         from flash.spec import GpuSpec, JobSpec, TrainSpec
-
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
 
         real_allocate = allocator.allocate
         alloc_calls = {"n": 0}
@@ -911,10 +899,8 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
-        import flash.providers.runpod.pricing as pricing
         import flash.providers.runpod.train as flash_train
 
-        monkeypatch.setattr(pricing, "live_rates", lambda *a, **k: {})
         status = orch.RunStatus(
             run_id="walked",
             state="running",

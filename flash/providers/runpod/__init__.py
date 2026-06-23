@@ -23,10 +23,9 @@ class RunpodProvider:
 
     def is_configured(self) -> bool:
         # RunPod is the ALWAYS-ON default substrate, so it is always "available" for
-        # allocation (offline pricing degrades to the static snapshot, and a missing
-        # RUNPOD_API_KEY surfaces at provision time via ensure_auth / the preflight —
-        # never as a silent empty candidate list). This matches the historical
-        # ``available_providers()`` which listed runpod unconditionally.
+        # allocation. Pricing is static, and a missing RUNPOD_API_KEY surfaces at provision time
+        # via ensure_auth / the preflight, never as a silent empty candidate list. This matches the
+        # historical ``available_providers()`` which listed runpod unconditionally.
         return True
 
     def preflight(self, require_hf: bool = True) -> list[str]:
