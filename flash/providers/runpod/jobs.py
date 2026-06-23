@@ -163,6 +163,8 @@ def _is_workers_quota_error(exc: Exception) -> bool:
 def _sweep_idle_flash_endpoints(skip_name: str) -> int:
     """Delete idle flash-* endpoints to reclaim worker quota. Returns count deleted.
 
+    RunPod Flash registers each endpoint as ``live-<endpoint_name>`` in its resource
+    registry, so the actual RunPod endpoint name is ``live-flash-<gpu>-<suffix>``.
     An endpoint is idle when health reports zero active workers (running/ready/idle/
     initializing) and no jobs in queue or in progress. These belong to runs that finished
     or crashed without cleaning up their endpoint. ``skip_name`` is never deleted.
@@ -175,7 +177,10 @@ def _sweep_idle_flash_endpoints(skip_name: str) -> int:
     for ep in endpoints:
         ep_name = ep.get("name") or ""
         eid = ep.get("id")
-        if not (ep_name.startswith("flash-") and eid and ep_name != skip_name):
+        # Endpoints are registered as "live-<endpoint_name>" by the Flash SDK; both the
+        # bare "flash-" prefix and the "live-flash-" prefix must match.
+        is_flash = ep_name.startswith("flash-") or ep_name.startswith("live-flash-")
+        if not (is_flash and eid and ep_name != skip_name and f"live-{skip_name}" != ep_name):
             continue
         try:
             health = runpod_api.endpoint_health(eid) or {}
