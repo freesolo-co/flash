@@ -811,9 +811,7 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
             alloc = real_allocate(*a, **k)
             keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "A100 SXM"))
             best = keep[0]
-            return dataclasses.replace(
-                alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep, offer=best.offer
-            )
+            return dataclasses.replace(alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep)
 
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         gpus_seen: list[str] = []
@@ -955,9 +953,8 @@ def test_cancel_uses_rest_handle(monkeypatch):
         st = orch.cancel_run("c1")
         assert st.state == "cancelled"
         assert cancelled == [("epX", "jX")]
-        # cancel_run now also destroys the handle's endpoint for cost-safety symmetry
-        # with vast (idempotent); the GC backstop may delete it again — endpoint id
-        # was torn down, which is what matters.
+        # cancel_run now also destroys the handle's endpoint (idempotent); the GC backstop may
+        # delete it again — endpoint id was torn down, which is what matters.
         assert deleted
         assert all(e == "epX" for e in deleted)
 
