@@ -154,6 +154,57 @@ class JobHandle:
         return cls(d["endpoint_id"], d.get("endpoint_name", ""), d["job_id"])
 
 
+def _is_workers_quota_error(exc: Exception) -> bool:
+    """True when a RunPod exception signals the account worker quota is exhausted."""
+    msg = str(exc).lower()
+    return "max workers across all endpoints" in msg
+
+
+def _sweep_idle_flash_endpoints(skip_name: str) -> int:
+    """Delete idle flash-* endpoints to reclaim worker quota. Returns count deleted.
+
+    RunPod Flash registers each endpoint as ``live-<endpoint_name>`` in its resource
+    registry, so the actual RunPod endpoint name is ``live-flash-<gpu>-<suffix>``.
+    An endpoint is idle when health reports zero active workers (running/ready/idle/
+    initializing) and no jobs in queue or in progress. These belong to runs that finished
+    or crashed without cleaning up their endpoint. ``skip_name`` is never deleted.
+    """
+    deleted = 0
+    try:
+        endpoints = runpod_api.list_endpoints()
+    except Exception:
+        logger.debug("quota-sweep: failed to list endpoints", exc_info=True)
+        return 0
+    for ep in endpoints:
+        ep_name = ep.get("name") or ""
+        eid = ep.get("id")
+        # Endpoints are registered as "live-<endpoint_name>" by the Flash SDK; both the
+        # bare "flash-" prefix and the "live-flash-" prefix must match.
+        is_flash = ep_name.startswith("flash-") or ep_name.startswith("live-flash-")
+        if not (is_flash and eid and ep_name != skip_name and f"live-{skip_name}" != ep_name):
+            continue
+        try:
+            health = runpod_api.endpoint_health(eid) or {}
+            workers = health.get("workers")
+            jobs_info = health.get("jobs")
+            # Require non-empty dicts: a missing or empty workers section means the health
+            # response is incomplete and we can't confirm the endpoint is idle.
+            if not isinstance(workers, dict) or not workers or not isinstance(jobs_info, dict):
+                continue
+            active_workers = sum(
+                workers.get(k, 0) or 0
+                for k in ("running", "ready", "idle", "initializing")
+            )
+            in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
+            if active_workers == 0 and in_flight == 0 and runpod_api.delete_endpoint(eid):
+                deleted += 1
+                logger.info("quota-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
+        except Exception:
+            logger.debug("quota-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True)
+            continue
+    return deleted
+
+
 def deploy_train_endpoint(
     friendly_gpu: str,
     execution_timeout_ms: int | None = None,
@@ -161,7 +212,11 @@ def deploy_train_endpoint(
     disk_gb: int | None = None,
     spec=None,
 ) -> tuple[str, str]:
-    """Deploy (or reuse) the run's uniquely-named worker endpoint; return (id, name)."""
+    """Deploy (or reuse) the run's uniquely-named worker endpoint; return (id, name).
+
+    On a worker-quota error, sweeps idle flash-* endpoints (from crashed/completed runs
+    that skipped GC) and retries up to ``_QUOTA_MAX_RETRIES`` times with backoff.
+    """
     os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
 
@@ -180,36 +235,54 @@ def deploy_train_endpoint(
     image = os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
-    # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
-    # suffix, and ResourceManager + the deploy share the SDK's asyncio singleton. Hold the
-    # lock across the whole critical section so a concurrent run can't swap the registry
-    # scope or race the event loop mid-deploy.
-    with FLASH_SDK_LOCK:
-        isolate_flash_state(name_suffix)
-        kwargs = dict(
-            name=name,
-            gpu=flash_gpu(friendly),
-            gpu_count=1,
-            min_cuda_version=min_cuda_for(friendly),
-            execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-            workers=(0, 1),
-            **volume_endpoint_kwargs(spec),
-        )
-        if image:
-            kwargs["image"] = image
-        else:
-            # Pass the resolved GPU so Hopper (sm90) gets its fla-drop treatment (resolve_worker_deps
-            # is GPU-scoped); a bare call would ship the generic deps and run fla's #640-buggy GDN
-            # Triton kernel on an H100 instead of the correct pure-PyTorch delta rule.
-            kwargs["dependencies"] = resolve_worker_deps(friendly)
-            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-        ep = Endpoint(**kwargs)
-        ep._qb_target = _train_body
-        config = ep._build_resource_config()
-        apply_disk_gb(config, disk_gb)
-        # Worker image is PUBLIC, so no container-registry credential is needed to pull it.
-        rm = ResourceManager()
-        resource = asyncio.run(rm.get_or_deploy_resource(config))
+    _QUOTA_MAX_RETRIES = 3
+    resource = None
+    for quota_attempt in range(_QUOTA_MAX_RETRIES):
+        if quota_attempt > 0:
+            # Sweep idle flash-* endpoints to free quota, then backoff.
+            swept = _sweep_idle_flash_endpoints(skip_name=name)
+            wait_s = 30 * quota_attempt
+            logger.warning(
+                "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
+                "retrying in %ds",
+                quota_attempt + 1, _QUOTA_MAX_RETRIES, swept, wait_s,
+            )
+            time.sleep(wait_s)
+        # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
+        # suffix, and ResourceManager + the deploy share the SDK's asyncio singleton. Hold the
+        # lock across the whole critical section so a concurrent run can't swap the registry
+        # scope or race the event loop mid-deploy.
+        with FLASH_SDK_LOCK:
+            isolate_flash_state(name_suffix)
+            kwargs = dict(
+                name=name,
+                gpu=flash_gpu(friendly),
+                gpu_count=1,
+                min_cuda_version=min_cuda_for(friendly),
+                execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+                workers=(0, 1),
+                **volume_endpoint_kwargs(spec),
+            )
+            if image:
+                kwargs["image"] = image
+            else:
+                # Pass the resolved GPU so Hopper (sm90) gets its fla-drop treatment
+                # (resolve_worker_deps is GPU-scoped); a bare call would ship the generic deps
+                # and run fla's #640-buggy GDN Triton kernel on an H100.
+                kwargs["dependencies"] = resolve_worker_deps(friendly)
+                kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+            ep = Endpoint(**kwargs)
+            ep._qb_target = _train_body
+            config = ep._build_resource_config()
+            apply_disk_gb(config, disk_gb)
+            # Worker image is PUBLIC, so no container-registry credential is needed to pull it.
+            rm = ResourceManager()
+            try:
+                resource = asyncio.run(rm.get_or_deploy_resource(config))
+                break  # success
+            except Exception as exc:
+                if not (_is_workers_quota_error(exc) and quota_attempt < _QUOTA_MAX_RETRIES - 1):
+                    raise
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
         raise RuntimeError(f"deploy_train_endpoint: no endpoint id on resource {resource!r}")
