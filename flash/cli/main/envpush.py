@@ -135,12 +135,12 @@ def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
             shutil.copy2(child, target)
 
 
-def _upload_and_report(name: str, *, is_new: bool, package_b64: str) -> int:
+def _upload_and_report(name: str, *, package_b64: str) -> int:
     """Upload a packaged env to the managed control plane and print the returned id."""
     from flash.client import ClientError, client_from_config
 
     try:
-        result = client_from_config().publish_env(name=name, is_new=is_new, package_b64=package_b64)
+        result = client_from_config().publish_env(name=name, package_b64=package_b64)
     except ClientError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -197,4 +197,4 @@ def cmd_env_push(args) -> int:
         (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
         _copy_env_sidecars(env_root, pkg, entrypoint=entrypoint)
         (pkg / "README.md").write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
-        return _upload_and_report(env_name, is_new=True, package_b64=_tar_b64(pkg))
+        return _upload_and_report(env_name, package_b64=_tar_b64(pkg))

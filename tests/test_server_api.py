@@ -873,7 +873,7 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     resp = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "MyEnv", "is_new": True, "package_b64": pkg},
+        json={"name": "MyEnv", "package_b64": pkg},
     )
     assert resp.status_code == 200
     ref = resp.json()["id"]
@@ -887,9 +887,8 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
 
 
-def test_publish_env_parses_is_new_robustly(api, monkeypatch):
-    """`is_new` from the JSON body must be parsed as a real bool: the string "false"/"0" is False
-    (a plain bool() would make any non-empty string True), and it defaults to True when absent."""
+def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
+    """Publish mode is determined by the explicit name and server publish id."""
     import base64
     import io
     import tarfile
@@ -898,8 +897,8 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
 
     seen: dict = {}
 
-    def fake_publish_package(*, package_b64, name, is_new, key):
-        seen.update(package_b64=package_b64, name=name, is_new=is_new, key=key)
+    def fake_publish_package(*, package_b64, name, key):
+        seen.update(package_b64=package_b64, name=name, key=key)
         return "github:freesolo-co/environment-hub@main:user-example-com/e/publish-1/environment.py"
 
     monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
@@ -915,23 +914,15 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
             tar.addfile(info, io.BytesIO(content))
     pkg = base64.b64encode(buf.getvalue()).decode()
 
-    def _publish(body_extra):
-        resp = api.post(
-            "/v1/envs",
-            headers=_bearer(_login()),
-            json={"name": "e", "package_b64": pkg, **body_extra},
-        )
-        assert resp.status_code == 200, resp.text
-        return seen["is_new"]
-
-    # Falsey string forms -> False (the bug: bool("false") was True).
-    assert _publish({"is_new": "false"}) is False
-    assert _publish({"is_new": "0"}) is False
-    assert _publish({"is_new": False}) is False
-    # Truthy forms and absence -> True.
-    assert _publish({"is_new": "true"}) is True
-    assert _publish({"is_new": True}) is True
-    assert _publish({}) is True  # default when absent
+    resp = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "e", "package_b64": pkg, "is_new": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["name"] == "e"
+    assert seen["package_b64"] == pkg
+    assert "is_new" not in seen
 
 
 def test_publish_env_falsy_non_string_fields_are_not_coerced(api):

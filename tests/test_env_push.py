@@ -14,8 +14,8 @@ def _fake_client(capture: dict, *, slug: str = "github:freesolo-co/envs@main:acm
     """A stand-in ApiClient that records the publish_env call and returns a GitHub ref."""
 
     class _C:
-        def publish_env(self, *, name, is_new, package_b64):
-            capture.update(name=name, is_new=is_new, package_b64=package_b64)
+        def publish_env(self, *, name, package_b64):
+            capture.update(name=name, package_b64=package_b64)
             return {"id": slug}
 
     return lambda: _C()
@@ -50,7 +50,6 @@ def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):
     assert "pyproject.toml" not in files
     assert not any(name.startswith("freesolo/") for name in files)
     assert cap["name"] == "math-env"
-    assert cap["is_new"] is True
     assert "published freesolo-co/u-environment" in capsys.readouterr().out
 
 
@@ -71,7 +70,6 @@ def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
     assert "pyproject.toml" not in files
     assert not any(name.startswith("source/") for name in files)
     assert cap["name"] == "explicit-env"
-    assert cap["is_new"] is True
 
 
 def test_push_single_py_does_not_ship_sibling_datasets(monkeypatch, tmp_path):
@@ -128,7 +126,6 @@ def test_push_sibling_config_does_not_override_explicit_name(monkeypatch, tmp_pa
     assert cli.cmd_env_push(_args(env_file, name="new-name")) == 0
     names = set(_members(cap["package_b64"]))
     assert cap["name"] == "new-name"
-    assert cap["is_new"] is True
     assert "environment.py" in names
 
 
