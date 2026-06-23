@@ -287,8 +287,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     clean = _sanitize_name(name)
     publish_root = f"{ns}/{clean}"
     _environment_file_relative_path(dest)
-    files = sorted(path for path in dest.rglob("*") if path.is_file())
-    if not files:
+    if not any(path.is_file() for path in dest.rglob("*")):
         raise EnvPublishError("env package contains no files")
     message = f"Upload Flash environment {ns}/{clean}"
 
