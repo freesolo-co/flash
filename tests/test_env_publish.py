@@ -63,11 +63,11 @@ def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
     )
 
     root = "environments/dev-clado-ai/my-env"
-    assert ref == (
-        "github:freesolo-co/environment-hub@dev:"
-        f"{root}/freesolo/environment.py"
-    )
-    assert (f"{root}/freesolo/environment.py", _MINIMAL["freesolo/environment.py"].encode()) in uploaded
+    assert ref == (f"github:freesolo-co/environment-hub@dev:{root}/freesolo/environment.py")
+    assert (
+        f"{root}/freesolo/environment.py",
+        _MINIMAL["freesolo/environment.py"].encode(),
+    ) in uploaded
     assert (f"{root}/pyproject.toml", _MINIMAL["pyproject.toml"].encode()) in uploaded
 
 
@@ -141,7 +141,7 @@ def test_safe_extract_rejects_special_members(tmp_path):
 
 
 def test_safe_extract_rejects_workflow_control_paths(tmp_path):
-    for label in (".github", ".git"):
+    for label in (".github", ".git", "./.github", "./.git"):
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             d = tarfile.TarInfo(f"{label}/workflows")

@@ -148,9 +148,7 @@ def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
     def load_task_examples(source):
         if isinstance(source, (list, tuple)):
             return [
-                item
-                if isinstance(item, _TaskExample)
-                else task_example_from_record(item)
+                item if isinstance(item, _TaskExample) else task_example_from_record(item)
                 for item in source
             ]
         path = os.fspath(source)
@@ -281,11 +279,14 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     assert env.rollout_done(state) is True
     assert env.reward("ignored", {"task": "browse", "expected_output": "done"}, state) == 0.5
     assert env.grade("ignored", {"task": "browse", "expected_output": "done"}, state) is True
-    assert env.reward_from_messages(
-        [{"role": "assistant", "content": "final"}],
-        {"task": "browse", "expected_output": "done"},
-        [{"role": "user", "content": "contract:browse"}],
-    ) == 0.5
+    assert (
+        env.reward_from_messages(
+            [{"role": "assistant", "content": "final"}],
+            {"task": "browse", "expected_output": "done"},
+            [{"role": "user", "content": "contract:browse"}],
+        )
+        == 0.5
+    )
 
 
 def test_github_environment_ref_parsing():
@@ -294,6 +295,10 @@ def test_github_environment_ref_parsing():
     assert is_github_environment_ref("github:owner/repo@dev:envs/e/freesolo/environment.py")
     assert is_github_environment_ref("github:owner/repo")
     assert not is_github_environment_ref("github:owner/repo@main:/etc/passwd")
+    assert not is_github_environment_ref(
+        "github:owner/repo/extra@main:envs/e/freesolo/environment.py"
+    )
+    assert not is_github_environment_ref("github:owner/repo@:envs/e/freesolo/environment.py")
     assert is_github_environment_ref(
         "https://github.com/owner/repo/blob/dev/envs/e/freesolo/environment.py"
     )
@@ -301,9 +306,7 @@ def test_github_environment_ref_parsing():
     assert not is_github_environment_ref("owner/env")
     assert not is_github_environment_ref("gsm8k")
     assert not is_github_environment_ref("github:owner/repo@main:../../etc/passwd")
-    assert not is_github_environment_ref(
-        "https://github.com/owner/repo/blob/dev/../../etc/passwd"
-    )
+    assert not is_github_environment_ref("https://github.com/owner/repo/blob/dev/../../etc/passwd")
     assert not is_github_environment_ref("https://github.com/owner/repo/blob/main:/etc/passwd")
     assert not is_github_environment_ref("https://github.com/owner/repo/issues/1")
 
@@ -326,7 +329,9 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
 
     monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
 
-    resolved = adapter._resolve_environment_reference("github:owner/repo@main:envs/e/freesolo/environment.py")
+    resolved = adapter._resolve_environment_reference(
+        "github:owner/repo@main:envs/e/freesolo/environment.py"
+    )
     assert resolved.endswith("envs/e/freesolo/environment.py")
     assert downloads == ["b" * 40]
 
@@ -359,7 +364,27 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
     monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 5)
     monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 1)
     with pytest.raises(RuntimeError, match="too large"):
-        _safe_extract_archive(make_members_tar([("repo-root/", None), ("repo-root/keep.txt", b"xx")]), dest)
+        _safe_extract_archive(
+            make_members_tar([("repo-root/", None), ("repo-root/keep.txt", b"xx")]), dest
+        )
+
+    dest = tmp_path / "extract_pax"
+    dest.mkdir()
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 100)
+    tar = io.BytesIO()
+    with tarfile.open(fileobj=tar, mode="w:gz") as handle:
+        pax = tarfile.TarInfo("pax_global_header")
+        pax.type = tarfile.XGLTYPE
+        handle.addfile(pax)
+        root = tarfile.TarInfo("repo-root/")
+        root.type = tarfile.DIRTYPE
+        root.mode = 0o755
+        handle.addfile(root)
+        file_info = tarfile.TarInfo("repo-root/freesolo/environment.py")
+        payload = b"def load_environment(**k):\n    return None\n"
+        file_info.size = len(payload)
+        handle.addfile(file_info, io.BytesIO(payload))
+    assert _safe_extract_archive(tar.getvalue(), dest) == dest / "repo-root"
 
 
 def test_install_manifest_and_worker_deps():

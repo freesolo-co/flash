@@ -55,13 +55,13 @@ def cmd_version(args) -> int:
 
 def cmd_login(args) -> int:
     # Login is handled by the freesolo backend (not the flash control plane): the user
-    # supplies the freesolo API key they created in the dashboard, and we verify it against
+    # supplies the freesolo API key they created at freesolo.co/sign-in, and we verify it against
     # freesolo before storing it. The same key authenticates flash's control plane.
     api_key = args.api_key or os.environ.get("FREESOLO_API_KEY")
     if not api_key:
         raise ClientError(
             "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
-            "Create a key in your freesolo dashboard."
+            "Create or copy a key at https://freesolo.co/sign-in."
         )
     verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
     api_url = args.api_url or load_credentials()[0]

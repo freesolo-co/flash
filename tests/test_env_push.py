@@ -10,7 +10,9 @@ import tarfile
 from flash.cli import main as cli
 
 
-def _fake_client(capture: dict, *, slug: str = "github:freesolo-co/envs@main:acme/freesolo/environment.py"):
+def _fake_client(
+    capture: dict, *, slug: str = "github:freesolo-co/envs@main:acme/freesolo/environment.py"
+):
     """A stand-in ApiClient that records the publish_env call and returns a GitHub ref."""
 
     class _C:
@@ -122,6 +124,36 @@ def test_push_sibling_config_id_with_dot_yields_valid_module(monkeypatch, tmp_pa
     assert cap["name"] == "my.weird.env"
     assert "freesolo/environment.py" in names
     assert not any("my.weird" in n for n in names)
+
+
+def test_push_sibling_config_repo_root_refs_do_not_override_name(monkeypatch, tmp_path):
+    for env_id in ("github:owner/repo", "github:owner/repo@main", "https://github.com/owner/repo"):
+        env_file = tmp_path / "my_task.py"
+        env_file.write_text("def load_environment(**k):\n    return None\n")
+        (tmp_path / "flash_grpo.toml").write_text(
+            f'model = "m"\nalgorithm = "grpo"\n[environment]\nid = "{env_id}"\n'
+        )
+        cap: dict = {}
+        monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+        assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
+        assert cap["name"] == "my-task"
+        assert cap["is_new"] is True
+
+
+def test_push_sibling_config_github_url_path_derives_name(monkeypatch, tmp_path):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "flash_grpo.toml").write_text(
+        'model = "m"\nalgorithm = "grpo"\n[environment]\n'
+        'id = "https://github.com/owner/repo/blob/main/envs/urlenv/freesolo/environment.py"\n'
+    )
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
+    assert cap["name"] == "urlenv"
+    assert cap["is_new"] is False
 
 
 def test_push_single_py_no_sibling_config_uses_file_stem(monkeypatch, tmp_path):
