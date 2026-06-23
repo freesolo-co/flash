@@ -970,14 +970,28 @@ def run_sft():
 
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
-    trainer = _SFT(
-        model=model_id,
-        args=cfg,
-        train_dataset=ds,
-        peft_config=make_lora(model_id),
-        processing_class=tok,
-        callbacks=[make_sft_heartbeat_callback(), make_checkpoint_upload_callback()],
-    )
+    # SFTTrainer.__init__ blocks for 10-15 min on first use (FA2 CUDA kernel JIT compilation);
+    # without a heartbeat the control plane can't distinguish this from a real hang and may
+    # recycle the worker. A daemon thread pings every 30s so the stall detector stays quiet.
+    _sft_init_done = threading.Event()
+
+    def _sft_init_heartbeat() -> None:
+        while not _sft_init_done.wait(30.0):
+            heartbeat("sft_initializing", gpu=gpu_diagnostics())
+
+    _sft_init_hb = threading.Thread(target=_sft_init_heartbeat, daemon=True)
+    _sft_init_hb.start()
+    try:
+        trainer = _SFT(
+            model=model_id,
+            args=cfg,
+            train_dataset=ds,
+            peft_config=make_lora(model_id),
+            processing_class=tok,
+            callbacks=[make_sft_heartbeat_callback(), make_checkpoint_upload_callback()],
+        )
+    finally:
+        _sft_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
     # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
     # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
@@ -1813,16 +1827,29 @@ def run_rl():
             engine_max_len=vllm_max_len,
         )
         print("[rl] multi-turn env: driving the turn loop via rollout_func")
-    trainer = GRPOTrainer(
-        model=init_model,
-        args=cfg,
-        train_dataset=ds,
-        reward_funcs=reward_fn,
-        peft_config=init_peft,
-        processing_class=tok,
-        callbacks=[hb_cb, make_checkpoint_upload_callback()],
-        **extra_trainer_kwargs,
-    )
+    # GRPOTrainer.__init__ blocks during model/vLLM init + FA2 kernel compilation (can be
+    # 10-20 min on first use). Background heartbeats keep the stall detector quiet.
+    _rl_init_done = threading.Event()
+
+    def _rl_init_heartbeat() -> None:
+        while not _rl_init_done.wait(30.0):
+            heartbeat("rl_initializing", gpu=gpu_diagnostics())
+
+    _rl_init_hb = threading.Thread(target=_rl_init_heartbeat, daemon=True)
+    _rl_init_hb.start()
+    try:
+        trainer = GRPOTrainer(
+            model=init_model,
+            args=cfg,
+            train_dataset=ds,
+            reward_funcs=reward_fn,
+            peft_config=init_peft,
+            processing_class=tok,
+            callbacks=[hb_cb, make_checkpoint_upload_callback()],
+            **extra_trainer_kwargs,
+        )
+    finally:
+        _rl_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
     # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
