@@ -62,11 +62,11 @@ def upload_code(repo: str | None = None) -> str:
 
     The worker downloads ``code/**`` to ``/runcode``. There are no built-in example
     environments to ship; Freesolo SDK support is installed through
-    ``registry.worker_pip_for_env`` and GitHub refs are resolved by the adapter at load time.
+    ``registry.worker_pip_for_env`` and environment ids are resolved by the adapter at load time.
 
     Only the ``flash`` package is uploaded, NOT the client's project tree. Managed runs must
-    reference a published GitHub Freesolo environment by ``id`` (``flash env push`` to publish
-    a local env first).
+    reference a published Freesolo environment by ``id`` (``flash env push`` to publish a local
+    env first).
     """
     from huggingface_hub import HfApi
 

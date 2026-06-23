@@ -175,14 +175,13 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         env_raw = {}
     if not isinstance(env_raw, dict):
         raise ConfigError("[environment] must be a table")
-    # Local environment paths are gone: a run names a GitHub-backed Freesolo env by
-    # [environment] id.
+    # Local environment paths are gone: a run names a published Freesolo env by [environment] id.
     # A stray `path` (alone or alongside `id`) is a stale config — reject it loudly instead of
     # silently ignoring the key and training against the wrong/missing env.
     if env_raw.get("path"):
         raise ConfigError(
             "local environment paths are no longer supported — remove `path` and reference a "
-            "GitHub Freesolo environment `id`"
+            "Freesolo environment `id` returned by `flash env push`"
         )
     # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
     # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
@@ -343,18 +342,17 @@ def _validate_spec(spec: JobSpec) -> None:
         raise ConfigError("train.steps must be positive for GRPO")
     if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
         raise ConfigError("train.epochs must be positive for SFT")
-    # Every run must name a Freesolo environment by GitHub ref via [environment] id.
+    # Every run must name a Freesolo environment by [environment] id.
     # There is no default environment and no local path mode.
     if not spec.environment.id:
         raise ConfigError(
-            "config must set [environment] id (a GitHub Freesolo environment ref, "
-            'e.g. "github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py"); '
+            "config must set [environment] id (upload an environment with `flash env push` "
+            "and paste the returned id); "
             "there is no local path mode"
         )
     _require_environment_ref(
         spec.environment.id,
-        "[environment] id must be a GitHub Freesolo environment ref "
-        '(for example "github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py")',
+        "[environment] id must be a Freesolo environment id returned by `flash env push`",
     )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")

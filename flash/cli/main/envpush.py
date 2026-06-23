@@ -1,6 +1,6 @@
 """Environment publish/install machinery for the `flash env` subcommands.
 
-`flash env install` records a Freesolo environment ref locally;
+`flash env install` records a Freesolo environment id locally;
 `flash env push` packages a local Freesolo environment and uploads it through the
 managed Flash control plane.
 """
@@ -18,8 +18,7 @@ def cmd_env_install(args) -> int:
     env_id = args.env_id
     if not is_github_environment_ref(env_id):
         print(
-            "env id must be a Freesolo environment ref, e.g. "
-            '"github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py" '
+            "env id must be a Freesolo environment id returned by `flash env push` "
             f"(got {env_id!r})",
             file=sys.stderr,
         )
@@ -63,11 +62,8 @@ def _env_name_from_ref_path(raw_path: str) -> str | None:
     if not path_text:
         return None
     path = Path(path_text)
-    parts = path.as_posix().split("/")
-    if len(parts) >= 3 and parts[-2:] == ["freesolo", "environment.py"]:
-        # Training-style refs are <namespace>/<project>/<publish-id>/freesolo/environment.py.
-        # Older Flash refs were environments/<namespace>/<project>/freesolo/environment.py.
-        name = parts[-4] if len(parts) >= 5 and parts[0] != "environments" else parts[-3]
+    if path.name == "environment.py" and path.parent.name == "freesolo":
+        name = path.parent.parent.name
     elif path.suffix == ".py":
         name = path.parent.name or path.stem
     else:

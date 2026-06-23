@@ -832,16 +832,11 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
 
     import flash.server.envs as envs_mod
 
-    uploaded: list[str] = []
+    published_roots: list[str] = []
     monkeypatch.setattr(
         envs_mod,
-        "_put_github_file",
-        lambda *, path, **_kwargs: uploaded.append(path),
-    )
-    monkeypatch.setattr(
-        envs_mod,
-        "_new_publish_id",
-        lambda: "12345678-1234-4321-abcd-123456789abc",
+        "_github_publish_once",
+        lambda *, publish_root, **_kwargs: published_roots.append(publish_root),
     )
 
     buf = io.BytesIO()
@@ -864,11 +859,8 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     assert resp.status_code == 200
     ref = resp.json()["id"]
     assert ref.startswith("github:")
-    assert ref.endswith("/myenv/12345678-1234-4321-abcd-123456789abc/freesolo/environment.py")
-    assert any(
-        path.endswith("/myenv/12345678-1234-4321-abcd-123456789abc/freesolo/environment.py")
-        for path in uploaded
-    )
+    assert ref.endswith("/myenv/freesolo/environment.py")
+    assert any(root.endswith("/myenv") for root in published_roots)
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
@@ -887,7 +879,7 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
 
     def fake_publish_package(*, package_b64, name, is_new, key):
         seen.update(package_b64=package_b64, name=name, is_new=is_new, key=key)
-        return "github:freesolo-co/training@main:key-1/e/publish-1/freesolo/environment.py"
+        return "github:freesolo-co/envs@main:environments/key-1/e/freesolo/environment.py"
 
     monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
 

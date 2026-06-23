@@ -26,8 +26,7 @@ def _missing_hf_credentials() -> list[str]:
     problems: list[str] = []
     if not os.environ.get("GITHUB_TOKEN"):
         problems.append(
-            "  - GITHUB_TOKEN: a token with read access to GitHub-hosted Freesolo "
-            "environments, e.g. `export GITHUB_TOKEN=github_pat_...`"
+            "  - GITHUB_TOKEN: server token with read access to private Freesolo environments"
         )
     if not os.environ.get("HF_TOKEN"):
         problems.append(
