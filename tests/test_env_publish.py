@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import io
+import subprocess
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -45,21 +47,29 @@ def test_namespace_distinct_for_placeholder_emails():
     assert envs.namespace_for(dict(k1)) == ns1
 
 
+def test_sanitize_name_never_returns_path_segments():
+    assert envs._sanitize_name("..") == "env"
+    assert envs._sanitize_name(".") == "env"
+    assert envs._sanitize_name("___") == "env"
+    assert envs._sanitize_name("My Env!") == "my-env"
+
+
 def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setenv("FLASH_ENV_GITHUB_REPO", "freesolo-co/training")
-    monkeypatch.setenv("FLASH_ENV_GITHUB_BRANCH", "dev")
-    monkeypatch.setattr(
-        envs,
-        "_new_publish_id",
-        lambda: "12345678-1234-4321-abcd-123456789abc",
-    )
-    uploaded: list[tuple[str, bytes]] = []
+    captured: dict[str, object] = {}
 
-    def fake_put_github_file(*, path, data, **_kwargs):
-        uploaded.append((path, data))
+    def fake_publish_once(*, dest, repo, token, publish_root, message):
+        captured.update(
+            repo=repo,
+            token=token,
+            publish_root=publish_root,
+            message=message,
+            files=sorted(
+                path.relative_to(dest).as_posix() for path in dest.rglob("*") if path.is_file()
+            ),
+        )
 
-    monkeypatch.setattr(envs, "_put_github_file", fake_put_github_file)
+    monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
     ref = envs.publish_package(
         package_b64=_pkg_b64(_MINIMAL),
         name="My Env!",
@@ -67,18 +77,22 @@ def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
         key={"email": "dev@clado.ai"},
     )
 
-    root = "dev-clado-ai/my-env/12345678-1234-4321-abcd-123456789abc"
-    assert ref == (f"github:freesolo-co/training@dev:{root}/freesolo/environment.py")
-    assert (
-        f"{root}/freesolo/environment.py",
-        _MINIMAL["freesolo/environment.py"].encode(),
-    ) in uploaded
-    assert (f"{root}/pyproject.toml", _MINIMAL["pyproject.toml"].encode()) in uploaded
+    root = "environments/dev-clado-ai/my-env"
+    assert ref == f"github:freesolo-co/environment-hub@main:{root}/freesolo/environment.py"
+    assert captured["repo"] == "freesolo-co/environment-hub"
+    assert captured["token"] == "ghp-test"
+    assert captured["publish_root"] == root
+    assert captured["message"] == "Upload Flash environment dev-clado-ai/my-env"
+    assert captured["files"] == [
+        "freesolo/__init__.py",
+        "freesolo/environment.py",
+        "pyproject.toml",
+    ]
 
 
 def test_publish_rejects_bad_input(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setattr(envs, "_put_github_file", lambda **_kwargs: None)
+    monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)
     with pytest.raises(envs.EnvPublishError, match="base64"):
         envs.publish_package(package_b64="not base64!!!", name="e", is_new=True, key={})
     with pytest.raises(envs.EnvPublishError, match="empty"):
@@ -100,6 +114,33 @@ def test_publish_requires_github_token(monkeypatch):
         envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", is_new=True, key={})
     assert excinfo.value.status == 503
     assert "GITHUB_TOKEN" in str(excinfo.value)
+
+
+def test_publish_does_not_accept_github_pat_alias(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_PAT", "github_pat_test")
+    with pytest.raises(envs.EnvPublishError) as excinfo:
+        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", is_new=True, key={})
+    assert excinfo.value.status == 503
+    assert "GITHUB_TOKEN" in str(excinfo.value)
+
+
+def test_redacts_raw_and_url_encoded_token():
+    token = "ghp_test/with:special"
+    encoded = "ghp_test%2Fwith%3Aspecial"
+    assert envs._redact(f"https://x-access-token:{encoded}@github.com\n{token}", token) == (
+        "https://x-access-token:<redacted>@github.com\n<redacted>"
+    )
+
+
+def test_copy_package_to_checkout_rejects_escape(tmp_path):
+    source = tmp_path / "source"
+    checkout = tmp_path / "checkout"
+    source.mkdir()
+    checkout.mkdir()
+    (source / "environment.py").write_text("def load_environment(**k): pass\n")
+    with pytest.raises(envs.EnvPublishError, match="unsafe"):
+        envs._copy_package_to_checkout(source=source, checkout=checkout, publish_root="../escape")
 
 
 def test_safe_extract_rejects_traversal(tmp_path):
@@ -156,30 +197,79 @@ def test_safe_extract_rejects_workflow_control_paths(tmp_path):
             envs._safe_extract(buf.getvalue(), tmp_path)
 
 
-def test_put_github_file_rejects_oversized_blob():
-    with pytest.raises(envs.EnvPublishError, match="exceeds GitHub Contents API limit"):
-        envs._put_github_file(
-            repo="owner/repo",
-            branch="main",
-            path="environments/sample.txt",
-            data=b"x" * (envs._MAX_GITHUB_FILE_BYTES + 1),
-            token="test",
-            message="upload",
-        )
+def test_push_environment_commit_rebases_before_push(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_run_git(cwd, args, *, token):
+        calls.append(args)
+        return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+    monkeypatch.setattr(envs, "_run_git", fake_run_git)
+    envs._push_environment_commit(checkout=tmp_path, token="tok")
+
+    assert calls == [
+        ["pull", "--rebase", "origin", "main"],
+        ["push", "origin", "HEAD:main"],
+    ]
 
 
-def test_existing_file_sha_returns_none_for_404(monkeypatch):
-    def fake_github_json(method: str, url: str, *, token: str, body: dict | None = None):
-        raise envs._GitHubApiError("missing", status=404)
+def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    (tmp_path / "freesolo").mkdir()
+    (tmp_path / "freesolo" / "environment.py").write_text("def load_environment(**k): pass\n")
+    calls = {"count": 0}
 
-    monkeypatch.setattr(envs, "_github_json", fake_github_json)
-    assert envs._existing_file_sha("owner/repo", "main", "f.txt", "token") is None
+    def fake_publish_once(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise envs.EnvPublishError("failed to push some refs")
+
+    monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
+    monkeypatch.setattr(envs.time, "sleep", lambda _seconds: None)
+
+    ref = envs._github_publish(tmp_path, name="e", key={"id": 1})
+
+    assert calls["count"] == 2
+    assert (
+        ref
+        == "github:freesolo-co/environment-hub@main:environments/key-1/e/freesolo/environment.py"
+    )
 
 
-def test_existing_file_sha_propagates_non_404(monkeypatch):
-    def fake_github_json(method: str, url: str, *, token: str, body: dict | None = None):
-        raise envs._GitHubApiError("forbidden", status=403)
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
-    monkeypatch.setattr(envs, "_github_json", fake_github_json)
-    with pytest.raises(envs.EnvPublishError, match="forbidden"):
-        envs._existing_file_sha("owner/repo", "main", "f.txt", "token")
+
+def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypatch):
+    remote = tmp_path / "environment-hub.git"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "--initial-branch", "main")
+    _git(seed, "config", "user.name", "test")
+    _git(seed, "config", "user.email", "test@example.com")
+    (seed / "README.md").write_text("hub\n")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "seed")
+    _git(seed, "init", "--bare", str(remote))
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "origin", "main")
+
+    package = tmp_path / "package"
+    (package / "freesolo").mkdir(parents=True)
+    (package / "freesolo" / "environment.py").write_text("def load_environment(**k): pass\n")
+
+    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+
+    envs._github_publish_once(
+        dest=package,
+        repo="ignored/repo",
+        token="tok",
+        publish_root="environments/ns/env",
+        message="Upload test env",
+    )
+
+    verify = tmp_path / "verify"
+    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
+    assert (verify / "environments/ns/env/freesolo/environment.py").read_text() == (
+        "def load_environment(**k): pass\n"
+    )

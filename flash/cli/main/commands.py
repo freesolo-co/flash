@@ -140,11 +140,10 @@ def cmd_env_setup(args) -> int:
         sample.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
-            "# Environment: a Freesolo environment ref. Publish the scaffolded\n"
-            "# environments/freesolo/environment.py with `flash env push environments/freesolo/environment.py`\n"
-            "# to get the id, and set it below.\n"
+            "# Environment: upload the scaffolded environments/freesolo/environment.py with\n"
+            "# `flash env push environments/freesolo/environment.py`, then paste the returned id below.\n"
             "[environment]\n"
-            'id = "github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py"\n\n'
+            'id = ""\n\n'
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
