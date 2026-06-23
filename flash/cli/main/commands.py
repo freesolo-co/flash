@@ -284,10 +284,6 @@ def cmd_env_setup(args) -> int:
     return 0
 
 
-def _model_dimension(params: str) -> str:
-    return params.split(" (", 1)[0]
-
-
 def cmd_models(args) -> int:
     rows = public_model_rows()
     if render.styled():
