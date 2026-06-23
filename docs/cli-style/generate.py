@@ -155,17 +155,18 @@ def _run(run_id, state, cost, model, algo, provider, gpu, ts):
 FAKE = FakeClient()
 
 
-def _set_style(styled: bool) -> None:
+def _set_style(styled: bool, theme: str = "dark") -> None:
     os.environ["FLASH_STYLE"] = "1" if styled else "0"
     os.environ.pop("NO_COLOR", None)
     os.environ["COLUMNS"] = "76"
     # advertise truecolor so the theme emits the exact brand hex (not the 256-color fallback)
     os.environ["COLORTERM"] = "truecolor"
+    os.environ["FLASH_THEME"] = theme
 
 
-def _capture_argv(argv, *, styled, cwd=None) -> str:
+def _capture_argv(argv, *, styled, theme="dark", cwd=None) -> str:
     """Run a real `flash` invocation against the fake client and capture stdout."""
-    _set_style(styled)
+    _set_style(styled, theme)
     commands = sys.modules["flash.cli.main.commands"]
     saved = commands.client_from_config
     commands.client_from_config = lambda *a, **k: FAKE
@@ -180,12 +181,6 @@ def _capture_argv(argv, *, styled, cwd=None) -> str:
         os.chdir(prev)
         commands.client_from_config = saved
     return out.getvalue().rstrip("\n")
-
-
-def _capture_text(styled_text: str, plain_text: str, *, styled: bool) -> str:
-    """For flows that need extra stubbing, supply the styled/plain strings directly."""
-    _set_style(styled)
-    return (styled_text if styled else plain_text).rstrip("\n")
 
 
 # ---- xterm-256 -> hex --------------------------------------------------------------
@@ -311,23 +306,29 @@ def build_cases(tmp: Path):
                 title,
                 sub,
                 _capture_argv(argv, styled=False, cwd=cwd),
-                _capture_argv(argv, styled=True, cwd=cwd),
+                _capture_argv(argv, styled=True, theme="dark", cwd=cwd),
+                _capture_argv(argv, styled=True, theme="light", cwd=cwd),
             )
         )
 
-    def add_text(title, sub, styled_fn, plain_text):
-        _set_style(False)
-        plain = _capture_text("", plain_text, styled=False)
-        _set_style(True)
-        styled = _capture_text(styled_fn(), "", styled=True)
-        cases.append((title, sub, plain, styled))
+    def add_text(title, sub, after_fn, plain_text):
+        # flows that need extra stubbing: render the styled "after" directly, per theme.
+        _set_style(True, "dark")
+        dark = after_fn().rstrip("\n")
+        _set_style(True, "light")
+        light = after_fn().rstrip("\n")
+        cases.append((title, sub, plain_text.rstrip("\n"), dark, light))
+
+    # login was already a card pre-PR; its "before" is that same card without color.
+    _set_style(False)
+    login_plain = render.login_ok(FAKE.me())
 
     add_argv("flash version", "package version", ["version"])
     add_text(
         "flash login",
         "verify + store your freesolo key",
         lambda: render.login_ok(FAKE.me()),
-        render.login_ok(FAKE.me()),
+        login_plain,
     )
     add_argv("flash whoami", "identity behind the stored key", ["whoami"])
     add_argv("flash models", "supported base models", ["models"])
@@ -383,7 +384,7 @@ HEAD = """<!doctype html>
 *{box-sizing:border-box}
 body{margin:0;background:radial-gradient(1200px 600px at 50% -10%,#5f72ff22,transparent),var(--bg);
   color:var(--ink);font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Inter,sans-serif}
-.wrap{max-width:1120px;margin:0 auto;padding:56px 24px 80px}
+.wrap{max-width:1320px;margin:0 auto;padding:56px 24px 80px}
 .brand{display:inline-flex;align-items:center;gap:10px;font-weight:700}
 .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px var(--accent)}
 .brand b{color:var(--accent)}
@@ -397,7 +398,7 @@ h1{font-size:30px;margin:18px 0 8px;letter-spacing:-.4px}
 .card>.head{display:flex;align-items:baseline;gap:12px;padding:15px 18px;border-bottom:1px solid var(--line)}
 .card>.head code{font:600 14px/1 ui-monospace,SFMono-Regular,Menlo,monospace}
 .card>.head .sub{color:var(--mut);font-size:13px}
-.cols{display:grid;grid-template-columns:1fr 1fr}
+.cols{display:grid;grid-template-columns:1fr 1fr 1fr}
 .col+.col{border-left:1px solid var(--line)}
 .col .tag{display:flex;align-items:center;gap:8px;padding:9px 16px;color:var(--mut);font-size:11px;
   letter-spacing:.14em;text-transform:uppercase;border-bottom:1px solid var(--line);background:#0d0d22}
@@ -408,7 +409,10 @@ pre{margin:0;padding:18px;overflow-x:auto;font:13px/1.5 ui-monospace,SFMono-Regu
   color:#aeb6cf;background:#0d0d22}
 .after pre{background:#09091a}
 .before pre{color:#868eaa}
-@media(max-width:760px){.cols{grid-template-columns:1fr}.col+.col{border-left:0;border-top:1px solid var(--line)}}
+/* the light column previews how the theme looks on a light terminal */
+.light .tag{background:#eef0f7;color:#5b6472;border-bottom-color:#e2e5f0}
+.light pre{background:#ffffff;color:#1b1b4b}
+@media(max-width:900px){.cols{grid-template-columns:1fr}.col+.col{border-left:0;border-top:1px solid var(--line)}}
 footer{color:var(--mut);font-size:13px;margin-top:48px;border-top:1px solid var(--line);padding-top:20px}
 footer code{color:var(--accent2)}
 </style></head><body><div class="wrap">
@@ -417,9 +421,11 @@ footer code{color:var(--accent2)}
   <h1>A standardized output theme for every command</h1>
   <p class="lede">One visual language across the whole CLI, in the Freesolo website palette
   (navy <code>#1b1b4b</code>, periwinkle <code>#5f72ff</code>, green <code>#57ff8f</code>): a brand
-  header, colored status badges, aligned tables, key/value panels, and syntax-highlighted JSON. The
-  themed view renders on an interactive terminal; piped or scripted output stays byte-for-byte
-  plain, so <code>jq</code>, scripts, and the agent contract are untouched.</p>
+  header, colored status badges, aligned tables, key/value panels, and syntax-highlighted JSON. Like
+  the website, it ships <b>light and dark</b> variants (auto-detected from the terminal background,
+  or forced with <code>FLASH_THEME</code>) &mdash; each command below shows both. The themed view
+  renders on an interactive terminal; piped or scripted output stays byte-for-byte plain, so
+  <code>jq</code>, scripts, and the agent contract are untouched.</p>
   <div class="legend">
     <span><i class="sw" style="background:#5f72ff"></i>periwinkle &mdash; accent / links</span>
     <span><i class="sw" style="background:#57ff8f"></i>green &mdash; success / done</span>
@@ -444,14 +450,16 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         cases = build_cases(Path(td))
     blocks = [HEAD]
-    for title, sub, plain, styled in cases:
+    for title, sub, plain, dark, light in cases:
         blocks.append(
             f'<section class="card"><div class="head"><code>{_html.escape(title)}</code>'
             f'<span class="sub">{_html.escape(sub)}</span></div><div class="cols">'
             f'<div class="col before"><div class="tag"><span class="pill"></span>before</div>'
             f"<pre>{ansi_to_html(plain) or '&nbsp;'}</pre></div>"
-            f'<div class="col after"><div class="tag"><span class="pill"></span>after</div>'
-            f"<pre>{ansi_to_html(styled) or '&nbsp;'}</pre></div></div></section>"
+            f'<div class="col after"><div class="tag"><span class="pill"></span>after · dark</div>'
+            f"<pre>{ansi_to_html(dark) or '&nbsp;'}</pre></div>"
+            f'<div class="col after light"><div class="tag"><span class="pill"></span>after · light</div>'
+            f"<pre>{ansi_to_html(light) or '&nbsp;'}</pre></div></div></section>"
         )
     blocks.append(FOOT)
     out_path.write_text("".join(blocks))
