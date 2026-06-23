@@ -15,6 +15,7 @@ from flash.cli import main as cli
 class _FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.log_text = "hello from the worker\n"
 
     def me(self) -> dict:
         return {"key_prefix": "freesolo", "email": "t@example.com"}
@@ -60,7 +61,7 @@ class _FakeClient:
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
         return {
             "run_id": run_id,
-            "logs": "hello from the worker\n",
+            "logs": self.log_text,
             "offset": 22,
             "state": "done",
         }
@@ -131,6 +132,14 @@ def test_status_ps_and_status_logs(fake_client, capsys) -> None:
     out = capsys.readouterr().out
     assert "hello from the worker" in out
     assert "cost_usd" in out
+
+
+def test_status_logs_separates_partial_log_line_from_json(fake_client, capsys) -> None:
+    fake_client.log_text = "partial log line"
+
+    assert _run(["status", "flash-1", "--logs"]) == 0
+    out = capsys.readouterr().out
+    assert "partial log line\n{" in out
 
 
 @pytest.mark.parametrize("removed", ["cost", "attach", "logs"])
