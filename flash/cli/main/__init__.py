@@ -13,6 +13,7 @@ import sys
 
 from flash import __version__
 from flash._logging import configure_logging, get_logger
+from flash._update_check import emit_update_notice, maybe_start_update_check
 
 # Command handlers + the patched client surface live in submodules; re-export them so
 # `flash.cli.main` stays the single public import surface (and so monkeypatching
@@ -189,6 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
+    # Kick off a once-a-day PyPI version check in the background; the "new release available"
+    # notice (if any) prints to stderr after the command output (see emit_update_notice).
+    update_check = maybe_start_update_check()
     try:
         return args.func(args)
     except _USER_ERRORS as exc:
@@ -199,3 +203,5 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("aborted", file=sys.stderr)
         return 130
+    finally:
+        emit_update_notice(update_check)
