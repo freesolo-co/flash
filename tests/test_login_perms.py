@@ -55,3 +55,22 @@ def _check_login(monkeypatch):
         os.environ.pop("FREESOLO_API_KEY", None)
         _, key = client_config.load_credentials()
         assert key == "fs-secret-123"
+
+
+def test_login_warns_when_env_key_will_override_saved_key(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("FREESOLO_API_KEY", "fs-secret-env")
+
+    import flash.client.config as client_config
+
+    importlib.reload(client_config)
+    import flash.cli.main as cli
+
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda api_key, base_url=None: None)
+    args = types.SimpleNamespace(api_key="fs-secret-arg", api_url=None, freesolo_url=None)
+
+    assert cli.cmd_login(args) == 0
+    captured = capsys.readouterr()
+    assert "logged in with your freesolo key" in captured.out
+    assert "FREESOLO_API_KEY is set and will override this saved login" in captured.err
+    assert client_config.load_credentials()[1] == "fs-secret-env"

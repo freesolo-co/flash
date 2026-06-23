@@ -57,7 +57,8 @@ def cmd_login(args) -> int:
     # Login is handled by the freesolo backend (not the flash control plane): the user
     # supplies the freesolo API key they created at freesolo.co/sign-in, and we verify it against
     # freesolo before storing it. The same key authenticates flash's control plane.
-    api_key = args.api_key or os.environ.get("FREESOLO_API_KEY")
+    env_api_key = os.environ.get("FREESOLO_API_KEY")
+    api_key = args.api_key or env_api_key
     if not api_key:
         raise ClientError(
             "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
@@ -68,6 +69,12 @@ def cmd_login(args) -> int:
     # save_credentials clears the stored url when it's the default, so logging into the
     # default plane also drops a stale custom url from a previous custom-URL login.
     _ = save_credentials(api_key, api_url=api_url)
+    if args.api_key and env_api_key and env_api_key != args.api_key:
+        print(
+            "warning: FREESOLO_API_KEY is set and will override this saved login for future "
+            "commands; unset FREESOLO_API_KEY to use the saved key.",
+            file=sys.stderr,
+        )
     # Never echo the key itself; the stored file is the single source of truth.
     print("logged in with your freesolo key")
     return 0
