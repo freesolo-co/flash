@@ -106,7 +106,10 @@ def rollout_one(
     token-aligned) and the scalar ``reward`` for this rollout.
     """
     state = active_env.new_rollout_state(example)
-    messages = [dict(m) for m in state["prompt"]]
+    initial_messages = state.get("prompt") or state.get("messages")
+    if not isinstance(initial_messages, list):
+        raise KeyError("multi-turn rollout state must include prompt or messages")
+    messages = [dict(m) for m in initial_messages]
     prompt_ids = render(messages, True)
     cur_ids = list(prompt_ids)  # invariant: cur_ids == prompt_ids + completion_ids so far
     # Per-rollout completion cap so prompt + accumulated completion never exceeds the colocate
