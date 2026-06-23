@@ -65,12 +65,19 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
         return None
     from fastapi import HTTPException
 
-    try:
-        want = int(raw_step)
-    except (TypeError, ValueError):
-        raise HTTPException(
-            status_code=400, detail=f"invalid checkpoint step: {raw_step!r}"
-        ) from None
+    # Accept only an actual integer step — NOT a bool (True would coerce to step 1) and not a
+    # non-integer float/string (40.9 / "40.9" must not silently round to a different checkpoint).
+    want: int | None = None
+    if isinstance(raw_step, bool):
+        want = None
+    elif isinstance(raw_step, int):
+        want = raw_step
+    elif isinstance(raw_step, float):
+        want = int(raw_step) if raw_step.is_integer() else None
+    elif isinstance(raw_step, str) and raw_step.strip().lstrip("-").isdigit():
+        want = int(raw_step.strip())
+    if want is None:
+        raise HTTPException(status_code=400, detail=f"invalid checkpoint step: {raw_step!r}")
     checkpoints = list_checkpoints(spec)
     if any(c["step"] == want for c in checkpoints):
         return want

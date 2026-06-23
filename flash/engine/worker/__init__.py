@@ -345,6 +345,11 @@ _CHECKPOINT_TRAINER_STATE = (
     "zero_to_fp32.py",
 )
 
+# The PEFT adapter weights file a checkpoint must carry to be loadable/servable (safetensors is
+# the default; .bin is the legacy fallback). A step with adapter_config.json but no weights is
+# NOT deployable, so it's never published/listed.
+_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
+
 
 def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
     """Mirror a trainer checkpoint's LoRA adapter to a stable, NON-pruned per-step path so a
@@ -359,9 +364,11 @@ def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
     """
     if not HF_REPO:
         return None
-    # Only publish a checkpoint that actually carries a loadable adapter — never advertise a
-    # non-deployable step.
-    if not os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")):
+    # Only publish a checkpoint that actually carries a loadable adapter (config AND weights) —
+    # never advertise a non-deployable step.
+    has_config = os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json"))
+    has_weights = any(os.path.isfile(os.path.join(ckpt_dir, w)) for w in _ADAPTER_WEIGHT_FILES)
+    if not (has_config and has_weights):
         return None
     subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
     try:
@@ -881,13 +888,14 @@ def run_sft():
         "logging_steps": 10,
         "save_steps": sft_save_default,
         "save_total_limit": 1,
-        # Full resumable checkpoints: save the optimizer / scheduler / RNG state alongside the
-        # (small) LoRA adapter, so a preempted run resumed via resume_from_checkpoint
-        # (hf_resume_checkpoint) continues with intact Adam moments + LR schedule instead of
-        # re-initializing the optimizer. For LoRA the optimizer state is tiny (it covers only the
-        # trainable adapter params), so the save spike is negligible. The deployable per-step
-        # snapshot (publish_deployable_checkpoint) strips this trainer state separately, so serving
-        # still gets adapter-only files.
+        # Resumable checkpoints: save the optimizer / scheduler / RNG state alongside the (small)
+        # LoRA adapter. We DO resume mid-run — make_checkpoint_upload_callback streams each save to
+        # HF and a replacement worker calls resume_from_checkpoint(hf_resume_checkpoint()) after a
+        # preemption — so without this the resumed run would re-initialize the optimizer (Adam
+        # moments) and LR schedule instead of truly continuing. For LoRA the optimizer state is tiny
+        # (it covers only the trainable adapter params), so the save spike is negligible. The
+        # deployable per-step snapshot (publish_deployable_checkpoint) strips this trainer state
+        # separately, so serving still gets adapter-only files.
         "save_only_model": False,
         "max_length": sft_max_len,
         "bf16": True,
@@ -1699,10 +1707,11 @@ def run_rl():
         "logging_steps": 1,
         "save_steps": _t.save_every if _t and _t.save_every is not None else 20,
         "save_total_limit": 1,
-        # Full resumable checkpoints: keep optimizer/scheduler/RNG state with the LoRA adapter so a
-        # preempted GRPO run resumes (resume_from_checkpoint) with intact optimizer state + step,
-        # not a fresh optimizer. For LoRA this state is small (trainable adapter params only). The
-        # deployable per-step snapshot strips it separately, so serving still gets adapter-only.
+        # Resumable checkpoints: keep the optimizer/scheduler/RNG state with the LoRA adapter so a
+        # preempted GRPO run resumed via resume_from_checkpoint(hf_resume_checkpoint()) continues
+        # with intact optimizer state + step instead of a fresh optimizer. For LoRA this state is
+        # small (trainable adapter params only). The deployable per-step snapshot strips it
+        # separately, so serving still gets adapter-only files.
         "save_only_model": False,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
