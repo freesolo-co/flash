@@ -396,10 +396,11 @@ def cmd_ps(args) -> int:
     if not runs:
         print("no runs yet")
         return 0
-    print(f"{'RUN_ID':<32}  {'STATE':<11}  {'COST($)':>8}  {'GPU':<22}  MODEL")
+    print(f"{'RUN_ID':<32}  {'STATE':<11}  {'ALGO':<5}  {'COST($)':>8}  {'GPU':<22}  MODEL")
     for r in sorted(runs, key=lambda r: r.get("updated_at", 0), reverse=True):
         spec = r.get("spec") or {}
         model = spec.get("model", "")
+        algorithm = str(spec.get("algorithm") or "-").upper()
         remote = r.get("remote") or {}
         # the remote handle knows what actually ran; the spec is the parse-time pick
         provider = remote.get("provider") or (
@@ -408,8 +409,8 @@ def cmd_ps(args) -> int:
         gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
         where = f"{gpu}@{provider}" if provider else gpu
         print(
-            f"{r['run_id']:<32}  {r['state']:<11}  {r.get('cost_usd', 0.0):>8.4f}  "
-            f"{where:<22}  {model}"
+            f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "
+            f"{r.get('cost_usd', 0.0):>8.4f}  {where:<22}  {model}"
         )
     return 0
 
