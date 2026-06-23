@@ -1130,3 +1130,15 @@ def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 999}, headers=_bearer(key))
     assert r.status_code == 404, r.text
     assert "available: 40, 80" in r.json()["detail"]
+
+
+def test_deploy_rejects_non_integer_step(api, monkeypatch):
+    """A bool (True->1) or non-integer step must be rejected, not silently coerced."""
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    for bad in (True, 40.9, "40.9"):
+        r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": bad}, headers=_bearer(key))
+        assert r.status_code == 400, f"{bad!r} -> {r.status_code} {r.text}"

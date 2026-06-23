@@ -93,6 +93,20 @@ def test_publish_deployable_checkpoint_skips_without_adapter(tmp_path, monkeypat
     assert rec.uploads == []
 
 
+def test_publish_deployable_checkpoint_skips_config_without_weights(tmp_path, monkeypatch):
+    """A checkpoint with adapter_config.json but no weights file isn't loadable -> not published."""
+    import flash.engine.worker as worker
+
+    rec = _RecordingHfApi()
+    _prime_worker(monkeypatch, rec)
+    ckpt = tmp_path / "checkpoint-20"
+    ckpt.mkdir()
+    (ckpt / "adapter_config.json").write_text("{}")  # config only, no adapter_model.*
+
+    assert worker.publish_deployable_checkpoint(str(ckpt), 20) is None
+    assert rec.uploads == []
+
+
 def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
     import flash.engine.worker as worker
 
@@ -139,6 +153,7 @@ def test_list_checkpoints_parses_and_sorts(monkeypatch):
         f"{base}/checkpoints/step-80/adapter/adapter_config.json",
         f"{base}/checkpoints/step-80/adapter/adapter_model.safetensors",
         f"{base}/checkpoints/step-40/adapter/adapter_config.json",
+        f"{base}/checkpoints/step-40/adapter/adapter_model.safetensors",
         # noise that must NOT be picked up:
         f"{base}/checkpoint/checkpoint-90/optimizer.pt",
         f"{base}/adapter/adapter_config.json",
@@ -153,6 +168,19 @@ def test_list_checkpoints_parses_and_sorts(monkeypatch):
     assert out[0]["subfolder"] == f"{base}/checkpoints/step-40/adapter"
     assert out[0]["repo_id"] == "org/test-runs"
     assert out[1]["step"] == 80
+
+
+def test_list_checkpoints_skips_step_without_weights(monkeypatch):
+    """A step with adapter_config.json but no weights file is NOT advertised as deployable."""
+    base = "rl/flash-ckpt-1/seed0"
+    files = [
+        # step-40 is complete; step-60 has config only (half-uploaded) and must be excluded.
+        f"{base}/checkpoints/step-40/adapter/adapter_config.json",
+        f"{base}/checkpoints/step-40/adapter/adapter_model.safetensors",
+        f"{base}/checkpoints/step-60/adapter/adapter_config.json",
+    ]
+    _patch_hf_files(monkeypatch, files)
+    assert [c["step"] for c in list_checkpoints(_spec())] == [40]
 
 
 def test_list_checkpoints_no_repo(monkeypatch):

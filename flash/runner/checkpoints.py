@@ -17,6 +17,9 @@ import re
 from flash.runner import adapter_prefix
 from flash.spec import JobSpec
 
+# The PEFT weights file a step must carry (alongside adapter_config.json) to be servable.
+_ADAPTER_WEIGHT_FILES = frozenset({"adapter_model.safetensors", "adapter_model.bin"})
+
 
 def checkpoint_adapter_prefix(spec: JobSpec, step: int, seed: int | None = None) -> str:
     """The ``adapter_prefix`` that serves checkpoint ``step``.
@@ -27,18 +30,17 @@ def checkpoint_adapter_prefix(spec: JobSpec, step: int, seed: int | None = None)
     return f"{adapter_prefix(spec, seed)}/checkpoints/step-{step}"
 
 
-def _adapter_config_re(base: str) -> re.Pattern[str]:
-    """Matches ``<base>/checkpoints/step-<N>/adapter/adapter_config.json`` — the presence of the
-    PEFT config is what marks a step as actually loadable/deployable."""
-    return re.compile(
-        re.escape(base) + r"/checkpoints/step-(\d+)/adapter/adapter_config\.json$"
-    )
+def _adapter_file_re(base: str) -> re.Pattern[str]:
+    """Matches ``<base>/checkpoints/step-<N>/adapter/<filename>`` and captures (step, filename)."""
+    return re.compile(re.escape(base) + r"/checkpoints/step-(\d+)/adapter/([^/]+)$")
 
 
 def list_checkpoints(spec: JobSpec, seed: int | None = None) -> list[dict]:
     """Deployable per-step adapter snapshots for ``spec``, ascending by step.
 
-    Each entry: ``{"step", "adapter_prefix", "subfolder", "repo_id", "repo_type"}`` where
+    A step is included only if its adapter folder carries BOTH ``adapter_config.json`` AND a
+    weights file (so ``/deploy --step`` can never target a half-uploaded, unloadable step). Each
+    entry: ``{"step", "adapter_prefix", "subfolder", "repo_id", "repo_type"}`` where
     ``adapter_prefix`` is the value to hand ``deploy_adapter`` to serve that exact step and
     ``subfolder`` is the full path of the adapter folder in the repo. Returns ``[]`` when the
     run has no HF repo or no published snapshots (older runs, or none saved yet)."""
@@ -46,7 +48,7 @@ def list_checkpoints(spec: JobSpec, seed: int | None = None) -> list[dict]:
     if not repo:
         return []
     base = adapter_prefix(spec, seed)
-    pattern = _adapter_config_re(base)
+    pattern = _adapter_file_re(base)
     try:
         from huggingface_hub import HfApi
 
@@ -56,12 +58,17 @@ def list_checkpoints(spec: JobSpec, seed: int | None = None) -> list[dict]:
     except Exception as exc:  # listing is best-effort; never raise into a run/route
         print(f"[ckpt] list warn for {spec.run_id}: {exc}")
         return []
-    out: list[dict] = []
+    # Collect each step's adapter-folder filenames, then keep only steps with config + weights.
+    by_step: dict[int, set[str]] = {}
     for path in files:
         match = pattern.search(path)
-        if not match:
+        if match:
+            by_step.setdefault(int(match.group(1)), set()).add(match.group(2))
+    out: list[dict] = []
+    for step in sorted(by_step):
+        names = by_step[step]
+        if "adapter_config.json" not in names or names.isdisjoint(_ADAPTER_WEIGHT_FILES):
             continue
-        step = int(match.group(1))
         prefix = checkpoint_adapter_prefix(spec, step, seed)
         out.append(
             {
@@ -72,5 +79,4 @@ def list_checkpoints(spec: JobSpec, seed: int | None = None) -> list[dict]:
                 "repo_type": "dataset",
             }
         )
-    out.sort(key=lambda c: c["step"])
     return out
