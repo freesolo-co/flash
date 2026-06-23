@@ -83,8 +83,8 @@ class _FakeSingleTurnEnv(_EnvironmentSingleTurn):
     dataset: ClassVar[list[dict]] = [
         {
             "id": "ex-1",
-            "task": "2+2?",
-            "expected_output": "4",
+            "input": "2+2?",
+            "output": "4",
             "metadata": {"split": "train"},
         }
     ]
@@ -118,7 +118,7 @@ class _FakeMultiTurnEnv(_EnvironmentMultiTurn):
             done=True,
             messages=({"role": "user", "content": f"observed {assistant_response}"},),
             final_response_text=f"final {assistant_response}",
-            metadata={"task": example.task},
+            metadata={"input": example.task},
         )
 
     def score_episodes(self, example, episodes):
@@ -139,9 +139,9 @@ def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
     def task_example_from_record(record):
         return _TaskExample(
             record=dict(record),
-            task=str(record.get("task") or record.get("prompt") or ""),
+            task=str(record["input"]),
             task_id=record.get("id"),
-            expected_output=record.get("expected_output"),
+            expected_output=record.get("output"),
             metadata=dict(record.get("metadata") or {}),
         )
 
@@ -216,7 +216,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     env_file.write_text("def load_environment(**kwargs): pass\n")
     dataset = tmp_path / "freesolo" / "datasets" / "train.jsonl"
     dataset.parent.mkdir()
-    dataset.write_text('{"id":"row-1","task":"2+2?","expected_output":"4"}\n')
+    dataset.write_text('{"id":"row-1","input":"2+2?","output":"4"}\n')
 
     from flash.envs.adapter import load_freesolo_environment
 
@@ -233,7 +233,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert seen["kwargs"]["difficulty"] == "hard"
 
     train = env.dataset()
-    assert train == [{"id": "row-1", "task": "2+2?", "expected_output": "4"}]
+    assert train == [{"id": "row-1", "input": "2+2?", "output": "4"}]
     assert env.prompt_messages(train[0]) == [
         {"role": "system", "content": "be brief"},
         {"role": "user", "content": "2+2?"},
@@ -242,7 +242,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.grade("the answer is 4", train[0]) is True
     assert env.reward("nope", train[0]) == 0.0
     assert env.scores_breakdown("the answer is 4", train[0]) == {"match": 1.0, "total": 1.0}
-    assert env.sft_target({"expected_output": "4"}) == "4"
+    assert env.sft_target({"output": "4"}) == "4"
 
 
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
@@ -256,7 +256,23 @@ def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
         source=None,
         contract_text="",
     )
-    assert env.dataset()[0]["expected_output"] == "4"
+    assert env.dataset()[0]["output"] == "4"
+
+
+def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        _FakeSingleTurnEnv(),
+        "owner/env",
+        source=None,
+        contract_text="",
+    )
+    assert env.sft_target({"expected_output": "4"}) == ""
+    with pytest.raises(ValueError, match="input field"):
+        env.prompt_messages({"task": "2+2?", "output": "4"})
 
 
 def test_freesolo_multiturn_hooks(monkeypatch):
@@ -267,10 +283,10 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     env = FreesoloEnvironment(
         _FakeMultiTurnEnv(),
         "github:owner/repo@main:env/environment.py",
-        source=[{"task": "browse", "expected_output": "done"}],
+        source=[{"input": "browse", "output": "done"}],
         contract_text="contract",
     )
-    state = env.new_rollout_state({"task": "browse", "expected_output": "done"})
+    state = env.new_rollout_state({"input": "browse", "output": "done"})
     assert state["prompt"] == [{"role": "user", "content": "contract:browse"}]
     assert state["messages"] == [{"role": "user", "content": "contract:browse"}]
     env.record_model_turn(state, "click")
@@ -278,12 +294,12 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     assert replies == [{"role": "user", "content": "observed click"}]
     assert state["done"] is True
     assert env.rollout_done(state) is True
-    assert env.reward("ignored", {"task": "browse", "expected_output": "done"}, state) == 0.5
-    assert env.grade("ignored", {"task": "browse", "expected_output": "done"}, state) is True
+    assert env.reward("ignored", {"input": "browse", "output": "done"}, state) == 0.5
+    assert env.grade("ignored", {"input": "browse", "output": "done"}, state) is True
     assert (
         env.reward_from_messages(
             [{"role": "assistant", "content": "final"}],
-            {"task": "browse", "expected_output": "done"},
+            {"input": "browse", "output": "done"},
             [{"role": "user", "content": "contract:browse"}],
         )
         == 0.5

@@ -14,7 +14,7 @@ from flash.envs.base import BaseEnvironment
 
 def test_base_environment_defaults() -> None:
     env = BaseEnvironment(id="x")
-    example = {"question": "Q?", "answer": "42"}
+    example = {"input": "Q?", "output": "42"}
     assert env.prompt_messages(example) == [{"role": "user", "content": "Q?"}]
     assert env.sft_target(example) == "42"
     assert env.grade("the answer is 42", example) is True
