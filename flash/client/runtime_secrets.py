@@ -9,10 +9,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
+DEFAULT_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
 
 
-def _read_env_file(path: Path) -> dict[str, str]:
+def _runtime_secret_keys(keys: tuple[str, ...] | list[str] | set[str] | None = None) -> set[str]:
+    return set(DEFAULT_RUNTIME_SECRET_KEYS) | {str(key) for key in (keys or ())}
+
+
+def _read_env_file(path: Path, keys: set[str]) -> dict[str, str]:
     if not path.exists() or not path.is_file():
         return {}
     out: dict[str, str] = {}
@@ -26,7 +30,7 @@ def _read_env_file(path: Path) -> dict[str, str]:
             continue
         key, value = s.split("=", 1)
         key = key.strip()
-        if key not in RUNTIME_SECRET_KEYS:
+        if key not in keys:
             continue
         value = value.strip().strip('"').strip("'")
         if value:
@@ -34,7 +38,10 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return out
 
 
-def runtime_secrets_from_local_env(config_path: str | os.PathLike[str] | None = None) -> dict[str, str]:
+def runtime_secrets_from_local_env(
+    config_path: str | os.PathLike[str] | None = None,
+    keys: tuple[str, ...] | list[str] | set[str] | None = None,
+) -> dict[str, str]:
     """Collect supported run secrets from the user's local env.
 
     Process environment wins. As a convenience for local project workflows, also read `.env` and
@@ -42,12 +49,21 @@ def runtime_secrets_from_local_env(config_path: str | os.PathLike[str] | None = 
     scan arbitrary parent directories or serialize secrets into the run spec.
     """
 
-    secrets = {key: value for key in RUNTIME_SECRET_KEYS if (value := os.environ.get(key))}
+    wanted = _runtime_secret_keys(keys)
+    secrets = {key: value for key in wanted if (value := os.environ.get(key))}
     candidates = [Path.cwd() / ".env", Path.cwd() / ".env.local"]
     if config_path:
         cfg_dir = Path(config_path).expanduser().resolve().parent
         candidates.extend([cfg_dir / ".env", cfg_dir / ".env.local"])
     for path in candidates:
-        for key, value in _read_env_file(path).items():
+        for key, value in _read_env_file(path, wanted).items():
             secrets.setdefault(key, value)
+    required = {str(key) for key in (keys or ())}
+    missing = sorted(required - set(secrets))
+    if missing:
+        raise ValueError(
+            "missing declared environment secret(s): "
+            f"{', '.join(missing)}. Set them in your shell or local .env file before submitting; "
+            "do not put secret values in TOML."
+        )
     return secrets
