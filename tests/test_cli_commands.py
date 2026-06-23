@@ -128,6 +128,7 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
     err = capsys.readouterr().err
     assert "login failed" in err
     assert "try again" in err
+    assert "founders@freesolo.co" in err
     assert "bad-key" not in err
 
 

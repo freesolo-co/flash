@@ -81,5 +81,6 @@ def login_failed(reason: str) -> str:
     return (
         f"{_style('31', _glyph('✗', 'x:'))} {_bold('login failed')}\n"
         f"  {reason}\n"
-        f"  {_dim('then run `flash login --api-key <key>` to try again')}"
+        f"  {_dim('then run `flash login --api-key <key>` to try again')}\n"
+        f"  {_dim('if it keeps failing, email founders@freesolo.co')}"
     )
