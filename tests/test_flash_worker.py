@@ -112,9 +112,8 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
 
 def test_build_worker_env_forwards_upload_console(monkeypatch):
     """FLASH_UPLOAD_CONSOLE (upload the worker console on SUCCESS, not just on crash) is read on the
-    worker by run_mode() from the forwarded env dict — RunPod _train_body AND the Vast bootstrap,
-    both of which reuse this build_worker_env. It MUST be on the allowlist or the success-console
-    upload silently no-ops on every remote run."""
+    worker by run_mode() from the forwarded env dict. It MUST be on the allowlist or the
+    success-console upload silently no-ops on every remote run."""
     from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("FLASH_UPLOAD_CONSOLE", "1")

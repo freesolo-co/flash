@@ -480,10 +480,10 @@ def _maybe_drop_fla() -> None:
         fla #640).
     Ampere/Ada/Blackwell otherwise keep fla for the speedup. This mirrors the control-plane
     ``resolve_worker_deps`` rule, but it is the only RELIABLE place to enforce it: the base image
-    BAKES fla in and per-run installs (extra_pip / `prime env install`) can pull it back, so the
-    drop must happen HERE in the worker process, after all installs and BEFORE any model import.
-    Runs on BOTH substrates (RunPod and Vast exec this module). importlib caches are invalidated so
-    the later is_fla_available() probe sees it gone.
+    BAKES fla in and per-run installs (extra_pip) can pull it back, so the drop must happen HERE
+    in the worker process, after all installs and BEFORE any model import. Runs in the worker
+    process on every run. importlib caches are invalidated so the later is_fla_available() probe
+    sees it gone.
     """
     import importlib.util
     import subprocess

@@ -581,8 +581,8 @@ def submit_run(
 def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float = 45.0):
     """Rate-limited reader for one HF artifact's text content (None until it exists).
 
-    Generic helper shared by both providers' pollers (runpod heartbeats + vast's
-    DONE/metrics/error artifacts). ``read(force=False)`` re-downloads at most once per
+    Generic helper for HF-backed worker artifacts and heartbeats. ``read(force=False)``
+    re-downloads at most once per
     ``min_interval_s`` (``force=True`` bypasses the gate); it never raises — any HF error
     (artifact absent, network) returns None.
     """

@@ -332,10 +332,9 @@ def get_train_endpoint(
         workers=(0, 1),  # one dedicated worker per run; scale to zero when idle
         **volume_endpoint_kwargs(spec),
     )
-    # RunPod Flash needs its serverless runtime baked into the worker image; the prebuilt
-    # WORKER_IMAGE is Vast's cold-start image (no Flash runtime) and leaves the worker unhealthy if
-    # forced. RunPod boot-installs WORKER_DEPS on Flash's default template instead (cached as a
-    # Flash artifact). Optional FLASH_WORKER_IMAGE override for a RunPod-serverless-compatible image.
+    # RunPod Flash needs its serverless runtime baked into the worker image. Boot-install
+    # WORKER_DEPS on Flash's default template instead (cached as a Flash artifact). Optional
+    # FLASH_WORKER_IMAGE override for a RunPod-serverless-compatible image.
     image = os.environ.get("FLASH_WORKER_IMAGE")
     if image:
         kwargs["image"] = image
