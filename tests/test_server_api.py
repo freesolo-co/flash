@@ -51,7 +51,11 @@ def _identity_for_token(token: str) -> dict[str, str]:
     if not token.startswith(_USER_PREFIX):
         return {}
     suffix = token.removeprefix(_USER_PREFIX)
-    return {"email": f"user-{suffix}@example.com", "key_prefix": "fslo_test"}
+    return {
+        "email": f"user-{suffix}@example.com",
+        "key_prefix": "fslo_test",
+        "org_id": f"org-{suffix}",
+    }
 
 
 @pytest.fixture

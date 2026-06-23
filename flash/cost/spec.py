@@ -1,7 +1,7 @@
 """Map a parsed training ``JobSpec`` to a cost ``RunConfig`` / step count / estimate.
 
-Shared by ``flash train --cost`` and the control plane's submit-time charge, so both price the
-same work on the same catalog-only, cheapest-fit basis."""
+Used by ``flash train --cost`` for a pre-flight quote. The control plane bills completed runs
+from their final recorded ``cost_usd`` instead of charging this estimate at submit time."""
 
 from __future__ import annotations
 

@@ -93,6 +93,7 @@ HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
 SEED = int(os.environ.get("SEED", "0"))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
+ATTEMPT = os.environ.get("ATTEMPT", "")
 JOB_SPEC = load_job_spec_from_env()
 # PHASE is the stable artifact namespace (sft|rl) and matches RUN_MODE for a train run.
 PHASE = os.environ.get(
@@ -214,6 +215,32 @@ def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False):
         required,
         "hf_upload_file",
     )
+
+
+_DEBUG_UPLOAD_LOCK = threading.Lock()
+
+
+def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> None:
+    """Append bounded JSONL debug rows and upload them as an optional artifact.
+
+    This is intentionally best-effort: debug visibility must not fail a paid run.
+    """
+    if not rows or not HF_REPO:
+        return
+    repo_name = os.path.basename(name if name.endswith(".jsonl") else f"{name}.jsonl")
+    path = os.path.join("/tmp", repo_name)
+    try:
+        with _DEBUG_UPLOAD_LOCK:
+            existing: list[str] = []
+            with contextlib.suppress(FileNotFoundError), open(path) as f:
+                existing = f.readlines()[-keep_last:]
+            with open(path, "w") as f:
+                f.writelines(existing)
+                for row in rows:
+                    f.write(json.dumps(row, default=str, ensure_ascii=True, sort_keys=True) + "\n")
+            hf_upload_file(path, repo_name)
+    except Exception as e:
+        print(f"debug upload warn ({repo_name}): {e}")
 
 
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False):
@@ -382,6 +409,7 @@ def heartbeat(stage: str, **kw):
         "run_id": RUN_ID,
         "mode": RUN_MODE,
         "seed": SEED,
+        "attempt": ATTEMPT,
         **kw,
     }
     os.makedirs("/tmp/hb", exist_ok=True)
@@ -948,7 +976,7 @@ def run_sft():
         train_dataset=ds,
         peft_config=make_lora(model_id),
         processing_class=tok,
-        callbacks=[make_checkpoint_upload_callback()],
+        callbacks=[make_sft_heartbeat_callback(), make_checkpoint_upload_callback()],
     )
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
     # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
@@ -1119,6 +1147,10 @@ def rl_per_device_comps(
     return max(1, base)
 
 
+_STEP_GPU_DIAG_INTERVAL_S = 300.0
+_SFT_HEARTBEAT_INTERVAL_S = 60.0
+
+
 def make_reward_heartbeat_callback():
     """A TRL/transformers callback that streams the per-step mean reward to the HF heartbeat
     channel, giving the worker a live RL signal (no pod log API) and recording a
@@ -1128,6 +1160,7 @@ def make_reward_heartbeat_callback():
     class _RewardHeartbeat(TrainerCallback):
         def __init__(self):
             self.reward_history = []
+            self.last_gpu_diag_at = 0.0
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs:
@@ -1141,9 +1174,55 @@ def make_reward_heartbeat_callback():
                 return
             self.reward_history.append(r)
             step = int(getattr(state, "global_step", len(self.reward_history)))
-            heartbeat("rl_step", step=step, reward=r, reward_last=self.reward_history[-8:])
+            payload = {
+                "step": step,
+                "reward": r,
+                "reward_last": self.reward_history[-8:],
+            }
+            now = time.monotonic()
+            if (
+                self.last_gpu_diag_at == 0.0
+                or now - self.last_gpu_diag_at >= _STEP_GPU_DIAG_INTERVAL_S
+            ):
+                payload["gpu"] = gpu_diagnostics()
+                self.last_gpu_diag_at = now
+            heartbeat("rl_step", **payload)
 
     return _RewardHeartbeat()
+
+
+def make_sft_heartbeat_callback():
+    """Stream SFT trainer logs so a run is not silent between model load and completion."""
+    from transformers import TrainerCallback
+
+    class _SFTHeartbeat(TrainerCallback):
+        def __init__(self):
+            self.last_heartbeat_at = 0.0
+            self.last_gpu_diag_at = 0.0
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return
+            now = time.monotonic()
+            if self.last_heartbeat_at and now - self.last_heartbeat_at < _SFT_HEARTBEAT_INTERVAL_S:
+                return
+            self.last_heartbeat_at = now
+            payload = {
+                "step": int(getattr(state, "global_step", 0) or 0),
+                "epoch": logs.get("epoch"),
+                "loss": logs.get("loss"),
+                "grad_norm": logs.get("grad_norm"),
+                "learning_rate": logs.get("learning_rate"),
+            }
+            if (
+                self.last_gpu_diag_at == 0.0
+                or now - self.last_gpu_diag_at >= _STEP_GPU_DIAG_INTERVAL_S
+            ):
+                payload["gpu"] = gpu_diagnostics()
+                self.last_gpu_diag_at = now
+            heartbeat("sft_step", **{k: v for k, v in payload.items() if v is not None})
+
+    return _SFTHeartbeat()
 
 
 def grpo_overrides() -> dict:
@@ -1429,17 +1508,42 @@ def run_rl():
         # the thinking-length penalty computed from the RAW completion's <think> span.
         examples = kwargs.get("example")
         rewards = []
-        for comp, ex in zip(completions, examples, strict=False):
+        debug_rows = []
+        for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
             if isinstance(comp, list):
                 # Tool / conversational transcript (TRL passes a list of messages): score the
                 # whole transcript via the environment reward (no <think> stripping —
                 # multi-turn content).
-                rewards.append(ACTIVE_ENV.reward_from_messages(comp, ex))
+                r = ACTIVE_ENV.reward_from_messages(comp, ex)
+                rewards.append(r)
                 continue
-            r = ACTIVE_ENV.reward(graded_text(comp), ex)
+            graded = graded_text(comp)
+            breakdown = None
+            if hasattr(ACTIVE_ENV, "scores_breakdown"):
+                breakdown = ACTIVE_ENV.scores_breakdown(graded, ex)
+                r = float(breakdown.get("total", 0.0))
+            else:
+                r = ACTIVE_ENV.reward(graded, ex)
             if _think_penalty > 0 and THINKING:
                 r -= _think_penalty * think_token_count(comp, tok)
             rewards.append(r)
+            if idx < 8:
+                debug_rows.append(
+                    {
+                        "ts": time.time(),
+                        "attempt": ATTEMPT,
+                        "run_id": RUN_ID,
+                        "mode": RUN_MODE,
+                        "seed": SEED,
+                        "reward": r,
+                        "breakdown": breakdown,
+                        "completion_prefix": str(comp or "")[:1000],
+                        "graded_prefix": str(graded or "")[:1000],
+                        "example_id": (ex or {}).get("id") if isinstance(ex, dict) else None,
+                        "example_input": (ex or {}).get("input") if isinstance(ex, dict) else None,
+                    }
+                )
+        upload_debug_jsonl("reward_debug.jsonl", debug_rows)
         return rewards
 
     # TRL's per_device_train_batch_size counts COMPLETIONS, not prompts. Size grad-accum so

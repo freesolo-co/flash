@@ -67,6 +67,7 @@ def build_worker_env(payload: dict) -> dict:
         env["FLASH_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
+    env["ATTEMPT"] = str(payload.get("attempt") or 0)
     # Compute substrate for the RunMetrics record (engine.worker reads FLASH_ARM). The
     # payload env was built by the shared runpod env builder, which stamps "runpod"; this
     # bootstrap runs on the Vast instance, so override it to the real backend.
