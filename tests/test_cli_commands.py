@@ -291,6 +291,9 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert _run(["env", "setup"]) == 0
 
     assert (tmp_path / "environment.py").is_file()
+    dataset = tmp_path / "datasets/train.jsonl"
+    assert dataset.is_file()
+    assert '"input":"What is 2 + 2?"' in dataset.read_text()
     grpo = tmp_path / "configs/grpo.toml"
     sft = tmp_path / "configs/sft.toml"
     assert grpo.is_file()
@@ -300,7 +303,9 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "steps = 150" in grpo.read_text()
     assert 'algorithm = "sft"' in sft.read_text()
     assert "epochs = 1" in sft.read_text()
-    assert "configs/grpo.toml" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "datasets/train.jsonl" in out
+    assert "configs/grpo.toml" in out
 
 
 def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None:
