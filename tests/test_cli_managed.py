@@ -136,8 +136,8 @@ def test_login_verifies_freesolo_key_and_train_submits(stub_server, tmp_path):
     assert out["run_id"] == "flash-1-stub"
     assert out["spec"]["model"] == "Qwen/Qwen3.5-4B"
 
-    # `flash ps` renders the server's run list.
-    proc = _run(["ps"], home=home, api_url=stub_server)
+    # `flash runs` renders the server's run list.
+    proc = _run(["runs"], home=home, api_url=stub_server)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "flash-1-stub" in proc.stdout
     assert "GRPO" in proc.stdout

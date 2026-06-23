@@ -184,13 +184,13 @@ def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
     assert "[gpu] config table" not in out
 
 
-def test_status_ps_and_status_logs(fake_client, capsys) -> None:
+def test_status_runs_and_status_logs(fake_client, capsys) -> None:
     assert _run(["status", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert "done" in out
     assert "cost_usd" in out
 
-    assert _run(["ps"]) == 0
+    assert _run(["runs"]) == 0
     out = capsys.readouterr().out
     assert "ALGO" in out
     assert "flash-1" in out
