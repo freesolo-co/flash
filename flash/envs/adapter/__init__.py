@@ -441,7 +441,37 @@ class FreesoloEnvironment(BaseEnvironment):
         self._EnvironmentTurn = tools["EnvironmentTurn"]
         self.multi_turn = isinstance(sdk_env, tools["EnvironmentMultiTurn"])
         self.is_tool_env = False
-        self.max_turns = 8
+        self._max_turns_cache: int | None = None
+
+    @property
+    def max_turns(self) -> int:
+        """Rollout turn ceiling the worker reads for the batch-level loop cap.
+
+        A pure multi-turn freesolo env sets a *per-example* budget via
+        ``max_episode_turns(example)`` (e.g. #user turns + a tool-iteration budget per
+        turn). The batch cap the rollout loop uses must be at least the largest such
+        budget, or it would truncate the deepest scenarios before they finish (e.g.
+        support-chat's 4-customer-turn rollouts need ~20 turns, not 8). Take the
+        dataset-wide max once, bounded so a pathological env can't make rollouts
+        unbounded; single-turn / non-multi-turn envs keep the small default. The exact
+        per-example budget is still enforced in :meth:`rollout_done`.
+        """
+        if self._max_turns_cache is not None:
+            return self._max_turns_cache
+        cap = 8
+        if self.multi_turn:
+            cap = 24  # safe default if the per-example budgets can't be read
+            try:
+                budgets = [
+                    int(self._env.max_episode_turns(self._task_example(ex)))
+                    for ex in self.dataset()
+                ]
+                if budgets:
+                    cap = max(8, min(64, max(budgets)))
+            except Exception:
+                pass
+        self._max_turns_cache = cap
+        return cap
 
     def _task_example(self, example: dict):
         return self._task_example_from_record(self._canonical_record(example))
@@ -550,6 +580,13 @@ class FreesoloEnvironment(BaseEnvironment):
     def new_rollout_state(self, example: dict) -> dict:
         task = self._task_example(example)
         prompt = [dict(message) for message in self._env.start_episode(task, self._contract_text)]
+        # Per-example turn budget (env's max_episode_turns) so rollout_done caps THIS
+        # rollout at its own budget rather than the batch-wide ceiling -- a single-turn
+        # scenario stops after a few turns while a deep one gets its full budget.
+        try:
+            episode_turns: int | None = int(self._env.max_episode_turns(task))
+        except Exception:
+            episode_turns = None
         return {
             "task": task,
             "prompt": [dict(message) for message in prompt],
@@ -558,6 +595,7 @@ class FreesoloEnvironment(BaseEnvironment):
             "done": False,
             "response_text": "",
             "turn": 0,
+            "max_episode_turns": episode_turns,
         }
 
     def record_model_turn(self, state: dict, content: str) -> dict:
@@ -599,7 +637,13 @@ class FreesoloEnvironment(BaseEnvironment):
             return True
         if bool(state.get("done")):
             return True
-        return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+        # Prefer THIS rollout's own per-example budget (set in new_rollout_state); fall
+        # back to the batch-wide cap the worker passes. The env normally terminates via
+        # step.done well before either, so this is a non-termination guard.
+        cap = state.get("max_episode_turns")
+        if cap is None:
+            cap = max_turns
+        return cap is not None and int(state.get("turn", 0)) >= int(cap)
 
     def _episode_from_state(self, state: dict):
         return self._EnvironmentEpisode(

@@ -7,6 +7,9 @@ verified the same way a real template (Qwen-style <|im_start|>/<|im_end|>) would
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 from flash.engine.multiturn_rollout import (
@@ -201,6 +204,150 @@ def test_engine_max_len_caps_total_completion():
     )
     # prompt + only the first assistant turn (2 tokens), then the budget halts it
     assert out["env_mask"] == [1, 1]
+
+
+# ---------------------------------------------------------------------------
+# build_rollout_func: colocate-engine wake/sleep + prompt-id guard (issue #162)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTok:
+    """Minimal tokenizer: render to text then map each char to its ordinal id."""
+
+    def __init__(self, force_ids=None):
+        self._force_ids = force_ids
+
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize, enable_thinking):
+        text = "".join(f"<{m['role']}>{m['content']}" for m in messages)
+        return text + ("<assistant>" if add_generation_prompt else "")
+
+    def __call__(self, text, add_special_tokens=False):
+        ids = self._force_ids if self._force_ids is not None else [ord(c) for c in text]
+        return types.SimpleNamespace(input_ids=ids)
+
+
+class _OneTurnEnv:
+    """multi-turn-shaped env that stops after the first model turn (no env reply)."""
+
+    multi_turn = True
+
+    def new_rollout_state(self, example):
+        return {"prompt": [{"role": "user", "content": "hi"}], "completion": []}
+
+    def record_model_turn(self, state, content):
+        state["completion"].append({"role": "assistant", "content": content})
+
+    def rollout_done(self, state, max_turns):
+        return True
+
+    def env_reply(self, messages, state):
+        return []
+
+    def reward(self, completion, example, state=None):
+        return 0.5
+
+
+class _FakeEngine:
+    def __init__(self, vocab=1000):
+        self.events = []
+        self.llm_engine = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(get_vocab_size=lambda: vocab)
+        )
+
+    def wake_up(self, tags=None):
+        self.events.append(("wake", tuple(tags or [])))
+
+    def sleep(self, level=None):
+        self.events.append(("sleep", level))
+
+    def generate(self, prompts, sampling_params=None, use_tqdm=False):
+        self.events.append(("generate", tuple(prompts[0]["prompt_token_ids"])))
+        comp = types.SimpleNamespace(token_ids=[5, 6], logprobs=None, text="ok")
+        return [types.SimpleNamespace(outputs=[comp])]
+
+
+def _fake_trainer(engine, *, sleep_mode):
+    return types.SimpleNamespace(
+        vllm_generation=types.SimpleNamespace(llm=engine),
+        num_generations=1,
+        args=types.SimpleNamespace(vllm_enable_sleep_mode=sleep_mode),
+    )
+
+
+@pytest.fixture
+def _stub_vllm():
+    """Stub the GPU-only ``vllm.SamplingParams`` so build_rollout_func imports on CPU."""
+    prev = sys.modules.get("vllm")
+    mod = types.ModuleType("vllm")
+    mod.SamplingParams = lambda **kw: types.SimpleNamespace(**kw)
+    sys.modules["vllm"] = mod
+    try:
+        yield
+    finally:
+        if prev is None:
+            sys.modules.pop("vllm", None)
+        else:
+            sys.modules["vllm"] = prev
+
+
+def _build(tok):
+    from flash.engine.multiturn_rollout import build_rollout_func
+
+    return build_rollout_func(
+        active_env=_OneTurnEnv(),
+        tok=tok,
+        examples_by_key={},
+        max_completion=8,
+        max_turns=4,
+        temperature=0.7,
+        top_p=1.0,
+        stop=None,
+        thinking=False,
+        engine_max_len=None,
+    )
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_wakes_kv_cache_around_generation_when_sleep_mode():
+    # The bug (#162): TRL's rollout_func path wakes only the weights, never the KV cache, so the
+    # first engine.generate() faults. The fix wakes tags=["kv_cache"] BEFORE any generate and
+    # re-sleeps AFTER the batch — assert that exact ordering.
+    engine = _FakeEngine()
+    rf = _build(_FakeTok())
+    out = rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=True))
+    kinds = [e[0] for e in engine.events]
+    assert kinds == ["wake", "generate", "sleep"]
+    assert engine.events[0] == ("wake", ("kv_cache",))
+    assert engine.events[-1] == ("sleep", 2)
+    assert out["reward"] == [0.5]
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_no_wakesleep_when_sleep_mode_off():
+    engine = _FakeEngine()
+    rf = _build(_FakeTok())
+    rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
+    assert [e[0] for e in engine.events] == ["generate"]
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_re_sleeps_even_if_generation_raises():
+    # finally: the engine must return to the offloaded state even when a rollout throws, or the
+    # next step inherits a half-woken engine.
+    engine = _FakeEngine(vocab=50)  # ord('h')=104 >= 50 -> guard fires inside generate()
+    rf = _build(_FakeTok())
+    with pytest.raises(ValueError, match="out-of-range token id"):
+        rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=True))
+    assert engine.events[0] == ("wake", ("kv_cache",))
+    assert engine.events[-1] == ("sleep", 2)
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_guards_empty_prompt():
+    engine = _FakeEngine()
+    rf = _build(_FakeTok(force_ids=[]))  # tokenizer yields no ids -> empty prompt
+    with pytest.raises(ValueError, match="empty prompt"):
+        rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
 
 
 def test_examples_index_and_collisions():

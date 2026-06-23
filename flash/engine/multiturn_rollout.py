@@ -200,6 +200,30 @@ def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: 
     return [int(t) for t in tok(text, add_special_tokens=False).input_ids]
 
 
+def _engine_vocab_size(engine) -> int | None:
+    """Best-effort vocab size of the colocate vLLM engine, or None if it can't be read.
+
+    Used only for a cheap fail-loud bounds check on the pre-tokenized prompt ids before they
+    reach ``engine.generate`` (the ``prompt_token_ids`` path does no bounds checking, so an
+    out-of-range id would otherwise surface as an opaque CUDA illegal-access). Never raises.
+    """
+    try:
+        mc = engine.llm_engine.model_config
+    except Exception:
+        return None
+    for attr in ("get_vocab_size", "get_hf_config_vocab_size"):
+        getter = getattr(mc, attr, None)
+        if callable(getter):
+            try:
+                return int(getter())
+            except Exception:
+                pass
+    try:
+        return int(mc.hf_text_config.vocab_size)
+    except Exception:
+        return None
+
+
 def build_rollout_func(
     *,
     active_env,
@@ -227,8 +251,31 @@ def build_rollout_func(
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
         num_gen = int(getattr(trainer, "num_generations", 1) or 1)
+        # Colocate vLLM sleep mode (GRPOConfig.vllm_enable_sleep_mode, ON for large / long-context
+        # runs) offloads BOTH the rollout engine's weights and its KV cache between steps. TRL's
+        # rollout_func path (GRPOTrainer._generate) calls vllm_generation.sync_weights() — which
+        # wakes only tags=["weights"] — and then hands control to this closure, but, UNLIKE TRL's
+        # own single-turn generate() path, it never wakes tags=["kv_cache"]. So engine.generate()
+        # below would run against a freed/offloaded KV cache and fault with CUDA "illegal memory
+        # access" on the very first generate of step 0. Wake the KV cache here and re-sleep after
+        # the whole batch, mirroring trl.generation.vllm_generation.generate (and
+        # trl.experimental.openenv). No-op when sleep mode is off (small/short-context runs keep
+        # the engine resident across steps). See flash issue #162.
+        sleep_mode = bool(getattr(getattr(trainer, "args", None), "vllm_enable_sleep_mode", False))
+        vocab_size = _engine_vocab_size(engine)
 
         def generate(prefix_ids: list[int], max_tokens: int):
+            # Fail loudly on a degenerate prompt instead of letting a bad id reach the embedding
+            # gather as an opaque async CUDA illegal-access (the exact failure mode #162 was first
+            # mistaken for): the prompt_token_ids path does no bounds checking.
+            if not prefix_ids:
+                raise ValueError("multi-turn rollout produced an empty prompt for engine.generate()")
+            lo, hi = min(prefix_ids), max(prefix_ids)
+            if lo < 0 or (vocab_size is not None and hi >= vocab_size):
+                raise ValueError(
+                    f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
+                    f"vocab size {vocab_size} (tokenizer/model mismatch)"
+                )
             sp = SamplingParams(
                 max_tokens=max(1, int(max_tokens)),
                 temperature=temperature,
@@ -254,23 +301,31 @@ def build_rollout_func(
                 lps.append(float(getattr(lp, "logprob", 0.0)) if lp is not None else 0.0)
             return token_ids, lps, comp.text
 
-        # One accumulator list per rollout field (batched dict-of-lists across all rollouts).
-        out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
-        for prompt in prompts:
-            example = examples_by_key.get(_prompt_key(prompt), {"prompt": prompt})
-            for _ in range(num_gen):
-                r = rollout_one(
-                    example=example,
-                    active_env=active_env,
-                    render=render,
-                    generate=generate,
-                    max_turns=max_turns,
-                    per_turn_max_tokens=max_completion,
-                    engine_max_len=engine_max_len,
-                    on_warn=print,
-                )
-                for k in out:
-                    out[k].append(r[k])
-        return out
+        # Wake the KV cache for the whole batch (see the note above), then re-sleep so the engine
+        # returns to its fully-offloaded state and the optimizer step has the freed memory back.
+        if sleep_mode:
+            engine.wake_up(tags=["kv_cache"])
+        try:
+            # One accumulator list per rollout field (batched dict-of-lists across all rollouts).
+            out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
+            for prompt in prompts:
+                example = examples_by_key.get(_prompt_key(prompt), {"prompt": prompt})
+                for _ in range(num_gen):
+                    r = rollout_one(
+                        example=example,
+                        active_env=active_env,
+                        render=render,
+                        generate=generate,
+                        max_turns=max_turns,
+                        per_turn_max_tokens=max_completion,
+                        engine_max_len=engine_max_len,
+                        on_warn=print,
+                    )
+                    for k in out:
+                        out[k].append(r[k])
+            return out
+        finally:
+            if sleep_mode:
+                engine.sleep(level=2)
 
     return rollout_func

@@ -132,6 +132,57 @@ class _FakeMultiTurnEnv(_EnvironmentMultiTurn):
         ]
 
 
+class _BudgetMultiTurnEnv(_EnvironmentMultiTurn):
+    """Multi-turn env with a per-example budget that never self-terminates (done=False),
+    so the rollout cap (max_episode_turns) is what must stop it."""
+
+    def start_episode(self, example, prompt_text):
+        return [{"role": "user", "content": "go"}]
+
+    def max_episode_turns(self, example):
+        return 15
+
+    def step_episode(self, example, messages, assistant_response):
+        return _EnvironmentStepResult(
+            done=False,
+            messages=({"role": "user", "content": "more"},),
+            final_response_text=None,
+            metadata={},
+        )
+
+    def score_episodes(self, example, episodes):
+        return [_RewardResult(score=0.0, success=False, metrics=()) for _ in episodes]
+
+
+def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):
+    _install_fake_freesolo(monkeypatch, sdk_env=_BudgetMultiTurnEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        _BudgetMultiTurnEnv(),
+        "owner/env",
+        source=[{"input": "go", "output": ""}],
+        contract_text="",
+    )
+    # max_turns is now the dataset-wide max_episode_turns (15), not the old hardcoded 8 —
+    # otherwise the rollout loop would truncate this 15-turn scenario at turn 8.
+    assert env.max_turns == 15
+
+    state = env.new_rollout_state({"input": "go", "output": ""})
+    assert state["max_episode_turns"] == 15
+    # rollout_done honors THIS rollout's budget even when the batch cap is larger, and even
+    # though the env never sets done=True.
+    state["turn"] = 14
+    assert env.rollout_done(state, max_turns=999) is False
+    state["turn"] = 15
+    assert env.rollout_done(state, max_turns=999) is True
+    # done=True still short-circuits before the budget.
+    state["turn"] = 0
+    state["done"] = True
+    assert env.rollout_done(state, max_turns=999) is True
+
+
 def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
     sdk_env = sdk_env or _FakeSingleTurnEnv()
     seen = seen if seen is not None else {}
