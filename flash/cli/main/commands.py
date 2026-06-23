@@ -144,7 +144,7 @@ def cmd_env_setup(args) -> int:
             "# environments/freesolo/environment.py with `flash env push environments/freesolo/environment.py`\n"
             "# to get the id, and set it below.\n"
             "[environment]\n"
-            'id = "github:owner/repo@main:path/to/freesolo/environment.py"\n\n'
+            'id = "github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py"\n\n'
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"

@@ -17,13 +17,14 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_MEMBERS = 5000
 _MAX_GITHUB_FILE_BYTES = 1024 * 1024
-_DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
+_DEFAULT_GITHUB_REPO = "freesolo-co/training"
 _DEFAULT_GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "freesolo/environment.py"
 
@@ -58,6 +59,10 @@ def namespace_for(key: dict) -> str:
 def _sanitize_name(name: str) -> str:
     slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")
     return slug or "env"
+
+
+def _new_publish_id() -> str:
+    return str(uuid.uuid4())
 
 
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
@@ -221,7 +226,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     branch = _github_branch()
     ns = namespace_for(key)
     clean = _sanitize_name(name)
-    publish_root = f"environments/{ns}/{clean}"
+    publish_root = f"{ns}/{clean}/{_new_publish_id()}"
     env_rel = _environment_file_relative_path(dest)
     files = sorted(path for path in dest.rglob("*") if path.is_file())
     if not files:

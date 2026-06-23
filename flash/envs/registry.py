@@ -14,7 +14,9 @@ from .._fileio import read_json_or_empty, secure_json_write
 from .base import Environment
 
 # Manifest of local GitHub environment refs (written by `flash env install`).
-INSTALLED_MANIFEST = Path(os.environ.get("FLASH_ENVS_MANIFEST", str(Path.home() / ".flash" / "envs.json")))
+INSTALLED_MANIFEST = Path(
+    os.environ.get("FLASH_ENVS_MANIFEST", str(Path.home() / ".flash" / "envs.json"))
+)
 
 
 def load_installed_manifest() -> dict:
@@ -56,6 +58,6 @@ def load_environment(env_id: str, params: dict | None = None) -> Environment:
         raise ValueError(
             "no environment specified: set [environment] id to a GitHub Freesolo "
             "environment ref, e.g. "
-            "'github:freesolo-co/training@main:path/to/freesolo/environment.py'"
+            "'github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py'"
         )
     return load_freesolo_environment(env_id, **params)

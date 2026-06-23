@@ -47,8 +47,13 @@ def test_namespace_distinct_for_placeholder_emails():
 
 def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setenv("FLASH_ENV_GITHUB_REPO", "freesolo-co/environment-hub")
+    monkeypatch.setenv("FLASH_ENV_GITHUB_REPO", "freesolo-co/training")
     monkeypatch.setenv("FLASH_ENV_GITHUB_BRANCH", "dev")
+    monkeypatch.setattr(
+        envs,
+        "_new_publish_id",
+        lambda: "12345678-1234-4321-abcd-123456789abc",
+    )
     uploaded: list[tuple[str, bytes]] = []
 
     def fake_put_github_file(*, path, data, **_kwargs):
@@ -62,8 +67,8 @@ def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
         key={"email": "dev@clado.ai"},
     )
 
-    root = "environments/dev-clado-ai/my-env"
-    assert ref == (f"github:freesolo-co/environment-hub@dev:{root}/freesolo/environment.py")
+    root = "dev-clado-ai/my-env/12345678-1234-4321-abcd-123456789abc"
+    assert ref == (f"github:freesolo-co/training@dev:{root}/freesolo/environment.py")
     assert (
         f"{root}/freesolo/environment.py",
         _MINIMAL["freesolo/environment.py"].encode(),
