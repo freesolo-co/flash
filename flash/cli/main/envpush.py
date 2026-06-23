@@ -188,7 +188,10 @@ def cmd_env_push(args) -> int:
         env_root = src
         entrypoint = modules[0]
     else:
-        print(f"cannot publish {src}: expected a Freesolo .py module or an env directory.")
+        print(
+            f"cannot publish {src}: expected a Freesolo .py module or an env directory.",
+            file=sys.stderr,
+        )
         return 1
 
     with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
