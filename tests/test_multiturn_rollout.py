@@ -37,6 +37,13 @@ def render(messages, add_generation_prompt):
     return ids
 
 
+def env_glue(env_messages):
+    """Inter-turn glue for the fake scheme: the env turn + next generation prompt. (In this
+    fake the model's generated tokens already carry the end-of-turn token, so the glue does not
+    add a separate close — mirroring how build_rollout_func derives the real glue.)"""
+    return render(env_messages, True)
+
+
 class FakeEnv:
     """Minimal MultiTurnEnv-shaped adapter: one env (user) turn, stops after 2 model turns."""
 
@@ -86,6 +93,7 @@ def test_rollout_one_interleaves_and_masks_env_tokens():
         active_env=FakeEnv(),
         render=render,
         generate=_generator(["a1", "GOOD"]),
+        env_glue=env_glue,
         max_turns=10,
         per_turn_max_tokens=64,
     )
@@ -121,6 +129,7 @@ def test_rollout_one_respects_max_turns():
         active_env=FakeEnv(),
         render=render,
         generate=_generator(["a1", "GOOD"]),
+        env_glue=env_glue,
         max_turns=1,
         per_turn_max_tokens=64,
     )
@@ -141,6 +150,7 @@ def test_rollout_one_stops_when_env_has_no_reply():
         active_env=NoReplyEnv(),
         render=render,
         generate=_generator(["a1", "a1"]),
+        env_glue=env_glue,
         max_turns=10,
         per_turn_max_tokens=64,
     )
@@ -161,6 +171,7 @@ def test_rollout_one_accepts_messages_only_initial_state():
         active_env=MessagesOnlyEnv(),
         render=render,
         generate=_generator(["a1", "GOOD"]),
+        env_glue=env_glue,
         max_turns=1,
         per_turn_max_tokens=64,
     )
@@ -168,26 +179,25 @@ def test_rollout_one_accepts_messages_only_initial_state():
     assert out["env_mask"] == [1, 1]
 
 
-def test_non_prefix_template_raises():
-    # A non-prefix-preserving template would mis-mask model vs env tokens, so the rollout must
-    # fail loudly rather than silently mis-train.
-    warnings: list[str] = []
-
-    def bad_render(messages, add_generation_prompt):
-        ids = render(messages, add_generation_prompt)
-        return list(reversed(ids))  # earlier tokens shift -> prefix invariant broken
-
-    with pytest.raises(ValueError, match="prefix-preserving"):
-        rollout_one(
-            example={"answer": "GOOD"},
-            active_env=FakeEnv(),
-            render=bad_render,
-            generate=_generator(["a1", "GOOD"]),
-            max_turns=10,
-            per_turn_max_tokens=64,
-            on_warn=warnings.append,
-        )
-    assert warnings
+def test_rollout_one_builds_from_env_glue_without_rerender():
+    # The sequence is built from generate() ids + env_glue ids only — never a re-render of the
+    # full conversation — so a template that does not round-trip history (e.g. Qwen3's <think>
+    # block) stays aligned. Inject an opaque glue and assert it lands verbatim, masked 0,
+    # between the model turns. (`render` here is used ONLY for the initial prompt.)
+    GLUE = [501, 502, 503]
+    out = rollout_one(
+        example={"answer": "GOOD"},
+        active_env=FakeEnv(),
+        render=render,
+        generate=_generator(["a1", "GOOD"]),
+        env_glue=lambda env_msgs: list(GLUE),
+        max_turns=10,
+        per_turn_max_tokens=64,
+    )
+    # completion = asst1(a1,END) + GLUE(masked 0) + asst2(GOOD,END)
+    assert out["completion_ids"] == [CONTENT["a1"], END, *GLUE, CONTENT["GOOD"], END]
+    assert out["env_mask"] == [1, 1, 0, 0, 0, 1, 1]
+    assert out["logprobs"][2:5] == [0.0, 0.0, 0.0]  # glue carries placeholder logprobs
 
 
 def test_engine_max_len_caps_total_completion():
@@ -198,6 +208,7 @@ def test_engine_max_len_caps_total_completion():
         active_env=FakeEnv(),
         render=render,
         generate=_generator(["a1", "GOOD"]),
+        env_glue=env_glue,
         max_turns=10,
         per_turn_max_tokens=64,
         engine_max_len=len(render([{"role": "user", "content": "u1"}], True)) + 10,

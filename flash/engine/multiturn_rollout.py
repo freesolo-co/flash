@@ -86,20 +86,28 @@ def rollout_one(
     active_env,
     render: Callable[[list, bool], list[int]],
     generate: Callable[[list, int], tuple[list[int], list[float], str]],
+    env_glue: Callable[[list], list[int]],
     max_turns: int,
     per_turn_max_tokens: int,
     engine_max_len: int | None = None,
-    on_warn: Callable[[str], None] | None = None,
 ) -> RolloutResult:
     """Run one multi-turn/tool rollout and return TRL ``rollout_func`` fields for it.
 
     Args:
         example: the dataset row carried into environment scoring.
         active_env: the Freesolo environment adapter (drives the turn loop + scoring).
-        render: ``render(messages, add_generation_prompt) -> token_ids`` (chat template).
+        render: ``render(messages, add_generation_prompt) -> token_ids`` (chat template) — used
+            only for the INITIAL prompt.
         generate: ``generate(prefix_token_ids, max_tokens) -> (token_ids, token_logprobs,
             text)`` for one sampled assistant turn (model tokens + sampling logprobs + text);
             ``max_tokens`` bounds that turn so it can't overflow the engine context.
+        env_glue: ``env_glue(env_messages) -> token_ids`` — the tokens that CLOSE the
+            just-finished assistant turn, render the env reply message(s), and OPEN the next
+            generation prompt. The running token sequence is built incrementally from these
+            (the model's generated ids + env glue), never by re-rendering the whole
+            conversation — so a chat template that does not round-trip prior turns (e.g. Qwen3's
+            empty ``<think>`` block, which is injected into the generation prompt but stripped
+            from history) stays token-aligned instead of failing the old prefix check.
         max_turns: hard cap on model turns (defense against a non-terminating env).
 
     Returns a dict with ``prompt_ids``, ``completion_ids``, ``logprobs``, ``env_mask`` (all
@@ -148,27 +156,18 @@ def rollout_one(
             break
         messages.extend(env_msgs)
 
-        # Env-segment tokens = the suffix added by re-rendering the conversation (with the next
-        # generation prompt) beyond what we already have. Masked (0) — they are not the
-        # policy's tokens — but kept in completion_ids so the next turn conditions on them. This
-        # REQUIRES a prefix-preserving template (appending a message must not retokenize earlier
-        # turns); otherwise the model/env token boundary is wrong and the loss mask is garbage —
-        # so fail loudly rather than silently mis-train.
-        new_ids = render(messages, True)
-        if new_ids[: len(cur_ids)] != cur_ids:
-            msg = (
-                "multi-turn rollout requires a prefix-preserving chat template (appending a "
-                "message must not retokenize earlier turns); this model's template is not. Use "
-                "a single-turn/tool env, or a model whose template is prefix-preserving."
-            )
-            if on_warn:
-                on_warn(msg)
-            raise ValueError(msg)
-        env_seg = new_ids[len(cur_ids) :]
-        completion_ids.extend(env_seg)
-        logprobs.extend([0.0] * len(env_seg))
-        env_mask.extend([0] * len(env_seg))
-        cur_ids = list(new_ids)
+        # Env-segment tokens = close the just-finished assistant turn + render the env reply +
+        # open the next generation prompt, computed INCREMENTALLY (env_glue) rather than by
+        # re-rendering the whole conversation. Masked (0) — they are not the policy's tokens —
+        # but kept in completion_ids so the next turn conditions on them. Building the sequence
+        # by id-concatenation (model ids + glue) keeps it token-aligned even for templates that
+        # don't round-trip history (Qwen3's empty <think> block), which the old re-render +
+        # prefix-check could not handle.
+        glue = env_glue(env_msgs)
+        completion_ids.extend(glue)
+        logprobs.extend([0.0] * len(glue))
+        env_mask.extend([0] * len(glue))
+        cur_ids.extend(glue)
 
     # Score with the ACTUAL rollout state (not a fresh one) so reward funcs see the tool/env
     # state the rollout accumulated. state["completion"] holds the full transcript.
@@ -248,6 +247,25 @@ def build_rollout_func(
     def render(messages: list, add_generation_prompt: bool) -> list[int]:
         return render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
 
+    def env_glue(env_messages: list) -> list[int]:
+        # Tokens between two assistant turns: close the previous assistant turn, render the env
+        # reply message(s), and open the next generation prompt. Derived by rendering a probe
+        # assistant turn followed by the env messages (+ generation prompt) and taking everything
+        # AFTER the probe content — so the glue is exactly the template's inter-turn wrapper,
+        # whatever it is (Qwen's <|im_end|> + user turn + <|im_start|>assistant + <think> block).
+        # This avoids re-rendering history (which Qwen3 does not round-trip) and matches how the
+        # model actually conditioned during generation. The probe is plain text the template
+        # inserts verbatim into assistant content; its FIRST occurrence is the probe turn.
+        probe = "flash-env-glue-probe"
+        text = tok.apply_chat_template(
+            [{"role": "assistant", "content": probe}, *env_messages],
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=thinking,
+        )
+        glue_text = text[text.index(probe) + len(probe) :]
+        return [int(t) for t in tok(glue_text, add_special_tokens=False).input_ids]
+
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
         num_gen = int(getattr(trainer, "num_generations", 1) or 1)
@@ -316,10 +334,10 @@ def build_rollout_func(
                         active_env=active_env,
                         render=render,
                         generate=generate,
+                        env_glue=env_glue,
                         max_turns=max_turns,
                         per_turn_max_tokens=max_completion,
                         engine_max_len=engine_max_len,
-                        on_warn=print,
                     )
                     for k in out:
                         out[k].append(r[k])
