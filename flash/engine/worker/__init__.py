@@ -1,8 +1,8 @@
-"""On-GPU fine-tuning worker (RunPod or Vast.ai). Modes: sft | rl.
+"""On-GPU fine-tuning worker (RunPod). Modes: sft | rl.
 
-This module runs on the provisioned GPU (RunPod or Vast.ai) launched by the selected
-``flash.providers`` backend. It uses the shared recipe (``flash.engine.recipe``) so
-SFT targets and RL rewards are rendered and scored consistently.
+This module runs on the provisioned RunPod GPU. It uses the shared recipe
+(``flash.engine.recipe``) so SFT targets and RL rewards are rendered and scored
+consistently.
 
 Artifacts (adapter, metrics.json, heartbeat.json, checkpoints) are streamed to a
 Hugging Face dataset repo. HF checkpoints give preemption resilience: if a worker is
@@ -384,7 +384,7 @@ _HB_THROTTLED_STAGES = frozenset({"rl_step"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 _HB_TERMINAL_ONLY = False
 # Even in terminal-only mode, emit a SLOW heartbeat at this cadence so the control plane's stall
-# detector (poll_vast_job stall_after_s, default 1500s) keeps seeing progress through a long
+# detector keeps seeing progress through a long
 # training phase and doesn't false-stall the run. 600s -> ~6 commits/hr, far under the 128/hr cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
 
@@ -1959,9 +1959,8 @@ def write_train_meta(
     # metrics only — loss/reward are streamed by the trainer; reward_history is in notes)
     # and write the completion sentinel. There is no separate eval phase.
     m = RunMetrics(
-        # Substrate the worker actually ran on. Each provider's launcher sets FLASH_ARM
-        # in the worker env (runpod -> "runpod", vast -> "vast"); default to "runpod" only
-        # when unset so the persisted metrics correctly attribute the compute backend.
+        # Substrate the worker actually ran on. The RunPod launcher sets FLASH_ARM; default to
+        # "runpod" when unset so persisted metrics correctly attribute the compute backend.
         arm=os.environ.get("FLASH_ARM", "runpod"),
         phase=phase,
         seed=SEED,
