@@ -167,14 +167,14 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     # worker at environment load time.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        environment=EnvironmentSpec(id="github:owner/repo@main:env/freesolo/environment.py"),
+        environment=EnvironmentSpec(id="github:owner/repo@main:env/environment.py"),
     )
     assert spec_payload(spec)["environment"]["pip"] == ["freesolo"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        environment=EnvironmentSpec(id="github:owner/repo@main:env/freesolo/environment.py", pip=("custom==1",)),
+        environment=EnvironmentSpec(id="github:owner/repo@main:env/environment.py", pip=("custom==1",)),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
 

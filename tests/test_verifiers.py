@@ -191,7 +191,7 @@ def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
 def _github_environment_tarball(
     top_dir: str,
     *,
-    env_path: str = "envs/e/freesolo/environment.py",
+    env_path: str = "envs/e/environment.py",
     env_text: str = "def load_environment(**kwargs):\n    return None\n",
 ) -> bytes:
     buf = io.BytesIO()
@@ -252,7 +252,7 @@ def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
 
     env = FreesoloEnvironment(
         _FakeSingleTurnEnv(),
-        "github:owner/repo@main:env/freesolo/environment.py",
+        "github:owner/repo@main:env/environment.py",
         source=None,
         contract_text="",
     )
@@ -266,7 +266,7 @@ def test_freesolo_multiturn_hooks(monkeypatch):
 
     env = FreesoloEnvironment(
         _FakeMultiTurnEnv(),
-        "github:owner/repo@main:env/freesolo/environment.py",
+        "github:owner/repo@main:env/environment.py",
         source=[{"task": "browse", "expected_output": "done"}],
         contract_text="contract",
     )
@@ -292,16 +292,12 @@ def test_freesolo_multiturn_hooks(monkeypatch):
 def test_github_environment_ref_parsing():
     from flash.envs.adapter import is_github_environment_ref
 
-    assert is_github_environment_ref("github:owner/repo@dev:envs/e/freesolo/environment.py")
+    assert is_github_environment_ref("github:owner/repo@dev:envs/e/environment.py")
     assert is_github_environment_ref("github:owner/repo")
     assert not is_github_environment_ref("github:owner/repo@main:/etc/passwd")
-    assert not is_github_environment_ref(
-        "github:owner/repo/extra@main:envs/e/freesolo/environment.py"
-    )
-    assert not is_github_environment_ref("github:owner/repo@:envs/e/freesolo/environment.py")
-    assert is_github_environment_ref(
-        "https://github.com/owner/repo/blob/dev/envs/e/freesolo/environment.py"
-    )
+    assert not is_github_environment_ref("github:owner/repo/extra@main:envs/e/environment.py")
+    assert not is_github_environment_ref("github:owner/repo@:envs/e/environment.py")
+    assert is_github_environment_ref("https://github.com/owner/repo/blob/dev/envs/e/environment.py")
     assert is_github_environment_ref("https://github.com/owner/repo")
     assert not is_github_environment_ref("owner/env")
     assert not is_github_environment_ref("gsm8k")
@@ -330,9 +326,9 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
 
     resolved = adapter._resolve_environment_reference(
-        "github:owner/repo@main:envs/e/freesolo/environment.py"
+        "github:owner/repo@main:envs/e/environment.py"
     )
-    assert resolved.endswith("envs/e/freesolo/environment.py")
+    assert resolved.endswith("envs/e/environment.py")
     assert downloads == ["b" * 40]
 
 
@@ -380,7 +376,7 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
         root.type = tarfile.DIRTYPE
         root.mode = 0o755
         handle.addfile(root)
-        file_info = tarfile.TarInfo("repo-root/freesolo/environment.py")
+        file_info = tarfile.TarInfo("repo-root/environment.py")
         payload = b"def load_environment(**k):\n    return None\n"
         file_info.size = len(payload)
         handle.addfile(file_info, io.BytesIO(payload))
@@ -393,7 +389,7 @@ def test_install_manifest_and_worker_deps():
         import flash.envs.registry as registry
 
         importlib.reload(registry)
-        env_id = "github:owner/repo@main:env/freesolo/environment.py"
+        env_id = "github:owner/repo@main:env/environment.py"
         registry.record_installed_env(env_id, package="freesolo")
         assert registry.worker_pip_for_env(env_id) == ["freesolo"]
         assert registry.worker_hub_env_ids(env_id) == []

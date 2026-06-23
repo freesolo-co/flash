@@ -18,7 +18,7 @@ def test_env_install_github_ref(monkeypatch):
         called = {"n": 0}
         monkeypatch.setattr("subprocess.run", lambda *a, **k: called.__setitem__("n", called["n"] + 1))
 
-        env_id = "github:owner/repo@main:envs/math/freesolo/environment.py"
+        env_id = "github:owner/repo@main:envs/math/environment.py"
         rc = cli.cmd_env_install(argparse.Namespace(env_id=env_id))
         assert rc == 0
         assert called["n"] == 0

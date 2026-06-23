@@ -82,7 +82,7 @@ _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
 Edit the dataset and reward code, then upload with
-`flash env push environments/freesolo/environment.py`.
+`flash env push environments/starter/environment.py`.
 
 A managed run should use the returned [environment] id from
 `flash env push`.
@@ -129,9 +129,8 @@ def cmd_env_setup(args) -> int:
     Path("configs/endpoints.toml").write_text(
         "# OpenAI-compatible endpoints returned by `flash deploy` can be stored here.\n"
     )
-    starter_env_dir = Path("environments/freesolo")
+    starter_env_dir = Path("environments/starter")
     starter_env_dir.mkdir(exist_ok=True, parents=True)
-    Path(starter_env_dir / "__init__.py").write_text("", encoding="utf-8")
     starter_env = Path(starter_env_dir / "environment.py")
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
@@ -140,10 +139,11 @@ def cmd_env_setup(args) -> int:
         sample.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
-            "# Environment: upload the scaffolded environments/freesolo/environment.py with\n"
-            "# `flash env push environments/freesolo/environment.py`, then paste the returned id below.\n"
+            "# Environment: a Freesolo environment ref. Publish the scaffolded\n"
+            "# environments/starter/environment.py with `flash env push environments/starter/environment.py`\n"
+            "# to get the id, and set it below.\n"
             "[environment]\n"
-            'id = ""\n\n'
+            'id = "github:freesolo-co/environment-hub@main:user/project/publish-id/environment.py"\n\n'
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
@@ -152,7 +152,7 @@ def cmd_env_setup(args) -> int:
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
     print(
-        "created environments/freesolo/environment.py, configs/, "
+        "created environments/starter/environment.py, configs/, "
         "configs/freesolo_grpo.toml, configs/endpoints.toml"
     )
     return 0
@@ -263,9 +263,9 @@ def cmd_env_list(args) -> int:
             if p.is_dir():
                 stem = p.name.replace("-", "_")
                 module = p / f"{stem}.py"
-                canonical = p / "freesolo" / "environment.py"
+                canonical = p / "environment.py"
                 if canonical.is_file():
-                    paths.append(f"environments/{p.name}/freesolo/environment.py")
+                    paths.append(f"environments/{p.name}/environment.py")
                 elif module.is_file():
                     paths.append(f"environments/{p.name}/{stem}.py")
             elif p.suffix == ".py":

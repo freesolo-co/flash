@@ -1,7 +1,7 @@
 """Adapter that runs Freesolo SDK environments on Flash.
 
 Flash environment ids now reference source in GitHub instead of package wheels.
-The canonical generated environment file is ``freesolo/environment.py`` and its
+The canonical generated environment file is ``environment.py`` and its
 ``load_environment`` function must return a Freesolo SDK environment:
 ``EnvironmentSingleTurn`` or ``EnvironmentMultiTurn``.
 """
@@ -26,7 +26,7 @@ from typing import Any
 from flash.envs.base import BaseEnvironment
 
 _DEFAULT_GITHUB_REF = "main"
-_DEFAULT_ENVIRONMENT_PATH = "freesolo/environment.py"
+_DEFAULT_ENVIRONMENT_PATH = "environment.py"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
@@ -280,9 +280,7 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
         extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
-            nested = candidate / _DEFAULT_ENVIRONMENT_PATH
-            flat = candidate / "environment.py"
-            candidate = nested if nested.is_file() else flat
+            candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
         if not candidate.is_file():
             raise FileNotFoundError(
                 f"GitHub environment {parsed.canonical()} did not contain {parsed.path!r}"

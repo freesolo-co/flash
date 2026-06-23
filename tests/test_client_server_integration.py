@@ -41,7 +41,7 @@ from flash.client.http import ApiClient, ApiError
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py", "params": {"max_examples": 8}},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py", "params": {"max_examples": 8}},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }

@@ -1,8 +1,7 @@
 """Environment registry used by specs, worker, CLI, and server.
 
-Every managed run names a Freesolo SDK environment by a published environment id.
-The canonical generated environment entrypoint is
-``freesolo/environment.py:load_environment``.
+Every managed run names a Freesolo SDK environment by a GitHub source reference.
+The canonical generated environment entrypoint is ``environment.py:load_environment``.
 """
 
 from __future__ import annotations
@@ -56,6 +55,8 @@ def load_environment(env_id: str, params: dict | None = None) -> Environment:
 
     if not env_id:
         raise ValueError(
-            "no environment specified: set [environment] id to the id returned by `flash env push`"
+            "no environment specified: set [environment] id to a GitHub Freesolo "
+            "environment ref, e.g. "
+            "'github:freesolo-co/environment-hub@main:user/project/publish-id/environment.py'"
         )
     return load_freesolo_environment(env_id, **params)
