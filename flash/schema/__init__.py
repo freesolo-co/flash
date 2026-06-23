@@ -82,6 +82,19 @@ def _apply_override(raw: dict, item: str) -> None:
         node[leaf] = _coerce_scalar(val)
 
 
+def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
+    ref = str(train_raw.get("init_from_adapter") or "")
+    if not ref:
+        return ""
+    repo, sep, prefix = ref.partition(":")
+    if sep and repo.count("/") == 1 and prefix.startswith(("sft/", "rl/")):
+        return ref
+    raise ConfigError(
+        "train.init_from_adapter must be the full adapter_ref emitted by `flash status` "
+        "(<owner>/<repo>:<phase>/<run_id>/seed<N>)"
+    )
+
+
 # Recognized config keys. Anything else is a typo or a knob in the wrong place — reject it loudly
 # rather than silently ignoring it and training (expensively) against defaults. The classic trap:
 # putting GRPO knobs under a `[grpo]` table (they belong under `[train]`), which used to be dropped
@@ -291,7 +304,7 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
             lora_rank=_train_int(train_raw, "lora_rank", minimum=1) or 32,
             lora_alpha=_train_int(train_raw, "lora_alpha", minimum=1) or 64,
             seeds=tuple(int(s) for s in train_raw.get("seeds", (0,))),
-            init_from_adapter=str(train_raw.get("init_from_adapter") or ""),
+            init_from_adapter=_init_from_adapter_ref(train_raw),
             # hf_repo is assigned by the control plane (a per-run private dataset under the
             # operator's namespace, written by the operator HF_TOKEN); a user-supplied
             # [train] hf_repo is ignored. See flash.runner.submit_job._assign_managed_hf_repo.
