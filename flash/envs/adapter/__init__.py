@@ -239,7 +239,7 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
                 # GitHub secondary rate limit: many workers booting simultaneously all
                 # hit the same commits/tarball endpoint, triggering abuse detection.
                 # Retry with jitter so concurrent workers don't all retry at once.
-                delay = max(10.0, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
+                delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
                 time.sleep(delay)
                 attempt += 1
                 continue
