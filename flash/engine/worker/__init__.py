@@ -328,12 +328,66 @@ def prefetch_model(model_id: str) -> float:
     return secs
 
 
+# Trainer-state files a serving engine never needs: optimizer/scheduler/rng/loss-curve
+# state. Excluded when publishing the deployable per-step adapter so each step's snapshot is
+# just the LoRA weights + config (a few MB), small enough to KEEP every step (no pruning).
+_CHECKPOINT_TRAINER_STATE = (
+    "optimizer.pt",
+    "optimizer.bin",
+    "scheduler.pt",
+    "scaler.pt",
+    "rng_state*.pth",
+    "trainer_state.json",
+    "training_args.bin",
+    "*.distcp",
+    "global_step*/**",
+    "latest",
+    "zero_to_fp32.py",
+)
+
+
+def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
+    """Mirror a trainer checkpoint's LoRA adapter to a stable, NON-pruned per-step path so a
+    run cancelled mid-RL is still one-command-deployable from its last good step.
+
+    The trainer's checkpoint folder already contains the PEFT adapter (``adapter_config.json``
+    + ``adapter_model.safetensors``) that ``deploy_adapter`` serves; we re-upload just those
+    (dropping optimizer/scheduler/rng state) to ``<prefix>/checkpoints/step-<step>/adapter``.
+    Unlike the resume checkpoint (``checkpoint/**``, kept latest-only), these accumulate, so
+    EVERY step stays deployable. Returns the deployable adapter subfolder, or ``None`` when
+    there's no adapter to publish. Best-effort: a failure here never fails a paid run.
+    """
+    if not HF_REPO:
+        return None
+    # Only publish a checkpoint that actually carries a loadable adapter — never advertise a
+    # non-deployable step.
+    if not os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")):
+        return None
+    subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
+    try:
+        hf_api().upload_folder(
+            folder_path=ckpt_dir,
+            path_in_repo=subfolder,
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+        )
+        heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
+        return subfolder
+    except Exception as e:
+        print(f"[ckpt] deployable publish warn (step {step}):", e)
+        return None
+
+
 def make_checkpoint_upload_callback():
     """Stream each trainer save to HF so preemption loses <= one save interval.
 
     Uploads run in a background thread (the train loop never blocks on the network);
     older checkpoints are deleted in the same commit. If an upload is still in flight
     when the next save fires, the new save is skipped (the following one catches up).
+
+    Each save also publishes a deployable per-step adapter snapshot (``publish_deployable_
+    checkpoint``) so a run cancelled mid-RL can still be deployed from its latest step.
     """
     from transformers import TrainerCallback
 
@@ -361,6 +415,9 @@ def make_checkpoint_upload_callback():
                         delete_patterns=[f"{hf_prefix()}/checkpoint/**"],
                     )
                     heartbeat("checkpoint_uploaded", step=step)
+                    # Mirror this step's adapter to its own kept-forever path so the run
+                    # stays deployable even if it never reaches "done".
+                    publish_deployable_checkpoint(ckpt_dir, step)
                 except Exception as e:
                     print("ckpt upload warn:", e)
                 finally:
@@ -824,10 +881,14 @@ def run_sft():
         "logging_steps": 10,
         "save_steps": sft_save_default,
         "save_total_limit": 1,
-        # Memory-light checkpoints: save ONLY the (small LoRA) model, not the optimizer /
-        # scheduler / RNG state — skips the optimizer-state serialization spike at save and
-        # writes just the adapter. (We don't resume mid-run; seeds restart cleanly.)
-        "save_only_model": True,
+        # Full resumable checkpoints: save the optimizer / scheduler / RNG state alongside the
+        # (small) LoRA adapter, so a preempted run resumed via resume_from_checkpoint
+        # (hf_resume_checkpoint) continues with intact Adam moments + LR schedule instead of
+        # re-initializing the optimizer. For LoRA the optimizer state is tiny (it covers only the
+        # trainable adapter params), so the save spike is negligible. The deployable per-step
+        # snapshot (publish_deployable_checkpoint) strips this trainer state separately, so serving
+        # still gets adapter-only files.
+        "save_only_model": False,
         "max_length": sft_max_len,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
@@ -1638,9 +1699,11 @@ def run_rl():
         "logging_steps": 1,
         "save_steps": _t.save_every if _t and _t.save_every is not None else 20,
         "save_total_limit": 1,
-        # Memory-light checkpoints: adapter only, no optimizer/scheduler/RNG state -> no
-        # serialization spike at save (the save-step OOM guard).
-        "save_only_model": True,
+        # Full resumable checkpoints: keep optimizer/scheduler/RNG state with the LoRA adapter so a
+        # preempted GRPO run resumes (resume_from_checkpoint) with intact optimizer state + step,
+        # not a fresh optimizer. For LoRA this state is small (trainable adapter params only). The
+        # deployable per-step snapshot strips it separately, so serving still gets adapter-only.
+        "save_only_model": False,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
         "run_name": wandb_run_name(),

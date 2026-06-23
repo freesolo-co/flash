@@ -28,6 +28,7 @@ from flash.cli.main.commands import (  # noqa: F401
     client_from_config,
     cmd_cancel,
     cmd_chat,
+    cmd_checkpoints,
     cmd_deploy,
     cmd_deployments,
     cmd_env_list,
@@ -165,9 +166,22 @@ def main(argv: list[str] | None = None) -> int:
     cancel.add_argument("run_id")
     cancel.set_defaults(func=cmd_cancel)
 
+    checkpoints = sub.add_parser(
+        "checkpoints", help="list a run's deployable per-step RL checkpoints"
+    )
+    checkpoints.add_argument("run_id")
+    checkpoints.set_defaults(func=cmd_checkpoints)
+
     deploy = sub.add_parser("deploy")
     deploy.add_argument("run_id")
     deploy.add_argument("--dry-run", action="store_true")
+    deploy.add_argument(
+        "--step",
+        type=int,
+        default=None,
+        help="deploy a specific intermediate checkpoint (see `flash checkpoints <run_id>`) "
+        "instead of the run's final adapter; works even for a run cancelled mid-RL",
+    )
     deploy.set_defaults(func=cmd_deploy)
 
     undeploy = sub.add_parser("undeploy", help="tear down a run's serving endpoint")
