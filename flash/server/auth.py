@@ -169,6 +169,11 @@ def _external_row(row: dict, token: str, identity: dict[str, Any]) -> dict:
     return out
 
 
+def _identity_email(identity: dict[str, Any]) -> str:
+    email = str(identity.get("email") or "").strip()
+    return email if "@" in email else ""
+
+
 def freesolo_base_url() -> str:
     """The freesolo backend base URL (``FREESOLO_BASE_URL`` env, else the default), trailing
     slash trimmed. Shared by auth verify and the billing client."""
@@ -246,10 +251,13 @@ def authenticate(authorization: str | None) -> dict | None:
     if _freesolo_verify(token):
         # A verified freesolo key gets its own per-token run-ownership identity.
         identity = _cached_identity(token)
+        email = _identity_email(identity)
+        if not email:
+            return None
         row = db.lookup_key(token) or db.ensure_external_key(
             token,
             key_prefix=_external_key_prefix(token, identity),
-            email=identity.get("email"),
+            email=email,
         )
         return _external_row(row, token, identity) if row is not None else None
     return None

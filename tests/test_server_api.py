@@ -161,6 +161,18 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
     assert again["id"] == row["id"]
 
 
+def test_freesolo_user_key_without_email_is_rejected(api, monkeypatch):
+    # A verified external key must include an email identity. Do not fall back to
+    # token-derived namespaces for env publishing.
+    import flash.server.auth as auth_mod
+
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
+    monkeypatch.setattr(auth_mod, "_cached_identity", lambda token: {"key_prefix": "fslo_noemail"})
+
+    assert auth_mod.authenticate("Bearer fslo-no-email") is None
+
+
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     # A freesolo key that verifies with the backend but whose db row was disabled (revoked)
     # must be rejected as 401 (authenticate -> None), not raise a 500.
@@ -171,6 +183,11 @@ def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
 
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {"email": "revoked@example.com", "key_prefix": "fslo_revoked"},
+    )
 
     assert auth_mod.authenticate("Bearer fslo-revoked") is not None  # provisioned on first use
     with sqlite3.connect(db_mod.db_path()) as conn:
@@ -373,6 +390,9 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
 
         class _Resp:
             status = 200
+
+            def read(self):
+                return b'{"email":"cached@example.com","key_prefix":"fslo_cached"}'
 
             def __enter__(self):
                 return self
