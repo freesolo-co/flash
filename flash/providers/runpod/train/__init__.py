@@ -106,7 +106,7 @@ def upload_code(repo: str | None = None) -> str:
 def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
     """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
-    from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
+    from flash.envs.registry import worker_pip_for_env
 
     handler = get_train_endpoint(
         spec.gpu.type,
@@ -126,7 +126,6 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         # default run — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
         + chalk_extra_pip(spec),
-        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     if log is not None:
         print(

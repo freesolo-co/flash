@@ -34,7 +34,7 @@ from flash.runner import (
 from flash.schema import ConfigError, spec_from_dict
 from flash.serve.deploy import ServingError, deploy_adapter, undeploy_adapter
 from flash.serve.deploy import chat as serve_chat
-from flash.spec import JobSpec, coerce_bool
+from flash.spec import JobSpec
 
 from . import auth, db
 
@@ -210,7 +210,9 @@ def recover_runs() -> None:
     for spec in resubmit:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         with contextlib.suppress(Exception):
-            _append_run_log(spec.run_id, "control plane restarted before provisioning; resubmitting")
+            _append_run_log(
+                spec.run_id, "control plane restarted before provisioning; resubmitting"
+            )
         threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
 
 
@@ -270,7 +272,14 @@ def create_app():
             "kind": "internal" if key.get("auth_kind") == "internal" else "freesolo_api_key",
             "key_prefix": key["key_prefix"],
         }
-        for field in ("email", "user_id", "org_id", "api_key_id", "training_agent_job_id", "project_id"):
+        for field in (
+            "email",
+            "user_id",
+            "org_id",
+            "api_key_id",
+            "training_agent_job_id",
+            "project_id",
+        ):
             if key.get(field):
                 payload[field] = key[field]
         return payload
@@ -294,9 +303,6 @@ def create_app():
             slug = envs.publish_package(
                 package_b64="" if _pkg is None else _pkg,
                 name="" if _name is None else _name,
-                # Robust bool parse: JSON `"is_new": "false"`/`"0"` must NOT become True
-                # (plain bool() is truthy for any non-empty string). Defaults True when absent.
-                is_new=coerce_bool(payload.get("is_new", True)),
                 key=key,
             )
         except envs.EnvPublishError as exc:
@@ -310,7 +316,7 @@ def create_app():
             raise HTTPException(
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
-                "publish the environment with `flash env push`, then reference it "
+                "publish the environment with `flash env push --name <name>`, then reference it "
                 "by the returned environment id",
             )
         try:
@@ -336,7 +342,9 @@ def create_app():
             if value is None:
                 continue
             if not isinstance(value, str):
-                raise HTTPException(status_code=400, detail=f"runtime_secrets.{key} must be a string")
+                raise HTTPException(
+                    status_code=400, detail=f"runtime_secrets.{key} must be a string"
+                )
             value = value.strip()
             if value:
                 out[key] = value
@@ -448,7 +456,6 @@ def create_app():
                         "cannot be located, so it cannot be deployed"
                     ),
                 )
-            mode = payload.get("mode", "dev")
             # The state the run must still be in for this deploy to finalize — a CAS guard so
             # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't be
             # silently overwritten by the deployment record.
@@ -460,8 +467,6 @@ def create_app():
                     hf_repo=spec.train.hf_repo,
                     adapter_prefix=adapter_prefix(spec),
                     gpu_name=spec.gpu.type,
-                    mode=mode,
-                    idle_timeout_s=int(payload.get("idle_timeout_s", 300)),
                     dry_run=dry_run,
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
@@ -502,20 +507,10 @@ def create_app():
                 # problem, not a flash bug — surface a clean 502 with the real reason (mirrors the
                 # deploy handler) instead of letting the ServingError escape as an unhandled 500.
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
-            # dev mode is scale-to-zero: the serve endpoint is created only on the first
-            # chat, so an empty deletion just means it was never warmed — still a clean
-            # undeploy. always-on provisions the endpoint at deploy time, so an empty
-            # deletion there is a transient RunPod failure that must NOT hide a
-            # still-billable endpoint (surface 502 so the user retries).
-            dev_mode = (status.deployment or {}).get("mode", "dev") == "dev"
-            if status.deployment and (deleted or dev_mode):
+            # Delete is idempotent: a missing serving-side adapter still means the local
+            # deployment record can be cleared.
+            if status.deployment:
                 mark_undeployed(run_id)
-            elif status.deployment and not deleted:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"could not delete the serving endpoint for {run_id}; it may still "
-                    "be running — retry `flash undeploy`",
-                )
             return {"run_id": run_id, "deleted_endpoints": deleted}
 
     @app.get("/v1/deployments")

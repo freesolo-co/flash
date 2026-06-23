@@ -8,10 +8,13 @@ reference the rest of the schema package; the package ``__init__`` re-exports th
 from __future__ import annotations
 
 import math
+import re
 import urllib.parse
 from typing import Any
 
 from flash.spec import WandbSpec
+
+_GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _train_int(train_raw: dict, key: str, *, minimum: int) -> int | None:
@@ -85,13 +88,24 @@ class ConfigError(ValueError):
 
 def _require_slug(value: str, message: str) -> None:
     """Require an ``owner/name`` slug."""
-    parts = value.split("/")
-    if len(parts) != 2 or not all(parts):
+    text = (value or "").strip()
+    if not text or ":" in text:
+        raise ConfigError(message)
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        raise ConfigError(message)
+    parts = text.split("/")
+    if len(parts) != 2 or not _is_safe_github_path_parts(parts):
         raise ConfigError(message)
 
 
 def _require_environment_ref(value: str, message: str) -> None:
     """Require a Freesolo environment id."""
+    try:
+        _require_slug(value, message)
+        return
+    except ConfigError:
+        pass
     if value.startswith("github:"):
         body = value[len("github:") :]
         repo_ref, sep, path = body.partition(":")
@@ -102,6 +116,7 @@ def _require_environment_ref(value: str, message: str) -> None:
         if (
             len(owner_repo) == 2
             and _is_safe_github_path_parts(owner_repo)
+            and (not at or _is_safe_github_path_parts([ref]))
             and (not sep or _is_safe_environment_path(path))
         ):
             return
@@ -121,7 +136,7 @@ def _require_environment_ref(value: str, message: str) -> None:
                     raise ConfigError(message)
             elif len(parts) >= 5 and parts[2] in {"blob", "tree"}:
                 ref = parts[3]
-                if not ref or ref in {".", ".."} or ":" in ref or "\\" in ref:
+                if not _is_safe_github_path_parts([ref]):
                     raise ConfigError(message)
                 raw_path = "/".join(parts[4:])
                 if not _is_safe_environment_path(raw_path):
@@ -149,7 +164,7 @@ def _is_safe_environment_path(path: str) -> bool:
 def _is_safe_github_path_parts(parts: list[str]) -> bool:
     if any(part in {".", "..", ""} for part in parts):
         return False
-    return not any("\\" in part for part in parts)
+    return all(_GITHUB_SAFE_PART_RE.fullmatch(part) for part in parts)
 
 
 def _coerce_scalar(value: str):

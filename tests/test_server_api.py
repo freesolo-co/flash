@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
@@ -45,6 +45,13 @@ def _bearer(key: str) -> dict:
 def _login() -> str:
     """A fresh, distinct freesolo user token (accepted by the fixture's stub verify)."""
     return f"{_USER_PREFIX}{next(_counter)}"
+
+
+def _identity_for_token(token: str) -> dict[str, str]:
+    if not token.startswith(_USER_PREFIX):
+        return {}
+    suffix = token.removeprefix(_USER_PREFIX)
+    return {"email": f"user-{suffix}@example.com", "key_prefix": "fslo_test"}
 
 
 @pytest.fixture
@@ -69,6 +76,7 @@ def api(tmp_path, monkeypatch):
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
     with TestClient(app_mod.create_app()) as client:
         yield client
 
@@ -77,9 +85,9 @@ def test_me(api):
     key = _login()
     me = api.get("/v1/me", headers=_bearer(key))
     assert me.status_code == 200
-    # A verified freesolo user key resolves to a per-token "freesolo" identity.
-    assert me.json()["email"] == "freesolo-user"
-    assert me.json()["key_prefix"] == "freesolo"
+    # A verified freesolo user key resolves to the Freesolo identity returned by verify.
+    assert me.json()["email"] == f"user-{key.removeprefix(_USER_PREFIX)}@example.com"
+    assert me.json()["key_prefix"] == "fslo_test"
 
 
 def test_requests_without_key_are_rejected(api):
@@ -133,15 +141,36 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
         return token == "fslo-user-good"
 
     monkeypatch.setattr(auth_mod, "_freesolo_verify", fake_verify)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: (
+            {"email": "user-good@example.com", "key_prefix": "fslo_good"}
+            if token == "fslo-user-good"
+            else {}
+        ),
+    )
 
     row = auth_mod.authenticate("Bearer fslo-user-good")
     assert row is not None
-    assert row["email"] == "freesolo-user"
+    assert row["email"] == "user-good@example.com"
     # An unverified token returns None (401).
     assert auth_mod.authenticate("Bearer fslo-user-bad") is None
     # The same key resolves to the same identity across requests (stable per-token row).
     again = auth_mod.authenticate("Bearer fslo-user-good")
     assert again["id"] == row["id"]
+
+
+def test_freesolo_user_key_without_email_is_rejected(api, monkeypatch):
+    # A verified external key must include an email identity. Do not fall back to
+    # token-derived namespaces for env publishing.
+    import flash.server.auth as auth_mod
+
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
+    monkeypatch.setattr(auth_mod, "_cached_identity", lambda token: {"key_prefix": "fslo_noemail"})
+
+    assert auth_mod.authenticate("Bearer fslo-no-email") is None
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
@@ -154,6 +183,11 @@ def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
 
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
+    monkeypatch.setattr(
+        auth_mod,
+        "_cached_identity",
+        lambda token: {"email": "revoked@example.com", "key_prefix": "fslo_revoked"},
+    )
 
     assert auth_mod.authenticate("Bearer fslo-revoked") is not None  # provisioned on first use
     with sqlite3.connect(db_mod.db_path()) as conn:
@@ -357,6 +391,9 @@ def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
         class _Resp:
             status = 200
 
+            def read(self):
+                return b'{"email":"cached@example.com","key_prefix":"fslo_cached"}'
+
             def __enter__(self):
                 return self
 
@@ -493,7 +530,7 @@ def test_logs_offset_paging(api):
 
 
 def test_local_env_path_rejected(api):
-    # GitHub Freesolo-only: a local [environment] path is rejected on the managed service.
+    # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()
     bad = {**SPEC, "environment": {"id": "custom", "path": "/home/user/env.py"}}
     r = api.post("/v1/runs", json={"spec": bad, "dry_run": True}, headers=_bearer(key))
@@ -513,12 +550,10 @@ def test_deploy_dry_run(api):
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    dep = api.post(
-        f"/v1/runs/{run_id}/deploy", json={"mode": "dev", "dry_run": True}, headers=_bearer(key)
-    )
+    dep = api.post(f"/v1/runs/{run_id}/deploy", json={"dry_run": True}, headers=_bearer(key))
     assert dep.status_code == 200, dep.text
     assert dep.json()["state"] == "dry_run"
-    assert dep.json()["mode"] == "dev"
+    assert "mode" not in dep.json()
     # Dry-run deploys never show up as active deployments.
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
@@ -549,7 +584,7 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
 
     monkeypatch.setattr(app_mod, "deploy_adapter", boom)
 
-    resp = api.post(f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key))
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert resp.status_code == 502, resp.text
     # The 502 carries the upstream reason verbatim, not a generic/unhandled-500 body.
     assert "serving backend unreachable" in resp.json()["detail"]
@@ -581,7 +616,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
 def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     # A finished run (state="done") MUST be deployable: mark_deployed has to record the
     # deployment and flip to "deployed". But a cancelled/failed run must never be flipped
-    # to "deployed" (a /cancel racing always-on provisioning persisted the terminal state).
+    # to "deployed" (a /cancel racing deployment persisted the terminal state).
     import flash.runner as runner
 
     importlib.reload(runner)
@@ -590,9 +625,9 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
 
     spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-1"}
     runner._save_status(runner.RunStatus(run_id="dep-1", state="done", spec=spec, remote=None))
-    out = runner.mark_deployed("dep-1", {"endpoint_name": "e", "mode": "dev"})
+    out = runner.mark_deployed("dep-1", {"endpoint_name": "e"})
     assert out.state == "deployed"
-    assert out.deployment == {"endpoint_name": "e", "mode": "dev"}
+    assert out.deployment == {"endpoint_name": "e"}
 
     # cancelled is sticky: the deploy must be refused, state preserved.
     runner._save_status(
@@ -600,7 +635,7 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
             run_id="dep-2", state="cancelled", spec={**spec, "run_id": "dep-2"}, remote=None
         )
     )
-    out2 = runner.mark_deployed("dep-2", {"endpoint_name": "e2", "mode": "dev"})
+    out2 = runner.mark_deployed("dep-2", {"endpoint_name": "e2"})
     assert out2.state == "cancelled"
     assert out2.deployment is None
 
@@ -622,7 +657,7 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
             state="deployed",
             spec=spec,
             remote=None,
-            deployment={"endpoint_name": "e", "mode": "always-on"},
+            deployment={"endpoint_name": "e"},
         )
     )
     # undeploy races in: endpoint torn down, run back to done/undeployed.
@@ -709,7 +744,7 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
 
 def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # Fault isolation: if the FIRST recoverable run's persisted spec is malformed (e.g. a
-    # legacy `environment.path`, which makes JobSpec.from_dict raise), recovery of that one
+    # unsupported `environment.path`, which makes JobSpec.from_dict raise), recovery of that one
     # run must be skipped — it must NOT abort recover_runs() and thereby skip recovery of
     # every OTHER in-flight run and the orphan sweep that follows. Here run #1 has a bad spec
     # and run #2 has a valid no-handle spec: assert run #2 is still resubmitted AND the orphan
@@ -729,7 +764,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
     importlib.reload(app_mod)
 
-    # Run #1: a malformed spec — a legacy local `environment.path` makes from_dict raise.
+    # Run #1: a malformed spec — local `environment.path` makes from_dict raise.
     bad_spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
@@ -825,7 +860,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
-    """POST /v1/envs publishes an uploaded package to the managed GitHub environment repo."""
+    """POST /v1/envs publishes an uploaded package to the managed environment hub."""
     import base64
     import io
     import tarfile
@@ -843,8 +878,7 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for name, content in (
             ("pyproject.toml", b"[project]\nname='e'\n"),
-            ("freesolo/__init__.py", b""),
-            ("freesolo/environment.py", b"def load_environment(**kwargs): return None\n"),
+            ("environment.py", b"def load_environment(**kwargs): return None\n"),
         ):
             info = tarfile.TarInfo(name)
             info.size = len(content)
@@ -854,21 +888,19 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     resp = api.post(
         "/v1/envs",
         headers=_bearer(_login()),
-        json={"name": "MyEnv", "is_new": True, "package_b64": pkg},
+        json={"name": "MyEnv", "package_b64": pkg},
     )
     assert resp.status_code == 200
     ref = resp.json()["id"]
-    assert ref.startswith("github:")
-    assert ref.endswith("/myenv/freesolo/environment.py")
+    assert ref.endswith("/myenv")
     assert any(root.endswith("/myenv") for root in published_roots)
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
 
 
-def test_publish_env_parses_is_new_robustly(api, monkeypatch):
-    """`is_new` from the JSON body must be parsed as a real bool: the string "false"/"0" is False
-    (a plain bool() would make any non-empty string True), and it defaults to True when absent."""
+def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
+    """Publish mode is determined by the explicit name and server publish id."""
     import base64
     import io
     import tarfile
@@ -877,9 +909,9 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
 
     seen: dict = {}
 
-    def fake_publish_package(*, package_b64, name, is_new, key):
-        seen.update(package_b64=package_b64, name=name, is_new=is_new, key=key)
-        return "github:freesolo-co/envs@main:environments/key-1/e/freesolo/environment.py"
+    def fake_publish_package(*, package_b64, name, key):
+        seen.update(package_b64=package_b64, name=name, key=key)
+        return "key-1/e"
 
     monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
 
@@ -887,31 +919,22 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for nm, content in (
             ("pyproject.toml", b"[project]\nname='e'\n"),
-            ("freesolo/__init__.py", b""),
-            ("freesolo/environment.py", b"def load_environment(**kwargs): return None\n"),
+            ("environment.py", b"def load_environment(**kwargs): return None\n"),
         ):
             info = tarfile.TarInfo(nm)
             info.size = len(content)
             tar.addfile(info, io.BytesIO(content))
     pkg = base64.b64encode(buf.getvalue()).decode()
 
-    def _publish(body_extra):
-        resp = api.post(
-            "/v1/envs",
-            headers=_bearer(_login()),
-            json={"name": "e", "package_b64": pkg, **body_extra},
-        )
-        assert resp.status_code == 200, resp.text
-        return seen["is_new"]
-
-    # Falsey string forms -> False (the bug: bool("false") was True).
-    assert _publish({"is_new": "false"}) is False
-    assert _publish({"is_new": "0"}) is False
-    assert _publish({"is_new": False}) is False
-    # Truthy forms and absence -> True.
-    assert _publish({"is_new": "true"}) is True
-    assert _publish({"is_new": True}) is True
-    assert _publish({}) is True  # default when absent
+    resp = api.post(
+        "/v1/envs",
+        headers=_bearer(_login()),
+        json={"name": "e", "package_b64": pkg, "is_new": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["name"] == "e"
+    assert seen["package_b64"] == pkg
+    assert "is_new" not in seen
 
 
 def test_publish_env_falsy_non_string_fields_are_not_coerced(api):

@@ -83,8 +83,8 @@ class _FakeSingleTurnEnv(_EnvironmentSingleTurn):
     dataset: ClassVar[list[dict]] = [
         {
             "id": "ex-1",
-            "task": "2+2?",
-            "expected_output": "4",
+            "input": "2+2?",
+            "output": "4",
             "metadata": {"split": "train"},
         }
     ]
@@ -118,7 +118,7 @@ class _FakeMultiTurnEnv(_EnvironmentMultiTurn):
             done=True,
             messages=({"role": "user", "content": f"observed {assistant_response}"},),
             final_response_text=f"final {assistant_response}",
-            metadata={"task": example.task},
+            metadata={"input": example.task},
         )
 
     def score_episodes(self, example, episodes):
@@ -139,9 +139,9 @@ def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
     def task_example_from_record(record):
         return _TaskExample(
             record=dict(record),
-            task=str(record.get("task") or record.get("prompt") or ""),
+            task=str(record["input"]),
             task_id=record.get("id"),
-            expected_output=record.get("expected_output"),
+            expected_output=record.get("output"),
             metadata=dict(record.get("metadata") or {}),
         )
 
@@ -191,7 +191,7 @@ def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
 def _github_environment_tarball(
     top_dir: str,
     *,
-    env_path: str = "envs/e/freesolo/environment.py",
+    env_path: str = "envs/e/environment.py",
     env_text: str = "def load_environment(**kwargs):\n    return None\n",
 ) -> bytes:
     buf = io.BytesIO()
@@ -216,7 +216,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     env_file.write_text("def load_environment(**kwargs): pass\n")
     dataset = tmp_path / "freesolo" / "datasets" / "train.jsonl"
     dataset.parent.mkdir()
-    dataset.write_text('{"id":"row-1","task":"2+2?","expected_output":"4"}\n')
+    dataset.write_text('{"id":"row-1","input":"2+2?","output":"4"}\n')
 
     from flash.envs.adapter import load_freesolo_environment
 
@@ -233,7 +233,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert seen["kwargs"]["difficulty"] == "hard"
 
     train = env.dataset()
-    assert train == [{"id": "row-1", "task": "2+2?", "expected_output": "4"}]
+    assert train == [{"id": "row-1", "input": "2+2?", "output": "4"}]
     assert env.prompt_messages(train[0]) == [
         {"role": "system", "content": "be brief"},
         {"role": "user", "content": "2+2?"},
@@ -242,7 +242,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.grade("the answer is 4", train[0]) is True
     assert env.reward("nope", train[0]) == 0.0
     assert env.scores_breakdown("the answer is 4", train[0]) == {"match": 1.0, "total": 1.0}
-    assert env.sft_target({"expected_output": "4"}) == "4"
+    assert env.sft_target({"output": "4"}) == "4"
 
 
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
@@ -252,11 +252,59 @@ def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
 
     env = FreesoloEnvironment(
         _FakeSingleTurnEnv(),
-        "github:owner/repo@main:env/freesolo/environment.py",
+        "github:owner/repo@main:env/environment.py",
         source=None,
         contract_text="",
     )
-    assert env.dataset()[0]["expected_output"] == "4"
+    assert env.dataset()[0]["output"] == "4"
+
+
+def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
+    class SdkExampleEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[_TaskExample]] = [
+            _TaskExample(
+                record={},
+                task="2+2?",
+                task_id="ex-1",
+                expected_output="4",
+                metadata={"split": "train"},
+            )
+        ]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=SdkExampleEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        SdkExampleEnv(),
+        "owner/env",
+        source=None,
+        contract_text="",
+    )
+    assert env.dataset() == [
+        {
+            "input": "2+2?",
+            "output": "4",
+            "id": "ex-1",
+            "metadata": {"split": "train"},
+        }
+    ]
+
+
+def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        _FakeSingleTurnEnv(),
+        "owner/env",
+        source=None,
+        contract_text="",
+    )
+    assert env.sft_target({"expected_output": "4"}) == ""
+    with pytest.raises(ValueError, match="input field"):
+        env.prompt_messages({"task": "2+2?", "output": "4"})
 
 
 def test_freesolo_multiturn_hooks(monkeypatch):
@@ -266,23 +314,24 @@ def test_freesolo_multiturn_hooks(monkeypatch):
 
     env = FreesoloEnvironment(
         _FakeMultiTurnEnv(),
-        "github:owner/repo@main:env/freesolo/environment.py",
-        source=[{"task": "browse", "expected_output": "done"}],
+        "github:owner/repo@main:env/environment.py",
+        source=[{"input": "browse", "output": "done"}],
         contract_text="contract",
     )
-    state = env.new_rollout_state({"task": "browse", "expected_output": "done"})
+    state = env.new_rollout_state({"input": "browse", "output": "done"})
+    assert state["prompt"] == [{"role": "user", "content": "contract:browse"}]
     assert state["messages"] == [{"role": "user", "content": "contract:browse"}]
     env.record_model_turn(state, "click")
     replies = env.env_reply(state["messages"], state)
     assert replies == [{"role": "user", "content": "observed click"}]
     assert state["done"] is True
     assert env.rollout_done(state) is True
-    assert env.reward("ignored", {"task": "browse", "expected_output": "done"}, state) == 0.5
-    assert env.grade("ignored", {"task": "browse", "expected_output": "done"}, state) is True
+    assert env.reward("ignored", {"input": "browse", "output": "done"}, state) == 0.5
+    assert env.grade("ignored", {"input": "browse", "output": "done"}, state) is True
     assert (
         env.reward_from_messages(
             [{"role": "assistant", "content": "final"}],
-            {"task": "browse", "expected_output": "done"},
+            {"input": "browse", "output": "done"},
             [{"role": "user", "content": "contract:browse"}],
         )
         == 0.5
@@ -290,18 +339,19 @@ def test_freesolo_multiturn_hooks(monkeypatch):
 
 
 def test_github_environment_ref_parsing():
-    from flash.envs.adapter import is_github_environment_ref
+    from flash.envs.adapter import (
+        is_freesolo_environment_id,
+        is_github_environment_ref,
+        is_managed_environment_slug,
+        managed_slug_to_github_ref,
+    )
 
-    assert is_github_environment_ref("github:owner/repo@dev:envs/e/freesolo/environment.py")
+    assert is_github_environment_ref("github:owner/repo@dev:envs/e/environment.py")
     assert is_github_environment_ref("github:owner/repo")
     assert not is_github_environment_ref("github:owner/repo@main:/etc/passwd")
-    assert not is_github_environment_ref(
-        "github:owner/repo/extra@main:envs/e/freesolo/environment.py"
-    )
-    assert not is_github_environment_ref("github:owner/repo@:envs/e/freesolo/environment.py")
-    assert is_github_environment_ref(
-        "https://github.com/owner/repo/blob/dev/envs/e/freesolo/environment.py"
-    )
+    assert not is_github_environment_ref("github:owner/repo/extra@main:envs/e/environment.py")
+    assert not is_github_environment_ref("github:owner/repo@:envs/e/environment.py")
+    assert is_github_environment_ref("https://github.com/owner/repo/blob/dev/envs/e/environment.py")
     assert is_github_environment_ref("https://github.com/owner/repo")
     assert not is_github_environment_ref("owner/env")
     assert not is_github_environment_ref("gsm8k")
@@ -309,6 +359,18 @@ def test_github_environment_ref_parsing():
     assert not is_github_environment_ref("https://github.com/owner/repo/blob/dev/../../etc/passwd")
     assert not is_github_environment_ref("https://github.com/owner/repo/blob/main:/etc/passwd")
     assert not is_github_environment_ref("https://github.com/owner/repo/issues/1")
+    assert not is_github_environment_ref("github:owner /repo@main:envs/e/environment.py")
+    assert not is_github_environment_ref("github:owner/repo@bad/ref:envs/e/environment.py")
+    assert not is_github_environment_ref(
+        "https://github.com/owner/repo/blob/bad ref/envs/e/environment.py"
+    )
+    assert is_managed_environment_slug("owner/env")
+    assert is_freesolo_environment_id("owner/env")
+    assert managed_slug_to_github_ref("owner/env") == (
+        "github:freesolo-co/environment-hub@main:owner/env/environment.py"
+    )
+    assert not is_managed_environment_slug("owner/env/extra")
+    assert not is_freesolo_environment_id("gsm8k")
 
 
 def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
@@ -330,10 +392,70 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
 
     resolved = adapter._resolve_environment_reference(
-        "github:owner/repo@main:envs/e/freesolo/environment.py"
+        "github:owner/repo@main:envs/e/environment.py"
+    )
+    assert resolved.endswith("envs/e/environment.py")
+    assert downloads == ["b" * 40]
+
+
+def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+
+    downloads: list[str] = []
+
+    def fake_download(ref):
+        downloads.append(ref.ref)
+        return _github_environment_tarball("repo-root")
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
+
+    resolved = adapter._resolve_environment_reference("github:owner/repo@main:envs/e")
+    assert resolved.endswith("envs/e/environment.py")
+    assert adapter._resolve_environment_reference("github:owner/repo@main:envs/e") == resolved
+    assert downloads == ["b" * 40]
+
+
+def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+
+    downloads: list[str] = []
+
+    def fake_download(ref):
+        downloads.append(ref.path)
+        return _github_environment_tarball(
+            "repo-root",
+            env_path="envs/e/freesolo/environment.py",
+        )
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
+
+    resolved = adapter._resolve_environment_reference(
+        "https://github.com/owner/repo/tree/main/envs/e/freesolo"
     )
     assert resolved.endswith("envs/e/freesolo/environment.py")
-    assert downloads == ["b" * 40]
+    assert "freesolo/freesolo" not in resolved
+    assert downloads == ["envs/e/freesolo/environment.py"]
+
+
+def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: _github_environment_tarball("repo-root", env_path="envs/e/helper.py"),
+    )
+
+    with pytest.raises(FileNotFoundError, match=r"envs/e/environment\.py"):
+        adapter._resolve_environment_reference("github:owner/repo@main:envs/e")
 
 
 def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
@@ -380,7 +502,7 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
         root.type = tarfile.DIRTYPE
         root.mode = 0o755
         handle.addfile(root)
-        file_info = tarfile.TarInfo("repo-root/freesolo/environment.py")
+        file_info = tarfile.TarInfo("repo-root/environment.py")
         payload = b"def load_environment(**k):\n    return None\n"
         file_info.size = len(payload)
         handle.addfile(file_info, io.BytesIO(payload))
@@ -393,10 +515,9 @@ def test_install_manifest_and_worker_deps():
         import flash.envs.registry as registry
 
         importlib.reload(registry)
-        env_id = "github:owner/repo@main:env/freesolo/environment.py"
+        env_id = "github:owner/repo@main:env/environment.py"
         registry.record_installed_env(env_id, package="freesolo")
         assert registry.worker_pip_for_env(env_id) == ["freesolo"]
-        assert registry.worker_hub_env_ids(env_id) == []
         assert registry.list_installed_environments() == [env_id]
 
         os.environ.pop("FLASH_ENVS_MANIFEST", None)

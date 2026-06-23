@@ -328,7 +328,7 @@ def build_worker_env(
             else {}
         ),
     }
-    # HF artifact creds + GitHub env-source creds + optional reward-judge creds: a Freesolo
+    # HF artifact creds + managed environment hub creds + optional reward-judge creds: a Freesolo
     # environment whose reward calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
     # where the reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env
     # reads (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's

@@ -62,7 +62,7 @@ def test_build_worker_env_forwards_judge_model(monkeypatch):
 
 
 def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
-    """The worker needs GitHub access to resolve private Freesolo environment refs."""
+    """The worker receives the control-plane token used for managed Freesolo environments."""
     from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
