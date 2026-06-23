@@ -49,6 +49,8 @@ from flash.engine.worker.lora import (
     _VL_EXCLUDE_SEGMENTS,  # noqa: F401
     _patch_peft_weight_converter_compat,  # noqa: F401
     _remap_vl_sync_weights,  # noqa: F401
+    assert_adapter_delta_nonzero,
+    assert_adapter_load_clean,
     assert_lora_applied,
     is_vl_checkpoint,
     lora_exclude_modules,
@@ -1216,9 +1218,23 @@ def _init_adapter_model(model_id: str):
         **({"attn_implementation": _attn} if _attn else {}),
     )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
-    # Fail loudly if the adapter didn't actually apply (a future key-mismatch regression would
-    # otherwise silently start GRPO from the base model again).
+    # Fail loudly if the adapter didn't actually apply (a key mismatch would otherwise silently start
+    # GRPO from the base model again). from_pretrained loads with load_state_dict(strict=False) and
+    # only WARNS on a mismatch, discarding the load result — so re-run load_adapter to CAPTURE which
+    # keys matched and assert matched==saved (peft injects the LoRA modules from target_modules BEFORE
+    # loading weights, so the module-count check alone can't see a silent weight discard). The reload
+    # is idempotent: same weights into the same "default" adapter. See flash/engine/worker/lora.py.
+    # Mirror from_pretrained's key_mapping: for transformers models that define a
+    # ``_checkpoint_conversion_mapping`` (renamed-arch checkpoints), from_pretrained remaps the adapter
+    # keys before loading; the reload must apply the SAME mapping or it would reinterpret valid keys as
+    # mismatched and falsely abort. peft reads it off the base model (peft_model.py from_pretrained).
+    key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+    load_result = model.load_adapter(
+        adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
+    )
+    assert_adapter_load_clean(load_result, model_id)
     assert_lora_applied(model, model_id)
+    assert_adapter_delta_nonzero(model, model_id)
     return model, None
 
 
