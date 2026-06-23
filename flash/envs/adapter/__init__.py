@@ -31,6 +31,7 @@ _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache")
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _TAR_METADATA_TYPES = {
     tarfile.XHDTYPE,
     tarfile.XGLTYPE,
@@ -76,6 +77,8 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
             ref = _DEFAULT_GITHUB_REF
         if not ref:
             return None
+        if not _is_safe_github_path_parts((ref,)):
+            return None
         owner_repo = repo_part.split("/")
         if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo):
             return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
@@ -93,7 +96,7 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
         return None
     if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
         ref = parts[3]
-        if not ref or ref in {".", ".."} or ":" in ref or "\\" in ref:
+        if not _is_safe_github_path_parts((ref,)):
             return None
         raw_path = "/".join(parts[4:])
         if not _is_safe_environment_path(raw_path):
@@ -150,7 +153,7 @@ def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
         return False
     if any(part in {".", "..", ""} for part in parts):
         return False
-    return not any("\\" in part for part in parts)
+    return all(_GITHUB_SAFE_PART_RE.fullmatch(part) for part in parts)
 
 
 def _github_token() -> str | None:
@@ -476,10 +479,11 @@ class FreesoloEnvironment(BaseEnvironment):
 
     def new_rollout_state(self, example: dict) -> dict:
         task = self._task_example(example)
-        messages = [dict(message) for message in self._env.start_episode(task, self._contract_text)]
+        prompt = [dict(message) for message in self._env.start_episode(task, self._contract_text)]
         return {
             "task": task,
-            "messages": messages,
+            "prompt": [dict(message) for message in prompt],
+            "messages": [dict(message) for message in prompt],
             "turns": [],
             "done": False,
             "response_text": "",

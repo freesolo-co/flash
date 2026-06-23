@@ -100,7 +100,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
     prints (see codex/outputs.py run_id field), so this asserts those keys exist with
     a real run id and a `dry_run` state — fully offline.
     """
-    config = tmp_path / "flash_grpo.toml"
+    config = tmp_path / "grpo.toml"
     config.write_text(
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "grpo"\n'

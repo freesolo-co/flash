@@ -40,15 +40,6 @@ def worker_pip_for_env(env_id: str) -> list[str]:
     return ["freesolo"]
 
 
-def worker_hub_env_ids(env_id: str, params: dict | None = None) -> list[str]:
-    """Backward-compatible name for worker environment refs.
-
-    The worker resolves Freesolo environment ids lazily through :func:`load_environment`,
-    so there is nothing to pre-install here.
-    """
-    return []
-
-
 def load_environment(env_id: str, params: dict | None = None) -> Environment:
     """Load a Freesolo SDK environment and wrap it in Flash's protocol."""
     params = params or {}
