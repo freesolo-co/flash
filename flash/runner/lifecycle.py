@@ -441,7 +441,7 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
 
     _update(
         spec.run_id,
-        "done",
+        get_status(spec.run_id).state,
         billing_state="charged",
         billing_error=None,
         billing_charge=charge,
