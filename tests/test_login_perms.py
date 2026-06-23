@@ -38,18 +38,25 @@ def _check_login(monkeypatch):
             "verify_freesolo_key",
             lambda api_key, base_url=None: verified.update(api_key=api_key, base_url=base_url),
         )
-        # After storing the key, login fetches the identity card via the control plane; stub
-        # it so the test stays offline (the lookup is best-effort and must not be a network hop).
+        # After storing the key, login fetches the identity card straight from the key it just
+        # verified (not ambient credentials); stub the client so the test stays offline and
+        # capture the key it was built with.
         identity = {"kind": "freesolo_api_key", "key_prefix": "fs-secr", "email": "me@example.com"}
-        monkeypatch.setattr(
-            cli.commands,
-            "client_from_config",
-            lambda *a, **k: types.SimpleNamespace(me=lambda: identity),
-        )
+        built_with: dict = {}
+
+        class _FakeApi:
+            def __init__(self, api_url, api_key=None, timeout=None):
+                built_with.update(api_url=api_url, api_key=api_key)
+
+            def me(self):
+                return identity
+
+        monkeypatch.setattr(cli.commands, "ApiClient", _FakeApi)
         args = types.SimpleNamespace(api_key="fs-secret-123", api_url=None, freesolo_url=None)
         rc = cli.cmd_login(args)
         assert rc == 0
         assert verified["api_key"] == "fs-secret-123"  # the key was actually verified
+        assert built_with["api_key"] == "fs-secret-123"  # ...and that exact key built the card
 
         cfg = client_config.CONFIG_PATH
         assert cfg.exists()
