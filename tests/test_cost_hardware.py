@@ -1,7 +1,7 @@
 """Cost estimator: GPU compute table, pricing/VRAM lookups, cheapest-fit selection.
 
 No network. The compute table and the selection rule must stay consistent with the
-provider-agnostic GPU registry in ``flash.providers.base``.
+RunPod GPU registry in ``flash.providers.base``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from flash.cost.facts import (
     gpu_vram_gb,
     pick_gpu,
 )
-from flash.providers.base import GPU_INFO, providers_for
+from flash.providers.base import GPU_INFO
 
 
 def test_static_rate_is_positive_for_any_class():
@@ -51,7 +51,7 @@ def test_unknown_gpu_lookup_raises():
 def test_pick_gpu_cheapest_fit_no_validation_gate():
     # No validation gate: every fitting class is eligible, ranked by static rate.
     assert pick_gpu(12) == "RTX 2000 Ada"
-    assert pick_gpu(24) == "RTX Pro 4000"
+    assert pick_gpu(24) == "L4"
     # > 24 GB needs the big-VRAM tier -> cheapest static >= 40 is the A40 ($0.44, 48 GB).
     assert pick_gpu(40) == "A40"
 
@@ -79,30 +79,6 @@ def test_pick_gpu_impossible_raises():
         pick_gpu(100_000)
 
 
-def test_pick_gpu_provider_pin_restricts_to_provisionable():
-    # The only per-provider filter is PROVISIONABILITY (providers_for) -- there is no validation
-    # gate. A provider pin only ever returns a class that provider can actually provision.
-    for prov in ("runpod", "vast"):
-        assert prov in providers_for(pick_gpu(24, provider=prov))
-
-
-def test_pick_gpu_provider_filter_excludes_other_providers_only_class():
-    # A class only the OTHER provider can provision must be excluded under a provider pin.
-    # Provisionability is providers_for() (enum_member for runpod, vast_name for vast); pricing
-    # a Vast-only class on a runpod pin would misquote the run.
-    vast_only = [n for n, g in GPU_INFO.items() if g.vast_name and not g.enum_member]
-    assert vast_only, "expected at least one Vast-only class in the registry"
-    for need in (16, 24, 48, 80):
-        try:
-            runpod_pick = pick_gpu(need, provider="runpod")
-        except ValueError:
-            continue  # nothing runpod-provisionable fits this tier; fine
-        assert "runpod" in providers_for(runpod_pick)
-        assert runpod_pick not in vast_only
-
-
-def test_pick_gpu_auto_spans_all_providers():
-    # Without a provider pin, selection spans the whole registry: the cheapest static-rate
-    # fitting class overall, regardless of which provider(s) can run it or whether it's validated.
-    assert pick_gpu(24, provider="auto") == "RTX Pro 4000"
+def test_pick_gpu_auto_matches_default():
+    assert pick_gpu(24, provider="auto") == pick_gpu(24)
     assert pick_gpu(12) == "RTX 2000 Ada"

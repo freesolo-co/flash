@@ -71,8 +71,7 @@ WORKER_DEPS = [
     # to the worker's `extra_pip` for EVERY job by default — installed + applied automatically, like
     # Liger. Override the source with FLASH_CHALK_SPEC (an exact version / git URL / wheel), or
     # disable every kernel (FLASH_<K>=0) to skip the install. The worker pip-installs extra_pip for
-    # EVERY job (baked-image RunPod
-    # _train_body + Vast bootstrap). Do NOT rely on
+    # EVERY job through the baked-image RunPod _train_body. Do NOT rely on
     # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS for this: the durable baked-image submit path
     # (jobs.build_function_input) returns the raw payload and never consults resolve_worker_deps, so
     # those vars don't reach a default run; and FLASH_WORKER_DEPS would also REPLACE the whole stack.
@@ -87,7 +86,6 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 # The prebuilt worker image (full training stack baked in; built by Dockerfile.worker /
 # .github/workflows/worker-image.yml). PUBLIC under the org namespace, so no registry login is
 # ever needed. Must be published to GHCR + made public before the paths that use it can pull it.
-#   * Vast: ALWAYS used (jobs.builders pins the container to WORKER_IMAGE).
 #   * RunPod baked-image submit (jobs.deploy_train_endpoint / build_function_input): the default —
 #     a self-contained serverless worker whose rp_handler runs _train_body. FLASH_WORKER_IMAGE
 #     overrides the tag (e.g. a hotfix); the boot-install fallback is only reachable if BOTH are
@@ -197,9 +195,9 @@ def chalk_extra_pip(spec=None) -> list[str]:
     """Chalk pip spec(s) to ADD to the worker's ``extra_pip`` when a chalk kernel is selected.
 
     This is the install hook that runs for DEFAULT remote jobs: the baked-image RunPod path
-    (``_train_body`` -> ``pip install *extra_pip``) and the Vast bootstrap both consume the
-    payload's ``extra_pip`` regardless of ``WORKER_IMAGE`` — unlike ``FLASH_WORKER_EXTRA_DEPS``
-    / ``resolve_worker_deps``, which the durable ``build_function_input`` baked-image path skips.
+    (``_train_body`` -> ``pip install *extra_pip``) consumes the payload's ``extra_pip``
+    regardless of ``WORKER_IMAGE`` — unlike ``FLASH_WORKER_EXTRA_DEPS`` /
+    ``resolve_worker_deps``, which the durable ``build_function_input`` baked-image path skips.
 
     Selection (and the ``FLASH_CHALK_SPEC`` lookup) is resolved against the EFFECTIVE worker env —
     the run's ``[worker_env]`` merged over ``os.environ`` — so it matches exactly what the worker
@@ -274,8 +272,7 @@ def build_worker_env(
     _alloc_conf = _alloc_override or _alloc_default
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
-        # Compute substrate, read back by engine.worker for the RunMetrics record. Vast's
-        # on-instance bootstrap overrides this to "vast" (it reuses this same env builder).
+        # Compute substrate, read back by engine.worker for the RunMetrics record.
         "FLASH_ARM": "runpod",
         "BENCH_HF_MODEL": spec.model,
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
@@ -371,7 +368,7 @@ def build_worker_env(
     # deploy, and artifact paths all key off spec.run_id / spec.train.hf_repo, so letting a
     # [worker_env] override RUN_ID/HF_REPO would make the worker upload under a different repo/prefix
     # and orphan the artifacts (the poller would never find DONE/metrics, deploy can't locate the
-    # adapter). FLASH_ARM identifies the substrate (Vast rewrites it in its own bootstrap).
+    # adapter). FLASH_ARM identifies the substrate.
     _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         if str(k).upper() in _RESERVED_WORKER_ENV:
