@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from flash.client.http import ProgressCallback
 
 
 def cmd_env_install(args) -> int:
@@ -148,15 +152,93 @@ def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
             shutil.copy2(child, target)
 
 
-def _upload_and_report(name: str, *, package_b64: str) -> int:
+def _human_bytes(n: int) -> str:
+    """A short human-readable byte count, e.g. ``13.4 MB`` (whole bytes for sub-KB sizes)."""
+    size = float(n)
+    for unit in ("B", "KB", "MB"):
+        if size < 1024:
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    # anything >= 1024 MB falls through to GB (env packages never reach TB).
+    return f"{size:.1f} GB"
+
+
+class _UploadProgress:
+    """A carriage-return upload progress bar on stderr; a no-op off a TTY.
+
+    Mirrors ``_LogFollowSpinner`` in commands.py: render only when stderr is interactive,
+    rewrite a single line with ``\\r``, and wipe it before normal output. Off a TTY (CI, pipes)
+    ``callback`` is None, so the client uploads in one shot exactly as before and nothing is
+    written to stderr."""
+
+    _BAR_WIDTH = 24
+
+    def __init__(self, name: str):
+        self._name = name
+        self._enabled = sys.stderr.isatty()
+        self._last_len = 0
+        self._active = False
+        self._last_pct = -1
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def callback(self) -> ProgressCallback | None:
+        # None off a TTY so the client keeps the plain single-shot upload path.
+        return self.update if self._enabled else None
+
+    def status(self, message: str) -> None:
+        """Show a transient pre-upload line (e.g. ``packaging environment``)."""
+        if self._enabled:
+            self._write(message)
+
+    def update(self, sent: int, total: int) -> None:
+        if not self._enabled:
+            return
+        pct = 100 if total <= 0 else min(100, sent * 100 // total)
+        # redraw only when the whole-number percent changes (8 KB chunks => thousands of calls)
+        if pct == self._last_pct and sent < total:
+            return
+        self._last_pct = pct
+        filled = (
+            self._BAR_WIDTH if total <= 0 else min(self._BAR_WIDTH, self._BAR_WIDTH * sent // total)
+        )
+        bar = "#" * filled + "-" * (self._BAR_WIDTH - filled)
+        self._write(
+            f"uploading {self._name} [{bar}] {pct:3d}% {_human_bytes(sent)}/{_human_bytes(total)}"
+        )
+
+    def _write(self, message: str) -> None:
+        padding = " " * max(0, self._last_len - len(message))
+        sys.stderr.write(f"\r{message}{padding}")
+        sys.stderr.flush()
+        self._last_len = len(message)
+        self._active = True
+
+    def clear(self) -> None:
+        if not (self._enabled and self._active):
+            return
+        sys.stderr.write(f"\r{' ' * self._last_len}\r")
+        sys.stderr.flush()
+        self._active = False
+
+
+def _upload_and_report(name: str, *, package_b64: str, bar: _UploadProgress | None = None) -> int:
     """Upload a packaged env to the managed control plane and print the returned id."""
     from flash.client import ClientError, client_from_config
 
+    bar = bar or _UploadProgress(name)
     try:
-        result = client_from_config().publish_env(name=name, package_b64=package_b64)
+        result = client_from_config().publish_env(
+            name=name, package_b64=package_b64, progress=bar.callback
+        )
     except ClientError as exc:
+        bar.clear()
         print(str(exc), file=sys.stderr)
         return 1
+    bar.clear()
     slug = result.get("id")
     if not slug:
         print("warning: the env was uploaded but the server returned no id", file=sys.stderr)
@@ -216,4 +298,9 @@ def cmd_env_push(args) -> int:
         (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
         _copy_env_sidecars(env_root, pkg, entrypoint=entrypoint)
         (pkg / "README.md").write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
-        return _upload_and_report(env_name, package_b64=_tar_b64(pkg))
+        # One progress widget spans both phases the user otherwise waits through silently:
+        # packaging (walk + gzip, slow for large datasets) and the upload itself.
+        bar = _UploadProgress(env_name)
+        bar.status("packaging environment")
+        package_b64 = _tar_b64(pkg)
+        return _upload_and_report(env_name, package_b64=package_b64, bar=bar)

@@ -41,6 +41,9 @@ def stub():
             seen["path"] = self.path
             n = int(self.headers.get("Content-Length") or 0)
             seen["body"] = json.loads(self.rfile.read(n) or b"{}")
+            if self.path == "/v1/envs":
+                self._send(200, {"id": "freesolo-co/e"})
+                return
             if self.path == "/v1/runs/json-chat/chat":
                 self._send(200, {"choices": [{"message": {"content": "json reply"}}]})
                 return
@@ -137,6 +140,66 @@ def test_chat_stream_accepts_json_fallback(stub):
     client = ApiClient(url, "fslo-user-test")
     chunks = list(client.chat_stream("json-chat", [{"role": "user", "content": "hi"}]))
     assert chunks == ["json reply"]
+
+
+def test_publish_env_plain_without_progress(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    out = client.publish_env(name="e", package_b64="QQ==")
+    assert out["id"] == "freesolo-co/e"
+    assert seen["path"] == "/v1/envs"
+    assert seen["body"] == {"name": "e", "package_b64": "QQ=="}
+
+
+def test_publish_env_streams_body_and_reports_progress(stub, monkeypatch):
+    import flash.client.http as http_mod
+
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    # spy on the streaming reader so we prove _post_with_progress (not the plain _request
+    # path) ran — a refactor that faked progress around a one-shot send must fail this test.
+    wrapped: list[int] = []
+    real_reader = http_mod._ProgressReader
+
+    class _SpyReader(real_reader):
+        def __init__(self, data, progress):
+            wrapped.append(len(data))
+            super().__init__(data, progress)
+
+    monkeypatch.setattr(http_mod, "_ProgressReader", _SpyReader)
+
+    # a payload large enough to span several 8192-byte http.client send chunks, so the
+    # callback fires repeatedly with a growing count instead of one all-at-once call.
+    big = "A" * 30000
+    body = {"name": "e", "package_b64": big}
+    calls: list[tuple[int, int]] = []
+    out = client.publish_env(
+        name="e", package_b64=big, progress=lambda sent, total: calls.append((sent, total))
+    )
+    assert out["id"] == "freesolo-co/e"
+    # the server reads exactly Content-Length bytes, so a correct multi-chunk stream
+    # round-trips the full 30 KB body byte-for-byte across the chunk boundaries.
+    assert seen["body"] == body
+    expected_total = len(json.dumps(body).encode())
+    assert wrapped == [expected_total]  # the streaming reader wrapped the full payload
+    assert len(calls) > 1  # multiple chunks => multiple progress updates
+    assert all(sent <= total for sent, total in calls)
+    assert calls[0][0] < calls[-1][0]  # the byte count grew across chunks
+    assert calls[-1] == (expected_total, expected_total)  # reached 100% of the real payload
+
+
+def test_publish_env_progress_errors_do_not_abort_upload(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    def boom(sent, total):
+        raise RuntimeError("render failed")
+
+    # a raising progress widget must never abort an in-flight upload (contextlib.suppress).
+    out = client.publish_env(name="e", package_b64="QQ==", progress=boom)
+    assert out["id"] == "freesolo-co/e"
+    assert seen["body"] == {"name": "e", "package_b64": "QQ=="}
 
 
 def test_unreachable_server_is_actionable():
