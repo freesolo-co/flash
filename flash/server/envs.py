@@ -28,10 +28,6 @@ _DEFAULT_ENVIRONMENT_FILE = "environment.py"
 _BLOCKED_TOP_LEVEL_PATHS = {
     ".github",
     ".git",
-    "data",
-    "databases",
-    "datasets",
-    "db",
     "source",
 }
 _GIT_TIMEOUT_S = 180
@@ -88,7 +84,7 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
                 if segments[0] in _BLOCKED_TOP_LEVEL_PATHS:
                     raise EnvPublishError(
-                        "env packages must not contain repo-control, source, or data top-level paths"
+                        "env packages must not contain repo-control or source top-level paths"
                     )
                 if member.islnk() or member.issym():
                     raise EnvPublishError(f"links are not allowed in env packages: {member.name!r}")
