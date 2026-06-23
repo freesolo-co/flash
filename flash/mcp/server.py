@@ -32,7 +32,7 @@ def create_train_run(args: dict) -> dict:
         return {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}
     return client_from_config().create_run(
         spec_payload(spec),
-        runtime_secrets=runtime_secrets_from_local_env(),
+        runtime_secrets=runtime_secrets_from_local_env(keys=spec.environment.secrets),
     )
 
 

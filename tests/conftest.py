@@ -15,19 +15,10 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _offline(monkeypatch, tmp_path):
-    # No live provider key in the suite: Vast stays unconfigured (RunPod-only allocation),
-    # and the Vast pricing/offer paths short-circuit to their static snapshot.
+def _offline(monkeypatch):
+    # No live provider key in the suite: Vast stays unconfigured (RunPod-only allocation)
+    # unless a test opts in by setting VAST_API_KEY and stubbing the offer path.
     monkeypatch.delenv("VAST_API_KEY", raising=False)
-
-    # RunPod live pricing -> static snapshot (no HTTP): stub the fetch, reset the in-memory
-    # cache, and point the disk cache at a non-existent tmp file so a dev machine's cached
-    # live rates can't leak into a test.
-    import flash.providers.runpod.pricing as runpod_pricing
-
-    monkeypatch.setattr(runpod_pricing, "_fetch_live_rates", lambda: {}, raising=False)
-    monkeypatch.setattr(runpod_pricing, "_CACHE_PATH", tmp_path / "runpod_rates.json", raising=False)
-    runpod_pricing._MEM.update(ts=0.0, rates={})
 
     # HF param probe -> offline: sizing for an unlisted model falls back to the heuristic
     # (24 GB tier) instead of hitting the Hugging Face API.

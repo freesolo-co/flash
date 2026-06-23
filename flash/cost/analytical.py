@@ -10,11 +10,11 @@ from flash.providers.allocator import required_vram_gb, vram_headroom
 
 from .facts import (
     download_weight_gb,
+    gpu_hourly_usd,
     gpu_tflops,
     gpu_vram_gb,
     model_quant,
     pick_gpu,
-    realized_hourly_usd,
     reward_seconds_per_completion,
     total_params_b,
 )
@@ -125,7 +125,7 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
             + (f", env {n.environment}" if n.environment else "")
             + ") + policy+reference update"
         )
-    notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; market (spot/queue) $/hr")
+    notes.append(f"GPU sized with {vram_headroom() - 1:.0%} VRAM headroom; static GPU $/hr")
     if wall_capped:
         per_seed = "" if config.setup_repeats == 1 else "per-seed "
         notes.append(
@@ -138,7 +138,7 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
     """Deterministic pre-flight cost calculation."""
     gpu, need = select_gpu(config)
-    hourly = realized_hourly_usd(gpu)
+    hourly = gpu_hourly_usd(gpu)
     # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
     cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
 
