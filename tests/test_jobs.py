@@ -63,6 +63,23 @@ def test_decode_output_client_mode_error_includes_stdout_tail():
     assert "worker stdout tail" in msg
 
 
+def test_surface_heartbeat_prints_loss_and_reward():
+    import io
+
+    from flash.providers._poll import make_say, surface_heartbeat
+
+    buf = io.StringIO()
+    key, stage = surface_heartbeat(
+        lambda: {"stage": "rl_step", "step": 50, "ts": 1, "loss": 1.23456, "reward": 0.5},
+        None,
+        make_say(buf),
+    )
+
+    assert key == ("rl_step", 50, 1)
+    assert stage == "rl_step"
+    assert "worker: stage=rl_step step=50 loss=1.2346 reward=0.500" in buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # poll_job state machine (mocked runpod_api)
 # ---------------------------------------------------------------------------

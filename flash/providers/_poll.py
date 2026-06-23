@@ -4,7 +4,7 @@
 poll loops with provider-specific terminal-state logic, but they share three verbatim
 blocks: a timestamped ``say()`` logger, a consecutive-poll-error retry/give-up counter,
 and the heartbeat progress-surfacing block (key on (stage, step, ts), log
-``worker: stage=… step=… reward=…``). Only those provider-neutral pieces live here; each
+``worker: stage=… step=… loss=… reward=…``). Only those provider-neutral pieces live here; each
 poller keeps its own status/terminal handling inline.
 """
 
@@ -78,10 +78,12 @@ def surface_heartbeat(
         return last_hb_key, None
     stage = hb.get("stage")
     step = hb.get("step")
+    loss = hb.get("loss")
     reward = hb.get("reward")
     say(
         f"worker: stage={stage}"
         + (f" step={step}" if step is not None else "")
+        + (f" loss={loss:.4f}" if isinstance(loss, (int, float)) else "")
         + (f" reward={reward:.3f}" if isinstance(reward, (int, float)) else "")
     )
     return key, stage

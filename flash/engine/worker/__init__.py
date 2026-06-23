@@ -323,6 +323,28 @@ def prefetch_model(model_id: str) -> float:
     return secs
 
 
+def _numeric_log_value(logs, *keys: str) -> float | None:
+    if not isinstance(logs, dict):
+        return None
+    for key in keys:
+        value = logs.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _latest_numeric_log(state, *keys: str) -> float | None:
+    for row in reversed(getattr(state, "log_history", []) or []):
+        value = _numeric_log_value(row, *keys)
+        if value is not None:
+            return value
+    return None
+
+
 def make_checkpoint_upload_callback():
     """Stream each trainer save to HF so preemption loses <= one save interval.
 
@@ -339,6 +361,7 @@ def make_checkpoint_upload_callback():
             if not HF_REPO:
                 return
             step = int(state.global_step)
+            loss = _latest_numeric_log(state, "loss", "train_loss")
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
             if not os.path.isdir(ckpt_dir):
                 return
@@ -355,7 +378,10 @@ def make_checkpoint_upload_callback():
                         repo_type="dataset",
                         delete_patterns=[f"{hf_prefix()}/checkpoint/**"],
                     )
-                    heartbeat("checkpoint_uploaded", step=step)
+                    hb = {"step": step}
+                    if loss is not None:
+                        hb["loss"] = loss
+                    heartbeat("checkpoint_uploaded", **hb)
                 except Exception as e:
                     print("ckpt upload warn:", e)
                 finally:
@@ -1153,8 +1179,9 @@ _SFT_HEARTBEAT_INTERVAL_S = 60.0
 
 def make_reward_heartbeat_callback():
     """A TRL/transformers callback that streams the per-step mean reward to the HF heartbeat
-    channel, giving the worker a live RL signal (no pod log API) and recording a
-    ``reward_history``. Built lazily so the module imports without transformers installed."""
+    channel, giving the worker a live RL signal (no pod log API), includes loss when TRL
+    reports it, and records a ``reward_history``. Built lazily so the module imports without
+    transformers installed."""
     from transformers import TrainerCallback
 
     class _RewardHeartbeat(TrainerCallback):
@@ -1165,20 +1192,18 @@ def make_reward_heartbeat_callback():
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs:
                 return
-            r = logs.get("reward")
-            if r is None:
+            r = _numeric_log_value(logs, "reward")
+            loss = _numeric_log_value(logs, "loss", "train_loss")
+            if r is None and loss is None:
                 return
-            try:
-                r = float(r)
-            except (TypeError, ValueError):
-                return
-            self.reward_history.append(r)
             step = int(getattr(state, "global_step", len(self.reward_history)))
-            payload = {
-                "step": step,
-                "reward": r,
-                "reward_last": self.reward_history[-8:],
-            }
+            payload = {"step": step}
+            if loss is not None:
+                payload["loss"] = loss
+            if r is not None:
+                self.reward_history.append(r)
+                payload["reward"] = r
+                payload["reward_last"] = self.reward_history[-8:]
             now = time.monotonic()
             if (
                 self.last_gpu_diag_at == 0.0
@@ -1210,7 +1235,7 @@ def make_sft_heartbeat_callback():
             payload = {
                 "step": int(getattr(state, "global_step", 0) or 0),
                 "epoch": logs.get("epoch"),
-                "loss": logs.get("loss"),
+                "loss": _numeric_log_value(logs, "loss", "train_loss"),
                 "grad_norm": logs.get("grad_norm"),
                 "learning_rate": logs.get("learning_rate"),
             }

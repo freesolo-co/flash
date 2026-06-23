@@ -37,7 +37,7 @@ def test_grpo_batching_matches_prompts_per_step():
     assert (8 * old_grad_accum) // 8 == 8
 
 
-def test_reward_heartbeat_callback_accumulates_history():
+def test_reward_heartbeat_callback_accumulates_history(monkeypatch):
     """The live-signal feature: the GRPO callback records a per-step reward_history (only
     from step logs that carry a 'reward') and ignores non-reward logs. Uses a minimal
     transformers stub so the test doesn't depend on a real transformers install."""
@@ -54,6 +54,9 @@ def test_reward_heartbeat_callback_accumulates_history():
         import flash.engine.worker as ne
 
         cb = ne.make_reward_heartbeat_callback()
+        seen = []
+        monkeypatch.setattr(ne, "heartbeat", lambda stage, **kw: seen.append((stage, kw)))
+        monkeypatch.setattr(ne, "gpu_diagnostics", lambda: {"used_gb": 1.0})
 
         class _State:
             global_step = 0
@@ -68,6 +71,101 @@ def test_reward_heartbeat_callback_accumulates_history():
         cb.on_log(None, st, None, logs={"reward": None})  # ignored
 
         assert cb.reward_history == [0.50, 0.62], cb.reward_history
+        assert seen == [
+            (
+                "rl_step",
+                {
+                    "step": 1,
+                    "loss": 1.2,
+                    "reward": 0.50,
+                    "reward_last": [0.50],
+                    "gpu": {"used_gb": 1.0},
+                },
+            ),
+            ("rl_step", {"step": 2, "reward": 0.62, "reward_last": [0.50, 0.62]}),
+        ]
+    finally:
+        if saved is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = saved
+
+
+def test_sft_heartbeat_callback_streams_loss(monkeypatch):
+    saved = sys.modules.get("transformers")
+    tfm = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    tfm.TrainerCallback = TrainerCallback
+    sys.modules["transformers"] = tfm
+    try:
+        import flash.engine.worker as ne
+
+        seen = []
+        monkeypatch.setattr(ne, "heartbeat", lambda stage, **kw: seen.append((stage, kw)))
+        monkeypatch.setattr(ne, "gpu_diagnostics", lambda: {"used_gb": 1.0})
+        cb = ne.make_sft_heartbeat_callback()
+
+        class _State:
+            global_step = 7
+
+        cb.on_log(None, _State(), None, logs={"loss": 2.5})
+        cb.on_log(None, _State(), None, logs={"eval_loss": 0.9})  # ignored
+        cb.on_log(None, _State(), None, logs={"loss": None})  # ignored
+
+        assert seen == [("sft_step", {"step": 7, "loss": 2.5, "gpu": {"used_gb": 1.0}})]
+    finally:
+        if saved is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = saved
+
+
+def test_checkpoint_upload_heartbeat_includes_latest_loss(monkeypatch, tmp_path):
+    saved = sys.modules.get("transformers")
+    tfm = types.ModuleType("transformers")
+
+    class TrainerCallback:
+        pass
+
+    tfm.TrainerCallback = TrainerCallback
+    sys.modules["transformers"] = tfm
+    try:
+        import flash.engine.worker as ne
+
+        monkeypatch.setattr(ne, "HF_REPO", "org/repo")
+        seen = []
+        monkeypatch.setattr(ne, "heartbeat", lambda stage, **kw: seen.append((stage, kw)))
+
+        class _Api:
+            def upload_folder(self, **kwargs):
+                return None
+
+        monkeypatch.setattr(ne, "hf_api", lambda: _Api())
+
+        class _InlineThread:
+            def __init__(self, target, daemon=None):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        monkeypatch.setattr(ne.threading, "Thread", _InlineThread)
+        cb = ne.make_checkpoint_upload_callback()
+
+        step = 50
+        (tmp_path / f"checkpoint-{step}").mkdir()
+        args = types.SimpleNamespace(output_dir=str(tmp_path))
+        state = types.SimpleNamespace(
+            global_step=step,
+            log_history=[{"loss": 2.0}, {"eval_loss": 1.0}, {"loss": "1.23456"}],
+        )
+
+        cb.on_save(args, state, None)
+
+        assert seen == [("checkpoint_uploaded", {"step": 50, "loss": 1.23456})]
     finally:
         if saved is None:
             sys.modules.pop("transformers", None)
