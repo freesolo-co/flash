@@ -66,7 +66,7 @@ class RunStatus:
     artifacts_dir: str | None = None
     deployment: dict | None = None
     # Durable job handle {endpoint_id, endpoint_name, job_id} — lets any process
-    # reattach to / cancel the remote job (see `flash attach`).
+    # reattach to / cancel the remote job (see `flash status --follow`).
     remote: dict | None = None
     # Index of the next seed to run for a multi-seed job, set while the remote handle
     # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds
