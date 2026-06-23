@@ -469,10 +469,17 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             # (e.g. FastAPI/Uvicorn lifespan shutdown).  Run in a ThreadPoolExecutor
             # thread instead — threads have no running loop, so asyncio.run() always
             # works, and the coroutine is guaranteed to be awaited (no RuntimeWarning).
+            # Use shutdown(wait=False) so the 30s timeout on future.result() is the
+            # actual cap: a context-manager `with` block calls shutdown(wait=True) on
+            # exit, which would block indefinitely even after the timeout fires.
             import concurrent.futures as _cf
 
-            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                results = _ex.submit(asyncio.run, _undeploy_all()).result(timeout=30)
+            _ex = _cf.ThreadPoolExecutor(max_workers=1)
+            try:
+                _fut = _ex.submit(asyncio.run, _undeploy_all())
+                results = _fut.result(timeout=30)
+            finally:
+                _ex.shutdown(wait=False, cancel_futures=True)
         except Exception as exc:
             results = [{"success": False, "name": target, "message": str(exc)}]
 
