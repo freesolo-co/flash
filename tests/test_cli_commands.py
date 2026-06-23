@@ -111,20 +111,33 @@ def test_models_table(fake_client, capsys) -> None:
     assert "Qwen/Qwen3.5-9B" in out
 
 
-def test_status_ps_cost_and_logs(fake_client, capsys) -> None:
+def test_status_ps_and_status_logs(fake_client, capsys) -> None:
     assert _run(["status", "flash-1"]) == 0
-    assert "done" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "done" in out
+    assert "cost_usd" in out
 
     assert _run(["ps"]) == 0
     out = capsys.readouterr().out
     assert "flash-1" in out
     assert "done" in out
 
-    assert _run(["cost", "flash-1"]) == 0
-    assert "0.25" in capsys.readouterr().out
+    assert _run(["status", "flash-1", "--logs"]) == 0
+    out = capsys.readouterr().out
+    assert "hello from the worker" in out
+    assert "cost_usd" in out
 
-    assert _run(["logs", "flash-1"]) == 0
-    assert "hello from the worker" in capsys.readouterr().out
+    assert _run(["status", "flash-1", "--follow"]) == 0
+    out = capsys.readouterr().out
+    assert "hello from the worker" in out
+    assert "cost_usd" in out
+
+
+@pytest.mark.parametrize("removed", ["cost", "attach", "logs"])
+def test_legacy_run_commands_removed(fake_client, removed) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        _run([removed, "flash-1"])
+    assert excinfo.value.code == 2
 
 
 def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:

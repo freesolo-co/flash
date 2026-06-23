@@ -1,7 +1,6 @@
-"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the CLI —
-it invokes `slm`, the deprecated alias of `flash` (same entrypoint, kept for back-compat) —
-and consumes its run-id / run-state / metrics outputs. This asserts that the flash side of
-that seam still provides what the agent depends on.
+"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the CLI
+and consumes its run-id / run-state / metrics outputs. This asserts that the flash
+side provides what the agent depends on.
 
 The agent package lives in a sibling folder (../agent/src) that is NOT installed in
 the flash venv, so we add it to sys.path here (mirroring how the existing
@@ -49,17 +48,14 @@ from flash.runner import (
     [
         "train",
         "status",
-        "logs",
         "ps",
         "cancel",
-        "attach",
-        "cost",
         "env",
     ],
 )
 def test_agent_required_subcommands_exist(subcommand: str) -> None:
-    """The agent's worker drives the CLI's `train/status/logs/ps/cancel/env install/...`
-    subcommands (invoked as `slm`, the deprecated alias of `flash` — see the module docstring).
+    """The agent's worker drives the CLI's `train/status/ps/cancel/env install/...`
+    subcommands.
 
     argparse exits with code 2 and an 'invalid choice' message when a subcommand
     does not exist. We invoke each with `--help`, which exits 0 for a real
@@ -185,7 +181,7 @@ def test_agent_terminal_states_subset_of_flash_terminal_states() -> None:
 
 def test_get_status_returns_fields_the_agent_reads(tmp_path, monkeypatch) -> None:
     """`flash status <run_id>` returns the run's status JSON; the agent reads `state`
-    and `run_id` from it (and the CLI's cost/ps commands read cost_usd/spec). Assert a
+    and `run_id` from it (and the CLI's status/ps commands read cost_usd/spec). Assert a
     persisted RunStatus exposes those keys so a field rename in RunStatus can't
     silently strip what the agent/CLI consume.
     """

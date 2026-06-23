@@ -74,10 +74,7 @@ Homepage = "https://github.com/freesolo-co/flash"
 Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
-# `flash` is the CLI. `slm` is a deprecated alias kept for back-compat (same entrypoint) —
-# e.g. the agent worker shells out to `slm`; remove it once those callers move to `flash`.
 flash = "flash.cli.main:main"
-slm = "flash.cli.main:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
 flash-server = "flash.server.__main__:main"
