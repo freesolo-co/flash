@@ -22,12 +22,22 @@ def _read_config() -> dict:
     return read_json_or_empty(CONFIG_PATH)
 
 
-def load_credentials() -> tuple[str, str | None]:
-    """Resolve (api_url, api_key); the key is None when the user hasn't logged in."""
+def load_credentials_with_source() -> tuple[str, str | None, str | None]:
+    """Resolve (api_url, api_key, key_source); key/source are None when logged out."""
     cfg = _read_config()
     api_url = os.environ.get("FLASH_API_URL") or cfg.get("api_url") or DEFAULT_API_URL
-    api_key = os.environ.get("FREESOLO_API_KEY") or cfg.get("api_key")
-    return api_url.rstrip("/"), api_key
+    env_key = os.environ.get("FREESOLO_API_KEY")
+    if env_key:
+        return api_url.rstrip("/"), env_key, "FREESOLO_API_KEY"
+    if cfg.get("api_key"):
+        return api_url.rstrip("/"), cfg["api_key"], str(CONFIG_PATH)
+    return api_url.rstrip("/"), None, None
+
+
+def load_credentials() -> tuple[str, str | None]:
+    """Resolve (api_url, api_key); the key is None when the user hasn't logged in."""
+    api_url, api_key, _source = load_credentials_with_source()
+    return api_url, api_key
 
 
 def save_credentials(api_key: str, api_url: str | None = None) -> Path:
