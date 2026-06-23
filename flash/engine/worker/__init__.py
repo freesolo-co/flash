@@ -1667,12 +1667,29 @@ def run_rl():
         force_vllm_backend_for_sm120()
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
-        # the model's FULL context and won't start on a consumer GPU). vllm_gpu_memory_utilization
-        # sizes vLLM's pool; sleep mode offloads its weights between steps.
+        # the model's FULL context and won't start on a consumer GPU).
+        # vllm_gpu_memory_utilization sizes vLLM's KV pool. When sleep_mode is ON (>=3B /
+        # long-ctx), vLLM offloads ALL GPU memory (model + KV) to CPU during the backward
+        # pass, so 0.45 is safe — the peak is max(rollout, train). When sleep_mode is OFF
+        # (small/fast models), the KV cache stays resident during training; on large cards
+        # (A100/H100) 0.45 × 80 GB = 36 GB KV that never frees, leaving too little room
+        # for activations and causing OOM. Cap the KV pool at ~8 GB (the estimator's
+        # _KV_CAP in flash.engine.vram) so the non-sleep training peak stays within budget.
+        if sleep_mode:
+            _vllm_gpu_mem_util = 0.45
+        else:
+            try:
+                import torch as _torch_vram
+
+                _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
+                _kv_target_gb = 8.0  # matches estimator's _KV_CAP (flash.engine.vram)
+                _vllm_gpu_mem_util = min(0.45, _kv_target_gb / max(1.0, _total_vram_gb))
+            except Exception:
+                _vllm_gpu_mem_util = 0.30  # conservative fallback
         grpo_kwargs.update(
             vllm_mode="colocate",
             vllm_max_model_length=vllm_max_len,
-            vllm_gpu_memory_utilization=0.45,
+            vllm_gpu_memory_utilization=_vllm_gpu_mem_util,
             vllm_enable_sleep_mode=sleep_mode,
         )
         # Rollout-memory + throughput knobs, applied ONLY if this TRL exposes the field (so an
@@ -1712,11 +1729,31 @@ def run_rl():
             True,
             "vLLM chunked prefill",
         )
-        _set_vllm_field(
-            ("vllm_compilation_config", "compilation_config"),
-            {"cudagraph_mode": "FULL_AND_PIECEWISE"},
-            "vLLM cudagraph_mode (verl rollout default)",
-        )
+        # vLLM 0.19.1 regressed the Triton _compute_slot_mapping_kernel: it launches
+        # (num_reqs + 1) thread blocks but the block table only has num_reqs rows, so the
+        # extra block causes an illegal memory access (cudaErrorIllegalAddress) on the first
+        # generation step. CUDA graph compilation triggers this path. Skip FULL_AND_PIECEWISE
+        # for vLLM versions outside TRL's supported range (0.12.0–0.19.0) until a fix lands.
+        _cudagraph_safe = True
+        try:
+            import vllm as _vllm_mod
+
+            _vllm_ver = tuple(int(x) for x in _vllm_mod.__version__.split(".")[:3])
+            if _vllm_ver > (0, 19, 0):
+                _cudagraph_safe = False
+                print(
+                    f"[rl][warn] vLLM {_vllm_mod.__version__} > 0.19.0: skipping "
+                    "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
+                    "crash workaround; update vLLM to a TRL-supported version to re-enable)"
+                )
+        except Exception:
+            pass
+        if _cudagraph_safe:
+            _set_vllm_field(
+                ("vllm_compilation_config", "compilation_config"),
+                {"cudagraph_mode": "FULL_AND_PIECEWISE"},
+                "vLLM cudagraph_mode (verl rollout default)",
+            )
     # Adapter init: continue training the SFT adapter (peft_config=None, model is the
     # loaded PeftModel) when train.init_from_adapter is set, else a fresh LoRA on the
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
