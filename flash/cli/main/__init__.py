@@ -116,6 +116,11 @@ def main(argv: list[str] | None = None) -> int:
     env_install.set_defaults(func=cmd_env_install)
 
     env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
+    env_push.add_argument(
+        "--name",
+        required=True,
+        help="Freesolo environment name to publish or update",
+    )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
 

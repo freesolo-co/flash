@@ -31,6 +31,10 @@ def _members(package_b64: str) -> dict[str, str]:
     return out
 
 
+def _args(path, *, name: str = "my-env"):
+    return argparse.Namespace(path=str(path), name=name)
+
+
 def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
@@ -39,18 +43,18 @@ def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):
         "flash.client.client_from_config", _fake_client(cap, slug="freesolo-co/u-environment")
     )
 
-    rc = cli.cmd_env_push(argparse.Namespace(path=str(env_file)))
+    rc = cli.cmd_env_push(_args(env_file, name="math-env"))
     assert rc == 0
     files = _members(cap["package_b64"])
     assert "environment.py" in files
     assert "pyproject.toml" not in files
     assert not any(name.startswith("freesolo/") for name in files)
-    assert cap["name"] == "environment"
+    assert cap["name"] == "math-env"
     assert cap["is_new"] is True
     assert "published freesolo-co/u-environment" in capsys.readouterr().out
 
 
-def test_push_dir_with_pyproject_publishes_env_artifact_only(monkeypatch, tmp_path):
+def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
     env_dir = tmp_path / "my-env"
     env_dir.mkdir()
     (env_dir / "pyproject.toml").write_text('[project]\nname = "my-env"\nversion = "0.1.0"\n')
@@ -60,19 +64,17 @@ def test_push_dir_with_pyproject_publishes_env_artifact_only(monkeypatch, tmp_pa
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    rc = cli.cmd_env_push(argparse.Namespace(path=str(env_dir)))
+    rc = cli.cmd_env_push(_args(env_dir, name="explicit-env"))
     assert rc == 0
     files = _members(cap["package_b64"])
     assert "environment.py" in files
     assert "pyproject.toml" not in files
     assert not any(name.startswith("source/") for name in files)
-    assert cap["name"] == "my-env"  # from the pyproject [project] name
+    assert cap["name"] == "explicit-env"
     assert cap["is_new"] is True
 
 
-def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
-    # A committed `datasets/` sibling must ship inside the package so a `__file__`-relative read
-    # resolves on the worker.
+def test_push_single_py_does_not_ship_sibling_datasets(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "datasets").mkdir()
@@ -80,111 +82,65 @@ def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    rc = cli.cmd_env_push(argparse.Namespace(path=str(env_file)))
-    assert rc == 0
-    assert "datasets/train.jsonl" in _members(cap["package_b64"])
+    assert cli.cmd_env_push(_args(env_file)) == 0
+    assert "datasets/train.jsonl" not in _members(cap["package_b64"])
 
 
-def test_push_single_py_ships_sibling_database(monkeypatch, tmp_path):
+def test_push_single_py_does_not_ship_sibling_database(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "state.sqlite").write_text("sqlite bytes")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
-    assert "state.sqlite" in _members(cap["package_b64"])
+    assert cli.cmd_env_push(_args(env_file)) == 0
+    assert "state.sqlite" not in _members(cap["package_b64"])
 
 
-def test_push_single_py_uses_sibling_config_id_name(monkeypatch, tmp_path):
-    # A bare environment.py with a sibling grpo.toml whose [environment] id points at
-    # a training-style <namespace>/<project>/<publish-id>/environment.py ref re-publishes to
-    # that SAME logical project.
+def test_push_single_py_ships_sibling_helper_modules(monkeypatch, tmp_path):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("import helper\n\ndef load_environment(**k):\n    return None\n")
+    (tmp_path / "helper.py").write_text("VALUE = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+    assert "helper.py" in _members(cap["package_b64"])
+
+
+def test_push_requires_explicit_name(tmp_path, capsys):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 1
+    assert "--name" in capsys.readouterr().err
+
+
+def test_push_sibling_config_does_not_override_explicit_name(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "github:owner/repo@main:user/myenv/12345678-1234-4321-abcd-123456789abc/environment.py"\n'
+        'id = "github:owner/repo@main:user/old-name/publish-id/environment.py"\n'
     )
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    rc = cli.cmd_env_push(argparse.Namespace(path=str(env_file)))
-    assert rc == 0
-    assert cap["name"] == "myenv"
-    assert cap["is_new"] is False
-
-
-def test_push_sibling_config_id_with_dot_yields_valid_module(monkeypatch, tmp_path):
-    # A sibling config env path may include dots. The packaged Python layout stays canonical
-    # regardless of the logical environment name.
-    env_file = tmp_path / "environment.py"
-    env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "grpo.toml").write_text(
-        'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "github:owner/repo@main:user/my.weird.env/12345678-1234-4321-abcd-123456789abc/environment.py"\n'
-    )
-    cap: dict = {}
-    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
-
-    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
+    assert cli.cmd_env_push(_args(env_file, name="new-name")) == 0
     names = set(_members(cap["package_b64"]))
-    assert cap["name"] == "my.weird.env"
-    assert "environment.py" in names
-    assert not any("my.weird" in n for n in names)
-
-
-def test_push_sibling_config_repo_root_refs_do_not_override_name(monkeypatch, tmp_path):
-    for env_id in ("github:owner/repo", "github:owner/repo@main", "https://github.com/owner/repo"):
-        env_file = tmp_path / "my_task.py"
-        env_file.write_text("def load_environment(**k):\n    return None\n")
-        (tmp_path / "grpo.toml").write_text(
-            f'model = "m"\nalgorithm = "grpo"\n[environment]\nid = "{env_id}"\n'
-        )
-        cap: dict = {}
-        monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
-
-        assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
-        assert cap["name"] == "my-task"
-        assert cap["is_new"] is True
-
-
-def test_push_sibling_config_github_url_path_derives_name(monkeypatch, tmp_path):
-    env_file = tmp_path / "environment.py"
-    env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "grpo.toml").write_text(
-        'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "https://github.com/owner/repo/blob/main/envs/urlenv/environment.py"\n'
-    )
-    cap: dict = {}
-    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
-
-    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
-    assert cap["name"] == "urlenv"
-    assert cap["is_new"] is False
-
-
-def test_push_single_py_no_sibling_config_uses_file_stem(monkeypatch, tmp_path):
-    env_file = tmp_path / "my_task.py"
-    env_file.write_text("def load_environment(**k):\n    return None\n")
-    cap: dict = {}
-    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
-
-    rc = cli.cmd_env_push(argparse.Namespace(path=str(env_file)))
-    assert rc == 0
-    assert cap["name"] == "my-task"
+    assert cap["name"] == "new-name"
     assert cap["is_new"] is True
+    assert "environment.py" in names
 
 
 def test_push_needs_no_local_github_credentials(monkeypatch, tmp_path):
-    # The client does not need GitHub credentials — publishing is server-side.
+    # The client does not need GitHub credentials; publishing is server-side.
     monkeypatch.setattr("shutil.which", lambda name: None)
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
+    assert cli.cmd_env_push(_args(env_file)) == 0
     assert cap["package_b64"]
 
 
@@ -199,19 +155,17 @@ def test_push_reports_server_error(monkeypatch, tmp_path, capsys):
             raise ClientError("not logged in — run `flash login`")
 
     monkeypatch.setattr("flash.client.client_from_config", lambda: _C())
-    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 1
+    assert cli.cmd_env_push(_args(env_file)) == 1
     assert "not logged in" in capsys.readouterr().err
 
 
 def test_push_nonexistent_path(tmp_path, capsys):
-    rc = cli.cmd_env_push(argparse.Namespace(path=str(tmp_path / "nope.py")))
+    rc = cli.cmd_env_push(_args(tmp_path / "nope.py"))
     assert rc == 1
     assert "no such path" in capsys.readouterr().err
 
 
 def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
-    # Tool metadata and caches must NOT be shipped in the upload: they aren't env source and
-    # bloat the package.
     env_dir = tmp_path / "my-env"
     env_dir.mkdir()
     (env_dir / "pyproject.toml").write_text('[project]\nname = "my-env"\nversion = "0.1.0"\n')
@@ -223,9 +177,8 @@ def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    assert cli.cmd_env_push(argparse.Namespace(path=str(env_dir))) == 0
+    assert cli.cmd_env_push(_args(env_dir, name="clean-env")) == 0
     names = set(_members(cap["package_b64"]))
     assert "environment.py" in names
-    assert "pyproject.toml" not in names
-    assert not any(n.startswith(".prime") for n in names)  # metadata stripped
+    assert not any(n.startswith(".prime") for n in names)
     assert not any("__pycache__" in n for n in names)
