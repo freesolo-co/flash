@@ -137,13 +137,20 @@ def cmd_login(args) -> int:
     # have to run a second command. Never echo the key itself. The identity lookup is
     # best-effort: the key is already verified and stored, so a momentary control-plane
     # hiccup must not turn a successful login into a failure.
-    print(render.login_ok(_identity_or_none()))
+    print(render.login_ok(_identity_or_none(api_key, api_url)))
     return 0
 
 
-def _identity_or_none() -> dict | None:
+# A control-plane hiccup must not make a successful login appear to hang while we fetch a
+# nonessential card, so the best-effort identity lookup uses a short timeout.
+_IDENTITY_LOOKUP_TIMEOUT_S = 5.0
+
+
+def _identity_or_none(api_key: str, api_url: str) -> dict | None:
+    # Use the key/url we just verified and stored, not `client_from_config()`: an ambient
+    # FREESOLO_API_KEY would otherwise win over the file and render the wrong identity.
     try:
-        return client_from_config().me()
+        return ApiClient(api_url, api_key, timeout=_IDENTITY_LOOKUP_TIMEOUT_S).me()
     except (ClientError, OSError, ValueError):
         return None
 

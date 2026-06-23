@@ -108,11 +108,19 @@ def test_whoami_prints_identity(fake_client, capsys) -> None:
     assert "{" not in out
 
 
-def test_login_shows_who_you_are(monkeypatch, fake_client, capsys) -> None:
+def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
     # Verify + store are stubbed; login should still surface the identity card itself so the
-    # user sees who they are without a separate `flash whoami`.
+    # user sees who they are without a separate `flash whoami`. The card is built from the
+    # just-verified key via ApiClient, so stub that (not client_from_config).
     monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
     monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli.commands,
+        "ApiClient",
+        lambda *a, **k: type(
+            "_C", (), {"me": lambda self: {"key_prefix": "freesolo", "email": "t@example.com"}}
+        )(),
+    )
     assert _run(["login", "--api-key", "fs-secret-key"]) == 0
     out = capsys.readouterr().out
     assert "logged in to flash" in out
@@ -133,6 +141,25 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
     assert "try again" in err
     assert "founders@freesolo.co" in err
     assert "bad-key" not in err
+
+
+def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
+    # Under an ASCII / non-UTF-8 stdout, neither a non-ASCII identity value nor our own
+    # punctuation may raise UnicodeEncodeError after a login has already succeeded.
+    from flash.cli.main import render
+
+    class _AsciiStdout:
+        encoding = "ascii"
+
+        def isatty(self) -> bool:
+            return False
+
+    monkeypatch.setattr(render.sys, "stdout", _AsciiStdout())
+    card = render.whoami({"key_prefix": "fs", "email": "tëst@example.com"})
+    fallback = render.login_ok(None)
+    for text in (card, fallback):
+        text.encode("ascii")  # raises if any non-ASCII slipped through
+    assert "run `flash whoami`" in fallback
 
 
 def test_models_table(fake_client, capsys) -> None:
