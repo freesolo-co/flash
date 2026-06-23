@@ -511,6 +511,37 @@ def test_runtime_secret_validation_and_non_persistence(api):
     assert "runtime_secrets" not in dumped
     assert "WANDB_API_KEY" not in body["spec"].get("worker_env", {})
 
+    env_secret_spec = {
+        **SPEC,
+        "environment": {
+            **SPEC["environment"],
+            "secrets": ["SERPAPI_API_KEY"],
+        },
+    }
+    created = api.post(
+        "/v1/runs",
+        json={
+            "spec": env_secret_spec,
+            "dry_run": True,
+            "runtime_secrets": {"SERPAPI_API_KEY": "serp-user-key"},
+        },
+        headers=_bearer(key),
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    dumped = json.dumps(body)
+    assert "serp-user-key" not in dumped
+    assert "runtime_secrets" not in dumped
+    assert body["spec"]["environment"]["secrets"] == ["SERPAPI_API_KEY"]
+
+    missing = api.post(
+        "/v1/runs",
+        json={"spec": env_secret_spec, "runtime_secrets": {}},
+        headers=_bearer(key),
+    )
+    assert missing.status_code == 400
+    assert "missing runtime secret" in missing.json()["detail"]
+
 
 def test_logs_offset_paging(api):
     key = _login()
