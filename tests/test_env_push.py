@@ -104,7 +104,7 @@ def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
     assert "datasets/train.jsonl" in _members(cap["package_b64"])
 
 
-def test_push_single_py_does_not_ship_sibling_database(monkeypatch, tmp_path):
+def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "state.sqlite").write_text("sqlite bytes")
@@ -112,6 +112,7 @@ def test_push_single_py_does_not_ship_sibling_database(monkeypatch, tmp_path):
     (tmp_path / "db" / "state.sqlite").write_text("sqlite bytes")
     (tmp_path / "configs").mkdir()
     (tmp_path / "configs" / "env.toml").write_text("[env]\n")
+    (tmp_path / "grpo.toml").write_text('algorithm = "grpo"\n')
     (tmp_path / "assets").mkdir()
     (tmp_path / "assets" / "labels.json").write_text("{}\n")
     cap: dict = {}
@@ -121,8 +122,9 @@ def test_push_single_py_does_not_ship_sibling_database(monkeypatch, tmp_path):
     files = _members(cap["package_b64"])
     assert "state.sqlite" not in files
     assert "db/state.sqlite" not in files
-    assert "configs/env.toml" in files
-    assert "assets/labels.json" in files
+    assert "configs/env.toml" not in files
+    assert "grpo.toml" not in files
+    assert "assets/labels.json" not in files
 
 
 def test_push_single_py_ships_sibling_helper_modules(monkeypatch, tmp_path):
