@@ -7,10 +7,12 @@ problems surface as ``ClientError`` with an actionable hint.
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from typing import Any
 
 from .config import load_credentials_with_source
@@ -201,6 +203,55 @@ class ApiClient:
             body={"messages": messages, "temperature": temperature, "max_tokens": max_tokens},
             timeout=30 * 60,
         )
+
+    def chat_stream(
+        self,
+        run_id: str,
+        messages: list[dict],
+        temperature: float = 0.0,
+        max_tokens: int = 512,
+    ) -> Iterator[str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            f"{self.api_url}/v1/runs/{run_id}/chat",
+            method="POST",
+            data=json.dumps(
+                {
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                }
+            ).encode(),
+            headers=headers,
+        )
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        try:
+            with urllib.request.urlopen(req, timeout=30 * 60) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if "application/json" in content_type:
+                    payload = json.loads(resp.read() or b"{}")
+                    content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
+                    if content:
+                        yield str(content)
+                    return
+                while raw := resp.read(1):
+                    chunk = decoder.decode(raw)
+                    if chunk:
+                        yield chunk
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    yield tail
+        except urllib.error.HTTPError as exc:
+            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            raise ApiError(exc.code, detail) from exc
+        except urllib.error.URLError as exc:
+            raise ClientError(
+                f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
+                "check your network connection and FLASH_API_URL"
+            ) from exc
 
 
 def client_from_config(require_key: bool = True) -> ApiClient:

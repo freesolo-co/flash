@@ -87,6 +87,11 @@ class _FakeClient:
         self.calls.append(("chat", run_id, messages))
         return {"choices": [{"message": {"content": "42"}}]}
 
+    def chat_stream(self, run_id: str, messages: list[dict], **_):
+        self.calls.append(("chat_stream", run_id, messages))
+        yield "4"
+        yield "2"
+
 
 @pytest.fixture
 def fake_client(monkeypatch) -> _FakeClient:
@@ -104,6 +109,62 @@ def test_whoami_prints_identity(fake_client, capsys) -> None:
     out = capsys.readouterr().out
     assert "freesolo" in out
     assert "t@example.com" in out
+    # Rendered as a human card, not raw JSON.
+    assert "{" not in out
+
+
+def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
+    # Verify + store are stubbed; login should still surface the identity card itself so the
+    # user sees who they are without a separate `flash whoami`. The card is built from the
+    # just-verified key via ApiClient, so stub that (not client_from_config).
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli.commands,
+        "ApiClient",
+        lambda *a, **k: type(
+            "_C", (), {"me": lambda self: {"key_prefix": "freesolo", "email": "t@example.com"}}
+        )(),
+    )
+    assert _run(["login", "--api-key", "fs-secret-key"]) == 0
+    out = capsys.readouterr().out
+    assert "logged in to flash" in out
+    assert "t@example.com" in out
+    assert "fs-secret-key" not in out  # never echo the key
+
+
+def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> None:
+    from flash.client import ClientError
+
+    def _reject(api_key, base_url=None):
+        raise ClientError("freesolo rejected this API key")
+
+    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _reject)
+    assert _run(["login", "--api-key", "bad-key"]) == 1
+    err = capsys.readouterr().err
+    assert "login failed" in err
+    assert "try again" in err
+    assert "founders@freesolo.co" in err
+    assert "bad-key" not in err
+
+
+def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
+    # Under an ASCII / non-UTF-8 stdout, neither a non-ASCII identity value nor our own
+    # punctuation may raise UnicodeEncodeError after a login has already succeeded.
+    from flash.cli.main import render
+
+    class _AsciiStdout:
+        encoding = "ascii"
+
+        def isatty(self) -> bool:
+            return False
+
+    monkeypatch.setattr(render.sys, "stdout", _AsciiStdout())
+    card = render.whoami({"key_prefix": "fs", "email": "tëst@example.com"})
+    fallback = render.login_ok(None)
+    for text in (card, fallback):
+        text.encode("ascii")  # raises if any non-ASCII slipped through
+    assert "run `flash whoami`" in fallback
 
 
 def test_models_table(fake_client, capsys) -> None:
@@ -128,13 +189,13 @@ def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
     assert "[gpu] config table" not in out
 
 
-def test_status_ps_and_status_logs(fake_client, capsys) -> None:
+def test_status_runs_and_status_logs(fake_client, capsys) -> None:
     assert _run(["status", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert "done" in out
     assert "cost_usd" in out
 
-    assert _run(["ps"]) == 0
+    assert _run(["runs"]) == 0
     out = capsys.readouterr().out
     assert "ALGO" in out
     assert "flash-1" in out
@@ -221,7 +282,7 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
 def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert _run(["chat", "flash-1", "-m", "What is 6*7?"]) == 0
     assert "42" in capsys.readouterr().out
-    assert fake_client.calls[-1][0] == "chat"
+    assert fake_client.calls[-1][0] == "chat_stream"
 
 
 def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys) -> None:
