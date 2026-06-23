@@ -10,9 +10,7 @@ import tarfile
 from flash.cli import main as cli
 
 
-def _fake_client(
-    capture: dict, *, slug: str = "github:freesolo-co/envs@main:acme/freesolo/environment.py"
-):
+def _fake_client(capture: dict, *, slug: str = "github:freesolo-co/envs@main:acme/environment.py"):
     """A stand-in ApiClient that records the publish_env call and returns a GitHub ref."""
 
     class _C:
@@ -44,32 +42,30 @@ def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):
     rc = cli.cmd_env_push(argparse.Namespace(path=str(env_file)))
     assert rc == 0
     files = _members(cap["package_b64"])
-    # The uploaded package holds a pyproject + the canonical Freesolo environment module.
-    assert "pyproject.toml" in files
-    assert "freesolo/__init__.py" in files
-    assert "freesolo/environment.py" in files
+    assert "environment.py" in files
+    assert "pyproject.toml" not in files
+    assert not any(name.startswith("freesolo/") for name in files)
     assert cap["name"] == "environment"
     assert cap["is_new"] is True
     assert "published freesolo-co/u-environment" in capsys.readouterr().out
 
 
-def test_push_dir_with_pyproject_is_passthrough(monkeypatch, tmp_path):
+def test_push_dir_with_pyproject_publishes_env_artifact_only(monkeypatch, tmp_path):
     env_dir = tmp_path / "my-env"
     env_dir.mkdir()
     (env_dir / "pyproject.toml").write_text('[project]\nname = "my-env"\nversion = "0.1.0"\n')
-    (env_dir / "freesolo").mkdir()
-    (env_dir / "freesolo" / "__init__.py").write_text("")
-    (env_dir / "freesolo" / "environment.py").write_text(
-        "def load_environment(**k):\n    return None\n"
-    )
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "source").mkdir()
+    (env_dir / "source" / "index.ts").write_text("console.log('agent workspace')\n")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     rc = cli.cmd_env_push(argparse.Namespace(path=str(env_dir)))
     assert rc == 0
     files = _members(cap["package_b64"])
-    assert "pyproject.toml" in files
-    assert "freesolo/environment.py" in files  # uploaded as-is
+    assert "environment.py" in files
+    assert "pyproject.toml" not in files
+    assert not any(name.startswith("source/") for name in files)
     assert cap["name"] == "my-env"  # from the pyproject [project] name
     assert cap["is_new"] is True
 
@@ -86,17 +82,29 @@ def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
 
     rc = cli.cmd_env_push(argparse.Namespace(path=str(env_file)))
     assert rc == 0
-    assert "freesolo/datasets/train.jsonl" in _members(cap["package_b64"])
+    assert "datasets/train.jsonl" in _members(cap["package_b64"])
+
+
+def test_push_single_py_ships_sibling_database(monkeypatch, tmp_path):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**k):\n    return None\n")
+    (tmp_path / "state.sqlite").write_text("sqlite bytes")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
+    assert "state.sqlite" in _members(cap["package_b64"])
 
 
 def test_push_single_py_uses_sibling_config_id_name(monkeypatch, tmp_path):
     # A bare environment.py with a sibling grpo.toml whose [environment] id points at
-    # envs/myenv/freesolo/environment.py re-publishes to that SAME logical env.
+    # a training-style <namespace>/<project>/<publish-id>/environment.py ref re-publishes to
+    # that SAME logical project.
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "github:owner/repo@main:envs/myenv/freesolo/environment.py"\n'
+        'id = "github:owner/repo@main:user/myenv/12345678-1234-4321-abcd-123456789abc/environment.py"\n'
     )
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
@@ -114,7 +122,7 @@ def test_push_sibling_config_id_with_dot_yields_valid_module(monkeypatch, tmp_pa
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "github:owner/repo@main:envs/my.weird.env/freesolo/environment.py"\n'
+        'id = "github:owner/repo@main:user/my.weird.env/12345678-1234-4321-abcd-123456789abc/environment.py"\n'
     )
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
@@ -122,7 +130,7 @@ def test_push_sibling_config_id_with_dot_yields_valid_module(monkeypatch, tmp_pa
     assert cli.cmd_env_push(argparse.Namespace(path=str(env_file))) == 0
     names = set(_members(cap["package_b64"]))
     assert cap["name"] == "my.weird.env"
-    assert "freesolo/environment.py" in names
+    assert "environment.py" in names
     assert not any("my.weird" in n for n in names)
 
 
@@ -146,7 +154,7 @@ def test_push_sibling_config_github_url_path_derives_name(monkeypatch, tmp_path)
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "https://github.com/owner/repo/blob/main/envs/urlenv/freesolo/environment.py"\n'
+        'id = "https://github.com/owner/repo/blob/main/envs/urlenv/environment.py"\n'
     )
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
@@ -207,11 +215,7 @@ def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
     env_dir = tmp_path / "my-env"
     env_dir.mkdir()
     (env_dir / "pyproject.toml").write_text('[project]\nname = "my-env"\nversion = "0.1.0"\n')
-    (env_dir / "freesolo").mkdir()
-    (env_dir / "freesolo" / "__init__.py").write_text("")
-    (env_dir / "freesolo" / "environment.py").write_text(
-        "def load_environment(**k):\n    return None\n"
-    )
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
     (env_dir / ".prime").mkdir()
     (env_dir / ".prime" / ".env-metadata.json").write_text('{"owner": "someone-else"}')
     (env_dir / "__pycache__").mkdir()
@@ -221,7 +225,7 @@ def test_push_excludes_metadata_and_cache_dirs(monkeypatch, tmp_path):
 
     assert cli.cmd_env_push(argparse.Namespace(path=str(env_dir))) == 0
     names = set(_members(cap["package_b64"]))
-    assert "pyproject.toml" in names
-    assert "freesolo/environment.py" in names
+    assert "environment.py" in names
+    assert "pyproject.toml" not in names
     assert not any(n.startswith(".prime") for n in names)  # metadata stripped
     assert not any("__pycache__" in n for n in names)
