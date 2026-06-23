@@ -585,8 +585,7 @@ def _drop_fla_on_hopper() -> None:
     The worker base image BAKES fla in, and per-run installs (extra_pip)
     can pull it back, so the only reliable place to drop it is HERE: in the worker process,
     after all installs and BEFORE any model import. transformers then uses the correct
-    pure-PyTorch delta rule (2-3x slower but it RUNS). Runs on BOTH substrates (RunPod and
-    Vast both exec this module). importlib caches are invalidated so the later
+    pure-PyTorch delta rule (2-3x slower but it RUNS). importlib caches are invalidated so the later
     is_fla_available() probe sees it gone. Ampere/Ada/Blackwell keep fla for the speedup.
     """
     import importlib.util

@@ -1,26 +1,13 @@
-"""Shared GPU-provider interface + the provider-agnostic GPU registry.
+"""Shared GPU-provider interface + GPU registry.
 
-Both substrates (RunPod Flash, Vast.ai verified datacenters) implement the SAME
-``Provider`` protocol and expose the SAME module set under ``providers/<name>/`` so a
-provider is pluggable/swappable. This module owns the parts that are NOT provider
-specific:
+RunPod is the managed GPU substrate. This module owns the parts that are not specific to the
+RunPod transport:
 
-  * ``GpuClass`` — one managed GPU class with its per-provider identity
-    (``enum_member`` for RunPod, ``vast_name`` for Vast). Each provider owns *which*
-    classes it lists (its ``gpus.py`` carves its rows out of ``GPU_CLASSES``), but the
-    class table itself is shared so a friendly name canonicalizes to one identity
-    everywhere (catalog, config, serving).
+  * ``GpuClass`` — one managed GPU class with its RunPod Flash identity.
   * ``JobHandle`` / ``PollResult`` — the persisted-handle + poll-outcome shapes the
-    orchestrator round-trips through any provider.
-  * ``Candidate`` / ``Allocation`` — the cross-provider allocation result.
+    orchestrator round-trips through the provider.
+  * ``Candidate`` / ``Allocation`` — the allocation result.
   * The canonicalization / alias / policy helpers every call site already used.
-
-The ``Provider`` protocol is the FIXED method set both providers implement; the
-orchestrator dispatches cancel/poll/destroy generically through the persisted
-handle's ``provider`` key. The post-run GC backstop is the deliberate exception:
-RunPod's ``gc`` runs unconditionally (a name-reconstruction backstop for rN-suffixed
-endpoints the persisted handle can't name) and Vast's ``gc`` is called by name only
-when Vast is available (its billing-leak reap), so that path branches per provider.
 """
 
 from __future__ import annotations
@@ -37,13 +24,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class GpuClass:
-    """One managed GPU class: a friendly name + per-provider identity/metadata.
-
-    Provider-agnostic by design — the identity columns (``enum_member`` for RunPod's
-    Flash ``GpuType``; ``vast_name`` for the Vast offer ``gpu_name``) carry the
-    per-provider facts, but a class is a single canonical row so the catalog / config /
-    serving all agree on what e.g. "RTX 5090" is.
-    """
+    """One managed RunPod GPU class: a friendly name + RunPod Flash identity/metadata."""
 
     name: str  # canonical friendly name used in configs / the catalog
     enum_member: str | None  # runpod_flash GpuType member name; None -> not on RunPod
@@ -54,10 +35,6 @@ class GpuClass:
     # Min host CUDA (driver) on the modern stack. None -> 12.8. Blackwell (sm120/sm100)
     # needs CUDA-13 drivers to JIT the wheels' PTX (no SASS shipped).
     min_cuda_modern: str | None = None
-    # Vast.ai offer ``gpu_name`` for this class; None -> not provisionable on Vast.
-    # A100 SXM4 boards exist in 40 GB and 80 GB variants under ONE Vast name — offers
-    # are disambiguated by ``gpu_ram`` (see ``vast_gpu_for_offer``).
-    vast_name: str | None = None
     # Whether this class has passed Flash's LIVE validation smoke (a real train+eval run on the
     # card). The deployed control plane REJECTS a submit for a non-validated class ("gpu type 'X'
     # has not passed Flash's live validation smoke"), so client-side allocation restricts to the
@@ -68,8 +45,7 @@ class GpuClass:
     validated: bool = False
 
 
-# Static hourly rates are RunPod secure-cloud on-demand snapshots for RunPod classes.
-# Vast-only classes (enum_member=None) carry a Vast verified-datacenter snapshot instead.
+# Static hourly rates are RunPod secure-cloud on-demand snapshots.
 GPU_CLASSES: tuple[GpuClass, ...] = (
     GpuClass(
         "RTX 4090",
@@ -78,11 +54,8 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "4090",
         "sm89",
         0.69,
-        vast_name="RTX 4090",
         validated=True,
     ),
-    # Vast-validated 2026-06-12: Qwen3-0.6B SFT train+eval smoke on a verified
-    # datacenter ($0.60/hr South Korea), incl. vLLM eval on a CUDA-13 driver.
     GpuClass(
         "RTX 5090",
         "NVIDIA_GEFORCE_RTX_5090",
@@ -91,14 +64,13 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm120",
         0.99,
         min_cuda_modern="13.0",
-        vast_name="RTX 5090",
         validated=True,
     ),
     # ---- Ampere/Ada workstation + datacenter cards (cheap capacity pools) ----
     # Live-validated 2026-06-22: Qwen3.5-0.8B SFT train smoke (RunPod). 16 GB SFT-only tier (GRPO's
     # 24 GB floor never routes here).
     GpuClass(
-        "RTX A4000", "NVIDIA_RTX_A4000", 16, "a4000", "sm86", 0.25, vast_name="RTX A4000",
+        "RTX A4000", "NVIDIA_RTX_A4000", 16, "a4000", "sm86", 0.25,
         validated=True,
     ),
     # Live-validated 2026-06-22: Qwen3.5-0.8B/2B SFT train smokes (RunPod). 16 GB SFT-only tier.
@@ -109,10 +81,9 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "2000ada",
         "sm89",
         0.24,
-        vast_name="RTX 2000Ada",
         validated=True,
     ),
-    GpuClass("RTX A4500", "NVIDIA_RTX_A4500", 20, "a4500", "sm86", 0.25, vast_name="RTX A4500"),
+    GpuClass("RTX A4500", "NVIDIA_RTX_A4500", 20, "a4500", "sm86", 0.25),
     GpuClass(
         "RTX 4000 Ada",
         "NVIDIA_RTX_4000_ADA_GENERATION",
@@ -120,9 +91,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "4000ada",
         "sm89",
         0.26,
-        vast_name="RTX 4000Ada",
     ),
-    # Vast-validated 2026-06-12: Qwen3-0.6B SFT train+eval smoke ($0.25/hr Czechia).
     GpuClass(
         "RTX 3090",
         "NVIDIA_GEFORCE_RTX_3090",
@@ -130,31 +99,16 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "3090",
         "sm86",
         0.46,
-        vast_name="RTX 3090",
         validated=True,
     ),
-    GpuClass("L4", "NVIDIA_L4", 24, "l4", "sm89", 0.39, vast_name="L4"),
-    # Blackwell workstation card; cheap verified-datacenter capacity on Vast.
-    # Vast-validated 2026-06-12: Qwen3-0.6B SFT train+eval smoke incl. vLLM eval on a
-    # CUDA-13 driver with the cu128 stack image ($0.34/hr Hungary). Vast-only.
-    GpuClass(
-        "RTX Pro 4000",
-        None,
-        24,
-        "pro4000",
-        "sm120",
-        0.34,
-        min_cuda_modern="13.0",
-        vast_name="RTX PRO 4000",
-        validated=True,
-    ),
+    GpuClass("L4", "NVIDIA_L4", 24, "l4", "sm89", 0.39),
     # Live-validated 2026-06-22: Qwen3.5-0.8B/9B SFT+GRPO train smokes (RunPod). The 48 GB tier that
     # fills the 32->80 GB gap (e.g. 4B GRPO @ 35 GB) ~55% cheaper than the A100.
     GpuClass(
-        "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49, vast_name="RTX A6000",
+        "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
         validated=True,
     ),
-    GpuClass("A40", "NVIDIA_A40", 48, "a40", "sm86", 0.44, vast_name="A40"),
+    GpuClass("A40", "NVIDIA_A40", 48, "a40", "sm86", 0.44),
     GpuClass(
         "RTX 6000 Ada",
         "NVIDIA_RTX_6000_ADA_GENERATION",
@@ -162,14 +116,8 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "6000ada",
         "sm89",
         0.77,
-        vast_name="RTX 6000Ada",
     ),
-    # L40S exists at RunPod but not in the Flash SDK's GpuType enum -> Vast-only.
-    GpuClass("L40S", None, 48, "l40s", "sm89", 0.87, vast_name="L40S"),
     # ---- big-VRAM tier (9B bf16 GRPO, future >9B bf16) ----
-    # 40 GB SXM4 boards share Vast's "A100 SXM4" name with the 80 GB variant; offers
-    # are split by gpu_ram (vast_gpu_for_offer). Not a RunPod Flash class -> Vast-only.
-    GpuClass("A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 0.89, vast_name="A100 SXM4"),
     # Validated 2026-06-11: 0.6B SFT smoke (phase6).
     GpuClass(
         "A100 PCIe",
@@ -178,24 +126,17 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "a100pcie",
         "sm80",
         1.39,
-        vast_name="A100 PCIE",
         validated=True,
     ),
     # Live-validated 2026-06-22: Qwen3.5 0.8B/MiniCPM/2B/9B SFT+GRPO train smokes (RunPod).
     GpuClass(
-        "A100 SXM", "NVIDIA_A100_SXM4_80GB", 80, "a100sxm", "sm80", 1.49, vast_name="A100 SXM4",
+        "A100 SXM", "NVIDIA_A100_SXM4_80GB", 80, "a100sxm", "sm80", 1.49,
         validated=True,
     ),
     # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod).
     GpuClass(
-        "H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29, vast_name="H100 SXM",
+        "H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29,
         validated=True,
-    ),
-    # H100 NVL (94 GB) has no RunPod Flash GpuType member -> Vast-only. Cheaper than the
-    # 80 GB SXM H100 on the live market and carries 14 GB more VRAM, so it's a strong
-    # cost/VRAM pick for big-context GRPO tiers.
-    GpuClass(
-        "H100 NVL", None, 94, "h100nvl", "sm90", 2.39, vast_name="H100 NVL", validated=True
     ),
     # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod, sm120/CUDA-13).
     GpuClass(
@@ -286,37 +227,7 @@ def get_gpu_info(name: str) -> GpuClass:
 def providers_for(name: str) -> tuple[str, ...]:
     """Providers that can provision this GPU class."""
     info = get_gpu_info(name)
-    out = []
-    if info.enum_member:
-        out.append("runpod")
-    if info.vast_name:
-        out.append("vast")
-    return tuple(out)
-
-
-# Boards under-report usable VRAM vs the class's nominal size (measured live: L4
-# offers carry 23034 MB for the 24 GB class, A40 offers 46068 MB for the 48 GB
-# class — ~3 GB under), so class matching gets a tolerance. Safe at 3.5 GB: names
-# shared across VRAM variants differ by >= 40 GB (A100 SXM4 40/80).
-_VRAM_MATCH_TOLERANCE_GB = 3.5
-
-
-def vast_gpu_for_offer(gpu_name: str, gpu_ram_mb: float) -> str | None:
-    """Map a Vast offer (``gpu_name`` + ``gpu_ram`` MB) to a canonical GPU class.
-
-    Returns None for anything not in the managed table — that's the hard Ampere+
-    floor (T4/2080 Ti/Quadro RTX offers never match). Names shared across VRAM
-    variants (A100 SXM4 40/80 GB) resolve to the largest class the board's actual
-    RAM covers.
-    """
-    fitting = [
-        g
-        for g in GPU_INFO.values()
-        if g.vast_name == gpu_name and g.vram_gb <= gpu_ram_mb / 1024 + _VRAM_MATCH_TOLERANCE_GB
-    ]
-    if not fitting:
-        return None
-    return max(fitting, key=lambda g: g.vram_gb).name
+    return ("runpod",) if info.enum_member else ()
 
 
 def gpu_short(name: str) -> str:
@@ -332,11 +243,9 @@ def min_cuda_modern(name: str) -> str:
 def cheapest_gpu(min_vram_gb: int) -> str:
     """Cheapest validated RunPod GPU class with at least ``min_vram_gb`` VRAM.
 
-    RunPod-static by design (the cross-provider equivalent lives in
-    ``flash.providers.allocator``): Vast-only classes are excluded so the result is
-    always deployable via Flash, and offline resolution stays deterministic. Restricted to the
-    validated pool so the picked class matches what the deployed control plane will actually
-    accept — a non-validated class submits then gets rejected.
+    RunPod-static by design so the result is always deployable via Flash, and offline resolution
+    stays deterministic. Restricted to the validated pool so the picked class matches what the
+    deployed control plane will actually accept — a non-validated class submits then gets rejected.
     """
     pool = [
         g
@@ -344,10 +253,6 @@ def cheapest_gpu(min_vram_gb: int) -> str:
         if g.enum_member and g.vram_gb >= min_vram_gb and g.validated
     ]
     if not pool:
-        # This helper filters to RunPod-provisionable VALIDATED classes (enum_member set +
-        # validated) on purpose; a Vast-only / unvalidated class can still fit. Say so, so the
-        # message isn't misleading when a fitting GPU exists outside this pool (the cross-provider
-        # allocator may still place a validated Vast class).
         raise UnsupportedGpuError(
             f"no validated RunPod-provisionable GPU class has >= {min_vram_gb} GB VRAM"
         )
@@ -368,9 +273,8 @@ def provisional_gpu(
     GPU pinning is gone: this picks the cheapest RunPod-provisionable class whose VRAM covers the
     model, restricted to the validated pool (``cheapest_gpu``'s default) so the provisional
     matches what the deployed control plane will accept. The submit-time allocator
-    (``flash.providers.allocator``) ALWAYS re-resolves the cheapest fitting VALIDATED class
-    across all providers; this is the RunPod-static, offline-deterministic equivalent the schema
-    uses for sizing/display.
+    (``flash.providers.allocator``) always re-resolves the cheapest fitting validated class; this
+    is the RunPod-static, offline-deterministic equivalent the schema uses for sizing/display.
     """
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
@@ -393,9 +297,8 @@ def provisional_gpu(
 class JobHandle:
     """Provider-tagged, persisted handle: enough to reattach/cancel from any process.
 
-    Each provider owns the rest of its handle shape (RunPod: endpoint_id/job_id; Vast:
-    instance_id/offer_id/...). ``provider`` is the routing key the orchestrator uses to
-    dispatch poll/cancel/destroy generically through the registry.
+    The provider owns the rest of its handle shape (RunPod: endpoint_id/job_id). ``provider`` is
+    the routing key the orchestrator uses to dispatch poll/cancel/destroy through the registry.
     """
 
     provider: str
@@ -424,7 +327,7 @@ class PollResult:
 
 
 # ---------------------------------------------------------------------------
-# Allocation result (cross-provider)
+# Allocation result
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Candidate:
@@ -432,9 +335,6 @@ class Candidate:
     gpu: str
     hourly_usd: float
     vram_gb: int
-    # Opaque per-provider provisioning hint (e.g. the chosen Vast offer). The
-    # allocator stays provider-agnostic; the provider interprets it at submit time.
-    offer: Any = None
 
 
 @dataclass(frozen=True)
@@ -444,9 +344,6 @@ class Allocation:
     hourly_usd: float
     min_vram_gb: int
     candidates: tuple[Candidate, ...]  # full ranked list (retry walks this)
-    offer: Any = None  # the chosen provider's provisioning hint (vast offer | None)
-    # Per-provider book of provisioning hints for the Vast offer walk.
-    provider_offers: tuple[Any, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -454,13 +351,7 @@ class Allocation:
 # ---------------------------------------------------------------------------
 @runtime_checkable
 class Provider(Protocol):
-    """The pluggable GPU-substrate interface.
-
-    Both ``providers/runpod`` and ``providers/vast`` expose ``PROVIDER`` implementing
-    this protocol with an identical module layout (api/auth/pricing/gpus/jobs/
-    train/preflight). The orchestrator/allocator only ever talk to these methods, so a
-    provider is swappable without touching the control plane.
-    """
+    """The GPU-substrate interface implemented by ``providers/runpod``."""
 
     name: str
 
@@ -489,16 +380,9 @@ class Provider(Protocol):
         log: Any = None,
         on_handle: Any = None,
         attempt: int = 0,
-        offers: Any = None,
-        exclude_machine_ids: Any = frozenset(),
         runtime_secrets: dict[str, str] | None = None,
     ) -> PollResult:
-        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll.
-
-        ``exclude_machine_ids`` is the run's blacklist (machines that already failed
-        this run); a provider that re-searches the live market mid-submit (Vast) must
-        keep them excluded so a stalled/sick machine is never re-picked. RunPod ignores
-        it (no in-provider market re-search)."""
+        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll."""
         ...
 
     def poll(self, handle: JobHandle, spec: JobSpec, seed: int, *, log: Any = None) -> PollResult:
