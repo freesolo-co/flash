@@ -242,9 +242,9 @@ def cmd_env_setup(args) -> int:
         'id = ""\n\n'
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
-    grpo = Path("configs/grpo.toml")
-    if not grpo.exists():
-        grpo.write_text(
+    rl = Path("configs/rl.toml")
+    if not rl.exists():
+        rl.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
             f"{env_comment}"
@@ -270,7 +270,7 @@ def cmd_env_setup(args) -> int:
         )
     print(
         "ensured environment.py, datasets/train.jsonl, configs/, "
-        "configs/grpo.toml, configs/sft.toml"
+        "configs/rl.toml, configs/sft.toml"
     )
     return 0
 
