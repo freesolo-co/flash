@@ -1986,44 +1986,25 @@ def write_train_meta(
     _finalize(m)
 
 
-def _adapter_repo_default_prefix(repo: str) -> str | None:
-    repo_name = repo.rsplit("/", 1)[-1]
-    if repo_name.startswith("flashrun-"):
-        return f"sft/{repo_name.removeprefix('flashrun-')}/seed0"
-    return None
-
-
 def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     """Resolve init_from_adapter into (repo, prefix).
 
-    Supported forms:
-      * "sft/<run_id>/seed0"                     -> current run artifact repo.
-      * "<owner>/<repo>:sft/<run_id>/seed0"      -> explicit cross-repo prefix.
-      * "<owner>/flashrun-<sft-run-id>"          -> managed repo shorthand.
+    The only public form is the exact adapter_ref emitted by ``flash status``:
+    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
     """
-    if ":" in adapter_ref:
-        repo, prefix = adapter_ref.split(":", 1)
-        return (repo, prefix) if repo and prefix else None
-    if adapter_ref.startswith(("sft/", "rl/")):
-        return (HF_REPO, adapter_ref) if HF_REPO else None
-    if adapter_ref.count("/") == 1:
-        prefix = _adapter_repo_default_prefix(adapter_ref)
-        if prefix:
-            return adapter_ref, prefix
-    return (HF_REPO, adapter_ref) if HF_REPO and adapter_ref else None
+    repo, sep, prefix = adapter_ref.partition(":")
+    if not (sep and repo and prefix):
+        return None
+    if repo.count("/") != 1 or not prefix.startswith(("sft/", "rl/")):
+        return None
+    return repo, prefix
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
     """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
 
-    Supported forms of ``adapter_prefix``:
-      * ``"<prefix>"``            -> read from THIS run's own artifact repo (HF_REPO).
-      * ``"<owner>/<repo>:<prefix>"`` -> CROSS-REPO warm-start: read the SFT adapter from
-        another run's managed artifact repo. Required since hf_repo is now a per-run managed
-        repo (Freesolo-Co/flashrun-<run_id>), so an SFT adapter never lives in the GRPO run's
-        own repo. The control-plane HF_TOKEN can read sibling managed repos.
-      * ``"<owner>/flashrun-<run_id>"`` -> CROSS-REPO shorthand for the common SFT output
-        prefix ``sft/<run_id>/seed0``.
+    ``adapter_prefix`` must be the full ``adapter_ref`` string emitted by ``flash status``:
+    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
     """
     if not adapter_prefix:
         return None
