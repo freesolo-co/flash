@@ -33,8 +33,8 @@ from flash.cli.main.commands import (  # noqa: F401
     cmd_deployments,
     cmd_env_init,
     cmd_env_list,
+    cmd_env_setup,
     cmd_gpus,
-    cmd_lab_setup,
     cmd_login,
     cmd_logs,
     cmd_models,
@@ -91,11 +91,6 @@ def main(argv: list[str] | None = None) -> int:
     whoami = sub.add_parser("whoami", help="show the identity behind your stored key")
     whoami.set_defaults(func=cmd_whoami)
 
-    lab = sub.add_parser("lab", help="local authoring scaffolds")
-    lab_sub = lab.add_subparsers(dest="lab_cmd", required=True)
-    setup = lab_sub.add_parser("setup", help="scaffold environments/ + configs/ in the cwd")
-    setup.set_defaults(func=cmd_lab_setup)
-
     models = sub.add_parser("models", help="list supported base models")
     models.set_defaults(func=cmd_models)
 
@@ -104,6 +99,9 @@ def main(argv: list[str] | None = None) -> int:
 
     env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
+    setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
+    setup.set_defaults(func=cmd_env_setup)
+
     init = env_sub.add_parser("init", help="scaffold a new local Freesolo environment")
     init.add_argument("name")
     init.set_defaults(func=cmd_env_init)

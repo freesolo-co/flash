@@ -95,24 +95,34 @@ def _require_environment_ref(value: str, message: str) -> None:
     if value.startswith("github:"):
         body = value[len("github:") :]
         repo_ref, sep, path = body.partition(":")
-        repo, _, _ref = repo_ref.partition("@")
+        repo, _, _ = repo_ref.partition("@")
         owner_repo = repo.split("/", 1)
-        if len(owner_repo) == 2 and all(owner_repo) and (not sep or _is_safe_environment_path(path)):
+        if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo) and (
+            not sep or _is_safe_environment_path(path)
+        ):
             return
+        raise ConfigError(message)
     if value.startswith("https://github.com/") or value.startswith("http://github.com/"):
         parsed = urllib.parse.urlparse(value)
         if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "github.com":
             parts = [part for part in urllib.parse.unquote(parsed.path).strip("/").split("/") if part]
             if len(parts) < 2:
                 raise ConfigError(message)
-            if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
+            owner, repo = parts[0], parts[1]
+            repo = repo[:-4] if repo.endswith(".git") else repo
+            if len(parts) == 2:
+                if not _is_safe_github_path_parts([owner, repo]):
+                    raise ConfigError(message)
+            elif len(parts) >= 5 and parts[2] in {"blob", "tree"}:
                 ref = parts[3]
-                raw_path = "/".join(parts[4:])
                 if ":" in ref:
                     raise ConfigError(message)
+                raw_path = "/".join(parts[4:])
                 if not _is_safe_environment_path(raw_path):
                     raise ConfigError(message)
-            elif len(parts) >= 2 and not _is_safe_github_path_parts(parts):
+                if not _is_safe_github_path_parts([owner, repo, ref]):
+                    raise ConfigError(message)
+            else:
                 raise ConfigError(message)
             return
     raise ConfigError(message)

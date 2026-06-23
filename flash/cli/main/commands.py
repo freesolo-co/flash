@@ -79,12 +79,16 @@ def cmd_whoami(args) -> int:
 
 
 _STARTER_ENV_PY = '''\
-"""Starter local Freesolo environment.
+"""Starter Freesolo environment.
 
-Replace the dataset and reward with your task, then upload it with
-`flash env push environments/starter_env.py`. A managed run references the
-returned environment id in [environment] id.
+Edit the dataset and reward code, then upload with
+`flash env push environments/freesolo/environment.py`.
+
+A managed run should use the returned [environment] id from
+`flash env push`.
 """
+
+from __future__ import annotations
 
 from freesolo.datasets.types import TaskExample
 from freesolo.environments import EnvironmentSingleTurn, RewardResult
@@ -108,18 +112,27 @@ class StarterEnv(EnvironmentSingleTurn):
         return RewardResult(score=score, threshold=1.0)
 
 
-def load_environment(**kwargs) -> StarterEnv:
+def load_environment(
+    contract_path: str | None = None,
+    dataset_path: str | None = None,
+    reward_command: str | None = None,
+    mode: str = "eval",
+    **_: object,
+) -> StarterEnv:
     return StarterEnv()
 '''
 
 
-def cmd_lab_setup(args) -> int:
+def cmd_env_setup(args) -> int:
     Path("environments").mkdir(exist_ok=True)
     Path("configs").mkdir(exist_ok=True)
     Path("configs/endpoints.toml").write_text(
         "# OpenAI-compatible endpoints returned by `flash deploy` can be stored here.\n"
     )
-    starter_env = Path("environments/starter_env.py")
+    starter_env_dir = Path("environments/freesolo")
+    starter_env_dir.mkdir(exist_ok=True, parents=True)
+    Path(starter_env_dir / "__init__.py").write_text("", encoding="utf-8")
+    starter_env = Path(starter_env_dir / "environment.py")
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
     sample = Path("configs/freesolo_grpo.toml")
@@ -128,7 +141,7 @@ def cmd_lab_setup(args) -> int:
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
             "# Environment: a Freesolo environment ref. Publish the scaffolded\n"
-            "# environments/starter_env.py with `flash env push environments/starter_env.py`\n"
+            "# environments/freesolo/environment.py with `flash env push environments/freesolo/environment.py`\n"
             "# to get the id, and set it below.\n"
             "[environment]\n"
             'id = "github:owner/repo@main:path/to/freesolo/environment.py"\n\n'
@@ -140,7 +153,7 @@ def cmd_lab_setup(args) -> int:
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
     print(
-        "created environments/, environments/starter_env.py, configs/, "
+        "created environments/freesolo/environment.py, configs/, "
         "configs/freesolo_grpo.toml, configs/endpoints.toml"
     )
     return 0
@@ -240,21 +253,21 @@ def cmd_env_list(args) -> int:
             print(f"  {env_id}")
     local = Path("environments")
     if local.is_dir():
-        # Both directory envs (environments/<name>/<name>.py) and top-level single-file
-        # modules (environments/<name>.py, e.g. the `flash lab` starter env). These are local
-        # env SOURCES — publish one with `flash env push <path>` to run it on the managed
-        # service by its environment id.
+        # Both directory envs (environments/<name>/...) and single-file modules
+        # (environments/<name>.py). These are local env SOURCES — publish one with
+        # `flash env push <path>` to run it on the managed service by its
+        # environment id.
         paths: list[str] = []
         for p in local.iterdir():
             if p.name.startswith("__"):
                 continue
             if p.is_dir():
-                # `flash env init` maps a hyphenated dir to an underscored inner module file
-                # (my-env/ -> my-env/my_env.py). List that exact path, and only when it
-                # actually exists (an empty/incomplete folder isn't a publishable source).
                 stem = p.name.replace("-", "_")
                 module = p / f"{stem}.py"
-                if module.is_file():
+                canonical = p / "freesolo" / "environment.py"
+                if canonical.is_file():
+                    paths.append(f"environments/{p.name}/freesolo/environment.py")
+                elif module.is_file():
                     paths.append(f"environments/{p.name}/{stem}.py")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
