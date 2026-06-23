@@ -1212,3 +1212,159 @@ def test_update_will_not_overwrite_terminal_with_lifecycle_state(monkeypatch):
         orch._update("c", "cancelled", cost_usd=2.0)
         assert orch.get_status("c").state == "cancelled"
         assert orch.get_status("c").cost_usd == 2.0
+
+
+# ---------------------------------------------------------------------------
+# deploy_train_endpoint: quota-error sweep-and-retry
+# ---------------------------------------------------------------------------
+
+
+def _make_runpod_flash_mocks(monkeypatch, FakeRM):
+    """Inject fake runpod_flash modules so deploy_train_endpoint can be called without the SDK."""
+    import sys
+    import types
+
+    class FakeEndpoint:
+        def __init__(self, **kwargs):
+            pass
+
+        def _build_resource_config(self):
+            return {}
+
+    # Mark every stub as a package (via __path__) so Python allows dotted imports from them,
+    # e.g. `from runpod_flash.core.resources.resource_manager import ResourceManager`.
+    rf_mod = types.ModuleType("runpod_flash")
+    rf_mod.__path__ = []
+    rf_mod.Endpoint = FakeEndpoint
+    monkeypatch.setitem(sys.modules, "runpod_flash", rf_mod)
+
+    core_mod = types.ModuleType("runpod_flash.core")
+    core_mod.__path__ = []
+    monkeypatch.setitem(sys.modules, "runpod_flash.core", core_mod)
+
+    res_mod = types.ModuleType("runpod_flash.core.resources")
+    res_mod.__path__ = []
+    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources", res_mod)
+
+    rm_mod = types.ModuleType("runpod_flash.core.resources.resource_manager")
+    rm_mod.ResourceManager = FakeRM
+    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", rm_mod)
+
+
+def _patch_deploy_deps(monkeypatch, jobs):
+    """Patch all module-level symbols in jobs that deploy_train_endpoint uses."""
+    import flash.providers.runpod.auth as auth_mod
+
+    monkeypatch.setattr(jobs, "FLASH_SDK_LOCK", __import__("threading").Lock())
+    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(auth_mod, "ensure_auth", lambda: None)
+    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(jobs, "flash_gpu", lambda g: g)
+    monkeypatch.setattr(jobs, "canonical_gpu", lambda g: g)
+    monkeypatch.setattr(jobs, "endpoint_name", lambda g, s: f"flash-{g}-test")
+    monkeypatch.setattr(jobs, "min_cuda_for", lambda g: "12.8")
+    monkeypatch.setattr(jobs, "volume_endpoint_kwargs", lambda s: {})
+    monkeypatch.setattr(jobs, "WORKER_IMAGE", "fake-image")
+    monkeypatch.setattr(jobs, "DEFAULT_EXECUTION_TIMEOUT_MS", 3600000)
+    monkeypatch.setattr(jobs, "apply_disk_gb", lambda c, d: None)
+    monkeypatch.setattr(jobs, "time", type("T", (), {"sleep": staticmethod(lambda s: None)})())
+
+
+def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
+    """On a workers-quota error, deploy_train_endpoint sweeps idle endpoints and retries."""
+    import flash.providers.runpod.jobs as jobs
+
+    attempts = {"count": 0}
+    swept = {"count": 0}
+
+    class FakeResource:
+        id = "ep-new"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise RuntimeError(
+                    "GraphQL errors: Max workers across all endpoints must not exceed "
+                    "your workers quota (30)"
+                )
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+
+    def fake_sweep(skip_name):
+        swept["count"] += 1
+        return 5
+
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", fake_sweep)
+
+    ep_id, _ep_name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+
+    assert ep_id == "ep-new"
+    assert attempts["count"] == 3, "should take 3 attempts (2 quota failures + 1 success)"
+    assert swept["count"] == 2, "should sweep once per quota-error retry"
+
+
+def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
+    """deploy_train_endpoint re-raises the quota error after all retries are exhausted."""
+    import flash.providers.runpod.jobs as jobs
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            raise RuntimeError(
+                "GraphQL errors: Max workers across all endpoints must not exceed "
+                "your workers quota (30)"
+            )
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda skip_name: 0)
+
+    with pytest.raises(RuntimeError, match="workers quota"):
+        jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+
+
+def test_sweep_idle_flash_endpoints(monkeypatch):
+    """_sweep_idle_flash_endpoints deletes only idle flash-* / live-flash-* endpoints."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    # RunPod Flash registers endpoints as "live-<endpoint_name>", so real names are
+    # "live-flash-<gpu>-<suffix>". Both the bare "flash-*" and "live-flash-*" forms
+    # must be swept; the current run's endpoint (and its "live-" form) must be skipped.
+    endpoints = [
+        {"id": "ep-live-idle", "name": "live-flash-a100-abc"},  # live- prefix, idle → delete
+        {"id": "ep-live-busy", "name": "live-flash-a100-xyz"},  # live- prefix, busy → keep
+        {"id": "ep-live-skip", "name": "live-flash-a100-cur"},  # live- form of current → skip
+        {"id": "ep-bare-idle", "name": "flash-a100-old"},       # bare prefix, idle → delete
+        {"id": "ep-skip-bare", "name": "flash-a100-cur"},       # current run (bare) → skip
+        {"id": "ep-other",     "name": "other-ep"},              # not flash-* → skip
+    ]
+
+    def fake_list_endpoints():
+        return endpoints
+
+    def fake_health(eid):
+        if eid in ("ep-live-idle", "ep-bare-idle"):
+            return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                    "jobs": {"inQueue": 0, "inProgress": 0}}
+        if eid == "ep-live-busy":
+            return {"workers": {"running": 1, "ready": 0, "idle": 0, "initializing": 0},
+                    "jobs": {"inQueue": 0, "inProgress": 1}}
+        return {}
+
+    deleted = []
+
+    def fake_delete(eid):
+        deleted.append(eid)
+        return True
+
+    monkeypatch.setattr(runpod_api, "list_endpoints", fake_list_endpoints)
+    monkeypatch.setattr(runpod_api, "endpoint_health", fake_health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", fake_delete)
+
+    count = jobs._sweep_idle_flash_endpoints(skip_name="flash-a100-cur")
+
+    assert count == 2
+    assert sorted(deleted) == sorted(["ep-live-idle", "ep-bare-idle"])
