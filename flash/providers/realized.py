@@ -1,11 +1,10 @@
 """Realized provider cost (COGS) for a finished run -- the cost side of estimator accuracy.
 
-Each provider's billing API gives the dollars it ACTUALLY charged (RunPod /v1/billing/endpoints,
-Vast /v0/charges/), which the reconciliation job compares against the run's charged pre-flight
-estimate. This module owns the provider-agnostic ``RealizedCost`` shape and dispatches to the
-per-provider shaper by the run's persisted handle (``RunStatus.remote['provider']``). The HTTP
-calls live in each provider's ``api.py``; the pure shaping lives in each provider's ``cost.py``
-so it stays offline-testable.
+RunPod's billing API gives the dollars it ACTUALLY charged, which the reconciliation job
+compares against the run's charged pre-flight estimate. This module owns the ``RealizedCost``
+shape and dispatches to the RunPod shaper by the run's persisted handle
+(``RunStatus.remote['provider']``). The HTTP calls live in the provider's ``api.py``; the pure
+shaping lives in its ``cost.py`` so it stays offline-testable.
 """
 
 from __future__ import annotations
@@ -40,8 +39,4 @@ def realized_cost_for_remote(
         from flash.providers.runpod.cost import realized_cost as runpod_realized
 
         return runpod_realized(remote.get("endpoint_id"), start=start, end=end)
-    if provider == "vast":
-        from flash.providers.vast.cost import realized_cost as vast_realized
-
-        return vast_realized(remote.get("instance_id"), start=start, end=end)
     return None

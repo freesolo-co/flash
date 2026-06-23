@@ -1,7 +1,6 @@
 """Cost accounting + the standard run-metrics record for Flash runs.
 
-GPU cost = gpu_hours * hourly_rate (per-second billing on the selected provider —
-RunPod or Vast.ai; artifacts go via HF).
+GPU cost = gpu_hours * hourly_rate (per-second billing on RunPod; artifacts go via HF).
 """
 
 from __future__ import annotations
