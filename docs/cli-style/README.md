@@ -8,7 +8,7 @@ A standardized, production-grade output theme for every `flash` command.
 - **TTY-gated, machine-safe:** the theme renders only on an interactive terminal. Piped,
   redirected, captured, or agent-driven output stays byte-for-byte plain/JSON, so `jq`,
   scripts, and the trainer-agent contract are untouched. Force it with `FLASH_STYLE=1`;
-  disable with `FLASH_STYLE=0` or `NO_COLOR`.
+  disable the themed layout with `FLASH_STYLE=0`. `NO_COLOR` keeps the layout but drops ANSI color.
 - **No new dependencies:** pure standard library, like the rest of the client CLI.
 
 The rendering lives in `flash/cli/main/render.py`; the command wiring is in
