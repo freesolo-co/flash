@@ -79,6 +79,6 @@ def test_login_warns_when_env_key_will_override_saved_key(monkeypatch, tmp_path,
 
     assert cli.cmd_login(args) == 0
     captured = capsys.readouterr()
-    assert "logged in with your freesolo key" in captured.out
+    assert "logged in to flash" in captured.out
     assert "FREESOLO_API_KEY is set and will override this saved login" in captured.err
     assert client_config.load_credentials()[1] == "fs-secret-env"
