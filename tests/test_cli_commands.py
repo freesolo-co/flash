@@ -7,6 +7,8 @@ the remaining commands are covered without a server.
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from flash.cli import main as cli
@@ -140,6 +142,43 @@ def test_status_logs_separates_partial_log_line_from_json(fake_client, capsys) -
     assert _run(["status", "flash-1", "--logs"]) == 0
     out = capsys.readouterr().out
     assert "partial log line\n{" in out
+
+
+def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> None:
+    class _TTYBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    class _WaitingClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pages = iter(
+                [
+                    {"run_id": "flash-spin", "logs": "", "offset": 0, "state": "queued"},
+                    {
+                        "run_id": "flash-spin",
+                        "logs": "worker ready\n",
+                        "offset": 13,
+                        "state": "done",
+                    },
+                ]
+            )
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            return next(self.pages)
+
+    stderr = _TTYBuffer()
+    monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    state = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
+
+    assert state == "done"
+    assert capsys.readouterr().out == "worker ready\n"
+    err = stderr.getvalue()
+    assert "following logs for flash-spin (queued)" in err
+    assert "\r" in err
+    assert err.endswith("\r")
 
 
 @pytest.mark.parametrize("removed", ["cost", "attach", "logs"])
