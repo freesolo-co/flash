@@ -54,7 +54,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"seeds": [0], **knobs},
         }
     )
@@ -65,7 +65,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py", "params": {"grpo_config": knobs}},
+            "environment": {"id": "github:owner/repo@main:env/environment.py", "params": {"grpo_config": knobs}},
             "train": {"seeds": [0]},
         }
     )
@@ -79,7 +79,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             {
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"seeds": [0], "group_size": 2},
             }
         ),
@@ -103,7 +103,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
@@ -158,7 +158,7 @@ def test_opt_int_float_reject_bools() -> None:
             {
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"steps": 10, "group_size": True},
             }
         )
@@ -219,7 +219,7 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
@@ -244,7 +244,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
-        "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "train": {"seeds": [0], "steps": 10},
     }
     # absent -> fine (no longer required); left blank for the control plane to assign
@@ -267,7 +267,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
@@ -337,7 +337,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
     }
     bad_cases = [
@@ -376,7 +376,7 @@ def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "github:owner/repo@main:env/freesolo/environment.py"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
     }
     for bad in ({"steps": 1.5}, {"epochs": 2.5}, {"steps": 0}, {"epochs": -1}):
