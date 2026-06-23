@@ -19,7 +19,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -211,47 +210,13 @@ def main() -> int:
 
         extra_pip = payload.get("extra_pip") or []
         if extra_pip:
-            # check=True: a deterministic dependency failure (GRPO / Prime Hub
-            # / verifiers extras) must stop NOW with an actionable error, not proceed to
+            # check=True: a deterministic dependency failure (GRPO / Freesolo extras)
+            # must stop NOW with an actionable error, not proceed to
             # a later import crash while the paid instance runs (matches the RunPod path).
             subprocess.run([sys.executable, "-m", "pip", "install", *extra_pip], check=True)
         # NB: fla is dropped on Hopper (sm90) automatically by engine.worker._drop_fla_on_hopper at
         # worker startup (fla's GDN backward is miscomputed on sm90, #640) — no bootstrap uninstall
         # or env toggle. fla only ever runs on the consumer archs where its Triton kernel is correct.
-        # Install the run's verifiers environment(s) from the Prime Hub via the
-        # authenticated `prime` CLI (mirrors runpod/train.py:_train_body). The public pip
-        # index does not serve PRIVATE env wheels; `prime env install` pulls/builds/installs
-        # public + private alike, authenticated by PRIME_API_KEY forwarded in the payload env.
-        hub_env_ids = payload.get("hub_env_ids") or []
-        if hub_env_ids:
-            worker_env = {k: str(v) for k, v in (payload.get("env") or {}).items()}
-            prime_key = worker_env.get("PRIME_API_KEY") or os.environ.get("PRIME_API_KEY")
-            if not prime_key:
-                raise RuntimeError(
-                    "PRIME_API_KEY is required to install the Prime Hub environment on the worker"
-                )
-            # Only install `prime` when it isn't already present (it's often baked into the
-            # instance image) — an unconditional install adds latency and a per-run PyPI
-            # failure point every run.
-            if shutil.which("prime") is None:
-                subprocess.run([sys.executable, "-m", "pip", "install", "prime"], check=True)
-            # Resolve the prime binary (located path if present, else the bare name) so the env
-            # install runs through the actually-installed CLI.
-            prime_bin = shutil.which("prime") or "prime"
-            install_env = {
-                **os.environ,
-                "PRIME_API_KEY": prime_key,
-                "PRIME_DISABLE_VERSION_CHECK": "1",
-                "PIP_BREAK_SYSTEM_PACKAGES": "1",
-            }
-            # --with pip: install the env into THIS python via pip, not prime's isolated uv env
-            # (the default), so the trainer can import the env module at load_environment.
-            for env_id in hub_env_ids:
-                subprocess.run(
-                    [prime_bin, "env", "install", env_id, "--with", "pip"],
-                    check=True,
-                    env=install_env,
-                )
         fetch_code(payload)
         env = build_worker_env(payload)
         deadline = time.time() + float(payload.get("max_wall_s") or 24 * 3600)

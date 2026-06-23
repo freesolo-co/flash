@@ -1,384 +1,681 @@
-"""Adapter that runs Prime Intellect ``verifiers`` / Environments Hub envs on Flash.
+"""Adapter that runs Freesolo SDK environments on Flash.
 
-Wraps a ``verifiers`` ``Environment`` (``SingleTurnEnv``, ``MultiTurnEnv``, ``ToolEnv`` and
-its subclasses) in Flash's small ``Environment`` protocol so Hub environments run unchanged
-on Flash's trainer.
-
-GRPO supports all three shapes (the worker routes on ``multi_turn`` / ``is_tool_env``):
-  * single-turn — TRL's single-shot generation + per-completion reward;
-  * tool (``ToolEnv`` / ``StatefulToolEnv`` / ``SandboxEnv`` / ``PythonEnv``) — TRL drives the
-    tool-call loop natively via ``GRPOTrainer(tools=...)`` (:meth:`tools`), masking tool tokens
-    itself; the reward scores the full transcript (:meth:`reward_from_messages`);
-  * pure multi-turn — ``flash.engine.multiturn_rollout`` supplies a ``rollout_func`` that
-    drives this env's turn loop on the colocate engine via the adapter rollout helpers
-    (:meth:`new_rollout_state` / :meth:`record_model_turn` / :meth:`env_reply` /
-    :meth:`rollout_done`) and returns an ``env_mask`` so only model tokens are trained.
-
-Caveats:
-  * SFT on a multi-turn/tool env only fits the single assistant ``sft_target`` per row and
-    ignores tool/env turns, so it should be avoided (see ``run_sft`` / ``sft_target``);
-  * a ``StatefulToolEnv`` whose tools need verifiers' state-injection (``update_tool_args``)
-    is only fully honored on the rollout path — under TRL's native tool loop the tools are
-    called as plain functions.
-
-verifiers contract (docs):
-  * ``vf.load_environment(env_id, **kwargs) -> Environment``
-  * rows have ``prompt`` (chat messages) + ``answer`` (+ optional ``info``)
-  * ``env.dataset`` / ``env.get_dataset(n, seed)``, ``env.eval_dataset`` / ``get_eval_dataset``
-  * ``env.system_prompt``, ``env.parser``, ``env.rubric`` (weighted reward funcs that take
-    ``completion``/``prompt``/``answer``/``info``/``state``/``parser``/``judge`` by name; sync or async)
-  * multi-turn: ``env.env_response(messages, state)`` -> env reply messages;
-    ``env.is_completed(state)`` -> done flag (both async)
-
-Hub conveniences handled here so the *documented* flow (``flash env install owner/name`` +
-``[environment] id = "owner/name"``) works on real Prime Intellect envs:
-  * the ``owner/name`` Hub slug is mapped to the bare ``verifiers`` load id;
-  * a ``RubricGroup`` (rubrics-of-rubrics) is flattened so the real reward funcs are found;
-    unweighted (monitor) funcs are skipped — only weighted funcs count toward the reward;
-  * a ``JudgeRubric``'s judge client/model/prompt is supplied to reward funcs that declare a
-    ``judge``/``judge_client``/``judge_model``/``judge_prompt`` arg, so judge-based rewards run;
-  * named per-scorer breakdowns (``scores_breakdown``) expose each reward func's weighted
-    score so the frontend per-scorer view + W&B series survive.
+Flash environment ids are Freesolo Hub slugs (``namespace/name``). Explicit
+low-level refs remain parseable for compatibility. The canonical generated environment file is
+``environment.py`` and its
+``load_environment`` function must return a Freesolo SDK environment:
+``EnvironmentSingleTurn`` or ``EnvironmentMultiTurn``.
 """
 
 from __future__ import annotations
 
-import contextlib
+import hashlib
+import io
 import json
+import os
+import re
+import shutil
+import tarfile
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-from flash.envs.adapter.rubric import (  # noqa: F401
-    _AVAILABLE_REWARD_KWARGS,
-    _BASE_REWARD_KWARG_NAMES,
-    _JUDGE_KWARG_NAMES,
-    _call_dataset_getter,
-    _find_judge_rubric,
-    _flatten_rubric,
-    _invoke_reward,
-    _is_multi_turn,
-    _is_tool_env,
-    _judge_kwargs,
-    _reward_requires_unavailable_args,
-    _rows_to_list,
-    _run_async,
-    _substring_answer_score,
-    _unique_key,
-)
 from flash.envs.base import BaseEnvironment
 
+_DEFAULT_GITHUB_REF = "main"
+_DEFAULT_ENVIRONMENT_PATH = "environment.py"
+_DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
+_CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
+_MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+_MAX_ARCHIVE_MEMBERS = 5000
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_TAR_METADATA_TYPES = {
+    tarfile.XHDTYPE,
+    tarfile.XGLTYPE,
+    tarfile.GNUTYPE_LONGNAME,
+    tarfile.GNUTYPE_LONGLINK,
+}
+_CANONICAL_INPUT_KEY = "input"
+_CANONICAL_OUTPUT_KEY = "output"
 
-def vf_load_id(env_ref: str) -> str:
-    """Map a Hub slug (``owner/name``) to the bare ``verifiers`` load id (``name``)."""
-    return env_ref.split("/", 1)[1] if "/" in env_ref else env_ref
+
+@dataclass(frozen=True)
+class GitHubEnvironmentRef:
+    owner: str
+    repo: str
+    ref: str
+    path: str
+
+    @property
+    def repo_full_name(self) -> str:
+        return f"{self.owner}/{self.repo}"
+
+    def canonical(self) -> str:
+        return f"github:{self.repo_full_name}@{self.ref}:{self.path}"
 
 
-# Flash-reserved keys that may historically have ridden in [environment.params] but are
-# NOT verifiers ``load_environment`` kwargs. They are handled by the worker/adapter directly
-# (eval_* via named params; GRPO recipe knobs now live in [train]/TrainSpec). A stray one must
-# be dropped before forwarding to ``vf.load_environment`` — passing it through would raise a
-# TypeError in the env's loader (or silently change its behavior). The eval_* keys are also
-# listed here so the catch-all guard never forwards them even if they reach **kwargs.
-_RESERVED_ENV_PARAM_KEYS = frozenset(
-    {
-        "eval_env_id",
-        "eval_examples",
-        "eval_seed",
-        "grpo_config",
-        "sft_config",
-        "mode",
-        "records",
-        "eval_records",
-        "reward_command",
+def is_github_environment_ref(value: str) -> bool:
+    return _parse_github_environment_ref(value) is not None
+
+
+def is_managed_environment_slug(value: str) -> bool:
+    return _parse_managed_environment_slug(value) is not None
+
+
+def is_freesolo_environment_id(value: str) -> bool:
+    return is_managed_environment_slug(value) or is_github_environment_ref(value)
+
+
+def managed_slug_to_github_ref(value: str) -> str:
+    parsed = _parse_managed_environment_slug(value)
+    if parsed is None:
+        raise ValueError(f"not a Freesolo environment slug: {value!r}")
+    namespace, name = parsed
+    return (
+        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
+        f"{namespace}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
+    )
+
+
+def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
+    text = (value or "").strip()
+    if not text or ":" in text:
+        return None
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        return None
+    parts = text.split("/")
+    if len(parts) != 2 or not _is_safe_github_path_parts(tuple(parts)):
+        return None
+    return parts[0], parts[1]
+
+
+def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if text.startswith("github:"):
+        body = text[len("github:") :]
+        repo_ref, sep, path = body.partition(":")
+        try:
+            path = _normalize_env_path(path)
+        except ValueError:
+            return None
+        if not sep:
+            path = _DEFAULT_ENVIRONMENT_PATH
+        repo_part, at, ref = repo_ref.partition("@")
+        if not at:
+            ref = _DEFAULT_GITHUB_REF
+        if not ref:
+            return None
+        if not _is_safe_github_path_parts((ref,)):
+            return None
+        owner_repo = repo_part.split("/")
+        if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo):
+            return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
+        return None
+
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "github.com":
+        return None
+    parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[0], parts[1]
+    repo = repo[:-4] if repo.endswith(".git") else repo
+    if not _is_safe_github_path_parts((owner, repo)):
+        return None
+    if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
+        ref = parts[3]
+        if not _is_safe_github_path_parts((ref,)):
+            return None
+        raw_path = "/".join(parts[4:])
+        if not _is_safe_environment_path(raw_path):
+            return None
+        try:
+            path = _normalize_env_path(raw_path)
+        except ValueError:
+            return None
+        if not raw_path:
+            path = _DEFAULT_ENVIRONMENT_PATH
+        if parts[2] == "tree" and raw_path and not path.endswith(".py"):
+            path = f"{path.rstrip('/')}/{_DEFAULT_ENVIRONMENT_PATH}"
+    elif len(parts) == 2:
+        ref = _DEFAULT_GITHUB_REF
+        path = _DEFAULT_ENVIRONMENT_PATH
+    else:
+        return None
+    return GitHubEnvironmentRef(owner, repo, ref, path)
+
+
+def _normalize_env_path(path: str | None) -> str:
+    if not path:
+        return _DEFAULT_ENVIRONMENT_PATH
+    raw = path.strip()
+    if not raw:
+        return _DEFAULT_ENVIRONMENT_PATH
+    raw = raw.replace("\\", "/")
+    if raw.startswith("/"):
+        raise ValueError(f"unsafe environment path: {path!r}")
+    if not raw:
+        return _DEFAULT_ENVIRONMENT_PATH
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        return _DEFAULT_ENVIRONMENT_PATH
+    if any(part == ".." or part == "." for part in parts):
+        raise ValueError(f"unsafe environment path: {path!r}")
+    return "/".join(parts)
+
+
+def _is_safe_environment_path(path: str) -> bool:
+    if not path:
+        return True
+    raw = path.strip().replace("\\", "/")
+    if raw.startswith("/"):
+        return False
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        return True
+    return not any(part in {".", ".."} for part in parts)
+
+
+def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
+    if not parts:
+        return False
+    if any(part in {".", "..", ""} for part in parts):
+        return False
+    return all(_GITHUB_SAFE_PART_RE.fullmatch(part) for part in parts)
+
+
+def _github_token() -> str | None:
+    return os.environ.get("GITHUB_TOKEN")
+
+
+def _is_commit_sha(value: str) -> bool:
+    return _COMMIT_SHA_RE.fullmatch(value) is not None
+
+
+def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
+    if _is_commit_sha(parsed.ref):
+        return parsed.ref
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
+    req = urllib.request.Request(commit_url, headers=headers)
+    data = _urlopen(req, timeout=60.0)
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Failed to resolve GitHub environment ref {parsed.canonical()}: invalid response"
+        ) from exc
+    sha = payload.get("sha")
+    if not isinstance(sha, str) or not _is_commit_sha(sha):
+        raise RuntimeError(f"Failed to resolve GitHub environment ref {parsed.canonical()}")
+    return sha
+
+
+def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
+
+
+def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
+    url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "freesolo-flash",
     }
-)
-
-
-def _drop_reserved_kwargs(kwargs: dict) -> dict:
-    """Strip Flash-reserved keys so only true verifiers-env kwargs are forwarded."""
-    dropped = [k for k in kwargs if k in _RESERVED_ENV_PARAM_KEYS]
-    if dropped:
-        print(
-            "[verifiers-adapter] dropping Flash-reserved [environment.params] keys not "
-            f"accepted by vf.load_environment: {', '.join(sorted(dropped))}"
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
+    if len(data) > _MAX_ARCHIVE_BYTES:
+        raise RuntimeError(
+            f"environment archive is too large ({len(data)} bytes; "
+            f"limit {_MAX_ARCHIVE_BYTES} bytes)"
         )
-    return {k: v for k, v in kwargs.items() if k not in _RESERVED_ENV_PARAM_KEYS}
+    return data
 
 
-class VerifiersEnvironment(BaseEnvironment):
-    """Flash environment backed by a verifiers ``Environment`` instance.
-
-    GRPO training supports three env shapes (the worker routes on these flags):
-      * **single-turn** (``multi_turn`` False) — TRL's single-shot rollout (original path);
-      * **tool** (``is_tool_env`` True) — TRL drives the tool-call loop natively via
-        ``GRPOTrainer(tools=...)`` (:meth:`tools`); the reward scores the full transcript
-        (:meth:`reward_from_messages`);
-      * **pure multi-turn** (``multi_turn`` True, ``is_tool_env`` False) — TRL's
-        ``rollout_func`` drives this env's turn loop (:meth:`new_rollout_state` /
-        :meth:`record_model_turn` / :meth:`env_reply` / :meth:`rollout_done`).
-    """
-
-    def __init__(self, vf_env, env_id: str):
-        super().__init__(id=env_id)
-        self._env = vf_env
-        self.multi_turn = _is_multi_turn(vf_env)
-        self.is_tool_env = _is_tool_env(vf_env)
-        # Turn cap for the tool / multi-turn rollout loop (verifiers ToolEnv defaults to 10).
-        self.max_turns = int(getattr(vf_env, "max_turns", 10) or 10)
-        # The shared scorer is the TRAIN env's (flattened) rubric + parser, so the reward used
-        # for RL and the grader used at eval are byte-for-byte identical.
-        rubric = getattr(vf_env, "rubric", None)
-        self._reward_pairs = _flatten_rubric(rubric) if rubric is not None else []
-        self._judge_rubric = _find_judge_rubric(rubric)
-        # Fail fast on a group/batch reward func: the worker scores one completion at a time
-        # and cannot supply its plural batch args, so it would silently score 0.0 and train a
-        # paid run on an all-zero signal. Only weighted funcs matter (eval-metric ones skip).
-        for func, weight in self._reward_pairs:
-            if not weight:
-                continue
-            missing = _reward_requires_unavailable_args(func)
-            if missing:
-                raise ValueError(
-                    f"verifiers reward function {getattr(func, '__name__', func)!r} requires "
-                    f"argument {missing!r}, which the Flash adapter cannot supply (it scores "
-                    "one completion at a time, with no group/batch context such as "
-                    "completions/prompts/answers). This environment uses a group-based reward "
-                    "not supported on Flash; use a per-completion reward."
+def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
+    root = dest.resolve()
+    top_dirs: set[str] = set()
+    total = 0
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+        for count, member in enumerate(tar, start=1):
+            if count > _MAX_ARCHIVE_MEMBERS:
+                raise RuntimeError(
+                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
                 )
-        self._parser = getattr(vf_env, "parser", None)
+            if member.type in _TAR_METADATA_TYPES:
+                continue
+            parts: list[str] = []
+            for part in member.name.replace("\\", "/").split("/"):
+                if not part or part == ".":
+                    continue
+                if part == "..":
+                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+                parts.append(part)
+            if not parts:
+                continue
+            normalized_name = "/".join(parts)
+            target = (dest / normalized_name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
+            if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
+                continue
+            top_dirs.add(parts[0])
+            total += max(0, member.size)
+            if total > _MAX_ARCHIVE_BYTES:
+                raise RuntimeError(
+                    f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+                )
+            member.name = normalized_name
+            tar.extract(member, dest)
+    if len(top_dirs) != 1:
+        raise RuntimeError("environment archive had an unexpected layout")
+    extracted = dest / next(iter(top_dirs))
+    if not extracted.is_dir():
+        raise RuntimeError("environment archive did not extract to a directory")
+    return extracted
 
-    # -- data -------------------------------------------------------------
+
+def _resolve_github_environment_file(env_ref: str) -> Path:
+    parsed = _parse_github_environment_ref(env_ref)
+    if parsed is None:
+        raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
+    resolved_ref = _resolve_ref_sha(parsed)
+    cache_key = hashlib.sha256(
+        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
+    ).hexdigest()[:24]
+    cache_dir = _CACHE_ROOT / cache_key
+    env_file = cache_dir / parsed.path
+    if env_file.is_dir():
+        env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
+    if env_file.is_file():
+        return env_file
+    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
+    resolved = GitHubEnvironmentRef(
+        parsed.owner,
+        parsed.repo,
+        resolved_ref,
+        parsed.path,
+    )
+    try:
+        extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
+        candidate = extracted / parsed.path
+        if candidate.is_dir():
+            candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
+        required_entrypoint = candidate.relative_to(extracted).as_posix()
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"environment archive did not contain required entrypoint {required_entrypoint!r}"
+            )
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        shutil.copytree(extracted, cache_dir)
+        return cache_dir / candidate.relative_to(extracted)
+    finally:
+        shutil.rmtree(tmp_parent, ignore_errors=True)
+
+
+def _resolve_environment_reference(env_ref: str) -> str:
+    if is_managed_environment_slug(env_ref):
+        return str(_resolve_github_environment_file(managed_slug_to_github_ref(env_ref)))
+    parsed = _parse_github_environment_ref(env_ref)
+    if parsed is None:
+        path = Path(env_ref)
+        if path.exists():
+            return str(path)
+        return env_ref
+    return str(_resolve_github_environment_file(env_ref))
+
+
+def _resolve_path_arg(value: object, base_dir: Path) -> object:
+    if not isinstance(value, str) or not value:
+        return value
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme or Path(value).is_absolute():
+        return value
+    candidate = base_dir / value
+    return str(candidate) if candidate.exists() else value
+
+
+def _load_contract_text(path: str | None) -> str:
+    if not path:
+        return ""
+    candidate = Path(path)
+    if not candidate.is_file():
+        return ""
+    try:
+        return candidate.read_text(encoding="utf-8")
+    except UnicodeError:
+        return candidate.read_text(errors="replace")
+
+
+def _import_freesolo_environment_tools():
+    try:
+        from freesolo.datasets.records import load_task_examples, task_example_from_record
+        from freesolo.environments import (
+            EnvironmentEpisode,
+            EnvironmentMultiTurn,
+            EnvironmentSingleTurn,
+            EnvironmentTurn,
+            load_environment,
+        )
+
+        return {
+            "EnvironmentEpisode": EnvironmentEpisode,
+            "EnvironmentMultiTurn": EnvironmentMultiTurn,
+            "EnvironmentSingleTurn": EnvironmentSingleTurn,
+            "EnvironmentTurn": EnvironmentTurn,
+            "load_environment": load_environment,
+            "load_task_examples": load_task_examples,
+            "task_example_from_record": task_example_from_record,
+        }
+    except ImportError as exc:
+        raise ImportError(
+            "the 'freesolo' package is required to run Freesolo environments; "
+            "install it (for example `uv pip install freesolo`) or use a worker image "
+            "that includes the Freesolo SDK"
+        ) from exc
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+class FreesoloEnvironment(BaseEnvironment):
+    """Flash environment backed by ``freesolo.environments``."""
+
+    def __init__(
+        self,
+        sdk_env: object,
+        env_id: str,
+        *,
+        source: object | None,
+        contract_text: str = "",
+    ):
+        super().__init__(id=env_id)
+        self._env = sdk_env
+        self._source = source
+        self._contract_text = contract_text
+        tools = _import_freesolo_environment_tools()
+        self._task_example_from_record = tools["task_example_from_record"]
+        self._load_task_examples = tools["load_task_examples"]
+        self._EnvironmentEpisode = tools["EnvironmentEpisode"]
+        self._EnvironmentMultiTurn = tools["EnvironmentMultiTurn"]
+        self._EnvironmentTurn = tools["EnvironmentTurn"]
+        self.multi_turn = isinstance(sdk_env, tools["EnvironmentMultiTurn"])
+        self.is_tool_env = False
+        self.max_turns = 8
+
+    def _task_example(self, example: dict):
+        return self._task_example_from_record(self._canonical_record(example))
+
+    @staticmethod
+    def _canonical_record(record: dict) -> dict:
+        raw = dict(record)
+        canonical = {}
+        if _CANONICAL_INPUT_KEY not in raw:
+            raise ValueError("Freesolo dataset records must contain an input field")
+        canonical[_CANONICAL_INPUT_KEY] = raw[_CANONICAL_INPUT_KEY]
+        if _CANONICAL_OUTPUT_KEY in raw:
+            canonical[_CANONICAL_OUTPUT_KEY] = raw[_CANONICAL_OUTPUT_KEY]
+        if raw.get("id") is not None:
+            canonical["id"] = raw["id"]
+        metadata = raw.get("metadata")
+        if isinstance(metadata, dict) and metadata:
+            canonical["metadata"] = metadata
+        return canonical
+
+    def _reward_to_breakdown(self, reward) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for metric in getattr(reward, "metrics", ()) or ():
+            score = getattr(metric, "score", None)
+            if score is not None:
+                name = str(getattr(metric, "name", "") or "metric")
+                key = name
+                idx = 1
+                while key in out:
+                    idx += 1
+                    key = f"{name}_{idx}"
+                out[key] = float(score)
+        out["total"] = float(getattr(reward, "score", 0.0))
+        return out
+
     def dataset(self) -> list[dict]:
-        # Training rows only: the verifiers env's train split. Eval/validation/test are not
-        # served here — mid-run env eval was removed (held-out eval lives on the deploy/serving
-        # side), so there is no split to select (see commit "delete all env-eval support").
-        ds = _call_dataset_getter(self._env, "get_dataset", seed=0)
-        if ds is None:
-            ds = getattr(self._env, "dataset", None)
-        return _rows_to_list(ds)
-
-    # -- task interface ---------------------------------------------------
-    def prompt_messages(self, example: dict) -> list[dict]:
-        prompt = example.get("prompt")
-        if isinstance(prompt, list) and prompt:
-            msgs = [dict(m) for m in prompt]
+        if self._source is None:
+            rows = getattr(self._env, "dataset", None) or getattr(self._env, "examples", None)
+            if rows is None:
+                raise ValueError(
+                    "Freesolo environment has no dataset source. Set "
+                    "[environment.params] dataset_path or records so Flash can train."
+                )
+            examples = self._load_task_examples(rows)
         else:
-            question = example.get("question") or example.get("prompt") or ""
-            msgs = [{"role": "user", "content": str(question)}]
-        system_prompt = getattr(self._env, "system_prompt", None)
-        if system_prompt and not any(m.get("role") == "system" for m in msgs):
-            msgs = [{"role": "system", "content": system_prompt}, *msgs]
-        return msgs
+            examples = self._load_task_examples(self._source)
+        records = []
+        for example in examples:
+            raw = dict(getattr(example, "record", {}) or {})
+            task = getattr(example, "task", None)
+            if _CANONICAL_INPUT_KEY not in raw and task is not None:
+                raw[_CANONICAL_INPUT_KEY] = task
+            task_id = getattr(example, "task_id", None)
+            if task_id is not None:
+                raw.setdefault("id", task_id)
+            expected = getattr(example, "expected_output", None)
+            if expected is not None:
+                raw.setdefault(_CANONICAL_OUTPUT_KEY, _json_safe(expected))
+            metadata = getattr(example, "metadata", None)
+            if isinstance(metadata, dict) and metadata:
+                raw.setdefault("metadata", metadata)
+            record = self._canonical_record(raw)
+            records.append(record)
+        return records
+
+    def prompt_messages(self, example: dict) -> list[dict]:
+        messages = self._env.start_episode(self._task_example(example), self._contract_text)
+        return [dict(message) for message in messages]
 
     def sft_target(self, example: dict) -> str:
-        for key in ("answer", "completion", "target", "response"):
-            value = example.get(key)
-            if value:
-                if isinstance(value, list):  # chat messages
-                    return str(value[-1].get("content", ""))
-                return str(value)
+        value = example.get(_CANONICAL_OUTPUT_KEY)
+        if value is not None:
+            if isinstance(value, list) and value and isinstance(value[-1], dict):
+                return str(value[-1].get("content", ""))
+            return str(value)
         return ""
-
-    # -- reward / scoring -------------------------------------------------
-    def _normalize_info(self, example: dict) -> dict:
-        # Hub rows may store `info` as a JSON string (a supported Verifiers row shape);
-        # parse it so reward funcs that do `info[...]` get a dict, not a str (which would
-        # raise TypeError, be swallowed as 0.0, and poison the signal).
-        info = example.get("info") or {}
-        if isinstance(info, str):
-            try:
-                info = json.loads(info)
-            except (ValueError, TypeError):
-                info = {}
-        return info
-
-    def _reward_available(self, completion: str, example: dict, state: dict | None) -> dict:
-        # In multi-turn/tool mode the accumulated transcript lives on ``state`` (built by the
-        # rollout helpers): ``state["completion"]`` is the full assistant + tool/env message
-        # list and ``state["prompt"]`` is the initial prompt. Reward/tool funcs that inspect the
-        # whole message list need that transcript, not the scalar ``completion`` string wrapped
-        # as a lone synthesized assistant message. Single-turn falls back to wrapping the scalar.
-        completion_msgs: list[dict] | None = None
-        prompt_msgs = None
-        if self.multi_turn and state:
-            transcript = state.get("completion")
-            if isinstance(transcript, list) and transcript:
-                completion_msgs = [dict(m) for m in transcript]
-            state_prompt = state.get("prompt")
-            if isinstance(state_prompt, list) and state_prompt:
-                prompt_msgs = [dict(m) for m in state_prompt]
-        if completion_msgs is None:
-            completion_msgs = [{"role": "assistant", "content": completion}]
-        if prompt_msgs is None:
-            prompt_msgs = example.get("prompt") or self.prompt_messages(example)
-        available = {
-            "completion": completion_msgs,
-            "prompt": prompt_msgs,
-            "answer": example.get("answer"),
-            "info": self._normalize_info(example),
-            "state": state if state is not None else {},
-            "parser": self._parser,
-            "task": example,
-        }
-        available.update(_judge_kwargs(self._judge_rubric))
-        return available
 
     def scores_breakdown(
         self, completion: str, example: dict, state: dict | None = None
     ) -> dict[str, float]:
-        """Per-scorer weighted scores: ``{func_name: weighted_score, ..., "total": sum}``.
-
-        Every WEIGHTED rubric func contributes one entry (by ``func.__name__``); the
-        ``"total"`` is their sum (== :meth:`reward`). Used to preserve the frontend per-scorer
-        breakdown + W&B series instead of collapsing to a single binary ``correct``. Unweighted
-        (monitor) funcs are skipped — only weighted funcs shape the reward. Weighted funcs
-        propagate exceptions (a thrown weighted reward fails the run).
-        """
-        breakdown: dict[str, float] = {}
-        if not self._reward_pairs:
-            score = _substring_answer_score(completion, example)
-            return {"answer_match": score, "total": score}
-        available = self._reward_available(completion, example, state)
-        total = 0.0
-        for func, weight in self._reward_pairs:
-            if not weight:
-                continue  # unweighted monitor func: contributes nothing to the reward
-            name = getattr(func, "__name__", str(func))
-            score = float(weight) * _invoke_reward(func, available)
-            breakdown[_unique_key(name, breakdown)] = score
-            total += score
-        breakdown["total"] = total
-        return breakdown
+        if state and self.multi_turn:
+            reward = self._score_episode(example, state)
+        else:
+            rewards = self._env.score_responses(self._task_example(example), [completion])
+            if len(rewards) != 1:
+                raise RuntimeError("Freesolo environment score_responses returned the wrong length")
+            reward = rewards[0]
+        return self._reward_to_breakdown(reward)
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(self.scores_breakdown(completion, example, state)["total"])
 
-    def tools(self) -> list:
-        """The underlying ToolEnv's Python tool callables (``[]`` for non-tool envs).
+    def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
+        if state and self.multi_turn:
+            reward = self._score_episode(example, state)
+        else:
+            rewards = self._env.score_responses(self._task_example(example), [completion])
+            if len(rewards) != 1:
+                raise RuntimeError("Freesolo environment score_responses returned the wrong length")
+            reward = rewards[0]
+        return bool(reward.resolved_success())
 
-        Handed to ``GRPOTrainer(tools=...)`` so TRL runs the tool-call loop and does the
-        assistant-only token masking itself. Each is a plain function with type hints + a
-        Google-style docstring (verifiers and TRL share that requirement)."""
-        return list(getattr(self._env, "tools", None) or [])
+    def tools(self) -> list:
+        return []
+
+    def new_rollout_state(self, example: dict) -> dict:
+        task = self._task_example(example)
+        prompt = [dict(message) for message in self._env.start_episode(task, self._contract_text)]
+        return {
+            "task": task,
+            "prompt": [dict(message) for message in prompt],
+            "messages": [dict(message) for message in prompt],
+            "turns": [],
+            "done": False,
+            "response_text": "",
+            "turn": 0,
+        }
+
+    def record_model_turn(self, state: dict, content: str) -> dict:
+        msg = {"role": "assistant", "content": content}
+        state.setdefault("messages", []).append(msg)
+        state.setdefault("turns", []).append(
+            self._EnvironmentTurn(role="assistant", content=content)
+        )
+        state["response_text"] = content
+        return msg
+
+    def env_reply(self, messages: list[dict], state: dict) -> list[dict]:
+        if not self.multi_turn:
+            return []
+        task = state.get("task")
+        if task is None:
+            raise RuntimeError("missing Freesolo rollout task state")
+        assistant_response = str(state.get("response_text") or "")
+        step = self._env.step_episode(task, list(messages), assistant_response)
+        state["done"] = bool(step.done)
+        if step.final_response_text is not None:
+            state["response_text"] = step.final_response_text
+        state["turn"] = int(state.get("turn", 0)) + 1
+        if step.metadata:
+            state.setdefault("step_metadata", []).append(step.metadata)
+        replies = [dict(message) for message in step.messages]
+        state.setdefault("messages", []).extend(replies)
+        for message in replies:
+            state.setdefault("turns", []).append(
+                self._EnvironmentTurn(
+                    role=str(message.get("role", "")),
+                    content=str(message.get("content", "")),
+                )
+            )
+        return replies
+
+    def rollout_done(self, state: dict, max_turns: int | None = None) -> bool:
+        if not self.multi_turn:
+            return True
+        if bool(state.get("done")):
+            return True
+        return max_turns is not None and int(state.get("turn", 0)) >= int(max_turns)
+
+    def _episode_from_state(self, state: dict):
+        return self._EnvironmentEpisode(
+            messages=tuple(state.get("messages") or ()),
+            response_text=str(state.get("response_text") or ""),
+            turns=tuple(state.get("turns") or ()),
+            metadata={"steps": state.get("step_metadata", [])}
+            if state.get("step_metadata")
+            else {},
+        )
+
+    def _score_episode(self, example: dict, state: dict):
+        task = state.get("task") or self._task_example(example)
+        rewards = self._env.score_episodes(task, [self._episode_from_state(state)])
+        if len(rewards) != 1:
+            raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
+        return rewards[0]
 
     def reward_from_messages(
         self, completion_msgs: list[dict], example: dict, prompt_msgs: list[dict] | None = None
     ) -> float:
-        """Reward for a full transcript (assistant + tool/env messages) via the rubric.
-
-        The tool / multi-turn training path produces a *message list* rollout rather than a
-        single completion string; this routes it through the same weighted-rubric scoring as
-        :meth:`reward` by handing the transcript to the env's reward funcs as ``state``."""
-        state: dict = {"completion": [dict(m) for m in completion_msgs]}
-        if prompt_msgs:
-            state["prompt"] = [dict(m) for m in prompt_msgs]
-        return self.reward("", example, state)
-
-    def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
-        threshold = getattr(self._env, "pass_threshold", 0.5)
-        return self.reward(completion, example, state) >= threshold
-
-    # -- multi-turn rollout (driven by the worker) ------------------------
-    def new_rollout_state(self, example: dict) -> dict:
-        """A fresh per-rollout ``state`` dict, threaded through env_reply/reward.
-
-        Mirrors the verifiers rollout ``state``: holds the running ``prompt``, the
-        accumulated ``completion`` (assistant + tool/env turns), the ``answer``/``info``, and
-        a ``turn`` counter. Reward funcs that read ``state`` see this dict.
-        """
-        prompt = self.prompt_messages(example)
-        state = {
-            "prompt": [dict(m) for m in prompt],
-            "completion": [],
-            "answer": example.get("answer"),
-            "info": self._normalize_info(example),
-            "responses": [],
-            "turn": 0,
-        }
-        setup = getattr(self._env, "setup_state", None)
-        if callable(setup):
-            with contextlib.suppress(Exception):
-                state = _run_async(setup(state)) or state
-        return state
-
-    def env_reply(self, messages: list[dict], state: dict) -> list[dict]:
-        """One environment turn: given the conversation so far (incl. the latest model
-        message), return the env's reply messages (tool results / next user turn) and advance
-        ``state``. Empty list when the env has nothing to add. Single-turn envs return []."""
-        if not self.multi_turn:
-            return []
-        fn = getattr(self._env, "env_response", None)
-        if not callable(fn):
-            return []
-        try:
-            reply = _run_async(fn(messages, state))
-        except NotImplementedError:
-            # Legitimate "this env has no env turn" signal -> no env reply.
-            return []
-        except Exception as exc:
-            # Mirror `_invoke_reward`: a genuine bug in the env's `env_response` must
-            # NOT be swallowed. Silently returning [] would collapse every multi-turn
-            # rollout to a single turn and train a paid GRPO run on degenerate
-            # transcripts. The rollout loop (multiturn_rollout.py) calls this directly
-            # with no surrounding swallow, so re-raising propagates and fails the run
-            # fast (and the context is printed first so it never vanishes silently).
-            print(f"[env_reply] env_response failed (turn={state.get('turn', 0)}): {exc!r}")
-            raise
-        if reply is None:
-            return []
-        if isinstance(reply, dict):
-            reply = [reply]
-        out = [dict(m) for m in reply]
-        state["completion"].extend(out)
-        state["turn"] = int(state.get("turn", 0)) + 1
-        return out
-
-    def rollout_done(self, state: dict, max_turns: int | None = None) -> bool:
-        """Whether the multi-turn rollout should stop (env says completed, or turn cap hit)."""
-        if not self.multi_turn:
-            return True
-        if max_turns is not None and int(state.get("turn", 0)) >= int(max_turns):
-            return True
-        fn = getattr(self._env, "is_completed", None)
-        if not callable(fn):
-            return True
-        try:
-            return bool(_run_async(fn(state)))
-        except NotImplementedError:
-            # Env doesn't implement a completion check -> rely on the turn cap only.
-            return True
-        except Exception as exc:
-            # Mirror `_invoke_reward` / `env_reply`: a real bug in `is_completed` must
-            # not be silently treated as "done" (which would truncate every rollout and
-            # train on degenerate transcripts). Print context, then re-raise so the run
-            # fails fast (the rollout loop calls this directly with no surrounding swallow).
-            print(f"[rollout_done] is_completed failed (turn={state.get('turn', 0)}): {exc!r}")
-            raise
-
-    def record_model_turn(self, state: dict, content: str) -> dict:
-        """Append a model (assistant) turn to ``state`` before calling ``env_reply``."""
-        msg = {"role": "assistant", "content": content}
-        state["completion"].append(msg)
-        state.setdefault("responses", []).append(content)
-        return msg
+        messages = [*(prompt_msgs or []), *completion_msgs]
+        response_text = ""
+        turns = []
+        for message in completion_msgs:
+            content = str(message.get("content", ""))
+            role = str(message.get("role", ""))
+            turns.append(self._EnvironmentTurn(role=role, content=content))
+            if role == "assistant":
+                response_text = content
+        episode = self._EnvironmentEpisode(
+            messages=tuple(dict(m) for m in messages),
+            response_text=response_text,
+            turns=tuple(turns),
+        )
+        rewards = self._env.score_episodes(self._task_example(example), [episode])
+        if len(rewards) != 1:
+            raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
+        return float(rewards[0].score)
 
 
-def _import_vf():
-    try:
-        import verifiers as vf
+def load_freesolo_environment(env_id: str, **kwargs) -> FreesoloEnvironment:
+    tools = _import_freesolo_environment_tools()
+    reference = _resolve_environment_reference(env_id)
+    reference_path = Path(reference)
+    base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 
-        return vf
-    except ImportError as exc:
-        raise ImportError(
-            "the 'verifiers' package is required to run Prime Hub environments; "
-            "install it (e.g. `uv pip install verifiers`) or run `flash env install <env>`"
-        ) from exc
+    params = dict(kwargs)
+    source = params.pop("records", None)
+    dataset_path = params.get("dataset_path")
+    if source is None and dataset_path:
+        resolved_dataset_path = _resolve_path_arg(dataset_path, base_dir)
+        params["dataset_path"] = resolved_dataset_path
+        source = resolved_dataset_path
+    if source is None:
+        for rel in (
+            "datasets/train.jsonl",
+            "datasets/train.json",
+            "train.jsonl",
+            "train.json",
+        ):
+            candidate = base_dir / rel
+            if candidate.is_file():
+                params.setdefault("dataset_path", str(candidate))
+                source = str(candidate)
+                break
+
+    contract_path = _resolve_path_arg(params.get("contract_path"), base_dir)
+    if isinstance(contract_path, str):
+        params["contract_path"] = contract_path
+    else:
+        params.setdefault("contract_path", str(base_dir / "TRAINING_CONTRACT.md"))
+    contract_text = str(
+        params.pop("contract_text", "") or _load_contract_text(params["contract_path"])
+    )
+
+    sdk_env = tools["load_environment"](reference, **params)
+    return FreesoloEnvironment(
+        sdk_env,
+        env_id,
+        source=source,
+        contract_text=contract_text,
+    )
 
 
-def load_verifiers_environment(env_id: str, **kwargs) -> VerifiersEnvironment:
-    """Load an installed / Hub verifiers environment by id and wrap it for Flash.
-
-    ``env_id`` may be a Hub slug (``owner/name``); it is mapped to the bare verifiers load id.
-    Remaining ``kwargs`` are forwarded to the env's ``vf.load_environment``.
-    """
-    vf = _import_vf()
-    vf_env = vf.load_environment(vf_load_id(env_id), **_drop_reserved_kwargs(kwargs))
-    return VerifiersEnvironment(vf_env, env_id)
+__all__ = [
+    "FreesoloEnvironment",
+    "GitHubEnvironmentRef",
+    "is_freesolo_environment_id",
+    "is_github_environment_ref",
+    "is_managed_environment_slug",
+    "load_freesolo_environment",
+    "managed_slug_to_github_ref",
+]

@@ -60,13 +60,13 @@ def upload_code(repo: str | None = None) -> str:
     ``code/**`` from the same repo it is given in the submit payload, so the code must land in
     that per-run repo.
 
-    The worker downloads ``code/**`` to ``/runcode``. Verifiers-only: there are no built-in
-    example environments to ship — Hub/installed envs are pip-installed on the worker (see
-    ``registry.worker_pip_for_env``).
+    The worker downloads ``code/**`` to ``/runcode``. There are no built-in example
+    environments to ship; Freesolo SDK support is installed through
+    ``registry.worker_pip_for_env`` and environment ids are resolved by the adapter at load time.
 
     Only the ``flash`` package is uploaded, NOT the client's project tree. Managed runs must
-    reference a published Hub env by ``id`` (``flash env push`` to publish a local env first); the
-    worker pip-installs the env wheel.
+    reference a published Freesolo environment by ``id`` (``flash env push`` to publish a local
+    env first).
     """
     from huggingface_hub import HfApi
 
@@ -106,7 +106,7 @@ def upload_code(repo: str | None = None) -> str:
 def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
     """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
-    from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
+    from flash.envs.registry import worker_pip_for_env
 
     handler = get_train_endpoint(
         spec.gpu.type,
@@ -126,7 +126,6 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         # default run — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
         + chalk_extra_pip(spec),
-        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     if log is not None:
         print(

@@ -1,60 +1,512 @@
-"""Tests for the verifiers/Hub adapter + install manifest (no network/GPU)."""
+"""Tests for the Freesolo SDK environment adapter + install manifest."""
 
 from __future__ import annotations
 
 import importlib
+import io
+import json
 import os
 import sys
+import tarfile
 import tempfile
+import types
+from dataclasses import dataclass, field
+from typing import ClassVar
 
 import pytest
 
 
-class _FakeRubric:
-    def __init__(self, funcs, weights):
-        self.funcs = funcs
-        self.weights = weights
+@dataclass
+class _TaskExample:
+    record: dict
+    task: str
+    task_id: str | None = None
+    expected_output: object | None = None
+    metadata: dict = field(default_factory=dict)
 
 
-class _FakeVfEnv:
-    """Duck-typed stand-in for a verifiers SingleTurnEnv."""
-
-    def __init__(self):
-        self.system_prompt = "be brief"
-        self.parser = None
-        self.pass_threshold = 0.5
-        self.dataset = [{"prompt": [{"role": "user", "content": "2+2?"}], "answer": "4"}]
-        self.eval_dataset = [{"prompt": [{"role": "user", "content": "3+3?"}], "answer": "6"}]
-
-        async def correct(completion, answer):
-            return 1.0 if answer in completion[-1]["content"] else 0.0
-
-        def fmt(**kwargs):  # **kwargs-style reward func
-            return 0.0
-
-        self.rubric = _FakeRubric([correct, fmt], [1.0, 0.0])
+@dataclass(frozen=True)
+class _RewardMetric:
+    name: str
+    score: float | None = None
 
 
-def test_verifiers_adapter_mapping():
-    from flash.envs.adapter import VerifiersEnvironment
+@dataclass(frozen=True)
+class _RewardResult:
+    score: float
+    metrics: tuple[_RewardMetric, ...] = ()
+    success: bool | None = None
+    threshold: float | None = None
+    error: str | None = None
 
-    env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
-    assert env.id == "fake/env"
+    def resolved_success(self) -> bool:
+        if self.success is not None:
+            return self.success
+        if self.error:
+            return False
+        if self.threshold is not None:
+            return self.score >= self.threshold
+        return self.score > 0.0
+
+
+@dataclass(frozen=True)
+class _EnvironmentTurn:
+    role: str
+    content: str
+
+
+@dataclass(frozen=True)
+class _EnvironmentEpisode:
+    messages: tuple[dict, ...]
+    response_text: str
+    turns: tuple[_EnvironmentTurn, ...] = ()
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _EnvironmentStepResult:
+    done: bool = True
+    messages: tuple[dict, ...] = ()
+    final_response_text: str | None = None
+    metadata: dict = field(default_factory=dict)
+
+
+class _EnvironmentSingleTurn:
+    pass
+
+
+class _EnvironmentMultiTurn:
+    pass
+
+
+class _FakeSingleTurnEnv(_EnvironmentSingleTurn):
+    dataset: ClassVar[list[dict]] = [
+        {
+            "id": "ex-1",
+            "input": "2+2?",
+            "output": "4",
+            "metadata": {"split": "train"},
+        }
+    ]
+
+    def start_episode(self, example, prompt_text):
+        return [
+            {"role": "system", "content": prompt_text},
+            {"role": "user", "content": example.task},
+        ]
+
+    def score_responses(self, example, response_texts):
+        out = []
+        for response in response_texts:
+            score = 1.0 if str(example.expected_output) in response else 0.0
+            out.append(
+                _RewardResult(
+                    score=score,
+                    success=score == 1.0,
+                    metrics=(_RewardMetric("match", score),),
+                )
+            )
+        return out
+
+
+class _FakeMultiTurnEnv(_EnvironmentMultiTurn):
+    def start_episode(self, example, prompt_text):
+        return [{"role": "user", "content": f"{prompt_text}:{example.task}"}]
+
+    def step_episode(self, example, messages, assistant_response):
+        return _EnvironmentStepResult(
+            done=True,
+            messages=({"role": "user", "content": f"observed {assistant_response}"},),
+            final_response_text=f"final {assistant_response}",
+            metadata={"input": example.task},
+        )
+
+    def score_episodes(self, example, episodes):
+        return [
+            _RewardResult(
+                score=0.5,
+                success=True,
+                metrics=(_RewardMetric("episode", 0.5),),
+            )
+            for _episode in episodes
+        ]
+
+
+def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
+    sdk_env = sdk_env or _FakeSingleTurnEnv()
+    seen = seen if seen is not None else {}
+
+    def task_example_from_record(record):
+        return _TaskExample(
+            record=dict(record),
+            task=str(record["input"]),
+            task_id=record.get("id"),
+            expected_output=record.get("output"),
+            metadata=dict(record.get("metadata") or {}),
+        )
+
+    def load_task_examples(source):
+        if isinstance(source, (list, tuple)):
+            return [
+                item if isinstance(item, _TaskExample) else task_example_from_record(item)
+                for item in source
+            ]
+        path = os.fspath(source)
+        rows = []
+        if path.endswith(".jsonl"):
+            with open(path, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+        else:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            rows = loaded if isinstance(loaded, list) else loaded.get("records", [])
+        return [task_example_from_record(row) for row in rows]
+
+    def load_environment(reference, **kwargs):
+        seen["reference"] = reference
+        seen["kwargs"] = kwargs
+        return sdk_env
+
+    freesolo = types.ModuleType("freesolo")
+    datasets = types.ModuleType("freesolo.datasets")
+    records = types.ModuleType("freesolo.datasets.records")
+    records.load_task_examples = load_task_examples
+    records.task_example_from_record = task_example_from_record
+    envs = types.ModuleType("freesolo.environments")
+    envs.EnvironmentEpisode = _EnvironmentEpisode
+    envs.EnvironmentMultiTurn = _EnvironmentMultiTurn
+    envs.EnvironmentSingleTurn = _EnvironmentSingleTurn
+    envs.EnvironmentStepResult = _EnvironmentStepResult
+    envs.EnvironmentTurn = _EnvironmentTurn
+    envs.RewardMetric = _RewardMetric
+    envs.RewardResult = _RewardResult
+    envs.load_environment = load_environment
+    monkeypatch.setitem(sys.modules, "freesolo", freesolo)
+    monkeypatch.setitem(sys.modules, "freesolo.datasets", datasets)
+    monkeypatch.setitem(sys.modules, "freesolo.datasets.records", records)
+    monkeypatch.setitem(sys.modules, "freesolo.environments", envs)
+    return seen
+
+
+def _github_environment_tarball(
+    top_dir: str,
+    *,
+    env_path: str = "envs/e/environment.py",
+    env_text: str = "def load_environment(**kwargs):\n    return None\n",
+) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        dir_info = tarfile.TarInfo(f"{top_dir}/")
+        dir_info.type = tarfile.DIRTYPE
+        dir_info.mode = 0o755
+        tar.addfile(dir_info)
+
+        env_info = tarfile.TarInfo(f"{top_dir}/{env_path}")
+        env_bytes = env_text.encode("utf-8")
+        env_info.size = len(env_bytes)
+        env_info.mode = 0o644
+        tar.addfile(env_info, io.BytesIO(env_bytes))
+    return buf.getvalue()
+
+
+def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
+    seen = _install_fake_freesolo(monkeypatch)
+    env_file = tmp_path / "freesolo" / "environment.py"
+    env_file.parent.mkdir()
+    env_file.write_text("def load_environment(**kwargs): pass\n")
+    dataset = tmp_path / "freesolo" / "datasets" / "train.jsonl"
+    dataset.parent.mkdir()
+    dataset.write_text('{"id":"row-1","input":"2+2?","output":"4"}\n')
+
+    from flash.envs.adapter import load_freesolo_environment
+
+    env = load_freesolo_environment(
+        str(env_file),
+        dataset_path="datasets/train.jsonl",
+        contract_text="be brief",
+        difficulty="hard",
+    )
+
+    assert env.id == str(env_file)
+    assert seen["reference"] == str(env_file)
+    assert seen["kwargs"]["dataset_path"] == str(dataset)
+    assert seen["kwargs"]["difficulty"] == "hard"
 
     train = env.dataset()
-    assert train[0]["answer"] == "4"
-
-    msgs = env.prompt_messages(train[0])
-    assert msgs[0]["role"] == "system"
-    assert msgs[1]["content"] == "2+2?"
-
-    # async reward func handled; correct answer -> 1.0
+    assert train == [{"id": "row-1", "input": "2+2?", "output": "4"}]
+    assert env.prompt_messages(train[0]) == [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "2+2?"},
+    ]
     assert env.reward("the answer is 4", train[0]) == 1.0
     assert env.grade("the answer is 4", train[0]) is True
     assert env.reward("nope", train[0]) == 0.0
-    assert env.grade("nope", train[0]) is False
+    assert env.scores_breakdown("the answer is 4", train[0]) == {"match": 1.0, "total": 1.0}
+    assert env.sft_target({"output": "4"}) == "4"
 
-    assert env.sft_target({"answer": "4"}) == "4"
+
+def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        _FakeSingleTurnEnv(),
+        "github:owner/repo@main:env/environment.py",
+        source=None,
+        contract_text="",
+    )
+    assert env.dataset()[0]["output"] == "4"
+
+
+def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
+    class SdkExampleEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[_TaskExample]] = [
+            _TaskExample(
+                record={},
+                task="2+2?",
+                task_id="ex-1",
+                expected_output="4",
+                metadata={"split": "train"},
+            )
+        ]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=SdkExampleEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        SdkExampleEnv(),
+        "owner/env",
+        source=None,
+        contract_text="",
+    )
+    assert env.dataset() == [
+        {
+            "input": "2+2?",
+            "output": "4",
+            "id": "ex-1",
+            "metadata": {"split": "train"},
+        }
+    ]
+
+
+def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        _FakeSingleTurnEnv(),
+        "owner/env",
+        source=None,
+        contract_text="",
+    )
+    assert env.sft_target({"expected_output": "4"}) == ""
+    with pytest.raises(ValueError, match="input field"):
+        env.prompt_messages({"task": "2+2?", "output": "4"})
+
+
+def test_freesolo_multiturn_hooks(monkeypatch):
+    _install_fake_freesolo(monkeypatch, sdk_env=_FakeMultiTurnEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        _FakeMultiTurnEnv(),
+        "github:owner/repo@main:env/environment.py",
+        source=[{"input": "browse", "output": "done"}],
+        contract_text="contract",
+    )
+    state = env.new_rollout_state({"input": "browse", "output": "done"})
+    assert state["prompt"] == [{"role": "user", "content": "contract:browse"}]
+    assert state["messages"] == [{"role": "user", "content": "contract:browse"}]
+    env.record_model_turn(state, "click")
+    replies = env.env_reply(state["messages"], state)
+    assert replies == [{"role": "user", "content": "observed click"}]
+    assert state["done"] is True
+    assert env.rollout_done(state) is True
+    assert env.reward("ignored", {"input": "browse", "output": "done"}, state) == 0.5
+    assert env.grade("ignored", {"input": "browse", "output": "done"}, state) is True
+    assert (
+        env.reward_from_messages(
+            [{"role": "assistant", "content": "final"}],
+            {"input": "browse", "output": "done"},
+            [{"role": "user", "content": "contract:browse"}],
+        )
+        == 0.5
+    )
+
+
+def test_github_environment_ref_parsing():
+    from flash.envs.adapter import (
+        is_freesolo_environment_id,
+        is_github_environment_ref,
+        is_managed_environment_slug,
+        managed_slug_to_github_ref,
+    )
+
+    assert is_github_environment_ref("github:owner/repo@dev:envs/e/environment.py")
+    assert is_github_environment_ref("github:owner/repo")
+    assert not is_github_environment_ref("github:owner/repo@main:/etc/passwd")
+    assert not is_github_environment_ref("github:owner/repo/extra@main:envs/e/environment.py")
+    assert not is_github_environment_ref("github:owner/repo@:envs/e/environment.py")
+    assert is_github_environment_ref("https://github.com/owner/repo/blob/dev/envs/e/environment.py")
+    assert is_github_environment_ref("https://github.com/owner/repo")
+    assert not is_github_environment_ref("owner/env")
+    assert not is_github_environment_ref("gsm8k")
+    assert not is_github_environment_ref("github:owner/repo@main:../../etc/passwd")
+    assert not is_github_environment_ref("https://github.com/owner/repo/blob/dev/../../etc/passwd")
+    assert not is_github_environment_ref("https://github.com/owner/repo/blob/main:/etc/passwd")
+    assert not is_github_environment_ref("https://github.com/owner/repo/issues/1")
+    assert not is_github_environment_ref("github:owner /repo@main:envs/e/environment.py")
+    assert not is_github_environment_ref("github:owner/repo@bad/ref:envs/e/environment.py")
+    assert not is_github_environment_ref(
+        "https://github.com/owner/repo/blob/bad ref/envs/e/environment.py"
+    )
+    assert is_managed_environment_slug("owner/env")
+    assert is_freesolo_environment_id("owner/env")
+    assert managed_slug_to_github_ref("owner/env") == (
+        "github:freesolo-co/environment-hub@main:owner/env/environment.py"
+    )
+    assert not is_managed_environment_slug("owner/env/extra")
+    assert not is_freesolo_environment_id("gsm8k")
+
+
+def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_ref_sha",
+        lambda parsed: "b" * 40,
+    )
+
+    downloads: list[str] = []
+
+    def fake_download(ref):
+        downloads.append(ref.ref)
+        return _github_environment_tarball("repo-root")
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
+
+    resolved = adapter._resolve_environment_reference(
+        "github:owner/repo@main:envs/e/environment.py"
+    )
+    assert resolved.endswith("envs/e/environment.py")
+    assert downloads == ["b" * 40]
+
+
+def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+
+    downloads: list[str] = []
+
+    def fake_download(ref):
+        downloads.append(ref.ref)
+        return _github_environment_tarball("repo-root")
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
+
+    resolved = adapter._resolve_environment_reference("github:owner/repo@main:envs/e")
+    assert resolved.endswith("envs/e/environment.py")
+    assert adapter._resolve_environment_reference("github:owner/repo@main:envs/e") == resolved
+    assert downloads == ["b" * 40]
+
+
+def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+
+    downloads: list[str] = []
+
+    def fake_download(ref):
+        downloads.append(ref.path)
+        return _github_environment_tarball(
+            "repo-root",
+            env_path="envs/e/freesolo/environment.py",
+        )
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
+
+    resolved = adapter._resolve_environment_reference(
+        "https://github.com/owner/repo/tree/main/envs/e/freesolo"
+    )
+    assert resolved.endswith("envs/e/freesolo/environment.py")
+    assert "freesolo/freesolo" not in resolved
+    assert downloads == ["envs/e/freesolo/environment.py"]
+
+
+def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: _github_environment_tarball("repo-root", env_path="envs/e/helper.py"),
+    )
+
+    with pytest.raises(FileNotFoundError, match=r"envs/e/environment\.py"):
+        adapter._resolve_environment_reference("github:owner/repo@main:envs/e")
+
+
+def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
+    from flash.envs.adapter import _safe_extract_archive
+
+    def make_members_tar(members: list[tuple[str, bytes | None]]):
+        tar = io.BytesIO()
+        with tarfile.open(fileobj=tar, mode="w:gz") as handle:
+            for name, payload in members:
+                info = tarfile.TarInfo(name)
+                if payload is None:
+                    info.type = tarfile.DIRTYPE
+                    info.size = 0
+                    handle.addfile(info)
+                else:
+                    info.size = len(payload)
+                    handle.addfile(info, io.BytesIO(payload))
+        return tar.getvalue()
+
+    dest = tmp_path / "extract_many"
+    dest.mkdir()
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 0)
+    with pytest.raises(RuntimeError, match="too many members"):
+        _safe_extract_archive(make_members_tar([("a", b"")]), dest)
+
+    dest = tmp_path / "extract_big"
+    dest.mkdir()
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 5)
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 1)
+    with pytest.raises(RuntimeError, match="too large"):
+        _safe_extract_archive(
+            make_members_tar([("repo-root/", None), ("repo-root/keep.txt", b"xx")]), dest
+        )
+
+    dest = tmp_path / "extract_pax"
+    dest.mkdir()
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 100)
+    tar = io.BytesIO()
+    with tarfile.open(fileobj=tar, mode="w:gz") as handle:
+        pax = tarfile.TarInfo("pax_global_header")
+        pax.type = tarfile.XGLTYPE
+        handle.addfile(pax)
+        root = tarfile.TarInfo("repo-root/")
+        root.type = tarfile.DIRTYPE
+        root.mode = 0o755
+        handle.addfile(root)
+        file_info = tarfile.TarInfo("repo-root/environment.py")
+        payload = b"def load_environment(**k):\n    return None\n"
+        file_info.size = len(payload)
+        handle.addfile(file_info, io.BytesIO(payload))
+    assert _safe_extract_archive(tar.getvalue(), dest) == dest / "repo-root"
 
 
 def test_install_manifest_and_worker_deps():
@@ -63,358 +515,10 @@ def test_install_manifest_and_worker_deps():
         import flash.envs.registry as registry
 
         importlib.reload(registry)
-        # The worker only pip-installs `verifiers`; the env itself is installed via the
-        # authenticated `prime env install` (see worker_hub_env_ids), not pip.
-        assert registry.worker_pip_for_env("owner/env") == ["verifiers"]
-        assert registry.worker_hub_env_ids("owner/env") == ["owner/env"]
+        env_id = "github:owner/repo@main:env/environment.py"
+        registry.record_installed_env(env_id, package="freesolo")
+        assert registry.worker_pip_for_env(env_id) == ["freesolo"]
+        assert registry.list_installed_environments() == [env_id]
 
         os.environ.pop("FLASH_ENVS_MANIFEST", None)
         importlib.reload(registry)
-
-
-# ---------------------------------------------------------------------------
-# Regression tests for the Prime Intellect Hub interop defects fixed in this PR.
-# ---------------------------------------------------------------------------
-def test_vf_load_id_strips_owner_slug():
-    """DEFECT: the adapter passed the full ``owner/name`` slug to verifiers, which only
-    resolves the bare env id."""
-    from flash.envs.adapter import vf_load_id
-
-    assert vf_load_id("primeintellect/hendrycks-math") == "hendrycks-math"
-    assert vf_load_id("math500") == "math500"  # already bare -> unchanged
-
-
-def test_load_verifiers_environment_uses_bare_ids(monkeypatch):
-    """DEFECT: load must hand verifiers the BARE id (owner stripped)."""
-    import types as _types
-
-    from flash.envs import adapter as va
-
-    seen = []
-
-    class _Env:
-        rubric = None
-        parser = None
-
-    fake_vf = _types.ModuleType("verifiers")
-    fake_vf.load_environment = lambda env_id, **kw: (seen.append(env_id), _Env())[1]
-    monkeypatch.setitem(sys.modules, "verifiers", fake_vf)
-
-    va.load_verifiers_environment("primeintellect/hendrycks-math")
-    assert seen == ["hendrycks-math"]  # owner stripped
-
-
-def test_rubric_group_is_flattened_and_eval_metric_skipped():
-    """DEFECT: a RubricGroup's top-level funcs is empty, so reward was always 0; and a
-    eval-metric monitor func (e.g. num_turns) crashed on missing state."""
-    from flash.envs.adapter import VerifiersEnvironment, _flatten_rubric
-
-    def correct(completion, answer):
-        return 1.0 if str(answer) in completion[-1]["content"] else 0.0
-
-    def monitor(**kwargs):
-        raise KeyError("trajectory")  # weight 0 -> must be skipped/guarded
-
-    class _Sub:
-        def __init__(self, funcs, weights):
-            self.funcs, self.weights = funcs, weights
-
-    class _Group:  # RubricGroup: empty top-level funcs
-        funcs, weights = (), ()
-        rubrics = (_Sub([correct], [1.0]), _Sub([monitor], [0.0]))
-
-    class _Env:
-        rubric = _Group()
-        parser = None
-
-    pairs = _flatten_rubric(_Group())
-    assert len(pairs) == 2  # recursed into nested rubrics
-
-    env = VerifiersEnvironment(_Env(), "owner/x")
-    assert env.reward("the answer is 4", {"answer": "4"}) == 1.0
-    assert env.reward("nope", {"answer": "4"}) == 0.0
-
-
-def test_reward_from_weighted_func_propagates_exception():
-    """A WEIGHTED reward func that raises must PROPAGATE (fail loudly), not be swallowed as
-    0.0 — a raise in a weighted func is a real reward failure (e.g. judge API error) that would
-    otherwise train/score on an all-zero signal. (Unweighted monitor funcs are skipped.)"""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    def boom(**kwargs):
-        raise RuntimeError("kaboom")
-
-    class _Rubric:
-        funcs = (boom,)
-        weights = (1.0,)
-
-    class _Env:
-        rubric = _Rubric()
-        parser = None
-
-    env = VerifiersEnvironment(_Env(), "owner/x")
-    with pytest.raises(RuntimeError, match="kaboom"):
-        env.reward("anything", {"answer": "4"})
-
-
-def test_scores_breakdown_collision_does_not_clobber_existing_distinct_key():
-    """Colliding reward-func names get a probed exact-key suffix, never one a
-    prefix/length heuristic could recompute onto an already-recorded scorer.
-
-    The failing case for the old ``len([k for k in breakdown if k.startswith(name)])``
-    rule: a func named ``score`` followed by one named ``score_detail``, then a second
-    ``score``. After the first two keys (``score``, ``score_detail``) the heuristic counts
-    BOTH (both start with ``score``) and forms ``score_2`` for the third — fine here, but
-    a distinct-but-prefixed name in the wrong order makes it recompute an occupied key and
-    silently drop a scorer. Exact-key probing keeps every scorer."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    def make(name):
-        def f(**kwargs):
-            return 1.0
-
-        f.__name__ = name
-        return f
-
-    funcs = (make("score"), make("score_1"), make("score"), make("score"))
-
-    class _Rubric:
-        funcs = ()
-        weights = ()
-
-    _Rubric.funcs = funcs
-    _Rubric.weights = (1.0, 1.0, 1.0, 1.0)
-
-    class _Env:
-        rubric = _Rubric()
-        parser = None
-
-    env = VerifiersEnvironment(_Env(), "owner/x")
-    breakdown = env.scores_breakdown("anything", {"answer": "x"}, {})
-    # Every one of the 4 weighted scorers survives as a distinct key (+ total); none is
-    # overwritten. Probing yields: score, score_1, then score_2, score_3 for the dupes.
-    assert breakdown["total"] == 4.0
-    assert set(breakdown) == {"score", "score_1", "score_2", "score_3", "total"}
-
-
-def test_reward_available_uses_state_transcript_in_multi_turn():
-    """In multi-turn mode, `completion`/`prompt` passed to reward funcs come from the
-    accumulated `state` transcript (full message list), not the scalar completion wrapped as a
-    lone assistant message. Single-turn keeps the scalar-wrapping behavior."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    class _Env:
-        rubric = None
-        parser = None
-
-    env = VerifiersEnvironment(_Env(), "owner/x")
-    example = {"prompt": [{"role": "user", "content": "hi"}], "answer": "a"}
-
-    # Single-turn: scalar completion wrapped as one assistant message.
-    single = env._reward_available("the reply", example, None)
-    assert single["completion"] == [{"role": "assistant", "content": "the reply"}]
-    assert single["prompt"] == example["prompt"]
-
-    # Multi-turn: full transcript from state is used.
-    env.multi_turn = True
-    state = {
-        "prompt": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
-        "completion": [
-            {"role": "assistant", "content": "call tool"},
-            {"role": "tool", "content": "result"},
-            {"role": "assistant", "content": "final"},
-        ],
-    }
-    multi = env._reward_available("final", example, state)
-    assert multi["completion"] == state["completion"]
-    assert multi["completion"] is not state["completion"]  # copied, not aliased
-    assert multi["prompt"] == state["prompt"]
-
-    # Multi-turn with no transcript yet falls back to scalar wrapping.
-    fallback = env._reward_available("solo", example, {"turn": 0})
-    assert fallback["completion"] == [{"role": "assistant", "content": "solo"}]
-
-
-def test_group_reward_func_is_rejected_at_construction():
-    """A weighted group/batch reward func (plural required arg the single-turn worker
-    can't supply) must fail fast, not silently score 0.0 on a paid run."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    def group_reward(completions, answers):  # plural batch args — unsupported
-        return [1.0 for _ in completions]
-
-    class _Rubric:
-        funcs = (group_reward,)
-        weights = (1.0,)
-
-    class _Env:
-        rubric = _Rubric()
-        parser = None
-
-    with pytest.raises(ValueError, match="completions"):
-        VerifiersEnvironment(_Env(), "owner/x")
-
-    # A eval-metric group func is skipped (never invoked), so it must NOT block load.
-    class _RubricZero:
-        funcs = (group_reward,)
-        weights = (0.0,)
-
-    class _EnvZero:
-        rubric = _RubricZero()
-        parser = None
-
-    VerifiersEnvironment(_EnvZero(), "owner/x")  # does not raise
-
-
-def test_reward_parses_json_string_info():
-    """A Hub row may store `info` as a JSON string; reward funcs that index it must
-    receive a dict, not raise TypeError (swallowed as 0.0)."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    def uses_info(completion, info):
-        return 1.0 if info.get("want") == "yes" else 0.0
-
-    class _Rubric:
-        funcs = (uses_info,)
-        weights = (1.0,)
-
-    class _Env:
-        rubric = _Rubric()
-        parser = None
-
-    env = VerifiersEnvironment(_Env(), "owner/x")
-    # info as a JSON string is parsed -> dict; the func indexes it and scores 1.0.
-    assert env.reward("x", {"answer": "a", "info": '{"want": "yes"}'}) == 1.0
-    # a dict info still works
-    assert env.reward("x", {"answer": "a", "info": {"want": "yes"}}) == 1.0
-    # non-JSON string falls back to {} (no crash -> 0.0, not a swallowed TypeError)
-    assert env.reward("x", {"answer": "a", "info": "not json"}) == 0.0
-
-
-def test_dataset_getter_requiring_args_is_called_correctly():
-    """A Hub env exposing get_dataset(n, seed) without defaults must be called with
-    those args, not no-arg (which raised TypeError -> swallowed -> empty train set)."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    rows = [{"prompt": [{"role": "user", "content": "q"}], "answer": "a"}]
-
-    class _Env:
-        rubric = None
-        parser = None
-
-        def get_dataset(self, n, seed):  # required args, no defaults
-            assert n == -1
-            assert seed == 0
-            return rows
-
-    env = VerifiersEnvironment(_Env(), "owner/x")
-    train = env.dataset()
-    assert train, "getter with required args must yield rows (not swallowed to empty)"
-    assert train[0]["answer"] == "a"
-
-
-def test_dataset_returns_train_split_only_no_split_arg():
-    """``dataset()`` takes no split arg and yields the env's TRAIN rows only.
-
-    Mid-run env eval was removed (held-out eval lives on the deploy/serving side), so the
-    adapter no longer selects eval/validation/test. Guards against (a) re-introducing a
-    silently-ignored ``split`` param that would hand back train data while pretending to
-    serve eval, and (b) accidentally returning the env's ``eval_dataset`` rows. The
-    ``_FakeVfEnv`` carries both ``dataset`` (train) and ``eval_dataset`` rows; only train
-    must come back, and the call takes no positional arg."""
-    import inspect
-
-    from flash.envs.adapter import VerifiersEnvironment
-
-    env = VerifiersEnvironment(_FakeVfEnv(), "fake/env")
-
-    # No split parameter on the signature at all (param was dropped, not silently ignored).
-    params = inspect.signature(env.dataset).parameters
-    assert "split" not in params, "dataset() must not carry a (silently-ignored) split param"
-
-    rows = env.dataset()  # no positional split arg accepted
-    answers = [r["answer"] for r in rows]
-    assert answers == ["4"], "must return TRAIN rows only, never the eval_dataset rows"
-    assert "6" not in answers, "eval split rows must not leak into dataset()"
-
-    # Passing a split positionally is now a TypeError (param truly removed, not absorbed).
-    with pytest.raises(TypeError):
-        env.dataset("eval")
-
-
-def test_worker_installs_env_via_prime():
-    """The Flash worker pip-installs only verifiers; the Hub env installs via `prime`."""
-    import flash.envs.registry as registry
-
-    assert registry.worker_pip_for_env("primeintellect/hendrycks-math") == ["verifiers"]
-    # The env id is handed to the worker to `prime env install` (authenticated, public+private).
-    assert registry.worker_hub_env_ids("primeintellect/hendrycks-math") == [
-        "primeintellect/hendrycks-math"
-    ]
-
-
-def _multi_turn_env(vf_env):
-    """A VerifiersEnvironment forced into multi-turn mode (so env_reply/rollout_done run)."""
-    from flash.envs.adapter import VerifiersEnvironment
-
-    env = VerifiersEnvironment(vf_env, "owner/x")
-    env.multi_turn = True
-    return env
-
-
-def test_env_reply_propagates_real_env_response_error(capsys):
-    """A genuine bug in a MultiTurnEnv's `env_response` must NOT be silently swallowed as
-    [] (which would collapse every multi-turn rollout to a single turn and train a paid GRPO
-    run on degenerate transcripts). Mirroring `_invoke_reward`, env_reply logs context and
-    re-raises so the run fails fast. A NotImplementedError stays the benign "no env turn"."""
-
-    class _Env:
-        rubric = None
-        parser = None
-
-        async def env_response(self, messages, state):
-            raise RuntimeError("env boom")
-
-    env = _multi_turn_env(_Env())
-    with pytest.raises(RuntimeError, match="env boom"):
-        env.env_reply([{"role": "assistant", "content": "hi"}], {"turn": 1})
-    # the failure is surfaced, not vanished
-    assert "env_response failed" in capsys.readouterr().out
-
-    class _NotImpl:
-        rubric = None
-        parser = None
-
-        async def env_response(self, messages, state):
-            raise NotImplementedError
-
-    # NotImplementedError is the legitimate "no env turn" signal -> [] (does not raise).
-    assert _multi_turn_env(_NotImpl()).env_reply([], {"turn": 0}) == []
-
-
-def test_rollout_done_propagates_real_is_completed_error(capsys):
-    """A genuine bug in `is_completed` must NOT be silently treated as done=True (which would
-    truncate every rollout). It logs context and re-raises; a NotImplementedError remains the
-    benign "no completion check -> rely on the turn cap" signal."""
-
-    class _Env:
-        rubric = None
-        parser = None
-
-        async def is_completed(self, state):
-            raise RuntimeError("done boom")
-
-    env = _multi_turn_env(_Env())
-    with pytest.raises(RuntimeError, match="done boom"):
-        env.rollout_done({"turn": 1})
-    assert "is_completed failed" in capsys.readouterr().out
-
-    class _NotImpl:
-        rubric = None
-        parser = None
-
-        async def is_completed(self, state):
-            raise NotImplementedError
-
-    # NotImplementedError -> treat as done (turn-cap-only), does not raise.
-    assert _multi_turn_env(_NotImpl()).rollout_done({"turn": 0}) is True

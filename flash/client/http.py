@@ -53,7 +53,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
     """Verify a freesolo API key against the freesolo backend's ``/api/auth/verify``.
 
     Raises :class:`ClientError`/:class:`ApiError` if the key is rejected or the backend is
-    unreachable; returns ``None`` on success. Keys are issued from the freesolo dashboard.
+    unreachable; returns ``None`` on success. Keys are issued from the freesolo sign-in page.
     """
     base = freesolo_base_url(base_url)
     url = f"{base}{FREESOLO_AUTH_VERIFY_PATH}"
@@ -68,8 +68,9 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             raise ClientError(
-                "freesolo rejected this API key — create or copy a valid key from your "
-                "freesolo dashboard and pass it with `flash login --api-key` (or FREESOLO_API_KEY)"
+                "freesolo rejected this API key — create or copy a valid key at "
+                "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
+                "(or FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
     except urllib.error.URLError as exc:
@@ -121,17 +122,12 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     # -- environments ------------------------------------------------------------------
-    def publish_env(self, *, name: str, is_new: bool, package_b64: str) -> dict:
-        """Upload a packaged verifiers env to the managed Environments Hub (the control plane
-        publishes it under FreeSolo's Prime account); returns ``{"id": "owner/name"}``.
-
-        The server may retry `prime env push` up to its own bound (default 8 attempts x 180s =
-        ~24 min worst case, plus extract/build), so the client timeout must comfortably exceed
-        that — otherwise the client gives up while the publish is still running server-side."""
+    def publish_env(self, *, name: str, package_b64: str) -> dict:
+        """Upload a packaged Freesolo environment to the managed Environments Hub."""
         return self._request(
             "POST",
             "/v1/envs",
-            body={"name": name, "is_new": is_new, "package_b64": package_b64},
+            body={"name": name, "package_b64": package_b64},
             timeout=1800.0,
         )
 
@@ -158,18 +154,14 @@ class ApiClient:
     def deploy(
         self,
         run_id: str,
-        mode: str = "dev",
-        idle_timeout_s: int = 300,
         dry_run: bool = False,
     ) -> dict:
-        # always-on blocks on the server until the worker has downloaded the
-        # model/adapter and vLLM is healthy (the no-cold-start guarantee), which can
-        # take many minutes — use the serve-scale timeout, not the default 60s.
-        deploy_timeout = 30 * 60 if (mode == "always-on" and not dry_run) else None
+        # Deploy blocks on registration and serving warmup, which can take many minutes.
+        deploy_timeout = 30 * 60 if not dry_run else None
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/deploy",
-            body={"mode": mode, "idle_timeout_s": idle_timeout_s, "dry_run": dry_run},
+            body={"dry_run": dry_run},
             timeout=deploy_timeout,
         )
 
@@ -186,7 +178,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> dict:
-        # Cold starts in dev mode can take minutes; give inference a generous timeout.
+        # Serving warmup can take minutes; give inference a generous timeout.
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/chat",
