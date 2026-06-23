@@ -187,9 +187,9 @@ def _sweep_idle_flash_endpoints(skip_name: str) -> int:
             health = runpod_api.endpoint_health(eid) or {}
             workers = health.get("workers")
             jobs_info = health.get("jobs")
-            # If health is missing either section, we can't confirm the endpoint is idle —
-            # skip it rather than risk deleting an endpoint whose state is unknown.
-            if workers is None or jobs_info is None:
+            # Require non-empty dicts: a missing or empty workers section means the health
+            # response is incomplete and we can't confirm the endpoint is idle.
+            if not isinstance(workers, dict) or not workers or not isinstance(jobs_info, dict):
                 continue
             active_workers = sum(
                 workers.get(k, 0) or 0
@@ -236,7 +236,6 @@ def deploy_train_endpoint(
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
     _QUOTA_MAX_RETRIES = 3
-    last_quota_exc: Exception | None = None
     resource = None
     for quota_attempt in range(_QUOTA_MAX_RETRIES):
         if quota_attempt > 0:
@@ -280,15 +279,10 @@ def deploy_train_endpoint(
             rm = ResourceManager()
             try:
                 resource = asyncio.run(rm.get_or_deploy_resource(config))
-                last_quota_exc = None
                 break  # success
             except Exception as exc:
-                if _is_workers_quota_error(exc) and quota_attempt < _QUOTA_MAX_RETRIES - 1:
-                    last_quota_exc = exc
-                else:
+                if not (_is_workers_quota_error(exc) and quota_attempt < _QUOTA_MAX_RETRIES - 1):
                     raise
-    if last_quota_exc is not None:
-        raise last_quota_exc
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
         raise RuntimeError(f"deploy_train_endpoint: no endpoint id on resource {resource!r}")
