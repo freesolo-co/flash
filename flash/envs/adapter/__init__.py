@@ -475,17 +475,20 @@ class FreesoloEnvironment(BaseEnvironment):
             examples = self._load_task_examples(self._source)
         records = []
         for example in examples:
-            record = self._canonical_record(dict(getattr(example, "record", {}) or {}))
-            record[_CANONICAL_INPUT_KEY] = getattr(example, "task", record[_CANONICAL_INPUT_KEY])
+            raw = dict(getattr(example, "record", {}) or {})
+            task = getattr(example, "task", None)
+            if _CANONICAL_INPUT_KEY not in raw and task is not None:
+                raw[_CANONICAL_INPUT_KEY] = task
             task_id = getattr(example, "task_id", None)
             if task_id is not None:
-                record.setdefault("id", task_id)
+                raw.setdefault("id", task_id)
             expected = getattr(example, "expected_output", None)
             if expected is not None:
-                record[_CANONICAL_OUTPUT_KEY] = _json_safe(expected)
+                raw.setdefault(_CANONICAL_OUTPUT_KEY, _json_safe(expected))
             metadata = getattr(example, "metadata", None)
             if isinstance(metadata, dict) and metadata:
-                record.setdefault("metadata", metadata)
+                raw.setdefault("metadata", metadata)
+            record = self._canonical_record(raw)
             records.append(record)
         return records
 

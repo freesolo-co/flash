@@ -259,6 +259,38 @@ def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
     assert env.dataset()[0]["output"] == "4"
 
 
+def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
+    class SdkExampleEnv(_EnvironmentSingleTurn):
+        dataset: ClassVar[list[_TaskExample]] = [
+            _TaskExample(
+                record={},
+                task="2+2?",
+                task_id="ex-1",
+                expected_output="4",
+                metadata={"split": "train"},
+            )
+        ]
+
+    _install_fake_freesolo(monkeypatch, sdk_env=SdkExampleEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        SdkExampleEnv(),
+        "owner/env",
+        source=None,
+        contract_text="",
+    )
+    assert env.dataset() == [
+        {
+            "input": "2+2?",
+            "output": "4",
+            "id": "ex-1",
+            "metadata": {"split": "train"},
+        }
+    ]
+
+
 def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
