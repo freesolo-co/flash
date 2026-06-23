@@ -20,9 +20,7 @@ def _res(name):
 
 
 def test_select_matches_live_prefixed_endpoint():
-    target = endpoint_name(
-        "RTX 5090", _run_suffix("flash-123-c220526e")
-    )  # flash-5090-c220526e
+    target = endpoint_name("RTX 5090", _run_suffix("flash-123-c220526e"))  # flash-5090-c220526e
     resources = {
         "u1": _res(f"live-{target}"),  # the live-provisioned resource for this run
         "u2": _res("flash-5090-deadbeef"),  # a different run
@@ -94,7 +92,7 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
-        deployment={"state": "ready", "gpu": "RTX 5090", "mode": "dev"},
+        deployment={"state": "ready", "gpu": "RTX 5090"},
     )
     orch._save_status(st)
 
@@ -124,7 +122,7 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
-        deployment={"state": "ready", "gpu": "RTX 5090", "mode": "dev"},
+        deployment={"state": "ready", "gpu": "RTX 5090"},
     )
     orch._save_status(st)
 
@@ -167,7 +165,7 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
-        deployment={"state": "ready", "gpu": "RTX 5090", "mode": "dev"},
+        deployment={"state": "ready", "gpu": "RTX 5090"},
     )
     orch._save_status(st)
 
@@ -210,7 +208,7 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
-        deployment={"state": "ready", "gpu": "RTX 5090", "mode": "dev"},
+        deployment={"state": "ready", "gpu": "RTX 5090"},
     )
     orch._save_status(st)
 
@@ -259,7 +257,9 @@ def test_cancel_loses_to_racing_genuine_completion_done(tmp_path, monkeypatch):
     monkeypatch.setattr(ftrain, "terminate_endpoint", racing_completion)
 
     out = orch.cancel_run(spec.run_id)
-    assert out.state == "done", "a genuine training-completion `done` must NOT be clobbered by cancel"
+    assert out.state == "done", (
+        "a genuine training-completion `done` must NOT be clobbered by cancel"
+    )
     assert orch.get_status(spec.run_id).state == "done"
     assert out.cost_usd == 1.23, "the finished run's real result (cost) must be preserved"
     assert out.artifacts_dir == "/runs/finished"
@@ -348,7 +348,11 @@ def test_attach_run_recovery_skips_seed_loop_when_raced_terminal(tmp_path, monke
 
     # The seed loop is the PAID-work entry point; it must never be called for a terminal run.
     seed_loop_calls = {"n": 0}
-    monkeypatch.setattr(orch, "_run_seed_loop", lambda *a, **k: seed_loop_calls.__setitem__("n", seed_loop_calls["n"] + 1))
+    monkeypatch.setattr(
+        orch,
+        "_run_seed_loop",
+        lambda *a, **k: seed_loop_calls.__setitem__("n", seed_loop_calls["n"] + 1),
+    )
 
     from flash.providers.base import PollResult
 
@@ -362,7 +366,9 @@ def test_attach_run_recovery_skips_seed_loop_when_raced_terminal(tmp_path, monke
     _make_poll_provider(monkeypatch, on_poll=racing_poll)
 
     out = orch.attach_run(spec.run_id)
-    assert seed_loop_calls["n"] == 0, "must NOT submit paid work (resume seed loop) for a run raced to terminal"
+    assert seed_loop_calls["n"] == 0, (
+        "must NOT submit paid work (resume seed loop) for a run raced to terminal"
+    )
     assert out.state == "failed", "the authoritative terminal state must be preserved"
     assert orch.get_status(spec.run_id).state == "failed"
 
@@ -385,7 +391,11 @@ def test_attach_run_recovery_resumes_seed_loop_when_still_active(tmp_path, monke
     orch._save_status(st)
 
     seed_loop_calls = {"n": 0}
-    monkeypatch.setattr(orch, "_run_seed_loop", lambda *a, **k: seed_loop_calls.__setitem__("n", seed_loop_calls["n"] + 1))
+    monkeypatch.setattr(
+        orch,
+        "_run_seed_loop",
+        lambda *a, **k: seed_loop_calls.__setitem__("n", seed_loop_calls["n"] + 1),
+    )
 
     from flash.providers.base import PollResult
 
@@ -416,7 +426,11 @@ def test_run_seed_loop_bails_on_terminal_before_paid_work(tmp_path, monkeypatch)
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="failed", spec=spec.to_dict()))
 
     submitted = {"n": 0}
-    monkeypatch.setattr(orch, "_submit_seed_supervised", lambda *a, **k: submitted.__setitem__("n", submitted["n"] + 1))
+    monkeypatch.setattr(
+        orch,
+        "_submit_seed_supervised",
+        lambda *a, **k: submitted.__setitem__("n", submitted["n"] + 1),
+    )
 
     import io
 

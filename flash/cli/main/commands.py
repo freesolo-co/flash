@@ -82,10 +82,10 @@ _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
 Edit the dataset and reward code, then upload with
-`flash env push --name my-env environments/environment.py`.
+`flash env push --name my-env environments`.
 
 A managed run should use the returned [environment] id from
-`flash env push --name my-env environments/environment.py`.
+`flash env push --name my-env environments`.
 
 Keep real SFT/RL datasets in Freesolo or Hugging Face dataset storage. This
 inline dataset is only a smoke-test fixture.
@@ -104,7 +104,7 @@ DATASET = [
 
 
 def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult:
-    expected = str(example.record["output"]).strip()
+    expected = str(example.expected_output or "").strip()
     score = 1.0 if expected and expected in response_text else 0.0
     return RewardResult(score=score, threshold=1.0)
 
@@ -113,19 +113,13 @@ class StarterEnv(EnvironmentSingleTurn):
     dataset = DATASET
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
-        return [{"role": "user", "content": str(example.record["input"])}]
+        return [{"role": "user", "content": example.task}]
 
     def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
         return exact_match_reward(example, response_text)
 
 
-def load_environment(
-    contract_path: str | None = None,
-    dataset_path: str | None = None,
-    reward_command: str | None = None,
-    mode: str = "eval",
-    **_: object,
-) -> StarterEnv:
+def load_environment(**kwargs) -> StarterEnv:
     return StarterEnv()
 '''
 
@@ -140,8 +134,8 @@ def cmd_env_setup(args) -> int:
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
     env_comment = (
-        "# Environment: upload the scaffolded environments/environment.py with\n"
-        "# `flash env push --name my-env environments/environment.py`, then paste the returned id below.\n"
+        "# Environment: upload the scaffolded environments folder with\n"
+        "# `flash env push --name my-env environments`, then paste the returned id below.\n"
         "[environment]\n"
         'id = ""\n\n'
     )
@@ -230,10 +224,10 @@ def cmd_env_init(args) -> int:
     root.mkdir(parents=True, exist_ok=True)
     # Scaffold a real Freesolo SDK environment whose load_environment returns an
     # EnvironmentSingleTurn.
-    (root / f"{mod}.py").write_text(
+    (root / "environment.py").write_text(
         f'"""Custom Freesolo environment ({args.name}).\n\n'
-        "Replace the dataset and reward with your task, then upload it\n"
-        f"with `flash env push --name {mod} environments/{mod}/{mod}.py` and reference the returned id\n"
+        "Replace the dataset and reward with your task, then upload the folder\n"
+        f"with `flash env push --name {args.name} environments/{mod}` and reference the returned id\n"
         "in your config.\n"
         '"""\n\n'
         "from freesolo.datasets.types import TaskExample\n"
@@ -245,9 +239,9 @@ def cmd_env_init(args) -> int:
         "class CustomEnv(EnvironmentSingleTurn):\n"
         "    dataset = DATASET\n\n"
         "    def build_prompt_messages(self, example: TaskExample, prompt_text: str):\n"
-        '        return [{"role": "user", "content": str(example.record["input"])}]\n\n'
+        '        return [{"role": "user", "content": example.task}]\n\n'
         "    def score_response(self, example: TaskExample, response_text: str) -> RewardResult:\n"
-        '        expected = str(example.record["output"]).strip()\n'
+        '        expected = str(example.expected_output or "").strip()\n'
         "        score = 1.0 if expected and expected in response_text else 0.0\n"
         "        return RewardResult(score=score, threshold=1.0)\n\n\n"
         "def load_environment(**kwargs) -> CustomEnv:\n"
@@ -256,7 +250,7 @@ def cmd_env_init(args) -> int:
     (root / "README.md").write_text(f"# {args.name}\n\nCustom Freesolo environment for Flash.\n")
     print(f"created {root}")
     print(
-        f"upload it with `flash env push --name {mod} environments/{mod}/{mod}.py`, then reference "
+        f"upload it with `flash env push --name {args.name} environments/{mod}`, then reference "
         "the returned id in your config."
     )
     return 0
@@ -272,10 +266,7 @@ def cmd_env_list(args) -> int:
             print(f"  {env_id}")
     local = Path("environments")
     if local.is_dir():
-        # Both directory envs (environments/<name>/...) and single-file modules
-        # (environments/<name>.py). These are local env SOURCES — publish one with
-        # `flash env push --name <name> <path>` to run it on the managed service by its
-        # environment id.
+        # Prefer publishing folders. Single-file modules remain supported for small smoke tests.
         paths: list[str] = []
         for p in local.iterdir():
             if p.name.startswith("__"):
@@ -284,10 +275,8 @@ def cmd_env_list(args) -> int:
                 stem = p.name.replace("-", "_")
                 module = p / f"{stem}.py"
                 canonical = p / "environment.py"
-                if canonical.is_file():
-                    paths.append(f"environments/{p.name}/environment.py")
-                elif module.is_file():
-                    paths.append(f"environments/{p.name}/{stem}.py")
+                if canonical.is_file() or module.is_file():
+                    paths.append(f"environments/{p.name}")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
         if paths:
@@ -442,18 +431,14 @@ def cmd_logs(args) -> int:
 def cmd_deploy(args) -> int:
     dep = client_from_config().deploy(
         args.run_id,
-        mode=args.mode,
-        idle_timeout_s=args.idle_timeout,
         dry_run=args.dry_run,
     )
     print(json.dumps(dep, indent=2))
-    if dep.get("mode") == "always-on":
-        print(
-            f"note: always-on keeps a {dep.get('gpu')} warm 24/7 "
-            f"(~${dep.get('est_idle_cost_usd_per_day')}/day). Use `flash undeploy {args.run_id}` "
-            "to stop billing.",
-            file=sys.stderr,
-        )
+    print(
+        "note: serving is billed per token only; use "
+        f"`flash undeploy {args.run_id}` to deregister the adapter.",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -467,13 +452,10 @@ def cmd_deployments(args) -> int:
     if not rows:
         print("no active deployments")
         return 0
-    print(f"{'RUN_ID':<32}  {'MODE':<10}  {'GPU':<9}  {'$/DAY':>7}  ENDPOINT")
+    print(f"{'RUN_ID':<32}  {'GPU':<9}  ENDPOINT")
     for r in rows:
         d = r.get("deployment") or {}
-        print(
-            f"{r['run_id']:<32}  {d.get('mode', '?'):<10}  {d.get('gpu', '?'):<9}  "
-            f"{d.get('est_idle_cost_usd_per_day', 0):>7}  {d.get('endpoint_name', '')}"
-        )
+        print(f"{r['run_id']:<32}  {d.get('gpu', '?'):<9}  {d.get('endpoint_name', '')}")
     return 0
 
 
