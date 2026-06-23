@@ -58,15 +58,11 @@ def cancel_run(run_id: str) -> RunStatus:
         try:
             from flash.serve.deploy import undeploy_adapter
 
-            deleted = undeploy_adapter(run_id)
-            # Mark the deployment inactive so /v1/deployments and /chat (which gate only
-            # on the deployment record's state) stop treating the cancelled run as
-            # active. dev mode is scale-to-zero: a never-chatted dev deployment has no
-            # endpoint yet, so an empty deletion is still a clean teardown — don't leave
-            # it "ready". always-on provisions at deploy time, so only mark it inactive
-            # once a deletion is confirmed (an empty deletion there is suspicious).
-            dev_mode = (status.deployment or {}).get("mode", "dev") == "dev"
-            if status.deployment and (deleted or dev_mode):
+            undeploy_adapter(run_id)
+            # Mark the deployment inactive so /v1/deployments and /chat stop treating the
+            # cancelled run as active. Delete is idempotent: an already-absent adapter still
+            # means the local deployment record can be cleared.
+            if status.deployment:
                 # Mark the deployment inactive through the lock-guarded path so this write
                 # participates in the same _STATUS_LOCK as the rest of the runner. A bare
                 # _save_status here would persist a stale pre-teardown snapshot OUTSIDE the
@@ -180,7 +176,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 seed_index = list(spec.train.seeds).index(seed)
             except ValueError:
                 seed_index = 0
-            print(f"attach: {run_id} seed {seed} ended ({res.failure}); resuming from checkpoint", file=log)
+            print(
+                f"attach: {run_id} seed {seed} ended ({res.failure}); resuming from checkpoint",
+                file=log,
+            )
             # GC the dead endpoint, then clear the stale handle and record the seed so a second
             # restart mid-allocation resumes the right one.
             with contextlib.suppress(Exception):
@@ -190,7 +189,9 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
-            _run_seed_loop(spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0))
+            _run_seed_loop(
+                spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0)
+            )
             return get_status(run_id)
         # Carry the provisioned class into metrics so _persist_metrics costs the card the
         # run actually used (the in-process path stamps this; recovery must restore it).
@@ -309,7 +310,7 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
     from flash.runner import _STATUS_LOCK, _UNDEPLOYABLE_STATES, _save_status, get_status
 
     # Atomic + terminal-respecting (same guard as _update): a /cancel landing during
-    # always-on provisioning/warmup writes `cancelled`; this must NOT overwrite it with
+    # deployment writes `cancelled`; this must NOT overwrite it with
     # `deployed` and resurrect the run as an active deployment. `done` is deployable
     # though (the common case: deploy a finished run), so only the non-`done` terminal
     # states block here — otherwise a freshly finished run could never be deployed.

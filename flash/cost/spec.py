@@ -21,9 +21,9 @@ def count_env_examples(env_id: str, params: dict | None = None) -> int | None:
     """Training rows in ``env_id``'s dataset (the worker's train split), or ``None`` if it can't
     be loaded. Best-effort -- prices an uncapped SFT run on the real dataset size, not a guess.
 
-    Loading may need network/GitHub credentials for private environment refs. If the
-    environment cannot be loaded in this interpreter, this returns ``None`` and the caller
-    falls back to a default count instead of hard-failing."""
+    Loading may need network access for managed Freesolo environments. If the environment
+    cannot be loaded in this interpreter, this returns ``None`` and the caller falls back to a
+    default count instead of hard-failing."""
     if not env_id:
         return None
     try:
@@ -77,7 +77,7 @@ def spec_steps(spec) -> int:
         examples = pinned_examples
     else:
         # No cap: the worker trains the FULL env dataset, so price its real size when we can
-        # count it. A private GitHub environment may not be reachable in this interpreter, so
+        # count it. A managed Freesolo environment may not be reachable in this interpreter, so
         # counting can return None. Fall back to a representative default with a clear warning
         # instead of hard-failing.
         examples = count_env_examples(spec.environment.id, spec.environment.params)

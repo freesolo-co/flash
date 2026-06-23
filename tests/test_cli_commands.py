@@ -69,16 +69,16 @@ class _FakeClient:
         self.calls.append(("cancel", run_id))
         return {"run_id": run_id, "state": "cancelled"}
 
-    def deploy(self, run_id: str, mode: str = "dev", idle_timeout_s: int = 300, **_) -> dict:
-        self.calls.append(("deploy", run_id, mode, idle_timeout_s))
-        return {"run_id": run_id, "mode": mode, "openai_model": f"flash-{run_id}"}
+    def deploy(self, run_id: str, **_) -> dict:
+        self.calls.append(("deploy", run_id))
+        return {"run_id": run_id, "openai_model": f"flash-{run_id}"}
 
     def undeploy(self, run_id: str) -> dict:
         self.calls.append(("undeploy", run_id))
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
     def deployments(self) -> list[dict]:
-        return [{"run_id": "flash-1", "mode": "dev", "gpu": "RTX 4090"}]
+        return [{"run_id": "flash-1", "deployment": {"gpu": "RTX 4090"}}]
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
@@ -131,8 +131,8 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert _run(["cancel", "flash-1"]) == 0
     assert ("cancel", "flash-1") in fake_client.calls
 
-    assert _run(["deploy", "flash-1", "--mode", "dev", "--idle-timeout", "120"]) == 0
-    assert ("deploy", "flash-1", "dev", 120) in fake_client.calls
+    assert _run(["deploy", "flash-1"]) == 0
+    assert ("deploy", "flash-1") in fake_client.calls
 
     assert _run(["deployments"]) == 0
     assert "flash-1" in capsys.readouterr().out
@@ -145,6 +145,23 @@ def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert _run(["chat", "flash-1", "-m", "What is 6*7?"]) == 0
     assert "42" in capsys.readouterr().out
     assert fake_client.calls[-1][0] == "chat"
+
+
+def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup"]) == 0
+
+    assert (tmp_path / "environment.py").is_file()
+    grpo = tmp_path / "configs/grpo.toml"
+    sft = tmp_path / "configs/sft.toml"
+    assert grpo.is_file()
+    assert sft.is_file()
+    assert 'algorithm = "grpo"' in grpo.read_text()
+    assert "steps = 150" in grpo.read_text()
+    assert 'algorithm = "sft"' in sft.read_text()
+    assert "epochs = 1" in sft.read_text()
+    assert "configs/grpo.toml" in capsys.readouterr().out
 
 
 def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None:
@@ -163,18 +180,19 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     from flash.client.specs import spec_payload
     from flash.spec import EnvironmentSpec, JobSpec
 
-    # An unrecorded env resolves to the Freesolo SDK; the GitHub ref is loaded lazily by the
-    # worker at environment load time.
+    # An unrecorded env resolves to the Freesolo SDK; the env is loaded lazily by the worker.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        environment=EnvironmentSpec(id="github:owner/repo@main:env/freesolo/environment.py"),
+        environment=EnvironmentSpec(id="owner/env"),
     )
     assert spec_payload(spec)["environment"]["pip"] == ["freesolo"]
 
     # ...and an explicit pip list (the documented escape hatch) wins untouched.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        environment=EnvironmentSpec(id="github:owner/repo@main:env/freesolo/environment.py", pip=("custom==1",)),
+        environment=EnvironmentSpec(
+            id="github:owner/repo@main:env/environment.py", pip=("custom==1",)
+        ),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]
 

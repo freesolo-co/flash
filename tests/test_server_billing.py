@@ -18,12 +18,19 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
 
 _USER_PREFIX = "fslo-user-"
+
+
+def _identity_for_token(token: str) -> dict[str, str]:
+    if not token.startswith(_USER_PREFIX):
+        return {}
+    suffix = token.removeprefix(_USER_PREFIX)
+    return {"email": f"user-{suffix}@example.com", "key_prefix": "fslo_test"}
 
 
 def _bearer(key: str) -> dict:
@@ -214,6 +221,7 @@ def api(tmp_path, monkeypatch):
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
     with TestClient(app_mod.create_app()) as client:
         yield client
 

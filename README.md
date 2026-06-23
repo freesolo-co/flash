@@ -10,13 +10,12 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash train <cfg.toml>` / control-plane `POST /runs` — submit a training job;
   one dedicated GPU per run, supervised server-side (stall watchdog, bounded
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
-- `flash deploy` (scale-to-zero or always-on), `flash chat` —
-  serving for trained adapters.
+- `flash deploy`, `flash chat` — serving for trained adapters.
 - **Freesolo SDK environments.** Every run names a Freesolo environment id.
-  Scaffold a local env, upload it with `flash env push`, then reference the
-  returned id. The worker loads it through `freesolo.environments`. There are no
-  built-in task environments. Single-turn and bounded multi-turn environments are
-  supported.
+  Scaffold `environment.py`, upload `.` or another folder with
+  `flash env push --name <name> <folder>`, then reference the returned id. The
+  worker loads it through `freesolo.environments`. There are no built-in task
+  environments. Single-turn and bounded multi-turn environments are supported.
 
 ## Layout
 
@@ -34,8 +33,8 @@ allocator picks the cheapest GPU class that fits the run across both providers.
   (task-specific grading lives with its example, not in the engine)
 - `flash/envs/` — environment machinery: registry and the adapter that loads
   Freesolo SDK environments onto the worker's interface
-- `flash env setup` / `flash env init` — scaffold a starter local Freesolo env and a
-  ready-to-run config to start from
+- `flash env setup` — scaffold a starter local Freesolo env and a ready-to-run
+  config to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
   plane (run operator-side via the separate `flash-server` command)
 - `flash/mcp/` — stdio MCP bridge for coding agents
