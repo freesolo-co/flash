@@ -53,7 +53,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         status = runner.submit_job(spec, dry_run=False, background=False)
 
         assert status.state == "done", status.error
-        # 1h on a 4090 at the projected rate (static fallback, no live pricing)
+        # 1h on a 4090 at the projected static rate.
         from flash.providers.runpod.pricing import hourly_rate
 
         assert abs(status.cost_usd - hourly_rate("RTX 4090")) < 1e-6, status.cost_usd

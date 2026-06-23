@@ -135,8 +135,11 @@ def cmd_env_setup(args) -> int:
     env_comment = (
         "# Environment: upload this project folder with\n"
         "# `flash env push --name my-env .`, then paste the returned id below.\n"
+        "# If the environment reads secrets with os.environ, list only the env var names here.\n"
+        "# Values are read from your shell or .env at submit time and are not stored in the spec.\n"
         "[environment]\n"
         'id = ""\n\n'
+        '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
     grpo = Path("configs/grpo.toml")
     if not grpo.exists():
@@ -182,35 +185,26 @@ def cmd_models(args) -> int:
 
 def cmd_gpus(args) -> int:
     """List GPU classes, VRAM, and per-provider $/hr."""
-    from flash.providers import available_providers
     from flash.providers.base import GPU_INFO
-    from flash.providers.runpod.pricing import live_rates
+    from flash.providers.runpod.pricing import static_rates as runpod_static_rates
+    from flash.providers.vast.pricing import static_rates as vast_static_rates
 
-    rates = live_rates()
-    # Cheapest live verified-datacenter offer per class (vast key + network only).
-    vast_rates: dict[str, float] = {}
-    if "vast" in available_providers():
-        try:
-            from flash.providers.vast.jobs import usable_offers
-
-            for offer in usable_offers(0, 0):
-                vast_rates.setdefault(offer.gpu, offer.dph_total)  # offers are price-sorted
-        except Exception as exc:
-            print(f"warning: vast offers unavailable ({exc})", file=sys.stderr)
+    runpod_rates = runpod_static_rates()
+    vast_rates = vast_static_rates()
 
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
     print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}")
-    for info in sorted(GPU_INFO.values(), key=lambda g: rates.get(g.name, g.hourly_usd)):
-        runpod_rate = rates.get(info.name, info.hourly_usd) if info.enum_member else None
+    for info in sorted(GPU_INFO.values(), key=lambda g: g.hourly_usd):
+        runpod_rate = runpod_rates.get(info.name) if info.enum_member else None
         print(
             f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}"
             f"{fmt_rate(vast_rates.get(info.name))}"
         )
     print(
         "\nTip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest live-validated class that fits the model across all providers, so you don't pin a\n"
+        "cheapest validated class that fits the model across all providers, so you don't pin a\n"
         "GPU type. You can still tune the run via the [gpu] config table (disk_gb, max_wall_seconds,\n"
         "max_retries, network_volume / network_volume_gb, datacenter)."
     )
@@ -287,7 +281,7 @@ def cmd_train(args) -> int:
     client = client_from_config()
     status = client.create_run(
         spec_payload(spec),
-        runtime_secrets=runtime_secrets_from_local_env(args.config),
+        runtime_secrets=runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets),
     )
     run_id = status["run_id"]
     logger.info(
