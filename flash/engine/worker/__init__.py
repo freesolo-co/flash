@@ -1986,24 +1986,32 @@ def write_train_meta(
     _finalize(m)
 
 
+def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
+    """Resolve init_from_adapter into (repo, prefix).
+
+    The only public form is the exact adapter_ref emitted by ``flash status``:
+    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
+    """
+    repo, sep, prefix = adapter_ref.partition(":")
+    if not (sep and repo and prefix):
+        return None
+    if repo.count("/") != 1 or not prefix.startswith(("sft/", "rl/")):
+        return None
+    return repo, prefix
+
+
 def _download_adapter(adapter_prefix: str | None) -> str | None:
     """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
 
-    Two forms of ``adapter_prefix``:
-      * ``"<prefix>"``            -> read from THIS run's own artifact repo (HF_REPO).
-      * ``"<owner>/<repo>:<prefix>"`` -> CROSS-REPO warm-start: read the SFT adapter from
-        another run's managed artifact repo. Required since hf_repo is now a per-run managed
-        repo (Freesolo-Co/flashrun-<run_id>), so an SFT adapter never lives in the GRPO run's
-        own repo. The control-plane HF_TOKEN can read sibling managed repos.
+    ``adapter_prefix`` must be the full ``adapter_ref`` string emitted by ``flash status``:
+    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
     """
     if not adapter_prefix:
         return None
-    if ":" in adapter_prefix:
-        repo, prefix = adapter_prefix.split(":", 1)
-    else:
-        repo, prefix = HF_REPO, adapter_prefix
-    if not (repo and prefix):
+    resolved = _resolve_adapter_ref(adapter_prefix)
+    if not resolved:
         return None
+    repo, prefix = resolved
     from huggingface_hub import snapshot_download
 
     snapshot_download(
