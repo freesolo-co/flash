@@ -268,7 +268,7 @@ def test_github_environment_ref_parsing():
 
     assert is_github_environment_ref("github:owner/repo@dev:envs/e/freesolo/environment.py")
     assert is_github_environment_ref("github:owner/repo")
-    assert is_github_environment_ref("github:owner/repo@main:/etc/passwd")
+    assert not is_github_environment_ref("github:owner/repo@main:/etc/passwd")
     assert is_github_environment_ref(
         "https://github.com/owner/repo/blob/dev/envs/e/freesolo/environment.py"
     )
