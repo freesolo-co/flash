@@ -38,21 +38,18 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         ".venv",
         ".mypy_cache",
         ".pytest_cache",
+        "pyproject.toml",
         "source",
     }
 )
-_ENV_PUSH_SIDECAR_DIRS = frozenset({"assets", "data", "databases", "datasets", "db"})
+_ENV_PUSH_SIDECAR_DIRS = frozenset({"assets", "configs", "datasets"})
 _ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
     {
         ".csv",
-        ".db",
         ".json",
         ".jsonl",
         ".parquet",
-        ".pkl",
-        ".sqlite",
-        ".sqlite3",
-        ".sql",
+        ".toml",
         ".tsv",
         ".txt",
         ".yaml",
