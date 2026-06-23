@@ -104,15 +104,25 @@ def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
     assert "datasets/train.jsonl" in _members(cap["package_b64"])
 
 
-def test_push_single_py_ships_sibling_database(monkeypatch, tmp_path):
+def test_push_single_py_does_not_ship_sibling_database(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "state.sqlite").write_text("sqlite bytes")
+    (tmp_path / "db").mkdir()
+    (tmp_path / "db" / "state.sqlite").write_text("sqlite bytes")
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "env.toml").write_text("[env]\n")
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "labels.json").write_text("{}\n")
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
     assert cli.cmd_env_push(_args(env_file)) == 0
-    assert "state.sqlite" in _members(cap["package_b64"])
+    files = _members(cap["package_b64"])
+    assert "state.sqlite" not in files
+    assert "db/state.sqlite" not in files
+    assert "configs/env.toml" in files
+    assert "assets/labels.json" in files
 
 
 def test_push_single_py_ships_sibling_helper_modules(monkeypatch, tmp_path):
