@@ -165,7 +165,7 @@ def cmd_env_setup(args) -> int:
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
     print(
-        "created environment.py, configs/, "
+        "ensured environment.py, configs/, "
         "configs/grpo.toml, configs/sft.toml, configs/endpoints.toml"
     )
     return 0

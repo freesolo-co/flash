@@ -123,7 +123,11 @@ def _copy_env_sidecars(env_root: Path, dest: Path, *, entrypoint: Path) -> None:
     import shutil
 
     for child in sorted(env_root.iterdir()):
-        if child == entrypoint or child.name in _ENV_PUSH_IGNORED_NAMES:
+        if (
+            child == entrypoint
+            or child.name == _ENV_ENTRYPOINT
+            or child.name in _ENV_PUSH_IGNORED_NAMES
+        ):
             continue
         if child.name.startswith("."):
             continue
