@@ -30,17 +30,19 @@ def cache_path(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("version", "expected"),
     [
-        ("0.2.12", (0, 2, 12)),
-        ("v1.0", (1, 0)),
-        ("  0.3.0  ", (0, 3, 0)),
-        ("1.2.3rc1", (1, 2, 3)),  # pre-release suffix is dropped
-        ("1.0.0.dev4", (1, 0, 0)),
-        ("not-a-version", ()),
-        ("", ()),
+        ("0.2.12", ((0, 2, 12), 1, 0)),
+        ("v1.0", ((1,), 1, 0)),  # trailing zeros stripped
+        ("  1.0.0  ", ((1,), 1, 0)),
+        ("0.3.0rc1", ((0, 3), 0, 0)),  # pre-release ranks below final
+        ("1.0.0.dev4", ((1,), 0, 0)),
+        ("0.2.18.post1", ((0, 2, 18), 1, 1)),  # post ranks above final
+        ("0.2.18-1", ((0, 2, 18), 1, 1)),  # implicit post
+        ("not-a-version", ((), 1, 0)),
+        ("", ((), 1, 0)),
     ],
 )
-def test_release_tuple(version, expected):
-    assert uc._release_tuple(version) == expected
+def test_version_key(version, expected):
+    assert uc._version_key(version) == expected
 
 
 @pytest.mark.parametrize(
@@ -53,11 +55,33 @@ def test_release_tuple(version, expected):
         ("0.2.11", "0.2.12", False),  # older
         ("0.2", "0.2.12", False),  # 0.2 < 0.2.12 (shorter prefix is smaller)
         ("0.2.12", "0.2", True),  # 0.2.12 > 0.2
+        ("1.0", "1.0.0", False),  # trailing zero: equal, not newer
+        ("0.2.18.post1", "0.2.18", True),  # post-release is newer
+        ("0.2.18", "0.2.18.post1", False),  # ...and the reverse is not
+        ("0.3.0", "0.3.0rc1", True),  # final beats its own rc
+        ("0.3.0rc1", "0.3.0", False),  # rc does not beat the final
         ("garbage", "0.2.12", False),  # unparseable latest never nags
     ],
 )
 def test_is_newer(latest, current, expected):
     assert uc._is_newer(latest, current) is expected
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("0.3.0rc1", True),
+        ("1.0a1", True),
+        ("1.0b2", True),
+        ("1.0.dev1", True),
+        ("2.0.0.dev0", True),
+        ("0.2.18", False),
+        ("0.2.18.post1", False),  # post-release is not a pre-release
+        ("1.0", False),
+    ],
+)
+def test_is_prerelease(version, expected):
+    assert uc._is_prerelease(version) is expected
 
 
 # -- cache / scheduling ----------------------------------------------------------------------
@@ -127,10 +151,34 @@ def test_refresh_cache_writes_latest(cache_path, monkeypatch):
     assert isinstance(saved["checked_at"], (int, float))
 
 
-def test_refresh_cache_no_write_on_failure(cache_path, monkeypatch):
+def test_refresh_cache_stamps_time_on_failure(cache_path, monkeypatch):
+    # a failed lookup must still record checked_at (so offline users don't re-check every command)
     monkeypatch.setattr(uc, "_fetch_latest_version", lambda: None)
     uc._refresh_cache()
-    assert not cache_path.exists()
+    saved = json.loads(cache_path.read_text())
+    assert isinstance(saved["checked_at"], (int, float))
+    assert "pypi_version" not in saved
+
+
+def test_refresh_cache_keeps_known_version_on_failure(cache_path, monkeypatch):
+    # a later failed lookup must not drop the version a previous success recorded
+    cache_path.write_text(json.dumps({"checked_at": 1.0, "pypi_version": "9.9.9"}))
+    monkeypatch.setattr(uc, "_fetch_latest_version", lambda: None)
+    uc._refresh_cache()
+    saved = json.loads(cache_path.read_text())
+    assert saved["pypi_version"] == "9.9.9"
+    assert saved["checked_at"] > 1.0
+
+
+def test_read_cache_coerces_non_object(cache_path):
+    # a non-object cache (valid JSON, wrong shape) must not make .get() callers raise
+    cache_path.write_text("[1, 2, 3]")
+    assert uc._read_cache() == {}
+
+
+def test_check_due_true_when_cache_not_object(cache_path):
+    cache_path.write_text("[]")
+    assert uc._check_due(now=1_000_000.0) is True  # no crash, treated as "due"
 
 
 # -- notice building -------------------------------------------------------------------------
@@ -147,6 +195,12 @@ def test_build_notice_when_newer(cache_path, monkeypatch):
     assert "uv tool upgrade freesolo-flash" in notice
     assert "\033[31m" in notice  # red
     assert notice.endswith("\033[0m")
+
+
+def test_build_notice_skips_prerelease(cache_path):
+    # a newer-looking pre-release must not be advertised as a stable upgrade
+    cache_path.write_text(json.dumps({"checked_at": 1.0, "pypi_version": "99.0.0rc1"}))
+    assert uc._build_notice() is None
 
 
 def test_build_notice_none_when_up_to_date(cache_path):
