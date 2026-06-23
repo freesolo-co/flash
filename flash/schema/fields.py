@@ -95,6 +95,11 @@ def _require_slug(value: str, message: str) -> None:
 
 def _require_environment_ref(value: str, message: str) -> None:
     """Require a Freesolo environment id."""
+    try:
+        _require_slug(value, message)
+        return
+    except ConfigError:
+        pass
     if value.startswith("github:"):
         body = value[len("github:") :]
         repo_ref, sep, path = body.partition(":")

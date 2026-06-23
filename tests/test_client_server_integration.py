@@ -37,11 +37,11 @@ from fastapi.testclient import TestClient
 from flash.client.http import ApiClient, ApiError
 
 # A representative managed-run spec -- the shape the freesolo bridge / SDK
-# submits: catalog model, GitHub Freesolo environment slug, an HF repo for artifacts.
+# submits: catalog model, Freesolo environment id, and an HF repo for artifacts.
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py", "params": {"max_examples": 8}},
+    "environment": {"id": "freesolo/gsm8k", "params": {"max_examples": 8}},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }

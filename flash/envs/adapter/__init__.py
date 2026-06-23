@@ -1,7 +1,7 @@
 """Adapter that runs Freesolo SDK environments on Flash.
 
-Flash environment ids now reference source in GitHub instead of package wheels.
-The canonical generated environment file is ``environment.py`` and its
+Flash environment ids are Freesolo Hub slugs (``namespace/name``). Explicit
+low-level refs remain parseable for compatibility. The canonical generated environment file is ``environment.py`` and its
 ``load_environment`` function must return a Freesolo SDK environment:
 ``EnvironmentSingleTurn`` or ``EnvironmentMultiTurn``.
 """
@@ -27,6 +27,7 @@ from flash.envs.base import BaseEnvironment
 
 _DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
+_DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
@@ -57,6 +58,38 @@ class GitHubEnvironmentRef:
 
 def is_github_environment_ref(value: str) -> bool:
     return _parse_github_environment_ref(value) is not None
+
+
+def is_managed_environment_slug(value: str) -> bool:
+    return _parse_managed_environment_slug(value) is not None
+
+
+def is_freesolo_environment_id(value: str) -> bool:
+    return is_managed_environment_slug(value) or is_github_environment_ref(value)
+
+
+def managed_slug_to_github_ref(value: str) -> str:
+    parsed = _parse_managed_environment_slug(value)
+    if parsed is None:
+        raise ValueError(f"not a Freesolo environment slug: {value!r}")
+    namespace, name = parsed
+    return (
+        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
+        f"{namespace}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
+    )
+
+
+def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
+    text = (value or "").strip()
+    if not text or ":" in text:
+        return None
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        return None
+    parts = text.split("/")
+    if len(parts) != 2 or not _is_safe_github_path_parts(tuple(parts)):
+        return None
+    return parts[0], parts[1]
 
 
 def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
@@ -297,6 +330,8 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
 
 
 def _resolve_environment_reference(env_ref: str) -> str:
+    if is_managed_environment_slug(env_ref):
+        return str(_resolve_github_environment_file(managed_slug_to_github_ref(env_ref)))
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         path = Path(env_ref)
@@ -616,6 +651,9 @@ def load_freesolo_environment(env_id: str, **kwargs) -> FreesoloEnvironment:
 __all__ = [
     "FreesoloEnvironment",
     "GitHubEnvironmentRef",
+    "is_freesolo_environment_id",
     "is_github_environment_ref",
+    "is_managed_environment_slug",
     "load_freesolo_environment",
+    "managed_slug_to_github_ref",
 ]

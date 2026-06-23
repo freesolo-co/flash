@@ -16,7 +16,7 @@ from flash.spec import JobSpec, load_job_spec_from_env
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+    "environment": {"id": "freesolo/gsm8k"},
     "train": {"steps": 10, "lora_rank": 8, "seeds": [0], "hf_repo": "owner/runs"},
     "gpu": {"type": "RTX 4090"},
 }
@@ -102,7 +102,7 @@ def test_environment_path_is_rejected() -> None:
 
 
 def test_bare_environment_id_is_rejected() -> None:
-    # A bare id like "gsm8k" passes the presence check but is not a GitHub Freesolo ref;
+    # A bare id like "gsm8k" passes the presence check but is not a Freesolo env slug;
     # reject it up front.
     for bad in (
         "gsm8k",
