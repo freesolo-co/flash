@@ -435,11 +435,6 @@ def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
         match = [k for k in _ENDPOINT_CACHE if k.startswith(prefix)]
     for key in match:
         handler = _ENDPOINT_CACHE.pop(key, None)
-        # Safety-net release: if terminate_endpoint already released this slot the call is a
-        # no-op (name removed from _ACQUIRED_NAMES); otherwise we free the slot here so the
-        # process doesn't permanently hold it when stop_endpoint is called without a prior
-        # terminate_endpoint (e.g. on a cancel path).
-        _release_endpoint_slot(key)
         ep = getattr(handler, "__self__", None) or getattr(handler, "endpoint", None)
         for meth in ("scale_to_zero", "stop", "delete"):
             fn = getattr(ep, meth, None)
