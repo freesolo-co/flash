@@ -100,6 +100,11 @@ class RunStatus:
     billing_state: str | None = None
     billing_error: str | None = None
     billing_charge: dict | None = None
+    # Last worker heartbeat observed by the provider poller. This is intentionally
+    # duplicated from the HF artifact channel into local run status so `flash status`
+    # can show live worker/GPU state without doing a fresh HF read.
+    last_heartbeat: dict | None = None
+    gpu_status: dict | None = None
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -284,6 +289,45 @@ def get_logs(run_id: str) -> str:
     with open(log_path) as f:
         return f.read()
 
+
+def _sanitize_status_value(value, *, depth: int = 0):
+    """Bound a heartbeat payload before persisting it in run status JSON."""
+    if depth > 5:
+        return str(value)[:200]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, list):
+        return [_sanitize_status_value(v, depth=depth + 1) for v in value[:16]]
+    if isinstance(value, dict):
+        out = {}
+        for i, (k, v) in enumerate(value.items()):
+            if i >= 64:
+                out["truncated"] = True
+                break
+            out[str(k)[:120]] = _sanitize_status_value(v, depth=depth + 1)
+        return out
+    return str(value)[:500]
+
+
+def record_heartbeat(run_id: str, heartbeat: dict) -> None:
+    """Persist the latest worker heartbeat/GPU snapshot without changing run state."""
+    if not run_id or not isinstance(heartbeat, dict):
+        return
+    if not os.path.exists(runs_file_path(run_id, ".json")):
+        return
+    hb = _sanitize_status_value(heartbeat)
+    gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
+    with _STATUS_LOCK:
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        status.last_heartbeat = hb
+        status.gpu_status = gpu if isinstance(gpu, dict) else None
+        status.updated_at = time.time()
+        _save_status(status)
 
 def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     """Write metrics to results/runpod/<phase>/<run_id>/seedN and return the cost.
