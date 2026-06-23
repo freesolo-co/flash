@@ -14,7 +14,6 @@ def clean_env(monkeypatch):
         "GITHUB_TOKEN",
         "HF_REPO",
         "HF_TOKEN",
-        "VAST_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -61,7 +60,7 @@ def test_preflight_requires_runpod_by_default(clean_env, monkeypatch):
     pf.check_run_preflight()
 
 
-def test_preflight_vast_is_opt_in(clean_env, monkeypatch):
+def test_preflight_passes_with_required_operator_keys(clean_env, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp")
     monkeypatch.setenv("HF_TOKEN", "hf")

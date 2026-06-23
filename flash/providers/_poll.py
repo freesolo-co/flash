@@ -1,11 +1,9 @@
-"""Shared poll-loop scaffolding for the provider job pollers.
+"""Shared poll-loop scaffolding for provider job pollers.
 
-``runpod/jobs.py:poll_job`` and ``vast/jobs.py:poll_vast_job`` are independent live
-poll loops with provider-specific terminal-state logic, but they share three verbatim
-blocks: a timestamped ``say()`` logger, a consecutive-poll-error retry/give-up counter,
-and the heartbeat progress-surfacing block (key on (stage, step, ts), log
-``worker: stage=… step=… reward=…``). Only those provider-neutral pieces live here; each
-poller keeps its own status/terminal handling inline.
+Poll loops share a timestamped ``say()`` logger, a consecutive-poll-error retry/give-up
+counter, and the heartbeat progress-surfacing block (key on (stage, step, ts), log
+``worker: stage=… step=… reward=…``). Only those neutral pieces live here; each poller
+keeps its own status/terminal handling inline.
 """
 
 from __future__ import annotations
