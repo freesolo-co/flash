@@ -73,11 +73,16 @@ def ensure_internal_key(api_key: str) -> dict:
     internal-key runs share this single service identity (no per-user isolation;
     the platform scopes users upstream)."""
     now = time.time()
+    internal_email = "internal@freesolo.co"
     with _connect() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (hash_key(api_key), "internal", "freesolo-internal", now),
+            (hash_key(api_key), "internal", internal_email, now),
+        )
+        conn.execute(
+            "UPDATE api_keys SET email = ? WHERE key_hash = ? AND key_prefix = ?",
+            (internal_email, hash_key(api_key), "internal"),
         )
     row = lookup_key(api_key)
     if row is None:  # pragma: no cover - the row was just inserted
