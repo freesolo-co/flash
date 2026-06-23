@@ -824,10 +824,13 @@ def run_sft():
         "logging_steps": 10,
         "save_steps": sft_save_default,
         "save_total_limit": 1,
-        # Memory-light checkpoints: save ONLY the (small LoRA) model, not the optimizer /
-        # scheduler / RNG state — skips the optimizer-state serialization spike at save and
-        # writes just the adapter. (We don't resume mid-run; seeds restart cleanly.)
-        "save_only_model": True,
+        # Resumable checkpoints: save the optimizer / scheduler / RNG state alongside the (small)
+        # LoRA adapter. We DO resume mid-run — make_checkpoint_upload_callback streams each save to
+        # HF and a replacement worker calls resume_from_checkpoint(hf_resume_checkpoint()) after a
+        # preemption — so without this the resumed run would re-initialize the optimizer (Adam
+        # moments) and LR schedule instead of truly continuing. For LoRA the optimizer state is tiny
+        # (it covers only the trainable adapter params), so the save spike is negligible.
+        "save_only_model": False,
         "max_length": sft_max_len,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
@@ -1638,9 +1641,11 @@ def run_rl():
         "logging_steps": 1,
         "save_steps": _t.save_every if _t and _t.save_every is not None else 20,
         "save_total_limit": 1,
-        # Memory-light checkpoints: adapter only, no optimizer/scheduler/RNG state -> no
-        # serialization spike at save (the save-step OOM guard).
-        "save_only_model": True,
+        # Resumable checkpoints: keep the optimizer/scheduler/RNG state with the LoRA adapter so a
+        # preempted GRPO run resumed via resume_from_checkpoint(hf_resume_checkpoint()) continues
+        # with intact optimizer state + step instead of a fresh optimizer. For LoRA this state is
+        # small (trainable adapter params only).
+        "save_only_model": False,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
         "run_name": wandb_run_name(),
