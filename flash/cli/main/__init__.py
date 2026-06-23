@@ -31,7 +31,6 @@ from flash.cli.main.commands import (  # noqa: F401
     cmd_cost,
     cmd_deploy,
     cmd_deployments,
-    cmd_env_init,
     cmd_env_list,
     cmd_env_setup,
     cmd_gpus,
@@ -103,10 +102,6 @@ def main(argv: list[str] | None = None) -> int:
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
     setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
     setup.set_defaults(func=cmd_env_setup)
-
-    init = env_sub.add_parser("init", help="scaffold a new local Freesolo environment")
-    init.add_argument("name")
-    init.set_defaults(func=cmd_env_init)
 
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)

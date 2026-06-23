@@ -152,7 +152,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
 
     assert _run(["env", "setup"]) == 0
 
-    assert (tmp_path / "environments/environment.py").is_file()
+    assert (tmp_path / "environment.py").is_file()
     grpo = tmp_path / "configs/grpo.toml"
     sft = tmp_path / "configs/sft.toml"
     assert grpo.is_file()
