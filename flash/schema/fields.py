@@ -181,6 +181,50 @@ def _coerce_scalar(value: str):
         return value
 
 
+def _validate_env_var_names(names, context: str) -> None:
+    bad_names = sorted(repr(k) for k in names if (not k) or any(c in k for c in "=\0 \t\n\r"))
+    if bad_names:
+        raise ConfigError(
+            f"{context} has invalid environment variable name(s): {', '.join(bad_names)}; an "
+            "env var name must be non-empty and contain no '=', whitespace, or NUL byte"
+        )
+
+
+_RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
+    {
+        "RUNPOD_API_KEY",
+        "VAST_API_KEY",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "GITHUB_TOKEN",
+        "FREESOLO_API_KEY",
+        "FREESOLO_INTERNAL_KEY",
+        "RUN_ID",
+        "HF_REPO",
+        "FLASH_ARM",
+    }
+)
+
+
+def _environment_secrets(raw: Any) -> tuple[str, ...]:
+    """Parse [environment].secrets as declared worker env-var secret names."""
+    if raw is None:
+        return ()
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+        raise ConfigError("[environment] secrets must be a list of environment variable names")
+    if not all(isinstance(name, str) for name in raw):
+        raise ConfigError("[environment] secrets entries must be strings")
+    secrets = tuple(dict.fromkeys(raw))
+    _validate_env_var_names(secrets, "[environment] secrets")
+    reserved = sorted(set(secrets) & _RESERVED_ENVIRONMENT_SECRET_KEYS)
+    if reserved:
+        raise ConfigError(
+            "[environment] secrets must not include platform-managed key(s): "
+            f"{', '.join(reserved)}"
+        )
+    return secrets
+
+
 def _worker_env(raw: Any) -> dict[str, str]:
     """Parse the optional [worker_env] table: per-run worker env overrides (string-valued)."""
     if raw is None:
@@ -192,12 +236,7 @@ def _worker_env(raw: Any) -> dict[str, str]:
     # ValueError for an empty name or one containing '=' or a NUL byte (and whitespace breaks most
     # shells). Reject these at parse time so a malformed [worker_env] (e.g. a TOML quoted key like
     # "BAD=KEY", or an empty key) fails on config load — not after a worker has been provisioned.
-    bad_names = sorted(repr(k) for k in env if (not k) or any(c in k for c in "=\0 \t\n\r"))
-    if bad_names:
-        raise ConfigError(
-            f"[worker_env] has invalid environment variable name(s): {', '.join(bad_names)}; an "
-            "env var name must be non-empty and contain no '=', whitespace, or NUL byte"
-        )
+    _validate_env_var_names(env, "[worker_env]")
     # [worker_env] is serialized into job_spec_json (persisted + logged), so it must NOT carry
     # secrets — they would leak into run artifacts. Reject secret-looking keys; operators set
     # those as real process environment variables (forwarded to the worker out-of-band) instead.

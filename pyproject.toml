@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "0.2.14"
+version = "0.2.15"
 description = "Flash — managed LoRA post-training (SFT/GRPO) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.10-3.12 (not 3.13 yet).
@@ -58,6 +58,19 @@ gpu = [
 # split (cost.spec.count_env_examples -> envs.load_environment -> the Freesolo adapter), so the server
 # needs the env-loading stack too -- not just the GPU worker.
 server = [
+    "fastapi",
+    "uvicorn",
+    "runpod-flash",
+    "httpx>=0.27",
+    "huggingface-hub>=0.34",
+    "datasets>=2.19",
+    "freesolo>=0.2.46",
+]
+# CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
+dev = [
+    "mypy>=1.13.0",
+    "pytest>=9.0.3",
+    "ruff>=0.6",
     "fastapi",
     "uvicorn",
     "runpod-flash",

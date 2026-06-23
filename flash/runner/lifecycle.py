@@ -65,10 +65,10 @@ def _submit_seed_supervised(
 ) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
-    Each attempt first ALLOCATES the GPU: the cheapest LIVE-VALIDATED class across providers
-    (RunPod live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
-    fresh per attempt because offers are a live market. There is no GPU pin and no provider pin —
-    the cheapest fitting class in the validated pool always wins.
+    Each attempt first ALLOCATES the GPU: the cheapest validated class across providers
+    that fits the model, priced from the static GPU table. Vast offers are re-resolved fresh
+    per attempt because those machines are a live market. There is no GPU pin and no provider
+    pin — the cheapest fitting class in the validated pool always wins.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF
     checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
@@ -196,7 +196,7 @@ def _submit_seed_supervised(
                 raise  # config-shaped: no GPU anywhere can run this job
             res = PollResult(False, failure="poll_error", detail=f"allocation: {exc}")
         if alloc is not None:
-            # allocate() above ran a live-market price walk; re-check cancellation
+            # allocate() above may have searched Vast offers; re-check cancellation
             # right before provisioning so a cancel during allocation doesn't still
             # launch a paid worker.
             with contextlib.suppress(FileNotFoundError):
@@ -219,7 +219,7 @@ def _submit_seed_supervised(
             run_spec = _spec_with_gpu(spec, chosen.gpu)
             current_gpu["name"] = chosen.gpu
             provider = get_provider(chosen.provider)
-            # Vast needs the live-market offer book for the chosen class first, then the
+            # Vast needs the offer book for the chosen class first, then the
             # other allocator-approved classes by price; RunPod ignores ``offers``.
             offers = None
             if chosen.provider == "vast":
