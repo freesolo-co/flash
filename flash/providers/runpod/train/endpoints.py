@@ -34,15 +34,15 @@ FLASH_SDK_LOCK = threading.Lock()
 
 # Quota semaphore: cap in-flight endpoints at 28 (RunPod's account-wide max-workers quota
 # is 30; the 2-slot buffer absorbs headroom for endpoints deployed by other tools/the CLI).
-# Every endpoint this process creates acquires one slot; terminate_endpoint / stop_endpoint
-# release it when the remote endpoint is torn down.  The semaphore is process-wide and
-# resets on restart — that's fine, because on restart there are no live endpoints from this
-# process.  Runs that find all slots occupied block here instead of failing with RunPod's
-# "Max workers across all endpoints must not exceed your workers quota (30)" error.
+# Every endpoint this process creates acquires one slot; terminate_endpoint releases it once
+# the remote endpoint is provably torn down.  The semaphore is process-wide and resets on
+# restart — that's fine, because on restart there are no live endpoints from this process.
+# Runs that find all slots occupied block here instead of failing with RunPod's "Max workers
+# across all endpoints must not exceed your workers quota (30)" error.
 _ENDPOINT_SLOTS = threading.Semaphore(28)
-# Track which endpoint names this process has acquired a slot for, so releases are
-# idempotent (both terminate_endpoint and stop_endpoint may attempt a release; only the
-# first one that finds the name here actually releases the semaphore).
+# Track which endpoint names this process has acquired a slot for, so releases are idempotent:
+# terminate_endpoint may run more than once for a name (e.g. a retry after a failed undeploy),
+# and only the call that still finds the name here actually releases the semaphore.
 _ACQUIRED_NAMES: set[str] = set()
 _ACQUIRED_NAMES_LOCK = threading.Lock()
 
@@ -54,9 +54,9 @@ def _release_endpoint_slot(name: str) -> bool:
 
     Returns ``True`` if a slot was released, ``False`` if this process never acquired one
     for ``name`` (e.g. a fresh ``flash cancel`` process, or the slot was already released).
-    The ``_ACQUIRED_NAMES`` tracking set makes this safe to call from both
-    ``terminate_endpoint`` and ``stop_endpoint`` — only the first call releases the
-    semaphore; subsequent calls are no-ops.
+    The ``_ACQUIRED_NAMES`` tracking set makes this idempotent — only the first call for a
+    name releases the semaphore; subsequent calls (e.g. a re-run of ``terminate_endpoint``)
+    are no-ops.
     """
     with _ACQUIRED_NAMES_LOCK:
         if name not in _ACQUIRED_NAMES:
@@ -356,8 +356,8 @@ def get_train_endpoint(
         return _ENDPOINT_CACHE[name]
     # Acquire a quota slot before creating the endpoint.  This blocks when all 28 slots are
     # occupied, making new runs queue here instead of failing with RunPod's worker-quota
-    # error.  The slot is released by terminate_endpoint (or stop_endpoint as a safety net)
-    # when the remote endpoint is torn down.
+    # error.  The slot is released by terminate_endpoint once the remote endpoint is provably
+    # torn down.
     if not _ENDPOINT_SLOTS.acquire(blocking=False):
         logger.info("Quota full (28/28 slots occupied) — waiting for a free slot...")
         _ENDPOINT_SLOTS.acquire()
@@ -543,23 +543,40 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
     # registry per-process under ~/.flash, so a recreated container (or a crash before
     # on_handle() persisted the endpoint id) leaves the live endpoint invisible to the
     # lookup above. Delete it via the RunPod REST API by its reconstructed name so it
-    # can't keep a paid worker alive.
+    # can't keep a paid worker alive.  ``rest_confirmed_absent`` records that the REST
+    # lookup actually RAN and found no endpoint of this name — i.e. we positively verified
+    # there is nothing to tear down (distinct from the API being unreachable, where we
+    # cannot tell and must keep holding the slot).
+    rest_confirmed_absent = False
     if not uids:
-        with contextlib.suppress(Exception):
+        try:
             from flash.providers.runpod import api as runpod_api
 
-            for ep in runpod_api.find_endpoints_by_name(target):
-                if ep.get("name") == target and runpod_api.delete_endpoint(ep["id"]):
+            matches = [
+                e for e in runpod_api.find_endpoints_by_name(target) if e.get("name") == target
+            ]
+            for ep in matches:
+                if runpod_api.delete_endpoint(ep["id"]):
                     results.append(
                         {"success": True, "name": target, "message": "deleted via REST API"}
                     )
+            # No endpoint of this name exists remotely — positively verified absent.
+            rest_confirmed_absent = not matches
+        except Exception as exc:
+            # REST API unreachable: we cannot prove the endpoint is gone, so do NOT treat this
+            # as "absent" — releasing on an unverified absence risks oversubscribing the quota.
+            logger.debug("REST endpoint lookup failed for %s: %s", target, exc)
 
     # Release the quota slot for this run's endpoint.  Only releases if this process
-    # previously acquired one (no-op in a fresh ``flash cancel`` process).  We release
-    # whenever at least one undeploy succeeded; stop_endpoint below acts as a safety net
-    # for the case where all undeploy attempts failed but we still remove the endpoint
-    # from our in-process cache.
-    if any(r.get("success") for r in results):
+    # previously acquired one (no-op in a fresh ``flash cancel`` process).  Release ONLY when
+    # the remote endpoint is provably gone: (a) at least one undeploy/delete succeeded, or
+    # (b) we positively verified no remote endpoint exists (registry returned no uids AND the
+    # REST lookup confirmed none — e.g. the endpoint never finished deploying, so its slot
+    # would otherwise leak forever and deadlock the queue).  We deliberately do NOT release on
+    # an undeploy/delete *failure*: the endpoint may still be live and counting against the
+    # RunPod quota, so releasing would oversubscribe it — the slot stays held until a later
+    # teardown confirms the endpoint is gone.  (stop_endpoint no longer releases the slot.)
+    if any(r.get("success") for r in results) or (not uids and rest_confirmed_absent):
         _release_endpoint_slot(target)
 
     # also drop the in-process cached handler for THIS run only (a class-wide
