@@ -47,13 +47,8 @@ def test_sanitize_name_never_returns_path_segments():
     assert envs._sanitize_name("My Env!") == "my-env"
 
 
-def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
+def test_publish_uploads_to_github_and_returns_slug(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setattr(
-        envs,
-        "_new_publish_id",
-        lambda: "12345678-1234-4321-abcd-123456789abc",
-    )
     captured: dict[str, object] = {}
 
     def fake_publish_once(*, dest, repo, token, publish_root, message):
@@ -74,8 +69,8 @@ def test_publish_uploads_to_github_and_returns_ref(monkeypatch):
         key={"email": "dev@clado.ai"},
     )
 
-    root = "dev-clado-ai/my-env/12345678-1234-4321-abcd-123456789abc"
-    assert ref == (f"github:freesolo-co/environment-hub@main:{root}/environment.py")
+    root = "dev-clado-ai/my-env"
+    assert ref == root
     assert captured["repo"] == "freesolo-co/environment-hub"
     assert captured["token"] == "ghp-test"
     assert captured["publish_root"] == root
@@ -220,7 +215,6 @@ def test_push_environment_commit_rebases_before_push(monkeypatch, tmp_path):
 def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     (tmp_path / "environment.py").write_text("def load_environment(**k): pass\n")
-    monkeypatch.setattr(envs, "_new_publish_id", lambda: "publish-1")
     calls = {"count": 0}
 
     def fake_publish_once(**_kwargs):
@@ -234,9 +228,7 @@ def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
     ref = envs._github_publish(tmp_path, name="e", key={"email": "dev@clado.ai"})
 
     assert calls["count"] == 2
-    assert ref == (
-        "github:freesolo-co/environment-hub@main:dev-clado-ai/e/publish-1/environment.py"
-    )
+    assert ref == "dev-clado-ai/e"
 
 
 def _git(cwd: Path, *args: str) -> None:

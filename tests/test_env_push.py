@@ -10,8 +10,8 @@ import tarfile
 from flash.cli import main as cli
 
 
-def _fake_client(capture: dict, *, slug: str = "github:freesolo-co/envs@main:acme/environment.py"):
-    """A stand-in ApiClient that records the publish_env call and returns a GitHub ref."""
+def _fake_client(capture: dict, *, slug: str = "acme/environment"):
+    """A stand-in ApiClient that records the publish_env call and returns an env id."""
 
     class _C:
         def publish_env(self, *, name, package_b64):
@@ -117,8 +117,7 @@ def test_push_sibling_config_does_not_override_explicit_name(monkeypatch, tmp_pa
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "grpo.toml").write_text(
-        'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "github:owner/repo@main:user/old-name/publish-id/environment.py"\n'
+        'model = "m"\nalgorithm = "grpo"\n[environment]\nid = "user/old-name"\n'
     )
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))

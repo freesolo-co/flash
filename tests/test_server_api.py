@@ -508,7 +508,7 @@ def test_logs_offset_paging(api):
 
 
 def test_local_env_path_rejected(api):
-    # GitHub Freesolo-only: a local [environment] path is rejected on the managed service.
+    # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()
     bad = {**SPEC, "environment": {"id": "custom", "path": "/home/user/env.py"}}
     r = api.post("/v1/runs", json={"spec": bad, "dry_run": True}, headers=_bearer(key))
@@ -840,7 +840,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
-    """POST /v1/envs publishes an uploaded package to the managed GitHub environment repo."""
+    """POST /v1/envs publishes an uploaded package to the managed environment hub."""
     import base64
     import io
     import tarfile
@@ -848,11 +848,6 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     import flash.server.envs as envs_mod
 
     published_roots: list[str] = []
-    monkeypatch.setattr(
-        envs_mod,
-        "_new_publish_id",
-        lambda: "12345678-1234-4321-abcd-123456789abc",
-    )
     monkeypatch.setattr(
         envs_mod,
         "_github_publish_once",
@@ -877,11 +872,8 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     )
     assert resp.status_code == 200
     ref = resp.json()["id"]
-    assert ref.startswith("github:")
-    assert ref.endswith("/myenv/12345678-1234-4321-abcd-123456789abc/environment.py")
-    assert any(
-        root.endswith("/myenv/12345678-1234-4321-abcd-123456789abc") for root in published_roots
-    )
+    assert ref.endswith("/myenv")
+    assert any(root.endswith("/myenv") for root in published_roots)
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
@@ -899,7 +891,7 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
 
     def fake_publish_package(*, package_b64, name, key):
         seen.update(package_b64=package_b64, name=name, key=key)
-        return "github:freesolo-co/environment-hub@main:user-example-com/e/publish-1/environment.py"
+        return "key-1/e"
 
     monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
 
