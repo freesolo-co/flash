@@ -67,10 +67,9 @@ def cmd_login(args) -> int:
     api_url = args.api_url or load_credentials()[0]
     # save_credentials clears the stored url when it's the default, so logging into the
     # default plane also drops a stale custom url from a previous custom-URL login.
-    path = save_credentials(api_key, api_url=api_url)
+    _ = save_credentials(api_key, api_url=api_url)
     # Never echo the key itself; the stored file is the single source of truth.
-    print(f"logged in: freesolo verified your key (saved to {path})")
-    print("you're ready to train — try `flash train <config.toml>`")
+    print("logged in with your freesolo key")
     return 0
 
 
@@ -82,9 +81,9 @@ def cmd_whoami(args) -> int:
 _STARTER_ENV_PY = '''\
 """Starter local Freesolo environment.
 
-Replace the dataset and reward with your task, then upload it to GitHub with
-`flash env push environments/starter_env.py`. A managed run references the returned
-GitHub environment id in [environment] id.
+Replace the dataset and reward with your task, then upload it with
+`flash env push environments/starter_env.py`. A managed run references the
+returned environment id in [environment] id.
 """
 
 from freesolo.datasets.types import TaskExample
@@ -128,7 +127,7 @@ def cmd_lab_setup(args) -> int:
         sample.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
-            "# Environment: a GitHub Freesolo environment ref. Publish the scaffolded\n"
+            "# Environment: a Freesolo environment ref. Publish the scaffolded\n"
             "# environments/starter_env.py with `flash env push environments/starter_env.py`\n"
             "# to get the id, and set it below.\n"
             "[environment]\n"
@@ -201,7 +200,7 @@ def cmd_env_init(args) -> int:
     # EnvironmentSingleTurn.
     (root / f"{mod}.py").write_text(
         f'"""Custom Freesolo environment ({args.name}).\n\n'
-        "Replace the dataset and reward with your task, then upload it to GitHub\n"
+        "Replace the dataset and reward with your task, then upload it\n"
         f"with `flash env push environments/{mod}/{mod}.py` and reference the returned id\n"
         "in your config.\n"
         '"""\n\n'
@@ -236,7 +235,7 @@ def cmd_env_list(args) -> int:
 
     installed = list_installed_environments()
     if installed:
-        print("installed (Freesolo GitHub refs):")
+        print("installed environments:")
         for env_id in installed:
             print(f"  {env_id}")
     local = Path("environments")
@@ -244,7 +243,7 @@ def cmd_env_list(args) -> int:
         # Both directory envs (environments/<name>/<name>.py) and top-level single-file
         # modules (environments/<name>.py, e.g. the `flash lab` starter env). These are local
         # env SOURCES — publish one with `flash env push <path>` to run it on the managed
-        # service by its GitHub id.
+        # service by its environment id.
         paths: list[str] = []
         for p in local.iterdir():
             if p.name.startswith("__"):
@@ -270,7 +269,8 @@ def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
     Catalog-only and deterministic; an uncapped SFT run tries to count the env's train split, and
-    falls back to a default example count (with a warning) when the GitHub env isn't importable here."""
+    falls back to a default example count (with a warning) when the environment isn't
+    importable here."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(

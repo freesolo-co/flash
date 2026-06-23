@@ -91,7 +91,6 @@ def test_publish_rejects_bad_input(monkeypatch):
 
 def test_publish_requires_github_token(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("FLASH_ENV_GITHUB_TOKEN", raising=False)
     with pytest.raises(envs.EnvPublishError) as excinfo:
         envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", is_new=True, key={})
     assert excinfo.value.status == 503

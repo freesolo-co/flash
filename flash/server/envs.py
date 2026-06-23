@@ -110,7 +110,7 @@ def _github_branch() -> str:
 
 
 def _github_token() -> str | None:
-    return os.environ.get("FLASH_ENV_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    return os.environ.get("GITHUB_TOKEN")
 
 
 def _github_json(
@@ -206,7 +206,7 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     token = _github_token()
     if not token:
         raise EnvPublishError(
-            "FLASH_ENV_GITHUB_TOKEN or GITHUB_TOKEN is required to upload environments to GitHub",
+            "GITHUB_TOKEN is required to upload environments to GitHub",
             status=503,
         )
     repo = _github_repo()

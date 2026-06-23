@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 import flash.providers.preflight as pf
@@ -14,7 +12,6 @@ def clean_env(monkeypatch):
     for var in (
         "RUNPOD_API_KEY",
         "GITHUB_TOKEN",
-        "FLASH_ENV_GITHUB_TOKEN",
         "HF_REPO",
         "HF_TOKEN",
         "VAST_API_KEY",
@@ -28,7 +25,6 @@ def test_preflight_lists_all_missing(clean_env):
     msg = str(excinfo.value)
     assert "RUNPOD_API_KEY" in msg
     assert "GITHUB_TOKEN" in msg
-    assert "FLASH_ENV_GITHUB_TOKEN" in msg
     assert "HF_REPO" not in msg
     assert "HF_TOKEN" in msg
     assert "operator" in msg
@@ -39,14 +35,6 @@ def test_preflight_passes_when_present(clean_env, monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-key")
     monkeypatch.setenv("HF_TOKEN", "hf_token")
     pf.check_run_preflight()
-
-
-def test_preflight_accepts_flash_github_token_fallback(clean_env, monkeypatch):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
-    monkeypatch.setenv("FLASH_ENV_GITHUB_TOKEN", "ghp-key")
-    monkeypatch.setenv("HF_TOKEN", "hf_only_token")
-    pf.check_run_preflight()
-    assert os.environ.get("HF_TOKEN") == "hf_only_token"
 
 
 def test_preflight_require_hf_false_still_needs_provider_keys(clean_env, monkeypatch):

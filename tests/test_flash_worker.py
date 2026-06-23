@@ -65,10 +65,10 @@ def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
     """The worker needs GitHub access to resolve private Freesolo environment refs."""
     from flash.providers.runpod.train import build_worker_env
 
-    monkeypatch.setenv("FLASH_ENV_GITHUB_TOKEN", "ghp-secret")
-    assert build_worker_env(_spec(), 0).get("FLASH_ENV_GITHUB_TOKEN") == "ghp-secret"
-    monkeypatch.delenv("FLASH_ENV_GITHUB_TOKEN", raising=False)
-    assert "FLASH_ENV_GITHUB_TOKEN" not in build_worker_env(_spec(), 0)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
+    assert build_worker_env(_spec(), 0).get("GITHUB_TOKEN") == "ghp-secret"
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    assert "GITHUB_TOKEN" not in build_worker_env(_spec(), 0)
 
 
 def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(monkeypatch):

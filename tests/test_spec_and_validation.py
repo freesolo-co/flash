@@ -115,7 +115,7 @@ def test_bare_environment_id_is_rejected() -> None:
     ):
         raw = _raw()
         raw["environment"] = {"id": bad}
-        with pytest.raises(ConfigError, match=r"GitHub Freesolo environment ref"):
+        with pytest.raises(ConfigError, match=r"Freesolo environment ref"):
             spec_from_dict(raw)
 
 
@@ -386,7 +386,6 @@ def test_configure_logging_verbosity() -> None:
         "AWS_SECRET_ACCESS_KEY",  # SECRET word + KEY qualified by SECRET/ACCESS
         "DB_PASSWORD",  # PASSWORD word
         "GITHUB_TOKEN",
-        "FLASH_ENV_GITHUB_TOKEN",
         "WANDB_API_KEY",
         "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
         "MY_CREDENTIAL",
