@@ -437,6 +437,78 @@ def assert_lora_applied(model, model_id: str) -> int:
     return count
 
 
+def assert_adapter_load_clean(load_result, model_id: str) -> None:
+    """Assert a peft adapter load matched ALL saved keys — fail closed on a silent discard.
+
+    ``PeftModel.from_pretrained`` loads adapter weights with ``load_state_dict(strict=False)`` and
+    only WARNS on a key mismatch (it throws the load result away), so an SFT adapter whose keys don't
+    line up with the target base is silently dropped and GRPO restarts from the base model (bug #67).
+    ``assert_lora_applied`` can't catch this: peft INJECTS the LoRA modules from ``target_modules``
+    BEFORE loading any weights, so the module count is non-zero even when zero saved weights matched.
+
+    ``load_result`` is the object returned by ``PeftModel.load_adapter`` (a ``_IncompatibleKeys`` with
+    ``missing_keys`` / ``unexpected_keys``). We only care about LoRA keys: an adapter-only checkpoint
+    loaded with ``strict=False`` legitimately leaves the base-model params out, so they can surface as
+    "missing" without anything being wrong. peft's ``load_adapter`` already filters ``missing_keys`` to
+    the tuner prefix, but we re-filter to keys carrying the LoRA prefix (``lora_``) ourselves so a
+    benign base-weight miss never aborts a correct warm-start even if peft's internal filtering
+    changes. Raises if any injected LoRA module got no saved weight (``missing_keys``) or any saved
+    LoRA key matched no module (``unexpected_keys``) — i.e. matched != saved.
+    """
+
+    def _lora_only(keys):
+        # the #67 mismatch keys (e.g. ...lora_A.default.weight) all carry this prefix; base-model
+        # params do not, so this drops the benign base misses peft can report under strict=False.
+        return [k for k in (keys or []) if "lora_" in k]
+
+    missing = _lora_only(getattr(load_result, "missing_keys", None))
+    unexpected = _lora_only(getattr(load_result, "unexpected_keys", None))
+    if missing or unexpected:
+        raise RuntimeError(
+            f"warm-start adapter for {model_id} did NOT load cleanly: {len(missing)} injected LoRA "
+            f"module(s) got no saved weight (missing) and {len(unexpected)} saved adapter key(s) "
+            "matched no module (unexpected). The adapter was silently discarded -> GRPO would restart "
+            "from the base model. For Qwen3.5/3.6 VL this is the '.language_model.' key mismatch "
+            "(check remap_vl_adapter_dir ran on the adapter); otherwise the adapter's keys don't match "
+            f"the base. missing[:3]={missing[:3]} unexpected[:3]={unexpected[:3]}"
+        )
+    print(
+        f"[init-adapter] adapter load matched all saved keys for {model_id} (no missing/unexpected)"
+    )
+
+
+def assert_adapter_delta_nonzero(model, model_id: str) -> int:
+    """Assert at least one ``lora_B`` weight is non-zero — the adapter is not an identity no-op.
+
+    With standard zero-B init (``init_lora_weights=True``), a freshly-injected-but-unloaded adapter
+    has ``lora_B == 0`` everywhere, so the effective delta ``(B @ A) * scaling`` is identically zero
+    and the warm-started model equals the base. A real SFT adapter that actually loaded has non-zero
+    ``lora_B``. This is an API-independent backstop to ``assert_adapter_load_clean``: it catches a
+    silent discard even if peft's load-result shape changes. Returns the count of non-zero ``lora_B``
+    modules. When no ``lora_B`` modules exist at all, defers to ``assert_lora_applied`` (no raise).
+    """
+    seen = 0
+    nonzero = 0
+    for name, module in model.named_modules():
+        if not name.endswith("lora_B.default"):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            continue
+        seen += 1
+        if bool(weight.detach().ne(0).any()):
+            nonzero += 1
+    if seen and nonzero == 0:
+        raise RuntimeError(
+            f"warm-start adapter for {model_id} has ALL-ZERO lora_B weights across {seen} module(s) — "
+            "the adapter delta is identically zero (an unloaded / silently-discarded adapter). GRPO "
+            "would train from the base model. Verify the adapter's keys match the base (see "
+            "remap_vl_adapter_dir)."
+        )
+    print(f"[init-adapter] verified non-zero lora_B in {nonzero}/{seen} module(s) for {model_id}")
+    return nonzero
+
+
 def model_quant(model_id: str) -> str:
     """Quantization tier for this model: catalog entry > bf16 (managed; no override).
 
