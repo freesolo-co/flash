@@ -55,6 +55,19 @@ _OPT_OUT_ENV = "FLASH_NO_UPDATE_CHECK"
 # response can't inject escape codes into the notice. The length bound is just a sanity cap.
 _SAFE_VERSION = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9.+!_-]{0,63}\Z")
 
+# A coarse subset of the PEP 440 grammar: the numeric release plus optional pre/post/dev markers.
+# Enough to order the simple versions this package ships and to spot pre-releases; this is not a
+# full PEP 440 implementation (the stdlib-only client can't depend on `packaging`).
+_VERSION_RE = re.compile(
+    r"""\A\s*v?
+        (?P<release>\d+(?:\.\d+)*)
+        (?P<pre>[._-]?(?:alpha|beta|preview|pre|rc|a|b|c)\d*)?
+        (?P<post>[._-]?(?:post|rev|r)\d*|-\d+)?
+        (?P<dev>[._-]?dev\d*)?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 
 def _enabled() -> bool:
     """The whole feature is off unless stderr is a TTY and the user hasn't opted out."""
@@ -68,22 +81,42 @@ def _enabled() -> bool:
         return False
 
 
-def _release_tuple(version: str) -> tuple[int, ...]:
-    """Leading numeric release segment of a version, e.g. ``"0.2.12"`` -> ``(0, 2, 12)``.
+def _normalize_release(release: tuple[int, ...]) -> tuple[int, ...]:
+    """Drop trailing zeros so ``1.0`` and ``1.0.0`` compare equal (keep at least one segment)."""
+    parts = list(release)
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
 
-    Anything after the release (pre-release/dev/local suffixes) is ignored. Returns ``()``
-    when no leading numeric segment is found, which compares as "older than everything".
+
+def _version_key(version: str) -> tuple[tuple[int, ...], int, int]:
+    """A coarse PEP 440 sort key ``(release, final_rank, post)`` where higher means newer.
+
+    The release segment is normalized (``1.0 == 1.0.0``). A pre-release/dev version ranks below
+    the final release of the same number (``final_rank`` 0 vs 1); a post-release ranks above it
+    via ``post``. Epochs and local versions are ignored — the catalog ships only simple versions.
+    Returns an empty release for unparseable input, which compares as "older than everything".
     """
-    match = re.match(r"\s*v?(\d+(?:\.\d+)*)", version or "")
+    match = _VERSION_RE.match(version or "")
     if not match:
-        return ()
-    return tuple(int(part) for part in match.group(1).split("."))
+        return ((), 1, 0)
+    release = _normalize_release(tuple(int(part) for part in match.group("release").split(".")))
+    is_pre = bool(match.group("pre") or match.group("dev"))
+    post_digits = re.search(r"\d+", match.group("post") or "")
+    post = int(post_digits.group()) if post_digits else 0
+    return (release, 0 if is_pre else 1, post)
+
+
+def _is_prerelease(version: str) -> bool:
+    """True when the version carries a pre-release or dev marker (a/b/c/rc/alpha/beta/dev)."""
+    match = _VERSION_RE.match(version or "")
+    return bool(match and (match.group("pre") or match.group("dev")))
 
 
 def _is_newer(latest: str, current: str) -> bool:
-    """True only when ``latest`` is a strictly newer release than ``current``."""
-    latest_release = _release_tuple(latest)
-    return bool(latest_release) and latest_release > _release_tuple(current)
+    """True only when ``latest`` is a strictly newer version than ``current`` (PEP 440 order)."""
+    latest_key = _version_key(latest)
+    return bool(latest_key[0]) and latest_key > _version_key(current)
 
 
 def _clean_version(value: object) -> str | None:
@@ -97,7 +130,11 @@ def _clean_version(value: object) -> str | None:
 
 
 def _read_cache() -> dict:
-    return read_json_or_empty(CACHE_PATH)
+    # read_json_or_empty returns whatever the file parses to; a non-object (e.g. ``[]``) would
+    # make the ``.get()`` callers raise, and _check_due runs before main()'s error handling — so
+    # coerce anything that isn't a dict back to an empty one.
+    cache = read_json_or_empty(CACHE_PATH)
+    return cache if isinstance(cache, dict) else {}
 
 
 def _check_due(now: float) -> bool:
@@ -131,9 +168,14 @@ def _refresh_cache() -> None:
     """Hit PyPI and persist the result; runs in a daemon thread, so never raises out."""
     try:
         latest = _fetch_latest_version()
-        if not latest:
-            return
-        secure_json_write(CACHE_PATH, {"checked_at": time.time(), "pypi_version": latest})
+        # Always stamp the attempt time, even on failure: otherwise _check_due stays true and a
+        # firewalled/offline user would re-run the lookup (and pay the join wait) on every
+        # command instead of once a day. Keep any previously known version when the fetch fails.
+        cache = _read_cache()
+        cache["checked_at"] = time.time()
+        if latest:
+            cache["pypi_version"] = latest
+        secure_json_write(CACHE_PATH, cache)
     except Exception as exc:  # truly never let a background thread escape
         logger.debug("update check: refresh failed: %s", exc)
 
@@ -149,7 +191,8 @@ def _red(text: str) -> str:
 def _build_notice() -> str | None:
     """Build the upgrade notice from the cached PyPI version, or ``None`` if up to date."""
     latest = _clean_version(_read_cache().get("pypi_version"))
-    if not latest or not _is_newer(latest, __version__):
+    # Only nudge toward stable releases: never advertise a pre-release (rc/dev) as an upgrade.
+    if not latest or _is_prerelease(latest) or not _is_newer(latest, __version__):
         return None
     return _red(
         f"A new release of {PACKAGE_NAME} is available: {__version__} -> {latest}\n"
