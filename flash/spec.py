@@ -159,9 +159,9 @@ class TrainSpec:
 class GpuSpec:
     # The parse-time provisional GPU class (cheapest VALIDATED class that fits the model). GPU
     # pinning is gone: the submit-time allocator always re-picks the cheapest fitting validated
-    # class across ALL providers, so a config's gpu.type does NOT pin — ``type`` is just the
-    # offline sizing/display default and the carrier the runner overwrites with the
-    # actually-allocated class.
+    # active RunPod class, so a config's gpu.type does NOT pin — ``type`` is just the offline
+    # sizing/display default and the carrier the runner overwrites with the actually-allocated
+    # class.
     type: str = DEFAULT_GPU
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
@@ -172,18 +172,10 @@ class GpuSpec:
     # cross-run HF model cache (repeat runs skip the model download). Trade-offs: it
     # pins the run to the volume's datacenter (smaller GPU pool — usually the bigger
     # cost) and the volume bills monthly while it exists. Off (None) by default.
-    # RunPod-specific: network_volume/datacenter are read only by the RunPod provider
-    # and ignored by Vast (which rents single-GPU instances with no network volume).
+    # RunPod-specific: network_volume/datacenter are read only by the RunPod provider.
     network_volume: str | None = None
     network_volume_gb: int = 100
     datacenter: str | None = None  # e.g. "EU-RO-1"; required pool pin for the volume
-    # OPT-IN per-run provider pin. Unlike gpu.type (no pin — the submit-time allocator always
-    # re-picks the cheapest fitting validated CLASS across ALL providers), provider pins which
-    # SUBSTRATE the allocator may use: "vast" or "runpod" restricts allocation to that provider;
-    # None (default) keeps the cross-provider cheapest-wins behavior. Used for A/B-ing one provider
-    # against the full pool. The allocator raises a clear error if the pinned provider isn't
-    # available/configured.
-    provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -282,7 +274,6 @@ class JobSpec:
                 network_volume=gpu.get("network_volume"),
                 network_volume_gb=int(gpu.get("network_volume_gb", 100)),
                 datacenter=gpu.get("datacenter"),
-                provider=gpu.get("provider"),
             ),
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),
