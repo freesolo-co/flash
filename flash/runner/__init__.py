@@ -79,6 +79,12 @@ class RunStatus:
     # re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
     realized_cost_usd: float | None = None
     reconciled_at: float | None = None
+    # Non-secret customer billing context, set for externally-submitted runs. Completion-time
+    # billing uses this org id with the operator internal key; user API keys are not persisted.
+    billing_context: dict | None = None
+    billing_state: str | None = None
+    billing_error: str | None = None
+    billing_charge: dict | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -194,6 +200,7 @@ def submit_job(
     dry_run: bool = False,
     background: bool = False,
     runtime_secrets: dict[str, str] | None = None,
+    billing_context: dict | None = None,
 ) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     across the configured providers (RunPod Flash or Vast); dry-run only records state."""
@@ -205,7 +212,13 @@ def submit_job(
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
     spec = _assign_managed_hf_repo(spec)
-    status = RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+    status = RunStatus(
+        run_id=spec.run_id,
+        state="queued",
+        spec=spec.to_dict(),
+        billing_context=billing_context,
+        billing_state="pending" if billing_context else None,
+    )
     _save_status(status)
     if dry_run:
         status.state = "dry_run"
