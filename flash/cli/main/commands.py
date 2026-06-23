@@ -98,13 +98,13 @@ from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 
 DATASET = [
-    {"task": "What is 2 + 2?", "expected_output": "4"},
-    {"task": "What is 3 + 5?", "expected_output": "8"},
+    {"input": "What is 2 + 2?", "output": "4"},
+    {"input": "What is 3 + 5?", "output": "8"},
 ]
 
 
 def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult:
-    expected = str(example.expected_output or "").strip()
+    expected = str(example.record["output"]).strip()
     score = 1.0 if expected and expected in response_text else 0.0
     return RewardResult(score=score, threshold=1.0)
 
@@ -113,7 +113,7 @@ class StarterEnv(EnvironmentSingleTurn):
     dataset = DATASET
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
-        return [{"role": "user", "content": example.task}]
+        return [{"role": "user", "content": str(example.record["input"])}]
 
     def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
         return exact_match_reward(example, response_text)
@@ -239,15 +239,15 @@ def cmd_env_init(args) -> int:
         "from freesolo.datasets.types import TaskExample\n"
         "from freesolo.environments import EnvironmentSingleTurn, RewardResult\n\n\n"
         "DATASET = [\n"
-        '    {"task": "What is 2 + 2?", "expected_output": "4"},\n'
-        '    {"task": "What is 3 + 5?", "expected_output": "8"},\n'
+        '    {"input": "What is 2 + 2?", "output": "4"},\n'
+        '    {"input": "What is 3 + 5?", "output": "8"},\n'
         "]\n\n\n"
         "class CustomEnv(EnvironmentSingleTurn):\n"
         "    dataset = DATASET\n\n"
         "    def build_prompt_messages(self, example: TaskExample, prompt_text: str):\n"
-        '        return [{"role": "user", "content": example.task}]\n\n'
+        '        return [{"role": "user", "content": str(example.record["input"])}]\n\n'
         "    def score_response(self, example: TaskExample, response_text: str) -> RewardResult:\n"
-        '        expected = str(example.expected_output or "").strip()\n'
+        '        expected = str(example.record["output"]).strip()\n'
         "        score = 1.0 if expected and expected in response_text else 0.0\n"
         "        return RewardResult(score=score, threshold=1.0)\n\n\n"
         "def load_environment(**kwargs) -> CustomEnv:\n"
