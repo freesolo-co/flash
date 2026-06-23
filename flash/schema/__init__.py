@@ -91,14 +91,42 @@ def _apply_override(raw: dict, item: str) -> None:
 # remain RECOGNIZED — not rejected — because a round-tripped JobSpec (spec.to_dict(), which the
 # control plane re-parses on submit) still carries them; rejecting would break that re-validation.
 _TOP_LEVEL_KEYS = frozenset(
-    {"model", "algorithm", "model_policy", "thinking",
-     "environment", "train", "gpu", "worker_env", "wandb", "run_id"}
+    {
+        "model",
+        "algorithm",
+        "model_policy",
+        "thinking",
+        "environment",
+        "train",
+        "gpu",
+        "worker_env",
+        "wandb",
+        "run_id",
+    }
 )
 _TRAIN_KEYS = frozenset(
-    {"steps", "epochs", "lora_rank", "lora_alpha", "seeds", "init_from_adapter", "hf_repo",
-     "learning_rate", "batch_size", "max_length", "save_every", "group_size", "temperature",
-     "max_tokens", "kl_penalty_coef", "advantage_clip", "thinking_length_penalty_coef",
-     "stop_sequences", "max_steps", "max_examples"}
+    {
+        "steps",
+        "epochs",
+        "lora_rank",
+        "lora_alpha",
+        "seeds",
+        "init_from_adapter",
+        "hf_repo",
+        "learning_rate",
+        "batch_size",
+        "max_length",
+        "save_every",
+        "group_size",
+        "temperature",
+        "max_tokens",
+        "kl_penalty_coef",
+        "advantage_clip",
+        "thinking_length_penalty_coef",
+        "stop_sequences",
+        "max_steps",
+        "max_examples",
+    }
 )
 # Allowed values for the OPT-IN [gpu] provider pin (mirrors providers.PROVIDER_NAMES); unset keeps
 # cross-provider cheapest-wins allocation.
@@ -320,13 +348,13 @@ def _validate_spec(spec: JobSpec) -> None:
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (a GitHub Freesolo environment ref, "
-            'e.g. "github:freesolo-co/training@main:path/to/freesolo/environment.py"); '
+            'e.g. "github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py"); '
             "there is no local path mode"
         )
     _require_environment_ref(
         spec.environment.id,
         "[environment] id must be a GitHub Freesolo environment ref "
-        '(for example "github:owner/repo@main:path/to/freesolo/environment.py")',
+        '(for example "github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py")',
     )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")
