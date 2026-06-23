@@ -159,9 +159,8 @@ def test_sft_steps_max_examples_zero_means_no_cap(monkeypatch):
 
 def test_sft_steps_unpinned_falls_back_when_env_cannot_be_counted(monkeypatch, capsys):
     # A managed Freesolo env may not be importable in the local cost path, so counting returns None.
-    # Pricing must NOT hard-fail: it falls back to
-    # a representative default example count (with a clear warning) so `flash train --cost` still
-    # produces a quote without pinning [train].max_examples.
+    # Pricing must NOT hard-fail: it falls back to a representative default example count so
+    # `flash train --cost` still produces a quote.
     from flash.cost.spec import DEFAULT_UNCOUNTED_SFT_EXAMPLES
 
     monkeypatch.setattr("flash.cost.spec.count_env_examples", lambda env_id, params=None: None)
@@ -172,9 +171,7 @@ def test_sft_steps_unpinned_falls_back_when_env_cannot_be_counted(monkeypatch, c
         examples=DEFAULT_UNCOUNTED_SFT_EXAMPLES, requested_batch=16, epochs=2
     )
     assert steps > 0
-    warning = capsys.readouterr().err
-    assert "could not count training examples" in warning
-    assert "max_examples" in warning  # the warning still points at the exact-cost knob
+    assert capsys.readouterr().err == ""
 
 
 def test_sft_steps_pinned_examples_skips_the_uncounted_fallback(monkeypatch, capsys):
