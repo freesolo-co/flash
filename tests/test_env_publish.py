@@ -32,18 +32,12 @@ def _pkg_b64(files: dict[str, str]) -> str:
 def test_namespace_is_stable_and_repo_safe():
     assert envs.namespace_for({"email": "Dev@Clado.ai"}) == "dev-clado-ai"
     assert envs.namespace_for({"email": "dev@clado.ai"}) == "dev-clado-ai"
-    assert envs.namespace_for({"id": 7}) == "key-7"
-    assert envs.namespace_for({"key_prefix": "fslo-abc"}) == "fslo-abc"
-    assert envs.namespace_for({}) == "user"
 
 
-def test_namespace_distinct_for_placeholder_emails():
-    k1 = {"id": 11, "email": "freesolo-user", "key_prefix": "freesolo"}
-    k2 = {"id": 12, "email": "freesolo-user", "key_prefix": "freesolo"}
-    ns1, ns2 = envs.namespace_for(k1), envs.namespace_for(k2)
-    assert ns1 != ns2
-    assert "freesolo-user" not in (ns1, ns2)
-    assert envs.namespace_for(dict(k1)) == ns1
+def test_namespace_requires_email():
+    for key in ({"id": 7}, {"key_prefix": "fslo-abc"}, {}, {"email": "missing-email"}):
+        with pytest.raises(envs.EnvPublishError, match="email"):
+            envs.namespace_for(key)
 
 
 def test_sanitize_name_never_returns_path_segments():
@@ -104,7 +98,7 @@ def test_publish_rejects_bad_input(monkeypatch):
             package_b64=_pkg_b64({"pyproject.toml": "[project]\nname='e'\n"}),
             name="e",
             is_new=True,
-            key={},
+            key={"email": "dev@clado.ai"},
         )
 
 
@@ -186,8 +180,20 @@ def test_safe_extract_rejects_special_members(tmp_path):
         assert not (tmp_path / f"evil-{label}").exists()
 
 
-def test_safe_extract_rejects_workflow_control_paths(tmp_path):
-    for label in (".github", ".git", "source", "./.github", "./.git", "./source"):
+def test_safe_extract_rejects_repo_control_source_and_data_paths(tmp_path):
+    for label in (
+        ".github",
+        ".git",
+        "data",
+        "databases",
+        "datasets",
+        "db",
+        "source",
+        "./.github",
+        "./.git",
+        "./datasets",
+        "./source",
+    ):
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             d = tarfile.TarInfo(f"{label}/workflows")
@@ -227,10 +233,12 @@ def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
     monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
     monkeypatch.setattr(envs.time, "sleep", lambda _seconds: None)
 
-    ref = envs._github_publish(tmp_path, name="e", key={"id": 1})
+    ref = envs._github_publish(tmp_path, name="e", key={"email": "dev@clado.ai"})
 
     assert calls["count"] == 2
-    assert ref == "github:freesolo-co/environment-hub@main:key-1/e/publish-1/environment.py"
+    assert ref == (
+        "github:freesolo-co/environment-hub@main:dev-clado-ai/e/publish-1/environment.py"
+    )
 
 
 def _git(cwd: Path, *args: str) -> None:

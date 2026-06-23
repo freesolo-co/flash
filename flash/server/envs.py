@@ -26,7 +26,15 @@ _MAX_MEMBERS = 5000
 _DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
 _GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
-_BLOCKED_TOP_LEVEL_PATHS = {".github", ".git", "source"}
+_BLOCKED_TOP_LEVEL_PATHS = {
+    ".github",
+    ".git",
+    "data",
+    "databases",
+    "datasets",
+    "db",
+    "source",
+}
 _GIT_TIMEOUT_S = 180
 _GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
@@ -43,13 +51,9 @@ class EnvPublishError(Exception):
 
 def namespace_for(key: dict) -> str:
     email = str(key.get("email") or "")
-    if "@" in email:
-        raw = email
-    elif key.get("id") is not None:
-        raw = f"key-{key['id']}"
-    else:
-        raw = str(key.get("key_prefix") or "user")
-    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    if "@" not in email:
+        raise EnvPublishError("authenticated Freesolo key must include an email")
+    slug = re.sub(r"[^a-z0-9]+", "-", email.lower()).strip("-")
     return slug or "user"
 
 
@@ -89,7 +93,7 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                     raise EnvPublishError(f"unsafe path in env package: {member.name!r}")
                 if segments[0] in _BLOCKED_TOP_LEVEL_PATHS:
                     raise EnvPublishError(
-                        "env packages must not contain .github, .git, or source top-level paths"
+                        "env packages must not contain repo-control, source, or data top-level paths"
                     )
                 if member.islnk() or member.issym():
                     raise EnvPublishError(f"links are not allowed in env packages: {member.name!r}")

@@ -82,10 +82,13 @@ _STARTER_ENV_PY = '''\
 """Starter Freesolo environment.
 
 Edit the dataset and reward code, then upload with
-`flash env push environments/starter/environment.py`.
+`flash env push --name my-env environments/environment.py`.
 
 A managed run should use the returned [environment] id from
 `flash env push`.
+
+Keep real SFT/RL datasets in Freesolo or Hugging Face dataset storage. This
+inline dataset is only a smoke-test fixture.
 """
 
 from __future__ import annotations
@@ -100,6 +103,12 @@ DATASET = [
 ]
 
 
+def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult:
+    expected = str(example.expected_output or "").strip()
+    score = 1.0 if expected and expected in response_text else 0.0
+    return RewardResult(score=score, threshold=1.0)
+
+
 class StarterEnv(EnvironmentSingleTurn):
     dataset = DATASET
 
@@ -107,9 +116,7 @@ class StarterEnv(EnvironmentSingleTurn):
         return [{"role": "user", "content": example.task}]
 
     def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
-        expected = str(example.expected_output or "").strip()
-        score = 1.0 if expected and expected in response_text else 0.0
-        return RewardResult(score=score, threshold=1.0)
+        return exact_match_reward(example, response_text)
 
 
 def load_environment(
@@ -129,14 +136,12 @@ def cmd_env_setup(args) -> int:
     Path("configs/endpoints.toml").write_text(
         "# OpenAI-compatible endpoints returned by `flash deploy` can be stored here.\n"
     )
-    starter_env_dir = Path("environments/starter")
-    starter_env_dir.mkdir(exist_ok=True, parents=True)
-    starter_env = Path(starter_env_dir / "environment.py")
+    starter_env = Path("environments/environment.py")
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
     env_comment = (
-        "# Environment: upload the scaffolded environments/starter/environment.py with\n"
-        "# `flash env push environments/starter/environment.py`, then paste the returned id below.\n"
+        "# Environment: upload the scaffolded environments/environment.py with\n"
+        "# `flash env push --name my-env environments/environment.py`, then paste the returned id below.\n"
         "[environment]\n"
         'id = ""\n\n'
     )
@@ -167,7 +172,7 @@ def cmd_env_setup(args) -> int:
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
     print(
-        "created environments/starter/environment.py, configs/, "
+        "created environments/environment.py, configs/, "
         "configs/grpo.toml, configs/sft.toml, configs/endpoints.toml"
     )
     return 0
@@ -228,7 +233,7 @@ def cmd_env_init(args) -> int:
     (root / f"{mod}.py").write_text(
         f'"""Custom Freesolo environment ({args.name}).\n\n'
         "Replace the dataset and reward with your task, then upload it\n"
-        f"with `flash env push environments/{mod}/{mod}.py` and reference the returned id\n"
+        f"with `flash env push --name {mod} environments/{mod}/{mod}.py` and reference the returned id\n"
         "in your config.\n"
         '"""\n\n'
         "from freesolo.datasets.types import TaskExample\n"
@@ -251,7 +256,7 @@ def cmd_env_init(args) -> int:
     (root / "README.md").write_text(f"# {args.name}\n\nCustom Freesolo environment for Flash.\n")
     print(f"created {root}")
     print(
-        f"upload it with `flash env push environments/{mod}/{mod}.py`, then reference "
+        f"upload it with `flash env push --name {mod} environments/{mod}/{mod}.py`, then reference "
         "the returned id in your config."
     )
     return 0
@@ -269,7 +274,7 @@ def cmd_env_list(args) -> int:
     if local.is_dir():
         # Both directory envs (environments/<name>/...) and single-file modules
         # (environments/<name>.py). These are local env SOURCES — publish one with
-        # `flash env push <path>` to run it on the managed service by its
+        # `flash env push --name <name> <path>` to run it on the managed service by its
         # environment id.
         paths: list[str] = []
         for p in local.iterdir():
@@ -286,7 +291,7 @@ def cmd_env_list(args) -> int:
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
         if paths:
-            print("local env sources (publish with `flash env push <path>`):")
+            print("local env sources (publish with `flash env push --name <name> <path>`):")
             for path in sorted(paths):
                 print(f"  {path}")
     return 0
