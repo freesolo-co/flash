@@ -447,12 +447,22 @@ def assert_adapter_load_clean(load_result, model_id: str) -> None:
     BEFORE loading any weights, so the module count is non-zero even when zero saved weights matched.
 
     ``load_result`` is the object returned by ``PeftModel.load_adapter`` (a ``_IncompatibleKeys`` with
-    ``missing_keys`` / ``unexpected_keys``). peft has already filtered ``missing_keys`` down to THIS
-    adapter's LoRA params. Raises if any injected module got no saved weight (``missing_keys``) or any
-    saved key matched no module (``unexpected_keys``) — i.e. matched != saved.
+    ``missing_keys`` / ``unexpected_keys``). We only care about LoRA keys: an adapter-only checkpoint
+    loaded with ``strict=False`` legitimately leaves the base-model params out, so they can surface as
+    "missing" without anything being wrong. peft's ``load_adapter`` already filters ``missing_keys`` to
+    the tuner prefix, but we re-filter to keys carrying the LoRA prefix (``lora_``) ourselves so a
+    benign base-weight miss never aborts a correct warm-start even if peft's internal filtering
+    changes. Raises if any injected LoRA module got no saved weight (``missing_keys``) or any saved
+    LoRA key matched no module (``unexpected_keys``) — i.e. matched != saved.
     """
-    missing = list(getattr(load_result, "missing_keys", []) or [])
-    unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
+
+    def _lora_only(keys):
+        # the #67 mismatch keys (e.g. ...lora_A.default.weight) all carry this prefix; base-model
+        # params do not, so this drops the benign base misses peft can report under strict=False.
+        return [k for k in (keys or []) if "lora_" in k]
+
+    missing = _lora_only(getattr(load_result, "missing_keys", None))
+    unexpected = _lora_only(getattr(load_result, "unexpected_keys", None))
     if missing or unexpected:
         raise RuntimeError(
             f"warm-start adapter for {model_id} did NOT load cleanly: {len(missing)} injected LoRA "
