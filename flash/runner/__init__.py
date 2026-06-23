@@ -315,7 +315,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
     """Persist the latest worker heartbeat/GPU snapshot without changing run state."""
     if not run_id or not isinstance(heartbeat, dict):
         return
-    if not os.path.exists(runs_file_path(run_id)):
+    if not os.path.exists(runs_file_path(run_id, ".json")):
         return
     hb = _sanitize_status_value(heartbeat)
     gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
