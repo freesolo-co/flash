@@ -1672,7 +1672,7 @@ def run_rl():
         # long-ctx), vLLM offloads ALL GPU memory (model + KV) to CPU during the backward
         # pass, so 0.45 is safe — the peak is max(rollout, train). When sleep_mode is OFF
         # (small/fast models), the KV cache stays resident during training; on large cards
-        # (A100/H100) 0.45 × 80 GB = 36 GB KV that never frees, leaving too little room
+        # (A100/H100) 0.45 x 80 GB = 36 GB KV that never frees, leaving too little room
         # for activations and causing OOM. Cap the KV pool at ~8 GB (the estimator's
         # _KV_CAP in flash.engine.vram) so the non-sleep training peak stays within budget.
         if sleep_mode:
@@ -1733,7 +1733,7 @@ def run_rl():
         # (num_reqs + 1) thread blocks but the block table only has num_reqs rows, so the
         # extra block causes an illegal memory access (cudaErrorIllegalAddress) on the first
         # generation step. CUDA graph compilation triggers this path. Skip FULL_AND_PIECEWISE
-        # for vLLM versions outside TRL's supported range (0.12.0–0.19.0) until a fix lands.
+        # for vLLM versions outside TRL's supported range (0.12.0-0.19.0) until a fix lands.
         _cudagraph_safe = True
         try:
             import vllm as _vllm_mod
