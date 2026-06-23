@@ -9,7 +9,7 @@ the run. This module owns the lifecycle instead:
   build_function_input()   -> the exact FunctionRequest payload Flash workers expect
   submit + poll_job()      -> REST queue API with hardened retries; the job handle
                               {endpoint_id, job_id} is persisted by the runner so
-                              any process can re-attach (`flash attach`).
+                              any process can re-attach (`flash status --follow`).
 """
 
 from __future__ import annotations

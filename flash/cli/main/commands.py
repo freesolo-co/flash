@@ -302,7 +302,8 @@ def cmd_train(args) -> int:
         print(json.dumps(status, indent=2))
         return 0
     print(
-        f"run {run_id} submitted; following logs (Ctrl-C detaches, `flash attach {run_id}` resumes)",
+        f"run {run_id} submitted; following logs "
+        f"(Ctrl-C detaches, `flash status {run_id} --follow` resumes)",
         file=sys.stderr,
     )
     return _follow_run(client, run_id)
@@ -329,13 +330,13 @@ def _follow_run(client: ApiClient, run_id: str) -> int:
 
 
 def cmd_status(args) -> int:
-    print(json.dumps(client_from_config().get_run(args.run_id), indent=2))
-    return 0
-
-
-def cmd_attach(args) -> int:
     client = client_from_config()
-    return _follow_run(client, args.run_id)
+    if getattr(args, "follow", False):
+        return _follow_run(client, args.run_id)
+    if getattr(args, "logs", False):
+        print(client.get_logs(args.run_id)["logs"], end="")
+    print(json.dumps(client.get_run(args.run_id), indent=2))
+    return 0
 
 
 def cmd_ps(args) -> int:
@@ -361,33 +362,9 @@ def cmd_ps(args) -> int:
     return 0
 
 
-def cmd_cost(args) -> int:
-    status = client_from_config().get_run(args.run_id)
-    print(
-        json.dumps(
-            {
-                "run_id": args.run_id,
-                "state": status["state"],
-                "cost_usd": status.get("cost_usd", 0.0),
-            },
-            indent=2,
-        )
-    )
-    return 0
-
-
 def cmd_cancel(args) -> int:
     status = client_from_config().cancel_run(args.run_id)
     print(json.dumps({"run_id": args.run_id, "state": status["state"]}, indent=2))
-    return 0
-
-
-def cmd_logs(args) -> int:
-    client = client_from_config()
-    if not args.follow:
-        print(client.get_logs(args.run_id)["logs"], end="")
-        return 0
-    _poll_logs(client, args.run_id, interval=1.0)
     return 0
 
 
