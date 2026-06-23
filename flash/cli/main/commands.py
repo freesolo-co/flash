@@ -85,7 +85,7 @@ Edit the dataset and reward code, then upload with
 `flash env push --name my-env environments/environment.py`.
 
 A managed run should use the returned [environment] id from
-`flash env push`.
+`flash env push --name my-env environments/environment.py`.
 
 Keep real SFT/RL datasets in Freesolo or Hugging Face dataset storage. This
 inline dataset is only a smoke-test fixture.

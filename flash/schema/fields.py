@@ -88,8 +88,14 @@ class ConfigError(ValueError):
 
 def _require_slug(value: str, message: str) -> None:
     """Require an ``owner/name`` slug."""
-    parts = value.split("/")
-    if len(parts) != 2 or not all(parts):
+    text = (value or "").strip()
+    if not text or ":" in text:
+        raise ConfigError(message)
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        raise ConfigError(message)
+    parts = text.split("/")
+    if len(parts) != 2 or not _is_safe_github_path_parts(parts):
         raise ConfigError(message)
 
 
