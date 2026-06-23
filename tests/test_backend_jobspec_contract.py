@@ -39,7 +39,7 @@ def _representative_config() -> dict:
     return {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "environment": {"id": "owner/my-env", "params": {"split": "train"}},
+        "environment": {"id": "github:owner/repo@main:my-env/freesolo/environment.py", "params": {"split": "train"}},
         "train": {
             "hf_repo": "owner/my-runs",
             "steps": 120,
@@ -62,7 +62,7 @@ def test_backend_run_config_parses_into_valid_jobspec() -> None:
     assert isinstance(spec, JobSpec)
     assert spec.model == "Qwen/Qwen3.5-4B"
     assert spec.algorithm == "grpo"
-    assert spec.environment.id == "owner/my-env"
+    assert spec.environment.id == "github:owner/repo@main:my-env/freesolo/environment.py"
     assert spec.environment.params == {"split": "train"}
     # hf_repo is platform-managed: a user/backend-supplied value is ignored (left blank for the
     # control plane to assign per run at submit), so it must NOT survive parsing.
@@ -95,7 +95,7 @@ def test_backend_config_through_runcreaterequest_then_jobspec() -> None:
     req = RunCreateRequest(name="my run", config=_representative_config())
     assert req.config is not None
     spec = spec_from_dict(req.config, run_id="flash-test-3")
-    assert spec.environment.id == "owner/my-env"
+    assert spec.environment.id == "github:owner/repo@main:my-env/freesolo/environment.py"
     assert spec.algorithm == "grpo"
 
 
@@ -105,7 +105,7 @@ def test_sft_backend_config_maps_to_jobspec() -> None:
     config = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "sft",
-        "environment": {"id": "owner/my-env"},
+        "environment": {"id": "github:owner/repo@main:my-env/freesolo/environment.py"},
         "train": {"hf_repo": "owner/my-runs", "epochs": 3, "batch_size": 8},
         "gpu": {"type": "RTX 5090"},
     }

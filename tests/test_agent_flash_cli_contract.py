@@ -1,4 +1,5 @@
-"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the `flash` CLI
+"""Cross-folder contract: the freesolo Codex trainer agent (../agent) drives the CLI —
+it invokes `slm`, the deprecated alias of `flash` (same entrypoint, kept for back-compat) —
 and consumes its run-id / run-state / metrics outputs. This asserts that the flash side of
 that seam still provides what the agent depends on.
 
@@ -58,7 +59,7 @@ from flash.runner import (
 )
 def test_agent_required_subcommands_exist(subcommand: str) -> None:
     """The agent's worker drives the CLI's `train/status/logs/ps/cancel/env install/...`
-    subcommands.
+    subcommands (invoked as `slm`, the deprecated alias of `flash` — see the module docstring).
 
     argparse exits with code 2 and an 'invalid choice' message when a subcommand
     does not exist. We invoke each with `--help`, which exits 0 for a real
@@ -72,14 +73,14 @@ def test_agent_required_subcommands_exist(subcommand: str) -> None:
 
 
 def test_env_install_subcommand_exists() -> None:
-    """The migration path: the agent installs published envs via `flash env install`."""
+    """The migration path: the agent records published GitHub env refs via `flash env install`."""
     with pytest.raises(SystemExit) as excinfo:
         main(["env", "install", "--help"])
     assert excinfo.value.code == 0, "`flash env install` is missing from the CLI"
 
 
 def test_env_push_subcommand_exists() -> None:
-    """The agent publishes a locally-authored verifiers env via `flash env push`."""
+    """The agent publishes a locally-authored Freesolo env via `flash env push`."""
     with pytest.raises(SystemExit) as excinfo:
         main(["env", "push", "--help"])
     assert excinfo.value.code == 0, "`flash env push` is missing from the CLI"
@@ -104,7 +105,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
-        'id = "owner/name"\n'
+        'id = "github:owner/repo@main:env/freesolo/environment.py"\n'
         "[train]\n"
         'hf_repo = "owner/runs"\n'
         "steps = 10\n"
@@ -124,6 +125,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
 
 
 # --- new_run_id format vs the agent's run-id expectations ---------------------
+
 
 def test_new_run_id_format_is_filesystem_safe_and_stable() -> None:
     """flash.runner.new_run_id() must stay within the safe run-id alphabet (it flows
