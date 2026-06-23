@@ -1,9 +1,10 @@
 """Daily realized-cost reconciliation: pull what the GPU provider actually billed for each
-finished run and report it to the freesolo backend for ESTIMATOR ACCURACY tracking.
+finished run and report it to the freesolo backend for estimator accuracy tracking.
 
-The flash CLI charges each run its pre-flight ESTIMATE at submit; this is the other half --
-the realized provider invoice (RunPod /v1/billing/endpoints, Vast /v0/charges/). The backend's
-training_cost_accuracy view joins the two per run to surface estimated-vs-realized error.
+Flash charges customer-facing training usage from the completed run's final ``cost_usd``. This
+job is the COGS side: the realized provider invoice (RunPod /v1/billing/endpoints, Vast
+/v0/charges/). The backend's training_cost_accuracy view joins the two per run to surface
+charged-vs-realized error.
 
 Best-effort and entirely off the run hot path: it runs in a background loop (see the server
 lifespan), never blocks request handling, and any failure is swallowed and retried next cycle.
