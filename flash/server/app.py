@@ -186,7 +186,7 @@ def recover_runs() -> None:
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
             resubmit.append(spec)
-    # Reap orphaned per-run instances (Vast bills until destroyed); each provider sweeps its own.
+    # Reap orphaned per-run provider resources; each provider sweeps its own.
     from flash.providers import configured_providers
 
     for prov in configured_providers():
