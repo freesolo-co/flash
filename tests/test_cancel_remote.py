@@ -288,6 +288,62 @@ def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
     assert out[0]["success"] is False
 
 
+def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
+    """Regression: terminate_endpoint must not raise when called from a running event loop.
+
+    The original code called asyncio.run(_undeploy_all()) directly, which raises
+    RuntimeError('cannot be called when another event loop is running') from FastAPI/Uvicorn
+    lifespan shutdown or any other async context. The fix detects a running loop and falls
+    back to a ThreadPoolExecutor thread where asyncio.run() always succeeds.
+    """
+    import asyncio
+    import sys
+    import types as _types
+
+    import flash.providers.runpod.auth as auth
+    import flash.providers.runpod.train.endpoints as ep_mod
+    from flash.providers.base import canonical_gpu
+
+    run_id = "flash-1-abcd1234"
+    friendly = canonical_gpu("RTX 5090")
+    target = endpoint_name(friendly, _run_suffix(run_id))
+    resource_name = f"live-{target}"
+
+    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda _: None)
+
+    async def fake_undeploy(uid, **_):
+        return {"success": True, "name": resource_name}
+
+    fake_resource = _types.SimpleNamespace(name=resource_name)
+    fake_rm = _types.SimpleNamespace(
+        list_all_resources=lambda: {"uid-1": fake_resource},
+        undeploy_resource=fake_undeploy,
+    )
+
+    fake_rm_mod = _types.ModuleType("runpod_flash.core.resources.resource_manager")
+    fake_rm_mod.ResourceManager = lambda: fake_rm
+
+    for mod_name in (
+        "runpod_flash",
+        "runpod_flash.core",
+        "runpod_flash.core.resources",
+        "runpod_flash.core.resources.resource_manager",
+    ):
+        if mod_name not in sys.modules:
+            monkeypatch.setitem(sys.modules, mod_name, _types.ModuleType(mod_name))
+    monkeypatch.setitem(
+        sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod
+    )
+
+    async def _call():
+        return ftrain.terminate_endpoint("RTX 5090", run_id)
+
+    result = asyncio.run(_call())
+    assert isinstance(result, list)
+    assert result == [{"success": True, "name": resource_name}]
+
+
 def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
     import flash.runner as orch
 
