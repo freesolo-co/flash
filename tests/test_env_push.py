@@ -114,7 +114,7 @@ def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
     (tmp_path / "db" / "state.sqlite").write_text("sqlite bytes")
     (tmp_path / "configs").mkdir()
     (tmp_path / "configs" / "env.toml").write_text("[env]\n")
-    (tmp_path / "grpo.toml").write_text('algorithm = "grpo"\n')
+    (tmp_path / "rl.toml").write_text('algorithm = "grpo"\n')
     (tmp_path / "assets").mkdir()
     (tmp_path / "assets" / "labels.json").write_text("{}\n")
     cap: dict = {}
@@ -125,7 +125,7 @@ def test_push_single_py_ships_only_environment_sidecars(monkeypatch, tmp_path):
     assert "state.sqlite" not in files
     assert "db/state.sqlite" not in files
     assert "configs/env.toml" not in files
-    assert "grpo.toml" not in files
+    assert "rl.toml" not in files
     assert "assets/labels.json" not in files
 
 
@@ -163,7 +163,7 @@ def test_push_requires_explicit_name(tmp_path, capsys):
 def test_push_sibling_config_does_not_override_explicit_name(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "grpo.toml").write_text(
+    (tmp_path / "rl.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\nid = "user/old-name"\n'
     )
     cap: dict = {}
