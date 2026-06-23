@@ -1,8 +1,8 @@
 """Opt-in gate for the live, READ-ONLY provider smokes.
 
-These hit the real RunPod / Vast APIs, so they are skipped unless ``FLASH_LIVE=1``
+These hit the real RunPod APIs, so they are skipped unless ``FLASH_LIVE=1``
 (and the relevant provider key is present). They are strictly read-only — auth/health
-and list GPU types / offers — and NEVER provision or rent anything.
+and list GPU types — and NEVER provision or rent anything.
 
 Run them with:
     set -a && . /home/azureuser/workspace/.env && set +a && \

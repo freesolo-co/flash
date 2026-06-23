@@ -2,7 +2,7 @@
 
 There is no "skip the network" env flag; instead this autouse fixture stubs the network
 boundaries the production code would otherwise reach, so the whole suite stays hermetic (no
-real RunPod / Vast / Hugging Face calls) without any env switch. A test that exercises one of
+real RunPod / Hugging Face calls) without any env switch. A test that exercises one of
 these boundaries monkeypatches it itself — applied after this fixture, so the test's patch
 wins. (The freesolo auth verify isn't stubbed here because tests that touch it either patch
 ``_freesolo_verify`` or ``urllib.request.urlopen`` directly; a global ``urlopen`` stub would
@@ -16,10 +16,6 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    # No live provider key in the suite: Vast stays unconfigured (RunPod-only allocation)
-    # unless a test opts in by setting VAST_API_KEY and stubbing the offer path.
-    monkeypatch.delenv("VAST_API_KEY", raising=False)
-
     # HF param probe -> offline: sizing for an unlisted model falls back to the heuristic
     # (24 GB tier) instead of hitting the Hugging Face API.
     import flash.engine.vram as vram
