@@ -5,15 +5,13 @@ same work on the same catalog-only, cheapest-fit basis."""
 
 from __future__ import annotations
 
-import sys
-
 from flash.cost.analytical import estimate_cost
 from flash.cost.types import CostEstimate, RunConfig
 
 # Fallback SFT dataset size when an uncapped run's env can't be counted locally. Most Freesolo
 # training datasets land in the
 # low-thousands of rows; this is a representative middle estimate so the quote is in the right
-# ballpark rather than hard-failing. Pin [train].max_examples for an exact figure.
+# ballpark rather than hard-failing.
 DEFAULT_UNCOUNTED_SFT_EXAMPLES = 1000
 
 
@@ -78,18 +76,10 @@ def spec_steps(spec) -> int:
     else:
         # No cap: the worker trains the FULL env dataset, so price its real size when we can
         # count it. A managed Freesolo environment may not be reachable in this interpreter, so
-        # counting can return None. Fall back to a representative default with a clear warning
-        # instead of hard-failing.
+        # counting can return None. Fall back to a representative default instead of hard-failing.
         examples = count_env_examples(spec.environment.id, spec.environment.params)
         if examples is None:
             examples = DEFAULT_UNCOUNTED_SFT_EXAMPLES
-            print(
-                f"warning: could not count training examples for environment "
-                f"{spec.environment.id!r} (it is not reachable/importable in this environment). "
-                f"Estimating with a default of {examples} examples -- pin [train].max_examples "
-                f"for an exact cost.",
-                file=sys.stderr,
-            )
     n = max(1, -(-examples // batch) * epochs)  # epochs x ceil(examples / realized_batch)
     return min(n, cap) if cap > 0 else n
 
