@@ -24,10 +24,10 @@ __all__ = [
 def _missing_hf_credentials() -> list[str]:
     """Shared run infra every substrate needs."""
     problems: list[str] = []
-    if not (os.environ.get("FLASH_ENV_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")):
+    if not os.environ.get("GITHUB_TOKEN"):
         problems.append(
-            "  - GITHUB_TOKEN or FLASH_ENV_GITHUB_TOKEN: a token with read access to "
-            "GitHub-hosted Freesolo environments, e.g. `export GITHUB_TOKEN=github_pat_...`"
+            "  - GITHUB_TOKEN: a token with read access to GitHub-hosted Freesolo "
+            "environments, e.g. `export GITHUB_TOKEN=github_pat_...`"
         )
     if not os.environ.get("HF_TOKEN"):
         problems.append(
