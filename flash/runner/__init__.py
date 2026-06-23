@@ -320,12 +320,14 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
     hb = _sanitize_status_value(heartbeat)
     gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
     with _STATUS_LOCK:
-        status = get_status(run_id)
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
         status.last_heartbeat = hb
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
         _save_status(status)
-
 
 def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     """Write metrics to results/runpod/<phase>/<run_id>/seedN and return the cost.
