@@ -304,6 +304,8 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
     ).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
     env_file = cache_dir / parsed.path
+    if env_file.is_dir():
+        env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
     if env_file.is_file():
         return env_file
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
@@ -318,9 +320,10 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
         candidate = extracted / parsed.path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
+        required_entrypoint = candidate.relative_to(extracted).as_posix()
         if not candidate.is_file():
             raise FileNotFoundError(
-                f"managed environment did not contain required entrypoint {parsed.path!r}"
+                f"environment archive did not contain required entrypoint {required_entrypoint!r}"
             )
         cache_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
