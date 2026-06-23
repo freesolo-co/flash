@@ -1,32 +1,33 @@
 """Managed Freesolo environment publishing.
 
-``POST /v1/envs`` accepts a packaged Freesolo environment and uploads it to a
-managed GitHub repository. The returned id is a GitHub-backed environment ref
-that the worker resolves through ``freesolo.environments``.
+``POST /v1/envs`` accepts a packaged Freesolo environment and uploads it to the
+managed ``freesolo-co/environment-hub`` GitHub repository. The returned id is a
+GitHub-backed environment ref that the worker resolves through
+``freesolo.environments``.
 """
 
 from __future__ import annotations
 
 import base64
 import io
-import json
 import os
 import re
+import shutil
+import subprocess
 import tarfile
 import tempfile
-import urllib.error
+import time
 import urllib.parse
-import urllib.request
-import uuid
 from pathlib import Path
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_MEMBERS = 5000
-_MAX_GITHUB_FILE_BYTES = 1024 * 1024
-_DEFAULT_GITHUB_REPO = "freesolo-co/training"
-_DEFAULT_GITHUB_BRANCH = "main"
+_DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
+_GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "freesolo/environment.py"
+_GIT_TIMEOUT_S = 180
+_GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
 
 def _human_mb(n: int) -> str:
@@ -37,11 +38,6 @@ class EnvPublishError(Exception):
     def __init__(self, message: str, *, status: int = 400):
         super().__init__(message)
         self.status = status
-
-
-class _GitHubApiError(EnvPublishError):
-    def __init__(self, message: str, status: int):
-        super().__init__(message, status=status)
 
 
 def namespace_for(key: dict) -> str:
@@ -58,11 +54,9 @@ def namespace_for(key: dict) -> str:
 
 def _sanitize_name(name: str) -> str:
     slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")
+    if slug in {".", ".."} or not re.search(r"[a-z0-9]", slug):
+        return "env"
     return slug or "env"
-
-
-def _new_publish_id() -> str:
-    return str(uuid.uuid4())
 
 
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
@@ -114,93 +108,164 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
 
 
 def _github_repo() -> str:
-    return os.environ.get("FLASH_ENV_GITHUB_REPO") or _DEFAULT_GITHUB_REPO
-
-
-def _github_branch() -> str:
-    return os.environ.get("FLASH_ENV_GITHUB_BRANCH") or _DEFAULT_GITHUB_BRANCH
+    return _DEFAULT_GITHUB_REPO
 
 
 def _github_token() -> str | None:
     return os.environ.get("GITHUB_TOKEN")
 
 
-def _github_json(
-    method: str,
-    url: str,
-    *,
-    token: str,
-    body: dict | None = None,
-) -> dict:
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(
-        url,
-        method=method,
-        data=data,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "freesolo-flash",
-        },
+def _redact(value: str, token: str) -> str:
+    if not token:
+        return value
+    return value.replace(token, "<redacted>").replace(
+        urllib.parse.quote(token, safe=""), "<redacted>"
     )
+
+
+def _credentialed_repo_url(repo: str, token: str) -> str:
+    quoted = urllib.parse.quote(token, safe="")
+    return f"https://x-access-token:{quoted}@github.com/{repo}.git"
+
+
+def _run_git(cwd: Path, args: list[str], *, token: str) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")
-        raise _GitHubApiError(
-            f"GitHub environment upload failed ({exc.code}): {detail[:500]}",
-            status=exc.code,
-        ) from exc
-    except urllib.error.URLError as exc:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except FileNotFoundError as exc:
         raise EnvPublishError(
-            f"GitHub environment upload failed: {exc.reason}",
-            status=502,
+            "git is required to upload environments to Freesolo", status=503
         ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise EnvPublishError(
+            f"Freesolo environment upload git command timed out after {_GIT_TIMEOUT_S}s",
+            status=504,
+        ) from exc
+    if proc.returncode != 0:
+        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+        cmd = "git " + " ".join(args)
+        raise EnvPublishError(
+            _redact(f"Freesolo environment upload failed during `{cmd}`: {output[:1000]}", token),
+            status=502,
+        )
+    return proc
 
 
-def _existing_file_sha(repo: str, branch: str, path: str, token: str) -> str | None:
-    quoted = urllib.parse.quote(path, safe="/")
-    url = f"https://api.github.com/repos/{repo}/contents/{quoted}?ref={urllib.parse.quote(branch)}"
+def _is_retryable_git_publish_error(message: str) -> bool:
+    lowered = message.lower()
+    permanent = (
+        "authentication failed",
+        "could not read username",
+        "repository not found",
+        "permission denied",
+        "403",
+        "401",
+    )
+    if any(marker in lowered for marker in permanent):
+        return False
+    retryable = (
+        "failed to push some refs",
+        "fetch first",
+        "non-fast-forward",
+        "stale info",
+        "cannot lock ref",
+        "connection reset",
+        "operation timed out",
+        "the remote end hung up",
+        "early eof",
+        "index.lock",
+        "rebase",
+    )
+    return any(marker in lowered for marker in retryable)
+
+
+def _copy_package_to_checkout(*, source: Path, checkout: Path, publish_root: str) -> None:
+    target = checkout / publish_root
+    checkout_root = checkout.resolve()
+    target_root = target.resolve()
+    if target_root != checkout_root and checkout_root not in target_root.parents:
+        raise EnvPublishError("unsafe environment publish path")
+    shutil.rmtree(target, ignore_errors=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
+
+
+def _commit_environment_update(
+    *, checkout: Path, publish_root: str, message: str, token: str
+) -> bool:
+    _run_git(checkout, ["config", "user.name", "freesolo-bot"], token=token)
+    _run_git(checkout, ["config", "user.email", "bot@freesolo.co"], token=token)
+    _run_git(checkout, ["add", "-A", "--", publish_root], token=token)
     try:
-        data = _github_json("GET", url, token=token)
-    except _GitHubApiError as exc:
-        if exc.status == 404:
-            return None
-        raise
-    sha = data.get("sha")
-    return str(sha) if sha else None
+        proc = subprocess.run(
+            ["git", "diff", "--cached", "--quiet", "--", publish_root],
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EnvPublishError(
+            f"Freesolo environment upload git command timed out after {_GIT_TIMEOUT_S}s",
+            status=504,
+        ) from exc
+    if proc.returncode == 0:
+        return False
+    if proc.returncode != 1:
+        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+        raise EnvPublishError(
+            _redact(
+                f"Freesolo environment upload failed during staged diff check: {output}", token
+            ),
+            status=502,
+        )
+    _run_git(checkout, ["commit", "-m", message], token=token)
+    return True
 
 
-def _put_github_file(
+def _push_environment_commit(*, checkout: Path, token: str) -> None:
+    _run_git(checkout, ["pull", "--rebase", "origin", _GITHUB_BRANCH], token=token)
+    _run_git(checkout, ["push", "origin", f"HEAD:{_GITHUB_BRANCH}"], token=token)
+
+
+def _github_publish_once(
     *,
+    dest: Path,
     repo: str,
-    branch: str,
-    path: str,
-    data: bytes,
     token: str,
+    publish_root: str,
     message: str,
 ) -> None:
-    quoted = urllib.parse.quote(path, safe="/")
-    if len(data) > _MAX_GITHUB_FILE_BYTES:
-        raise EnvPublishError(
-            f"environment upload file {path!r} exceeds GitHub Contents API limit "
-            f"per-file cap ({_MAX_GITHUB_FILE_BYTES} bytes). Keep environment packages focused on code; "
-            "put large datasets in external storage and load from dataset_path or dataset URLs.",
-            status=413,
+    with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
+        tmp_path = Path(tmp)
+        checkout = tmp_path / "environment-hub"
+        _run_git(
+            tmp_path,
+            [
+                "clone",
+                "--branch",
+                _GITHUB_BRANCH,
+                "--single-branch",
+                _credentialed_repo_url(repo, token),
+                str(checkout),
+            ],
+            token=token,
         )
-    url = f"https://api.github.com/repos/{repo}/contents/{quoted}"
-    body = {
-        "message": message,
-        "content": base64.b64encode(data).decode("ascii"),
-        "branch": branch,
-    }
-    sha = _existing_file_sha(repo, branch, path, token)
-    if sha:
-        body["sha"] = sha
-    _github_json("PUT", url, token=token, body=body)
+        _copy_package_to_checkout(source=dest, checkout=checkout, publish_root=publish_root)
+        if _commit_environment_update(
+            checkout=checkout,
+            publish_root=publish_root,
+            message=message,
+            token=token,
+        ):
+            _push_environment_commit(checkout=checkout, token=token)
 
 
 def _environment_file_relative_path(root: Path) -> str:
@@ -219,30 +284,39 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     token = _github_token()
     if not token:
         raise EnvPublishError(
-            "GITHUB_TOKEN is required to upload environments to GitHub",
+            "GITHUB_TOKEN is required to upload environments to Freesolo",
             status=503,
         )
     repo = _github_repo()
-    branch = _github_branch()
     ns = namespace_for(key)
     clean = _sanitize_name(name)
-    publish_root = f"{ns}/{clean}/{_new_publish_id()}"
+    publish_root = f"environments/{ns}/{clean}"
     env_rel = _environment_file_relative_path(dest)
     files = sorted(path for path in dest.rglob("*") if path.is_file())
     if not files:
         raise EnvPublishError("env package contains no files")
     message = f"Upload Flash environment {ns}/{clean}"
-    for file_path in files:
-        rel = file_path.relative_to(dest).as_posix()
-        _put_github_file(
-            repo=repo,
-            branch=branch,
-            path=f"{publish_root}/{rel}",
-            data=file_path.read_bytes(),
-            token=token,
-            message=message,
-        )
-    return f"github:{repo}@{branch}:{publish_root}/{env_rel}"
+
+    last_error: EnvPublishError | None = None
+    max_attempts = len(_GIT_PUSH_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(max_attempts):
+        if attempt:
+            time.sleep(_GIT_PUSH_RETRY_DELAYS_SECONDS[attempt - 1])
+        try:
+            _github_publish_once(
+                dest=dest,
+                repo=repo,
+                token=token,
+                publish_root=publish_root,
+                message=message,
+            )
+            return f"github:{repo}@{_GITHUB_BRANCH}:{publish_root}/{env_rel}"
+        except EnvPublishError as exc:
+            last_error = exc
+            if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
+                raise
+    assert last_error is not None
+    raise last_error
 
 
 def publish_package(*, package_b64: str, name: str, is_new: bool, key: dict) -> str:

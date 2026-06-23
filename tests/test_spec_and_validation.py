@@ -119,7 +119,7 @@ def test_bare_environment_id_is_rejected() -> None:
     ):
         raw = _raw()
         raw["environment"] = {"id": bad}
-        with pytest.raises(ConfigError, match=r"Freesolo environment ref"):
+        with pytest.raises(ConfigError, match=r"Freesolo environment id"):
             spec_from_dict(raw)
 
 

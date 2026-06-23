@@ -12,9 +12,8 @@ allocator picks the cheapest GPU class that fits the run across both providers.
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
 - `flash deploy` (scale-to-zero or always-on), `flash chat` —
   serving for trained adapters.
-- **Freesolo SDK environments.** Every run names a Freesolo environment id
-  (for example `[environment] id = "github:freesolo-co/training@main:user/project/publish-id/freesolo/environment.py"`).
-  Scaffold a local env, publish it with `flash env push`, then reference the
+- **Freesolo SDK environments.** Every run names a Freesolo environment id.
+  Scaffold a local env, upload it with `flash env push`, then reference the
   returned id. The worker loads it through `freesolo.environments`. There are no
   built-in task environments. Single-turn and bounded multi-turn environments are
   supported.
@@ -34,7 +33,7 @@ allocator picks the cheapest GPU class that fits the run across both providers.
   shared recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
 - `flash/envs/` — environment machinery: registry and the adapter that loads
-  Freesolo SDK environments from GitHub refs onto the worker's interface
+  Freesolo SDK environments onto the worker's interface
 - `flash env setup` / `flash env init` — scaffold a starter local Freesolo env and a
   ready-to-run config to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control

@@ -98,7 +98,7 @@ def _opt_float(value: Any) -> float | None:
 
 @dataclass(frozen=True)
 class EnvironmentSpec:
-    # GitHub-backed Freesolo environment ref. No default:
+    # Freesolo environment id. No default:
     # a run must name an environment explicitly (validated in schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
@@ -230,12 +230,12 @@ class JobSpec:
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
         env = data.get("environment") or {}
         # Defense-in-depth: a stale/older payload may still carry a local `path`. The worker only
-        # runs GitHub-backed Freesolo environment refs, so reject it here rather than silently
+        # runs published Freesolo environment ids, so reject it here rather than silently
         # dropping it.
         if isinstance(env, dict) and env.get("path"):
             raise ValueError(
                 "local environment paths are no longer supported; the worker only runs "
-                "GitHub-backed Freesolo environment refs"
+                "published Freesolo environment ids"
             )
         train = data.get("train") or {}
         gpu = data.get("gpu") or {}

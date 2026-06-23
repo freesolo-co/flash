@@ -91,29 +91,12 @@ def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
 
 def test_push_single_py_uses_sibling_config_id_name(monkeypatch, tmp_path):
     # A bare environment.py with a sibling flash_grpo.toml whose [environment] id points at
-    # a training-style <namespace>/<project>/<publish-id>/freesolo/environment.py ref
-    # re-publishes to that SAME logical project.
+    # envs/myenv/freesolo/environment.py re-publishes to that SAME logical env.
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "flash_grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "github:owner/repo@main:user/myenv/12345678-1234-4321-abcd-123456789abc/freesolo/environment.py"\n'
-    )
-    cap: dict = {}
-    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
-
-    rc = cli.cmd_env_push(argparse.Namespace(path=str(env_file)))
-    assert rc == 0
-    assert cap["name"] == "myenv"
-    assert cap["is_new"] is False
-
-
-def test_push_single_py_uses_legacy_environments_config_id_name(monkeypatch, tmp_path):
-    env_file = tmp_path / "environment.py"
-    env_file.write_text("def load_environment(**k):\n    return None\n")
-    (tmp_path / "flash_grpo.toml").write_text(
-        'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "github:owner/repo@main:environments/user/myenv/freesolo/environment.py"\n'
+        'id = "github:owner/repo@main:envs/myenv/freesolo/environment.py"\n'
     )
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
@@ -131,7 +114,7 @@ def test_push_sibling_config_id_with_dot_yields_valid_module(monkeypatch, tmp_pa
     env_file.write_text("def load_environment(**k):\n    return None\n")
     (tmp_path / "flash_grpo.toml").write_text(
         'model = "m"\nalgorithm = "grpo"\n[environment]\n'
-        'id = "github:owner/repo@main:user/my.weird.env/12345678-1234-4321-abcd-123456789abc/freesolo/environment.py"\n'
+        'id = "github:owner/repo@main:envs/my.weird.env/freesolo/environment.py"\n'
     )
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
