@@ -1317,25 +1317,30 @@ def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
 
 
 def test_sweep_idle_flash_endpoints(monkeypatch):
-    """_sweep_idle_flash_endpoints deletes only idle flash-* endpoints, skips current."""
+    """_sweep_idle_flash_endpoints deletes only idle flash-* / live-flash-* endpoints."""
     import flash.providers.runpod.api as runpod_api
     import flash.providers.runpod.jobs as jobs
 
+    # RunPod Flash registers endpoints as "live-<endpoint_name>", so real names are
+    # "live-flash-<gpu>-<suffix>". Both the bare "flash-*" and "live-flash-*" forms
+    # must be swept; the current run's endpoint (and its "live-" form) must be skipped.
     endpoints = [
-        {"id": "ep-idle", "name": "flash-a100-abc"},   # idle, should be deleted
-        {"id": "ep-busy", "name": "flash-a100-xyz"},   # has running worker, keep
-        {"id": "ep-skip", "name": "flash-a100-cur"},   # current run, skip
-        {"id": "ep-other", "name": "other-ep"},         # not flash-*, skip
+        {"id": "ep-live-idle", "name": "live-flash-a100-abc"},  # live- prefix, idle → delete
+        {"id": "ep-live-busy", "name": "live-flash-a100-xyz"},  # live- prefix, busy → keep
+        {"id": "ep-live-skip", "name": "live-flash-a100-cur"},  # live- form of current → skip
+        {"id": "ep-bare-idle", "name": "flash-a100-old"},       # bare prefix, idle → delete
+        {"id": "ep-skip-bare", "name": "flash-a100-cur"},       # current run (bare) → skip
+        {"id": "ep-other",     "name": "other-ep"},              # not flash-* → skip
     ]
 
     def fake_list_endpoints():
         return endpoints
 
     def fake_health(eid):
-        if eid == "ep-idle":
+        if eid in ("ep-live-idle", "ep-bare-idle"):
             return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
                     "jobs": {"inQueue": 0, "inProgress": 0}}
-        if eid == "ep-busy":
+        if eid == "ep-live-busy":
             return {"workers": {"running": 1, "ready": 0, "idle": 0, "initializing": 0},
                     "jobs": {"inQueue": 0, "inProgress": 1}}
         return {}
@@ -1352,5 +1357,5 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
 
     count = jobs._sweep_idle_flash_endpoints(skip_name="flash-a100-cur")
 
-    assert count == 1
-    assert deleted == ["ep-idle"]
+    assert count == 2
+    assert sorted(deleted) == sorted(["ep-live-idle", "ep-bare-idle"])
