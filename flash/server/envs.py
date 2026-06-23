@@ -245,7 +245,7 @@ def _github_publish_once(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
         tmp_path = Path(tmp)
-        checkout = tmp_path / "training"
+        checkout = tmp_path / "environment-hub"
         _run_git(
             tmp_path,
             [
