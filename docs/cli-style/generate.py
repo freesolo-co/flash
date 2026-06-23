@@ -2,7 +2,7 @@
 
 Drives the real cmd_* handlers with a fake control-plane client, capturing the plain
 (FLASH_STYLE=0) and themed (FLASH_STYLE=1) rendering of each, then writes a self-contained
-dark-terminal HTML page plus a full-page PNG. ANSI is converted to inline-styled spans
+dark-terminal HTML page. ANSI is converted to inline-styled spans
 (xterm-256 -> hex), so the page needs no external assets and renders anywhere.
 
 usage:
