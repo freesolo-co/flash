@@ -363,6 +363,15 @@ def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None
     assert orch.artifacts_dir(spec).endswith(os.path.join("results", "runpod", "rl", "flash-1-x"))
     assert orch.adapter_prefix(spec) == "rl/flash-1-x/seed0"
     assert orch.adapter_prefix(spec, seed=3) == "rl/flash-1-x/seed3"
+    assert orch.adapter_ref(spec) is None
+
+    d = spec.to_dict()
+    d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
+    spec_with_repo = JobSpec.from_dict(d)
+    assert (
+        orch.adapter_ref(spec_with_repo)
+        == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x/seed0"
+    )
 
 
 # ---------------------------------------------------------------------------
