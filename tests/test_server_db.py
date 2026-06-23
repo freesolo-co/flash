@@ -150,6 +150,7 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     monkeypatch.setenv("PRIME_API_KEY", "pit-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
 
     import flash.runner as runner
     import flash.server.auth as auth_mod

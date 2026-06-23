@@ -1,8 +1,8 @@
 """Environment publish/install machinery for the `flash env` subcommands.
 
-`flash env install` records a GitHub-backed Freesolo environment ref locally;
-`flash env push` packages a local Freesolo environment and uploads it to GitHub
-through the managed Flash control plane.
+`flash env install` records a Freesolo environment ref locally;
+`flash env push` packages a local Freesolo environment and uploads it through the
+managed Flash control plane.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ def cmd_env_install(args) -> int:
     env_id = args.env_id
     if not is_github_environment_ref(env_id):
         print(
-            "env id must be a GitHub Freesolo environment ref, e.g. "
+            "env id must be a Freesolo environment ref, e.g. "
             '"github:owner/repo@main:path/to/freesolo/environment.py" '
             f"(got {env_id!r})",
             file=sys.stderr,
@@ -30,7 +30,7 @@ def cmd_env_install(args) -> int:
     return 0
 
 
-# A Freesolo environment package is uploaded to GitHub in canonical generated-repo layout:
+# A Freesolo environment package is uploaded in canonical generated-repo layout:
 # freesolo/environment.py exposes load_environment().
 _ENV_PUSH_PYPROJECT = """\
 [project]
@@ -59,7 +59,7 @@ def _push_env_name(raw: str) -> str:
 
 
 def _config_env_name(config_path) -> str | None:
-    """A stable name from a sibling flash.toml's GitHub `[environment] id`, or None."""
+    """A stable name from a sibling flash.toml's `[environment] id`, or None."""
     import tomllib
 
     path = Path(config_path)
@@ -82,7 +82,7 @@ def _config_env_name(config_path) -> str | None:
 
 
 def _config_env_name_from_dir(config_dir) -> str | None:
-    """The GitHub env name declared by the sibling per-phase flash configs
+    """The environment name declared by the sibling per-phase flash configs
     (``flash_grpo.toml``/``flash_sft.toml``). Without this, pushing ``environment.py`` finds
     no id and mints a brand-new env, so the run trains against the stale id in the configs.
     """
@@ -134,7 +134,7 @@ _TAR_EXCLUDE_DIRS = frozenset({".prime", ".git", "__pycache__", ".venv", ".mypy_
 def _tar_b64(directory: Path) -> str:
     """Pack a directory's contents into a base64 ``.tar.gz`` (members rooted at the top level)
     for upload, skipping tool/cache dirs (``.prime/``, ``.git/``, ``__pycache__``, ...). Packaging
-    is pure file I/O and needs no local GitHub credentials; upload happens through the server.
+    is pure file I/O and needs no local credentials; upload happens through the server.
 
     We walk with ``os.walk`` and PRUNE excluded directories in place (``dirs[:] = ...``) so we never
     descend into them: a plain ``rglob('*')`` would still recurse into (and stat every entry under)
@@ -182,7 +182,7 @@ def _pyproject_name(env_dir: Path) -> str | None:
 
 
 def _upload_and_report(name: str, *, is_new: bool, package_b64: str) -> int:
-    """Upload a packaged env to managed GitHub storage and print the returned id."""
+    """Upload a packaged env to the managed control plane and print the returned id."""
     from flash.client import ClientError, client_from_config
 
     try:

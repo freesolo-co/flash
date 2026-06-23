@@ -71,7 +71,9 @@ def main(argv: list[str] | None = None) -> int:
     version = sub.add_parser("version", help="print the Flash version")
     version.set_defaults(func=cmd_version)
 
-    login = sub.add_parser("login", help="log in with your freesolo API key (verified by freesolo)")
+    login = sub.add_parser(
+        "login", help="log in with your freesolo API key (create one at https://freesolo.co/sign-in)"
+    )
     login.add_argument(
         "--api-key",
         help="your freesolo API key (default: FREESOLO_API_KEY); created in the dashboard",
@@ -109,13 +111,11 @@ def main(argv: list[str] | None = None) -> int:
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
-    env_install = env_sub.add_parser("install", help="record a GitHub Freesolo environment")
-    env_install.add_argument("env_id", help="the GitHub environment id to record")
+    env_install = env_sub.add_parser("install", help="record a Freesolo environment")
+    env_install.add_argument("env_id", help="the Freesolo environment id to record")
     env_install.set_defaults(func=cmd_env_install)
 
-    env_push = env_sub.add_parser(
-        "push", help="upload a local Freesolo env to GitHub; prints its env id"
-    )
+    env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
 

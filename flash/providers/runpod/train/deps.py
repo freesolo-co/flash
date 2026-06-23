@@ -307,7 +307,6 @@ def build_worker_env(
     for key in (
         "HF_TOKEN",
         "GITHUB_TOKEN",
-        "FLASH_ENV_GITHUB_TOKEN",
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "FLASH_JUDGE_MODEL",
