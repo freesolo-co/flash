@@ -1685,7 +1685,7 @@ def run_rl():
                 _kv_target_gb = 8.0  # matches estimator's _KV_CAP (flash.engine.vram)
                 _vllm_gpu_mem_util = min(0.45, _kv_target_gb / max(1.0, _total_vram_gb))
             except Exception:
-                _vllm_gpu_mem_util = 0.30  # conservative fallback
+                _vllm_gpu_mem_util = 0.10  # safe fallback: ~8 GB KV on worst-case 80 GB card
         grpo_kwargs.update(
             vllm_mode="colocate",
             vllm_max_model_length=vllm_max_len,
@@ -1738,7 +1738,8 @@ def run_rl():
         try:
             import vllm as _vllm_mod
 
-            _vllm_ver = tuple(int(x) for x in _vllm_mod.__version__.split(".")[:3])
+            _ver_base = _vllm_mod.__version__.split("+")[0]  # strip PEP440 local (e.g. +cu121)
+            _vllm_ver = tuple(int(x) for x in _ver_base.split(".")[:3])
             if _vllm_ver > (0, 19, 0):
                 _cudagraph_safe = False
                 print(
