@@ -49,6 +49,8 @@ from flash.engine.worker.lora import (
     _VL_EXCLUDE_SEGMENTS,  # noqa: F401
     _patch_peft_weight_converter_compat,  # noqa: F401
     _remap_vl_sync_weights,  # noqa: F401
+    assert_adapter_delta_nonzero,
+    assert_adapter_load_clean,
     assert_lora_applied,
     is_vl_checkpoint,
     lora_exclude_modules,
@@ -100,11 +102,11 @@ PHASE = os.environ.get(
 
 
 def _load_active_env():
-    """Load the run's verifiers environment from the JobSpec; require an explicit env.
+    """Load the run's Freesolo environment from the JobSpec; require an explicit env.
 
-    There is no default/builtin environment (verifiers-only): a run MUST name a verifiers/
-    Prime Hub env id. Failing here (instead of falling back to some default) prevents a paid
-    worker from training/evaluating the wrong task.
+    There is no default/builtin environment: a run MUST name a published Freesolo
+    environment id. Failing here prevents a paid worker from training/evaluating the
+    wrong task.
     """
     if JOB_SPEC is None:
         # No JobSpec at all (e.g. the module imported for a non-run path / a unit test). There
@@ -113,12 +115,13 @@ def _load_active_env():
         return None
     env_id = JOB_SPEC.environment.id
     if not env_id:
-        # Every supported algorithm (sft/grpo) trains/evaluates against a verifiers env, so a
+        # Every supported algorithm (sft/grpo) trains/evaluates against a Freesolo env, so a
         # missing env is always a misconfigured spec. Fail loudly rather than fall back to a
         # default and burn a paid worker on the wrong task.
         raise RuntimeError(
-            "JobSpec sets no environment: provide [environment] id (a verifiers/Prime Hub "
-            "slug, e.g. 'owner/name')."
+            "JobSpec sets no environment: provide [environment] id "
+            "(a Freesolo environment id like 'your-name/your-env', returned by "
+            "`flash env push --name <name>`)."
         )
     return load_environment(env_id, JOB_SPEC.environment.params)
 
@@ -140,8 +143,9 @@ def require_active_env():
         raise RuntimeError(
             "no environment is loaded: this worker was started without a JobSpec "
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
-            "carry a JobSpec naming [environment] id (a verifiers/Prime Hub slug, e.g. "
-            "'owner/name')."
+            "carry a JobSpec naming [environment] id "
+            "(a Freesolo environment id like 'your-name/your-env', returned by "
+            "`flash env push --name <name>`)."
         )
     return ACTIVE_ENV
 
@@ -466,12 +470,9 @@ def graded_text(completion: str | None) -> str | None:
     return strip_think(completion) if THINKING else completion
 
 
-
-
 # ---------------------------------------------------------------------------
 # SFT
 # ---------------------------------------------------------------------------
-
 
 
 def force_vllm_backend_for_sm120() -> str | None:
@@ -495,10 +496,11 @@ def force_vllm_backend_for_sm120() -> str | None:
         print("[rl] sm120 vLLM backend probe skipped:", e)
         return None
     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
-    print("[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
-          "on consumer Blackwell hosts -> empty-rollout failures)")
+    print(
+        "[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
+        "on consumer Blackwell hosts -> empty-rollout failures)"
+    )
     return "FLASHINFER"
-
 
 
 def finalize_alloc_conf_for_sleep() -> None:
@@ -536,10 +538,6 @@ def finalize_alloc_conf_for_sleep() -> None:
         print("[alloc] auto-conf skipped:", e)
 
 
-
-
-
-
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
@@ -568,7 +566,9 @@ def wandb_report_to() -> list[str]:
             project = (JOB_SPEC.wandb.project if JOB_SPEC else None) or "flash"
             wandb.init(project=project, name=wandb_run_name())
     except Exception as e:
-        print(f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)")
+        print(
+            f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)"
+        )
         return []
     return ["wandb"]
 
@@ -604,9 +604,6 @@ def wandb_run_info() -> dict:
         return {}
 
 
-
-
-
 def make_lora(model_id: str | None = None):
     """LoRA config. We target 'all-linear' (every nn.Linear) rather than a hardcoded
     q/k/v/o list: it is architecture-agnostic, so the same recipe works for the dense
@@ -637,7 +634,9 @@ def make_lora(model_id: str | None = None):
     # save, but the simpler, robust choice is the default init (the convergence gain isn't worth
     # silently breaking serve + warm-start).
     kwargs["init_lora_weights"] = True
-    print("[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)")
+    print(
+        "[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)"
+    )
     # Standard LoRA scaling (alpha/r). rsLoRA was removed: it scales by alpha/sqrt(r) (~5.6x larger
     # for r=32/alpha=64), so with the usual LoRA LR (e.g. 2e-4) the effective update is ~5.6x too
     # large -> SFT diverges to a degenerate adapter (served model repeats a single token / emits
@@ -650,8 +649,6 @@ def make_lora(model_id: str | None = None):
             kwargs["exclude_modules"] = exclude
             print(f"[lora] excluding modules for {model_id}: {exclude}")
     return LoraConfig(**kwargs)
-
-
 
 
 def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_id: str) -> None:
@@ -685,7 +682,7 @@ def run_sft():
     # collapsed single-turn target). Warn loudly so it is not mistaken for proper multi-turn SFT.
     if getattr(ACTIVE_ENV, "multi_turn", False):
         print(
-            "[sft][warn] this is a multi-turn / tool verifiers environment, but SFT only fits "
+            "[sft][warn] this is a multi-turn Freesolo environment, but SFT only fits "
             "the single assistant target per row (tool/env turns are ignored). The model will be "
             "trained on collapsed single-turn targets; multi-turn SFT is not supported. Use a "
             "single-turn environment, or expect a single-turn-only fit."
@@ -826,20 +823,20 @@ def run_sft():
     # FLOPs on padding. TRL's 'bfd' strategy makes padding-free batches whose example boundaries are
     # honored ONLY by an attention impl that reads them — under plain SDPA packed examples
     # cross-contaminate (silent quality loss). The boundary-correct backend is FlashAttention-2
-    # varlen (reads position_ids); but flash-attn has NO prebuilt wheel for torch 2.10 (PyPI
-    # sdist-only; Dao-AILab wheels stop at torch 2.9) so it would build from source on every cold
-    # start (~20 min, fragile) — it is NOT in the worker image. So _fa_ok is False on the current
-    # stack and packing is effectively unavailable until flash-attn is baked into a prebuilt image.
-    # Packing is ON when FA2 is importable (varlen keeps 'bfd' example boundaries correct); else
-    # SKIP — without a boundary-correct attn backend examples would cross-contaminate under SDPA.
+    # varlen (reads position_ids), which the worker image bakes in best-effort: Dockerfile.worker
+    # installs FLASH_ATTN_SPEC (a community cu128/torch2.10/cp312 wheel preferred, source build as a
+    # fallback) and tolerates a build failure -> SDPA. So _fa_ok is True whenever that install landed;
+    # packing is ON then (varlen keeps 'bfd' example boundaries correct). If the best-effort install
+    # failed, _fa_ok is False and we SKIP packing — without a boundary-correct attn backend examples
+    # would cross-contaminate under SDPA.
     _fa_ok = _flash_attn_available()
     if _fa_ok:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
     else:
         print(
-            "[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
-            "2.10). Bake flash-attn into the worker image to enable FA2 varlen packing."
+            "[sft] packing SKIPPED: flash_attn not importable (best-effort image build failed) "
+            "— no boundary-correct attn backend, falling back to SDPA without packing."
         )
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
@@ -1156,7 +1153,7 @@ def grpo_overrides() -> dict:
     Knobs: group_size, temperature, max_tokens (completion budget), kl_penalty_coef (the KL
     beta), advantage_clip (centered-advantage clip), and thinking_length_penalty_coef
     (a per-<think>-token reward deduction). These live in ``[train]`` — NOT in
-    ``[environment.params]``, which is forwarded verbatim to the verifiers env loader."""
+    ``[environment.params]``, which is forwarded verbatim to the Freesolo env loader."""
     if not JOB_SPEC:
         return {}
     train = JOB_SPEC.train
@@ -1225,9 +1222,23 @@ def _init_adapter_model(model_id: str):
         **({"attn_implementation": _attn} if _attn else {}),
     )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
-    # Fail loudly if the adapter didn't actually apply (a future key-mismatch regression would
-    # otherwise silently start GRPO from the base model again).
+    # Fail loudly if the adapter didn't actually apply (a key mismatch would otherwise silently start
+    # GRPO from the base model again). from_pretrained loads with load_state_dict(strict=False) and
+    # only WARNS on a mismatch, discarding the load result — so re-run load_adapter to CAPTURE which
+    # keys matched and assert matched==saved (peft injects the LoRA modules from target_modules BEFORE
+    # loading weights, so the module-count check alone can't see a silent weight discard). The reload
+    # is idempotent: same weights into the same "default" adapter. See flash/engine/worker/lora.py.
+    # Mirror from_pretrained's key_mapping: for transformers models that define a
+    # ``_checkpoint_conversion_mapping`` (renamed-arch checkpoints), from_pretrained remaps the adapter
+    # keys before loading; the reload must apply the SAME mapping or it would reinterpret valid keys as
+    # mismatched and falsely abort. peft reads it off the base model (peft_model.py from_pretrained).
+    key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+    load_result = model.load_adapter(
+        adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
+    )
+    assert_adapter_load_clean(load_result, model_id)
     assert_lora_applied(model, model_id)
+    assert_adapter_delta_nonzero(model, model_id)
     return model, None
 
 
@@ -1240,9 +1251,7 @@ def _grpo_resume_already_complete(resume_ckpt, target_steps: int, steps_run: int
     return bool(resume_ckpt) and target_steps > 0 and steps_run >= target_steps
 
 
-def _grpo_is_no_op_failure(
-    reward_history, resume_ckpt, target_steps: int, steps_run: int
-) -> bool:
+def _grpo_is_no_op_failure(reward_history, resume_ckpt, target_steps: int, steps_run: int) -> bool:
     """True when a GRPO run trained NOTHING and must fail loudly instead of reporting as done.
 
     An empty ``reward_history`` means the reward callback never fired — the rollout scored nothing
@@ -1292,7 +1301,9 @@ def run_rl():
     _t = JOB_SPEC.train if JOB_SPEC else None
     # batch_size = prompts per optimizer step for GRPO.
     # prompts per optimizer step = the run config's [train].batch_size (recipe default otherwise).
-    prompts_per_step = int(_t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step)
+    prompts_per_step = int(
+        _t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step
+    )
     group_size = int(gcfg.get("group_size") or rl.group_size)
     # temperature: explicit None check, NOT `or` — a configured 0.0 (greedy/deterministic
     # rollouts) must be honored, not fall back to the recipe sampling temperature.
@@ -1421,7 +1432,8 @@ def run_rl():
         for comp, ex in zip(completions, examples, strict=False):
             if isinstance(comp, list):
                 # Tool / conversational transcript (TRL passes a list of messages): score the
-                # whole transcript via the rubric (no <think> stripping — multi-turn content).
+                # whole transcript via the environment reward (no <think> stripping —
+                # multi-turn content).
                 rewards.append(ACTIVE_ENV.reward_from_messages(comp, ex))
                 continue
             r = ACTIVE_ENV.reward(graded_text(comp), ex)
@@ -1448,7 +1460,9 @@ def run_rl():
     )
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
-        print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
+        print(
+            "WARN: generation batch not divisible by group size; check prompts_per_step/group_size"
+        )
     print(
         f"[rl] GRPO batching: per_device={batching['per_device_train_batch_size']} "
         f"grad_accum={batching['gradient_accumulation_steps']} "
@@ -1880,7 +1894,6 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
-
 def main():
     # Idempotency: if DONE was already uploaded, a re-delivered job re-fetches the final
     # metrics from HF and returns them immediately. (The previous behavior — sleeping in
@@ -1968,5 +1981,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

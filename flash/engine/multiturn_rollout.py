@@ -1,7 +1,7 @@
 """Multi-turn / tool GRPO rollout for TRL's experimental ``rollout_func`` (colocate vLLM).
 
 TRL's ``GRPOTrainer`` generates a single assistant turn per prompt, which cannot drive a
-verifiers ``MultiTurnEnv`` / ``ToolEnv`` turn loop (model turn -> env reply -> ...). This
+Freesolo ``EnvironmentMultiTurn`` turn loop (model turn -> env reply -> ...). This
 module supplies a ``rollout_func`` that:
 
   * drives the env's turn loop via the adapter helpers (``new_rollout_state`` /
@@ -13,7 +13,7 @@ module supplies a ``rollout_func`` that:
     multi-turn credit assignment (it is treated internally as the tool mask), so only the
     policy's own tokens get advantage while the env tokens still provide context for the
     forward pass;
-  * scores each rollout with the env's weighted rubric (``reward_from_messages``) and returns
+  * scores each rollout with the environment reward (``reward_from_messages``) and returns
     it as an extra field consumed by a pass-through ``reward_func``.
 
 Token alignment assumes a **prefix-preserving** chat template: appending a message must not
@@ -94,8 +94,8 @@ def rollout_one(
     """Run one multi-turn/tool rollout and return TRL ``rollout_func`` fields for it.
 
     Args:
-        example: the dataset row (carries ``answer``/``info`` for the rubric).
-        active_env: the ``VerifiersEnvironment`` adapter (drives the turn loop + scoring).
+        example: the dataset row carried into environment scoring.
+        active_env: the Freesolo environment adapter (drives the turn loop + scoring).
         render: ``render(messages, add_generation_prompt) -> token_ids`` (chat template).
         generate: ``generate(prefix_token_ids, max_tokens) -> (token_ids, token_logprobs,
             text)`` for one sampled assistant turn (model tokens + sampling logprobs + text);
@@ -106,7 +106,10 @@ def rollout_one(
     token-aligned) and the scalar ``reward`` for this rollout.
     """
     state = active_env.new_rollout_state(example)
-    messages = [dict(m) for m in state["prompt"]]
+    initial_messages = state.get("prompt") or state.get("messages")
+    if not isinstance(initial_messages, list):
+        raise KeyError("multi-turn rollout state must include prompt or messages")
+    messages = [dict(m) for m in initial_messages]
     prompt_ids = render(messages, True)
     cur_ids = list(prompt_ids)  # invariant: cur_ids == prompt_ids + completion_ids so far
     # Per-rollout completion cap so prompt + accumulated completion never exceeds the colocate
