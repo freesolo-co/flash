@@ -275,13 +275,9 @@ def cmd_env_setup(args) -> int:
     return 0
 
 
-def _model_dimension(params: str) -> str:
-    return params.split(" (", 1)[0]
-
-
 def cmd_models(args) -> int:
     for row in public_model_rows():
-        print(f"{row['id']}\t{_model_dimension(row['params'])}")
+        print(row["id"])
     return 0
 
 
