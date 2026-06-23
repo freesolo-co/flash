@@ -1,8 +1,8 @@
-"""On-GPU fine-tuning worker (RunPod or Vast.ai). Modes: sft | rl.
+"""On-GPU fine-tuning worker (RunPod). Modes: sft | rl.
 
-This module runs on the provisioned GPU (RunPod or Vast.ai) launched by the selected
-``flash.providers`` backend. It uses the shared recipe (``flash.engine.recipe``) so
-SFT targets and RL rewards are rendered and scored consistently.
+This module runs on the provisioned RunPod GPU. It uses the shared recipe
+(``flash.engine.recipe``) so SFT targets and RL rewards are rendered and scored
+consistently.
 
 Artifacts (adapter, metrics.json, heartbeat.json, checkpoints) are streamed to a
 Hugging Face dataset repo. HF checkpoints give preemption resilience: if a worker is
@@ -27,6 +27,7 @@ import contextlib
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -127,7 +128,7 @@ def _load_active_env():
     return load_environment(env_id, JOB_SPEC.environment.params)
 
 
-ACTIVE_ENV = _load_active_env()
+ACTIVE_ENV = None
 
 
 def require_active_env():
@@ -140,6 +141,9 @@ def require_active_env():
     actionable message instead — mirrors the explicit RuntimeError raised when a JobSpec is
     present but names no environment.
     """
+    global ACTIVE_ENV
+    if ACTIVE_ENV is None:
+        ACTIVE_ENV = _load_active_env()
     if ACTIVE_ENV is None:
         raise RuntimeError(
             "no environment is loaded: this worker was started without a JobSpec "
@@ -319,6 +323,7 @@ def prefetch_model(model_id: str) -> float:
         model=model_id,
         download_seconds=secs,
         hf_transfer=os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
+        gpu=gpu_diagnostics(),
     )
     return secs
 
@@ -384,7 +389,7 @@ _HB_THROTTLED_STAGES = frozenset({"rl_step"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 _HB_TERMINAL_ONLY = False
 # Even in terminal-only mode, emit a SLOW heartbeat at this cadence so the control plane's stall
-# detector (poll_vast_job stall_after_s, default 1500s) keeps seeing progress through a long
+# detector keeps seeing progress through a long
 # training phase and doesn't false-stall the run. 600s -> ~6 commits/hr, far under the 128/hr cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
 
@@ -702,13 +707,13 @@ def run_sft():
     from trl import SFTConfig as TRLSFTConfig
     from trl import SFTTrainer
 
-    require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
+    env = require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
-    heartbeat("sft_start")
+    heartbeat("sft_start", gpu=gpu_diagnostics())
     # SFT only fits the single assistant `sft_target` per row; a multi-turn/ToolEnv env's
     # tool/env turns are not represented, so SFT on one would silently mis-train (imitating a
     # collapsed single-turn target). Warn loudly so it is not mistaken for proper multi-turn SFT.
-    if getattr(ACTIVE_ENV, "multi_turn", False):
+    if getattr(env, "multi_turn", False):
         print(
             "[sft][warn] this is a multi-turn Freesolo environment, but SFT only fits "
             "the single assistant target per row (tool/env turns are ignored). The model will be "
@@ -724,7 +729,7 @@ def run_sft():
         tok.pad_token = tok.eos_token
 
     # Build SFT text dataset (seeded shuffle for reproducibility)
-    train = ACTIVE_ENV.dataset()
+    train = env.dataset()
     rng = random.Random(SEED)
     rng.shuffle(train)
     max_examples = int(
@@ -737,8 +742,8 @@ def run_sft():
     texts = []
     for ex in train:
         msgs = [
-            *ACTIVE_ENV.prompt_messages(ex),
-            {"role": "assistant", "content": ACTIVE_ENV.sft_target(ex)},
+            *env.prompt_messages(ex),
+            {"role": "assistant", "content": env.sft_target(ex)},
         ]
         texts.append(
             {
@@ -756,7 +761,7 @@ def run_sft():
     ds = Dataset.from_list(texts)
 
     setup_seconds = time.time() - t_start
-    heartbeat("sft_model_load", setup_seconds=setup_seconds)
+    heartbeat("sft_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
 
     # Epochs come from the run's [train] epochs (already in JOB_SPEC), else the recipe default.
     epochs = int(
@@ -997,7 +1002,7 @@ def run_sft():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     hf_upload_folder(adapter_dir, "adapter", required=True)
-    heartbeat("sft_trained", train_wall=train_wall)
+    heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     # count train tokens
     train_tokens = int(sum(len(tok(t["text"])["input_ids"]) for t in texts) * epochs)
@@ -1364,9 +1369,9 @@ def run_rl():
     from transformers import AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
 
-    require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
+    env = require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
-    heartbeat("rl_start")
+    heartbeat("rl_start", gpu=gpu_diagnostics())
     # GRPO rollout strategy by env shape (trl 1.6 adds the hooks these need):
     #   * single-turn          -> TRL single-shot generation + per-completion reward (below);
     #   * tool (ToolEnv & subs:
@@ -1376,8 +1381,8 @@ def run_rl():
     #   * pure multi-turn      -> a custom rollout_func (flash.engine.multiturn_rollout)
     #     drives THIS env's turn loop on the colocate engine and returns the interleaved
     #     token sequence with an env_mask so only the model's tokens are trained.
-    is_tool_env = getattr(ACTIVE_ENV, "is_tool_env", False)
-    is_multi_turn = getattr(ACTIVE_ENV, "multi_turn", False)
+    is_tool_env = getattr(env, "is_tool_env", False)
+    is_multi_turn = getattr(env, "multi_turn", False)
     conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
     wait_for_gpu()
     setup_perf_backends()
@@ -1426,13 +1431,13 @@ def run_rl():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    train = ACTIVE_ENV.dataset()
+    train = env.dataset()
     rng = random.Random(SEED)
     rng.shuffle(train)
     if conversational:
         # Message-list prompts so the chat template applies roles + (for tool envs) the tool
         # schemas; per-turn length is managed by the tool loop / rollout_func, not a flat budget.
-        prompts = [{"prompt": ACTIVE_ENV.prompt_messages(ex), "example": ex} for ex in train]
+        prompts = [{"prompt": env.prompt_messages(ex), "example": ex} for ex in train]
     else:
         prompts = [{"prompt": render_prompt(tok, ex), "example": ex} for ex in train]
     # The colocated vLLM engine's model length is the hard cap on prompt+completion at
@@ -1472,7 +1477,7 @@ def run_rl():
     # Tool schemas TRL injects into the prompt for native tools= GRPO — include them in the
     # budget for a tool env so a prompt isn't undercounted at filter time vs. rollout time.
     _oai_tools = (
-        getattr(getattr(ACTIVE_ENV, "_env", None), "oai_tools", None) if is_tool_env else None
+        getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
     )
 
     def _prompt_tokens(p) -> int:
@@ -1537,16 +1542,16 @@ def run_rl():
                 # Tool / conversational transcript (TRL passes a list of messages): score the
                 # whole transcript via the environment reward (no <think> stripping —
                 # multi-turn content).
-                r = ACTIVE_ENV.reward_from_messages(comp, ex)
+                r = env.reward_from_messages(comp, ex)
                 rewards.append(r)
                 continue
             graded = graded_text(comp)
             breakdown = None
-            if hasattr(ACTIVE_ENV, "scores_breakdown"):
-                breakdown = ACTIVE_ENV.scores_breakdown(graded, ex)
+            if hasattr(env, "scores_breakdown"):
+                breakdown = env.scores_breakdown(graded, ex)
                 r = float(breakdown.get("total", 0.0))
             else:
-                r = ACTIVE_ENV.reward(graded, ex)
+                r = env.reward(graded, ex)
             if _think_penalty > 0 and THINKING:
                 r -= _think_penalty * think_token_count(comp, tok)
             rewards.append(r)
@@ -1758,7 +1763,7 @@ def run_rl():
         print("[rl] rollout amortization: num_iterations=2 (reuse each generation batch)")
     cfg = GRPOConfig(**grpo_kwargs)
     setup_seconds = time.time() - t_start
-    heartbeat("rl_train_start", setup_seconds=setup_seconds)
+    heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
 
     # VL checkpoints (Qwen3.5/3.6) train text-only: make TRL's colocated rollout
     # engine skip the vision tower (VRAM + 5090 PTX-compat; see the patch docstring).
@@ -1776,7 +1781,7 @@ def run_rl():
     # tool-call loop natively; pure multi-turn envs hand TRL a rollout_func that drives the
     # env's own turn loop on the colocate engine (env_mask masks the non-model tokens).
     extra_trainer_kwargs: dict = {}
-    tools = ACTIVE_ENV.tools() if is_tool_env else []
+    tools = env.tools() if is_tool_env else []
     # A tool env exposing NO tools would silently degrade to single-shot under tools=[]; drive
     # it through the rollout_func turn loop instead so it isn't mis-trained as single-turn.
     if is_tool_env and not tools:
@@ -1793,19 +1798,19 @@ def run_rl():
             index_collisions,
         )
 
-        examples_by_key = build_examples_index(train, ACTIVE_ENV.prompt_messages)
-        ncol = index_collisions(train, ACTIVE_ENV.prompt_messages)
+        examples_by_key = build_examples_index(train, env.prompt_messages)
+        ncol = index_collisions(train, env.prompt_messages)
         if ncol:
             print(
                 f"[rl][warn] {ncol} duplicate prompt(s) collide in the reward index; the shared "
                 "prompt scores against the last example's answer/info"
             )
         extra_trainer_kwargs["rollout_func"] = build_rollout_func(
-            active_env=ACTIVE_ENV,
+            active_env=env,
             tok=tok,
             examples_by_key=examples_by_key,
             max_completion=_max_completion,
-            max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
+            max_turns=getattr(env, "max_turns", 10),
             temperature=_temperature,
             top_p=rl.sampling_top_p,
             stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
@@ -1882,7 +1887,7 @@ def run_rl():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     hf_upload_folder(adapter_dir, "adapter", required=True)
-    heartbeat("rl_trained", train_wall=train_wall)
+    heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     # Upper bound on generated tokens: completions actually optimized (the intended
     # prompts_per_step after the batch fix) x the max completion length. Over-counts (most
@@ -1938,6 +1943,7 @@ def run_rl():
 def write_train_meta(
     phase, adapter_dir, model_id, train_wall, setup_seconds, train_tokens, generated_tokens, notes
 ):
+    env = require_active_env()
     meta = {
         "phase": phase,
         "adapter_dir": adapter_dir,
@@ -1954,14 +1960,14 @@ def write_train_meta(
     heartbeat(
         f"{phase}_train_done",
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
+        gpu=gpu_diagnostics(),
     )
     # Finalize directly from the training phase: build the run-metrics record (training
     # metrics only — loss/reward are streamed by the trainer; reward_history is in notes)
     # and write the completion sentinel. There is no separate eval phase.
     m = RunMetrics(
-        # Substrate the worker actually ran on. Each provider's launcher sets FLASH_ARM
-        # in the worker env (runpod -> "runpod", vast -> "vast"); default to "runpod" only
-        # when unset so the persisted metrics correctly attribute the compute backend.
+        # Substrate the worker actually ran on. The RunPod launcher sets FLASH_ARM; default to
+        # "runpod" when unset so persisted metrics correctly attribute the compute backend.
         arm=os.environ.get("FLASH_ARM", "runpod"),
         phase=phase,
         seed=SEED,
@@ -1979,31 +1985,43 @@ def write_train_meta(
             "thinking": THINKING,
             "train_wall": train_wall,
             "model_id": model_id,
-            "environment": ACTIVE_ENV.id,
+            "environment": env.id,
             "job_spec": JOB_SPEC.to_dict() if JOB_SPEC else None,
         },
     )
     _finalize(m)
 
 
+def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
+    """Resolve init_from_adapter into (repo, prefix).
+
+    The only public form is the exact adapter_ref emitted by ``flash status``:
+    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
+    """
+    adapter_ref = adapter_ref.strip()
+    match = re.fullmatch(
+        r"(?P<repo>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*):"
+        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})/seed(?P<seed>\d+)",
+        adapter_ref,
+    )
+    if not match:
+        return None
+    repo, phase, run_id, seed = match.groups()
+    return repo, f"{phase}/{run_id}/seed{seed}"
+
+
 def _download_adapter(adapter_prefix: str | None) -> str | None:
     """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
 
-    Two forms of ``adapter_prefix``:
-      * ``"<prefix>"``            -> read from THIS run's own artifact repo (HF_REPO).
-      * ``"<owner>/<repo>:<prefix>"`` -> CROSS-REPO warm-start: read the SFT adapter from
-        another run's managed artifact repo. Required since hf_repo is now a per-run managed
-        repo (Freesolo-Co/flashrun-<run_id>), so an SFT adapter never lives in the GRPO run's
-        own repo. The control-plane HF_TOKEN can read sibling managed repos.
+    ``adapter_prefix`` must be the full ``adapter_ref`` string emitted by ``flash status``:
+    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
     """
     if not adapter_prefix:
         return None
-    if ":" in adapter_prefix:
-        repo, prefix = adapter_prefix.split(":", 1)
-    else:
-        repo, prefix = HF_REPO, adapter_prefix
-    if not (repo and prefix):
+    resolved = _resolve_adapter_ref(adapter_prefix)
+    if not resolved:
         return None
+    repo, prefix = resolved
     from huggingface_hub import snapshot_download
 
     snapshot_download(
@@ -2025,7 +2043,7 @@ def _finalize(metrics: RunMetrics):
     with open("/tmp/DONE", "w") as f:
         f.write(str(time.time()))
     hf_upload_file("/tmp/DONE", "DONE", required=True)
-    heartbeat("done")
+    heartbeat("done", gpu=gpu_diagnostics())
     print("NODE DONE:", metrics.to_json())
 
 
@@ -2053,7 +2071,7 @@ def main():
                 done = False
             if done:
                 print("Run already complete (DONE present); returning persisted metrics.")
-                heartbeat("already_done")
+                heartbeat("already_done", gpu=gpu_diagnostics(include_torch=False))
                 try:
                     got = hf_hub_download(
                         repo_id=HF_REPO,
@@ -2069,7 +2087,7 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
-        heartbeat("boot")
+        heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.

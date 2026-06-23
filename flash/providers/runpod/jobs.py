@@ -23,7 +23,12 @@ import time
 from dataclasses import dataclass
 
 from flash._logging import get_logger
-from flash.providers._poll import PollErrorTracker, make_say, surface_heartbeat
+from flash.providers._poll import (
+    PollErrorTracker,
+    make_say,
+    surface_forced_heartbeat,
+    surface_heartbeat,
+)
 from flash.providers.base import PollResult, canonical_gpu
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.gpus import flash_gpu
@@ -366,6 +371,7 @@ def poll_job(
             except RuntimeError as e:
                 # COMPLETED but the output decodes as an error (a handler exception). Consult the
                 # worker flag too: an infra failure can surface here and must still retry.
+                last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
                 retriable = worker_flagged_retriable(heartbeat_reader)
                 detail = _append_failure_artifacts(str(e), failure_detail_reader)
                 return PollResult(
@@ -388,6 +394,7 @@ def poll_job(
             if status in PLATFORM_TERMINATIONS:
                 return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
             # A worker FAILED: consult the structured worker flag (one forced heartbeat read).
+            last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
             retriable = worker_flagged_retriable(heartbeat_reader)
             detail = _append_failure_artifacts(detail, failure_detail_reader)
             return PollResult(
@@ -581,8 +588,8 @@ def submit_run(
 def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float = 45.0):
     """Rate-limited reader for one HF artifact's text content (None until it exists).
 
-    Generic helper shared by both providers' pollers (runpod heartbeats + vast's
-    DONE/metrics/error artifacts). ``read(force=False)`` re-downloads at most once per
+    Generic helper for HF-backed worker artifacts and heartbeats. ``read(force=False)``
+    re-downloads at most once per
     ``min_interval_s`` (``force=True`` bypasses the gate); it never raises — any HF error
     (artifact absent, network) returns None.
     """
