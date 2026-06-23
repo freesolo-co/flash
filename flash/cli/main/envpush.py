@@ -18,8 +18,7 @@ def cmd_env_install(args) -> int:
     env_id = args.env_id
     if not is_freesolo_environment_id(env_id):
         print(
-            'env id must be a Freesolo environment id, e.g. "your-name/your-env" '
-            f"(got {env_id!r})",
+            f'env id must be a Freesolo environment id, e.g. "your-name/your-env" (got {env_id!r})',
             file=sys.stderr,
         )
         return 1
@@ -180,27 +179,30 @@ def cmd_env_push(args) -> int:
         print(f"no such path: {src}", file=sys.stderr)
         return 1
 
-    if src.is_dir() and (src / "pyproject.toml").is_file():
-        entrypoint = src / _ENV_ENTRYPOINT
-        if not entrypoint.is_file():
+    if src.is_dir():
+        canonical_entrypoint = src / _ENV_ENTRYPOINT
+        if canonical_entrypoint.is_file():
+            entrypoint = canonical_entrypoint
+            env_root = src
+        elif (src / "pyproject.toml").is_file():
             print(f"{src} has a pyproject.toml but no environment.py entrypoint", file=sys.stderr)
             return 1
-        env_root = src
+        else:
+            modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
+            if len(modules) != 1:
+                print(
+                    f"{src} has no environment.py and "
+                    f"{'no' if not modules else 'multiple'} top-level .py module(s); "
+                    "add an environment.py entrypoint or pass the exact .py file "
+                    "for a single-file smoke test.",
+                    file=sys.stderr,
+                )
+                return 1
+            env_root = src
+            entrypoint = modules[0]
     elif src.is_file() and src.suffix == ".py":
         env_root = src.parent
         entrypoint = src
-    elif src.is_dir():
-        modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
-        if len(modules) != 1:
-            print(
-                f"{src} has no pyproject.toml and {'no' if not modules else 'multiple'} "
-                "top-level .py module(s); point `flash env push --name <name>` at the "
-                "env's .py file or add a pyproject.toml.",
-                file=sys.stderr,
-            )
-            return 1
-        env_root = src
-        entrypoint = modules[0]
     else:
         print(
             f"cannot publish {src}: expected a Freesolo .py module or an env directory.",

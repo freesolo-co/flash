@@ -43,7 +43,7 @@ def test_env_init_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> No
     monkeypatch.chdir(tmp_path)
     assert cmd_env_init(Namespace(name="my-task")) == 0
 
-    env_module = tmp_path / "environments" / "my_task" / "my_task.py"
+    env_module = tmp_path / "environments" / "my_task" / "environment.py"
     assert env_module.is_file()
     source = env_module.read_text(encoding="utf-8")
     # The scaffold must be a Freesolo SDK env, not the old BaseEnvironment subclass.
