@@ -211,10 +211,12 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
     try:
         payload = json.loads(data)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Failed to resolve managed environment version: invalid response") from exc
+        raise RuntimeError(
+            f"Failed to resolve GitHub environment ref {parsed.canonical()}: invalid response"
+        ) from exc
     sha = payload.get("sha")
     if not isinstance(sha, str) or not _is_commit_sha(sha):
-        raise RuntimeError("Failed to resolve managed environment version")
+        raise RuntimeError(f"Failed to resolve GitHub environment ref {parsed.canonical()}")
     return sha
 
 
@@ -224,9 +226,9 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
             return resp.read()
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"managed environment request failed ({exc.code}): {body[:500]}") from exc
+        raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"managed environment request failed: {exc.reason}") from exc
+        raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
