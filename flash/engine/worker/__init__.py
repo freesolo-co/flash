@@ -1101,6 +1101,22 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     }
 
 
+def resolve_grpo_prompts_per_step(requested: int, available_prompts: int) -> int:
+    """Cap GRPO's prompt batch to the retained dataset size.
+
+    TRL's GRPO dataloader can yield zero batches when the configured prompt batch is larger
+    than the dataset that remains after prompt-budget filtering. That surfaces late as
+    "There seems not to be a single sample in your epoch_iterator" and then our no-reward guard
+    reports the wrong cause. Small smoke envs should still train; use every retained prompt per
+    step instead of asking TRL for an impossible larger batch.
+    """
+    requested = max(1, int(requested))
+    available_prompts = int(available_prompts)
+    if available_prompts <= 0:
+        raise ValueError("GRPO needs at least one retained training prompt")
+    return min(requested, available_prompts)
+
+
 def rl_per_device_comps(
     completion_len: int = 0,
     vocab: int = 248_320,
@@ -1497,6 +1513,13 @@ def run_rl():
             "[train].max_tokens, or shorten the environment's prompts"
         )
     prompts = kept
+    resolved_prompts_per_step = resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
+    if resolved_prompts_per_step != prompts_per_step:
+        print(
+            f"[rl] lowering prompts_per_step from {prompts_per_step} to "
+            f"{resolved_prompts_per_step}: only {len(prompts)} prompt(s) fit after filtering"
+        )
+        prompts_per_step = resolved_prompts_per_step
     ds = Dataset.from_list(prompts)
 
     def reward_fn(completions, **kwargs):
@@ -1837,6 +1860,14 @@ def run_rl():
     # didn't reach the target steps).
     _resumed_complete = _grpo_resume_already_complete(resume_ckpt, steps, _steps_run)
     if _grpo_is_no_op_failure(reward_history, resume_ckpt, steps, _steps_run):
+        if _steps_run == 0:
+            raise RuntimeError(
+                "GRPO trainer completed zero optimizer steps before any reward was scored. "
+                f"retained_prompts={len(prompts)}, prompts_per_step={prompts_per_step}, "
+                f"generations_per_step={batching['generations_per_step']}. This usually means "
+                "TRL built an empty dataloader; add training examples, lower [train].batch_size, "
+                "or reduce prompt length/max_tokens so more examples fit."
+            )
         raise RuntimeError(
             f"GRPO scored no reward in {train_wall:.1f}s over {_steps_run} step(s) — the rollout "
             "produced no completions, so the policy was never actually trained. Failing loudly "

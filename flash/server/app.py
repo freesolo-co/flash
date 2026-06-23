@@ -35,6 +35,7 @@ from flash.runner import (
 from flash.schema import ConfigError, spec_from_dict
 from flash.serve.deploy import ServingError, deploy_adapter, undeploy_adapter
 from flash.serve.deploy import chat as serve_chat
+from flash.serve.deploy import chat_stream as serve_chat_stream
 from flash.spec import JobSpec
 
 from . import auth, db
@@ -204,6 +205,7 @@ def recover_runs() -> None:
 def create_app():
     try:
         from fastapi import Depends, FastAPI, Header, HTTPException
+        from fastapi.responses import StreamingResponse
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     from contextlib import asynccontextmanager
@@ -547,6 +549,18 @@ def create_app():
                 detail=f"run {run_id} has no [train].hf_repo (legacy run); its adapter cannot be served",
             )
         try:
+            if payload.get("stream") is True:
+                return StreamingResponse(
+                    serve_chat_stream(
+                        run_id=run_id,
+                        messages=payload.get("messages") or [],
+                        temperature=float(payload.get("temperature") or 0.0),
+                        max_tokens=int(payload.get("max_tokens") or 512),
+                        # a run trained with thinking serves with thinking (per-run parity)
+                        thinking=spec.thinking,
+                    ),
+                    media_type="text/plain; charset=utf-8",
+                )
             return serve_chat(
                 run_id=run_id,
                 messages=payload.get("messages") or [],
