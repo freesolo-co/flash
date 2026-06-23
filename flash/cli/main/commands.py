@@ -290,7 +290,7 @@ def cmd_models(args) -> int:
         print(render.models_table(rows))
         return 0
     for row in rows:
-        print(f"{row['id']}\t{_model_dimension(row['params'])}")
+        print(row["id"])
     return 0
 
 
