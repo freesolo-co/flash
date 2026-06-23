@@ -223,14 +223,29 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
 
 
 def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
+    import random
+    import time
+
+    _MAX_RATE_LIMIT_RETRIES = 5
+    _RATE_LIMIT_BASE_DELAY = 10.0
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            if exc.code == 403 and "rate limit" in body.lower() and attempt < _MAX_RATE_LIMIT_RETRIES:
+                # GitHub secondary rate limit: many workers booting simultaneously all
+                # hit the same commits/tarball endpoint, triggering abuse detection.
+                # Retry with jitter so concurrent workers don't all retry at once.
+                delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
+                time.sleep(delay)
+                attempt += 1
+                continue
+            raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:

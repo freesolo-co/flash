@@ -465,7 +465,31 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             return out
 
         try:
-            results = asyncio.run(_undeploy_all())
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                # No running event loop — asyncio.run() works directly.
+                results = asyncio.run(_undeploy_all())
+            else:
+                # Running event loop (e.g. FastAPI lifespan) — asyncio.run() would raise;
+                # daemon=True so a hung undeploy cannot prevent process shutdown.
+                _out: list = []
+                _err: list = []
+
+                def _run_undeploy() -> None:
+                    try:
+                        _out.append(asyncio.run(_undeploy_all()))
+                    except Exception as _e:
+                        _err.append(_e)
+
+                _t = threading.Thread(target=_run_undeploy, daemon=True)
+                _t.start()
+                _t.join(timeout=30)
+                if _err:
+                    raise _err[0]
+                if not _out:
+                    raise TimeoutError("undeploy timed out after 30s")
+                results = _out[0]
         except Exception as exc:
             results = [{"success": False, "name": target, "message": str(exc)}]
 
