@@ -413,7 +413,14 @@ def create_app():
                 f.seek(end)
                 chunk = f.read()
                 end = f.tell()
-        return {"run_id": run_id, "logs": chunk, "offset": end, "state": status.state}
+        return {
+            "run_id": run_id,
+            "logs": chunk,
+            "offset": end,
+            "state": status.state,
+            "last_heartbeat": status.last_heartbeat,
+            "gpu_status": status.gpu_status,
+        }
 
     @app.post("/v1/runs/{run_id}/cancel")
     def cancel(run_id: str, key: dict = Depends(require_key)):

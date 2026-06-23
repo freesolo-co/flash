@@ -109,6 +109,44 @@ def _fake_bitsandbytes(monkeypatch):
     return _PagedAdamW8bit
 
 
+def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
+    from flash.engine.worker import perf
+
+    class _Completed:
+        def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(cmd, **_kwargs):
+        joined = " ".join(cmd)
+        if "--query-gpu=" in joined:
+            return _Completed(
+                "0, GPU-abc, 575.57, NVIDIA GeForce RTX 5090, 98, 77, "
+                "32607, 24000, 8607, 69, 412.5, 575.0, P0, 2700, 14001, 5, 16\n"
+            )
+        if "--query-compute-apps=" in joined:
+            return _Completed("1234, /usr/bin/python, 23900\n")
+        return _Completed(returncode=1, stderr="unexpected command")
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    diag = perf.gpu_diagnostics()
+
+    assert diag["device_name"] == "NVIDIA GeForce RTX 5090"
+    assert diag["driver_version"] == "575.57"
+    assert diag["gpu_util_pct"] == 98
+    assert diag["mem_util_pct"] == 77
+    assert diag["memory_used_gb"] == pytest.approx(23.438)
+    assert diag["memory_total_gb"] == pytest.approx(31.8428, rel=1e-3)
+    assert diag["temperature_c"] == 69
+    assert diag["power_w"] == 412.5
+    assert diag["processes"][0]["process_name"] == "/usr/bin/python"
+    assert diag["processes"][0]["used_memory_gb"] == pytest.approx(23.34, rel=1e-3)
+
+
 def test_loraplus_optimizer_mirrors_8bit_optim(monkeypatch):
     """An `8bit` optim string -> bnb PagedAdamW8bit (LoRA+ and 8-bit state coexist), always-on."""
     worker = _import_worker(monkeypatch)
