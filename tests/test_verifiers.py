@@ -418,6 +418,31 @@ def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, 
     assert downloads == ["b" * 40]
 
 
+def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+
+    downloads: list[str] = []
+
+    def fake_download(ref):
+        downloads.append(ref.path)
+        return _github_environment_tarball(
+            "repo-root",
+            env_path="envs/e/freesolo/environment.py",
+        )
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
+
+    resolved = adapter._resolve_environment_reference(
+        "https://github.com/owner/repo/tree/main/envs/e/freesolo"
+    )
+    assert resolved.endswith("envs/e/freesolo/environment.py")
+    assert "freesolo/freesolo" not in resolved
+    assert downloads == ["envs/e/freesolo/environment.py"]
+
+
 def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, monkeypatch):
     import flash.envs.adapter as adapter
 

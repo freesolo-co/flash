@@ -144,6 +144,27 @@ def test_rollout_one_stops_when_env_has_no_reply():
     assert out["env_mask"] == [1, 1]
 
 
+def test_rollout_one_accepts_messages_only_initial_state():
+    class MessagesOnlyEnv(FakeEnv):
+        def new_rollout_state(self, example):
+            return {
+                "messages": [{"role": "user", "content": "u1"}],
+                "completion": [],
+                "answer": example.get("answer"),
+            }
+
+    out = rollout_one(
+        example={"answer": "x"},
+        active_env=MessagesOnlyEnv(),
+        render=render,
+        generate=_generator(["a1", "GOOD"]),
+        max_turns=1,
+        per_turn_max_tokens=64,
+    )
+    assert out["prompt_ids"] == [HDR["user"], CONTENT["u1"], END, HDR["assistant"]]
+    assert out["env_mask"] == [1, 1]
+
+
 def test_non_prefix_template_raises():
     # A non-prefix-preserving template would mis-mask model vs env tokens, so the rollout must
     # fail loudly rather than silently mis-train.
