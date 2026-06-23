@@ -264,3 +264,113 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
     assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
     # The OpenAI shape is preserved so resp["choices"][0]["message"]["content"] works.
     assert out["choices"][0]["message"]["content"] == "hi there"
+
+
+def test_chat_stream_yields_openai_sse_content(monkeypatch):
+    """chat_stream requests OpenAI streaming and yields assistant content deltas only."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    seen = {}
+
+    class _StreamResp:
+        def __init__(self):
+            self.headers = {"content-type": "text/event-stream"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            return iter(
+                [
+                    'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}',
+                    'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}',
+                    'data: {"choices":[{"delta":{"content":" there"},"finish_reason":null}]}',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            seen["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def stream(self, method, url, json=None):
+            seen["method"] = method
+            seen["url"] = url
+            seen["json"] = json
+            return _StreamResp()
+
+    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
+
+    chunks = list(
+        d.chat_stream(
+            run_id="flash-7-abcd",
+            messages=[{"role": "user", "content": "2+2?"}],
+            temperature=0.0,
+            max_tokens=8,
+            thinking=True,
+        )
+    )
+
+    assert chunks == ["hi", " there"]
+    assert seen["client_kwargs"]["follow_redirects"] is True
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://serve.example/v1/chat/completions"
+    assert seen["json"]["stream"] is True
+    assert seen["json"]["model"] == "flash-7-abcd"
+    assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_chat_stream_accepts_json_fallback(monkeypatch):
+    """A new Flash server can still talk to an older serving app that ignores stream=true."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+
+    class _JsonResp:
+        def __init__(self):
+            self.headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "full reply"}}]}
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def stream(self, method, url, json=None):
+            return _JsonResp()
+
+    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
+
+    assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
+        "full reply"
+    ]
