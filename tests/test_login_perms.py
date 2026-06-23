@@ -38,6 +38,14 @@ def _check_login(monkeypatch):
             "verify_freesolo_key",
             lambda api_key, base_url=None: verified.update(api_key=api_key, base_url=base_url),
         )
+        # After storing the key, login fetches the identity card via the control plane; stub
+        # it so the test stays offline (the lookup is best-effort and must not be a network hop).
+        identity = {"kind": "freesolo_api_key", "key_prefix": "fs-secr", "email": "me@example.com"}
+        monkeypatch.setattr(
+            cli.commands,
+            "client_from_config",
+            lambda *a, **k: types.SimpleNamespace(me=lambda: identity),
+        )
         args = types.SimpleNamespace(api_key="fs-secret-123", api_url=None, freesolo_url=None)
         rc = cli.cmd_login(args)
         assert rc == 0
