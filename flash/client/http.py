@@ -8,14 +8,19 @@ problems surface as ``ClientError`` with an actionable hint.
 from __future__ import annotations
 
 import codecs
+import contextlib
 import json
 import os
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from .config import load_credentials_with_source
+
+# Called as ``progress(bytes_sent, total_bytes)`` as a request body streams to the server, so
+# the CLI can draw an upload bar. ``total_bytes`` is the full Content-Length, fixed up front.
+ProgressCallback = Callable[[int, int], None]
 
 
 class ClientError(RuntimeError):
@@ -82,6 +87,35 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
         ) from exc
 
 
+class _ProgressReader:
+    """A read()-only file-like over an in-memory payload that reports bytes consumed.
+
+    ``http.client`` sends a body exposing ``read()`` in blocksize chunks; we forward the running
+    total to ``progress(sent, total)`` for each chunk so the CLI can draw an upload bar. The
+    caller sets Content-Length from ``len(payload)``, so the request is NOT chunked-encoded and
+    the server reads it exactly as a plain bytes body."""
+
+    def __init__(self, data: bytes, progress: ProgressCallback):
+        self._data = data
+        self._total = len(data)
+        self._pos = 0
+        self._progress = progress
+
+    def __len__(self) -> int:
+        return self._total
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            chunk = self._data[self._pos :]
+        else:
+            chunk = self._data[self._pos : self._pos + size]
+        self._pos += len(chunk)
+        # a rendering hiccup must never abort an in-flight upload
+        with contextlib.suppress(Exception):
+            self._progress(self._pos, self._total)
+        return chunk
+
+
 class ApiClient:
     def __init__(
         self,
@@ -132,6 +166,41 @@ class ApiClient:
                 "check your network connection and FLASH_API_URL"
             ) from exc
 
+    def _post_with_progress(
+        self,
+        path: str,
+        body: dict,
+        *,
+        progress: ProgressCallback,
+        timeout: float,
+    ) -> Any:
+        """POST a JSON body while reporting upload progress (see :class:`_ProgressReader`).
+
+        Same error mapping as :meth:`_request`; kept separate because the body is a streaming
+        reader with an explicit Content-Length rather than a one-shot bytes payload."""
+        payload = json.dumps(body).encode()
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(payload))}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            f"{self.api_url}{path}",
+            method="POST",
+            data=_ProgressReader(payload, progress),
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            raise ApiError(exc.code, detail) from exc
+        except urllib.error.URLError as exc:
+            raise ClientError(
+                f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
+                "check your network connection and FLASH_API_URL"
+            ) from exc
+
     # -- identity ----------------------------------------------------------------------
     def me(self) -> dict:
         return self._request("GET", "/v1/me")
@@ -140,14 +209,22 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     # -- environments ------------------------------------------------------------------
-    def publish_env(self, *, name: str, package_b64: str) -> dict:
-        """Upload a packaged Freesolo environment to the managed Environments Hub."""
-        return self._request(
-            "POST",
-            "/v1/envs",
-            body={"name": name, "package_b64": package_b64},
-            timeout=1800.0,
-        )
+    def publish_env(
+        self,
+        *,
+        name: str,
+        package_b64: str,
+        progress: ProgressCallback | None = None,
+    ) -> dict:
+        """Upload a packaged Freesolo environment to the managed Environments Hub.
+
+        When ``progress`` is given the body streams to the server in chunks and
+        ``progress(bytes_sent, total_bytes)`` fires for each, so the CLI can render an upload
+        bar; otherwise the body is sent in one shot (the default, used off a TTY)."""
+        body = {"name": name, "package_b64": package_b64}
+        if progress is None:
+            return self._request("POST", "/v1/envs", body=body, timeout=1800.0)
+        return self._post_with_progress("/v1/envs", body, progress=progress, timeout=1800.0)
 
     # -- runs --------------------------------------------------------------------------
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
