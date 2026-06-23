@@ -1224,7 +1224,14 @@ def _init_adapter_model(model_id: str):
     # keys matched and assert matched==saved (peft injects the LoRA modules from target_modules BEFORE
     # loading weights, so the module-count check alone can't see a silent weight discard). The reload
     # is idempotent: same weights into the same "default" adapter. See flash/engine/worker/lora.py.
-    load_result = model.load_adapter(adir, adapter_name="default", is_trainable=True)
+    # Mirror from_pretrained's key_mapping: for transformers models that define a
+    # ``_checkpoint_conversion_mapping`` (renamed-arch checkpoints), from_pretrained remaps the adapter
+    # keys before loading; the reload must apply the SAME mapping or it would reinterpret valid keys as
+    # mismatched and falsely abort. peft reads it off the base model (peft_model.py from_pretrained).
+    key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+    load_result = model.load_adapter(
+        adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
+    )
     assert_adapter_load_clean(load_result, model_id)
     assert_lora_applied(model, model_id)
     assert_adapter_delta_nonzero(model, model_id)
