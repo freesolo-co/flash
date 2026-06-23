@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import random
 import sys
 import threading
@@ -1991,12 +1992,12 @@ def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     The only public form is the exact adapter_ref emitted by ``flash status``:
     ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
     """
-    repo, sep, prefix = adapter_ref.partition(":")
-    if not (sep and repo and prefix):
+    adapter_ref = adapter_ref.strip()
+    match = re.match(r"^([^/]+/[^/:]+):(sft|rl)/([^/]+)/seed(\d+)$", adapter_ref)
+    if not match:
         return None
-    if repo.count("/") != 1 or not prefix.startswith(("sft/", "rl/")):
-        return None
-    return repo, prefix
+    repo, phase, run_id, seed = match.groups()
+    return repo, f"{phase}/{run_id}/seed{seed}"
 
 
 def _download_adapter(adapter_prefix: str | None) -> str | None:
