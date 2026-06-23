@@ -245,7 +245,7 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
     if len(data) > _MAX_ARCHIVE_BYTES:
         raise RuntimeError(
-            f"managed environment package is too large ({len(data)} bytes; "
+            f"environment archive is too large ({len(data)} bytes; "
             f"limit {_MAX_ARCHIVE_BYTES} bytes)"
         )
     return data
@@ -268,29 +268,29 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
                 if not part or part == ".":
                     continue
                 if part == "..":
-                    raise RuntimeError(f"unsafe path in managed environment package: {member.name!r}")
+                    raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
                 parts.append(part)
             if not parts:
                 continue
             normalized_name = "/".join(parts)
             target = (dest / normalized_name).resolve()
             if target != root and root not in target.parents:
-                raise RuntimeError(f"unsafe path in managed environment package: {member.name!r}")
+                raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
             top_dirs.add(parts[0])
             total += max(0, member.size)
             if total > _MAX_ARCHIVE_BYTES:
                 raise RuntimeError(
-                    f"managed environment package is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+                    f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
                 )
             member.name = normalized_name
             tar.extract(member, dest)
     if len(top_dirs) != 1:
-        raise RuntimeError("managed environment package had an unexpected layout")
+        raise RuntimeError("environment archive had an unexpected layout")
     extracted = dest / next(iter(top_dirs))
     if not extracted.is_dir():
-        raise RuntimeError("managed environment package did not extract to a directory")
+        raise RuntimeError("environment archive did not extract to a directory")
     return extracted
 
 

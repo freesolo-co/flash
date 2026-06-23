@@ -138,6 +138,19 @@ def test_push_single_py_ships_sibling_helper_modules(monkeypatch, tmp_path):
     assert "helper.py" in _members(cap["package_b64"])
 
 
+def test_push_alternate_py_keeps_packaged_entrypoint(monkeypatch, tmp_path):
+    env_file = tmp_path / "custom_env.py"
+    env_file.write_text("def load_environment(**k):\n    return 'custom'\n")
+    (tmp_path / "environment.py").write_text("def load_environment(**k):\n    return 'sibling'\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+    files = _members(cap["package_b64"])
+    assert "return 'custom'" in files["environment.py"]
+    assert "return 'sibling'" not in files["environment.py"]
+
+
 def test_push_requires_explicit_name(tmp_path, capsys):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")
