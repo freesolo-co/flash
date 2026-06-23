@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 
 from flash._logging import get_logger
+from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.spec import JobSpec
 
 # Literal name (NOT __name__) so the logger stays "flash.providers.runpod.train" after the
@@ -254,7 +255,7 @@ def chalk_extra_pip(spec=None) -> list[str]:
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
 
 
-_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
+_RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 
 
 def build_worker_env(
@@ -265,8 +266,8 @@ def build_worker_env(
     """Per-run env passed to the worker (platform creds + recipe overrides).
 
     Provider and artifact credentials still come from the control-plane process environment.
-    User-owned W&B is the one supported client runtime secret, injected from ``runtime_secrets``
-    below so the control plane does not need a platform W&B key.
+    User runtime secrets (W&B plus [environment].secrets) are injected from ``runtime_secrets``
+    below so the control plane never stores user-owned secret values in the spec.
     """
     # CUDA allocator conf. Colocate (TRL trainer + vLLM on one GPU) fragments over a long run,
     # so expandable_segments (which reclaims fragmentation) is the right default — EXCEPT under
@@ -412,7 +413,8 @@ def build_worker_env(
         if str(k).upper() in _RESERVED_WORKER_ENV:
             continue  # control plane owns run identity; a per-run override would orphan artifacts
         env[str(k)] = str(v)
+    allowed_runtime_secrets = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
     for k, v in (runtime_secrets or {}).items():
-        if k in _RUNTIME_SECRET_KEYS and v:
+        if k in allowed_runtime_secrets and v:
             env[k] = str(v)
     return env

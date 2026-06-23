@@ -1,7 +1,7 @@
 """Live, READ-ONLY Vast smoke (opt-in, no instance rental, no spend).
 
 Only read paths: API auth/reachability via the instances list, the verified-datacenter
-offer search, and the offer->class mapping / live pricing. Never rents an instance.
+offer search, and the offer->class mapping. Never rents an instance.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def test_vast_search_offers_read_only():
 
 
 def test_vast_usable_offers_and_pricing():
-    """usable_offers maps live offers to managed classes; pricing reads the cheapest."""
+    """usable_offers maps live offers to managed classes; pricing stays static."""
     _require_key()
     from flash.providers import get_provider
     from flash.providers.vast.jobs import usable_offers
@@ -52,5 +52,5 @@ def test_vast_usable_offers_and_pricing():
     for o in offers[:5]:
         assert o.gpu  # mapped to a canonical managed class
         assert o.dph_total > 0
-    # the provider interface returns a rate (cheapest live offer, else static fallback)
+    # the provider interface returns a static rate
     assert get_provider("vast").hourly_rate("RTX 5090") > 0

@@ -87,6 +87,29 @@ def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(mon
     assert env["WANDB_API_KEY"] == "user-wb"
 
 
+def test_build_worker_env_forwards_declared_environment_runtime_secrets():
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import EnvironmentSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        environment=EnvironmentSpec(id="owner/env", secrets=("SERPAPI_API_KEY",)),
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+    )
+
+    env = build_worker_env(
+        spec,
+        0,
+        runtime_secrets={
+            "SERPAPI_API_KEY": "serp-user",
+            "UNDECLARED_API_KEY": "must-not-forward",
+        },
+    )
+    assert env["SERPAPI_API_KEY"] == "serp-user"
+    assert "UNDECLARED_API_KEY" not in env
+
+
 def test_build_worker_env_forwards_upload_console(monkeypatch):
     """FLASH_UPLOAD_CONSOLE (upload the worker console on SUCCESS, not just on crash) is read on the
     worker by run_mode() from the forwarded env dict — RunPod _train_body AND the Vast bootstrap,
