@@ -15,7 +15,7 @@ from flash.providers.base import (
 from flash.schema.fields import (
     ConfigError,
     _coerce_scalar,
-    _require_slug,
+    _require_environment_ref,
     _train_float,
     _train_int,
     _train_stops,
@@ -91,14 +91,42 @@ def _apply_override(raw: dict, item: str) -> None:
 # remain RECOGNIZED — not rejected — because a round-tripped JobSpec (spec.to_dict(), which the
 # control plane re-parses on submit) still carries them; rejecting would break that re-validation.
 _TOP_LEVEL_KEYS = frozenset(
-    {"model", "algorithm", "model_policy", "thinking",
-     "environment", "train", "gpu", "worker_env", "wandb", "run_id"}
+    {
+        "model",
+        "algorithm",
+        "model_policy",
+        "thinking",
+        "environment",
+        "train",
+        "gpu",
+        "worker_env",
+        "wandb",
+        "run_id",
+    }
 )
 _TRAIN_KEYS = frozenset(
-    {"steps", "epochs", "lora_rank", "lora_alpha", "seeds", "init_from_adapter", "hf_repo",
-     "learning_rate", "batch_size", "max_length", "save_every", "group_size", "temperature",
-     "max_tokens", "kl_penalty_coef", "advantage_clip", "thinking_length_penalty_coef",
-     "stop_sequences", "max_steps", "max_examples"}
+    {
+        "steps",
+        "epochs",
+        "lora_rank",
+        "lora_alpha",
+        "seeds",
+        "init_from_adapter",
+        "hf_repo",
+        "learning_rate",
+        "batch_size",
+        "max_length",
+        "save_every",
+        "group_size",
+        "temperature",
+        "max_tokens",
+        "kl_penalty_coef",
+        "advantage_clip",
+        "thinking_length_penalty_coef",
+        "stop_sequences",
+        "max_steps",
+        "max_examples",
+    }
 )
 # Allowed values for the OPT-IN [gpu] provider pin (mirrors providers.PROVIDER_NAMES); unset keeps
 # cross-provider cheapest-wins allocation.
@@ -147,14 +175,13 @@ def spec_from_dict(raw: dict[str, Any], run_id: str | None = None) -> JobSpec:
         env_raw = {}
     if not isinstance(env_raw, dict):
         raise ConfigError("[environment] must be a table")
-    # Local environment paths are gone: a run names a published verifiers environment by
-    # [environment] id.
+    # Local environment paths are gone: a run names a published Freesolo env by [environment] id.
     # A stray `path` (alone or alongside `id`) is a stale config — reject it loudly instead of
     # silently ignoring the key and training against the wrong/missing env.
     if env_raw.get("path"):
         raise ConfigError(
             "local environment paths are no longer supported — remove `path` and reference a "
-            'published verifiers environment `id` ("owner/name")'
+            "Freesolo environment `id` returned by `flash env push`"
         )
     # Validate the [environment] sub-fields before they reach EnvironmentSpec(...). The
     # constructor's ``dict(... or {})`` / ``tuple(str(p) for p in ... or ())`` papers over a falsy
@@ -315,19 +342,17 @@ def _validate_spec(spec: JobSpec) -> None:
         raise ConfigError("train.steps must be positive for GRPO")
     if spec.algorithm == "sft" and spec.train.epochs is not None and spec.train.epochs <= 0:
         raise ConfigError("train.epochs must be positive for SFT")
-    # Verifiers-only: every run must name a published verifiers environment
-    # via [environment] id. There is no default environment and no local path mode.
+    # Every run must name a Freesolo environment by [environment] id.
+    # There is no default environment and no local path mode.
     if not spec.environment.id:
         raise ConfigError(
-            "config must set [environment] id (a published verifiers environment id, e.g. "
-            '"owner/name"); there is no local path mode'
+            "config must set [environment] id (upload an environment with `flash env push` "
+            "and paste the returned id); "
+            "there is no local path mode"
         )
-    # The id must be a full "owner/name" id: exactly one slash, both parts
-    # non-empty. A bare id like "gsm8k" passes the presence check but then the worker install
-    # cannot resolve it after provisioning.
-    _require_slug(
+    _require_environment_ref(
         spec.environment.id,
-        '[environment] id must be a published verifiers environment id "owner/name"',
+        "[environment] id must be a Freesolo environment id returned by `flash env push`",
     )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")

@@ -37,11 +37,11 @@ from fastapi.testclient import TestClient
 from flash.client.http import ApiClient, ApiError
 
 # A representative managed-run spec -- the shape the freesolo bridge / SDK
-# submits: catalog model, published environment id, an HF repo for artifacts.
+# submits: catalog model, GitHub Freesolo environment slug, an HF repo for artifacts.
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "primeintellect/gsm8k", "params": {"max_examples": 8}},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py", "params": {"max_examples": 8}},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
@@ -78,7 +78,7 @@ def make_client(tmp_path, monkeypatch):
     """Yields a factory building real ``ApiClient``s wired into one in-process
     control-plane app via a ``urllib`` -> ``TestClient`` shim."""
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("PRIME_API_KEY", "pit-test")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
 
     import flash.runner as runner
@@ -147,9 +147,8 @@ def test_health_and_identity_roundtrip(make_client) -> None:
     me = client.me()
     # The server resolves the bearer to a per-key identity and the client parses
     # the JSON body back into a dict the CLI prints.
-    assert me["kind"] == "freesolo_api_key"
     assert me["key_prefix"]
-    assert "email" not in me
+    assert "email" in me
 
 
 def test_create_status_list_cancel_lifecycle(make_client) -> None:

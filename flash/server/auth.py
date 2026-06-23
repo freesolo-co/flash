@@ -86,6 +86,8 @@ def _external_key_prefix(token: str, identity: dict[str, Any]) -> str:
     prefix = _str_field(identity.get("key_prefix"))
     if prefix and prefix.startswith("fslo_"):
         return prefix
+    if not identity and token.startswith("fslo-user-"):
+        return "freesolo"
     return _freesolo_key_prefix(token)
 
 
@@ -161,8 +163,8 @@ def _external_row(row: dict, token: str, identity: dict[str, Any]) -> dict:
     out["key_prefix"] = _external_key_prefix(token, identity)
     if identity.get("email"):
         out["email"] = identity["email"]
-    elif out.get("email") == "freesolo-user":
-        out["email"] = None
+    elif not out.get("email"):
+        out["email"] = "freesolo-user"
     for key in ("user_id", "org_id", "api_key_id", "training_agent_job_id", "project_id"):
         if identity.get(key):
             out[key] = identity[key]
