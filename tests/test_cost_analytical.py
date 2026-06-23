@@ -93,13 +93,13 @@ def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
 
 def test_cold_start_calibrated_to_real_short_sft_run():
     # Calibration anchor: a real fresh-worker run (0.8B SFT, 391 examples -> 26 priced steps at
-    # the recipe batch, RTX 3090 @ $0.239/hr) billed ~$0.047, cold-start-dominated (a fresh worker
-    # spent ~12.5 min in model load). The estimate must land within +-10% of that actual -- earlier
-    # the cold start was under-modeled (~$0.04, ~15% low). 26 = ceil(391 / 32) * 2 epochs.
+    # the recipe batch) was cold-start-dominated (a fresh worker spent ~12.5 min in model load).
+    # Static pricing now picks the cheapest fitting class, but the estimate must stay in the same
+    # short-run range. 26 = ceil(391 / 32) * 2 epochs.
     e = estimate_cost(RunConfig(SMALL, "sft", 26))
-    assert e.gpu == "RTX 3090"
-    assert e.gpu_hourly_usd == pytest.approx(0.239, abs=1e-3)
-    assert e.total_usd == pytest.approx(0.047, rel=0.10)
+    assert e.gpu == "RTX 2000 Ada"
+    assert e.gpu_hourly_usd == pytest.approx(0.24, abs=1e-3)
+    assert e.total_usd == pytest.approx(0.044, rel=0.10)
     # Model load (not boot/deps) is the dominant cold-start term for a short job.
     assert e.setup_seconds > e.train_seconds  # cold start dominates this short run
 
@@ -164,15 +164,15 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
 
 def test_select_gpu_picks_cheapest_including_unvalidated():
     # No validation gate: select_gpu picks the cheapest fitting class (validated or not) at the
-    # REALIZED (billed) rate, and nothing fitting is cheaper.
-    from flash.cost.facts import pick_gpu, realized_hourly_usd
+    # static rate, and nothing fitting is cheaper.
+    from flash.cost.facts import gpu_hourly_usd, pick_gpu
     from flash.providers.base import GPU_INFO
 
     gpu, need = select_gpu(RunConfig(MID, "sft", 100))
     assert gpu == pick_gpu(need)
     cheaper = [
         g for g in GPU_INFO.values()
-        if g.vram_gb >= need and realized_hourly_usd(g.name) < realized_hourly_usd(gpu)
+        if g.vram_gb >= need and gpu_hourly_usd(g.name) < gpu_hourly_usd(gpu)
     ]
     assert not cheaper, f"{cheaper} cheaper than {gpu} for {need} GB"
 

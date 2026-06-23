@@ -44,7 +44,7 @@ def adapter_prefix(spec: JobSpec, seed: int | None = None) -> str:
 
 
 def _gpu_rate(gpu_type: str) -> float:
-    """Representative $/hr for cost projection (live RunPod pricing, static fallback);
+    """Static representative $/hr for cost projection;
     the worker also records wall time so cost = wall_hours * rate."""
     try:
         from flash.providers.runpod.pricing import hourly_rate
