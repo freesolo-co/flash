@@ -31,6 +31,8 @@ from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
 
+from . import render
+
 logger = get_logger("flash.cli.main")
 
 
@@ -57,24 +59,43 @@ def cmd_login(args) -> int:
     # Login is handled by the freesolo backend (not the flash control plane): the user
     # supplies the freesolo API key they created at freesolo.co, and we verify it against
     # freesolo before storing it. The same key authenticates flash's control plane.
-    api_key = args.api_key or os.environ.get("FREESOLO_API_KEY")
-    if not api_key:
-        raise ClientError(
-            "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
-            "Create or copy a key at https://freesolo.co/sign-in."
-        )
-    verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
+    try:
+        api_key = args.api_key or os.environ.get("FREESOLO_API_KEY")
+        if not api_key:
+            raise ClientError(
+                "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
+                "Create or copy a key at https://freesolo.co/sign-in."
+            )
+        verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
+    except ClientError as exc:
+        # Login failed (no key, a rejected key, or an unreachable backend): say so plainly
+        # and point the user back at `flash login` to try again. `--debug` still surfaces
+        # the full traceback via the top-level handler.
+        if getattr(args, "debug", False):
+            raise
+        print(render.login_failed(str(exc)), file=sys.stderr)
+        return 1
     api_url = args.api_url or load_credentials()[0]
     # save_credentials clears the stored url when it's the default, so logging into the
     # default plane also drops a stale custom url from a previous custom-URL login.
     save_credentials(api_key, api_url=api_url)
-    # Never echo the key itself; the stored file is the single source of truth.
-    print("logged in: freesolo verified your key")
+    # Show who they are right away (the same identity `flash whoami` prints) so they don't
+    # have to run a second command. Never echo the key itself. The identity lookup is
+    # best-effort: the key is already verified and stored, so a momentary control-plane
+    # hiccup must not turn a successful login into a failure.
+    print(render.login_ok(_identity_or_none()))
     return 0
 
 
+def _identity_or_none() -> dict | None:
+    try:
+        return client_from_config().me()
+    except (ClientError, OSError, ValueError):
+        return None
+
+
 def cmd_whoami(args) -> int:
-    print(json.dumps(client_from_config().me(), indent=2))
+    print(render.whoami(client_from_config().me()))
     return 0
 
 
