@@ -133,9 +133,6 @@ def load_environment(**kwargs) -> StarterEnv:
 
 def cmd_env_setup(args) -> int:
     Path("configs").mkdir(exist_ok=True)
-    Path("configs/endpoints.toml").write_text(
-        "# OpenAI-compatible endpoints returned by `flash deploy` can be stored here.\n"
-    )
     starter_env = Path("environment.py")
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
@@ -174,10 +171,7 @@ def cmd_env_setup(args) -> int:
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
-    print(
-        "ensured environment.py, configs/, "
-        "configs/grpo.toml, configs/sft.toml, configs/endpoints.toml"
-    )
+    print("ensured environment.py, configs/, configs/grpo.toml, configs/sft.toml")
     return 0
 
 
