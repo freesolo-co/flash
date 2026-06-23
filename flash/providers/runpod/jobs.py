@@ -527,6 +527,7 @@ def submit_run(
         list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
     ) + chalk_extra_pip(spec)
     worker_env = build_worker_env(spec, seed, runtime_secrets=runtime_secrets)
+    worker_env["ATTEMPT"] = str(int(attempt))
     endpoint_id, name = deploy_train_endpoint(
         spec.gpu.type,
         execution_timeout_ms=timeout_s * 1000,

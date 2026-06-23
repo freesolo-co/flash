@@ -46,6 +46,53 @@ _USER_ERRORS = (
 # Run states after which nothing more will happen (polling can stop).
 _CLI_DONE_STATES = TERMINAL_STATES | {"deployed"}
 _OK_STATES = {"done", "dry_run", "deployed"}
+_SPINNER_FRAMES = "|/-\\"
+_SPINNER_TICK_SECONDS = 0.1
+
+
+class _LogFollowSpinner:
+    def __init__(self, run_id: str):
+        self._run_id = run_id
+        self._frame = 0
+        self._last_len = 0
+        self._active = False
+        self._enabled = sys.stderr.isatty()
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def render(self, state: str) -> None:
+        if not self._enabled:
+            return
+        frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
+        self._frame += 1
+        message = f"{frame} following logs for {self._run_id} ({state})"
+        padding = " " * max(0, self._last_len - len(message))
+        sys.stderr.write(f"\r{message}{padding}")
+        sys.stderr.flush()
+        self._last_len = len(message)
+        self._active = True
+
+    def clear(self) -> None:
+        if not (self._enabled and self._active):
+            return
+        sys.stderr.write(f"\r{' ' * self._last_len}\r")
+        sys.stderr.flush()
+        self._active = False
+
+
+def _sleep_with_spinner(interval: float, spinner: _LogFollowSpinner, state: str) -> None:
+    if interval <= 0:
+        return
+    if not spinner.enabled:
+        time.sleep(interval)
+        return
+    ticks = max(1, int(interval / _SPINNER_TICK_SECONDS))
+    sleep_for = interval / ticks
+    for _ in range(ticks):
+        spinner.render(state)
+        time.sleep(sleep_for)
 
 
 def cmd_version(args) -> int:
@@ -175,12 +222,13 @@ def cmd_env_setup(args) -> int:
     return 0
 
 
+def _model_dimension(params: str) -> str:
+    return params.split(" (", 1)[0]
+
+
 def cmd_models(args) -> int:
     for row in public_model_rows():
-        print(
-            f"{row['id']}\t{row['params']}\talgos={','.join(row['algos'])}\t{row['quant']}"
-            f"\tthinking={row.get('thinking', 'none')}"
-        )
+        print(f"{row['id']}\t{_model_dimension(row['params'])}")
     return 0
 
 
@@ -206,8 +254,7 @@ def cmd_gpus(args) -> int:
     print(
         "\nTip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
         "cheapest validated class that fits the model across all providers, so you don't pin a\n"
-        "GPU type. You can still tune the run via the [gpu] config table (disk_gb, max_wall_seconds,\n"
-        "max_retries, network_volume / network_volume_gb, datacenter)."
+        "GPU type."
     )
     return 0
 
@@ -307,14 +354,20 @@ def cmd_train(args) -> int:
 def _poll_logs(client: ApiClient, run_id: str, interval: float) -> str:
     """Stream offset-paged logs until the run reaches a terminal state; return that state."""
     offset = 0
-    while True:
-        page = client.get_logs(run_id, offset=offset)
-        if page["logs"]:
-            print(page["logs"], end="", flush=True)
-        offset = page["offset"]
-        if page["state"] in _CLI_DONE_STATES:
-            return page["state"]
-        time.sleep(interval)
+    spinner = _LogFollowSpinner(run_id)
+    try:
+        while True:
+            page = client.get_logs(run_id, offset=offset)
+            if page["logs"]:
+                spinner.clear()
+                print(page["logs"], end="", flush=True)
+            offset = page["offset"]
+            if page["state"] in _CLI_DONE_STATES:
+                spinner.clear()
+                return page["state"]
+            _sleep_with_spinner(interval, spinner, page["state"])
+    finally:
+        spinner.clear()
 
 
 def _follow_run(client: ApiClient, run_id: str) -> int:
@@ -343,10 +396,11 @@ def cmd_ps(args) -> int:
     if not runs:
         print("no runs yet")
         return 0
-    print(f"{'RUN_ID':<32}  {'STATE':<11}  {'COST($)':>8}  {'GPU':<22}  MODEL")
+    print(f"{'RUN_ID':<32}  {'STATE':<11}  {'ALGO':<5}  {'COST($)':>8}  {'GPU':<22}  MODEL")
     for r in sorted(runs, key=lambda r: r.get("updated_at", 0), reverse=True):
         spec = r.get("spec") or {}
         model = spec.get("model", "")
+        algorithm = str(spec.get("algorithm") or "-").upper()
         remote = r.get("remote") or {}
         # the remote handle knows what actually ran; the spec is the parse-time pick
         provider = remote.get("provider") or (
@@ -355,8 +409,8 @@ def cmd_ps(args) -> int:
         gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
         where = f"{gpu}@{provider}" if provider else gpu
         print(
-            f"{r['run_id']:<32}  {r['state']:<11}  {r.get('cost_usd', 0.0):>8.4f}  "
-            f"{where:<22}  {model}"
+            f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "
+            f"{r.get('cost_usd', 0.0):>8.4f}  {where:<22}  {model}"
         )
     return 0
 
