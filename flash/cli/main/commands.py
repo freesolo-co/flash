@@ -242,9 +242,9 @@ def cmd_env_setup(args) -> int:
         'id = ""\n\n'
         '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
-    grpo = Path("configs/grpo.toml")
-    if not grpo.exists():
-        grpo.write_text(
+    rl = Path("configs/rl.toml")
+    if not rl.exists():
+        rl.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
             f"{env_comment}"
@@ -270,7 +270,7 @@ def cmd_env_setup(args) -> int:
         )
     print(
         "ensured environment.py, datasets/train.jsonl, configs/, "
-        "configs/grpo.toml, configs/sft.toml"
+        "configs/rl.toml, configs/sft.toml"
     )
     return 0
 
@@ -286,28 +286,23 @@ def cmd_models(args) -> int:
 
 
 def cmd_gpus(args) -> int:
-    """List GPU classes, VRAM, and per-provider $/hr."""
+    """List RunPod GPU classes, VRAM, and $/hr."""
     from flash.providers.base import GPU_INFO
     from flash.providers.runpod.pricing import static_rates as runpod_static_rates
-    from flash.providers.vast.pricing import static_rates as vast_static_rates
 
     runpod_rates = runpod_static_rates()
-    vast_rates = vast_static_rates()
 
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
-    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}")
-    for info in sorted(GPU_INFO.values(), key=lambda g: g.hourly_usd):
+    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}")
+    infos = [info for info in GPU_INFO.values() if info.enum_member]
+    for info in sorted(infos, key=lambda g: g.hourly_usd):
         runpod_rate = runpod_rates.get(info.name) if info.enum_member else None
-        print(
-            f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}"
-            f"{fmt_rate(vast_rates.get(info.name))}"
-        )
+        print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}")
     print(
         "\nTip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest validated class that fits the model across all providers, so you don't pin a\n"
-        "GPU type."
+        "cheapest validated RunPod class that fits the model, so you don't pin a GPU type."
     )
     return 0
 

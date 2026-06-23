@@ -1,4 +1,4 @@
-"""Platform runner: drives managed GPUs across providers (RunPod Flash + Vast), one allocation per seed."""
+"""Platform runner: drives managed RunPod GPUs, one allocation per seed."""
 
 from __future__ import annotations
 
@@ -224,7 +224,7 @@ def submit_job(
     billing_context: dict | None = None,
 ) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
-    across the configured providers (RunPod Flash or Vast); dry-run only records state."""
+    that fits the run; dry-run only records state."""
     info = resolve_model(spec.model, spec.algorithm, policy=spec.model_policy, gpu=spec.gpu.type)
     # Finalize the run_id BEFORE assigning the per-run artifact repo. The JobSpec default run_id is
     # the placeholder "local" (truthy), so `or new_run_id()` alone would keep it; treat "local" as
@@ -289,9 +289,7 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     """Write metrics to results/runpod/<phase>/<run_id>/seedN and return the cost.
 
     The run id keeps concurrent/sequential runs of the same phase+seed from
-    overwriting each other's artifacts. Vast runs arrive with ``cost_usd`` already
-    stamped from the offer's real $/hr (plus provider notes) and short-circuit the
-    rate fallback below (the RunPod projection)."""
+    overwriting each other's artifacts."""
     dest = os.path.join(artifacts_dir(spec), f"seed{seed}")
     os.makedirs(dest, exist_ok=True)
     # Rate the actually-allocated class, not the parse-time provisional spec.gpu.type:
@@ -299,19 +297,8 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     # the worker stamps "allocated_gpu" into metrics for the cost fallback below.
     gpu_type = metrics.get("allocated_gpu") or spec.gpu.type
     rate = _gpu_rate(gpu_type)
-    # A non-runpod provider (e.g. Vast) stamps the real cost_usd from its offer's $/hr
-    # AND tags notes["provider"] with its own name — and a near-zero-duration run can
-    # legitimately stamp cost_usd == 0.0. The RunPod arm, by contrast, never stamps a real
-    # cost: it arrives with cost_usd absent (or a 0.0 placeholder) and no provider note, so
-    # the wall-based projection below must run. A bare `cost or 0.0` would treat the Vast
-    # 0.0 as "absent" and re-rate it against RunPod pricing while overwriting the provider
-    # notes, mis-attributing the run to 'runpod'. So fall back only when the cost is
-    # missing/zero AND it has NOT already been attributed to a non-runpod provider.
-    _notes = metrics.get("notes")
-    _stamped_provider = _notes.get("provider") if isinstance(_notes, dict) else None
-    _non_runpod = bool(_stamped_provider) and _stamped_provider != "runpod"
     cost = metrics.get("cost_usd")
-    if cost or _non_runpod:
+    if cost:
         cost = float(cost or 0.0)
     else:
         wall = float(metrics.get("wall_seconds") or 0.0)
