@@ -144,9 +144,11 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
     monkeypatch.setattr(
         auth_mod,
         "_cached_identity",
-        lambda token: {"email": "user-good@example.com", "key_prefix": "fslo_good"}
-        if token == "fslo-user-good"
-        else {},
+        lambda token: (
+            {"email": "user-good@example.com", "key_prefix": "fslo_good"}
+            if token == "fslo-user-good"
+            else {}
+        ),
     )
 
     row = auth_mod.authenticate("Bearer fslo-user-good")
@@ -528,12 +530,10 @@ def test_deploy_dry_run(api):
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    dep = api.post(
-        f"/v1/runs/{run_id}/deploy", json={"mode": "dev", "dry_run": True}, headers=_bearer(key)
-    )
+    dep = api.post(f"/v1/runs/{run_id}/deploy", json={"dry_run": True}, headers=_bearer(key))
     assert dep.status_code == 200, dep.text
     assert dep.json()["state"] == "dry_run"
-    assert dep.json()["mode"] == "dev"
+    assert "mode" not in dep.json()
     # Dry-run deploys never show up as active deployments.
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
@@ -564,7 +564,7 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
 
     monkeypatch.setattr(app_mod, "deploy_adapter", boom)
 
-    resp = api.post(f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key))
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
     assert resp.status_code == 502, resp.text
     # The 502 carries the upstream reason verbatim, not a generic/unhandled-500 body.
     assert "serving backend unreachable" in resp.json()["detail"]
@@ -596,7 +596,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
 def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     # A finished run (state="done") MUST be deployable: mark_deployed has to record the
     # deployment and flip to "deployed". But a cancelled/failed run must never be flipped
-    # to "deployed" (a /cancel racing always-on provisioning persisted the terminal state).
+    # to "deployed" (a /cancel racing deployment persisted the terminal state).
     import flash.runner as runner
 
     importlib.reload(runner)
@@ -605,9 +605,9 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
 
     spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-1"}
     runner._save_status(runner.RunStatus(run_id="dep-1", state="done", spec=spec, remote=None))
-    out = runner.mark_deployed("dep-1", {"endpoint_name": "e", "mode": "dev"})
+    out = runner.mark_deployed("dep-1", {"endpoint_name": "e"})
     assert out.state == "deployed"
-    assert out.deployment == {"endpoint_name": "e", "mode": "dev"}
+    assert out.deployment == {"endpoint_name": "e"}
 
     # cancelled is sticky: the deploy must be refused, state preserved.
     runner._save_status(
@@ -615,7 +615,7 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
             run_id="dep-2", state="cancelled", spec={**spec, "run_id": "dep-2"}, remote=None
         )
     )
-    out2 = runner.mark_deployed("dep-2", {"endpoint_name": "e2", "mode": "dev"})
+    out2 = runner.mark_deployed("dep-2", {"endpoint_name": "e2"})
     assert out2.state == "cancelled"
     assert out2.deployment is None
 
@@ -637,7 +637,7 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
             state="deployed",
             spec=spec,
             remote=None,
-            deployment={"endpoint_name": "e", "mode": "always-on"},
+            deployment={"endpoint_name": "e"},
         )
     )
     # undeploy races in: endpoint torn down, run back to done/undeployed.

@@ -27,8 +27,8 @@ def test_deploy_dry_run():
     # The adapter is addressed by its run_id on the freesolo serving app.
     assert d["openai_model"] == "r1"
     assert d["adapter_hf_prefix"] == "sft/r1/seed0/adapter"
-    # freesolo serving scales to zero per base model — no flash-side idle billing.
-    assert d["est_idle_cost_usd_per_day"] == 0.0
+    assert "mode" not in d
+    assert "est_idle_cost_usd_per_day" not in d
 
 
 def test_deploy_9b_dry_run_is_not_rejected():

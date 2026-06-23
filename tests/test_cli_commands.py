@@ -69,16 +69,16 @@ class _FakeClient:
         self.calls.append(("cancel", run_id))
         return {"run_id": run_id, "state": "cancelled"}
 
-    def deploy(self, run_id: str, mode: str = "dev", idle_timeout_s: int = 300, **_) -> dict:
-        self.calls.append(("deploy", run_id, mode, idle_timeout_s))
-        return {"run_id": run_id, "mode": mode, "openai_model": f"flash-{run_id}"}
+    def deploy(self, run_id: str, **_) -> dict:
+        self.calls.append(("deploy", run_id))
+        return {"run_id": run_id, "openai_model": f"flash-{run_id}"}
 
     def undeploy(self, run_id: str) -> dict:
         self.calls.append(("undeploy", run_id))
         return {"run_id": run_id, "deleted_endpoints": ["live-x"]}
 
     def deployments(self) -> list[dict]:
-        return [{"run_id": "flash-1", "mode": "dev", "gpu": "RTX 4090"}]
+        return [{"run_id": "flash-1", "deployment": {"gpu": "RTX 4090"}}]
 
     def chat(self, run_id: str, messages: list[dict], **_) -> dict:
         self.calls.append(("chat", run_id, messages))
@@ -131,8 +131,8 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert _run(["cancel", "flash-1"]) == 0
     assert ("cancel", "flash-1") in fake_client.calls
 
-    assert _run(["deploy", "flash-1", "--mode", "dev", "--idle-timeout", "120"]) == 0
-    assert ("deploy", "flash-1", "dev", 120) in fake_client.calls
+    assert _run(["deploy", "flash-1"]) == 0
+    assert ("deploy", "flash-1") in fake_client.calls
 
     assert _run(["deployments"]) == 0
     assert "flash-1" in capsys.readouterr().out
