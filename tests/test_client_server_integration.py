@@ -37,11 +37,11 @@ from fastapi.testclient import TestClient
 from flash.client.http import ApiClient, ApiError
 
 # A representative managed-run spec -- the shape the freesolo bridge / SDK
-# submits: catalog model, published environment id, an HF repo for artifacts.
+# submits: catalog model, Freesolo environment id, and an HF repo for artifacts.
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "primeintellect/gsm8k", "params": {"max_examples": 8}},
+    "environment": {"id": "freesolo/gsm8k", "params": {"max_examples": 8}},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
@@ -53,6 +53,13 @@ _counter = itertools.count()
 def _token() -> str:
     """A fresh freesolo user token accepted by the fixture's stub verify."""
     return f"{_USER_PREFIX}{next(_counter)}"
+
+
+def _identity_for_token(token: str) -> dict[str, str]:
+    if not token.startswith(_USER_PREFIX):
+        return {}
+    suffix = token.removeprefix(_USER_PREFIX)
+    return {"email": f"user-{suffix}@example.com", "key_prefix": "fslo_test"}
 
 
 class _FakeUrlResponse:
@@ -78,7 +85,7 @@ def make_client(tmp_path, monkeypatch):
     """Yields a factory building real ``ApiClient``s wired into one in-process
     control-plane app via a ``urllib`` -> ``TestClient`` shim."""
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("PRIME_API_KEY", "pit-test")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
 
     import flash.runner as runner
@@ -99,6 +106,7 @@ def make_client(tmp_path, monkeypatch):
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
     # The submit-time org charge (server/billing) talks to the freesolo backend; it has its own
     # suite (test_server_billing.py). Stub that boundary (both the charge and its reversal) so this
     # cross-component test stays focused on the client<->server CONTRACT and isn't routed through
@@ -147,9 +155,8 @@ def test_health_and_identity_roundtrip(make_client) -> None:
     me = client.me()
     # The server resolves the bearer to a per-key identity and the client parses
     # the JSON body back into a dict the CLI prints.
-    assert me["kind"] == "freesolo_api_key"
     assert me["key_prefix"]
-    assert "email" not in me
+    assert "email" in me
 
 
 def test_create_status_list_cancel_lifecycle(make_client) -> None:
@@ -251,11 +258,10 @@ def test_deploy_dry_run_and_deployments_roundtrip(make_client) -> None:
     client = make_client()
     run_id = client.create_run(SPEC)["run_id"]
 
-    # A dry-run deploy validates the serving path without provisioning a GPU; the
-    # real client must serialise mode/dry_run and parse the deployment back.
-    deployment = client.deploy(run_id, mode="dev", dry_run=True)
+    # A dry-run deploy validates the serving path without provisioning a GPU.
+    deployment = client.deploy(run_id, dry_run=True)
     assert deployment["state"] == "dry_run"
-    assert deployment["mode"] == "dev"
+    assert "mode" not in deployment
 
     # Dry-run deploys never count as active deployments.
     assert client.deployments() == []

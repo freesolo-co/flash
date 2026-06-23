@@ -61,8 +61,8 @@ def test_cheapest_gpu_policy(monkeypatch):
     from flash.providers import base as gpus
     from flash.providers.runpod import pricing
 
-    # Validated-only by default: the cheapest LIVE-VALIDATED enum class that fits each VRAM tier
-    # wins on static rates. After the 2026-06-22 live-smoke expansion the pool includes RTX 2000 Ada
+    # Validated-only by default: the cheapest validated enum class that fits each VRAM tier
+    # wins on static rates. After the 2026-06-22 smoke expansion the pool includes RTX 2000 Ada
     # (16G) and RTX A6000 (48G); A40 (48G) stays unvalidated (no RunPod capacity to smoke it in-window).
     assert gpus.cheapest_gpu(16) == "RTX 2000 Ada"  # now validated, cheapest >=16G ($0.24)
     # cheapest VALIDATED >=24G (16G cards don't fit).
@@ -73,9 +73,9 @@ def test_cheapest_gpu_policy(monkeypatch):
     # classes, so a fitting Vast-only / unvalidated class doesn't make the message a lie.
     with pytest.raises(gpus.UnsupportedGpuError, match="no validated RunPod-provisionable GPU"):
         gpus.cheapest_gpu(4096)
-    # static fallback rates cover every known class
-    rates = pricing.live_rates()
-    assert set(rates) >= set(gpus.GPU_INFO)
+    # static rates cover every RunPod-provisionable class
+    rates = pricing.static_rates()
+    assert set(rates) == {name for name, info in gpus.GPU_INFO.items() if info.enum_member}
 
 
 def test_provisional_gpu_cheapest_for_model(monkeypatch):
@@ -95,13 +95,13 @@ def test_config_cheapest_policy_validated_pool(monkeypatch):
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "environment": {"id": "primeintellect/gsm8k"},
+        "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "gpu": {"type": "cheapest"},
     }
     spec = spec_from_dict(raw, run_id="x")
     # Cheapest fitting VALIDATED class for a small model: post-expansion that's the 16 GB RTX 2000
-    # Ada ($0.24, live-validated 2026-06-22 for SFT) — 0.8B SFT needs ~12 GB.
+    # Ada ($0.24, validated 2026-06-22 for SFT) — 0.8B SFT needs ~12 GB.
     assert spec.gpu.type == "RTX 2000 Ada"
     # GPU pinning is gone: a config's gpu.type is IGNORED — the schema always resolves the
     # cheapest fitting VALIDATED class, no matter what class the config names.
@@ -130,7 +130,7 @@ def test_config_defaults_gpu_from_model():
     raw = {
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
-        "environment": {"id": "primeintellect/gsm8k"},
+        "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")

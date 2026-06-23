@@ -10,14 +10,12 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash train <cfg.toml>` / control-plane `POST /runs` — submit a training job;
   one dedicated GPU per run, supervised server-side (stall watchdog, bounded
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
-- `flash deploy` (scale-to-zero or always-on), `flash chat` —
-  serving for trained adapters.
-- **Verifiers-only environments.** Every run names a published `verifiers`
-  environment by id (`[environment] id = "owner/name"`).
-  Scaffold a local env, publish it with `flash env push`, then reference it by id.
-  The worker wraps it via `flash/envs/adapter.py`. There are no
-  built-in task environments and no freesolo bridge. Single-turn environments
-  are fully supported (SFT/GRPO/eval).
+- `flash deploy`, `flash chat` — serving for trained adapters.
+- **Freesolo SDK environments.** Every run names a Freesolo environment id.
+  Scaffold `environment.py`, upload `.` or another folder with
+  `flash env push --name <name> <folder>`, then reference the returned id. The
+  worker loads it through `freesolo.environments`. There are no built-in task
+  environments. Single-turn and bounded multi-turn environments are supported.
 
 ## Layout
 
@@ -33,12 +31,12 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
   shared recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
-- `flash/envs/` — environment machinery: registry and the
-  `adapter` that wraps published `verifiers` environments onto the worker's interface
-- `flash env setup` / `flash env init` — scaffold a starter local verifiers env and a
-  ready-to-run config to start from
+- `flash/envs/` — environment machinery: registry and the adapter that loads
+  Freesolo SDK environments onto the worker's interface
+- `flash env setup` — scaffold a starter local Freesolo env and a ready-to-run
+  config to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
-  plane (run operator-side via `python -m flash.server`)
+  plane (run operator-side via the separate `flash-server` command)
 - `flash/mcp/` — stdio MCP bridge for coding agents
 - `Dockerfile` — the control-plane image (used by the repo docker-compose)
 - `tests/` — pytest suite (CPU-only; offline-by-default, no GPU/network)
@@ -51,12 +49,11 @@ uv sync --extra server
 uv run pytest                           # CPU tests (offline-by-default, no GPU/network)
 uv run ruff check . && uv run ruff format .
 uv run flash --help
-uv run python -m flash.server            # control plane (operator-side, run once)
+uv run flash-server                      # control plane (operator-side, run once)
 ```
 
 The control plane owns provider credentials: `RUNPOD_API_KEY` is always required
 (RunPod is the default substrate), `VAST_API_KEY` is opt-in (only checked when set),
 plus the shared `HF_TOKEN`.
 The artifact repo is per-run (the run TOML's `[train] hf_repo`), not an
-operator-wide env var. Clients authenticate with their freesolo API key (`flash login`);
-create or copy one at https://freesolo.co/sign-in.
+operator-wide env var. Clients authenticate with their freesolo API key (`flash login`).
