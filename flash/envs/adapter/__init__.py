@@ -31,6 +31,12 @@ _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache")
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_TAR_METADATA_TYPES = {
+    tarfile.XHDTYPE,
+    tarfile.XGLTYPE,
+    tarfile.GNUTYPE_LONGNAME,
+    tarfile.GNUTYPE_LONGLINK,
+}
 
 
 @dataclass(frozen=True)
@@ -68,7 +74,9 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
         repo_part, at, ref = repo_ref.partition("@")
         if not at:
             ref = _DEFAULT_GITHUB_REF
-        owner_repo = repo_part.split("/", 1)
+        if not ref:
+            return None
+        owner_repo = repo_part.split("/")
         if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo):
             return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
         return None
@@ -85,7 +93,7 @@ def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
         return None
     if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
         ref = parts[3]
-        if ":" in ref:
+        if not ref or ref in {".", ".."} or ":" in ref or "\\" in ref:
             return None
         raw_path = "/".join(parts[4:])
         if not _is_safe_environment_path(raw_path):
@@ -211,21 +219,35 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
         for count, member in enumerate(tar, start=1):
             if count > _MAX_ARCHIVE_MEMBERS:
-                raise RuntimeError(f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})")
-            parts = Path(member.name).parts
+                raise RuntimeError(
+                    f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})"
+                )
+            if member.type in _TAR_METADATA_TYPES:
+                continue
+            parts: list[str] = []
+            for part in member.name.replace("\\", "/").split("/"):
+                if not part or part == ".":
+                    continue
+                if part == "..":
+                    raise RuntimeError(
+                        f"unsafe path in GitHub environment archive: {member.name!r}"
+                    )
+                parts.append(part)
             if not parts:
                 continue
-            top_dirs.add(parts[0])
-            target = (dest / member.name).resolve()
+            normalized_name = "/".join(parts)
+            target = (dest / normalized_name).resolve()
             if target != root and root not in target.parents:
                 raise RuntimeError(f"unsafe path in GitHub environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
+            top_dirs.add(parts[0])
             total += max(0, member.size)
             if total > _MAX_ARCHIVE_BYTES:
                 raise RuntimeError(
                     f"GitHub environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
                 )
+            member.name = normalized_name
             tar.extract(member, dest)
     if len(top_dirs) != 1:
         raise RuntimeError("GitHub environment archive had an unexpected layout")
@@ -510,7 +532,9 @@ class FreesoloEnvironment(BaseEnvironment):
             messages=tuple(state.get("messages") or ()),
             response_text=str(state.get("response_text") or ""),
             turns=tuple(state.get("turns") or ()),
-            metadata={"steps": state.get("step_metadata", [])} if state.get("step_metadata") else {},
+            metadata={"steps": state.get("step_metadata", [])}
+            if state.get("step_metadata")
+            else {},
         )
 
     def _score_episode(self, example: dict, state: dict):
@@ -574,7 +598,9 @@ def load_freesolo_environment(env_id: str, **kwargs) -> FreesoloEnvironment:
         params["contract_path"] = contract_path
     else:
         params.setdefault("contract_path", str(base_dir / "TRAINING_CONTRACT.md"))
-    contract_text = str(params.pop("contract_text", "") or _load_contract_text(params["contract_path"]))
+    contract_text = str(
+        params.pop("contract_text", "") or _load_contract_text(params["contract_path"])
+    )
 
     sdk_env = tools["load_environment"](reference, **params)
     return FreesoloEnvironment(

@@ -72,11 +72,13 @@ def main(argv: list[str] | None = None) -> int:
     version.set_defaults(func=cmd_version)
 
     login = sub.add_parser(
-        "login", help="log in with your freesolo API key (create one at https://freesolo.co/sign-in)"
+        "login",
+        help="log in with your freesolo API key (create one at https://freesolo.co/sign-in)",
     )
     login.add_argument(
         "--api-key",
-        help="your freesolo API key (default: FREESOLO_API_KEY); created in the dashboard",
+        help="your freesolo API key (default: FREESOLO_API_KEY); create it at "
+        "https://freesolo.co/sign-in",
     )
     login.add_argument(
         "--freesolo-url",
