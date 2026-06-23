@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import os
 import sys
+import tarfile
 import tempfile
 import types
 from dataclasses import dataclass, field
 from typing import ClassVar
+
+import pytest
 
 
 @dataclass
@@ -186,6 +190,27 @@ def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
     return seen
 
 
+def _github_environment_tarball(
+    top_dir: str,
+    *,
+    env_path: str = "envs/e/freesolo/environment.py",
+    env_text: str = "def load_environment(**kwargs):\n    return None\n",
+) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        dir_info = tarfile.TarInfo(f"{top_dir}/")
+        dir_info.type = tarfile.DIRTYPE
+        dir_info.mode = 0o755
+        tar.addfile(dir_info)
+
+        env_info = tarfile.TarInfo(f"{top_dir}/{env_path}")
+        env_bytes = env_text.encode("utf-8")
+        env_info.size = len(env_bytes)
+        env_info.mode = 0o644
+        tar.addfile(env_info, io.BytesIO(env_bytes))
+    return buf.getvalue()
+
+
 def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     seen = _install_fake_freesolo(monkeypatch)
     env_file = tmp_path / "freesolo" / "environment.py"
@@ -272,6 +297,7 @@ def test_github_environment_ref_parsing():
     assert is_github_environment_ref(
         "https://github.com/owner/repo/blob/dev/envs/e/freesolo/environment.py"
     )
+    assert is_github_environment_ref("https://github.com/owner/repo")
     assert not is_github_environment_ref("owner/env")
     assert not is_github_environment_ref("gsm8k")
     assert not is_github_environment_ref("github:owner/repo@main:../../etc/passwd")
@@ -279,6 +305,61 @@ def test_github_environment_ref_parsing():
         "https://github.com/owner/repo/blob/dev/../../etc/passwd"
     )
     assert not is_github_environment_ref("https://github.com/owner/repo/blob/main:/etc/passwd")
+    assert not is_github_environment_ref("https://github.com/owner/repo/issues/1")
+
+
+def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_ref_sha",
+        lambda parsed: "b" * 40,
+    )
+
+    downloads: list[str] = []
+
+    def fake_download(ref):
+        downloads.append(ref.ref)
+        return _github_environment_tarball("repo-root")
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
+
+    resolved = adapter._resolve_environment_reference("github:owner/repo@main:envs/e/freesolo/environment.py")
+    assert resolved.endswith("envs/e/freesolo/environment.py")
+    assert downloads == ["b" * 40]
+
+
+def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
+    from flash.envs.adapter import _safe_extract_archive
+
+    def make_members_tar(members: list[tuple[str, bytes | None]]):
+        tar = io.BytesIO()
+        with tarfile.open(fileobj=tar, mode="w:gz") as handle:
+            for name, payload in members:
+                info = tarfile.TarInfo(name)
+                if payload is None:
+                    info.type = tarfile.DIRTYPE
+                    info.size = 0
+                    handle.addfile(info)
+                else:
+                    info.size = len(payload)
+                    handle.addfile(info, io.BytesIO(payload))
+        return tar.getvalue()
+
+    dest = tmp_path / "extract_many"
+    dest.mkdir()
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 0)
+    with pytest.raises(RuntimeError, match="too many members"):
+        _safe_extract_archive(make_members_tar([("a", b"")]), dest)
+
+    dest = tmp_path / "extract_big"
+    dest.mkdir()
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 5)
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 1)
+    with pytest.raises(RuntimeError, match="too large"):
+        _safe_extract_archive(make_members_tar([("repo-root/", None), ("repo-root/keep.txt", b"xx")]), dest)
 
 
 def test_install_manifest_and_worker_deps():
