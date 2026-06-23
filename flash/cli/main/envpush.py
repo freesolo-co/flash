@@ -58,9 +58,24 @@ def _push_env_name(raw: str) -> str:
     return name or "flash-env"
 
 
+def _env_name_from_ref_path(raw_path: str) -> str | None:
+    path_text = raw_path.strip()
+    if not path_text:
+        return None
+    path = Path(path_text)
+    if path.name == "environment.py" and path.parent.name == "freesolo":
+        name = path.parent.parent.name
+    elif path.suffix == ".py":
+        name = path.parent.name or path.stem
+    else:
+        name = path.name
+    return name or None
+
+
 def _config_env_name(config_path) -> str | None:
     """A stable name from a sibling flash.toml's `[environment] id`, or None."""
     import tomllib
+    import urllib.parse
 
     path = Path(config_path)
     if not path.is_file():
@@ -71,15 +86,21 @@ def _config_env_name(config_path) -> str | None:
         return None
     env = data.get("environment")
     env_id = str(env.get("id") or "").strip() if isinstance(env, dict) else ""
-    if ":" in env_id:
-        if env_id.startswith("github:") and ":" not in env_id[len("github:") :]:
+    if env_id.startswith("github:"):
+        _repo_ref, sep, ref_path = env_id[len("github:") :].partition(":")
+        if not sep:
             return None
-        path = Path(env_id.rsplit(":", 1)[1].strip())
-        if path.name == "environment.py" and path.parent.name == "freesolo":
-            name = path.parent.parent.name
-        else:
-            name = path.parent.name or path.stem
-        return name or None
+        return _env_name_from_ref_path(ref_path)
+
+    parsed = urllib.parse.urlparse(env_id)
+    if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "github.com":
+        parts = [urllib.parse.unquote(part) for part in parsed.path.strip("/").split("/") if part]
+        if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
+            return _env_name_from_ref_path("/".join(parts[4:]))
+        return None
+
+    if ":" in env_id and not parsed.scheme:
+        return _env_name_from_ref_path(env_id.rsplit(":", 1)[1])
     return None
 
 
@@ -130,7 +151,9 @@ def _with_syspath_bootstrap(env_source: str) -> str:
     return "".join(lines[:insert_after]) + bootstrap + "".join(lines[insert_after:])
 
 
-_TAR_EXCLUDE_DIRS = frozenset({".prime", ".git", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"})
+_TAR_EXCLUDE_DIRS = frozenset(
+    {".prime", ".git", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"}
+)
 
 
 def _tar_b64(directory: Path) -> str:

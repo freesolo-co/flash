@@ -56,9 +56,9 @@ def test_internal_key_provisioning_is_idempotent_and_hashed(isolated_db) -> None
     assert second["key_prefix"] == "internal"
     assert second["email"] == "freesolo-internal"
     with sqlite3.connect(isolated_db.db_path()) as conn:
-        stored = conn.execute("SELECT key_hash FROM api_keys WHERE id = ?", (first["id"],)).fetchone()[
-            0
-        ]
+        stored = conn.execute(
+            "SELECT key_hash FROM api_keys WHERE id = ?", (first["id"],)
+        ).fetchone()[0]
     assert stored == isolated_db.hash_key("internal-secret")
     assert stored != "internal-secret"
 
@@ -147,7 +147,6 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("PRIME_API_KEY", "pit-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
