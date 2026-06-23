@@ -7,8 +7,8 @@ every validated RunPod candidate by static $/hr and pick the cheapest:
   runpod  every Flash-provisionable class
 
 Allocation happens at SUBMIT time in the runner. The parse-time resolution in schema is a
-RunPod-static provisional for validation/dry-run display. With no live pricing reachable, the
-allocator degrades to exactly ``cheapest_gpu``'s deterministic static-rate answer.
+RunPod-static provisional for validation/dry-run display, and both use the same static GPU
+rate table (see ``flash.providers.base`` / ``flash.providers.runpod.pricing``).
 
 RunPod is the only active provider; the provider registry remains the narrow interface
 for pricing/provisionability.
