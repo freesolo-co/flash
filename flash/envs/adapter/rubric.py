@@ -66,7 +66,7 @@ def _run_async(coro):
 def _call_dataset_getter(obj, method_name: str, *, seed: int, n: int = -1):
     """Call a verifiers dataset getter, binding (n, seed) when it declares them.
 
-    verifiers exposes get_dataset/get_eval_dataset as get_X(n=-1, seed=0); some Hub envs
+    verifiers exposes get_dataset/get_eval_dataset as get_X(n=-1, seed=0); some published envs
     declare them WITHOUT defaults, so a no-arg call raised TypeError, swallowed into an empty
     dataset (a paid run over no data). Bind ``n`` (default -1 = all rows — the adapter does its
     own fixed subset selection; callers pass a positive cap to avoid materializing a huge split)

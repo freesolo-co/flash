@@ -55,22 +55,21 @@ def cmd_version(args) -> int:
 
 def cmd_login(args) -> int:
     # Login is handled by the freesolo backend (not the flash control plane): the user
-    # supplies the freesolo API key they created in the dashboard, and we verify it against
+    # supplies the freesolo API key they created at freesolo.co/sign-in, and we verify it against
     # freesolo before storing it. The same key authenticates flash's control plane.
     api_key = args.api_key or os.environ.get("FREESOLO_API_KEY")
     if not api_key:
         raise ClientError(
             "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
-            "Create a key in your freesolo dashboard."
+            "Create or copy a key at https://freesolo.co/sign-in."
         )
     verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
     api_url = args.api_url or load_credentials()[0]
     # save_credentials clears the stored url when it's the default, so logging into the
     # default plane also drops a stale custom url from a previous custom-URL login.
-    path = save_credentials(api_key, api_url=api_url)
+    _ = save_credentials(api_key, api_url=api_url)
     # Never echo the key itself; the stored file is the single source of truth.
-    print(f"logged in: freesolo verified your key (saved to {path})")
-    print("you're ready to train — try `flash train <config.toml>`")
+    print("logged in with your freesolo key")
     return 0
 
 
@@ -80,55 +79,71 @@ def cmd_whoami(args) -> int:
 
 
 _STARTER_ENV_PY = '''\
-"""Starter local verifiers environment.
+"""Starter Freesolo environment.
 
-Replace the dataset and rubric with your task, then publish it to the Prime Hub with
-`flash env push environments/starter_env.py`. A managed run references the published env by
-its Hub slug: set [environment] id = "owner/name" in the config.
-See https://github.com/PrimeIntellect-ai/verifiers for the full API.
+Edit the dataset and reward code, then upload with
+`flash env push environments/freesolo/environment.py`.
+
+A managed run should use the returned [environment] id from
+`flash env push`.
 """
 
-import verifiers as vf
-from datasets import Dataset
+from __future__ import annotations
+
+from freesolo.datasets.types import TaskExample
+from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 
-def load_environment(**kwargs) -> vf.Environment:
-    dataset = Dataset.from_list(
-        [
-            {"prompt": [{"role": "user", "content": "What is 2 + 2?"}], "answer": "4"},
-            {"prompt": [{"role": "user", "content": "What is 3 + 5?"}], "answer": "8"},
-        ]
-    )
+DATASET = [
+    {"task": "What is 2 + 2?", "expected_output": "4"},
+    {"task": "What is 3 + 5?", "expected_output": "8"},
+]
 
-    def correct_answer(completion, answer, **_):
-        """Reward 1.0 when the gold answer appears in the model's final message."""
-        text = completion[-1]["content"] if isinstance(completion, list) else str(completion)
-        return 1.0 if str(answer) in text else 0.0
 
-    rubric = vf.Rubric(funcs=[correct_answer], weights=[1.0])
-    return vf.SingleTurnEnv(dataset=dataset, rubric=rubric, **kwargs)
+class StarterEnv(EnvironmentSingleTurn):
+    dataset = DATASET
+
+    def build_prompt_messages(self, example: TaskExample, prompt_text: str):
+        return [{"role": "user", "content": example.task}]
+
+    def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
+        expected = str(example.expected_output or "").strip()
+        score = 1.0 if expected and expected in response_text else 0.0
+        return RewardResult(score=score, threshold=1.0)
+
+
+def load_environment(
+    contract_path: str | None = None,
+    dataset_path: str | None = None,
+    reward_command: str | None = None,
+    mode: str = "eval",
+    **_: object,
+) -> StarterEnv:
+    return StarterEnv()
 '''
 
 
-def cmd_lab_setup(args) -> int:
+def cmd_env_setup(args) -> int:
     Path("environments").mkdir(exist_ok=True)
     Path("configs").mkdir(exist_ok=True)
     Path("configs/endpoints.toml").write_text(
         "# OpenAI-compatible endpoints returned by `flash deploy` can be stored here.\n"
     )
-    starter_env = Path("environments/starter_env.py")
+    starter_env_dir = Path("environments/freesolo")
+    starter_env_dir.mkdir(exist_ok=True, parents=True)
+    Path(starter_env_dir / "__init__.py").write_text("", encoding="utf-8")
+    starter_env = Path(starter_env_dir / "environment.py")
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
-    sample = Path("configs/verifiers_grpo.toml")
+    sample = Path("configs/freesolo_grpo.toml")
     if not sample.exists():
         sample.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
-            "# Environment: a verifiers / Prime Hub env slug. Publish the scaffolded\n"
-            "# environments/starter_env.py with `flash env push environments/starter_env.py`\n"
-            "# (then `flash env install owner/name`) to get the slug, and set it below.\n"
+            "# Environment: upload the scaffolded environments/freesolo/environment.py with\n"
+            "# `flash env push environments/freesolo/environment.py`, then paste the returned id below.\n"
             "[environment]\n"
-            'id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
+            'id = ""\n\n'
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
@@ -137,8 +152,8 @@ def cmd_lab_setup(args) -> int:
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
     print(
-        "created environments/, environments/starter_env.py, configs/, "
-        "configs/verifiers_grpo.toml, configs/endpoints.toml"
+        "created environments/freesolo/environment.py, configs/, "
+        "configs/freesolo_grpo.toml, configs/endpoints.toml"
     )
     return 0
 
@@ -193,68 +208,65 @@ def cmd_env_init(args) -> int:
     mod = args.name.replace("-", "_")
     root = Path("environments") / mod
     root.mkdir(parents=True, exist_ok=True)
-    # Verifiers-only: scaffold a real verifiers env whose load_environment returns a
-    # vf.Environment (here a SingleTurnEnv + Rubric over a datasets.Dataset). This is what
-    # a Hub push expects, so a freshly scaffolded env actually loads.
+    # Scaffold a real Freesolo SDK environment whose load_environment returns an
+    # EnvironmentSingleTurn.
     (root / f"{mod}.py").write_text(
-        f'"""Custom verifiers environment ({args.name}).\n\n'
-        "Replace the dataset and rubric with your task, then publish it to the Prime Hub\n"
-        f"with `flash env push environments/{mod}/{mod}.py` and reference it by id\n"
-        '([environment] id = "owner/name") in your config.\n'
-        "See https://github.com/PrimeIntellect-ai/verifiers for the full API.\n"
+        f'"""Custom Freesolo environment ({args.name}).\n\n'
+        "Replace the dataset and reward with your task, then upload it\n"
+        f"with `flash env push environments/{mod}/{mod}.py` and reference the returned id\n"
+        "in your config.\n"
         '"""\n\n'
-        "import verifiers as vf\n"
-        "from datasets import Dataset\n\n\n"
-        "def load_environment(**kwargs) -> vf.Environment:\n"
-        "    dataset = Dataset.from_list(\n"
-        "        [\n"
-        '            {"prompt": [{"role": "user", "content": "What is 2 + 2?"}], "answer": "4"},\n'
-        '            {"prompt": [{"role": "user", "content": "What is 3 + 5?"}], "answer": "8"},\n'
-        "        ]\n"
-        "    )\n\n"
-        "    def correct_answer(completion, answer, **_):\n"
-        '        """Reward 1.0 when the gold answer appears in the model\'s final message."""\n'
-        "        text = (\n"
-        '            completion[-1]["content"] if isinstance(completion, list) else str(completion)\n'
-        "        )\n"
-        "        return 1.0 if str(answer) in text else 0.0\n\n"
-        "    rubric = vf.Rubric(funcs=[correct_answer], weights=[1.0])\n"
-        "    return vf.SingleTurnEnv(dataset=dataset, rubric=rubric, **kwargs)\n"
+        "from freesolo.datasets.types import TaskExample\n"
+        "from freesolo.environments import EnvironmentSingleTurn, RewardResult\n\n\n"
+        "DATASET = [\n"
+        '    {"task": "What is 2 + 2?", "expected_output": "4"},\n'
+        '    {"task": "What is 3 + 5?", "expected_output": "8"},\n'
+        "]\n\n\n"
+        "class CustomEnv(EnvironmentSingleTurn):\n"
+        "    dataset = DATASET\n\n"
+        "    def build_prompt_messages(self, example: TaskExample, prompt_text: str):\n"
+        '        return [{"role": "user", "content": example.task}]\n\n'
+        "    def score_response(self, example: TaskExample, response_text: str) -> RewardResult:\n"
+        '        expected = str(example.expected_output or "").strip()\n'
+        "        score = 1.0 if expected and expected in response_text else 0.0\n"
+        "        return RewardResult(score=score, threshold=1.0)\n\n\n"
+        "def load_environment(**kwargs) -> CustomEnv:\n"
+        "    return CustomEnv()\n"
     )
-    (root / "README.md").write_text(f"# {args.name}\n\nCustom verifiers environment for Flash.\n")
+    (root / "README.md").write_text(f"# {args.name}\n\nCustom Freesolo environment for Flash.\n")
     print(f"created {root}")
     print(
-        f"publish it to the Prime Hub with `flash env push environments/{mod}/{mod}.py`, "
-        'then reference it by id ([environment] id = "owner/name") in your config.'
+        f"upload it with `flash env push environments/{mod}/{mod}.py`, then reference "
+        "the returned id in your config."
     )
     return 0
 
 
 def cmd_env_list(args) -> int:
-    from flash.envs.registry import list_installed_verifiers_envs
+    from flash.envs.registry import list_installed_environments
 
-    installed = list_installed_verifiers_envs()
+    installed = list_installed_environments()
     if installed:
-        print("installed (verifiers / Prime Hub):")
+        print("installed environments:")
         for env_id in installed:
             print(f"  {env_id}")
     local = Path("environments")
     if local.is_dir():
-        # Both directory envs (environments/<name>/<name>.py) and top-level single-file
-        # modules (environments/<name>.py, e.g. the `flash lab` starter env). These are local
-        # env SOURCES — publish one with `flash env push <path>` to run it on the managed
-        # service by its Hub id.
+        # Both directory envs (environments/<name>/...) and single-file modules
+        # (environments/<name>.py). These are local env SOURCES — publish one with
+        # `flash env push <path>` to run it on the managed service by its
+        # environment id.
         paths: list[str] = []
         for p in local.iterdir():
             if p.name.startswith("__"):
                 continue
             if p.is_dir():
-                # `flash env init` maps a hyphenated dir to an underscored inner module file
-                # (my-env/ -> my-env/my_env.py). List that exact path, and only when it
-                # actually exists (an empty/incomplete folder isn't a publishable source).
                 stem = p.name.replace("-", "_")
                 module = p / f"{stem}.py"
-                if module.is_file():
+                canonical = p / "freesolo" / "environment.py"
+                if canonical.is_file():
+                    paths.append(f"environments/{p.name}/freesolo/environment.py")
+                elif module.is_file():
                     paths.append(f"environments/{p.name}/{stem}.py")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
@@ -269,7 +281,8 @@ def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
     Catalog-only and deterministic; an uncapped SFT run tries to count the env's train split, and
-    falls back to a default example count (with a warning) when the Hub env isn't importable here."""
+    falls back to a default example count (with a warning) when the environment isn't
+    importable here."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(

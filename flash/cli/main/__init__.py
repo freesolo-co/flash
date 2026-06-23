@@ -33,8 +33,8 @@ from flash.cli.main.commands import (  # noqa: F401
     cmd_deployments,
     cmd_env_init,
     cmd_env_list,
+    cmd_env_setup,
     cmd_gpus,
-    cmd_lab_setup,
     cmd_login,
     cmd_logs,
     cmd_models,
@@ -71,10 +71,14 @@ def main(argv: list[str] | None = None) -> int:
     version = sub.add_parser("version", help="print the Flash version")
     version.set_defaults(func=cmd_version)
 
-    login = sub.add_parser("login", help="log in with your freesolo API key (verified by freesolo)")
+    login = sub.add_parser(
+        "login",
+        help="log in with your freesolo API key (create one at https://freesolo.co/sign-in)",
+    )
     login.add_argument(
         "--api-key",
-        help="your freesolo API key (default: FREESOLO_API_KEY); created in the dashboard",
+        help="your freesolo API key (default: FREESOLO_API_KEY); create it at "
+        "https://freesolo.co/sign-in",
     )
     login.add_argument(
         "--freesolo-url",
@@ -89,33 +93,29 @@ def main(argv: list[str] | None = None) -> int:
     whoami = sub.add_parser("whoami", help="show the identity behind your stored key")
     whoami.set_defaults(func=cmd_whoami)
 
-    lab = sub.add_parser("lab", help="local authoring scaffolds")
-    lab_sub = lab.add_subparsers(dest="lab_cmd", required=True)
-    setup = lab_sub.add_parser("setup", help="scaffold environments/ + configs/ in the cwd")
-    setup.set_defaults(func=cmd_lab_setup)
-
     models = sub.add_parser("models", help="list supported base models")
     models.set_defaults(func=cmd_models)
 
     gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
     gpus.set_defaults(func=cmd_gpus)
 
-    env = sub.add_parser("env", help="manage verifiers environments")
+    env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
-    init = env_sub.add_parser("init", help="scaffold a new local verifiers environment")
+    setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
+    setup.set_defaults(func=cmd_env_setup)
+
+    init = env_sub.add_parser("init", help="scaffold a new local Freesolo environment")
     init.add_argument("name")
     init.set_defaults(func=cmd_env_init)
 
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
-    env_install = env_sub.add_parser("install", help="install a published Prime Hub environment")
-    env_install.add_argument("env_id", help='the env id to install (a Hub slug, "owner/name")')
+    env_install = env_sub.add_parser("install", help="record a Freesolo environment")
+    env_install.add_argument("env_id", help="the Freesolo environment id to record")
     env_install.set_defaults(func=cmd_env_install)
 
-    env_push = env_sub.add_parser(
-        "push", help="publish a local verifiers env to the Prime Hub (private); prints its env id"
-    )
+    env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
 

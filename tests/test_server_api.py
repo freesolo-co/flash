@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "primeintellect/gsm8k"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
@@ -50,7 +50,7 @@ def _login() -> str:
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("PRIME_API_KEY", "pit-test")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     import flash.runner as runner
     import flash.server.auth as auth_mod
@@ -493,7 +493,7 @@ def test_logs_offset_paging(api):
 
 
 def test_local_env_path_rejected(api):
-    # Prime Hub-only: a local [environment] path is rejected on the managed service.
+    # GitHub Freesolo-only: a local [environment] path is rejected on the managed service.
     key = _login()
     bad = {**SPEC, "environment": {"id": "custom", "path": "/home/user/env.py"}}
     r = api.post("/v1/runs", json={"spec": bad, "dry_run": True}, headers=_bearer(key))
@@ -549,9 +549,7 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
 
     monkeypatch.setattr(app_mod, "deploy_adapter", boom)
 
-    resp = api.post(
-        f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key)
-    )
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key))
     assert resp.status_code == 502, resp.text
     # The 502 carries the upstream reason verbatim, not a generic/unhandled-500 body.
     assert "serving backend unreachable" in resp.json()["detail"]
@@ -755,9 +753,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         runner.RunStatus(run_id="good-2", state="provisioning", spec=good_spec, remote=None)
     )
     # Order matters: the bad run is iterated FIRST, so an unguarded parse would abort here.
-    monkeypatch.setattr(
-        app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}]
-    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}])
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
 
     # A malformed spec can't be parsed into a JobSpec, so the good-spec branch's
@@ -807,7 +803,9 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # the user AND drops out of the recoverable set (never re-attempted).
     bad_status = runner.get_status("bad-1")
     assert bad_status.state == "failed", "an unparseable persisted spec must be marked failed"
-    assert bad_status.state in runner.TERMINAL_STATES, "failed is terminal, so it won't recover again"
+    assert bad_status.state in runner.TERMINAL_STATES, (
+        "failed is terminal, so it won't recover again"
+    )
     assert bad_status.state not in app_mod._RECOVERABLE, "the failed run leaves the recoverable set"
     assert bad_status.error, "the failed run must carry an operator-visible error note"
     assert "unrecoverable" in bad_status.error, (
@@ -827,24 +825,26 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
-    """POST /v1/envs publishes an uploaded package under FreeSolo's Prime account (the control
-    plane's PRIME_API_KEY), namespaced per identity — so the user needs no Prime account."""
+    """POST /v1/envs publishes an uploaded package to the managed GitHub environment repo."""
     import base64
     import io
     import tarfile
 
     import flash.server.envs as envs_mod
 
-    # Stub the actual `prime env push` so the test doesn't hit Prime; echo the namespaced name.
+    published_roots: list[str] = []
     monkeypatch.setattr(
-        envs_mod, "_prime_push", lambda env_dir, *, name, is_new: f"freesolo-co/{name}"
+        envs_mod,
+        "_github_publish_once",
+        lambda *, publish_root, **_kwargs: published_roots.append(publish_root),
     )
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for name, content in (
             ("pyproject.toml", b"[project]\nname='e'\n"),
-            ("e/__init__.py", b"x=1\n"),
+            ("freesolo/__init__.py", b""),
+            ("freesolo/environment.py", b"def load_environment(**kwargs): return None\n"),
         ):
             info = tarfile.TarInfo(name)
             info.size = len(content)
@@ -857,9 +857,10 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
         json={"name": "MyEnv", "is_new": True, "package_b64": pkg},
     )
     assert resp.status_code == 200
-    slug = resp.json()["id"]
-    assert slug.startswith("freesolo-co/")  # published under the managed account
-    assert slug.endswith("-myenv")  # per-identity namespaced + sanitized
+    ref = resp.json()["id"]
+    assert ref.startswith("github:")
+    assert ref.endswith("/myenv/freesolo/environment.py")
+    assert any(root.endswith("/myenv") for root in published_roots)
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
@@ -876,15 +877,19 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
 
     seen: dict = {}
 
-    def fake_push(env_dir, *, name, is_new):
-        seen["is_new"] = is_new
-        return f"freesolo-co/{name}"
+    def fake_publish_package(*, package_b64, name, is_new, key):
+        seen.update(package_b64=package_b64, name=name, is_new=is_new, key=key)
+        return "github:freesolo-co/envs@main:environments/key-1/e/freesolo/environment.py"
 
-    monkeypatch.setattr(envs_mod, "_prime_push", fake_push)
+    monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for nm, content in (("pyproject.toml", b"[project]\nname='e'\n"), ("e/__init__.py", b"x=1\n")):
+        for nm, content in (
+            ("pyproject.toml", b"[project]\nname='e'\n"),
+            ("freesolo/__init__.py", b""),
+            ("freesolo/environment.py", b"def load_environment(**kwargs): return None\n"),
+        ):
             info = tarfile.TarInfo(nm)
             info.size = len(content)
             tar.addfile(info, io.BytesIO(content))

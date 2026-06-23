@@ -1,100 +1,50 @@
 """Environment publish/install machinery for the `flash env` subcommands.
 
-`flash env install` records a published Prime Hub env locally; `flash env push` packages a
-local verifiers env and publishes it (always PRIVATE) to the Prime Environments Hub.
+`flash env install` records a Freesolo environment id locally;
+`flash env push` packages a local Freesolo environment and uploads it through the
+managed Flash control plane.
 """
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
 
-# Prime Intellect Environments Hub pip index. Each org's wheels live under ITS OWN namespace
-# (e.g. freesolo-co/flash-bench -> .../freesolo-co/simple/), so derive the index from the
-# slug owner — a hardcoded `primeintellect` index 404s on any non-primeintellect env.
-PRIME_HUB_INDEX_TMPL = "https://hub.primeintellect.ai/{owner}/simple/"
-
-
-def _prime_hub_index(env_id: str) -> str:
-    owner = env_id.split("/", 1)[0] if "/" in env_id else "primeintellect"
-    return PRIME_HUB_INDEX_TMPL.format(owner=owner)
-
 
 def cmd_env_install(args) -> int:
-    import shutil
-    import subprocess
-
-    from flash.envs.registry import _bare_wheel_name, record_installed_env
+    from flash.envs.adapter import is_github_environment_ref
+    from flash.envs.registry import record_installed_env
 
     env_id = args.env_id
-    # Managed envs are Prime Hub slugs: exactly one `/` with non-empty owner and name. A bare
-    # id (`gsm8k`) or a malformed slug can't be resolved on the Hub, so reject it up front
-    # rather than letting `prime`/pip fail with an opaque error.
-    parts = env_id.split("/")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
+    if not is_github_environment_ref(env_id):
         print(
-            f'env id must be a Prime Hub slug "owner/name" (got {env_id!r})',
+            "env id must be a Freesolo environment id returned by `flash env push` "
+            f"(got {env_id!r})",
             file=sys.stderr,
         )
         return 1
-    # `flash env install` is a LOCAL-client convenience: it installs the env into the client's
-    # interpreter and records it in ~/.flash/envs.json for local authoring/dry-run. The
-    # managed worker does NOT reinstall from this record — it installs Hub envs itself via an
-    # authenticated `prime env install` on the GPU box. A Hub slug `owner/name` maps to the pip
-    # wheel `name` on the Prime Intellect Hub index; we record that index alongside the env.
-    extras = {"extra_index_url": _prime_hub_index(env_id)}
-    if shutil.which("prime"):
-        # The `prime` CLI resolves the Hub + index itself (and is the only path that can fetch a
-        # PRIVATE Hub env — flash publishes envs PRIVATE).
-        cmd = ["prime", "env", "install", env_id]
-    else:
-        # The pip fallback hits the PUBLIC Hub index only; it cannot fetch PRIVATE Hub envs
-        # (the public index never serves private wheels). Be explicit instead of letting a
-        # private install fail confusingly, but still attempt pip for the public case.
-        print(
-            f"note: `prime` CLI not found; attempting a pip install of {env_id} from the "
-            "PUBLIC Hub index. PRIVATE Hub envs require the `prime` CLI — install it "
-            "(https://docs.primeintellect.ai) to install a private env."
-        )
-        installer = (
-            # `uv pip install` outside an active venv errors with "No virtual environment
-            # found"; --python targets the CLI's own interpreter so a global/pipx `flash`
-            # install still records the env.
-            ["uv", "pip", "install", "--python", sys.executable]
-            if shutil.which("uv")
-            else [sys.executable, "-m", "pip", "install"]
-        )
-        cmd = [*installer, _bare_wheel_name(env_id), "--extra-index-url", extras["extra_index_url"]]
-    print("running:", " ".join(cmd))
-    rc = subprocess.run(cmd).returncode
-    if rc != 0:
-        print("install failed")
-        return rc
-    record_installed_env(env_id, package=_bare_wheel_name(env_id), extras=extras)
+    record_installed_env(env_id, package="freesolo")
     print(f"installed {env_id}; recorded in ~/.flash/envs.json")
     print(f'use it via:  [environment]\\nid = "{env_id}"')
     return 0
 
 
-# A verifiers env packaged for the Prime Hub is a pyproject + an importable module exposing
-# load_environment(). When `flash env push` is pointed at a bare module (a single `.py`, as the
-# freesolo training agent emits, or a dir without a pyproject), we wrap it in this layout so the
-# push Just Works instead of erroring on "pyproject.toml not found".
+# A Freesolo environment package is uploaded in canonical generated-repo layout:
+# freesolo/environment.py exposes load_environment().
 _ENV_PUSH_PYPROJECT = """\
 [project]
 name = "{name}"
 version = "{version}"
-description = "Flash verifiers environment ({name})."
+description = "Flash Freesolo environment ({name})."
 requires-python = ">=3.10"
-dependencies = ["verifiers"]
+dependencies = ["freesolo"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["{module}"]
+packages = ["freesolo"]
 """
 
 _PUSH_INITIAL_VERSION = "0.1.0"
@@ -107,13 +57,24 @@ def _push_env_name(raw: str) -> str:
     return name or "flash-env"
 
 
-def _config_env_name(config_path) -> str | None:
-    """The `name` part of a sibling flash.toml's `[environment] id = "owner/name"`, or None.
+def _env_name_from_ref_path(raw_path: str) -> str | None:
+    path_text = raw_path.strip()
+    if not path_text:
+        return None
+    path = Path(path_text)
+    if path.name == "environment.py" and path.parent.name == "freesolo":
+        name = path.parent.parent.name
+    elif path.suffix == ".py":
+        name = path.parent.name or path.stem
+    else:
+        name = path.name
+    return name or None
 
-    Used so a bare `environment.py` re-publishes under its EXISTING Hub env (minting a new
-    version) instead of deriving a fresh name from the file stem. Owner still comes from the
-    authenticated Prime account/team, so only the name part is consumed here."""
+
+def _config_env_name(config_path) -> str | None:
+    """A stable name from a sibling flash.toml's `[environment] id`, or None."""
     import tomllib
+    import urllib.parse
 
     path = Path(config_path)
     if not path.is_file():
@@ -124,14 +85,26 @@ def _config_env_name(config_path) -> str | None:
         return None
     env = data.get("environment")
     env_id = str(env.get("id") or "").strip() if isinstance(env, dict) else ""
-    if "/" in env_id:
-        name = env_id.split("/", 1)[1].strip()
-        return name or None
+    if env_id.startswith("github:"):
+        _repo_ref, sep, ref_path = env_id[len("github:") :].partition(":")
+        if not sep:
+            return None
+        return _env_name_from_ref_path(ref_path)
+
+    parsed = urllib.parse.urlparse(env_id)
+    if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "github.com":
+        parts = [urllib.parse.unquote(part) for part in parsed.path.strip("/").split("/") if part]
+        if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
+            return _env_name_from_ref_path("/".join(parts[4:]))
+        return None
+
+    if ":" in env_id and not parsed.scheme:
+        return _env_name_from_ref_path(env_id.rsplit(":", 1)[1])
     return None
 
 
 def _config_env_name_from_dir(config_dir) -> str | None:
-    """The Hub env name declared by the sibling per-phase flash configs
+    """The environment name declared by the sibling per-phase flash configs
     (``flash_grpo.toml``/``flash_sft.toml``). Without this, pushing ``environment.py`` finds
     no id and mints a brand-new env, so the run trains against the stale id in the configs.
     """
@@ -146,13 +119,15 @@ def _config_env_name_from_dir(config_dir) -> str | None:
 def _with_syspath_bootstrap(env_source: str) -> str:
     """Prepend a sys.path bootstrap so a published env (run as the package __init__) can resolve
     BARE absolute imports of its shipped sibling helpers (`import config` / `from utils import x`)
-    even without its own sys.path.insert — otherwise `prime env install`/load_environment fails
+    even without its own sys.path.insert — otherwise load_environment fails
     with ModuleNotFoundError. Inserted AFTER the module docstring and any `from __future__` imports
     (which must stay first). Mirrors the platform hub publisher."""
     bootstrap = (
         "import os as _flash_os, sys as _flash_sys\n"
         "_flash_sys.path.insert(0, _flash_os.path.dirname(__file__))\n"
     )
+    import ast
+
     try:
         tree = ast.parse(env_source)
     except SyntaxError:
@@ -175,17 +150,15 @@ def _with_syspath_bootstrap(env_source: str) -> str:
     return "".join(lines[:insert_after]) + bootstrap + "".join(lines[insert_after:])
 
 
-# Tool/cache dirs that aren't part of the environment SOURCE. We never ship them: `.prime/` in
-# particular carries Prime CLI metadata (.env-metadata.json) from a prior local push — shipping it
-# bloats the upload and could let stale client metadata confuse server-side slug discovery (the
-# server also strips it defensively, but don't send it in the first place).
-_TAR_EXCLUDE_DIRS = frozenset({".prime", ".git", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"})
+_TAR_EXCLUDE_DIRS = frozenset(
+    {".prime", ".git", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"}
+)
 
 
 def _tar_b64(directory: Path) -> str:
     """Pack a directory's contents into a base64 ``.tar.gz`` (members rooted at the top level)
     for upload, skipping tool/cache dirs (``.prime/``, ``.git/``, ``__pycache__``, ...). Packaging
-    is pure file I/O — no `prime` CLI or Prime account needed locally.
+    is pure file I/O and needs no local credentials; upload happens through the server.
 
     We walk with ``os.walk`` and PRUNE excluded directories in place (``dirs[:] = ...``) so we never
     descend into them: a plain ``rglob('*')`` would still recurse into (and stat every entry under)
@@ -221,7 +194,7 @@ def _tar_b64(directory: Path) -> str:
 
 
 def _pyproject_name(env_dir: Path) -> str | None:
-    """The ``[project] name`` of a ready-made env dir, used to name the managed Hub env."""
+    """The ``[project] name`` of a ready-made env dir, used to name the managed env."""
     import tomllib
 
     try:
@@ -233,8 +206,7 @@ def _pyproject_name(env_dir: Path) -> str | None:
 
 
 def _upload_and_report(name: str, *, is_new: bool, package_b64: str) -> int:
-    """Upload a packaged env to the managed Environments Hub (the control plane publishes it
-    under FreeSolo's Prime account) and print the returned id."""
+    """Upload a packaged env to the managed control plane and print the returned id."""
     from flash.client import ClientError, client_from_config
 
     try:
@@ -244,7 +216,7 @@ def _upload_and_report(name: str, *, is_new: bool, package_b64: str) -> int:
         return 1
     slug = result.get("id")
     if not slug:
-        print("warning: the env was published but the server returned no id", file=sys.stderr)
+        print("warning: the env was uploaded but the server returned no id", file=sys.stderr)
         return 1
     print(f"published {slug}")
     print(f'reference it in your config:\n\n  [environment]\n  id = "{slug}"')
@@ -260,22 +232,24 @@ def cmd_env_push(args) -> int:
         print(f"no such path: {src}", file=sys.stderr)
         return 1
 
-    # A ready-made env directory (has a pyproject.toml) is uploaded as-is; its name comes from
-    # the pyproject. Publishing happens server-side under FreeSolo's managed Prime account, so no
-    # local `prime` CLI or Prime Intellect account is required.
+    # A ready-made generated repo/package is uploaded as-is when it already carries the canonical
+    # Freesolo environment file.
     if src.is_dir() and (src / "pyproject.toml").is_file():
+        if not (src / "freesolo" / "environment.py").is_file():
+            print(
+                f"{src} has a pyproject.toml but no freesolo/environment.py entrypoint",
+                file=sys.stderr,
+            )
+            return 1
         env_name = _pyproject_name(src) or _push_env_name(src.name)
         return _upload_and_report(env_name, is_new=True, package_b64=_tar_b64(src))
 
-    # Wrap a bare verifiers module (a single .py, or a one-module dir) into a Prime-compatible
-    # env package and upload that. `data_dir` is a committed `datasets/` sibling of the module
-    # (if any); we ship it inside the package so an env that reads a `__file__`-relative data
-    # file still resolves once installed.
+    # Wrap a bare Freesolo environment module (a single .py, or a one-module dir) into the
+    # canonical generated-repo layout and upload that. `data_dir` is a committed `datasets/`
+    # sibling of the module; it ships beside the environment.
     if src.is_file() and src.suffix == ".py":
         module_source = src.read_text()
-        # Re-publish to the SAME Hub env when a sibling flash config names one: use its
-        # `[environment] id` name part so an edited environment.py mints a new version of the
-        # existing env instead of creating a fresh env from the file stem.
+        # Re-publish to the same logical environment when sibling configs name one.
         sibling_name = _config_env_name_from_dir(src.parent)
         env_name = sibling_name or _push_env_name(src.stem)
         data_dir = src.parent / "datasets"
@@ -284,8 +258,6 @@ def cmd_env_push(args) -> int:
         sibling_modules = [
             p for p in sorted(src.parent.glob("*.py")) if p != src and not p.name.startswith("__")
         ]
-        # A sibling config id means we're re-publishing an EXISTING Hub env: auto-bump from the
-        # first attempt so it doesn't restart at 0.1.0 and climb through version conflicts.
         is_new = sibling_name is None
     elif src.is_dir():
         modules = [p for p in sorted(src.glob("*.py")) if not p.name.startswith("__")]
@@ -303,31 +275,22 @@ def cmd_env_push(args) -> int:
         sibling_modules = []
         is_new = True
     else:
-        print(f"cannot publish {src}: expected a verifiers .py module or an env directory.")
+        print(f"cannot publish {src}: expected a Freesolo .py module or an env directory.")
         return 1
 
-    # The module dir name must be a valid Python identifier. `env_name` may be a sibling config's
-    # Hub slug name (`_config_env_name`), which is NOT sanitized and can contain `.`/other chars
-    # invalid in a package dir (and would mismatch `[tool.hatch...] packages = ["<module>"]`,
-    # breaking the build). Normalize through `_push_env_name` (collapses non-[a-z0-9] runs to `-`)
-    # before mapping `-`->`_`, so the module is always [a-z0-9_].
-    module = _push_env_name(env_name).replace("-", "_")
-    # A Python package name can't start with a digit, so prefix one (e.g. "2026-task").
-    if module[:1].isdigit():
-        module = f"env_{module}"
     with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
-        (pkg / module).mkdir()
-        (pkg / module / "__init__.py").write_text(_with_syspath_bootstrap(module_source))
-        # Ship committed sibling data inside the package dir (it lands at <module>/datasets/, so a
-        # `os.path.dirname(__file__)/datasets/...` read resolves on the worker); the whole package
-        # dir ships via `[tool.hatch.build.targets.wheel] packages = ["<module>"]`.
+        env_pkg = pkg / "freesolo"
+        env_pkg.mkdir()
+        (env_pkg / "__init__.py").write_text("")
+        (env_pkg / "environment.py").write_text(_with_syspath_bootstrap(module_source))
+        # Ship committed sibling data inside the canonical freesolo package dir.
         if data_dir.is_dir() and any(data_dir.iterdir()):
-            shutil.copytree(data_dir, pkg / module / "datasets")
+            shutil.copytree(data_dir, env_pkg / "datasets")
         for mod in sibling_modules:
-            shutil.copy2(mod, pkg / module / mod.name)
+            shutil.copy2(mod, env_pkg / mod.name)
         (pkg / "pyproject.toml").write_text(
-            _ENV_PUSH_PYPROJECT.format(name=env_name, module=module, version=_PUSH_INITIAL_VERSION)
+            _ENV_PUSH_PYPROJECT.format(name=env_name, version=_PUSH_INITIAL_VERSION)
         )
-        (pkg / "README.md").write_text(f"# {env_name}\n\nFlash verifiers environment.\n")
+        (pkg / "README.md").write_text(f"# {env_name}\n\nFlash Freesolo environment.\n")
         return _upload_and_report(env_name, is_new=is_new, package_b64=_tar_b64(pkg))

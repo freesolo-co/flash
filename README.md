@@ -12,12 +12,11 @@ allocator picks the cheapest GPU class that fits the run across both providers.
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
 - `flash deploy` (scale-to-zero or always-on), `flash chat` —
   serving for trained adapters.
-- **Verifiers-only environments.** Every run names a Prime Intellect `verifiers`
-  environment by its published Hub slug (`[environment] id = "owner/name"`).
-  Scaffold a local env, publish it with `flash env push`, then reference it by id.
-  The worker wraps it via `flash/envs/adapter.py`. There are no
-  built-in task environments and no freesolo bridge. Single-turn environments
-  are fully supported (SFT/GRPO/eval).
+- **Freesolo SDK environments.** Every run names a Freesolo environment id.
+  Scaffold a local env, upload it with `flash env push`, then reference the
+  returned id. The worker loads it through `freesolo.environments`. There are no
+  built-in task environments. Single-turn and bounded multi-turn environments are
+  supported.
 
 ## Layout
 
@@ -33,10 +32,9 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
   shared recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
-- `flash/envs/` — environment machinery: registry and the
-  `adapter` that wraps Prime Intellect / Hub `verifiers`
-  environments onto the worker's interface
-- `flash lab setup` / `flash env init` — scaffold a starter local verifiers env and a
+- `flash/envs/` — environment machinery: registry and the adapter that loads
+  Freesolo SDK environments onto the worker's interface
+- `flash env setup` / `flash env init` — scaffold a starter local Freesolo env and a
   ready-to-run config to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
   plane (run operator-side via the separate `flash-server` command)

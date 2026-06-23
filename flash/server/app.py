@@ -1,10 +1,9 @@
 """FastAPI control plane for the managed Flash service.
 
-This is the operator-side component. It holds the
-provider credentials (``RUNPOD_API_KEY``, ``HF_TOKEN``, ``PRIME_API_KEY`` —
-the worker needs the last to ``prime env install`` the run's Prime Hub env) and
-exposes the full run lifecycle to clients that authenticate with their freesolo API
-key (verified against the freesolo backend) — clients never see provider credentials.
+This is the operator-side component. It holds the provider credentials
+(``RUNPOD_API_KEY``, ``HF_TOKEN``, and environment source tokens) and exposes the
+full run lifecycle to clients that authenticate with their freesolo API key
+(verified against the freesolo backend) — clients never see provider credentials.
 
 Run state truth stays in the runner's JSON files; SQLite (server/db.py) holds
 keys and run ownership. Runs the server owns are recovered on startup by re-attaching
@@ -267,11 +266,14 @@ def create_app():
 
     @app.get("/v1/me")
     def me(key: dict = Depends(require_key)):
-        return {
+        payload = {
+            "kind": "internal" if key.get("auth_kind") == "internal" else "freesolo_api_key",
             "key_prefix": key["key_prefix"],
-            "email": key["email"],
-            "created_at": key["created_at"],
         }
+        for field in ("email", "user_id", "org_id", "api_key_id", "training_agent_job_id", "project_id"):
+            if key.get(field):
+                payload[field] = key[field]
+        return payload
 
     @app.get("/v1/models")
     def models(_: dict = Depends(require_key)):
@@ -279,9 +281,8 @@ def create_app():
 
     @app.post("/v1/envs")
     def publish_env(payload: dict, key: dict = Depends(require_key)):
-        # Publish a client-built verifiers env package to the MANAGED Prime account (this control
-        # plane's PRIME_API_KEY), namespaced per identity and PRIVATE — so users never need their
-        # own Prime account. The client just packages local source and uploads it here.
+        # Publish a client-built Freesolo environment package to the managed
+        # environment repository. Users never need direct repository credentials.
         from flash.server import envs
 
         # Default to "" only when the key is missing/None — pass a present-but-falsy
@@ -309,8 +310,8 @@ def create_app():
             raise HTTPException(
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
-                "publish the environment to the Prime Hub (`flash env push`), then reference it "
-                'by its Hub id (`[environment] id = "owner/name"`)',
+                "publish the environment with `flash env push`, then reference it "
+                "by the returned environment id",
             )
         try:
             return spec_from_dict(spec_raw, run_id=run_id)
