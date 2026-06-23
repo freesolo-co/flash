@@ -162,7 +162,7 @@ def sft_per_device(batch_size: int, *, seq_len: int = 0, vocab: int = 0, fused: 
     """The per-device SFT micro-batch the worker runs: the requested global batch capped at the
     micro-batch default (4) and ADDITIONALLY vocab-sized to the logits budget when the fused CE is
     OFF (small model AND short context) — so the big-vocab [per_device, seq, vocab] logits can't OOM
-    the card. With seq_len/vocab unset (or fused) it's just the old fixed cap (back-compatible)."""
+    the card. With seq_len/vocab unset (or fused), this remains the fixed cap."""
     per_device = max(1, min(_SFT_PER_DEVICE_BS_DEFAULT, max(1, int(batch_size))))
     if not fused and seq_len and vocab:
         per_device = min(per_device, sft_logits_per_device_cap(seq_len, vocab))
