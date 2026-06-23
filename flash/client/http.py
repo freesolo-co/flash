@@ -123,7 +123,7 @@ class ApiClient:
 
     # -- environments ------------------------------------------------------------------
     def publish_env(self, *, name: str, package_b64: str) -> dict:
-        """Upload a packaged Freesolo environment to managed GitHub storage."""
+        """Upload a packaged Freesolo environment to the managed Environments Hub."""
         return self._request(
             "POST",
             "/v1/envs",

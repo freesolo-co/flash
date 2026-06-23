@@ -366,6 +366,41 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
     assert downloads == ["b" * 40]
 
 
+def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+
+    downloads: list[str] = []
+
+    def fake_download(ref):
+        downloads.append(ref.ref)
+        return _github_environment_tarball("repo-root")
+
+    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
+
+    resolved = adapter._resolve_environment_reference("github:owner/repo@main:envs/e")
+    assert resolved.endswith("envs/e/environment.py")
+    assert adapter._resolve_environment_reference("github:owner/repo@main:envs/e") == resolved
+    assert downloads == ["b" * 40]
+
+
+def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, monkeypatch):
+    import flash.envs.adapter as adapter
+
+    monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    monkeypatch.setattr(
+        adapter,
+        "_download_github_tarball",
+        lambda ref: _github_environment_tarball("repo-root", env_path="envs/e/helper.py"),
+    )
+
+    with pytest.raises(FileNotFoundError, match=r"envs/e/environment\.py"):
+        adapter._resolve_environment_reference("github:owner/repo@main:envs/e")
+
+
 def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
     from flash.envs.adapter import _safe_extract_archive
 
