@@ -473,15 +473,24 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                 results = asyncio.run(_undeploy_all())
             else:
                 # Running event loop (e.g. FastAPI lifespan) — asyncio.run() would raise;
-                # use a thread. shutdown(wait=False) ensures future.result(timeout=30) is the
-                # actual cap (context-manager `with` calls shutdown(wait=True) on exit).
-                import concurrent.futures as _cf
+                # daemon=True so a hung undeploy cannot prevent process shutdown.
+                _out: list = []
+                _err: list = []
 
-                _ex = _cf.ThreadPoolExecutor(max_workers=1)
-                try:
-                    results = _ex.submit(lambda: asyncio.run(_undeploy_all())).result(timeout=30)
-                finally:
-                    _ex.shutdown(wait=False, cancel_futures=True)
+                def _run_undeploy() -> None:
+                    try:
+                        _out.append(asyncio.run(_undeploy_all()))
+                    except Exception as _e:
+                        _err.append(_e)
+
+                _t = threading.Thread(target=_run_undeploy, daemon=True)
+                _t.start()
+                _t.join(timeout=30)
+                if _err:
+                    raise _err[0]
+                if not _out:
+                    raise TimeoutError("undeploy timed out after 30s")
+                results = _out[0]
         except Exception as exc:
             results = [{"success": False, "name": target, "message": str(exc)}]
 
