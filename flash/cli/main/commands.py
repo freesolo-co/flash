@@ -135,15 +135,18 @@ def cmd_env_setup(args) -> int:
     starter_env = Path(starter_env_dir / "environment.py")
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
-    sample = Path("configs/freesolo_grpo.toml")
-    if not sample.exists():
-        sample.write_text(
+    env_comment = (
+        "# Environment: upload the scaffolded environments/freesolo/environment.py with\n"
+        "# `flash env push environments/freesolo/environment.py`, then paste the returned id below.\n"
+        "[environment]\n"
+        'id = ""\n\n'
+    )
+    grpo = Path("configs/grpo.toml")
+    if not grpo.exists():
+        grpo.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
-            "# Environment: upload the scaffolded environments/freesolo/environment.py with\n"
-            "# `flash env push environments/freesolo/environment.py`, then paste the returned id below.\n"
-            "[environment]\n"
-            'id = ""\n\n'
+            f"{env_comment}"
             "[train]\n"
             "steps = 150\n"
             "lora_rank = 32\n"
@@ -151,9 +154,22 @@ def cmd_env_setup(args) -> int:
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
+    sft = Path("configs/sft.toml")
+    if not sft.exists():
+        sft.write_text(
+            'model = "Qwen/Qwen3.5-4B"\n'
+            'algorithm = "sft"\n\n'
+            f"{env_comment}"
+            "[train]\n"
+            "epochs = 1\n"
+            "lora_rank = 32\n"
+            "seeds = [0]\n"
+            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
+        )
     print(
         "created environments/freesolo/environment.py, configs/, "
-        "configs/freesolo_grpo.toml, configs/endpoints.toml"
+        "configs/grpo.toml, configs/sft.toml, configs/endpoints.toml"
     )
     return 0
 

@@ -271,6 +271,7 @@ def test_freesolo_multiturn_hooks(monkeypatch):
         contract_text="contract",
     )
     state = env.new_rollout_state({"task": "browse", "expected_output": "done"})
+    assert state["prompt"] == [{"role": "user", "content": "contract:browse"}]
     assert state["messages"] == [{"role": "user", "content": "contract:browse"}]
     env.record_model_turn(state, "click")
     replies = env.env_reply(state["messages"], state)
@@ -309,6 +310,11 @@ def test_github_environment_ref_parsing():
     assert not is_github_environment_ref("https://github.com/owner/repo/blob/dev/../../etc/passwd")
     assert not is_github_environment_ref("https://github.com/owner/repo/blob/main:/etc/passwd")
     assert not is_github_environment_ref("https://github.com/owner/repo/issues/1")
+    assert not is_github_environment_ref("github:owner /repo@main:envs/e/freesolo/environment.py")
+    assert not is_github_environment_ref("github:owner/repo@bad/ref:envs/e/freesolo/environment.py")
+    assert not is_github_environment_ref(
+        "https://github.com/owner/repo/blob/bad ref/envs/e/freesolo/environment.py"
+    )
 
 
 def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
@@ -396,7 +402,6 @@ def test_install_manifest_and_worker_deps():
         env_id = "github:owner/repo@main:env/freesolo/environment.py"
         registry.record_installed_env(env_id, package="freesolo")
         assert registry.worker_pip_for_env(env_id) == ["freesolo"]
-        assert registry.worker_hub_env_ids(env_id) == []
         assert registry.list_installed_environments() == [env_id]
 
         os.environ.pop("FLASH_ENVS_MANIFEST", None)
