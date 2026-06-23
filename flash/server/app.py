@@ -64,22 +64,6 @@ async def _reconcile_cost_loop() -> None:
                 _log.info("reconciled realized cost for %d run(s)", reported)
 
 
-def _reverse_charge_best_effort(*, token: str, run_id: str, charge: dict) -> None:
-    """Refund a run's pre-flight charge after its submit failed; never raises (logs on failure
-    so the refund error can't mask the submit error). Idempotent by ``run_id``."""
-    try:
-        from flash.server.billing import reverse_run_charge
-
-        reverse_run_charge(token=token, run_id=run_id, charge=charge)
-    except Exception:
-        # A refund failure must NOT mask the submit error: log and swallow.
-        _log.exception(
-            "failed to reverse the pre-flight charge for run %s after a submit failure; "
-            "the org may be charged for a run that never started — reconcile manually",
-            run_id,
-        )
-
-
 class _RunLock:
     """A weak-referenceable mutex usable as a context manager.
 
@@ -368,44 +352,35 @@ def create_app():
     def create_run(
         payload: dict,
         key: dict = Depends(require_key),
-        authorization: str | None = Header(default=None),
     ):
         spec = _parse_spec(payload, run_id=new_run_id())
         dry_run = bool(payload.get("dry_run", False))
         runtime_secrets = _runtime_secrets(
             payload, spec, require_environment_secrets=not dry_run
         )
-        # Charge the pre-flight estimate to the user's org BEFORE accepting the run, so it's gated
-        # on balance and never starts unpaid. Skipped for --dry-run and the internal service
-        # identity (no user org to bill).
-        billed = not dry_run and key.get("key_prefix") != "internal"
-        token = (authorization or "").removeprefix("Bearer ").strip()
-        charge: dict = {}
-        if billed:
-            from flash.server.billing import BillingError as _BillingError
-            from flash.server.billing import charge_run_estimate
-
-            try:
-                charge = charge_run_estimate(token=token, spec=spec)
-            except _BillingError as exc:
-                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-            except ValueError as exc:
-                # Unpriceable config (e.g. uncapped SFT whose env can't be counted): 400 with a
-                # fixable message, not a 500.
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-        # record_run is inside the try so any post-charge failure (SQLite, submit) reverses the
-        # debit — the org must never pay for a run that didn't start.
+        # External user-key runs are charged only after training succeeds. Persist the org id
+        # (non-secret) so the background runner can bill with the operator internal key at
+        # completion; never persist the submitting user's API key.
+        bill_on_completion = not dry_run and key.get("auth_kind") != "internal"
+        billing_context = None
+        if bill_on_completion:
+            org_id = str(key.get("org_id") or "").strip()
+            if not org_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="org id is required to bill a completed training run",
+                )
+            billing_context = {"org_id": org_id}
         try:
             db.record_run(spec.run_id, key["id"])
             submit_kwargs = {"dry_run": dry_run, "background": True}
             if runtime_secrets:
                 submit_kwargs["runtime_secrets"] = runtime_secrets
+            if billing_context:
+                submit_kwargs["billing_context"] = billing_context
             status = submit_job(spec, **submit_kwargs)
         except Exception as exc:
             db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
-            # The run never started — reverse the charge so the org isn't billed for it.
-            if billed:
-                _reverse_charge_best_effort(token=token, run_id=spec.run_id, charge=charge)
             if isinstance(exc, HTTPException):
                 raise
             raise HTTPException(status_code=400, detail=str(exc)) from exc
