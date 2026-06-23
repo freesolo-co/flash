@@ -111,7 +111,7 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     if not _report(body):
         return False
 
-    # Persist locally so we don't re-pull/re-report, and so `flash cost` can show realized vs
+    # Persist locally so we don't re-pull/re-report, and so `flash status` can show realized vs
     # estimated. COST-FIELDS-ONLY: record_realized_cost re-reads the run under the lock and writes
     # only the realized-cost columns, never `state`. The `status` here is an earlier snapshot, so
     # writing its `state` back could REVERT a run that advanced since (e.g. to `deployed`) -- which

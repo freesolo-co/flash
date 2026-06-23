@@ -16,7 +16,7 @@ from flash.spec import JobSpec, load_job_spec_from_env
 BASE_RAW = {
     "model": "Qwen/Qwen3.5-0.8B",
     "algorithm": "grpo",
-    "environment": {"id": "primeintellect/gsm8k"},
+    "environment": {"id": "freesolo/gsm8k"},
     "train": {"steps": 10, "lora_rank": 8, "seeds": [0], "hf_repo": "owner/runs"},
     "gpu": {"type": "RTX 4090"},
 }
@@ -102,12 +102,32 @@ def test_environment_path_is_rejected() -> None:
 
 
 def test_bare_environment_id_is_rejected() -> None:
-    # A bare id like "gsm8k" passes the presence check but the worker would run
-    # `prime env install gsm8k` (invalid — Prime needs owner/name); reject it up front.
-    for bad in ("gsm8k", "owner/", "/name", "a/b/c"):
+    # A bare id like "gsm8k" passes the presence check but is not a Freesolo env slug;
+    # reject it up front.
+    for bad in (
+        "gsm8k",
+        "owner/",
+        "/name",
+        "a/b/c",
+        "owner/..",
+        "owner/.",
+        "owner/na me",
+        "owner/name:tag",
+        "https://freesolo.co/owner/name",
+        "github:owner/repo/extra@main:x/environment.py",
+        "github:owner/repo@:x/environment.py",
+        "github:owner/repo@main:../x.py",
+        "github:owner/repo@main:/etc/passwd",
+        "github:owner /repo@main:x/environment.py",
+        "github:owner/repo@bad/ref:x/environment.py",
+        "https://github.com/owner/repo/blob/main/../x.py",
+        "https://github.com/owner/repo/blob/main:/etc/passwd",
+        "https://github.com/owner/repo/blob/bad ref/x.py",
+        "https://github.com/owner/repo/issues/1",
+    ):
         raw = _raw()
         raw["environment"] = {"id": bad}
-        with pytest.raises(ConfigError, match=r"owner/name"):
+        with pytest.raises(ConfigError, match=r"Freesolo environment id"):
             spec_from_dict(raw)
 
 
@@ -138,42 +158,89 @@ def test_environment_subfields_reject_wrong_types() -> None:
     # `environment = false` must fail rather than silently coerce to {} and bypass intent.
     for bad in ("notatable", 123, False):
         raw = _raw()
-        raw["environment"] = {"id": "primeintellect/gsm8k", "params": bad}
+        raw["environment"] = {
+            "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+            "params": bad,
+        }
         with pytest.raises(ConfigError, match=r"\[environment\] params must be a table"):
             spec_from_dict(raw)
     for bad in ("notalist", 123, False):
         raw = _raw()
-        raw["environment"] = {"id": "primeintellect/gsm8k", "pip": bad}
+        raw["environment"] = {
+            "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+            "pip": bad,
+        }
         with pytest.raises(ConfigError, match=r"\[environment\] pip must be a list of strings"):
             spec_from_dict(raw)
     raw = _raw()
-    raw["environment"] = {"id": "primeintellect/gsm8k", "pip": ["ok", 123]}
+    raw["environment"] = {
+        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "pip": ["ok", 123],
+    }
     with pytest.raises(ConfigError, match=r"\[environment\] pip entries must be strings"):
+        spec_from_dict(raw)
+    for bad in ("notalist", 123, False):
+        raw = _raw()
+        raw["environment"] = {
+            "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+            "secrets": bad,
+        }
+        with pytest.raises(ConfigError, match=r"\[environment\] secrets must be a list"):
+            spec_from_dict(raw)
+    raw = _raw()
+    raw["environment"] = {
+        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "secrets": ["OK_SECRET", 123],
+    }
+    with pytest.raises(ConfigError, match=r"\[environment\] secrets entries must be strings"):
+        spec_from_dict(raw)
+    raw = _raw()
+    raw["environment"] = {
+        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "secrets": ["BAD KEY"],
+    }
+    with pytest.raises(ConfigError, match=r"\[environment\] secrets has invalid"):
+        spec_from_dict(raw)
+    raw = _raw()
+    raw["environment"] = {
+        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "secrets": ["HF_TOKEN"],
+    }
+    with pytest.raises(ConfigError, match=r"platform-managed"):
         spec_from_dict(raw)
 
 
 def test_environment_subfields_accept_valid_and_missing() -> None:
     # Missing sub-fields keep their defaults, and valid values pass through unchanged.
     raw = _raw()
-    raw["environment"] = {"id": "primeintellect/gsm8k"}
+    raw["environment"] = {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"}
     spec = spec_from_dict(raw)
     assert spec.environment.params == {}
     assert spec.environment.pip == ()
+    assert spec.environment.secrets == ()
     raw = _raw()
     raw["environment"] = {
-        "id": "primeintellect/gsm8k",
+        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
         "params": {"k": "v"},
         "pip": ["pkg==1.0"],
+        "secrets": ["SERPAPI_API_KEY", "OPENAI_API_KEY", "SERPAPI_API_KEY"],
     }
     spec = spec_from_dict(raw)
     assert spec.environment.params == {"k": "v"}
     assert spec.environment.pip == ("pkg==1.0",)
+    assert spec.environment.secrets == ("SERPAPI_API_KEY", "OPENAI_API_KEY")
     # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
     raw = _raw()
-    raw["environment"] = {"id": "primeintellect/gsm8k", "params": None, "pip": None}
+    raw["environment"] = {
+        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "params": None,
+        "pip": None,
+        "secrets": None,
+    }
     spec = spec_from_dict(raw)
     assert spec.environment.params == {}
     assert spec.environment.pip == ()
+    assert spec.environment.secrets == ()
 
 
 def test_jobspec_from_dict_rejects_path() -> None:
@@ -377,7 +444,7 @@ def test_configure_logging_verbosity() -> None:
         "OPENAI_API_KEY",  # KEY qualified by API
         "AWS_SECRET_ACCESS_KEY",  # SECRET word + KEY qualified by SECRET/ACCESS
         "DB_PASSWORD",  # PASSWORD word
-        "PRIME_API_KEY",
+        "GITHUB_TOKEN",
         "WANDB_API_KEY",
         "SOME_PRIVATE_KEY",  # KEY qualified by PRIVATE
         "MY_CREDENTIAL",

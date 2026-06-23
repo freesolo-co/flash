@@ -44,7 +44,7 @@ def adapter_prefix(spec: JobSpec, seed: int | None = None) -> str:
 
 
 def _gpu_rate(gpu_type: str) -> float:
-    """Representative $/hr for cost projection (live RunPod pricing, static fallback);
+    """Static representative $/hr for cost projection;
     the worker also records wall time so cost = wall_hours * rate."""
     try:
         from flash.providers.runpod.pricing import hourly_rate
@@ -66,7 +66,7 @@ class RunStatus:
     artifacts_dir: str | None = None
     deployment: dict | None = None
     # Durable job handle {endpoint_id, endpoint_name, job_id} — lets any process
-    # reattach to / cancel the remote job (see `flash attach`).
+    # reattach to / cancel the remote job (see `flash status --follow`).
     remote: dict | None = None
     # Index of the next seed to run for a multi-seed job, set while the remote handle
     # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds

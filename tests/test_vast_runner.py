@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import itertools
 import json
+import sys
 
 import pytest
 
@@ -165,8 +166,8 @@ def test_bootstrap_fails_without_metrics(monkeypatch):
     assert "metrics.json" in error
 
 
-def _bootstrap_with_hub_env(monkeypatch, prime_present):
-    """Drive _bootstrap.main() with one published env to install, recording subprocess cmds."""
+def _bootstrap_with_extra_pip(monkeypatch):
+    """Drive _bootstrap.main() with Freesolo extra pip deps, recording subprocess cmds."""
     from flash.providers.vast import _bootstrap as vb
 
     cmds: list[list[str]] = []
@@ -178,9 +179,8 @@ def _bootstrap_with_hub_env(monkeypatch, prime_present):
             "job_spec_json": "{}",
             "phase": "sft",
             "seed": 0,
-            "env": {"PRIME_API_KEY": "pit-test"},
-            "extra_pip": [],
-            "hub_env_ids": ["owner/env"],
+            "env": {"GITHUB_TOKEN": "ghp-test"},
+            "extra_pip": ["freesolo"],
             "hf_prefix": "sft/x/seed0",
             "max_wall_s": 60,
             "attempt": 0,
@@ -197,31 +197,14 @@ def _bootstrap_with_hub_env(monkeypatch, prime_present):
     monkeypatch.setattr(
         vb.subprocess, "run", lambda cmd, *a, **k: (cmds.append(list(cmd)), _Proc())[1]
     )
-    monkeypatch.setattr(
-        vb.shutil,
-        "which",
-        lambda name: "/usr/bin/prime" if (prime_present and name == "prime") else None,
-    )
     return vb, cmds
 
 
-def test_bootstrap_installs_prime_into_worker_python(monkeypatch):
-    # When `prime` is already present (baked into the image), don't reinstall it; run the
-    # LOCATED prime binary and install the env into THIS python via `--with pip` so the
-    # trainer can import the env module at load_environment.
-    vb, cmds = _bootstrap_with_hub_env(monkeypatch, prime_present=True)
+def test_bootstrap_installs_extra_pip_without_prime(monkeypatch):
+    vb, cmds = _bootstrap_with_extra_pip(monkeypatch)
     assert vb.main() == 0
-    assert not any(c[-1] == "prime" and "install" in c for c in cmds)
-    assert ["/usr/bin/prime", "env", "install", "owner/env", "--with", "pip"] in cmds
-
-
-def test_bootstrap_installs_prime_when_missing(monkeypatch):
-    # When `prime` isn't already on PATH, the bootstrap installs it and then proceeds to the env
-    # install (rather than silently skipping it, which would crash later with ModuleNotFoundError).
-    vb, cmds = _bootstrap_with_hub_env(monkeypatch, prime_present=False)
-    assert vb.main() == 0
-    assert any(c[-1] == "prime" and "install" in c for c in cmds)
-    assert ["prime", "env", "install", "owner/env", "--with", "pip"] in cmds
+    assert [sys.executable, "-m", "pip", "install", "freesolo"] in cmds
+    assert not any("prime" in c for cmd in cmds for c in cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -609,9 +592,7 @@ def test_run_label_prefix_matches_instance_label():
     assert instance_label("fail-fast", 0, 0).startswith(run_label_prefix("fail-fast"))
     # an already-prefixed run id is idempotent
     assert run_label_prefix("flash-1700-abcd") == "flash-1700-abcd"
-    assert instance_label("flash-1700-abcd", 1, 2).startswith(
-        run_label_prefix("flash-1700-abcd")
-    )
+    assert instance_label("flash-1700-abcd", 1, 2).startswith(run_label_prefix("flash-1700-abcd"))
 
 
 def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):

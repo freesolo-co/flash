@@ -32,7 +32,7 @@ def create_train_run(args: dict) -> dict:
         return {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}
     return client_from_config().create_run(
         spec_payload(spec),
-        runtime_secrets=runtime_secrets_from_local_env(),
+        runtime_secrets=runtime_secrets_from_local_env(keys=spec.environment.secrets),
     )
 
 
@@ -48,8 +48,6 @@ def get_run_logs(args: dict) -> dict:
 def deploy_adapter_tool(args: dict) -> dict:
     return client_from_config().deploy(
         args["run_id"],
-        mode=args.get("mode", "dev"),
-        idle_timeout_s=int(args.get("idle_timeout_s", 300)),
         dry_run=bool(args.get("dry_run", False)),
     )
 
