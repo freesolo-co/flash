@@ -419,7 +419,7 @@ def cmd_status(args) -> int:
     return 0
 
 
-def cmd_ps(args) -> int:
+def cmd_runs(args) -> int:
     runs = client_from_config().list_runs()
     if not runs:
         print("no runs yet")
