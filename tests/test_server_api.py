@@ -549,9 +549,7 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
 
     monkeypatch.setattr(app_mod, "deploy_adapter", boom)
 
-    resp = api.post(
-        f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key)
-    )
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={"mode": "dev"}, headers=_bearer(key))
     assert resp.status_code == 502, resp.text
     # The 502 carries the upstream reason verbatim, not a generic/unhandled-500 body.
     assert "serving backend unreachable" in resp.json()["detail"]
@@ -755,9 +753,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         runner.RunStatus(run_id="good-2", state="provisioning", spec=good_spec, remote=None)
     )
     # Order matters: the bad run is iterated FIRST, so an unguarded parse would abort here.
-    monkeypatch.setattr(
-        app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}]
-    )
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}])
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
 
     # A malformed spec can't be parsed into a JobSpec, so the good-spec branch's
@@ -807,7 +803,9 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # the user AND drops out of the recoverable set (never re-attempted).
     bad_status = runner.get_status("bad-1")
     assert bad_status.state == "failed", "an unparseable persisted spec must be marked failed"
-    assert bad_status.state in runner.TERMINAL_STATES, "failed is terminal, so it won't recover again"
+    assert bad_status.state in runner.TERMINAL_STATES, (
+        "failed is terminal, so it won't recover again"
+    )
     assert bad_status.state not in app_mod._RECOVERABLE, "the failed run leaves the recoverable set"
     assert bad_status.error, "the failed run must carry an operator-visible error note"
     assert "unrecoverable" in bad_status.error, (
@@ -840,6 +838,11 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
         "_put_github_file",
         lambda *, path, **_kwargs: uploaded.append(path),
     )
+    monkeypatch.setattr(
+        envs_mod,
+        "_new_publish_id",
+        lambda: "12345678-1234-4321-abcd-123456789abc",
+    )
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -861,8 +864,11 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     assert resp.status_code == 200
     ref = resp.json()["id"]
     assert ref.startswith("github:")
-    assert ref.endswith("/myenv/freesolo/environment.py")
-    assert any(path.endswith("/myenv/freesolo/environment.py") for path in uploaded)
+    assert ref.endswith("/myenv/12345678-1234-4321-abcd-123456789abc/freesolo/environment.py")
+    assert any(
+        path.endswith("/myenv/12345678-1234-4321-abcd-123456789abc/freesolo/environment.py")
+        for path in uploaded
+    )
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
@@ -881,7 +887,7 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
 
     def fake_publish_package(*, package_b64, name, is_new, key):
         seen.update(package_b64=package_b64, name=name, is_new=is_new, key=key)
-        return "github:freesolo-co/envs@main:environments/key-1/e/freesolo/environment.py"
+        return "github:freesolo-co/training@main:key-1/e/publish-1/freesolo/environment.py"
 
     monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
 
