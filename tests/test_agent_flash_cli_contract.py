@@ -50,13 +50,13 @@ from flash.spec import JobSpec
     [
         "train",
         "status",
-        "ps",
+        "runs",
         "cancel",
         "env",
     ],
 )
 def test_agent_required_subcommands_exist(subcommand: str) -> None:
-    """The agent's worker drives the CLI's `train/status/ps/cancel/env install/...`
+    """The agent's worker drives the CLI's `train/status/runs/cancel/env install/...`
     subcommands.
 
     argparse exits with code 2 and an 'invalid choice' message when a subcommand
@@ -183,7 +183,7 @@ def test_agent_terminal_states_subset_of_flash_terminal_states() -> None:
 
 def test_get_status_returns_fields_the_agent_reads(tmp_path, monkeypatch) -> None:
     """`flash status <run_id>` returns the run's status JSON; the agent reads `state`
-    and `run_id` from it (and the CLI's status/ps commands read cost_usd/spec). Assert a
+    and `run_id` from it (and the CLI's status/runs commands read cost_usd/spec). Assert a
     persisted RunStatus exposes those keys so a field rename in RunStatus can't
     silently strip what the agent/CLI consume.
     """

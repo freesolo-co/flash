@@ -419,7 +419,7 @@ def cmd_status(args) -> int:
     return 0
 
 
-def cmd_ps(args) -> int:
+def cmd_runs(args) -> int:
     runs = client_from_config().list_runs()
     if not runs:
         print("no runs yet")
@@ -481,9 +481,26 @@ def cmd_deployments(args) -> int:
 
 
 def cmd_chat(args) -> int:
-    resp = client_from_config().chat(
+    client = client_from_config()
+    messages = [{"role": "user", "content": args.message}]
+    stream = getattr(client, "chat_stream", None)
+    if stream is not None:
+        wrote = False
+        for chunk in stream(
+            args.run_id,
+            messages=messages,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        ):
+            print(chunk, end="", flush=True)
+            wrote = True
+        if wrote:
+            print()
+        return 0
+
+    resp = client.chat(
         args.run_id,
-        messages=[{"role": "user", "content": args.message}],
+        messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
     )

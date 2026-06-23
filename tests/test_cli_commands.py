@@ -87,6 +87,11 @@ class _FakeClient:
         self.calls.append(("chat", run_id, messages))
         return {"choices": [{"message": {"content": "42"}}]}
 
+    def chat_stream(self, run_id: str, messages: list[dict], **_):
+        self.calls.append(("chat_stream", run_id, messages))
+        yield "4"
+        yield "2"
+
 
 @pytest.fixture
 def fake_client(monkeypatch) -> _FakeClient:
@@ -184,13 +189,13 @@ def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
     assert "[gpu] config table" not in out
 
 
-def test_status_ps_and_status_logs(fake_client, capsys) -> None:
+def test_status_runs_and_status_logs(fake_client, capsys) -> None:
     assert _run(["status", "flash-1"]) == 0
     out = capsys.readouterr().out
     assert "done" in out
     assert "cost_usd" in out
 
-    assert _run(["ps"]) == 0
+    assert _run(["runs"]) == 0
     out = capsys.readouterr().out
     assert "ALGO" in out
     assert "flash-1" in out
@@ -277,7 +282,7 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
 def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
     assert _run(["chat", "flash-1", "-m", "What is 6*7?"]) == 0
     assert "42" in capsys.readouterr().out
-    assert fake_client.calls[-1][0] == "chat"
+    assert fake_client.calls[-1][0] == "chat_stream"
 
 
 def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys) -> None:
