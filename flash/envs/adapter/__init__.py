@@ -40,6 +40,8 @@ _TAR_METADATA_TYPES = {
     tarfile.GNUTYPE_LONGNAME,
     tarfile.GNUTYPE_LONGLINK,
 }
+_CANONICAL_INPUT_KEY = "input"
+_CANONICAL_OUTPUT_KEY = "output"
 
 
 @dataclass(frozen=True)
@@ -424,7 +426,23 @@ class FreesoloEnvironment(BaseEnvironment):
         self.max_turns = 8
 
     def _task_example(self, example: dict):
-        return self._task_example_from_record(example)
+        return self._task_example_from_record(self._canonical_record(example))
+
+    @staticmethod
+    def _canonical_record(record: dict) -> dict:
+        raw = dict(record)
+        canonical = {}
+        if _CANONICAL_INPUT_KEY not in raw:
+            raise ValueError("Freesolo dataset records must contain an input field")
+        canonical[_CANONICAL_INPUT_KEY] = raw[_CANONICAL_INPUT_KEY]
+        if _CANONICAL_OUTPUT_KEY in raw:
+            canonical[_CANONICAL_OUTPUT_KEY] = raw[_CANONICAL_OUTPUT_KEY]
+        if raw.get("id") is not None:
+            canonical["id"] = raw["id"]
+        metadata = raw.get("metadata")
+        if isinstance(metadata, dict) and metadata:
+            canonical["metadata"] = metadata
+        return canonical
 
     def _reward_to_breakdown(self, reward) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -454,14 +472,14 @@ class FreesoloEnvironment(BaseEnvironment):
             examples = self._load_task_examples(self._source)
         records = []
         for example in examples:
-            record = dict(getattr(example, "record", {}) or {})
-            record.setdefault("task", getattr(example, "task", ""))
+            record = self._canonical_record(dict(getattr(example, "record", {}) or {}))
+            record[_CANONICAL_INPUT_KEY] = getattr(example, "task", record[_CANONICAL_INPUT_KEY])
             task_id = getattr(example, "task_id", None)
             if task_id is not None:
                 record.setdefault("id", task_id)
             expected = getattr(example, "expected_output", None)
             if expected is not None:
-                record.setdefault("expected_output", _json_safe(expected))
+                record[_CANONICAL_OUTPUT_KEY] = _json_safe(expected)
             metadata = getattr(example, "metadata", None)
             if isinstance(metadata, dict) and metadata:
                 record.setdefault("metadata", metadata)
@@ -473,12 +491,11 @@ class FreesoloEnvironment(BaseEnvironment):
         return [dict(message) for message in messages]
 
     def sft_target(self, example: dict) -> str:
-        for key in ("completion", "expected_output", "output", "target", "answer"):
-            if example.get(key) is not None:
-                value = example[key]
-                if isinstance(value, list) and value and isinstance(value[-1], dict):
-                    return str(value[-1].get("content", ""))
-                return str(value)
+        value = example.get(_CANONICAL_OUTPUT_KEY)
+        if value is not None:
+            if isinstance(value, list) and value and isinstance(value[-1], dict):
+                return str(value[-1].get("content", ""))
+            return str(value)
         return ""
 
     def scores_breakdown(
