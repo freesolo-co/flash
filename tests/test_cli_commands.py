@@ -112,6 +112,20 @@ def test_models_table(fake_client, capsys) -> None:
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
+    assert "Qwen/Qwen3.5-2B\t2.3B" in out
+    assert "openbmb/MiniCPM5-1B\t1.2B dense" in out
+    assert "(text-only fine-tune)" not in out
+    assert "algos=" not in out
+    assert "bf16" not in out
+    assert "thinking=" not in out
+
+
+def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
+    assert _run(["gpus"]) == 0
+    out = capsys.readouterr().out
+    assert "GPU class selection is fully automatic" in out
+    assert "You can still tune" not in out
+    assert "[gpu] config table" not in out
 
 
 def test_status_ps_and_status_logs(fake_client, capsys) -> None:
