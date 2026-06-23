@@ -44,10 +44,10 @@ def test_thinking_capability_values_are_valid():
         assert info.thinking in ("none", "hybrid", "always"), (model_id, info.thinking)
 
 
-def test_default_model_supports_default_on_thinking():
-    # The thinking flag now defaults ON, so the default model must be thinking-capable
-    # ("hybrid" or "always"); a "none" default would be rejected by config_schema on a
-    # plain default run. (DEFAULT_MODEL is currently hybrid.)
+def test_default_model_is_thinking_capable():
+    # The thinking flag defaults OFF, but the default model should stay thinking-capable
+    # ("hybrid" or "always") so a plain default run can still opt into thinking = true
+    # without being rejected by config_schema. (DEFAULT_MODEL is currently hybrid.)
     assert get_model(DEFAULT_MODEL).thinking in ("hybrid", "always")
 
 
