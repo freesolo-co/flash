@@ -1,4 +1,4 @@
-"""Charge a run's pre-flight cost estimate to the freesolo backend at submit time.
+"""Charge a run's pre-flight cost to the freesolo backend at submit time.
 
 The control plane computes the estimate from the spec and POSTs it (authenticated with the
 submitting user's freesolo key) to the billing endpoint, which debits the org. The charge GATES

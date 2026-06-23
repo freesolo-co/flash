@@ -124,7 +124,7 @@ def _deploy_lock(run_id: str) -> _RunLock:
 
 
 def _append_run_log(run_id: str, message: str) -> None:
-    """Append a timestamped note to a run's log so it surfaces in `flash logs`."""
+    """Append a timestamped note to a run's log so it surfaces in `flash status --logs`."""
     import time
 
     with open(runs_file_path(run_id, ".log"), "a") as f:
