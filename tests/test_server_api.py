@@ -1020,3 +1020,113 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     r2 = api.post("/v1/envs", headers=_bearer(_login()), json={"name": "e", "package_b64": False})
     assert r2.status_code == 400, r2.text
     assert "must be a base64 string" in r2.text.lower()
+
+
+# --------------------------------------------------------------------------------------------
+# Deployable RL checkpoints: list + deploy-by-step (incl. a run cancelled mid-RL).
+# --------------------------------------------------------------------------------------------
+_FAKE_CKPTS = [
+    {"step": 40, "adapter_prefix": "rl/X/seed0/checkpoints/step-40",
+     "subfolder": "rl/X/seed0/checkpoints/step-40/adapter",
+     "repo_id": "org/test-runs", "repo_type": "dataset"},
+    {"step": 80, "adapter_prefix": "rl/X/seed0/checkpoints/step-80",
+     "subfolder": "rl/X/seed0/checkpoints/step-80/adapter",
+     "repo_id": "org/test-runs", "repo_type": "dataset"},
+]
+
+
+class _FakeDeployment:
+    def __init__(self, adapter_prefix):
+        self.adapter_prefix = adapter_prefix
+
+    def to_dict(self):
+        return {"state": "ready", "run_id": "X", "adapter_hf_prefix": f"{self.adapter_prefix}/adapter"}
+
+
+def _make_run(api, key, state):
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    import flash.runner as runner
+
+    status = runner.get_status(run_id)
+    status.state = state
+    runner._save_status(status)
+    return run_id
+
+
+def test_list_checkpoints_endpoint(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    r = api.get(f"/v1/runs/{run_id}/checkpoints", headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    assert [c["step"] for c in r.json()["checkpoints"]] == [40, 80]
+
+
+def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    captured = {}
+
+    def fake_deploy(**kwargs):
+        captured.update(kwargs)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    # Served the step-40 checkpoint's adapter, not the run's final adapter.
+    assert captured["adapter_prefix"].endswith("/checkpoints/step-40")
+    assert r.json()["checkpoint_step"] == 40
+    # A finished run flips to `deployed` as usual.
+    import flash.runner as runner
+
+    assert runner.get_status(run_id).state == "deployed"
+
+
+def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatch):
+    """The headline fix: a run cancelled mid-RL can deploy a checkpoint, and stays `cancelled`."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(
+        app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
+    )
+
+    key = _login()
+    run_id = _make_run(api, key, "cancelled")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 80}, headers=_bearer(key))
+    assert r.status_code == 200, r.text
+    assert r.json()["checkpoint_step"] == 80
+    # Training outcome preserved (NOT flipped to `deployed`)...
+    assert runner.get_status(run_id).state == "cancelled"
+    # ...but the serving deployment is recorded and listed as active.
+    deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
+    assert any(d["run_id"] == run_id for d in deployments)
+
+
+def test_deploy_cancelled_run_without_step_is_409(api):
+    """Without a step, a cancelled run is still undeployable (no final adapter)."""
+    key = _login()
+    run_id = _make_run(api, key, "cancelled")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert r.status_code == 409, r.text
+
+
+def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 999}, headers=_bearer(key))
+    assert r.status_code == 404, r.text
+    assert "available: 40, 80" in r.json()["detail"]
