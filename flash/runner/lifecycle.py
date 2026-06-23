@@ -76,10 +76,13 @@ def _submit_seed_supervised(
     immediately.
     """
     from flash.providers import get_provider
+    from flash.providers._poll import make_say
     from flash.providers.allocator import allocate, allocation_summary
     from flash.providers.base import PollResult
     from flash.runner import TERMINAL_STATES, _RunCancelled, _spec_with_gpu, _update, get_status
 
+    # timestamp every line like the pollers' say() so the whole run log reads consistently.
+    say = make_say(log)
     last_handle: dict = {}
     # The friendly GPU class the CURRENT attempt provisioned (set right before each submit),
     # so on_handle persists it into the run handle and a recovery via attach_run costs the
@@ -127,11 +130,9 @@ def _submit_seed_supervised(
 
                     runpod_api.cancel_job(last_handle["endpoint_id"], last_handle["job_id"])
                     runpod_api.delete_endpoint(last_handle["endpoint_id"])
-                    print(
+                    say(
                         f"retry {attempt}: deleted endpoint {last_handle['endpoint_id']} "
-                        "(escaping throttled/sick host)",
-                        file=log,
-                        flush=True,
+                        "(escaping throttled/sick host)"
                     )
                 except Exception:
                     # Logging the host-escape note is cosmetic; never let it abort the retry.
@@ -182,13 +183,11 @@ def _submit_seed_supervised(
             # it to an infra failure steps to the next-cheapest, so a capacity-starved class
             # can't burn the whole budget.
             chosen = alloc.candidates[min(gpu_walk_offset, len(alloc.candidates) - 1)]
-            print(allocation_summary(alloc), file=log, flush=True)
+            say(allocation_summary(alloc))
             if chosen.gpu != alloc.gpu:
-                print(
+                say(
                     f"retry {attempt}: walking past the cheapest class to {chosen.gpu} "
-                    f"@ ${chosen.hourly_usd:.2f}/hr",
-                    file=log,
-                    flush=True,
+                    f"@ ${chosen.hourly_usd:.2f}/hr"
                 )
             run_spec = _spec_with_gpu(spec, chosen.gpu)
             current_gpu["name"] = chosen.gpu
@@ -240,12 +239,10 @@ def _submit_seed_supervised(
         except FileNotFoundError:
             # Status file not yet written (early race): treat as not-cancelled and proceed.
             pass
-        print(
+        say(
             f"seed={seed} attempt={attempt} failed ({res.failure}); "
             f"{'retrying (resume from last checkpoint)' if infra_shaped and attempt < max_retries else 'not retrying'}"
-            f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
-            file=log,
-            flush=True,
+            f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---"
         )
         if not infra_shaped or attempt >= max_retries:
             break
@@ -301,6 +298,7 @@ def _run_seed_loop(
 
     Shared by a fresh submit (start_index=0) and post-restart recovery, which
     resumes the remaining seeds after the in-flight one completes."""
+    from flash.providers._poll import make_say
     from flash.runner import (
         TERMINAL_STATES,
         _persist_metrics,
@@ -311,6 +309,7 @@ def _run_seed_loop(
         get_status,
     )
 
+    say = make_say(log)
     total_cost = prior_cost
     seeds = spec.train.seeds
     for i in range(start_index, len(seeds)):
@@ -325,11 +324,8 @@ def _run_seed_loop(
         if get_status(spec.run_id).state in TERMINAL_STATES:
             raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting seed")
         _update(spec.run_id, "running")
-        print(
-            f"starting seed={seed} phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
-            file=log,
-            flush=True,
-        )
+        # phase/model/gpu are in the client header banner; keep this line to just the seed marker.
+        say(f"starting seed={seed}")
         metrics = _submit_seed_supervised(spec, seed, log, runtime_secrets=runtime_secrets)
         total_cost += _persist_metrics(spec, seed, metrics)
         # A cancel can land while this thread writes metrics — after the supervised
@@ -353,11 +349,7 @@ def _run_seed_loop(
             cost_usd=total_cost,
             **({"remote": None, "resume_seed_index": i + 1} if more_seeds else {}),
         )
-        print(
-            f"seed={seed} done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}",
-            file=log,
-            flush=True,
-        )
+        say(f"seed={seed} done: train_wall={metrics.get('wall_seconds')} cost_usd={total_cost:.4f}")
     # Final guard: a cancel landing after the last seed's check must not be overwritten
     # by the terminal "done".
     with contextlib.suppress(FileNotFoundError):
@@ -375,10 +367,12 @@ def _run_seed_loop(
 
 def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
     """Bill a successfully completed external run without changing its training result."""
+    from flash.providers._poll import make_say
     from flash.runner import _update, get_status
     from flash.server.auth import INTERNAL_KEY_ENV
     from flash.server.billing import BillingError, charge_completed_run
 
+    say = make_say(log)
     status = get_status(spec.run_id)
     if not status.billing_context or status.billing_state == "charged":
         return
@@ -392,7 +386,7 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
             billing_state="failed",
             billing_error=detail,
         )
-        print(f"billing failed: {detail}", file=log, flush=True)
+        say(f"billing failed: {detail}")
         return
 
     _update(
@@ -411,7 +405,7 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
             billing_state="failed",
             billing_error=exc.detail,
         )
-        print(f"billing failed: {exc.detail}", file=log, flush=True)
+        say(f"billing failed: {exc.detail}")
         return
 
     _update(
@@ -421,11 +415,9 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
         billing_error=None,
         billing_charge=charge,
     )
-    print(
+    say(
         f"billing charged: amount_cents={charge.get('amountCents')} "
-        f"replay={bool(charge.get('replay'))}",
-        file=log,
-        flush=True,
+        f"replay={bool(charge.get('replay'))}"
     )
 
 

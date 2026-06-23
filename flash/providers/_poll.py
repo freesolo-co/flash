@@ -163,10 +163,36 @@ def format_gpu_status(gpu: Any) -> str:
     return " gpu[" + " ".join(parts) + "]" if parts else ""
 
 
+# human phrasing for the worker heartbeat stages (see engine/worker.heartbeat()), so the live
+# log reads as plain progress instead of raw stage= tokens.
+_STAGE_WORDS = {
+    "boot": "booting worker",
+    "sft_start": "preparing",
+    "rl_start": "preparing",
+    "sft_model_load": "loading model",
+    "rl_train_start": "starting training",
+    "sft_trained": "training complete",
+    "rl_trained": "training complete",
+    "done": "done",
+    "already_done": "already complete",
+}
+
+
+def _heartbeat_head(stage, step) -> str:
+    """A short human label for the heartbeat stage; per-step training stages render as 'step N'."""
+    if stage == "checkpoint_uploaded":
+        return f"checkpoint uploaded (step {int(step)})" if step is not None else "checkpoint uploaded"
+    if isinstance(stage, str) and stage.endswith("_step"):
+        return f"step {int(step)}" if step is not None else "step"
+    base = _STAGE_WORDS.get(stage) or (str(stage).replace("_", " ") if stage else "working")
+    # keep the step for any other stage that carries one, so no progress info is dropped.
+    return f"{base} (step {int(step)})" if step is not None else base
+
+
 def _format_heartbeat(hb: dict) -> str:
-    msg = f"worker: stage={hb.get('stage')}"
+    msg = _heartbeat_head(hb.get("stage"), hb.get("step"))
+    # step is folded into the head above; append the remaining training metrics that are present.
     for key, digits in (
-        ("step", 0),
         ("epoch", 3),
         ("reward", 3),
         ("loss", 4),
@@ -179,10 +205,7 @@ def _format_heartbeat(hb: dict) -> str:
         if value is None:
             continue
         if isinstance(value, (int, float)):
-            if digits == 0:
-                msg += f" {key}={int(value)}"
-            else:
-                msg += f" {key}={value:.{digits}f}"
+            msg += f" {key}={value:.{digits}f}"
         else:
             msg += f" {key}={value}"
     msg += format_gpu_status(hb.get("gpu") or hb.get("diag"))

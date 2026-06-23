@@ -77,6 +77,17 @@ _SETUP_HEARTBEAT_STAGES = frozenset(
     {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
 )
 
+# plain words for RunPod job statuses so the live log reads cleanly (any unmapped status falls
+# back to its lowercased form).
+_JOB_STATUS_WORDS = {
+    "IN_QUEUE": "queued",
+    "IN_PROGRESS": "running",
+    "COMPLETED": "completed",
+    "FAILED": "failed",
+    "CANCELLED": "cancelled",
+    "TIMED_OUT": "timed out",
+}
+
 
 def stall_kwargs() -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
@@ -362,7 +373,10 @@ def poll_job(
             continue
         status = st.get("status")
         if status != last_status:
-            say(f"job {handle.job_id}: {status}")
+            # Surface the transition in plain words, without the noisy job uuid. IN_QUEUE is
+            # left to the workers-availability line below so we don't double-log "queued".
+            if status != "IN_QUEUE":
+                say(_JOB_STATUS_WORDS.get(status, str(status).lower().replace("_", " ")))
             last_status = status
             last_progress = time.time()
         if status in TERMINAL_OK:
@@ -435,7 +449,8 @@ def poll_job(
                     any(workers.get(k) for k in ("throttled", "unhealthy", "initializing"))
                     or not usable
                 ):
-                    say(f"queued; workers: {workers}")
+                    detail = ", ".join(f"{n} {k}" for k, n in workers.items() if n) or "none ready yet"
+                    say(f"queued - waiting for worker ({detail})")
                 # Fail fast on a worker stuck UNHEALTHY: a dead worker / failed image pull won't
                 # self-recover, so don't burn the full setup_grace_s (~50 min) waiting on it — once
                 # it has stayed unhealthy with nothing usable or (re)initializing for
@@ -561,13 +576,10 @@ def submit_run(
             runpod_api.delete_endpoint(endpoint_id)
         raise
     handle = JobHandle(endpoint_id, name, job_id)
-    if log is not None:
-        print(
-            f"submitted job: endpoint={name} ({endpoint_id}) job={job_id} "
-            f"attempt={attempt} gpu={spec.gpu.type} phase={spec.phase} seed={seed}",
-            file=log,
-            flush=True,
-        )
+    # endpoint/job ids are persisted on the run handle (flash status) — keep the human log line
+    # short; gpu/phase/seed are already in the client header banner. attempt is 0-indexed
+    # internally; show it 1-indexed so the first submit reads "attempt 1".
+    make_say(log)(f"submitted job (attempt {attempt + 1})")
     if on_handle is not None:
         on_handle(handle.to_dict())
     hf_repo = spec.train.hf_repo

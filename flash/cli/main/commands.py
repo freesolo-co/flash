@@ -388,8 +388,14 @@ def cmd_train(args) -> int:
         print(json.dumps(status, indent=2))
         return 0
     print(
-        f"run {run_id} submitted; following logs "
-        f"(Ctrl-C detaches, `flash status {run_id} --follow` resumes)",
+        render.run_banner(
+            run_id,
+            algorithm=spec.algorithm,
+            model=spec.model,
+            gpu=spec.gpu.type,
+            seeds=spec.train.seeds,
+            resume_hint=f"Ctrl-C detaches; resume: flash status {run_id} --follow",
+        ),
         file=sys.stderr,
     )
     return _follow_run(client, run_id)

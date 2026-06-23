@@ -113,3 +113,28 @@ def login_failed(reason: str) -> str:
         f"  {_dim('then run `flash login --api-key <key>` to try again')}\n"
         f"  {_dim('if it keeps failing, email founders@freesolo.co')}"
     )
+
+
+def run_banner(run_id: str, *, algorithm: str, model: str, gpu: str, seeds, resume_hint: str) -> str:
+    """A boxed header for `flash train` so the run id and key facts stand out above the log stream.
+
+    Box-drawing degrades to ASCII when stdout can't encode it. The allocated GPU price isn't known
+    until the server allocates, so it surfaces in the streamed `allocated ...` line, not here.
+    """
+    tl, tr = _glyph("┌", "+"), _glyph("┐", "+")
+    bl, br = _glyph("└", "+"), _glyph("┘", "+")
+    hbar, vbar = _glyph("─", "-"), _glyph("│", "|")
+    # plain text drives width/padding; styled text is what we print, so ANSI codes in the styled
+    # run id never skew the box alignment (escape sequences are zero-width on screen).
+    rows = [
+        (run_id, _bold(run_id)),
+        (f"{algorithm}  -  {model}",) * 2,
+        (f"{gpu}  -  seeds {list(seeds)}",) * 2,
+    ]
+    title = f"{hbar} flash run "
+    width = max(max(len(plain) for plain, _ in rows), len(title))
+    span = width + 2  # a space of padding on each side of the content
+    top = tl + title + hbar * (span - len(title)) + tr
+    body = "\n".join(f"{vbar} {styled}{' ' * (width - len(plain))} {vbar}" for plain, styled in rows)
+    bottom = bl + hbar * span + br
+    return _safe(f"{top}\n{body}\n{bottom}\n{_dim(resume_hint)}")

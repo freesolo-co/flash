@@ -142,7 +142,7 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
     assert stage == "sft_step"
     assert len(lines) == 1
     line = lines[0]
-    assert "worker: stage=sft_step step=12 loss=1.2346" in line
+    assert "step 12 loss=1.2346" in line
     assert "gpu[RTX 5090" in line
     assert "util=97%" in line
     assert "mem=22.2GB/31.8GB" in line
@@ -188,7 +188,7 @@ def test_poll_job_failure_surfaces_forced_heartbeat(monkeypatch):
 
     assert not res.ok
     assert res.failure == "job_failed"
-    assert "worker: stage=boot" in log.getvalue()
+    assert "booting worker" in log.getvalue()
     assert "gpu[RTX 5090" in log.getvalue()
 
 

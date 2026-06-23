@@ -117,12 +117,8 @@ def allocate(
 
 
 def allocation_summary(a: Allocation) -> str:
-    head = (
-        f"allocated {a.gpu} on {a.provider} at ${a.hourly_usd:.2f}/hr "
-        f"(need >= {a.min_vram_gb} GB VRAM"
-    )
-    head += ")"
+    head = f"allocated {a.gpu} on {a.provider} (${a.hourly_usd:.2f}/hr, >={a.min_vram_gb}GB)"
     if len(a.candidates) > 1:
         nxt = a.candidates[1]
-        head += f"; next-best: {nxt.gpu}@{nxt.provider} ${nxt.hourly_usd:.2f}/hr"
+        head += f"; next-best {nxt.gpu}@{nxt.provider} ${nxt.hourly_usd:.2f}/hr"
     return head
