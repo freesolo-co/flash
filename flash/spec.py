@@ -98,7 +98,7 @@ def _opt_float(value: Any) -> float | None:
 
 @dataclass(frozen=True)
 class EnvironmentSpec:
-    # Published verifiers environment id ("owner/name") or installed/local env id. No default:
+    # Freesolo environment id. No default:
     # a run must name an environment explicitly (validated in schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
@@ -137,7 +137,7 @@ class TrainSpec:
     max_steps: int | None = None
     max_examples: int | None = None
     # GRPO recipe knobs (datums parity), shipped by the SDK in [train] (NOT in
-    # [environment.params], which is forwarded verbatim to the verifiers env loader).
+    # [environment.params], which is forwarded verbatim to the Freesolo env loader).
     # None/() -> recipe default. group_size = completions per prompt; temperature = rollout
     # sampling temp; max_tokens = completion budget; kl_penalty_coef = KL beta;
     # advantage_clip = centered-advantage clamp; thinking_length_penalty_coef =
@@ -230,11 +230,12 @@ class JobSpec:
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
         env = data.get("environment") or {}
         # Defense-in-depth: a stale/older payload may still carry a local `path`. The worker only
-        # runs published environment ids, so reject it here rather than silently dropping it.
+        # runs published Freesolo environment ids, so reject it here rather than silently
+        # dropping it.
         if isinstance(env, dict) and env.get("path"):
             raise ValueError(
                 "local environment paths are no longer supported; the worker only runs "
-                "published verifiers environment ids"
+                "published Freesolo environment ids"
             )
         train = data.get("train") or {}
         gpu = data.get("gpu") or {}

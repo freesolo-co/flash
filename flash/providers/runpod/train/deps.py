@@ -19,7 +19,7 @@ logger = get_logger("flash.providers.runpod.train")
 
 
 # Worker stack: trl 1.6 (colocate default; adds the GRPO `tools=` / `rollout_func`
-# multi-turn hooks used for verifiers ToolEnv / MultiTurnEnv training), vllm 0.19.1
+# multi-turn hooks used for Freesolo EnvironmentMultiTurn training), vllm 0.19.1
 # (Qwen3.5/3.6 archs, native RL APIs, transformers-5
 # compatible metadata), transformers 5.x (qwen3_5/qwen3_5_moe model types),
 # bitsandbytes (the 8-bit paged AdamW optimizer state — LoRA+ coexists with it).
@@ -42,6 +42,7 @@ WORKER_DEPS = [
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
+    "freesolo>=0.2.46",
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
     # NB: the HF `kernels` Hub package is intentionally NOT pinned here — the versions
@@ -327,9 +328,8 @@ def build_worker_env(
             else {}
         ),
     }
-    # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub
-    # env(s), public + private) + optional reward-judge creds: a verifiers env whose rubric
-    # calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
+    # HF artifact creds + GitHub env-source creds + optional reward-judge creds: a Freesolo
+    # environment whose reward calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
     # where the reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env
     # reads (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's
     # control-plane override so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
@@ -337,7 +337,7 @@ def build_worker_env(
     # simply not passed (the env then uses its own default model).
     for key in (
         "HF_TOKEN",
-        "PRIME_API_KEY",
+        "GITHUB_TOKEN",
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "FLASH_JUDGE_MODEL",

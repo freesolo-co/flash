@@ -40,8 +40,7 @@ RUN pip install --no-cache-dir \
     "liger-kernel>=0.5" \
     "flash-linear-attention[cuda]==0.5.1" \
     "hf_transfer" \
-    "verifiers>=0.1.10" \
-    "prime" \
+    "freesolo>=0.2.46" \
     "runpod"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. The [cuda] extra is
 # required on 0.5.1+ (fla split into fla-core with torch/triton behind extras; torch/triton are
@@ -76,15 +75,12 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" MAX_JOBS=4 \
 # (liger, flash-linear-attention=fla, flash_attn, bitsandbytes, triton), and the HF/env libs. A
 # missing or ABI-broken package fails the build HERE instead of silently shipping (the FA wheel in
 # particular can install yet fail to import against this torch). cuDNN comes from the base image.
-# `prime` is a CLI dist (no importable top-level module) and the worker never imports it, so we
-# verify its PRESENCE via metadata rather than importing it. Everything else the worker imports at
-# runtime is imported strictly here.
 # flash_attn is BEST-EFFORT (the install above tolerates a build failure -> SDPA fallback), so it
 # is imported optionally here: a missing FA must NOT abort the build, or the SDPA-fallback image
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
 import torch, transformers, trl, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
-liger_kernel, fla, bitsandbytes, hf_transfer, triton, verifiers, runpod; \
+liger_kernel, fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
 import importlib; \
 fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
@@ -93,7 +89,7 @@ ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)'); \
 [print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','datasets','huggingface-hub', \
 'accelerate','wandb','liger-kernel','flash-linear-attention','bitsandbytes', \
-'hf-transfer','verifiers','prime','runpod']]"
+'hf-transfer','freesolo','runpod']]"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
 # from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;

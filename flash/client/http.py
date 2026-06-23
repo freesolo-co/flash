@@ -53,7 +53,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
     """Verify a freesolo API key against the freesolo backend's ``/api/auth/verify``.
 
     Raises :class:`ClientError`/:class:`ApiError` if the key is rejected or the backend is
-    unreachable; returns ``None`` on success. Keys are issued at https://freesolo.co/sign-in.
+    unreachable; returns ``None`` on success. Keys are issued from the freesolo sign-in page.
     """
     base = freesolo_base_url(base_url)
     url = f"{base}{FREESOLO_AUTH_VERIFY_PATH}"
@@ -69,8 +69,8 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
         if exc.code in (401, 403):
             raise ClientError(
                 "freesolo rejected this API key — create or copy a valid key at "
-                "https://freesolo.co/sign-in, then pass it with "
-                "`flash login --api-key` (or FREESOLO_API_KEY)"
+                "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
+                "(or FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
     except urllib.error.URLError as exc:
@@ -123,12 +123,7 @@ class ApiClient:
 
     # -- environments ------------------------------------------------------------------
     def publish_env(self, *, name: str, is_new: bool, package_b64: str) -> dict:
-        """Upload a packaged verifiers env to the managed service; returns
-        ``{"id": "owner/name"}``.
-
-        The server may retry the publish up to its own bound, so the client timeout must
-        comfortably exceed that — otherwise the client gives up while the publish is still
-        running server-side."""
+        """Upload a packaged Freesolo environment to managed GitHub storage."""
         return self._request(
             "POST",
             "/v1/envs",
@@ -201,7 +196,6 @@ def client_from_config(require_key: bool = True) -> ApiClient:
     api_url, api_key = load_credentials()
     if require_key and not api_key:
         raise ClientError(
-            "not logged in — create or copy a freesolo API key at https://freesolo.co/sign-in, "
-            "then run `flash login` (or set FREESOLO_API_KEY)"
+            "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
     return ApiClient(api_url, api_key)
