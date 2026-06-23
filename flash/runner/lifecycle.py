@@ -435,7 +435,12 @@ def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
     try:
         charge = charge_completed_run(internal_key=internal_key, status=status)
     except BillingError as exc:
-        _update(spec.run_id, "done", billing_state="failed", billing_error=exc.detail)
+        _update(
+            spec.run_id,
+            get_status(spec.run_id).state,
+            billing_state="failed",
+            billing_error=exc.detail,
+        )
         print(f"billing failed: {exc.detail}", file=log, flush=True)
         return
 
