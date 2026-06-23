@@ -32,7 +32,38 @@ from flash.providers.runpod.train.deps import (
 # are infrequent vs training, so the serialization cost is negligible.
 FLASH_SDK_LOCK = threading.Lock()
 
+# Quota semaphore: cap in-flight endpoints at 28 (RunPod's account-wide max-workers quota
+# is 30; the 2-slot buffer absorbs headroom for endpoints deployed by other tools/the CLI).
+# Every endpoint this process creates acquires one slot; terminate_endpoint / stop_endpoint
+# release it when the remote endpoint is torn down.  The semaphore is process-wide and
+# resets on restart — that's fine, because on restart there are no live endpoints from this
+# process.  Runs that find all slots occupied block here instead of failing with RunPod's
+# "Max workers across all endpoints must not exceed your workers quota (30)" error.
+_ENDPOINT_SLOTS = threading.Semaphore(28)
+# Track which endpoint names this process has acquired a slot for, so releases are
+# idempotent (both terminate_endpoint and stop_endpoint may attempt a release; only the
+# first one that finds the name here actually releases the semaphore).
+_ACQUIRED_NAMES: set[str] = set()
+_ACQUIRED_NAMES_LOCK = threading.Lock()
+
 _ENDPOINT_CACHE: dict[str, Any] = {}
+
+
+def _release_endpoint_slot(name: str) -> bool:
+    """Release the quota semaphore slot for ``name``.
+
+    Returns ``True`` if a slot was released, ``False`` if this process never acquired one
+    for ``name`` (e.g. a fresh ``flash cancel`` process, or the slot was already released).
+    The ``_ACQUIRED_NAMES`` tracking set makes this safe to call from both
+    ``terminate_endpoint`` and ``stop_endpoint`` — only the first call releases the
+    semaphore; subsequent calls are no-ops.
+    """
+    with _ACQUIRED_NAMES_LOCK:
+        if name not in _ACQUIRED_NAMES:
+            return False
+        _ACQUIRED_NAMES.discard(name)
+    _ENDPOINT_SLOTS.release()
+    return True
 
 
 def _train_body(input_data: dict) -> dict:
@@ -321,35 +352,50 @@ def get_train_endpoint(
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
     if name in _ENDPOINT_CACHE:
+        # Slot was already acquired when the entry was first created; don't re-acquire.
         return _ENDPOINT_CACHE[name]
-    kwargs = dict(
-        name=name,
-        gpu=flash_gpu(friendly),
-        gpu_count=1,
-        min_cuda_version=min_cuda_for(friendly),
-        execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-        workers=(0, 1),  # one dedicated worker per run; scale to zero when idle
-        **volume_endpoint_kwargs(spec),
-    )
-    # RunPod Flash needs its serverless runtime baked into the worker image. Boot-install
-    # WORKER_DEPS on Flash's default template instead (cached as a Flash artifact). Optional
-    # FLASH_WORKER_IMAGE override for a RunPod-serverless-compatible image.
-    image = os.environ.get("FLASH_WORKER_IMAGE")
-    if image:
-        kwargs["image"] = image
-    else:
-        kwargs["dependencies"] = resolve_worker_deps(friendly)
-        kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-    ep = Endpoint(**kwargs)
-    handler = ep(_train_body)  # register the queue-based handler; returns the callable
-    # The resource config is cached on the Endpoint, so raising the disk on it here
-    # carries through to the deploy that the first handler call triggers.
-    from flash.providers.runpod.jobs import apply_disk_gb
+    # Acquire a quota slot before creating the endpoint.  This blocks when all 28 slots are
+    # occupied, making new runs queue here instead of failing with RunPod's worker-quota
+    # error.  The slot is released by terminate_endpoint (or stop_endpoint as a safety net)
+    # when the remote endpoint is torn down.
+    if _ENDPOINT_SLOTS._value == 0:
+        logger.info("Quota full (28/28 slots occupied) — waiting for a free slot...")
+    _ENDPOINT_SLOTS.acquire()
+    with _ACQUIRED_NAMES_LOCK:
+        _ACQUIRED_NAMES.add(name)
+    try:
+        kwargs = dict(
+            name=name,
+            gpu=flash_gpu(friendly),
+            gpu_count=1,
+            min_cuda_version=min_cuda_for(friendly),
+            execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+            workers=(0, 1),  # one dedicated worker per run; scale to zero when idle
+            **volume_endpoint_kwargs(spec),
+        )
+        # RunPod Flash needs its serverless runtime baked into the worker image. Boot-install
+        # WORKER_DEPS on Flash's default template instead (cached as a Flash artifact). Optional
+        # FLASH_WORKER_IMAGE override for a RunPod-serverless-compatible image.
+        image = os.environ.get("FLASH_WORKER_IMAGE")
+        if image:
+            kwargs["image"] = image
+        else:
+            kwargs["dependencies"] = resolve_worker_deps(friendly)
+            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+        ep = Endpoint(**kwargs)
+        handler = ep(_train_body)  # register the queue-based handler; returns the callable
+        # The resource config is cached on the Endpoint, so raising the disk on it here
+        # carries through to the deploy that the first handler call triggers.
+        from flash.providers.runpod.jobs import apply_disk_gb
 
-    cfg = ep._build_resource_config()
-    apply_disk_gb(cfg, disk_gb)
-    _ENDPOINT_CACHE[name] = handler
-    return handler
+        cfg = ep._build_resource_config()
+        apply_disk_gb(cfg, disk_gb)
+        _ENDPOINT_CACHE[name] = handler
+        return handler
+    except Exception:
+        # Endpoint creation failed — release the slot so other runs are not permanently blocked.
+        _release_endpoint_slot(name)
+        raise
 
 
 def _run_suffix(run_id: str | None) -> str | None:
@@ -389,6 +435,11 @@ def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
         match = [k for k in _ENDPOINT_CACHE if k.startswith(prefix)]
     for key in match:
         handler = _ENDPOINT_CACHE.pop(key, None)
+        # Safety-net release: if terminate_endpoint already released this slot the call is a
+        # no-op (name removed from _ACQUIRED_NAMES); otherwise we free the slot here so the
+        # process doesn't permanently hold it when stop_endpoint is called without a prior
+        # terminate_endpoint (e.g. on a cancel path).
+        _release_endpoint_slot(key)
         ep = getattr(handler, "__self__", None) or getattr(handler, "endpoint", None)
         for meth in ("scale_to_zero", "stop", "delete"):
             fn = getattr(ep, meth, None)
@@ -507,6 +558,14 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                     results.append(
                         {"success": True, "name": target, "message": "deleted via REST API"}
                     )
+
+    # Release the quota slot for this run's endpoint.  Only releases if this process
+    # previously acquired one (no-op in a fresh ``flash cancel`` process).  We release
+    # whenever at least one undeploy succeeded; stop_endpoint below acts as a safety net
+    # for the case where all undeploy attempts failed but we still remove the endpoint
+    # from our in-process cache.
+    if any(r.get("success") for r in results):
+        _release_endpoint_slot(target)
 
     # also drop the in-process cached handler for THIS run only (a class-wide
     # drop would evict a concurrent run's endpoint on the same GPU class).
