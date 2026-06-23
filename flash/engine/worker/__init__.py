@@ -117,7 +117,9 @@ def _load_active_env():
         # missing env is always a misconfigured spec. Fail loudly rather than fall back to a
         # default and burn a paid worker on the wrong task.
         raise RuntimeError(
-            "JobSpec sets no environment: provide [environment] id from `flash env push`."
+            "JobSpec sets no environment: provide [environment] id (a GitHub Freesolo "
+            "environment ref, e.g. "
+            "'github:freesolo-co/environment-hub@main:user/project/publish-id/environment.py')."
         )
     return load_environment(env_id, JOB_SPEC.environment.params)
 
@@ -139,7 +141,9 @@ def require_active_env():
         raise RuntimeError(
             "no environment is loaded: this worker was started without a JobSpec "
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
-            "carry a JobSpec naming [environment] id from `flash env push`."
+            "carry a JobSpec naming [environment] id (a GitHub Freesolo environment ref, "
+            "e.g. "
+            "'github:freesolo-co/environment-hub@main:user/project/publish-id/environment.py')."
         )
     return ACTIVE_ENV
 

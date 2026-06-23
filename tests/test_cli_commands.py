@@ -152,7 +152,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
 
     assert _run(["env", "setup"]) == 0
 
-    assert (tmp_path / "environments/freesolo/environment.py").is_file()
+    assert (tmp_path / "environments/starter/environment.py").is_file()
     grpo = tmp_path / "configs/grpo.toml"
     sft = tmp_path / "configs/sft.toml"
     assert grpo.is_file()
@@ -184,7 +184,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     # worker at environment load time.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        environment=EnvironmentSpec(id="github:owner/repo@main:env/freesolo/environment.py"),
+        environment=EnvironmentSpec(id="github:owner/repo@main:env/environment.py"),
     )
     assert spec_payload(spec)["environment"]["pip"] == ["freesolo"]
 
@@ -192,7 +192,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         environment=EnvironmentSpec(
-            id="github:owner/repo@main:env/freesolo/environment.py", pip=("custom==1",)
+            id="github:owner/repo@main:env/environment.py", pip=("custom==1",)
         ),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]

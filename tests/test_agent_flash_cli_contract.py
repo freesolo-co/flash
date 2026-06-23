@@ -105,7 +105,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys) -> None:
         'model = "Qwen/Qwen3.5-4B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
-        'id = "github:owner/repo@main:env/freesolo/environment.py"\n'
+        'id = "github:owner/repo@main:env/environment.py"\n'
         "[train]\n"
         'hf_repo = "owner/runs"\n'
         "steps = 10\n"

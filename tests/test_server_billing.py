@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }

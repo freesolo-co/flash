@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/freesolo/environment.py"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
@@ -709,7 +709,7 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
 
 def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # Fault isolation: if the FIRST recoverable run's persisted spec is malformed (e.g. a
-    # legacy `environment.path`, which makes JobSpec.from_dict raise), recovery of that one
+    # unsupported `environment.path`, which makes JobSpec.from_dict raise), recovery of that one
     # run must be skipped — it must NOT abort recover_runs() and thereby skip recovery of
     # every OTHER in-flight run and the orphan sweep that follows. Here run #1 has a bad spec
     # and run #2 has a valid no-handle spec: assert run #2 is still resubmitted AND the orphan
@@ -729,7 +729,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
     importlib.reload(app_mod)
 
-    # Run #1: a malformed spec — a legacy local `environment.path` makes from_dict raise.
+    # Run #1: a malformed spec — local `environment.path` makes from_dict raise.
     bad_spec = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
@@ -835,6 +835,11 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     published_roots: list[str] = []
     monkeypatch.setattr(
         envs_mod,
+        "_new_publish_id",
+        lambda: "12345678-1234-4321-abcd-123456789abc",
+    )
+    monkeypatch.setattr(
+        envs_mod,
         "_github_publish_once",
         lambda *, publish_root, **_kwargs: published_roots.append(publish_root),
     )
@@ -843,8 +848,7 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for name, content in (
             ("pyproject.toml", b"[project]\nname='e'\n"),
-            ("freesolo/__init__.py", b""),
-            ("freesolo/environment.py", b"def load_environment(**kwargs): return None\n"),
+            ("environment.py", b"def load_environment(**kwargs): return None\n"),
         ):
             info = tarfile.TarInfo(name)
             info.size = len(content)
@@ -859,8 +863,10 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     assert resp.status_code == 200
     ref = resp.json()["id"]
     assert ref.startswith("github:")
-    assert ref.endswith("/myenv/freesolo/environment.py")
-    assert any(root.endswith("/myenv") for root in published_roots)
+    assert ref.endswith("/myenv/12345678-1234-4321-abcd-123456789abc/environment.py")
+    assert any(
+        root.endswith("/myenv/12345678-1234-4321-abcd-123456789abc") for root in published_roots
+    )
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)
@@ -879,7 +885,7 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
 
     def fake_publish_package(*, package_b64, name, is_new, key):
         seen.update(package_b64=package_b64, name=name, is_new=is_new, key=key)
-        return "github:freesolo-co/envs@main:environments/key-1/e/freesolo/environment.py"
+        return "github:freesolo-co/environment-hub@main:key-1/e/publish-1/environment.py"
 
     monkeypatch.setattr(envs_mod, "publish_package", fake_publish_package)
 
@@ -887,8 +893,7 @@ def test_publish_env_parses_is_new_robustly(api, monkeypatch):
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for nm, content in (
             ("pyproject.toml", b"[project]\nname='e'\n"),
-            ("freesolo/__init__.py", b""),
-            ("freesolo/environment.py", b"def load_environment(**kwargs): return None\n"),
+            ("environment.py", b"def load_environment(**kwargs): return None\n"),
         ):
             info = tarfile.TarInfo(nm)
             info.size = len(content)
