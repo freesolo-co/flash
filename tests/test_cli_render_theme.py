@@ -94,3 +94,28 @@ def test_render_json_plain_matches_json_dumps(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "0")
     obj = {"run_id": "flash-1", "state": "done", "cost_usd": 0.25, "nested": {"a": [1, 2]}}
     assert render._json(obj) == json.dumps(obj, indent=2)
+
+
+def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    monkeypatch.setenv("FLASH_THEME", "dark")
+    dark = render.badge("done")
+    assert "87;255;143" in dark  # bright brand green (#57ff8f) reads on a dark terminal
+
+    monkeypatch.setenv("FLASH_THEME", "light")
+    light = render.badge("done")
+    assert "0;105;92" in light  # deep teal (#00695c) — the website's light-surface green
+    assert dark != light
+
+
+def test_theme_follows_terminal_background(monkeypatch) -> None:
+    monkeypatch.delenv("FLASH_THEME", raising=False)
+    monkeypatch.setenv("COLORFGBG", "0;15")  # dark text on light background
+    assert render._theme() == "light"
+    monkeypatch.setenv("COLORFGBG", "15;0")  # light text on dark background
+    assert render._theme() == "dark"
+    monkeypatch.delenv("COLORFGBG", raising=False)
+    assert render._theme() == "dark"  # default when nothing indicates a light terminal
