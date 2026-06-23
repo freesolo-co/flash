@@ -25,12 +25,8 @@ def test_unknown_gpu_rejected():
 def test_providers_for():
     from flash.providers.base import providers_for
 
-    # RTX 4090 is provisionable on BOTH substrates; RTX Pro 6000 is RunPod-only
-    # (no vast_name); L40S / RTX Pro 4000 are vast-only (no Flash enum member).
-    assert providers_for("RTX 4090") == ("runpod", "vast")
+    assert providers_for("RTX 4090") == ("runpod",)
     assert providers_for("RTX Pro 6000") == ("runpod",)
-    assert providers_for("L40S") == ("vast",)
-    assert providers_for("RTX Pro 4000") == ("vast",)
 
 
 def test_expanded_gpu_table():
@@ -69,8 +65,8 @@ def test_cheapest_gpu_policy(monkeypatch):
     assert gpus.cheapest_gpu(24) == "RTX 3090"
     assert gpus.cheapest_gpu(32) == "RTX A6000"  # 48G A6000 now validated, $0.49 < 5090 $0.99
     assert gpus.cheapest_gpu(48) == "RTX A6000"  # cheapest validated >=48G ($0.49, was A100 PCIe)
-    # The error names the REAL constraint: this helper filters to RunPod-provisionable VALIDATED
-    # classes, so a fitting Vast-only / unvalidated class doesn't make the message a lie.
+    # The error names the REAL constraint: this helper filters to validated RunPod classes,
+    # so a fitting unvalidated class doesn't make the message a lie.
     with pytest.raises(gpus.UnsupportedGpuError, match="no validated RunPod-provisionable GPU"):
         gpus.cheapest_gpu(4096)
     # static rates cover every RunPod-provisionable class

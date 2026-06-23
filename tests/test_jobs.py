@@ -110,6 +110,46 @@ def test_poll_job_completes(monkeypatch):
     assert res.metrics == {"acc": 1.0}
 
 
+def test_surface_heartbeat_logs_gpu_status(monkeypatch):
+    from flash.providers._poll import surface_heartbeat
+
+    lines = []
+    hb = {
+        "stage": "sft_step",
+        "step": 12,
+        "loss": 1.23456,
+        "ts": 123.0,
+        "gpu": {
+            "device_name": "RTX 5090",
+            "driver_version": "575.57",
+            "torch_cuda": "12.8",
+            "gpu_util_pct": 97,
+            "memory_used_gb": 22.25,
+            "memory_total_gb": 31.8,
+            "temperature_c": 68,
+            "power_w": 411.3,
+            "power_limit_w": 575.0,
+            "processes": [
+                {"pid": 1234, "process_name": "/usr/bin/python", "used_memory_gb": 21.9}
+            ],
+        },
+    }
+    monkeypatch.setattr("flash.providers._poll._record_heartbeat", lambda _hb: None)
+
+    key, stage = surface_heartbeat(lambda: hb, None, lines.append)
+
+    assert key == ("sft_step", 12, 123.0)
+    assert stage == "sft_step"
+    assert len(lines) == 1
+    line = lines[0]
+    assert "worker: stage=sft_step step=12 loss=1.2346" in line
+    assert "gpu[RTX 5090" in line
+    assert "util=97%" in line
+    assert "mem=22.2GB/31.8GB" in line
+    assert "power=411W/575W" in line
+    assert "procs=python:1234:21.9GB" in line
+
+
 def test_poll_job_failure(monkeypatch):
     res, _ = _poll(
         monkeypatch,
@@ -118,6 +158,38 @@ def test_poll_job_failure(monkeypatch):
     assert not res.ok
     assert res.failure == "job_failed"
     assert "worker exploded" in res.detail
+
+
+def test_poll_job_failure_surfaces_forced_heartbeat(monkeypatch):
+    import io
+
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs
+
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda eid, jid: {"status": "FAILED", "error": "worker exploded"},
+    )
+    log = io.StringIO()
+    hb = {
+        "run_id": "missing-local-status-is-ok",
+        "stage": "boot",
+        "ts": 456.0,
+        "gpu": {"device_name": "RTX 5090", "gpu_util_pct": 1, "memory_total_gb": 31.8},
+    }
+
+    res = jobs.poll_job(
+        jobs.JobHandle("ep", "name", "job"),
+        interval_s=0,
+        heartbeat_reader=lambda force=False: hb,
+        log=log,
+    )
+
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert "worker: stage=boot" in log.getvalue()
+    assert "gpu[RTX 5090" in log.getvalue()
 
 
 def test_poll_job_failure_appends_worker_artifacts(monkeypatch):
@@ -811,9 +883,7 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
             alloc = real_allocate(*a, **k)
             keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "A100 SXM"))
             best = keep[0]
-            return dataclasses.replace(
-                alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep, offer=best.offer
-            )
+            return dataclasses.replace(alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep)
 
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         gpus_seen: list[str] = []
@@ -955,9 +1025,8 @@ def test_cancel_uses_rest_handle(monkeypatch):
         st = orch.cancel_run("c1")
         assert st.state == "cancelled"
         assert cancelled == [("epX", "jX")]
-        # cancel_run now also destroys the handle's endpoint for cost-safety symmetry
-        # with vast (idempotent); the GC backstop may delete it again — endpoint id
-        # was torn down, which is what matters.
+        # cancel_run now also destroys the handle's endpoint (idempotent); the GC backstop may
+        # delete it again — endpoint id was torn down, which is what matters.
         assert deleted
         assert all(e == "epX" for e in deleted)
 
