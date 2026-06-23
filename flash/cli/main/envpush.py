@@ -42,14 +42,13 @@ _ENV_PUSH_IGNORED_NAMES = frozenset(
         "source",
     }
 )
-_ENV_PUSH_SIDECAR_DIRS = frozenset({"assets", "configs", "datasets"})
+_ENV_PUSH_SIDECAR_DIRS = frozenset({"datasets"})
 _ENV_PUSH_SIDECAR_SUFFIXES = frozenset(
     {
         ".csv",
         ".json",
         ".jsonl",
         ".parquet",
-        ".toml",
         ".tsv",
         ".txt",
         ".yaml",
