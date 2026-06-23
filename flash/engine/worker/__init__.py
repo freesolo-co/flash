@@ -1993,7 +1993,7 @@ def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
     ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
     """
     adapter_ref = adapter_ref.strip()
-    match = re.match(r"^([^/]+/[^/:]+):(sft|rl)/([^/]+)/seed(\d+)$", adapter_ref)
+    match = re.fullmatch(r"([^/:]+/[^/:]+):(sft|rl)/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/seed(\d+)", adapter_ref)
     if not match:
         return None
     repo, phase, run_id, seed = match.groups()
