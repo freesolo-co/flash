@@ -115,7 +115,7 @@ def _normalize_env_path(path: str | None) -> str:
 
 
 def _github_token() -> str | None:
-    return os.environ.get("FLASH_ENV_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    return os.environ.get("GITHUB_TOKEN")
 
 
 def _is_commit_sha(value: str) -> bool:
@@ -135,7 +135,9 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
     try:
         payload = json.loads(data)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to resolve commit for {parsed.canonical()}: invalid GitHub response")
+        raise RuntimeError(
+            f"Failed to resolve commit for {parsed.canonical()}: invalid GitHub response"
+        ) from exc
     sha = payload.get("sha")
     if not isinstance(sha, str) or not _is_commit_sha(sha):
         raise RuntimeError(f"Failed to resolve commit for {parsed.canonical()}")
@@ -200,7 +202,7 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
     resolved_ref = _resolve_ref_sha(parsed)
     cache_key = hashlib.sha256(
-        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode("utf-8")
+        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
     env_file = cache_dir / parsed.path

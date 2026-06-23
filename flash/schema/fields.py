@@ -117,17 +117,13 @@ def _is_safe_environment_path(path: str) -> bool:
     parts = [part for part in raw.split("/") if part]
     if not parts:
         return True
-    if any(part in {".", ".."} for part in parts):
-        return False
-    return True
+    return not any(part in {".", ".."} for part in parts)
 
 
 def _is_safe_github_path_parts(parts: list[str]) -> bool:
     if any(part in {".", "..", ""} for part in parts):
         return False
-    if any("\\" in part for part in parts):
-        return False
-    return True
+    return not any("\\" in part for part in parts)
 
 
 def _coerce_scalar(value: str):
