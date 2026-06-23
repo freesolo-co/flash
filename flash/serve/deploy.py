@@ -21,7 +21,9 @@ unauthenticated.
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 
 import httpx
@@ -259,3 +261,51 @@ def chat(
         resp = client.post(f"{base}/v1/chat/completions", json=body)
     resp.raise_for_status()
     return resp.json()
+
+
+def _openai_stream_content(lines: Iterator[str]) -> Iterator[str]:
+    for line in lines:
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line.removeprefix("data:").strip()
+        if data == "[DONE]":
+            break
+        if not data:
+            continue
+        chunk = json.loads(data)
+        for choice in chunk.get("choices") or []:
+            content = ((choice.get("delta") or {}).get("content")) or ""
+            if content:
+                yield str(content)
+
+
+def chat_stream(
+    run_id: str,
+    messages: list[dict],
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    thinking: bool = False,
+) -> Iterator[str]:
+    """Yield text deltas from the freesolo OpenAI-compatible streaming endpoint."""
+    base = serving_base_url()
+    body = {
+        "model": run_id,
+        "messages": messages,
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
+        "stream": True,
+    }
+    with (
+        httpx.Client(follow_redirects=True, max_redirects=100, timeout=30 * 60.0) as client,
+        client.stream("POST", f"{base}/v1/chat/completions", json=body) as resp,
+    ):
+        resp.raise_for_status()
+        if "application/json" in resp.headers.get("content-type", ""):
+            payload = resp.json()
+            content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
+            if content:
+                yield str(content)
+            return
+        yield from _openai_stream_content(resp.iter_lines())
