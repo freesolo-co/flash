@@ -7,6 +7,8 @@ the remaining commands are covered without a server.
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from flash.cli import main as cli
@@ -110,6 +112,20 @@ def test_models_table(fake_client, capsys) -> None:
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
+    assert "Qwen/Qwen3.5-2B\t2.3B" in out
+    assert "openbmb/MiniCPM5-1B\t1.2B dense" in out
+    assert "(text-only fine-tune)" not in out
+    assert "algos=" not in out
+    assert "bf16" not in out
+    assert "thinking=" not in out
+
+
+def test_gpus_tip_omits_config_knobs(fake_client, capsys) -> None:
+    assert _run(["gpus"]) == 0
+    out = capsys.readouterr().out
+    assert "GPU class selection is fully automatic" in out
+    assert "You can still tune" not in out
+    assert "[gpu] config table" not in out
 
 
 def test_status_ps_and_status_logs(fake_client, capsys) -> None:
@@ -120,8 +136,10 @@ def test_status_ps_and_status_logs(fake_client, capsys) -> None:
 
     assert _run(["ps"]) == 0
     out = capsys.readouterr().out
+    assert "ALGO" in out
     assert "flash-1" in out
     assert "done" in out
+    assert "SFT" in out
 
     assert _run(["status", "flash-1", "--logs"]) == 0
     out = capsys.readouterr().out
@@ -140,6 +158,43 @@ def test_status_logs_separates_partial_log_line_from_json(fake_client, capsys) -
     assert _run(["status", "flash-1", "--logs"]) == 0
     out = capsys.readouterr().out
     assert "partial log line\n{" in out
+
+
+def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> None:
+    class _TTYBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    class _WaitingClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pages = iter(
+                [
+                    {"run_id": "flash-spin", "logs": "", "offset": 0, "state": "queued"},
+                    {
+                        "run_id": "flash-spin",
+                        "logs": "worker ready\n",
+                        "offset": 13,
+                        "state": "done",
+                    },
+                ]
+            )
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            return next(self.pages)
+
+    stderr = _TTYBuffer()
+    monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    state = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
+
+    assert state == "done"
+    assert capsys.readouterr().out == "worker ready\n"
+    err = stderr.getvalue()
+    assert "following logs for flash-spin (queued)" in err
+    assert "\r" in err
+    assert err.endswith("\r")
 
 
 @pytest.mark.parametrize("removed", ["cost", "attach", "logs"])
