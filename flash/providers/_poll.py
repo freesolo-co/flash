@@ -1,15 +1,14 @@
-"""Shared poll-loop scaffolding for the provider job pollers.
+"""Shared poll-loop scaffolding for provider job pollers.
 
-``runpod/jobs.py:poll_job`` and ``vast/jobs.py:poll_vast_job`` are independent live
-poll loops with provider-specific terminal-state logic, but they share three verbatim
-blocks: a timestamped ``say()`` logger, a consecutive-poll-error retry/give-up counter,
-and the heartbeat progress-surfacing block (key on (stage, step, ts), log
-``worker: stage=… step=… reward=…``). Only those provider-neutral pieces live here; each
-poller keeps its own status/terminal handling inline.
+Poll loops share a timestamped ``say()`` logger, a consecutive-poll-error retry/give-up
+counter, and the heartbeat progress-surfacing block (key on (stage, step, ts), log
+``worker: stage=… step=… reward=…``). Only those neutral pieces live here; each poller
+keeps its own status/terminal handling inline.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from typing import Any
@@ -53,6 +52,156 @@ class PollErrorTracker:
         return False
 
 
+def _num(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_float(value: Any, digits: int = 3) -> str | None:
+    num = _num(value)
+    if num is None:
+        return None
+    return f"{num:.{digits}f}"
+
+
+def _fmt_gb(value: Any) -> str | None:
+    num = _num(value)
+    if num is None:
+        return None
+    return f"{num:.1f}GB"
+
+
+def _fmt_pct(value: Any) -> str | None:
+    num = _num(value)
+    if num is None:
+        return None
+    return f"{num:.0f}%"
+
+
+def _fmt_watts(value: Any) -> str | None:
+    num = _num(value)
+    if num is None:
+        return None
+    return f"{num:.0f}W"
+
+
+def _short_process_name(name: str) -> str:
+    base = os.path.basename(str(name or "").strip())
+    return base or "process"
+
+
+def format_gpu_status(gpu: Any) -> str:
+    """Human-readable one-line GPU telemetry summary for heartbeat log lines."""
+    if not isinstance(gpu, dict) or not gpu:
+        return ""
+    parts: list[str] = []
+    name = gpu.get("device_name") or gpu.get("name")
+    if name:
+        parts.append(str(name))
+    driver = gpu.get("driver_version")
+    cuda = gpu.get("torch_cuda")
+    if driver:
+        parts.append(f"driver={driver}")
+    if cuda:
+        parts.append(f"cuda={cuda}")
+    util = _fmt_pct(gpu.get("gpu_util_pct"))
+    mem_util = _fmt_pct(gpu.get("mem_util_pct"))
+    if util:
+        parts.append(f"util={util}")
+    if mem_util:
+        parts.append(f"mem_util={mem_util}")
+    used = _fmt_gb(gpu.get("memory_used_gb"))
+    total = _fmt_gb(gpu.get("memory_total_gb"))
+    free = _fmt_gb(gpu.get("memory_free_gb"))
+    if used and total:
+        parts.append(f"mem={used}/{total}")
+    elif free and total:
+        parts.append(f"free={free}/{total}")
+    torch_alloc = _fmt_gb(gpu.get("torch_memory_allocated_gb"))
+    torch_reserved = _fmt_gb(gpu.get("torch_memory_reserved_gb"))
+    if torch_alloc:
+        if torch_reserved:
+            parts.append(f"torch={torch_alloc}/{torch_reserved}")
+        else:
+            parts.append(f"torch={torch_alloc}")
+    temp = _num(gpu.get("temperature_c"))
+    if temp is not None:
+        parts.append(f"temp={temp:.0f}C")
+    power = _fmt_watts(gpu.get("power_w"))
+    power_limit = _fmt_watts(gpu.get("power_limit_w"))
+    if power and power_limit:
+        parts.append(f"power={power}/{power_limit}")
+    elif power:
+        parts.append(f"power={power}")
+    pstate = gpu.get("pstate")
+    if pstate:
+        parts.append(f"pstate={pstate}")
+    processes = gpu.get("processes")
+    if isinstance(processes, list) and processes:
+        proc_parts = []
+        for proc in processes[:3]:
+            if not isinstance(proc, dict):
+                continue
+            pname = _short_process_name(str(proc.get("process_name") or ""))
+            pid = proc.get("pid")
+            mem = _fmt_gb(proc.get("used_memory_gb"))
+            label = f"{pname}:{pid}" if pid is not None else pname
+            if mem:
+                label = f"{label}:{mem}"
+            proc_parts.append(label)
+        if proc_parts:
+            parts.append("procs=" + ",".join(proc_parts))
+    if not parts:
+        if gpu.get("nvidia_smi"):
+            parts.append(str(gpu["nvidia_smi"])[:160])
+        elif gpu.get("nvidia_smi_err"):
+            parts.append(str(gpu["nvidia_smi_err"])[:160])
+    return " gpu[" + " ".join(parts) + "]" if parts else ""
+
+
+def _format_heartbeat(hb: dict) -> str:
+    msg = f"worker: stage={hb.get('stage')}"
+    for key, digits in (
+        ("step", 0),
+        ("epoch", 3),
+        ("reward", 3),
+        ("loss", 4),
+        ("grad_norm", 3),
+        ("learning_rate", 8),
+        ("setup_seconds", 1),
+        ("train_wall", 1),
+    ):
+        value = hb.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            if digits == 0:
+                msg += f" {key}={int(value)}"
+            else:
+                msg += f" {key}={value:.{digits}f}"
+        else:
+            msg += f" {key}={value}"
+    msg += format_gpu_status(hb.get("gpu") or hb.get("diag"))
+    return msg
+
+
+def _record_heartbeat(hb: dict) -> None:
+    run_id = str(hb.get("run_id") or "").strip()
+    if not run_id:
+        return
+    try:
+        from flash.runner import record_heartbeat
+
+        record_heartbeat(run_id, hb)
+    except Exception:
+        # Status persistence is diagnostic only; polling/liveness must not depend on it.
+        pass
+
+
 def surface_heartbeat(
     heartbeat_reader: Callable[[], Any] | None,
     last_hb_key: tuple | None,
@@ -76,12 +225,22 @@ def surface_heartbeat(
     key = (hb.get("stage"), hb.get("step"), hb.get("ts"))
     if key == last_hb_key:
         return last_hb_key, None
+    _record_heartbeat(hb)
     stage = hb.get("stage")
-    step = hb.get("step")
-    reward = hb.get("reward")
-    say(
-        f"worker: stage={stage}"
-        + (f" step={step}" if step is not None else "")
-        + (f" reward={reward:.3f}" if isinstance(reward, (int, float)) else "")
-    )
+    say(_format_heartbeat(hb))
     return key, stage
+
+
+def surface_forced_heartbeat(
+    heartbeat_reader: Callable[..., Any] | None,
+    last_hb_key: tuple | None,
+    say: Callable[[str], None],
+) -> tuple[tuple | None, str | None]:
+    """Force-read and surface the latest heartbeat, bypassing reader rate limits.
+
+    Used on terminal provider statuses so a fast worker failure still leaves the last worker/GPU
+    snapshot in both the run log and status JSON.
+    """
+    if heartbeat_reader is None:
+        return last_hb_key, None
+    return surface_heartbeat(lambda: heartbeat_reader(force=True), last_hb_key, say)
