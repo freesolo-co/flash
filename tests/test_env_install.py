@@ -1,4 +1,4 @@
-"""`flash env install` records Freesolo environment refs."""
+"""`flash env install` records Freesolo environment ids."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def test_env_install_rejects_non_github_ref(monkeypatch, capsys):
     assert rc == 1
     assert called["n"] == 0
     err = capsys.readouterr().err
-    assert "Freesolo environment ref" in err
+    assert "Freesolo environment id" in err
 
     assert cli.cmd_env_install(argparse.Namespace(env_id="owner/name")) == 1
     assert called["n"] == 0
