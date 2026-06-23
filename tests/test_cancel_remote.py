@@ -331,7 +331,9 @@ def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
         "runpod_flash.core.resources.resource_manager",
     ):
         if mod_name not in sys.modules:
-            monkeypatch.setitem(sys.modules, mod_name, _types.ModuleType(mod_name))
+            stub = _types.ModuleType(mod_name)
+            stub.__path__ = []  # mark as package so sub-imports don't raise
+            monkeypatch.setitem(sys.modules, mod_name, stub)
     monkeypatch.setitem(
         sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod
     )
