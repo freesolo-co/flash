@@ -72,6 +72,26 @@ def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
     assert cap["name"] == "explicit-env"
 
 
+def test_push_dir_prefers_environment_py_and_ships_helpers(monkeypatch, tmp_path):
+    env_dir = tmp_path / "math"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text(
+        "import helper\n\ndef load_environment(**k):\n    return helper.build()\n"
+    )
+    (env_dir / "helper.py").write_text("def build():\n    return None\n")
+    (env_dir / "datasets").mkdir()
+    (env_dir / "datasets" / "train.jsonl").write_text('{"input":"2+2","output":"4"}\n')
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir, name="math")) == 0
+    files = _members(cap["package_b64"])
+    assert "environment.py" in files
+    assert "helper.py" in files
+    assert "datasets/train.jsonl" in files
+    assert cap["name"] == "math"
+
+
 def test_push_single_py_ships_sibling_datasets(monkeypatch, tmp_path):
     env_file = tmp_path / "environment.py"
     env_file.write_text("def load_environment(**k):\n    return None\n")

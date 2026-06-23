@@ -258,11 +258,10 @@ def test_deploy_dry_run_and_deployments_roundtrip(make_client) -> None:
     client = make_client()
     run_id = client.create_run(SPEC)["run_id"]
 
-    # A dry-run deploy validates the serving path without provisioning a GPU; the
-    # real client must serialise mode/dry_run and parse the deployment back.
-    deployment = client.deploy(run_id, mode="dev", dry_run=True)
+    # A dry-run deploy validates the serving path without provisioning a GPU.
+    deployment = client.deploy(run_id, dry_run=True)
     assert deployment["state"] == "dry_run"
-    assert deployment["mode"] == "dev"
+    assert "mode" not in deployment
 
     # Dry-run deploys never count as active deployments.
     assert client.deployments() == []

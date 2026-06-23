@@ -182,19 +182,6 @@ def main(argv: list[str] | None = None) -> int:
 
     deploy = sub.add_parser("deploy")
     deploy.add_argument("run_id")
-    deploy.add_argument(
-        "--mode",
-        choices=["dev", "always-on"],
-        default="dev",
-        help="dev: scale-to-zero, cold start after idle, $0 when unused (default). "
-        "always-on: one warm worker 24/7, no cold starts, continuous billing.",
-    )
-    deploy.add_argument(
-        "--idle-timeout",
-        type=int,
-        default=300,
-        help="dev mode: seconds of inactivity before the worker scales to zero (default 300)",
-    )
     deploy.add_argument("--dry-run", action="store_true")
     deploy.set_defaults(func=cmd_deploy)
 
