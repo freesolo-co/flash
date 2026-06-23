@@ -291,7 +291,12 @@ def test_freesolo_multiturn_hooks(monkeypatch):
 
 
 def test_github_environment_ref_parsing():
-    from flash.envs.adapter import is_github_environment_ref
+    from flash.envs.adapter import (
+        is_freesolo_environment_id,
+        is_github_environment_ref,
+        is_managed_environment_slug,
+        managed_slug_to_github_ref,
+    )
 
     assert is_github_environment_ref("github:owner/repo@dev:envs/e/environment.py")
     assert is_github_environment_ref("github:owner/repo")
@@ -311,6 +316,13 @@ def test_github_environment_ref_parsing():
     assert not is_github_environment_ref(
         "https://github.com/owner/repo/blob/bad ref/envs/e/environment.py"
     )
+    assert is_managed_environment_slug("owner/env")
+    assert is_freesolo_environment_id("owner/env")
+    assert managed_slug_to_github_ref("owner/env") == (
+        "github:freesolo-co/environment-hub@main:owner/env/environment.py"
+    )
+    assert not is_managed_environment_slug("owner/env/extra")
+    assert not is_freesolo_environment_id("gsm8k")
 
 
 def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):

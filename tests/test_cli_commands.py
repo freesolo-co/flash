@@ -180,11 +180,10 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     from flash.client.specs import spec_payload
     from flash.spec import EnvironmentSpec, JobSpec
 
-    # An unrecorded env resolves to the Freesolo SDK; the GitHub ref is loaded lazily by the
-    # worker at environment load time.
+    # An unrecorded env resolves to the Freesolo SDK; the env is loaded lazily by the worker.
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
-        environment=EnvironmentSpec(id="github:owner/repo@main:env/environment.py"),
+        environment=EnvironmentSpec(id="owner/env"),
     )
     assert spec_payload(spec)["environment"]["pip"] == ["freesolo"]
 

@@ -12,14 +12,13 @@ from pathlib import Path
 
 
 def cmd_env_install(args) -> int:
-    from flash.envs.adapter import is_github_environment_ref
+    from flash.envs.adapter import is_freesolo_environment_id
     from flash.envs.registry import INSTALLED_MANIFEST, record_installed_env
 
     env_id = args.env_id
-    if not is_github_environment_ref(env_id):
+    if not is_freesolo_environment_id(env_id):
         print(
-            "env id must be a Freesolo environment id / GitHub ref, e.g. "
-            '"github:freesolo-co/environment-hub@main:user/project/publish-id/environment.py" '
+            'env id must be a Freesolo environment id, e.g. "your-name/your-env" '
             f"(got {env_id!r})",
             file=sys.stderr,
         )

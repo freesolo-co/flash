@@ -347,13 +347,12 @@ def _validate_spec(spec: JobSpec) -> None:
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "
-            "`flash env push --name <name>` and paste the returned id); "
+            '`flash env push --name <name>` and paste the returned id, e.g. "your-name/your-env"); '
             "there is no local path mode"
         )
     _require_environment_ref(
         spec.environment.id,
-        "[environment] id must be a Freesolo environment id returned by "
-        "`flash env push --name <name>`",
+        '[environment] id must be a Freesolo environment id (for example "your-name/your-env")',
     )
     if spec.train.lora_rank <= 0:
         raise ConfigError("train.lora_rank must be positive")

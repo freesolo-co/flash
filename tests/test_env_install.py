@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 
-def test_env_install_github_ref(monkeypatch, capsys):
+def test_env_install_slug(monkeypatch, capsys):
     with tempfile.TemporaryDirectory() as tmp:
         import flash.envs.registry as registry
         from flash.cli import main as cli
@@ -20,7 +20,7 @@ def test_env_install_github_ref(monkeypatch, capsys):
             "subprocess.run", lambda *a, **k: called.__setitem__("n", called["n"] + 1)
         )
 
-        env_id = "github:owner/repo@main:envs/math/environment.py"
+        env_id = "owner/name"
         rc = cli.cmd_env_install(argparse.Namespace(env_id=env_id))
         assert rc == 0
         assert called["n"] == 0
@@ -30,7 +30,7 @@ def test_env_install_github_ref(monkeypatch, capsys):
         assert f"recorded in {manifest_path}" in capsys.readouterr().out
 
 
-def test_env_install_rejects_non_github_ref(monkeypatch, capsys):
+def test_env_install_rejects_bad_id(monkeypatch, capsys):
     from flash.cli import main as cli
 
     called = {"n": 0}
@@ -41,6 +41,3 @@ def test_env_install_rejects_non_github_ref(monkeypatch, capsys):
     assert called["n"] == 0
     err = capsys.readouterr().err
     assert "Freesolo environment id" in err
-
-    assert cli.cmd_env_install(argparse.Namespace(env_id="owner/name")) == 1
-    assert called["n"] == 0

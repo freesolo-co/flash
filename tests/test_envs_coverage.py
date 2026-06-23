@@ -1,5 +1,5 @@
 """Environment behaviors not covered elsewhere: the base env protocol and the registry's
-id-based loader (Freesolo GitHub refs; no built-in envs and no local-path mode)."""
+id-based loader (Freesolo env ids; no built-in envs and no local-path mode)."""
 
 from __future__ import annotations
 
