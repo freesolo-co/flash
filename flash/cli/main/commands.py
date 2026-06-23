@@ -334,7 +334,11 @@ def cmd_status(args) -> int:
     if getattr(args, "follow", False):
         return _follow_run(client, args.run_id)
     if getattr(args, "logs", False):
-        print(client.get_logs(args.run_id)["logs"], end="")
+        logs = client.get_logs(args.run_id)["logs"]
+        if logs:
+            print(logs, end="")
+            if not logs.endswith("\n"):
+                print()
     print(json.dumps(client.get_run(args.run_id), indent=2))
     return 0
 
