@@ -122,8 +122,10 @@ def test_status_ps_and_status_logs(fake_client, capsys) -> None:
 
     assert _run(["ps"]) == 0
     out = capsys.readouterr().out
+    assert "ALGO" in out
     assert "flash-1" in out
     assert "done" in out
+    assert "SFT" in out
 
     assert _run(["status", "flash-1", "--logs"]) == 0
     out = capsys.readouterr().out
