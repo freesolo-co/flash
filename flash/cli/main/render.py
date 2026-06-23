@@ -45,6 +45,35 @@ def _glyph(unicode_glyph: str, ascii_fallback: str) -> str:
     return unicode_glyph
 
 
+# Common unicode punctuation we'd rather downgrade to a readable ASCII stand-in than to an
+# escape sequence when stdout can't encode it (e.g. an ASCII/non-UTF-8 locale). Written as
+# escapes so the source stays free of confusable characters.
+_ASCII_PUNCT = {
+    0x2014: "-",  # em dash
+    0x2013: "-",  # en dash
+    0x2026: "...",  # ellipsis
+    0x2019: "'",  # right single quote
+    0x201C: '"',  # left double quote
+    0x201D: '"',  # right double quote
+}
+
+
+def _safe(text: str) -> str:
+    """Guarantee ``text`` can be printed under the current stdout encoding.
+
+    Identity values from ``/v1/me`` (e.g. an internationalized email) or punctuation in our
+    own copy must never make ``print()`` raise ``UnicodeEncodeError`` after a login has
+    already succeeded. On a normal UTF-8 terminal the text is returned unchanged; only when
+    the active encoding can't represent it do we downgrade punctuation and escape the rest.
+    """
+    enc = sys.stdout.encoding or "ascii"
+    try:
+        text.encode(enc)
+    except UnicodeEncodeError:
+        return text.translate(_ASCII_PUNCT).encode(enc, "backslashreplace").decode(enc)
+    return text
+
+
 def _bold(s: str) -> str:
     return _style("1", s)
 
@@ -67,18 +96,18 @@ def login_ok(me: dict | None) -> str:
     head = f"{_style('32', _glyph('✓', 'ok:'))} {_bold('logged in to flash')}"
     if not me:
         # The key is verified and stored; we just couldn't fetch the account card right now.
-        return (
+        return _safe(
             f"{head}\n{_dim('  account details unavailable right now — run `flash whoami` later')}"
         )
-    return f"{head}\n\n{format_identity(me)}"
+    return _safe(f"{head}\n\n{format_identity(me)}")
 
 
 def whoami(me: dict) -> str:
-    return f"{_bold('logged in to flash')}\n\n{format_identity(me)}"
+    return _safe(f"{_bold('logged in to flash')}\n\n{format_identity(me)}")
 
 
 def login_failed(reason: str) -> str:
-    return (
+    return _safe(
         f"{_style('31', _glyph('✗', 'x:'))} {_bold('login failed')}\n"
         f"  {reason}\n"
         f"  {_dim('then run `flash login --api-key <key>` to try again')}\n"
