@@ -278,6 +278,7 @@ def test_github_environment_ref_parsing():
     assert not is_github_environment_ref(
         "https://github.com/owner/repo/blob/dev/../../etc/passwd"
     )
+    assert not is_github_environment_ref("https://github.com/owner/repo/blob/main:/etc/passwd")
 
 
 def test_install_manifest_and_worker_deps():

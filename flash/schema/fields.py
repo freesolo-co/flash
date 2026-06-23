@@ -103,8 +103,18 @@ def _require_environment_ref(value: str, message: str) -> None:
         parsed = urllib.parse.urlparse(value)
         if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "github.com":
             parts = [part for part in urllib.parse.unquote(parsed.path).strip("/").split("/") if part]
-            if len(parts) >= 2 and _is_safe_github_path_parts(parts):
-                return
+            if len(parts) < 2:
+                raise ConfigError(message)
+            if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
+                ref = parts[3]
+                raw_path = "/".join(parts[4:])
+                if ":" in ref:
+                    raise ConfigError(message)
+                if not _is_safe_environment_path(raw_path):
+                    raise ConfigError(message)
+            elif len(parts) >= 2 and not _is_safe_github_path_parts(parts):
+                raise ConfigError(message)
+            return
     raise ConfigError(message)
 
 

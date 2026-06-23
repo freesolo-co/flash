@@ -112,6 +112,7 @@ def test_bare_environment_id_is_rejected() -> None:
         "github:owner/repo@main:../x.py",
         "github:owner/repo@main:/etc/passwd",
         "https://github.com/owner/repo/blob/main/../x.py",
+        "https://github.com/owner/repo/blob/main:/etc/passwd",
     ):
         raw = _raw()
         raw["environment"] = {"id": bad}
