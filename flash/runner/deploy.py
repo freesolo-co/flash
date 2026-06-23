@@ -90,8 +90,7 @@ def cancel_run(run_id: str) -> RunStatus:
             handle = JobHandle.from_dict(remote)
             provider = get_provider(handle.provider)
             provider.cancel(handle)
-            # Vast bills until destroyed, so also belt-and-suspenders destroy the
-            # instance (a no-op cost-wise for runpod, whose endpoint GC follows).
+            # Belt-and-suspenders destroy after cancel; RunPod endpoint GC follows.
             provider.destroy(handle)
         except Exception:
             # Best-effort remote stop; _gc_run_endpoints below still tears the endpoint down.

@@ -25,7 +25,7 @@ SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
 
-# Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod/Vast
+# Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod
 # wall clock. LoRA + small batches sit well below dense-pretraining MFU.
 MFU_TRAIN = 0.35  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
