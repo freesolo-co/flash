@@ -25,17 +25,14 @@ from flash.cli.main.commands import (  # noqa: F401
     _follow_run,
     _poll_logs,
     client_from_config,
-    cmd_attach,
     cmd_cancel,
     cmd_chat,
-    cmd_cost,
     cmd_deploy,
     cmd_deployments,
     cmd_env_list,
     cmd_env_setup,
     cmd_gpus,
     cmd_login,
-    cmd_logs,
     cmd_models,
     cmd_ps,
     cmd_status,
@@ -149,31 +146,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     train.set_defaults(func=cmd_train)
 
-    status = sub.add_parser("status", help="show a run's full status JSON")
+    status = sub.add_parser("status", help="show a run's status, logs, or follow logs")
     status.add_argument("run_id")
-    status.set_defaults(func=cmd_status)
-
-    attach = sub.add_parser(
-        "attach", help="follow a running job's logs to completion (resumable any time)"
+    status.add_argument("--logs", action="store_true", help="print current logs before status")
+    status.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="stream logs until the run ends, then print final status",
     )
-    attach.add_argument("run_id")
-    attach.set_defaults(func=cmd_attach)
+    status.set_defaults(func=cmd_status)
 
     ps = sub.add_parser("ps", help="list runs and their state/cost")
     ps.set_defaults(func=cmd_ps)
 
-    cost = sub.add_parser("cost", help="show a run's accrued cost (USD)")
-    cost.add_argument("run_id")
-    cost.set_defaults(func=cmd_cost)
-
-    cancel = sub.add_parser("cancel", help="cancel a run (best-effort)")
+    cancel = sub.add_parser("cancel", help="cancel a run")
     cancel.add_argument("run_id")
     cancel.set_defaults(func=cmd_cancel)
-
-    logs = sub.add_parser("logs")
-    logs.add_argument("run_id")
-    logs.add_argument("-f", "--follow", action="store_true", help="stream new log lines")
-    logs.set_defaults(func=cmd_logs)
 
     deploy = sub.add_parser("deploy")
     deploy.add_argument("run_id")
