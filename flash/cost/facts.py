@@ -8,10 +8,6 @@ from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
 # ===== GPU facts =====
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
-    "RTX A4000": 77.0,
-    "RTX 2000 Ada": 89.0,
-    "RTX A4500": 89.0,
-    "RTX 4000 Ada": 90.0,
     "RTX 3090": 71.0,
     "L4": 60.0,
     "RTX 4090": 165.0,
