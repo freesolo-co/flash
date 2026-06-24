@@ -1,29 +1,20 @@
 """flash <-> chalk wiring (CPU-safe).
 
 flash applies chalk via chalk's Liger-style ``apply_chalk_kernel_to_qwen35(model, liger=False, ...)``
-on the POST-build pass (chalk patches the live module). These tests verify: the gap-fillers are ON
-by default and map to the right apply kwargs; FLASH_<K>=0 disables a default-on kernel and
-FLASH_<K>=1 enables an opt-in one; the pre-build pass (model=None) is a no-op; the no-op when chalk
-is absent or every kernel is disabled; and that a chalk apply error never aborts training.
+on the POST-build pass (chalk patches the live module). Kernel selection is FIXED — the gap-fillers
+(rope/lora/embedding) are ON and the overlap/situational kernels (mlp/qkv/fp8) are OFF, with NO env
+override. These tests verify: the fixed kwargs are passed; the selection ignores any FLASH_* env
+var; the pre-build pass (model=None) is a no-op; the no-op when chalk is absent; and that a chalk
+apply error never aborts training.
 """
 
 import sys
 import types
 
-from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels, is_chalk_enabled
+from flash.engine.chalk_kernels import active_kernels, install_chalk_kernels
 
-# Every FLASH_* kernel flag (so a test can clear leftovers from the environment).
-_ALL_FLAGS = (
-    "FLASH_ROPE_KERNEL",
-    "FLASH_TRITON_LORA",
-    "FLASH_EMBED_KERNEL",
-    "FLASH_MLP_KERNEL",
-    "FLASH_QKV_KERNEL",
-    "FLASH_FP8_BASE",
-)
-
-# The apply kwargs flash should pass for a DEFAULT run (gap-fillers on, overlap/situational off).
-_DEFAULT_KWARGS = {
+# The apply kwargs flash always passes (gap-fillers on, overlap/situational off) — fixed, no env.
+_FIXED_KWARGS = {
     "rope": True,
     "fused_lora_delta": True,
     "fused_embedding": True,
@@ -31,11 +22,6 @@ _DEFAULT_KWARGS = {
     "attn_epilogue": False,
     "fp8_frozen_base": False,
 }
-
-
-def _clear_flags(monkeypatch):
-    for k in _ALL_FLAGS:
-        monkeypatch.delenv(k, raising=False)
 
 
 def _install_fake_chalk(monkeypatch, calls, *, raise_in_apply=False, report=None):
@@ -55,10 +41,9 @@ def _install_fake_chalk(monkeypatch, calls, *, raise_in_apply=False, report=None
     monkeypatch.setitem(sys.modules, "chalk.transformers", ck)
 
 
-def test_default_on_applies_gap_fillers(monkeypatch):
-    """Default (no FLASH_* flags), post-build -> apply is called once with liger=False and the
-    gap-fillers ON (rope/fused_lora_delta/fused_embedding), the overlap/situational kernels OFF."""
-    _clear_flags(monkeypatch)
+def test_applies_fixed_gap_fillers(monkeypatch):
+    """Post-build -> apply is called once with liger=False and the fixed kwargs (gap-fillers ON,
+    the overlap/situational kernels OFF)."""
     calls = []
     _install_fake_chalk(monkeypatch, calls)
     model = object()
@@ -67,12 +52,25 @@ def test_default_on_applies_gap_fillers(monkeypatch):
     got_model, kwargs = calls[0]
     assert got_model is model
     assert kwargs.pop("liger") is False  # TRL owns Liger; chalk composes on top
-    assert kwargs == _DEFAULT_KWARGS
+    assert kwargs == _FIXED_KWARGS
+
+
+def test_selection_ignores_env_flags(monkeypatch):
+    """Selection is deterministic: a leftover FLASH_* env var does NOT change which kernels run."""
+    # These would previously have toggled kernels; now they must be ignored entirely.
+    monkeypatch.setenv("FLASH_ROPE_KERNEL", "0")
+    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")
+    monkeypatch.setenv("FLASH_FP8_BASE", "1")
+    calls = []
+    _install_fake_chalk(monkeypatch, calls)
+    install_chalk_kernels(object())
+    _, kwargs = calls[0]
+    kwargs.pop("liger")
+    assert kwargs == _FIXED_KWARGS  # unchanged despite the env vars
 
 
 def test_pre_build_pass_is_noop(monkeypatch):
     """The pre-build pass (model=None) does nothing — chalk's apply patches the live module."""
-    _clear_flags(monkeypatch)
     calls = []
     _install_fake_chalk(monkeypatch, calls)
     assert install_chalk_kernels() == {}
@@ -81,54 +79,13 @@ def test_pre_build_pass_is_noop(monkeypatch):
 
 
 def test_noop_when_chalk_absent(monkeypatch):
-    """Gap-fillers are default-on, but if freesolo-chalk isn't installed -> no-op (returns {})."""
-    _clear_flags(monkeypatch)
+    """If freesolo-chalk isn't installed -> no-op (returns {})."""
     monkeypatch.setitem(sys.modules, "chalk", None)  # force ImportError on `from chalk.transformers ...`
     assert install_chalk_kernels(object()) == {}
 
 
-def test_flag_zero_disables_default_on_kernel(monkeypatch):
-    """FLASH_<K>=0/false disables a default-ON gap-filler; the others stay on."""
-    _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_ROPE_KERNEL", "0")
-    monkeypatch.setenv("FLASH_EMBED_KERNEL", "false")
-    calls = []
-    _install_fake_chalk(monkeypatch, calls)
-    install_chalk_kernels(object())
-    _, kwargs = calls[0]
-    assert kwargs["rope"] is False
-    assert kwargs["fused_embedding"] is False
-    assert kwargs["fused_lora_delta"] is True  # still default-on
-
-
-def test_optin_flag_enables_extra_kernel(monkeypatch):
-    """A default-OFF kernel turns on with FLASH_<K>=1, alongside the default-on gap-fillers."""
-    _clear_flags(monkeypatch)
-    monkeypatch.setenv("FLASH_MLP_KERNEL", "1")  # opt in to the fused MLP
-    monkeypatch.setenv("FLASH_FP8_BASE", "1")  # opt in to FP8 frozen base
-    calls = []
-    _install_fake_chalk(monkeypatch, calls)
-    install_chalk_kernels(object())
-    _, kwargs = calls[0]
-    assert kwargs["fused_mlp"] is True
-    assert kwargs["fp8_frozen_base"] is True
-    assert kwargs["rope"] is True  # gap-fillers still on
-
-
-def test_all_kernels_disabled_is_noop(monkeypatch):
-    """Disabling every gap-filler (FLASH_<K>=0) -> apply is never called, returns {}."""
-    _clear_flags(monkeypatch)
-    for k in ("FLASH_ROPE_KERNEL", "FLASH_TRITON_LORA", "FLASH_EMBED_KERNEL"):
-        monkeypatch.setenv(k, "0")
-    calls = []
-    _install_fake_chalk(monkeypatch, calls)
-    assert install_chalk_kernels(object()) == {}
-    assert calls == []  # nothing enabled -> chalk not even imported
-
-
 def test_apply_error_is_swallowed(monkeypatch):
     """A chalk apply that raises must not abort training; install returns {} instead of propagating."""
-    _clear_flags(monkeypatch)
     calls = []
     _install_fake_chalk(monkeypatch, calls, raise_in_apply=True)
     assert install_chalk_kernels(object()) == {}
@@ -137,23 +94,10 @@ def test_apply_error_is_swallowed(monkeypatch):
 
 def test_returns_chalk_report(monkeypatch):
     """install_chalk_kernels returns chalk's per-kernel report verbatim."""
-    _clear_flags(monkeypatch)
     rep = {"rope": True, "fused_lora_delta": 12, "fused_embedding": False, "liger": False}
     calls = []
     _install_fake_chalk(monkeypatch, calls, report=rep)
     assert install_chalk_kernels(object()) == rep
-
-
-def test_is_chalk_enabled(monkeypatch):
-    """is_chalk_enabled is True by default (gap-fillers on) and False only when all are disabled."""
-    _clear_flags(monkeypatch)
-    import os
-
-    assert is_chalk_enabled(os.environ) is True
-    disabled = {"FLASH_ROPE_KERNEL": "0", "FLASH_TRITON_LORA": "0", "FLASH_EMBED_KERNEL": "0"}
-    assert is_chalk_enabled(disabled) is False
-    # a single opt-in flag is enough to need chalk installed
-    assert is_chalk_enabled({**disabled, "FLASH_MLP_KERNEL": "1"}) is True
 
 
 def test_active_kernels_filters_report():
