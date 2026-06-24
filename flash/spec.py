@@ -110,6 +110,15 @@ class EnvironmentSpec:
     # spec; the client reads matching local env/.env values and sends them out-of-band via
     # runtime_secrets.
     secrets: tuple[str, ...] = ()
+    # Optional pinned commit SHA for the environment's GitHub ref, resolved ONCE in the control
+    # plane so every worker boots from an immutable sha instead of each one re-resolving the
+    # symbolic ref (e.g. "main") against the GitHub commits API. Empty (the default) preserves
+    # today's behavior: the worker resolves the ref itself. The adapter only trusts a real 40-char
+    # sha (see adapter._resolve_ref_sha), so a stale/garbage value falls back to live resolution.
+    # TODO(resolve-once): populate this in the control plane (flash.runner.submit_job, after the
+    # spec is finalized) by calling the adapter's ref-resolver once; until then it stays "" and the
+    # worker's existing _is_commit_sha short-circuit + content-addressed cache carry the load.
+    resolved_sha: str = ""
 
 
 @dataclass(frozen=True)
@@ -235,6 +244,7 @@ class JobSpec:
                 params=dict(env.get("params") or {}),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
                 secrets=_str_tuple(env.get("secrets")),
+                resolved_sha=str(env.get("resolved_sha") or ""),
             ),
             train=TrainSpec(
                 steps=_opt_int(train.get("steps")),
