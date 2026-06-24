@@ -950,9 +950,32 @@ def run_sft():
         )
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
-    if liger_on(_memory_mode(model_id, sft_max_len)):
+    _sft_liger = liger_on(_memory_mode(model_id, sft_max_len))
+    if _sft_liger:
         cfg_kwargs["use_liger_kernel"] = True
         print("[sft] liger fused kernels enabled")
+    elif _sft_vocab > 100_000:
+        # liger fused-ce is off but the vocab is huge (qwen3.5 ~248k): use trl's chunked_nll loss,
+        # which gathers the supervised (non -100) positions before the lm_head matmul so the
+        # [seq, vocab] logits never materialize for masked tokens (~30% peak vram, up to ~50% on
+        # large vocab per trl docs). feature-detected: only set if this trl's SFTConfig supports it.
+        import dataclasses as _dc_sft
+
+        try:
+            _sft_fields = {f.name for f in _dc_sft.fields(TRLSFTConfig)}
+        except TypeError:
+            _sft_fields = set()
+        if "loss_type" in _sft_fields:
+            cfg_kwargs["loss_type"] = "chunked_nll"
+            print(
+                f"[sft] chunked_nll loss enabled (large vocab {_sft_vocab}, liger off; "
+                "drops -100 positions before the lm_head matmul)"
+            )
+        else:
+            print(
+                f"[sft] chunked_nll unavailable on this trl (no loss_type field); "
+                f"large-vocab logits cap still applies (vocab {_sft_vocab})"
+            )
     _attn = optimal_attn_impl()  # arch-best FlashAttention (FA3 Hopper / FA2 Ampere·Ada) or SDPA
     # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen-capable attn
     # (FA2 and FA3 both expose flash_attn_varlen_func; plain SDPA cross-contaminates packed examples).
