@@ -333,6 +333,9 @@ def create_app():
             )
         except envs.EnvPublishError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        from flash.server.environment_registry import record_published_environment
+
+        record_published_environment(slug=slug, name=str(_name), key=key)
         return {"id": slug}
 
     def _parse_spec(payload: dict, run_id: str) -> JobSpec:
@@ -419,7 +422,26 @@ def create_app():
                 submit_kwargs["runtime_secrets"] = runtime_secrets
             if billing_context:
                 submit_kwargs["billing_context"] = billing_context
+            platform_context = {
+                field: value
+                for field, value in {
+                    "org_id": key.get("org_id"),
+                    "user_id": key.get("user_id"),
+                    "api_key_id": key.get("api_key_id"),
+                }.items()
+                if value
+            }
+            if platform_context:
+                submit_kwargs["platform_context"] = platform_context
             status = submit_job(spec, **submit_kwargs)
+            from flash.server.run_registry import record_training_run
+
+            record_training_run(status=status, key=key)
+            from flash.envs.adapter import is_managed_environment_slug
+            from flash.server.environment_registry import record_environment_use
+
+            if is_managed_environment_slug(spec.environment.id):
+                record_environment_use(slug=spec.environment.id, run_id=spec.run_id, key=key)
         except Exception as exc:
             db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
             if isinstance(exc, HTTPException):
