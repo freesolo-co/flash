@@ -758,13 +758,13 @@ def test_fla_git_pin_is_consistent_and_pinned():
 
     # The worker's runtime fla reinstall (perf._ensure_fla_fastpath_on_hopper) must use the SAME pin —
     # an unpinned reinstall would pull the moving default branch and defeat reproducibility.
-    perf_src = (root / "flash" / "engine" / "worker" / "perf.py").read_text()
+    perf_src = (root / "flash" / "engine" / "worker" / "perf" / "__init__.py").read_text()
     # The URL is built via implicit string concatenation across lines:
     #   "...flash-linear-attention.git"\n        "@<sha>" — so allow quotes/newline/space between.
     pm = re.search(r"flash-linear-attention\.git[\"'\s]*@([0-9a-f]{40})\b", perf_src)
-    assert pm, "perf.py runtime fla reinstall must be pinned to a 40-char commit SHA"
+    assert pm, "perf/__init__.py runtime fla reinstall must be pinned to a 40-char commit SHA"
     assert pm.group(1) == deps_sha, (
-        f"perf.py fla SHA must match WORKER_DEPS (deps={deps_sha}, perf={pm.group(1)})"
+        f"perf/__init__.py fla SHA must match WORKER_DEPS (deps={deps_sha}, perf={pm.group(1)})"
     )
 
 
@@ -789,12 +789,12 @@ def test_tilelang_pin_is_consistent_and_pinned():
         f"Dockerfile.worker tilelang pin must match WORKER_DEPS (deps={pin}, dockerfile={dm.group(1)})"
     )
 
-    perf_src = (root / "flash" / "engine" / "worker" / "perf.py").read_text()
-    # perf.py builds the spec via an f-string `f"tilelang=={TILELANG_PIN}"`, so assert the constant.
+    perf_src = (root / "flash" / "engine" / "worker" / "perf" / "__init__.py").read_text()
+    # perf/__init__.py builds the spec via an f-string `f"tilelang=={TILELANG_PIN}"`, so assert the constant.
     pm = re.search(r'TILELANG_PIN\s*=\s*"([0-9][0-9A-Za-z.\-]*)"', perf_src)
-    assert pm, "perf.py must define a pinned TILELANG_PIN constant for the runtime reinstall"
+    assert pm, "perf/__init__.py must define a pinned TILELANG_PIN constant for the runtime reinstall"
     assert pm.group(1) == pin, (
-        f"perf.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
+        f"perf/__init__.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
     )
 
 
