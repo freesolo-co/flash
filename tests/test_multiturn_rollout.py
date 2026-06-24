@@ -690,17 +690,17 @@ class _RaiseEnvReplyEnv(_TwoTurnEnv):
 
 
 @pytest.mark.usefixtures("_stub_vllm")
-def test_rollout_func_aborts_inflight_requests_on_error():
-    # A rollout that raises mid-flight must not leak the OTHER rollouts' in-flight requests into the
-    # next GRPO step — the finally aborts them. finish="one" leaves r1/r2 in flight when r0's env
-    # reply raises on its first turn.
+def test_rollout_func_no_inflight_leak_on_error():
+    # A rollout whose env reply raises mid-flight must propagate the error from the worker thread
+    # (not hang) and leave NO in-flight engine request behind for the next GRPO step — whether the
+    # leftover requests were aborted in the finally or had already finished.
     engine = _FakeEngine(finish="one")
     rf = _build(_FakeTok(), active_env=_RaiseEnvReplyEnv())
     prompts = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}],
                [{"role": "user", "content": "c"}]]
     with pytest.raises(RuntimeError, match="boom in env_reply"):
         rf(prompts, _fake_trainer(engine, sleep_mode=False))
-    assert engine.aborted  # leftover in-flight requests were aborted, not leaked
+    assert not engine.llm_engine.has_unfinished_requests()  # nothing leaked into the engine
 
 
 class _CountingTok(_FakeTok):

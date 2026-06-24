@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import queue
+import threading
 from collections.abc import Callable
 from typing import TypedDict
 
@@ -411,6 +413,16 @@ def rollout_async(
     rollout's env reply) completes. For high-variance multi-turn (rollouts of very different
     depths) this keeps the GPU busy across the many turn boundaries the synchronized path idles at.
 
+    The work is split across two threads so the per-turn ENV work (env reply + glue render — the
+    overhead that bounds an otherwise GPU-light rollout) overlaps the GPU decode instead of blocking
+    it: the MAIN thread owns the engine (submit / poll / busy) and a single WORKER thread owns the
+    env (``_advance_after_turn``). vLLM's ``step()`` runs the model forward in CUDA with the GIL
+    released, so the worker advances finished turns DURING the decode of the still-running ones. The
+    two threads share no mutable state — only thread-safe queues, and each next-turn prefix is handed
+    over as a copy — so the env (not thread-safe) is touched by exactly one thread and the engine by
+    exactly one thread. Results are byte-identical to one :func:`rollout_one` per example (a rollout
+    keeps at most one request in flight, so its turns stay strictly sequential), in input order.
+
     The engine is injected as three callables so the loop is unit-testable on CPU:
       * ``submit(req_id, prefix_ids, max_tokens, initial)`` — enqueue one assistant-turn request
         (``initial`` marks a turn-0 prompt, the only externally-rendered ids worth bounds-checking);
@@ -421,31 +433,81 @@ def rollout_async(
     rollouts = _build_rollout_states(examples, active_env, render, engine_max_len)
     by_id: dict[str, _RolloutState] = {}
     counter = 0
+    to_env: queue.Queue = queue.Queue()  # main -> worker: finished turns to fold + run the env step
+    to_submit: queue.Queue = queue.Queue()  # worker -> main: ("next", r, prefix, max_new) | ("done", r)
 
-    def launch(r: _RolloutState) -> None:
-        """Submit r's next assistant turn, or no-op (marking r done) if its budget is exhausted."""
+    def do_submit(r: _RolloutState, prefix: list[int], max_new: int, initial: bool) -> None:
         nonlocal counter
-        max_new = _turn_budget(r, per_turn_max_tokens)
-        if max_new is None:
-            return  # _turn_budget marked r.done — nothing left to generate
         req_id = f"r{counter}"
         counter += 1
         by_id[req_id] = r
-        submit(req_id, list(r.cur_ids), max_new, r.turns == 0)
+        submit(req_id, prefix, max_new, initial)
 
-    for r in rollouts:
-        launch(r)  # prime turn 0 for every rollout
-    # Drain: each finished turn is folded + its env step run + its next turn enqueued immediately,
-    # so freed decode slots refill with other rollouts' next turns rather than idling at a barrier.
-    while busy():
-        for req_id, asst_ids, asst_lp, text in poll():
-            r = by_id.pop(req_id)
-            _advance_after_turn(
-                r, asst_ids, asst_lp, text,
-                active_env=active_env, env_glue=env_glue, max_turns=max_turns,
-            )
-            if not r.done:
-                launch(r)
+    def env_worker() -> None:
+        # Owns the env: fold each finished turn, run its env step (env reply + glue render), and hand
+        # the next-turn prefix (a copy) back to the main thread — or signal the rollout is done. An
+        # env/template error here must propagate to the main thread (which owns the engine), not die
+        # silently in this thread and hang the main loop waiting for a result that never comes.
+        while True:
+            item = to_env.get()
+            if item is None:
+                return
+            r, asst_ids, asst_lp, text = item
+            try:
+                _advance_after_turn(
+                    r, asst_ids, asst_lp, text,
+                    active_env=active_env, env_glue=env_glue, max_turns=max_turns,
+                )
+                max_new = None if r.done else _turn_budget(r, per_turn_max_tokens)
+            except Exception as exc:  # surfaced + re-raised on the main thread (engine owner)
+                to_submit.put(("error", exc))
+                return
+            to_submit.put(("done", r) if max_new is None else ("next", r, list(r.cur_ids), max_new))
+
+    worker = threading.Thread(target=env_worker, daemon=True)
+    worker.start()
+    n = len(rollouts)
+    completed = 0
+
+    def take(msg) -> None:
+        nonlocal completed
+        if msg[0] == "error":
+            raise msg[1]  # re-raise the worker's env/template error on the main thread
+        if msg[0] == "done":
+            completed += 1
+        else:
+            _, r, prefix, max_new = msg
+            do_submit(r, prefix, max_new, False)
+
+    try:
+        for r in rollouts:  # prime turn 0 on the main thread
+            max_new = _turn_budget(r, per_turn_max_tokens)
+            if max_new is None:
+                completed += 1
+            else:
+                do_submit(r, list(r.cur_ids), max_new, r.turns == 0)
+        while completed < n:
+            progressed = False
+            while True:  # submit every next-turn the worker has produced (and count finished ones)
+                try:
+                    take(to_submit.get_nowait())
+                    progressed = True
+                except queue.Empty:
+                    break
+            if completed >= n:
+                break
+            if busy():  # step the engine; hand finished turns to the worker (overlaps its env work)
+                for req_id, asst_ids, asst_lp, text in poll():
+                    to_env.put((by_id.pop(req_id), asst_ids, asst_lp, text))
+            elif not progressed:
+                # nothing in flight and nothing newly ready: the worker is mid-advance — block on its
+                # next output instead of spinning (every rollout is in exactly one stage, so this
+                # can't deadlock: the only state with all queues + in-flight empty is all-done).
+                with contextlib.suppress(queue.Empty):
+                    take(to_submit.get(timeout=0.1))
+    finally:
+        to_env.put(None)
+        worker.join()
 
     # Score with the ACTUAL accumulated rollout state (matches rollout_one), batched per task.
     rewards = _score_rollouts(active_env, rollouts)
