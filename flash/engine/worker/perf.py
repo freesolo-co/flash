@@ -95,11 +95,16 @@ def _flash_attn_3_available() -> bool:
 def _flash_attn_available() -> bool:
     """True when the ``flash_attn`` (FA2) wheel is importable (baked into the worker image).
 
-    Drives BOTH the FA2 attn_implementation selection (Ampere/Ada, and Hopper without FA3) AND the
-    SFT packing default: TRL's ``packing_strategy='bfd'`` produces flattened/padding-free batches
-    whose example boundaries are carried by ``position_ids`` and enforced ONLY by a varlen-capable
-    attention impl (FA2/FA3/flex). Under plain SDPA, packed examples attend ACROSS boundaries
-    (silent quality loss). find_spec only — no import side effects (and no CUDA init). The escape
+    Drives the FA2 ``attn_implementation`` selection on Ampere/Ada (via ``_attn_impl_for_capability``)
+    AND the SFT packing default on every arch. ``_attn_impl_for_capability`` itself never picks FA2 on
+    Hopper (FA3, else uniform SDPA); FA2 re-enters there ONLY through the SFT packing path, which
+    forces FA2 varlen when ``optimal_attn_impl`` returned None (Hopper without FA3). On sm120 the
+    selector returns ``"sdpa"`` and run_sft DISABLES packing instead (consumer Blackwell stays plain
+    SDPA — no flash), so sm120 never forces FA2. Packing rationale: TRL's ``packing_strategy='bfd'``
+    produces flattened/padding-free
+    batches whose example boundaries are carried by ``position_ids`` and enforced ONLY by a
+    varlen-capable attention impl (FA2/FA3/flex). Under plain SDPA, packed examples attend ACROSS
+    boundaries (silent quality loss). find_spec only — no import side effects (no CUDA init). The escape
     hatch ``FLASH_DISABLE_FA2=1`` forces it off (reverts that arch to plain SDPA + no packing,
     without rebuilding the image — e.g. if a wheel lacks kernels for the live arch)."""
     if _env_flag_disabled("FLASH_DISABLE_FA2"):
@@ -140,10 +145,8 @@ def optimal_attn_impl() -> str | None:
             else "flash_attn_interface absent (FA3 is baked into the worker image by default — check the install)"
         )
         print(f"[attn] sm{major}{minor}: FA3 {why} -> SDPA")
-    elif major == 12:
+    elif major == 12:  # the only arch that returns impl=="sdpa" -> this branch covers all of it
         print(f"[attn] sm{major}{minor} (consumer Blackwell) -> SDPA/cuDNN (FA3/FA4 need TMEM; n/a on sm120)")
-    elif impl == "sdpa":
-        print(f"[attn] sm{major}{minor} -> attn_implementation=sdpa")
     elif not fa2:
         print(f"[attn] sm{major}{minor}: flash_attn wheel absent -> SDPA")
     return impl

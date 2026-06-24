@@ -332,8 +332,8 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
 
 def test_attn_impl_for_capability_per_arch(monkeypatch):
     """Pure capability -> best-per-arch flash policy (no CUDA needed): flash on every arch EXCEPT
-    consumer Blackwell sm120. Hopper(sm90): FA3 > FA2 > SDPA. Ampere(sm80/86)+Ada(sm89): FA2.
-    sm120: cuDNN SDPA (FA3/FA4 can't run; FA2 wheel coverage unverified)."""
+    consumer Blackwell sm120. Hopper(sm90): FA3, else a UNIFORM fall back to plain SDPA (NO FA3->FA2
+    chain). Ampere(sm80/86)+Ada(sm89): FA2. sm120: cuDNN SDPA (FA3/FA4 can't run)."""
     w = _import_worker(monkeypatch)
     f = w._attn_impl_for_capability
     # Hopper sm90: FA3 is the arch's best flash; absent -> plain SDPA (uniform fallback, NOT FA2).
