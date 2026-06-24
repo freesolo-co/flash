@@ -371,6 +371,24 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     assert "next-best GPU" in res.detail
 
 
+def test_capacity_grace_defaults_are_one_minute():
+    # The two no-capacity backstops — IN_QUEUE with no worker (queue_grace_s) and a worker stuck
+    # THROTTLED (throttled_grace_s) — fail fast (~1 min) so the runner's gpu-walk re-provisions on
+    # the next-best class instead of blocking the run on a class that is out of capacity. A *placed*
+    # worker that is still cold-starting is governed by the much larger setup_grace_s and must NOT be
+    # shortened — assert it stays large so we never abandon a legitimately-initializing worker.
+    import inspect
+
+    from flash.providers.runpod import jobs
+
+    assert jobs.stall_kwargs()["queue_grace_s"] == 60.0
+    assert jobs.stall_kwargs()["setup_grace_s"] >= 1800.0  # cold-start budget unchanged
+    sig = inspect.signature(jobs.poll_job)
+    assert sig.parameters["queue_grace_s"].default == 60.0
+    assert sig.parameters["throttled_grace_s"].default == 60.0
+    assert sig.parameters["setup_grace_s"].default >= 1800.0
+
+
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     # A job that leaves IN_QUEUE (a worker picks it up) must clear the queue timer: the later
     # IN_PROGRESS/COMPLETED path is governed by the heartbeat/setup windows, never by queue_grace_s.
@@ -499,6 +517,7 @@ def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
         heartbeat_reader=lambda: None,
         stall_after_s=150.0,
         setup_grace_s=100000.0,  # huge: only the unhealthy fast-fail can trip here
+        queue_grace_s=100000.0,  # huge: isolate the unhealthy path from the (tight) queue backstop
         unhealthy_grace_s=240.0,
     )
     assert res.failure == "stalled"  # infra-shaped -> runner retries on a fresh endpoint
@@ -547,6 +566,7 @@ def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
         heartbeat_reader=lambda: None,
         stall_after_s=150.0,
         setup_grace_s=100000.0,
+        queue_grace_s=100000.0,  # huge: isolate the transient-unhealthy recovery from the queue backstop
         unhealthy_grace_s=240.0,
     )
     assert res.ok
@@ -580,6 +600,7 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
         stall_after_s=150.0,
         setup_grace_s=100000.0,  # huge: only the throttled fast-fail can trip here
         unhealthy_grace_s=100000.0,  # huge: isolate the throttled path
+        queue_grace_s=100000.0,  # huge: isolate the throttled path from the (tight) queue backstop
         throttled_grace_s=300.0,
     )
     assert res.failure == "stalled"  # infra-shaped -> runner retries on the next-best GPU
@@ -628,6 +649,7 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
         heartbeat_reader=lambda: None,
         stall_after_s=150.0,
         setup_grace_s=100000.0,
+        queue_grace_s=100000.0,  # huge: isolate the transient-throttle recovery from the queue backstop
         throttled_grace_s=300.0,
     )
     assert res.ok
