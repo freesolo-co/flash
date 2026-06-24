@@ -19,9 +19,9 @@ on:
         required: false
       flash_attn_3_spec:
         description: >-
-          FlashAttention-3 (Hopper sm90) install spec passed as the FLASH_ATTN_3_SPEC build-arg
-          (a prebuilt cu128/torch2.10 flash_attn_3 wheel URL preferred). Empty -> SDPA on Hopper.
-        default: ""
+          FlashAttention-3 (Hopper sm90) install spec -> FLASH_ATTN_3_SPEC build-arg. Leave at the
+          default validated wheel to bake FA3 into every image; override to pin a different wheel.
+        default: "https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl"
         required: false
   push:
     branches: [main]
@@ -74,4 +74,4 @@ jobs:
           # (cu128 / torch2.10 / cp312).
           build-args: |
             FLASH_ATTN_SPEC=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
-            FLASH_ATTN_3_SPEC=${{ github.event.inputs.flash_attn_3_spec || '' }}
+            FLASH_ATTN_3_SPEC=${{ github.event.inputs.flash_attn_3_spec || 'https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl' }}

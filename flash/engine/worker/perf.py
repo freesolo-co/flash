@@ -31,33 +31,30 @@ def _attn_impl_for_capability(
     pure-PyTorch delta rule once fla is dropped on Hopper) — FlashAttention does not apply to linear
     attention.
 
-      * Hopper (sm90, H100/H200): "flash_attention_3" when ``flash_attn_interface`` is installed
-        (``fa3_available``) — FA3's warp-specialized async kernels are the fastest exact attention
-        on Hopper; transformers routes it to the LOCAL ``flash_attn_interface`` (no HF Kernels-Hub,
-        whose torch2.10 versions break ``import transformers``). Falls back to FA2, then SDPA.
+    Each arch maps to its ONE best flash kernel; the fallback is UNIFORM — plain SDPA on every arch
+    when that kernel's package is absent (no special FA3->FA2 chain on Hopper):
+      * Hopper (sm90, H100/H200): "flash_attention_3" — FA3's warp-specialized async kernels are the
+        fastest exact attention on Hopper; transformers routes it to the LOCAL ``flash_attn_interface``
+        (no HF Kernels-Hub, whose torch2.10 versions break ``import transformers``). FA3 is baked into
+        the worker image by default (Dockerfile FLASH_ATTN_3_SPEC), so ``fa3_available`` is normally
+        True; absent (or ``FLASH_DISABLE_FA3``) -> plain SDPA, same as every other arch.
       * Ampere (sm80 A100 / sm86 3090·A6000) + Ada (sm89 4090·L40S): "flash_attention_2" when the
         ``flash_attn`` wheel is importable (``fa2_available``) — FA3 does NOT support these archs.
-        Previously these returned None (plain SDPA) in the GRPO path; FA2 is the real flash kernel.
-      * consumer Blackwell (sm120 5090 / RTX Pro): "sdpa" forced to the cuDNN backend. FA3/FA4 do
-        NOT run on sm120 (no TMEM/tcgen05), and the prebuilt FA2 CUDA wheel's sm120 coverage is
-        unverified, so cuDNN SDPA is the validated best here (the SFT packing path may still use FA2
-        varlen where the wheel supports it — that decision is separate).
+      * consumer Blackwell (sm120 5090 / RTX Pro): "sdpa" forced to the cuDNN backend. THE ONE arch
+        with no flash: FA3/FA4 need TMEM/tcgen05 that sm120 lacks, and the prebuilt FA2 CUDA wheel's
+        sm120 coverage is unverified, so cuDNN SDPA is the validated best here.
       * anything else / flash unavailable -> None: transformers picks SDPA (already flash-backed on
         Ampere/Ada/Hopper).
     Pure function (no torch / no imports) so it's unit-testable on CPU; ``fa2_available`` /
     ``fa3_available`` are the caller's probes (``optimal_attn_impl``). The big LoRA win is still the
     Liger/chalk fused kernels; flash helps only the ~25% full-attention layers of the hybrid arch."""
-    if major == 9:  # Hopper: FA3 (best) > FA2 > SDPA
-        if fa3_available:
-            return "flash_attention_3"
-        if fa2_available:
-            return "flash_attention_2"
-        return None
-    if major == 8 and fa2_available:  # Ampere (8.0/8.6) + Ada (8.9): FA2 (no FA3 on these archs)
+    if major == 9 and fa3_available:  # Hopper: FA3 is the arch's best flash kernel
+        return "flash_attention_3"
+    if major == 8 and fa2_available:  # Ampere (8.0/8.6) + Ada (8.9): FA2 is the arch's best flash
         return "flash_attention_2"
-    if major == 12:  # Blackwell consumer: cuDNN SDPA (FA3/FA4 can't run; FA2 sm120 coverage unverified)
+    if major == 12:  # consumer Blackwell: cuDNN SDPA (the one exception — FA3/FA4 need TMEM/tcgen05)
         return "sdpa"
-    return None
+    return None  # the arch's flash kernel is absent -> plain SDPA (the SAME fallback on every arch)
 
 
 def _flash_attn_3_available() -> bool:
@@ -126,10 +123,11 @@ def optimal_attn_impl() -> str | None:
         ver = "FlashAttention-3" if impl == "flash_attention_3" else "FlashAttention-2"
         print(f"[attn] sm{major}{minor} -> attn_implementation={impl} ({ver}, full-attention layers)")
     elif major == 9 and not fa3:
-        # Hopper without FA3 built in -> FA2 if available, else SDPA; note it so an A/B is unambiguous.
+        # Hopper but FA3 not importable (FLASH_DISABLE_FA3, or a broken/absent flash_attn_interface
+        # despite the default image baking it in) -> plain SDPA, same uniform fallback as every arch.
         print(
-            f"[attn] sm{major}{minor}: flash_attn_interface absent -> "
-            f"{'flash_attention_2' if fa2 else 'SDPA'} (set FLASH_ATTN_3_SPEC to enable FA3)"
+            f"[attn] sm{major}{minor}: flash_attn_interface absent -> SDPA "
+            "(FA3 is baked into the worker image by default; check FLASH_DISABLE_FA3 / the FA3 install)"
         )
     elif major == 12:
         print(f"[attn] sm{major}{minor} (consumer Blackwell) -> SDPA/cuDNN (FA3/FA4 need TMEM; n/a on sm120)")

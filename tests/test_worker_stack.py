@@ -318,9 +318,9 @@ def test_attn_impl_for_capability_per_arch(monkeypatch):
     import flash.engine.worker as w
 
     f = w._attn_impl_for_capability
-    # Hopper sm90: FA3 best, FA2 fallback, then SDPA.
+    # Hopper sm90: FA3 is the arch's best flash; absent -> plain SDPA (uniform fallback, NOT FA2).
     assert f(9, 0, fa3_available=True, fa2_available=True) == "flash_attention_3"
-    assert f(9, 0, fa3_available=False, fa2_available=True) == "flash_attention_2"
+    assert f(9, 0, fa3_available=False, fa2_available=True) is None  # uniform: -> SDPA, not FA2
     assert f(9, 0, fa3_available=False, fa2_available=False) is None
     # Ampere (8.0/8.6) + Ada (8.9): FA2 when the wheel is present, else SDPA. FA3 never applies.
     assert f(8, 0, fa2_available=True) == "flash_attention_2"  # A100

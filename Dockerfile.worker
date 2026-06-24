@@ -64,18 +64,21 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" MAX_JOBS=4 \
     pip install --no-cache-dir "${FLASH_ATTN_SPEC}" --no-build-isolation \
     && echo "flash-attn: installed (${FLASH_ATTN_SPEC})" || echo "flash-attn: build failed, SDPA fallback"
 
-# FlashAttention-3 (Hopper sm90 ONLY: H100/H200). transformers routes
+# FlashAttention-3 (used on Hopper sm90: H100/H200). transformers routes
 # attn_implementation="flash_attention_3" to a LOCAL ``flash_attn_interface`` module (the
-# ``flash-attn-3`` Hopper build) — NOT the HF Kernels-Hub, whose torch2.10-compatible versions break
-# ``import transformers``. Installing it lets the trainer use FA3 on the model's FULL-attention
+# ``flash-attn-3`` build) — NOT the HF Kernels-Hub, whose torch2.10-compatible versions break
+# ``import transformers``. Baking it in lets the trainer use FA3 on the model's FULL-attention
 # (softmax) layers on Hopper (engine.worker.perf.optimal_attn_impl); the Qwen3.5 Gated-DeltaNet
-# linear-attention layers are unaffected (FA does not apply to linear attention). FA3 is built for
-# sm90 only but still heavy, so it is OPT-IN: set FLASH_ATTN_3_SPEC to a prebuilt cu128/torch2.10/
-# cp312 wheel URL (preferred) or a pip spec (e.g. a git subdirectory build of flash-attention/hopper).
-# Empty (default) -> skip, and Hopper runs fall back to SDPA. Best-effort like FA2: a failure never
-# blocks the image, and ``import flash_attn_interface`` is verified so a broken install can't ship as
-# "present" and then crash a run.
-ARG FLASH_ATTN_3_SPEC=
+# linear-attention layers are unaffected (FA does not apply to linear attention).
+# DEFAULT-ON, like FA2: FLASH_ATTN_3_SPEC defaults to a validated prebuilt cu128/torch2.10 wheel so
+# ``flash_attn_interface`` is ALWAYS present on Hopper — we control the image, so FA3 should never be
+# missing and the engine's SDPA fallback is pure defense-in-depth (only hit via FLASH_DISABLE_FA3).
+# It's a no-op on non-Hopper archs (optimal_attn_impl only probes FA3 on sm90); the wheel just rides
+# along. Override FLASH_ATTN_3_SPEC to pin a different wheel, or set it to "" to drop FA3. Best-effort:
+# a failed install never blocks the image, and ``import flash_attn_interface`` is verified so a broken
+# install can't ship as "present" and then crash a run.
+# NOTE: keep this default in sync with .github/workflows/worker-image.yml's flash_attn_3_spec input.
+ARG FLASH_ATTN_3_SPEC=https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl
 RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
       FLASH_ATTN_CUDA_ARCHS=90 TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=4 \
       pip install --no-cache-dir "${FLASH_ATTN_3_SPEC}" --no-build-isolation \
