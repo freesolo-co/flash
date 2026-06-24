@@ -443,6 +443,7 @@ def _save_status(status: RunStatus) -> None:
 # run AFTER the store layer above is fully defined; lifecycle/deploy import the store via
 # FUNCTION-LOCAL lazy `from flash.runner import ...` to avoid a partially-initialized cycle.
 from flash.runner.deploy import (  # noqa: E402,F401
+    attach_checkpoint_deployment,
     attach_run,
     cancel_run,
     mark_deployed,
