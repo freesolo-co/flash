@@ -330,7 +330,6 @@ def _neutralize_tilelang_cudart_stub() -> None:
     discoverable real runtime is a clean no-op; any error is swallowed (the worker must never crash
     on this hygiene step). No GPU required.
     """
-    import ctypes
     import importlib.util
 
     try:
@@ -341,15 +340,16 @@ def _neutralize_tilelang_cudart_stub() -> None:
     if not locs:
         return  # tilelang not installed -> nothing can shadow libcudart
     stub = os.path.join(locs[0], "lib", "libcudart_stub.so")
-    if not os.path.exists(stub):
+    if not os.path.lexists(stub):  # lexists: a dangling symlink still counts as present
         return
-    # Already healthy? A prior neutralize (this run is re-entrant), or a tilelang build whose stub
-    # carries the symbol, means the stub path ALREADY exposes cudaDeviceReset — leave it untouched.
-    try:
-        if hasattr(ctypes.CDLL(stub), "cudaDeviceReset"):
-            return
-    except Exception:
-        pass  # an unloadable/partial stub still gets replaced below
+    # Idempotency WITHOUT loading the stub: we only ever turn the stub into a symlink, and a pristine
+    # tilelang always ships it as a regular file, so a symlink here means a prior pass already
+    # neutralized it. Crucially, do NOT probe the stub with ctypes.CDLL — that dlopens it (it loads
+    # fine under lazy binding despite the missing cudaDeviceReset) and maps it into THIS process's
+    # /proc/self/maps, which is exactly the libcudart line vLLM's CudaRTLibrary scan would then pick
+    # up -> the very crash we're preventing. The stub must never be loaded; only the file is touched.
+    if os.path.islink(stub):
+        return
     real = _find_real_libcudart()
     if real is None:
         print(
