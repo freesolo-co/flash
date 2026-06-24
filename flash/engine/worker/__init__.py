@@ -66,8 +66,9 @@ from flash.engine.worker.lora import (
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,  # noqa: F401
-    _drop_fla_on_hopper,
+    _ensure_fla_fastpath_on_hopper,
     _estimate_params,  # noqa: F401
+    _flash_attn_3_available,  # noqa: F401
     _flash_attn_available,
     _GpuPeakSampler,
     _liger_default_for_model,  # noqa: F401
@@ -328,12 +329,73 @@ def prefetch_model(model_id: str) -> float:
     return secs
 
 
+# Trainer-state files a serving engine never needs: optimizer/scheduler/rng/loss-curve
+# state. Excluded when publishing the deployable per-step adapter so each step's snapshot is
+# just the LoRA weights + config (a few MB), small enough to KEEP every step (no pruning).
+_CHECKPOINT_TRAINER_STATE = (
+    "optimizer.pt",
+    "optimizer.bin",
+    "scheduler.pt",
+    "scaler.pt",
+    "rng_state*.pth",
+    "trainer_state.json",
+    "training_args.bin",
+    "*.distcp",
+    "global_step*/**",
+    "latest",
+    "zero_to_fp32.py",
+)
+
+# The PEFT adapter weights file a checkpoint must carry to be loadable/servable (safetensors is
+# the default; .bin is the legacy fallback). A step with adapter_config.json but no weights is
+# NOT deployable, so it's never published/listed.
+_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
+
+
+def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
+    """Mirror a trainer checkpoint's LoRA adapter to a stable, NON-pruned per-step path so a
+    run cancelled mid-RL is still one-command-deployable from its last good step.
+
+    The trainer's checkpoint folder already contains the PEFT adapter (``adapter_config.json``
+    + ``adapter_model.safetensors``) that ``deploy_adapter`` serves; we re-upload just those
+    (dropping optimizer/scheduler/rng state) to ``<prefix>/checkpoints/step-<step>/adapter``.
+    Unlike the resume checkpoint (``checkpoint/**``, kept latest-only), these accumulate, so
+    EVERY step stays deployable. Returns the deployable adapter subfolder, or ``None`` when
+    there's no adapter to publish. Best-effort: a failure here never fails a paid run.
+    """
+    if not HF_REPO:
+        return None
+    # Only publish a checkpoint that actually carries a loadable adapter (config AND weights) —
+    # never advertise a non-deployable step.
+    has_config = os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json"))
+    has_weights = any(os.path.isfile(os.path.join(ckpt_dir, w)) for w in _ADAPTER_WEIGHT_FILES)
+    if not (has_config and has_weights):
+        return None
+    subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
+    try:
+        hf_api().upload_folder(
+            folder_path=ckpt_dir,
+            path_in_repo=subfolder,
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+        )
+        heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
+        return subfolder
+    except Exception as e:
+        print(f"[ckpt] deployable publish warn (step {step}):", e)
+        return None
+
+
 def make_checkpoint_upload_callback():
     """Stream each trainer save to HF so preemption loses <= one save interval.
 
     Uploads run in a background thread (the train loop never blocks on the network);
     older checkpoints are deleted in the same commit. If an upload is still in flight
     when the next save fires, the new save is skipped (the following one catches up).
+
+    Each save also publishes a deployable per-step adapter snapshot (``publish_deployable_
+    checkpoint``) so a run cancelled mid-RL can still be deployed from its latest step.
     """
     from transformers import TrainerCallback
 
@@ -361,6 +423,9 @@ def make_checkpoint_upload_callback():
                         delete_patterns=[f"{hf_prefix()}/checkpoint/**"],
                     )
                     heartbeat("checkpoint_uploaded", step=step)
+                    # Mirror this step's adapter to its own kept-forever path so the run
+                    # stays deployable even if it never reaches "done".
+                    publish_deployable_checkpoint(ckpt_dir, step)
                 except Exception as e:
                     print("ckpt upload warn:", e)
                 finally:
@@ -710,16 +775,10 @@ def run_sft():
     env = require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
     heartbeat("sft_start", gpu=gpu_diagnostics())
-    # SFT only fits the single assistant `sft_target` per row; a multi-turn/ToolEnv env's
-    # tool/env turns are not represented, so SFT on one would silently mis-train (imitating a
-    # collapsed single-turn target). Warn loudly so it is not mistaken for proper multi-turn SFT.
-    if getattr(env, "multi_turn", False):
-        print(
-            "[sft][warn] this is a multi-turn Freesolo environment, but SFT only fits "
-            "the single assistant target per row (tool/env turns are ignored). The model will be "
-            "trained on collapsed single-turn targets; multi-turn SFT is not supported. Use a "
-            "single-turn environment, or expect a single-turn-only fit."
-        )
+    # SFT on a multi-turn env: rows whose target completion is a full trajectory train on the whole
+    # transcript (proper multi-turn SFT, handled below); rows with a single-turn target completion
+    # collapse to one assistant turn. Warn only for the collapsing case (computed during the
+    # dataset build below), not unconditionally.
     wait_for_gpu()
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
@@ -740,17 +799,31 @@ def run_sft():
     if max_examples > 0:
         train = train[:max_examples]
     texts = []
+    multiturn_targets = 0
     for ex in train:
-        msgs = [
-            *env.prompt_messages(ex),
-            {"role": "assistant", "content": env.sft_target(ex)},
-        ]
+        # The env (via the freesolo-sdk Environment.sft_completion) owns the target completion: the
+        # full multi-turn target trajectory (assistant turns + tool calls + tool results + replies)
+        # when the row ships one, else a single target assistant turn. Training on the whole
+        # transcript is what makes SFT actually multi-turn (the tool-call protocol + replies) — the
+        # warm start the GRPO recipe expects. A >1-message completion is a multi-turn trajectory.
+        completion = env.sft_completion(ex)
+        if len(completion) > 1:  # a multi-turn target trajectory (vs a single assistant turn)
+            multiturn_targets += 1
+        msgs = [*env.prompt_messages(ex), *completion]
         texts.append(
             {
                 "text": tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=False, enable_thinking=THINKING
                 )
             }
+        )
+    if multiturn_targets:
+        print(f"[sft] multi-turn SFT: {multiturn_targets}/{len(train)} rows train on a full target transcript")
+    elif getattr(env, "multi_turn", False):
+        print(
+            "[sft][warn] this is a multi-turn Freesolo environment but no row ships a multi-turn "
+            "target completion; SFT collapses to a single assistant turn per row (tool/env turns "
+            "ignored). Provide target transcripts (output={\"messages\": [...]}) for proper multi-turn SFT."
         )
     if THINKING and not any("<think>" in t["text"] for t in texts[:256]):
         print(
@@ -824,10 +897,15 @@ def run_sft():
         "logging_steps": 10,
         "save_steps": sft_save_default,
         "save_total_limit": 1,
-        # Memory-light checkpoints: save ONLY the (small LoRA) model, not the optimizer /
-        # scheduler / RNG state — skips the optimizer-state serialization spike at save and
-        # writes just the adapter. (We don't resume mid-run; seeds restart cleanly.)
-        "save_only_model": True,
+        # Resumable checkpoints: save the optimizer / scheduler / RNG state alongside the (small)
+        # LoRA adapter. We DO resume mid-run — make_checkpoint_upload_callback streams each save to
+        # HF and a replacement worker calls resume_from_checkpoint(hf_resume_checkpoint()) after a
+        # preemption — so without this the resumed run would re-initialize the optimizer (Adam
+        # moments) and LR schedule instead of truly continuing. For LoRA the optimizer state is tiny
+        # (it covers only the trainable adapter params), so the save spike is negligible. The
+        # deployable per-step snapshot (publish_deployable_checkpoint) strips this trainer state
+        # separately, so serving still gets adapter-only files.
+        "save_only_model": False,
         "max_length": sft_max_len,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
@@ -876,13 +954,27 @@ def run_sft():
     if liger_on(_memory_mode(model_id, sft_max_len)):
         cfg_kwargs["use_liger_kernel"] = True
         print("[sft] liger fused kernels enabled")
-    _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
-    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen attn.
-    # With FA2 importable force flash_attention_2 — a pure win over the SDPA default which would
-    # cross-contaminate packed examples.
-    if cfg_kwargs.get("packing") and _fa_ok:
-        _attn = "flash_attention_2"
-        print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+    _attn = optimal_attn_impl()  # arch-best FlashAttention (FA3 Hopper / FA2 Ampere·Ada) or SDPA
+    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen-capable attn
+    # (FA2 and FA3 both expose flash_attn_varlen_func; plain SDPA cross-contaminates packed examples).
+    # Use the ARCH-BEST flash impl optimal_attn_impl already picked (so Hopper packs under FA3, not
+    # FA2). Cases when it did NOT pick a flash impl:
+    #   * _attn == "sdpa" (sm120, the deliberate no-flash exception): DISABLE packing — consumer
+    #     Blackwell stays plain SDPA; do NOT force FA2 (its sm120 kernel coverage is unverified).
+    #   * _attn is None (Hopper without FA3): force FA2 for boundary-correct varlen IF the wheel is
+    #     importable; else drop packing rather than silently cross-contaminate.
+    if cfg_kwargs.get("packing"):
+        if _attn in ("flash_attention_2", "flash_attention_3"):
+            print(f"[sft] attn_implementation={_attn} (packing boundary-correct varlen)")
+        elif _attn == "sdpa":
+            cfg_kwargs["packing"] = False
+            print("[sft] packing disabled: selected attn_implementation=sdpa (no varlen flash backend)")
+        elif _fa_ok:
+            _attn = "flash_attention_2"
+            print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+        else:
+            cfg_kwargs["packing"] = False
+            print("[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA")
     # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
     # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
     # accelerate-offload large models to meta ("expected device meta but got
@@ -1398,6 +1490,20 @@ def run_rl():
     is_tool_env = getattr(env, "is_tool_env", False)
     is_multi_turn = getattr(env, "multi_turn", False)
     conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
+    if is_multi_turn:
+        # The Liger fused GRPO loss (use_liger_kernel, kept ON to avoid the 248k-vocab fp32-logits
+        # OOM) torch.compiles, and on the VARIABLE-length multi-turn completions its dynamo guard
+        # build trips a torch 2.10 bug (symbol_to_source IndexError) that crashes the first
+        # training step. Let dynamo FALL BACK TO EAGER for the offending function instead of
+        # raising. This is NOT `TORCHDYNAMO_DISABLE` (which would also break the colocate vLLM
+        # engine's required compilation) — dynamo stays enabled; only erroring graphs run eager.
+        try:
+            import torch._dynamo
+
+            torch._dynamo.config.suppress_errors = True
+            print("[rl] multi-turn: torch._dynamo suppress_errors=True (Liger loss falls back to eager on dynamic shapes)")
+        except Exception as exc:  # never let a torch internals change block the run
+            print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
     wait_for_gpu()
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
@@ -1638,9 +1744,12 @@ def run_rl():
         "logging_steps": 1,
         "save_steps": _t.save_every if _t and _t.save_every is not None else 20,
         "save_total_limit": 1,
-        # Memory-light checkpoints: adapter only, no optimizer/scheduler/RNG state -> no
-        # serialization spike at save (the save-step OOM guard).
-        "save_only_model": True,
+        # Resumable checkpoints: keep the optimizer/scheduler/RNG state with the LoRA adapter so a
+        # preempted GRPO run resumed via resume_from_checkpoint(hf_resume_checkpoint()) continues
+        # with intact optimizer state + step instead of a fresh optimizer. For LoRA this state is
+        # small (trainable adapter params only). The deployable per-step snapshot strips it
+        # separately, so serving still gets adapter-only files.
+        "save_only_model": False,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
         "run_name": wandb_run_name(),
@@ -2119,8 +2228,8 @@ def main():
     try:
         # Idempotency FIRST — before any env-mutating pip install / package removal: a re-delivered
         # job whose DONE already exists must return the persisted metrics and exit WITHOUT running
-        # _drop_fla_on_hopper() (pip-uninstalls fla) — that wasted a worker mutating its env on an
-        # already-complete run. It is called after the DONE check below (see _drop_fla_on_hopper()).
+        # _ensure_fla_fastpath_on_hopper() (mutates the env: pip-installs tilelang/fla) — that wasted
+        # a worker mutating its env on an already-complete run. It runs after the DONE check below.
         if HF_REPO:
             from huggingface_hub import hf_hub_download
 
@@ -2152,8 +2261,8 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
+        _ensure_fla_fastpath_on_hopper()  # Hopper: enable fla+tilelang GDN fast path (see perf.py)
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
-        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {

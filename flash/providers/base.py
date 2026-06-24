@@ -39,7 +39,7 @@ class GpuClass:
     # card). The deployed control plane REJECTS a submit for a non-validated class ("gpu type 'X'
     # has not passed Flash's live validation smoke"), so client-side allocation restricts to the
     # validated pool by default (see ``validated_classes`` / allocator) — otherwise a default
-    # `flash train` could pick the absolute-cheapest fitting class (e.g. "RTX 2000 Ada") that the
+    # `flash train` could pick the absolute-cheapest fitting class (e.g. "L4") that the
     # server then refuses, and the run never submits. Exactly the smoke-validated members below
     # are marked True.
     validated: bool = False
@@ -67,31 +67,8 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         validated=True,
     ),
     # ---- Ampere/Ada workstation + datacenter cards (cheap capacity pools) ----
-    # Live-validated 2026-06-22: Qwen3.5-0.8B SFT train smoke (RunPod). 16 GB SFT-only tier (GRPO's
-    # 24 GB floor never routes here).
-    GpuClass(
-        "RTX A4000", "NVIDIA_RTX_A4000", 16, "a4000", "sm86", 0.25,
-        validated=True,
-    ),
-    # Live-validated 2026-06-22: Qwen3.5-0.8B/2B SFT train smokes (RunPod). 16 GB SFT-only tier.
-    GpuClass(
-        "RTX 2000 Ada",
-        "NVIDIA_RTX_2000_ADA_GENERATION",
-        16,
-        "2000ada",
-        "sm89",
-        0.24,
-        validated=True,
-    ),
-    GpuClass("RTX A4500", "NVIDIA_RTX_A4500", 20, "a4500", "sm86", 0.25),
-    GpuClass(
-        "RTX 4000 Ada",
-        "NVIDIA_RTX_4000_ADA_GENERATION",
-        20,
-        "4000ada",
-        "sm89",
-        0.26,
-    ),
+    # 24 GB is the floor: the sub-24 GB tiers (16 GB RTX A4000 / RTX 2000 Ada, 20 GB RTX A4500 /
+    # RTX 4000 Ada) were dropped — the 24 GB classes below are the smallest managed cards.
     GpuClass(
         "RTX 3090",
         "NVIDIA_GEFORCE_RTX_3090",
@@ -190,8 +167,6 @@ _ALIASES.update(
         "nvidia a40": "A40",
         "nvidia rtx 6000 ada generation": "RTX 6000 Ada",
         "rtx 6000 ada generation": "RTX 6000 Ada",
-        "nvidia rtx 4000 ada generation": "RTX 4000 Ada",
-        "nvidia rtx 2000 ada generation": "RTX 2000 Ada",
         "nvidia a100 80gb pcie": "A100 PCIe",
         "a100 80gb pcie": "A100 PCIe",
         "a100-80g-pcie": "A100 PCIe",
