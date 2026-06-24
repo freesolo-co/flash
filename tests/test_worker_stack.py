@@ -13,17 +13,15 @@ from flash.providers.runpod.train import (
 )
 
 
-def test_resolve_worker_deps_default(monkeypatch):
-    monkeypatch.delenv("FLASH_WORKER_DEPS", raising=False)
-    # The single pinned stack is the validated default (bench/results/phase1 matrix).
+def test_resolve_worker_deps_default():
+    # The single pinned stack is the validated default (bench/results/phase1 matrix); fully
+    # managed, no per-run override.
     assert resolve_worker_deps() == WORKER_DEPS
 
 
-def test_gdn_fastpath_deps_present_and_kept_on_hopper(monkeypatch):
+def test_gdn_fastpath_deps_present_and_kept_on_hopper():
     """The GDN fast-path stack (fla-from-git + tilelang + pinned apache-tvm-ffi) is baked in, and
     fla is KEPT on Hopper (sm90) — the #640 fix is fla's tilelang backend, not dropping fla."""
-    monkeypatch.delenv("FLASH_WORKER_DEPS", raising=False)
-    monkeypatch.delenv("FLASH_WORKER_EXTRA_DEPS", raising=False)
     joined = " ".join(WORKER_DEPS)
     assert (
         "git+https://github.com/fla-org/flash-linear-attention" in joined
@@ -39,19 +37,6 @@ def test_gdn_fastpath_deps_present_and_kept_on_hopper(monkeypatch):
     assert any("flash-linear-attention" in d for d in deps_h100), (
         "fla must be kept on Hopper for the tilelang fast path"
     )
-
-
-def test_resolve_worker_deps_explicit_list_wins(monkeypatch):
-    # Whitespace-separated; a comma is part of a PEP 440 range, not a delimiter.
-    monkeypatch.setenv("FLASH_WORKER_DEPS", "torch==2.99  vllm==9.9.9   transformers>=5.6,<5.11")
-    assert resolve_worker_deps() == ["torch==2.99", "vllm==9.9.9", "transformers>=5.6,<5.11"]
-
-
-def test_resolve_worker_deps_json_list_supports_comma_specs(monkeypatch):
-    monkeypatch.setenv(
-        "FLASH_WORKER_DEPS", '["torch==2.10.0", "transformers>=5.6,<5.11", "fla==0.5.0"]'
-    )
-    assert resolve_worker_deps() == ["torch==2.10.0", "transformers>=5.6,<5.11", "fla==0.5.0"]
 
 
 def test_worker_stack_pins_qwen35_capable_versions():
@@ -207,15 +192,23 @@ def test_loraplus_optimizer_bnb_missing_falls_back(monkeypatch):
 def test_grpo_no_op_failure_empty_reward_no_resume(monkeypatch):
     """Empty reward_history with no resume = the rollout scored nothing -> fail loudly (no-op run)."""
     worker = _import_worker(monkeypatch)
-    assert worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
+    assert (
+        worker._grpo_is_no_op_failure([], resume_ckpt=None, target_steps=10, steps_run=10) is True
+    )
 
 
 def test_grpo_no_op_ok_when_rewards_present(monkeypatch):
     """A non-empty reward_history means the reward path ran -> never a no-op failure."""
     worker = _import_worker(monkeypatch)
-    assert worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10) is False
+    assert (
+        worker._grpo_is_no_op_failure([0.0], resume_ckpt=None, target_steps=10, steps_run=10)
+        is False
+    )
     # An all-zero history (env returned all-zero rewards) still counts as real training.
-    assert worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0) is False
+    assert (
+        worker._grpo_is_no_op_failure([0.0, 0.0], resume_ckpt="ckpt", target_steps=10, steps_run=0)
+        is False
+    )
 
 
 def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
@@ -223,14 +216,19 @@ def test_grpo_no_op_ok_when_resume_already_complete(monkeypatch):
     worker = _import_worker(monkeypatch)
     assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=10) is True
     # Empty history is tolerated -> NOT a no-op failure (finalize the completed policy).
-    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12) is False
+    assert (
+        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=12)
+        is False
+    )
 
 
 def test_grpo_no_op_failure_resume_did_not_reach_target(monkeypatch):
     """A resume that did NOT reach the target steps with no reward is still a genuine no-op -> fail."""
     worker = _import_worker(monkeypatch)
     assert worker._grpo_resume_already_complete("ckpt", target_steps=10, steps_run=3) is False
-    assert worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
+    assert (
+        worker._grpo_is_no_op_failure([], resume_ckpt="ckpt", target_steps=10, steps_run=3) is True
+    )
     # No target steps configured can never count as a complete resume.
     assert worker._grpo_resume_already_complete("ckpt", target_steps=0, steps_run=0) is False
 
@@ -298,6 +296,7 @@ def test_heartbeat_terminal_only_mode(monkeypatch):
     import flash.engine.worker as w
 
     calls = []
+
     def _fake_upload(*a, **k):
         calls.append(a[1])
         return True  # simulate a successful commit so the throttle clock advances
@@ -350,36 +349,13 @@ def test_attn_impl_for_capability_per_arch(monkeypatch):
     assert f(12, 0, fa3_available=True, fa2_available=True) == "sdpa"
 
 
-def test_env_flag_disabled_case_insensitive(monkeypatch):
-    """The FLASH_DISABLE_FA2/FA3 parser ``_env_flag_disabled`` is CASE-INSENSITIVE and hermetic (pure
-    string logic, no heavy imports): only truthy values disable; '', 0, false/False/FALSE, no, off
-    (any case) do NOT — so FLASH_DISABLE_FA3=FALSE never silently disables the kernel."""
-    _import_worker(monkeypatch)
-    from flash.engine.worker.perf import _env_flag_disabled
-
-    for falsey in ("", "0", "false", "False", "FALSE", "no", "NO", "off", "Off"):
-        monkeypatch.setenv("X_FLAG", falsey)
-        assert _env_flag_disabled("X_FLAG") is False, falsey
-    for truthy in ("1", "true", "TRUE", "Yes", "on", "enable"):
-        monkeypatch.setenv("X_FLAG", truthy)
-        assert _env_flag_disabled("X_FLAG") is True, truthy
-    monkeypatch.delenv("X_FLAG", raising=False)
-    assert _env_flag_disabled("X_FLAG") is False  # unset -> not disabled
-
-
-def test_flash_attn_probes_disable_hatch(monkeypatch):
-    """The disable hatches short-circuit to False BEFORE any heavy import (so this is deterministic
-    in the offline CI env, which has neither transformers nor flash_attn). With the hatches unset the
-    probes also report False here because the packages are absent."""
+def test_flash_attn_probes_false_in_ci(monkeypatch):
+    """The FA2/FA3 probes report False in offline CI (neither transformers/flash_attn nor the FA3
+    ``flash_attn_interface`` is present). FA is used whenever importable — there is no disable
+    hatch, so the result is purely 'is the package available'."""
     w = _import_worker(monkeypatch)
-    monkeypatch.delenv("FLASH_DISABLE_FA3", raising=False)
-    monkeypatch.delenv("FLASH_DISABLE_FA2", raising=False)
     assert w._flash_attn_3_available() is False  # flash_attn_interface / transformers absent in CI
     assert w._flash_attn_available() is False  # flash_attn wheel absent in CI
-    monkeypatch.setenv("FLASH_DISABLE_FA3", "1")
-    assert w._flash_attn_3_available() is False  # hatch short-circuits
-    monkeypatch.setenv("FLASH_DISABLE_FA2", "1")
-    assert w._flash_attn_available() is False  # hatch short-circuits
 
 
 def test_liger_on_requires_default_and_gpu(monkeypatch):
@@ -413,7 +389,9 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w._estimate_params(big) >= 3e9
 
     def fake_cfg(cfg):
-        fake = types.SimpleNamespace(AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg))
+        fake = types.SimpleNamespace(
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: cfg)
+        )
         monkeypatch.setitem(sys.modules, "transformers", fake)
 
     fake_cfg(small)
@@ -453,8 +431,9 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
 
 
 def test_force_vllm_backend_for_sm120(monkeypatch):
-    """RTX 5090 / sm120 -> FLASHINFER pinned (PTX-independent rollout); an operator override and a
-    non-sm120 GPU leave VLLM_ATTENTION_BACKEND untouched. Regression for the empty-5090-rollout."""
+    """RTX 5090 / sm120 -> FLASHINFER pinned (PTX-independent rollout); deterministic, no operator
+    override. A non-sm120 GPU leaves VLLM_ATTENTION_BACKEND untouched. Regression for the
+    empty-5090-rollout."""
     import os
     import sys
     import types
@@ -475,10 +454,10 @@ def test_force_vllm_backend_for_sm120(monkeypatch):
     assert worker.force_vllm_backend_for_sm120() == "FLASHINFER"
     assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
 
-    # operator override wins (not clobbered)
+    # sm120: a pre-set value is OVERWRITTEN — there is no operator override anymore (deterministic)
     monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
-    assert worker.force_vllm_backend_for_sm120() is None
-    assert os.environ["VLLM_ATTENTION_BACKEND"] == "TRITON_ATTN"
+    assert worker.force_vllm_backend_for_sm120() == "FLASHINFER"
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
 
     # non-sm120 (sm90 Hopper) -> untouched
     monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
@@ -725,7 +704,9 @@ def test_hopper_outer_exception_disables_fla(monkeypatch):
     # Must NOT propagate (the worker keeps running on the pure-PyTorch delta path).
     perf._ensure_fla_fastpath_on_hopper()
 
-    assert removed, "outer exception path must FAIL-CLOSED: disable fla (call _remove_fla_from_disk)"
+    assert removed, (
+        "outer exception path must FAIL-CLOSED: disable fla (call _remove_fla_from_disk)"
+    )
 
 
 def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
@@ -743,9 +724,7 @@ def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "torch", t)
     touched: list[str] = []
-    monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: touched.append("pip"), raising=True
-    )
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: touched.append("pip"), raising=True)
     monkeypatch.setattr(
         perf, "_remove_fla_from_disk", lambda: (touched.append("remove"), ([], False))[1]
     )
@@ -817,6 +796,8 @@ def test_tilelang_pin_is_consistent_and_pinned():
     assert pm.group(1) == pin, (
         f"perf.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
     )
+
+
 def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):
     # A GPU that never comes up is infra-shaped -> typed RetriableInfraError, not RuntimeError.
     import time as _time
