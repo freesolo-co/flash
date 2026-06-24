@@ -958,6 +958,11 @@ def test_neutralize_never_loads_the_stub_into_the_process(tmp_path, monkeypatch)
     missing cudaDeviceReset, run neutralize, and assert it was never mapped."""
     import os
 
+    if not os.path.exists("/proc/self/maps"):
+        import pytest
+
+        pytest.skip("/proc/self/maps unavailable (non-Linux); the loaded-mapping assertion needs it")
+
     pkg = tmp_path / "tilelang"
     (pkg / "lib").mkdir(parents=True)
     (pkg / "__init__.py").write_text("")
@@ -988,3 +993,57 @@ def test_neutralize_never_loads_the_stub_into_the_process(tmp_path, monkeypatch)
     import ctypes
 
     assert hasattr(ctypes.CDLL(stub), "cudaDeviceReset")
+
+
+def test_neutralize_repoints_a_dangling_symlink(tmp_path, monkeypatch):
+    """A DANGLING stub symlink (a prior pass's target moved/was removed) is NOT 'already done' — it
+    leaves tilelang with a broken libcudart_stub.so. Neutralize must re-point it at a real lib."""
+    import importlib
+    import os
+
+    pkg = tmp_path / "tilelang"
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    stub = str(pkg / "lib" / "libcudart_stub.so")
+    os.symlink(str(tmp_path / "gone-libcudart.so.12"), stub)  # dangling: target does not exist
+    assert os.path.islink(stub)
+    assert not os.path.exists(stub)
+
+    real = tmp_path / "libcudart.so.12"
+    real.write_bytes(b"REAL-CUDART")
+
+    from flash.engine.worker import perf
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    monkeypatch.setattr(perf, "_find_real_libcudart", lambda: str(real))
+
+    perf._neutralize_tilelang_cudart_stub()
+
+    assert os.path.islink(stub)
+    assert os.path.exists(stub)  # now RESOLVES
+    assert os.path.realpath(stub) == os.path.realpath(str(real))
+
+
+def test_find_real_libcudart_handles_bare_soname_without_crashing(monkeypatch):
+    """find_library('cudart') returns a bare soname (e.g. 'libcudart.so.12'), not a path. The
+    os.path.exists guard must not silently drop it; with no loadable cudart present it still resolves
+    to None safely (and never raises)."""
+    import builtins
+    import ctypes.util
+    import glob
+
+    from flash.engine.worker import perf
+
+    monkeypatch.setattr(glob, "glob", lambda *_a, **_k: [])  # no absolute-path candidates
+    monkeypatch.setattr(ctypes.util, "find_library", lambda _n: "libcudart.so.12")  # bare soname
+    real_import = builtins.__import__
+
+    def _no_nvidia(name, *a, **k):
+        if name.startswith("nvidia"):
+            raise ImportError(name)
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_nvidia)
+    # On a host without a real libcudart the bare soname won't load -> None (no exception, no skip).
+    assert perf._find_real_libcudart() is None
