@@ -300,6 +300,11 @@ def deploy_train_endpoint(
 
     _QUOTA_MAX_RETRIES = 3
     resource = None
+    # One pass over the pool: advance_key() WRAPS (always True for a multi-key pool, even after the
+    # last account), so without a bound an all-exhausted pool would fail over forever here. Cap the
+    # failovers at "every OTHER account once" and then raise — the lifecycle retry budget handles
+    # waiting for quota to recover and re-enters this with a fresh attempt.
+    failovers_left = max(0, rp_keys.key_count() - 1)
     while resource is None:
         ensure_auth()  # collapse RUNPOD_API_KEY to the (possibly failed-over) active account key
         quota_exc: Exception | None = None
@@ -329,8 +334,11 @@ def deploy_train_endpoint(
                 quota_exc = exc  # freeable: sweep + retry, then fail over to the next account
         if resource is not None:
             break
-        # Quota still exhausted after sweeping this account dry — fail over to the next one.
-        if rp_keys.advance_key():
+        # Quota still exhausted after sweeping this account dry — fail over to the next one, but only
+        # until every account has been tried once (failovers_left). advance_key() wraps and always
+        # returns True for a multi-key pool, so the count — not its return value — is what stops us.
+        if failovers_left > 0 and rp_keys.advance_key():
+            failovers_left -= 1
             logger.warning(
                 "RunPod worker quota exhausted on this account after sweeping; failing over to "
                 "the next RUNPOD_API_KEY account (%d configured)",
@@ -542,9 +550,9 @@ def poll_job(
             elif now - queued_since > queue_grace_s:
                 return PollResult(
                     False,
-                    failure="stalled",
-                    detail=f"job stuck IN_QUEUE for {int(now - queued_since)}s (no RunPod capacity "
-                    f"for the pinned GPU class); retrying on the next-best GPU",
+                    failure="no_capacity",
+                    detail=f"never scheduled: job stuck IN_QUEUE for {int(now - queued_since)}s "
+                    "(no RunPod capacity for the pinned GPU class); retrying on the next-best GPU",
                 )
         else:
             queued_since = None
@@ -593,8 +601,8 @@ def poll_job(
                     elif time.time() - throttled_since > throttled_grace_s:
                         return PollResult(
                             False,
-                            failure="stalled",
-                            detail=f"worker stuck throttled for "
+                            failure="no_capacity",
+                            detail=f"never scheduled: worker stuck THROTTLED for "
                             f"{int(time.time() - throttled_since)}s while IN_QUEUE (no RunPod "
                             f"capacity for the pinned GPU class); retrying on the next-best GPU",
                         )
