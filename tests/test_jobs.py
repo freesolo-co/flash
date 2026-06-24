@@ -1293,7 +1293,7 @@ def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
 
-    def fake_sweep(skip_name):
+    def fake_sweep(protected, min_idle_s=0.0):
         swept["count"] += 1
         return 5
 
@@ -1319,7 +1319,7 @@ def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
 
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda skip_name: 0)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0: 0)
 
     with pytest.raises(RuntimeError, match="workers quota"):
         jobs.deploy_train_endpoint("A100", name_suffix="testrun")
@@ -1363,8 +1363,111 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
     monkeypatch.setattr(runpod_api, "list_endpoints", fake_list_endpoints)
     monkeypatch.setattr(runpod_api, "endpoint_health", fake_health)
     monkeypatch.setattr(runpod_api, "delete_endpoint", fake_delete)
+    jobs._idle_since.clear()
 
-    count = jobs._sweep_idle_flash_endpoints(skip_name="flash-a100-cur")
+    count = jobs._sweep_idle_flash_endpoints(
+        protected={"flash-a100-cur", "live-flash-a100-cur"}
+    )
 
     assert count == 2
     assert sorted(deleted) == sorted(["ep-live-idle", "ep-bare-idle"])
+
+
+def test_sweep_excludes_serve_endpoints(monkeypatch):
+    """An idle (scaled-to-zero) serve endpoint is an intentional deployment, NOT an orphan, so
+    the quota sweep must never delete it — only training endpoints are reaped."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    endpoints = [
+        {"id": "ep-train-idle", "name": "flash-a100-old"},  # idle training orphan -> delete
+        {"id": "ep-serve-idle", "name": "flash-serve-a100-dep"},  # idle deployment -> KEEP
+        {"id": "ep-serve-live", "name": "live-flash-serve-a100-dep2"},  # live- serve form -> KEEP
+    ]
+    idle = {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+            "jobs": {"inQueue": 0, "inProgress": 0}}
+    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: endpoints)
+    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: idle)
+    deleted = []
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    jobs._idle_since.clear()
+
+    count = jobs._sweep_idle_flash_endpoints(protected=set())
+    assert count == 1
+    assert deleted == ["ep-train-idle"]
+
+
+def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
+    """With min_idle_s > 0, an endpoint that reports a single transient zero (cold start / between
+    jobs) is NOT deleted; only one idle across sweeps for >= min_idle_s is reaped."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    monkeypatch.setattr(
+        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                     "jobs": {"inQueue": 0, "inProgress": 0}},
+    )
+    deleted = []
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    jobs._idle_since.clear()
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+
+    # First sweep: idle observed, but grace (300s) not elapsed -> not deleted, timer recorded.
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert deleted == []
+    assert "ep-x" in jobs._idle_since
+
+    # Still within grace -> still not deleted.
+    clock["t"] = 1200.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert deleted == []
+
+    # Past grace -> reaped.
+    clock["t"] = 1400.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 1
+    assert deleted == ["ep-x"]
+
+
+def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
+    """A busy reading clears the grace timer, so the idle clock restarts if it goes idle again —
+    a long-running endpoint that dips idle briefly is never reaped."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    state = {"busy": False}
+    monkeypatch.setattr(
+        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+    )
+
+    def health(eid):
+        w = {"running": 1 if state["busy"] else 0, "ready": 0, "idle": 0, "initializing": 0}
+        j = {"inQueue": 0, "inProgress": 1 if state["busy"] else 0}
+        return {"workers": w, "jobs": j}
+
+    monkeypatch.setattr(runpod_api, "endpoint_health", health)
+    deleted = []
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    jobs._idle_since.clear()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+
+    # idle at t=1000 -> timer set
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert "ep-x" in jobs._idle_since
+    # busy at t=1200 -> timer cleared
+    state["busy"] = True
+    clock["t"] = 1200.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert "ep-x" not in jobs._idle_since
+    # idle again at t=1400 -> fresh timer (not deleted: only 0s of new idleness)
+    state["busy"] = False
+    clock["t"] = 1400.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert deleted == []
