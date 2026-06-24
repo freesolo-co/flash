@@ -12,6 +12,7 @@ import urllib.error
 from typing import Any
 
 from flash.providers._http import RestClient
+from flash.providers.runpod import keys as _keys
 
 REST_BASE = "https://rest.runpod.io/v1"
 QUEUE_BASE = "https://api.runpod.ai/v2"
@@ -24,7 +25,18 @@ class RunpodApiError(RuntimeError):
 # Shared urllib client (full-URL form: callers pass absolute REST/QUEUE urls).
 # Env-only by design: ~/.flash/config.json holds the *Flash* key (client-side),
 # never the RunPod key — the operator sets RUNPOD_API_KEY on the control-plane host.
-_CLIENT = RestClient(env_var="RUNPOD_API_KEY", error_cls=RunpodApiError)
+#
+# ``RUNPOD_API_KEY`` may be a comma-separated pool of per-account keys: the client tries
+# them active-account-first per call (``keys.ordered_keys``) and fails over to the next
+# account on an auth/quota/not-found error (``keys.is_failover_error``). RunPod endpoints
+# are account-scoped, so a single-account op (status/cancel/delete) resolves no matter
+# which account a failed-over run was provisioned on. A single key => a pool of one.
+_CLIENT = RestClient(
+    env_var="RUNPOD_API_KEY",
+    error_cls=RunpodApiError,
+    keys_provider=_keys.ordered_keys,
+    failover_predicate=_keys.is_failover_error,
+)
 
 
 def request_with_retries(
