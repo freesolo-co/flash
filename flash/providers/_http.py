@@ -127,6 +127,22 @@ class RestClient:
             f"{method} {target} failed after {retries + 1} attempts: {last}"
         ) from last
 
+    def request_with_retries_for_key(
+        self,
+        key: str,
+        target: str,
+        method: str = "GET",
+        body: dict | None = None,
+        retries: int = 4,
+        base_delay: float = 2.0,
+    ) -> Any:
+        """Like request_with_retries but always uses the supplied key, bypassing the pool.
+
+        Use this when you need to query each account in the pool independently (e.g.
+        list_endpoints aggregation) rather than stopping at the first success.
+        """
+        return self._request_one_key(key, target, method, body, retries, base_delay)
+
     def request_with_retries(
         self,
         target: str,

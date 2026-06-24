@@ -12,6 +12,11 @@ import urllib.error
 
 import pytest
 
+# Captured at module-load time (before conftest._offline's autouse fixture fires).
+# conftest stubs `runpod_api.list_endpoints` to `lambda: []` for every test; tests that
+# exercise the real aggregation implementation restore it via this reference.
+from flash.providers.runpod.api import list_endpoints as _real_list_endpoints
+
 
 def _http_error(code: int, body: bytes = b"{}"):
     return urllib.error.HTTPError(
@@ -48,6 +53,8 @@ def test_comma_separated_pool_parsed_and_trimmed(monkeypatch):
 
 
 def test_advance_collapses_env_and_reorders(monkeypatch):
+    import os
+
     import flash.providers.runpod.keys as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
@@ -60,11 +67,12 @@ def test_advance_collapses_env_and_reorders(monkeypatch):
     # ordered_keys is active-first, then the rest (so a non-preferred account is still tried).
     assert keys.ordered_keys() == ["rk-b", "rk-a"]
     # advance collapses RUNPOD_API_KEY to the active key for the runpod_flash SDK.
-    import os
-
     assert os.environ["RUNPOD_API_KEY"] == "rk-b"
 
-    assert keys.advance_key() is False  # pool exhausted
+    # Pool cycles: after the last key wraps back to key #0, not exhausted.
+    assert keys.advance_key() is True
+    assert keys.active_key() == "rk-a"
+    assert os.environ["RUNPOD_API_KEY"] == "rk-a"
 
 
 def test_select_active_collapses_env(monkeypatch):
@@ -229,3 +237,51 @@ def test_rest_waterfall_persistent_5xx_does_not_fail_over(monkeypatch):
 # _patch_deploy_deps / _make_runpod_flash_mocks helpers it shares with the other deploy tests),
 # and the idle-endpoint reaper / run-aware protection tests live in test_idle_endpoint_reaper.py
 # and test_jobs.py (the proactive reclaim mechanism from #190).
+
+
+# ---------------------------------------------------------------------------
+# list_endpoints — multi-key aggregation and raise-on-failure contract
+# ---------------------------------------------------------------------------
+def test_list_endpoints_aggregates_across_all_keys(monkeypatch):
+    """Endpoints from every account are merged into a single list."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
+    keys.reset()
+
+    responses = {
+        "rk-a": [{"id": "ep-a1"}, {"id": "ep-a2"}],
+        "rk-b": [{"id": "ep-b1"}],
+    }
+
+    def fake_for_key(key, target, **_kw):
+        return responses[key]
+
+    monkeypatch.setattr(runpod_api._CLIENT, "request_with_retries_for_key", fake_for_key)
+    # conftest._offline stubs list_endpoints → restore the real aggregating implementation.
+    monkeypatch.setattr(runpod_api, "list_endpoints", _real_list_endpoints)
+
+    result = runpod_api.list_endpoints()
+    ids = {e["id"] for e in result}
+    assert ids == {"ep-a1", "ep-a2", "ep-b1"}
+
+
+def test_list_endpoints_raises_when_any_key_fails(monkeypatch):
+    """A per-key failure propagates so callers don't act on a partial view."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
+    keys.reset()
+
+    def fake_for_key(key, target, **_kw):
+        if key == "rk-a":
+            return [{"id": "ep-a1"}]
+        raise runpod_api.RunpodApiError("GET .../endpoints -> HTTP 500: Internal Server Error")
+
+    monkeypatch.setattr(runpod_api._CLIENT, "request_with_retries_for_key", fake_for_key)
+    monkeypatch.setattr(runpod_api, "list_endpoints", _real_list_endpoints)
+
+    with pytest.raises(runpod_api.RunpodApiError):
+        runpod_api.list_endpoints()

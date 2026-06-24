@@ -1,10 +1,12 @@
 """RunPod multi-account key pool with quota failover ("waterfall").
 
 ``RUNPOD_API_KEY`` may hold a single key or a comma-separated list of keys, each for a
-distinct RunPod account. The pool is tried in order: when the preferred account is
+distinct RunPod account. The pool cycles in order: when the preferred account is
 exhausted — out of worker quota or credits, or its key is rejected — provisioning
-fails over to the next account so runs keep landing. A single key (no comma) behaves
-exactly as before: the pool is a list of one and no failover ever triggers.
+fails over to the next account so runs keep landing, and after the last account the
+pointer wraps back to the first so quota recovered on earlier accounts is reused.
+A single key (no comma) behaves exactly as before: the pool is a list of one and no
+failover ever triggers.
 
 Two cooperating notions of "which key":
 
@@ -91,7 +93,11 @@ def select_active() -> str | None:
 
 
 def advance_key() -> bool:
-    """Fail over to the next account (for new provisioning). False if none remain.
+    """Cycle to the next account for new provisioning. False only for a single-key pool.
+
+    Wraps around after the last key so quota recovered on earlier accounts is reused
+    (e.g. key1 → key2 → key1 → ...). With a single key there is nowhere to advance —
+    the caller's quota-sweep retry loop handles the wait in that case.
 
     Also collapses ``RUNPOD_API_KEY`` to the newly-active key so the SDK and the
     preferred-first REST ordering both follow the failover.
@@ -99,11 +105,11 @@ def advance_key() -> bool:
     global _idx
     pool = _ensure_pool()
     with _lock:
-        if _idx + 1 < len(pool):
-            _idx += 1
-            os.environ[_ENV_VAR] = pool[_idx]
-            return True
-        return False
+        if len(pool) <= 1:
+            return False
+        _idx = (_idx + 1) % len(pool)
+        os.environ[_ENV_VAR] = pool[_idx]
+        return True
 
 
 def reset() -> None:
