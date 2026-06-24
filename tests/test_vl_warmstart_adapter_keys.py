@@ -170,6 +170,22 @@ def test_remap_strips_vl_keys_by_evidence_when_probe_says_text_only(monkeypatch,
     assert not any(".language_model." in k for k in keys)
 
 
+def test_read_adapter_keys_rejects_oversized_header(tmp_path):
+    # A corrupt / hostile safetensors file can declare a huge header length; we must reject it from
+    # the declared length vs the real file size BEFORE allocating/reading the header payload.
+    import struct
+
+    import flash.engine.worker.lora as lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = adir / "adapter_model.safetensors"
+    # 8-byte length prefix claims a 4 GiB header, but the file is only 8 bytes.
+    st.write_bytes(struct.pack("<Q", 4 * 1024**3))
+    with pytest.raises(ValueError, match="implausible"):
+        lora._read_adapter_tensor_keys(str(adir))
+
+
 def test_remap_raises_when_adapter_has_no_lora_keys(monkeypatch, tmp_path):
     # A corrupt / wrong-architecture warm-start adapter with no LoRA weights can't carry an SFT
     # delta -> it would load as the all-zero identity. Fail loudly at remap time (#286 cause 3).

@@ -383,12 +383,20 @@ def _is_lora_key(key: str) -> bool:
     return any(m in key for m in _LORA_KEY_MARKERS)
 
 
-def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
-    """Tensor key names in the downloaded adapter, WITHOUT loading any tensor data.
+# A safetensors header is small even for huge models (a few hundred KB at most); 100 MB is a wildly
+# generous ceiling that still refuses a corrupt/hostile file declaring a multi-GB header length
+# before we allocate/read it.
+_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
-    Parses the ``.safetensors`` header (pure stdlib, keeps this module CPU-importable) or, for the
-    legacy ``.bin`` format, the pickled ``state_dict`` keys (needs torch — GPU-worker only). Returns
-    ``None`` when neither weight file exists in ``adir``.
+
+def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
+    """Tensor key names in the downloaded adapter.
+
+    For ``.safetensors`` this reads ONLY the JSON header (pure stdlib, no tensor data — keeps this
+    module CPU-importable). For the legacy ``.bin`` format the pickled ``state_dict`` must be
+    materialized via ``torch.load`` to enumerate its keys (a pickle can't be read key-only without
+    unpickling the tensor payloads — GPU-worker only). Returns ``None`` when neither weight file
+    exists in ``adir``.
     """
     import json
     import os
@@ -397,11 +405,20 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
     st_path = os.path.join(adir, "adapter_model.safetensors")
     bin_path = os.path.join(adir, "adapter_model.bin")
     if os.path.isfile(st_path):
+        # safetensors layout: 8-byte LE header length, then the JSON header, then the tensor data.
+        # Bound the DECLARED header length against the real file size (and an absolute ceiling)
+        # BEFORE reading it, so a corrupt/hostile file can't trigger a huge allocation / long read.
+        file_size = os.path.getsize(st_path)
         with open(st_path, "rb") as f:
             len_bytes = f.read(8)
             if len(len_bytes) < 8:
                 raise ValueError(f"{st_path}: too small to be a safetensors file")
             (hdr_len,) = struct.unpack("<Q", len_bytes)
+            if hdr_len > file_size - 8 or hdr_len > _MAX_SAFETENSORS_HEADER_BYTES:
+                raise ValueError(
+                    f"{st_path}: declared safetensors header length {hdr_len} is implausible "
+                    f"(file is {file_size} bytes) — refusing to read a corrupt/oversized header"
+                )
             header_bytes = f.read(hdr_len)
             if len(header_bytes) < hdr_len:
                 raise ValueError(f"{st_path}: truncated safetensors header")
