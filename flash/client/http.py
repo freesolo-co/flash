@@ -246,7 +246,17 @@ class ApiClient:
         # The train-subprocess console/traceback ({console_<phase>.txt, error_<phase>.txt}) from the
         # run's HF artifact repo, fetched server-side with the operator token — the real worker
         # output the offset-paged log can't carry. Kept off the hot get_logs poll path. {} if none.
-        return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
+        #
+        # Tolerate a managed server that predates the /worker route: a CLI upgraded ahead of the
+        # service rollout would otherwise hard-fail. FastAPI returns a bare 404 "Not Found" for an
+        # unmatched path -> treat ONLY that as "no worker output" ({}); real 404s still surface (an
+        # unknown run_id carries detail "unknown run_id: ...", not "Not Found").
+        try:
+            return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
+        except ApiError as exc:
+            if exc.status == 404 and str(exc).strip().lower() == "not found":
+                return {}
+            raise
 
     def cancel_run(self, run_id: str) -> dict:
         return self._request("POST", f"/v1/runs/{run_id}/cancel")
