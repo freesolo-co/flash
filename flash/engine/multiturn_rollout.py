@@ -30,8 +30,16 @@ the real tokenizer + the colocate vLLM engine into it at runtime.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from typing import TypedDict
+
+
+def _sequential_rollout() -> bool:
+    """A/B + escape hatch: ``FLASH_MT_SEQUENTIAL=1`` drives the multi-turn rollout one prompt at a
+    time (the pre-batching path) instead of the turn-synchronized batched generation. Default OFF
+    (batched). Case-insensitive truthy parse so ``FALSE``/``0`` don't accidentally enable it."""
+    return os.environ.get("FLASH_MT_SEQUENTIAL", "").strip().lower() not in ("", "0", "false", "no", "off")
 
 
 class RolloutResult(TypedDict):
@@ -467,7 +475,28 @@ def build_rollout_func(
         # the engine resident across steps). See flash issue #162.
         sleep_mode = bool(getattr(getattr(trainer, "args", None), "vllm_enable_sleep_mode", False))
         vocab_size = _engine_vocab_size(engine)
-        first_batch = True  # bounds-check the initial prompts once (turn 0); later prefixes are in-range
+        # Bounds-check each rollout's INITIAL prompt exactly once, keyed on the identity of its token
+        # list. A rollout's ``cur_ids`` is one object grown in place across turns and is FRESH per
+        # rollout, so the first time we see a given list it is that rollout's externally-rendered
+        # initial prompt — the only segment that can carry tokenizer/model-mismatch ids; its later
+        # (grown) appearances are vLLM-generated / tokenizer glue, both in range. Tracking identity
+        # (not a turn-0 flag) validates EVERY prompt in BOTH the batched and the sequential A/B path
+        # without re-scanning the growing prefix each turn. ``checked_refs`` holds the validated lists
+        # alive so a freed id can't be reused and wrongly skipped.
+        checked_ids: set[int] = set()
+        checked_refs: list[list[int]] = []
+
+        def _bounds_check(p: list[int]) -> None:
+            if id(p) in checked_ids:
+                return
+            checked_ids.add(id(p))
+            checked_refs.append(p)
+            lo, hi = min(p), max(p)
+            if lo < 0 or (vocab_size is not None and hi >= vocab_size):
+                raise ValueError(
+                    f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
+                    f"vocab size {vocab_size} (tokenizer/model mismatch)"
+                )
 
         def batched_generate(prefixes: list[list[int]], max_tokens_list: list[int]):
             """Sample ONE assistant turn for every active rollout in a single vLLM decode.
@@ -477,26 +506,13 @@ def build_rollout_func(
             and the shared in-group prompt KV. Returns (token_ids, logprobs, text) per prefix, in
             input order.
             """
-            nonlocal first_batch
             for p in prefixes:
                 # Fail loudly on a degenerate prompt instead of letting it reach the embedding gather
                 # as an opaque async CUDA illegal-access (the failure mode #162 was first mistaken
                 # for): the prompt_token_ids path does no bounds checking.
                 if not p:
                     raise ValueError("multi-turn rollout produced an empty prompt for engine.generate()")
-            if first_batch:
-                # Turn 0: every prefix IS an externally-rendered initial prompt — the only segment
-                # that can carry tokenizer/model-mismatch ids. Validate EACH one (every prompt in the
-                # batch, not just the first); later turns' prefixes are vLLM-generated / tokenizer
-                # glue, both in range, so we skip them (no O(total_tokens^2) re-scan of the prefix).
-                first_batch = False
-                for p in prefixes:
-                    lo, hi = min(p), max(p)
-                    if lo < 0 or (vocab_size is not None and hi >= vocab_size):
-                        raise ValueError(
-                            f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
-                            f"vocab size {vocab_size} (tokenizer/model mismatch)"
-                        )
+                _bounds_check(p)  # validates each initial prompt once (id-keyed); later turns skip
             # Per-prompt SamplingParams: each rollout has its own remaining-token budget.
             sps = [
                 SamplingParams(
@@ -546,16 +562,38 @@ def build_rollout_func(
             # of the same prompt. rollout_batch advances every active rollout's turn in a single
             # batched_generate call and returns results in input order, so the group stays aligned.
             examples = [examples_by_key.get(_prompt_key(p), {"prompt": p}) for p in prompts]
-            rollouts = rollout_batch(
-                examples=examples,
-                active_env=active_env,
-                render=render,
-                batched_generate=batched_generate,
-                env_glue=env_glue,
-                max_turns=max_turns,
-                per_turn_max_tokens=max_completion,
-                engine_max_len=engine_max_len,
-            )
+            if _sequential_rollout():
+                # A/B + escape hatch (FLASH_MT_SEQUENTIAL=1): drive each prompt's rollout one at a
+                # time through a batch-of-1 generate — the pre-batching behavior. Identical results
+                # to rollout_batch (proven in tests); only the vLLM batch size differs, which is
+                # exactly the variable the A/B isolates. Default OFF -> the batched fast path.
+                def _gen(prefix: list[int], mt: int):
+                    return batched_generate([prefix], [mt])[0]
+
+                rollouts = [
+                    rollout_one(
+                        example=ex,
+                        active_env=active_env,
+                        render=render,
+                        generate=_gen,
+                        env_glue=env_glue,
+                        max_turns=max_turns,
+                        per_turn_max_tokens=max_completion,
+                        engine_max_len=engine_max_len,
+                    )
+                    for ex in examples
+                ]
+            else:
+                rollouts = rollout_batch(
+                    examples=examples,
+                    active_env=active_env,
+                    render=render,
+                    batched_generate=batched_generate,
+                    env_glue=env_glue,
+                    max_turns=max_turns,
+                    per_turn_max_tokens=max_completion,
+                    engine_max_len=engine_max_len,
+                )
             out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
             for r in rollouts:
                 for k in out:

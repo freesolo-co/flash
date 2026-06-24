@@ -483,6 +483,28 @@ def test_rollout_func_returns_one_completion_per_prompt():
 
 
 @pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_sequential_toggle_matches_batched(monkeypatch):
+    # FLASH_MT_SEQUENTIAL=1 (the A/B baseline / escape hatch) must yield byte-identical rollouts to
+    # the default batched path — only the vLLM batch size differs (that's the variable the A/B
+    # isolates). Use a 2-turn env so the env_glue / multi-turn machinery actually runs.
+    prompts = [
+        [{"role": "user", "content": "a"}],
+        [{"role": "user", "content": "b"}],
+        [{"role": "user", "content": "c"}],
+    ]
+    monkeypatch.delenv("FLASH_MT_SEQUENTIAL", raising=False)
+    batched = _build(_FakeTok(), active_env=_TwoTurnEnv())(
+        prompts, _fake_trainer(_FakeEngine(), sleep_mode=False)
+    )
+    monkeypatch.setenv("FLASH_MT_SEQUENTIAL", "1")
+    seq = _build(_FakeTok(), active_env=_TwoTurnEnv())(
+        prompts, _fake_trainer(_FakeEngine(), sleep_mode=False)
+    )
+    assert batched == seq
+    assert len(batched["completion_ids"]) == 3
+
+
+@pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_no_wakesleep_when_sleep_mode_off():
     engine = _FakeEngine()
     rf = _build(_FakeTok())
