@@ -71,8 +71,9 @@ def test_scaffolded_env_scores_through_real_task_example(tmp_path, monkeypatch) 
     from argparse import Namespace
 
     pytest.importorskip("freesolo")
-    from flash.cli.main import cmd_env_setup
     from freesolo.datasets.records import load_task_examples
+
+    from flash.cli import cmd_env_setup
 
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
