@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "0.2.19"
+version = "0.2.21"
 description = "Flash — managed LoRA post-training (SFT/GRPO) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.10-3.12 (not 3.13 yet).
