@@ -774,9 +774,9 @@ def run_sft():
     env = require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
     heartbeat("sft_start", gpu=gpu_diagnostics())
-    # SFT on a multi-turn env: rows that ship a full gold trajectory (sft_messages) train on the
-    # whole transcript (proper multi-turn SFT, handled below); rows with only a scalar sft_target
-    # collapse to a single assistant turn. Warn only for the collapsing case (computed during the
+    # SFT on a multi-turn env: rows whose gold completion is a full trajectory train on the whole
+    # transcript (proper multi-turn SFT, handled below); rows with a single-turn gold completion
+    # collapse to one assistant turn. Warn only for the collapsing case (computed during the
     # dataset build below), not unconditionally.
     wait_for_gpu()
     setup_perf_backends()
@@ -805,9 +805,7 @@ def run_sft():
         # when the row ships one, else a single gold assistant turn. Training on the whole
         # transcript is what makes SFT actually multi-turn (the tool-call protocol + replies) — the
         # warm start the GRPO recipe expects. A >1-message completion is a multi-turn trajectory.
-        completion = env.sft_completion(ex) if hasattr(env, "sft_completion") else None
-        if completion is None:  # older adapter without sft_completion -> single-turn target
-            completion = [{"role": "assistant", "content": env.sft_target(ex)}]
+        completion = env.sft_completion(ex)
         if len(completion) > 1:  # a multi-turn gold trajectory (vs a single assistant turn)
             gold_multiturn += 1
         msgs = [*env.prompt_messages(ex), *completion]
@@ -822,9 +820,9 @@ def run_sft():
         print(f"[sft] multi-turn SFT: {gold_multiturn}/{len(train)} rows train on a full gold transcript")
     elif getattr(env, "multi_turn", False):
         print(
-            "[sft][warn] this is a multi-turn Freesolo environment but no row ships a gold "
-            "trajectory (sft_messages); SFT collapses to the single final assistant target per row "
-            "(tool/env turns ignored). Provide gold transcripts for proper multi-turn SFT."
+            "[sft][warn] this is a multi-turn Freesolo environment but no row ships a multi-turn "
+            "gold completion; SFT collapses to a single assistant turn per row (tool/env turns "
+            "ignored). Provide gold transcripts (output={\"messages\": [...]}) for proper multi-turn SFT."
         )
     if THINKING and not any("<think>" in t["text"] for t in texts[:256]):
         print(

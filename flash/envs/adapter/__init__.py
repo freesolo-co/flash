@@ -564,14 +564,6 @@ class FreesoloEnvironment(BaseEnvironment):
             return [dict(m) for m in value["messages"]]
         return [{"role": "assistant", "content": "" if value is None else str(value)}]
 
-    def sft_target(self, example: dict) -> str:
-        """Gold single assistant response (single-turn SFT): the final assistant turn of
-        :meth:`sft_completion` (delegated to the SDK env)."""
-        for m in reversed(self.sft_completion(example)):
-            if m.get("role") == "assistant":
-                return str(m.get("content") or "")
-        return ""
-
     def scores_breakdown(
         self, completion: str, example: dict, state: dict | None = None
     ) -> dict[str, float]:

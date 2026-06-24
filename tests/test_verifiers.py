@@ -167,8 +167,6 @@ def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
         {"role": "assistant", "content": "done"},
     ]
     assert env.sft_completion({"input": "x", "output": gold}) == gold  # len>1 -> multi-turn
-    # sft_target is the final assistant turn of the completion.
-    assert env.sft_target({"input": "x", "output": gold}) == "done"
     # A scalar `output` is single-turn SFT -> one assistant turn.
     assert env.sft_completion({"input": "x", "output": "4"}) == [
         {"role": "assistant", "content": "4"}
@@ -315,7 +313,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.grade("the answer is 4", train[0]) is True
     assert env.reward("nope", train[0]) == 0.0
     assert env.scores_breakdown("the answer is 4", train[0]) == {"match": 1.0, "total": 1.0}
-    assert env.sft_target({"output": "4"}) == "4"
+    assert env.sft_completion({"output": "4"}) == [{"role": "assistant", "content": "4"}]
 
 
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
@@ -375,7 +373,8 @@ def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
         source=None,
         contract_text="",
     )
-    assert env.sft_target({"expected_output": "4"}) == ""
+    # `expected_output` is NOT an alias for `output`, so there is no gold completion (empty turn).
+    assert env.sft_completion({"expected_output": "4"}) == [{"role": "assistant", "content": ""}]
     with pytest.raises(ValueError, match="input field"):
         env.prompt_messages({"task": "2+2?", "output": "4"})
 

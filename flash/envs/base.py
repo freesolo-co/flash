@@ -15,8 +15,9 @@ class Environment(Protocol):
     def prompt_messages(self, example: dict) -> list[dict]:
         """Chat messages fed to the model for one example."""
 
-    def sft_target(self, example: dict) -> str:
-        """Assistant target text for an SFT example."""
+    def sft_completion(self, example: dict) -> list[dict]:
+        """Gold completion messages appended after the prompt for one SFT example — a multi-turn
+        trajectory or a single assistant turn."""
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         """Scalar RL reward for a completion."""
@@ -35,8 +36,11 @@ class BaseEnvironment:
     def prompt_messages(self, example: dict) -> list[dict]:
         return [{"role": "user", "content": str(example.get("input") or "")}]
 
-    def sft_target(self, example: dict) -> str:
-        return str(example.get("output") or "")
+    def sft_completion(self, example: dict) -> list[dict]:
+        # Single-turn default: one gold assistant turn from the record's scalar ``output``.
+        # FreesoloEnvironment overrides this to support multi-turn gold trajectories via the
+        # freesolo-sdk (``Environment.sft_completion`` -> ``datasets.target_messages``).
+        return [{"role": "assistant", "content": str(example.get("output") or "")}]
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return 1.0 if self.grade(completion, example, state) else 0.0
