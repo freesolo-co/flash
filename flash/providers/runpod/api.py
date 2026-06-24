@@ -60,16 +60,16 @@ def list_endpoints() -> list[dict]:
     # endpoints are account-scoped: a plain request_with_retries() call stops at the
     # first key that succeeds and returns only *that* account's endpoints. Idle-sweep
     # and slot-reconcile need the full fleet across every account in the pool, so we
-    # query each key independently and aggregate. A failure on one key is skipped — the
-    # sweep runs on a short interval so a missed key costs at most one sweep cycle.
+    # query each key independently (with per-key retries) and aggregate.
+    #
+    # Raises on any per-key failure so callers that treat an empty result as "confirmed
+    # absent" (teardown, slot-reconcile) don't act on an incomplete view. Both
+    # sweep_idle_endpoints() and the slot reconcile already catch and skip on exception.
     all_endpoints: list[dict] = []
-    for key in _keys.keys():
-        try:
-            out = _CLIENT.request(f"{REST_BASE}/endpoints", key=key)
-            if isinstance(out, list):
-                all_endpoints.extend(out)
-        except Exception:
-            pass
+    for key in _keys.keys():  # noqa: SIM118  (_keys is a module, not a dict)
+        out = _CLIENT.request_with_retries_for_key(key, f"{REST_BASE}/endpoints", retries=2)
+        if isinstance(out, list):
+            all_endpoints.extend(out)
     return all_endpoints
 
 
