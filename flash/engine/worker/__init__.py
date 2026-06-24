@@ -66,7 +66,7 @@ from flash.engine.worker.lora import (
 from flash.engine.worker.perf import (
     RetriableInfraError,
     _attn_impl_for_capability,  # noqa: F401
-    _drop_fla_on_hopper,
+    _ensure_fla_fastpath_on_hopper,
     _estimate_params,  # noqa: F401
     _flash_attn_available,
     _GpuPeakSampler,
@@ -2191,8 +2191,8 @@ def main():
     try:
         # Idempotency FIRST — before any env-mutating pip install / package removal: a re-delivered
         # job whose DONE already exists must return the persisted metrics and exit WITHOUT running
-        # _drop_fla_on_hopper() (pip-uninstalls fla) — that wasted a worker mutating its env on an
-        # already-complete run. It is called after the DONE check below (see _drop_fla_on_hopper()).
+        # _ensure_fla_fastpath_on_hopper() (mutates the env: pip-installs tilelang/fla) — that wasted
+        # a worker mutating its env on an already-complete run. It runs after the DONE check below.
         if HF_REPO:
             from huggingface_hub import hf_hub_download
 
@@ -2224,8 +2224,8 @@ def main():
                 except Exception as e:
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
+        _ensure_fla_fastpath_on_hopper()  # Hopper: enable fla+tilelang GDN fast path (see perf.py)
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
-        _drop_fla_on_hopper()  # Hopper fla guard (see _drop_fla_on_hopper)
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
