@@ -349,33 +349,36 @@ def test_attn_impl_for_capability_per_arch(monkeypatch):
     assert f(12, 0, fa3_available=True, fa2_available=True) == "sdpa"
 
 
-def test_flash_attn_3_disable_hatch_case_insensitive(monkeypatch):
-    """The FLASH_DISABLE_FA3 escape hatch is honored CASE-INSENSITIVELY: only truthy values disable;
-    FALSE/False/0/off/'' (any case) do NOT. Stub transformers' FA3 probe so the test is hermetic —
-    it asserts the hatch logic, not whether flash_attn_interface happens to be installed in CI."""
-    w = _import_worker(monkeypatch)
-    import transformers.utils as tu
+def test_env_flag_disabled_case_insensitive(monkeypatch):
+    """The FLASH_DISABLE_FA2/FA3 parser ``_env_flag_disabled`` is CASE-INSENSITIVE and hermetic (pure
+    string logic, no heavy imports): only truthy values disable; '', 0, false/False/FALSE, no, off
+    (any case) do NOT — so FLASH_DISABLE_FA3=FALSE never silently disables the kernel."""
+    _import_worker(monkeypatch)
+    from flash.engine.worker.perf import _env_flag_disabled
 
-    monkeypatch.setattr(tu, "is_flash_attn_3_available", lambda: True, raising=False)
+    for falsey in ("", "0", "false", "False", "FALSE", "no", "NO", "off", "Off"):
+        monkeypatch.setenv("X_FLAG", falsey)
+        assert _env_flag_disabled("X_FLAG") is False, falsey
+    for truthy in ("1", "true", "TRUE", "Yes", "on", "enable"):
+        monkeypatch.setenv("X_FLAG", truthy)
+        assert _env_flag_disabled("X_FLAG") is True, truthy
+    monkeypatch.delenv("X_FLAG", raising=False)
+    assert _env_flag_disabled("X_FLAG") is False  # unset -> not disabled
+
+
+def test_flash_attn_probes_disable_hatch(monkeypatch):
+    """The disable hatches short-circuit to False BEFORE any heavy import (so this is deterministic
+    in the offline CI env, which has neither transformers nor flash_attn). With the hatches unset the
+    probes also report False here because the packages are absent."""
+    w = _import_worker(monkeypatch)
     monkeypatch.delenv("FLASH_DISABLE_FA3", raising=False)
-    assert w._flash_attn_3_available() is True  # probe available, hatch unset
-    for truthy in ("1", "true", "TRUE", "Yes", "on"):
-        monkeypatch.setenv("FLASH_DISABLE_FA3", truthy)
-        assert w._flash_attn_3_available() is False, truthy  # hatch disables
-    for falsey in ("0", "false", "False", "FALSE", "off", ""):
-        monkeypatch.setenv("FLASH_DISABLE_FA3", falsey)
-        assert w._flash_attn_3_available() is True, falsey  # case-insensitive -> NOT disabled
-
-
-def test_flash_attn_2_disable_hatch(monkeypatch):
-    """FLASH_DISABLE_FA2=1 short-circuits _flash_attn_available off (reverts the arch to SDPA + no
-    packing) regardless of whether the flash_attn wheel is present; a falsey value does not."""
-    w = _import_worker(monkeypatch)
+    monkeypatch.delenv("FLASH_DISABLE_FA2", raising=False)
+    assert w._flash_attn_3_available() is False  # flash_attn_interface / transformers absent in CI
+    assert w._flash_attn_available() is False  # flash_attn wheel absent in CI
+    monkeypatch.setenv("FLASH_DISABLE_FA3", "1")
+    assert w._flash_attn_3_available() is False  # hatch short-circuits
     monkeypatch.setenv("FLASH_DISABLE_FA2", "1")
-    assert w._flash_attn_available() is False  # hatch forces off even if the wheel were importable
-    monkeypatch.setenv("FLASH_DISABLE_FA2", "FALSE")
-    # falsey (case-insensitive) -> hatch does NOT disable; result then reflects the wheel (absent in CI).
-    assert w._flash_attn_available() is False
+    assert w._flash_attn_available() is False  # hatch short-circuits
 
 
 def test_liger_on_requires_default_and_gpu(monkeypatch):
