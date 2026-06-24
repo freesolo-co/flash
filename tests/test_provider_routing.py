@@ -76,6 +76,7 @@ def test_runpod_allocation_routes_to_runpod_submit(orch, monkeypatch):
         on_handle=None,
         attempt=0,
         runtime_secrets=None,
+        **_,
     ):
         captured["gpu_type"] = run_spec.gpu.type
         captured["runtime_secrets"] = dict(runtime_secrets or {})
