@@ -183,8 +183,8 @@ def _worker_artifacts(spec) -> dict[str, str]:
                 filename=f"{prefix}/{name}",
                 token=os.environ.get("HF_TOKEN"),
                 # The worker appends to console/error files across the run, so a cached copy goes
-                # stale; force a fresh pull (matches the other HF artifact readers, e.g.
-                # providers/runpod/jobs.py make_hf_console_reader).
+                # stale; force a fresh pull (matches other HF artifact readers, e.g.
+                # flash/providers/runpod/jobs.py:make_hf_text_reader).
                 force_download=True,
             )
             # errors="replace": worker stdout can carry non-UTF-8 bytes (tracebacks, progress bars);
