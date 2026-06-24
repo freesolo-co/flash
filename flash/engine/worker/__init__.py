@@ -1476,6 +1476,20 @@ def run_rl():
     is_tool_env = getattr(env, "is_tool_env", False)
     is_multi_turn = getattr(env, "multi_turn", False)
     conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
+    if is_multi_turn:
+        # The Liger fused GRPO loss (use_liger_kernel, kept ON to avoid the 248k-vocab fp32-logits
+        # OOM) torch.compiles, and on the VARIABLE-length multi-turn completions its dynamo guard
+        # build trips a torch 2.10 bug (symbol_to_source IndexError) that crashes the first
+        # training step. Let dynamo FALL BACK TO EAGER for the offending function instead of
+        # raising. This is NOT `TORCHDYNAMO_DISABLE` (which would also break the colocate vLLM
+        # engine's required compilation) — dynamo stays enabled; only erroring graphs run eager.
+        try:
+            import torch._dynamo
+
+            torch._dynamo.config.suppress_errors = True
+            print("[rl] multi-turn: torch._dynamo suppress_errors=True (Liger loss falls back to eager on dynamic shapes)")
+        except Exception as exc:  # never let a torch internals change block the run
+            print(f"[rl] could not set torch._dynamo.suppress_errors: {exc!r}")
     wait_for_gpu()
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
