@@ -83,9 +83,13 @@ def stall_kwargs() -> dict:
     run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
     window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat;
     ``queue_grace_s`` = how long a job may sit IN_QUEUE (no worker assigned) before we treat the
-    pinned GPU class as out of capacity and walk to the next-best one.
+    pinned GPU class as out of capacity and walk to the next-best one. Kept tight (~1 min): a
+    class that can't place a worker within a minute is out of capacity *now*, and the gpu-walk
+    re-provisions on the next-best class far faster than waiting out a multi-minute queue. This
+    is a no-capacity backstop only — a worker that has been placed and is cold-starting is
+    governed by the much larger ``setup_grace_s`` and is never abandoned at one minute.
     """
-    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 900.0}
+    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 60.0}
 
 
 def apply_disk_gb(config, disk_gb: int | None) -> None:
@@ -427,8 +431,8 @@ def poll_job(
     stall_after_s: float = 1200.0,
     setup_grace_s: float = 3000.0,
     unhealthy_grace_s: float = 240.0,
-    throttled_grace_s: float = 300.0,
-    queue_grace_s: float = 900.0,
+    throttled_grace_s: float = 60.0,
+    queue_grace_s: float = 60.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
@@ -446,14 +450,18 @@ def poll_job(
 
     ``throttled_grace_s`` bounds how long we wait on a worker stuck THROTTLED (no RunPod
     capacity for the pinned GPU class) before returning a retryable stall so the runner
-    walks to the next-best GPU.
+    walks to the next-best GPU. Tight by default (~1 min): THROTTLED means there is no
+    capacity for this class right now, so failing fast onto the next-best class beats blocking
+    the run on a host that won't free up.
 
     ``queue_grace_s`` is the capacity backstop for that same walk when RunPod *doesn't* surface
     a THROTTLED/UNHEALTHY worker: a job can sit IN_QUEUE with zero workers assigned (or one stuck
     INITIALIZING, or while ``endpoint_health`` errors are swallowed below) and the throttled/
     unhealthy fast-fails never arm — so without this it would burn the full ``setup_grace_s``
     (~50 min). Keyed off the authoritative job status (robust to a failing health probe), it
-    returns a retryable stall once a job has been IN_QUEUE longer than ``queue_grace_s``.
+    returns a retryable stall once a job has been IN_QUEUE longer than ``queue_grace_s`` (~1 min
+    by default). Both capacity graces gate only the *no-worker* phase; once a worker is placed
+    and cold-starting, ``setup_grace_s`` governs and the run is never walked off at one minute.
     """
 
     say = make_say(log)
