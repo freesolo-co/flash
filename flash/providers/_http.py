@@ -119,7 +119,13 @@ class RestClient:
             if attempt < retries:
                 delay = min(base_delay * (2 ** min(attempt, 6)), 30.0)
                 time.sleep(delay * random.uniform(0.7, 1.3))
-        raise self.error_cls(f"{method} {target} failed after {retries + 1} attempts: {last}")
+        # Chain the last exception so callers can inspect it: ``_is_not_found`` keys off the
+        # HTTPError code, and the multi-key waterfall's ``failover_predicate`` needs it to see
+        # a persistent 429's status (without the cause it can't tell the account is rate/quota
+        # limited and would stop instead of trying the next account).
+        raise self.error_cls(
+            f"{method} {target} failed after {retries + 1} attempts: {last}"
+        ) from last
 
     def request_with_retries(
         self,
