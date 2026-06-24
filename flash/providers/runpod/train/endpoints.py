@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import os
 import threading
+import time
 from typing import Any
 
 from flash.providers.base import canonical_gpu, gpu_short
@@ -32,38 +33,184 @@ from flash.providers.runpod.train.deps import (
 # are infrequent vs training, so the serialization cost is negligible.
 FLASH_SDK_LOCK = threading.Lock()
 
-# Quota semaphore: cap in-flight endpoints at 28 (RunPod's account-wide max-workers quota
-# is 30; the 2-slot buffer absorbs headroom for endpoints deployed by other tools/the CLI).
-# Every endpoint this process creates acquires one slot; terminate_endpoint releases it once
-# the remote endpoint is provably torn down.  The semaphore is process-wide and resets on
-# restart — that's fine, because on restart there are no live endpoints from this process.
-# Runs that find all slots occupied block here instead of failing with RunPod's "Max workers
-# across all endpoints must not exceed your workers quota (30)" error.
-_ENDPOINT_SLOTS = threading.Semaphore(28)
-# Track which endpoint names this process has acquired a slot for, so releases are idempotent:
-# terminate_endpoint may run more than once for a name (e.g. a retry after a failed undeploy),
-# and only the call that still finds the name here actually releases the semaphore.
-_ACQUIRED_NAMES: set[str] = set()
-_ACQUIRED_NAMES_LOCK = threading.Lock()
+# Quota: cap in-flight endpoints under RunPod's account-wide max-workers quota (30; the cap of
+# 28 leaves a 2-slot buffer for endpoints deployed by other tools/the CLI). Every endpoint this
+# process creates claims one slot; terminate_endpoint releases it once the remote endpoint is
+# provably torn down. Runs that find the quota full QUEUE (block) here instead of failing with
+# RunPod's "Max workers across all endpoints must not exceed your workers quota (30)" error.
+#
+# The store is CROSS-PROCESS when an operator internal key is configured: the claim is an
+# advisory-locked atomic op in Postgres (via the freesolo backend), so >1 control-plane replica
+# can never together exceed the cap, and a startup reconcile recovers the true in-use count after
+# a crash. Without an internal key (local/dev single process) we fall back to an in-process
+# semaphore. Releases route by how the slot was acquired (recorded in ``_ACQUIRED``), so a slot
+# claimed against the shared store is always released there.
+RUNPOD_ENDPOINT_SLOT_CAP = 28
+# How long to wait before re-checking a full shared quota (queue-don't-crash), and how many
+# consecutive store errors to tolerate before falling back to the local semaphore so a single
+# process stays capped rather than deadlocking on a persistently-unreachable backend.
+_SLOT_QUEUE_WAIT_S = 10.0
+_SLOT_STORE_MAX_ERRORS = 6
+
+# Local (single-process) fallback, used when no internal key is configured or the shared store is
+# persistently unreachable. Resets on restart — fine, because a fresh process holds no slots.
+_LOCAL_SLOTS = threading.Semaphore(RUNPOD_ENDPOINT_SLOT_CAP)
+# name -> "shared" | "local": how this process acquired each held slot, so release routes to the
+# same store. Makes release idempotent — terminate_endpoint may run more than once for a name
+# (e.g. a retry after a failed undeploy), and only the call that still finds the name releases.
+_ACQUIRED: dict[str, str] = {}
+_ACQUIRED_LOCK = threading.Lock()
 
 _ENDPOINT_CACHE: dict[str, Any] = {}
 
 
-def _release_endpoint_slot(name: str) -> bool:
-    """Release the quota semaphore slot for ``name``.
+def _acquire_local_slot(name: str) -> None:
+    """Claim an in-process semaphore slot (no internal key / store-unreachable fallback)."""
+    if not _LOCAL_SLOTS.acquire(blocking=False):
+        logger.info(
+            "Quota full (%d/%d slots) — waiting for a free slot...",
+            RUNPOD_ENDPOINT_SLOT_CAP,
+            RUNPOD_ENDPOINT_SLOT_CAP,
+        )
+        _LOCAL_SLOTS.acquire()
+    with _ACQUIRED_LOCK:
+        _ACQUIRED[name] = "local"
 
-    Returns ``True`` if a slot was released, ``False`` if this process never acquired one
-    for ``name`` (e.g. a fresh ``flash cancel`` process, or the slot was already released).
-    The ``_ACQUIRED_NAMES`` tracking set makes this idempotent — only the first call for a
-    name releases the semaphore; subsequent calls (e.g. a re-run of ``terminate_endpoint``)
-    are no-ops.
+
+def _acquire_endpoint_slot(name: str) -> None:
+    """Claim a quota slot for ``name``, QUEUEING (blocking) until one is free. Idempotent per name.
+
+    Uses the shared cross-process store when an internal key is set, else the in-process
+    semaphore. On persistent store errors it falls back to the local semaphore so a single
+    process stays capped instead of deadlocking or oversubscribing.
     """
-    with _ACQUIRED_NAMES_LOCK:
-        if name not in _ACQUIRED_NAMES:
-            return False
-        _ACQUIRED_NAMES.discard(name)
-    _ENDPOINT_SLOTS.release()
-    return True
+    with _ACQUIRED_LOCK:
+        if name in _ACQUIRED:
+            return  # already hold a slot for this name (e.g. _ENDPOINT_CACHE re-entry)
+    from flash.providers.runpod import slots
+
+    if slots.internal_key() is None:
+        _acquire_local_slot(name)
+        return
+
+    errors = 0
+    queued = False
+    while True:
+        try:
+            claimed, in_use = slots.claim(
+                name, cap=RUNPOD_ENDPOINT_SLOT_CAP, claimed_by=slots.claimed_by_ident()
+            )
+        except slots.SlotStoreError as exc:
+            errors += 1
+            logger.warning(
+                "slot-store claim failed for %s (%s) [%d/%d]",
+                name,
+                exc,
+                errors,
+                _SLOT_STORE_MAX_ERRORS,
+            )
+            if errors >= _SLOT_STORE_MAX_ERRORS:
+                logger.error(
+                    "slot store unreachable; falling back to the in-process cap for %s", name
+                )
+                _acquire_local_slot(name)
+                return
+            time.sleep(_SLOT_QUEUE_WAIT_S)
+            continue
+        errors = 0
+        if claimed:
+            if queued:
+                logger.info(
+                    "RunPod endpoint slot acquired for %s after queueing (%d/%d in use)",
+                    name,
+                    in_use,
+                    RUNPOD_ENDPOINT_SLOT_CAP,
+                )
+            with _ACQUIRED_LOCK:
+                _ACQUIRED[name] = "shared"
+            return
+        if not queued:
+            logger.info(
+                "RunPod quota full (%d/%d) — queueing for a free slot...",
+                in_use,
+                RUNPOD_ENDPOINT_SLOT_CAP,
+            )
+            queued = True
+        time.sleep(_SLOT_QUEUE_WAIT_S)
+
+
+def _release_endpoint_slot(name: str) -> bool:
+    """Release the quota slot for ``name``, routed to the store it was claimed from.
+
+    The ``_ACQUIRED`` map records how this process claimed the slot (``"local"`` | ``"shared"``)
+    and makes the common path idempotent — only the first call for a name this process claimed
+    releases. When a shared store is configured, a teardown running on a DIFFERENT replica than
+    the one that claimed the slot (e.g. a ``flash cancel`` routed to another control-plane
+    replica) has no ``_ACQUIRED`` entry but must STILL drop the shared row, or the slot leaks
+    until the next reconcile and the queue is throttled even though the endpoint is gone. The
+    callers only invoke this once the remote endpoint is provably gone, and server-side release
+    is idempotent, so the best-effort cross-replica release is safe.
+
+    Returns ``True`` if a slot was (or, on the shared path, may have been) released; ``False`` for
+    a no-op (nothing tracked locally and no shared store to release against).
+    """
+    with _ACQUIRED_LOCK:
+        mode = _ACQUIRED.pop(name, None)
+    if mode == "local":
+        _LOCAL_SLOTS.release()
+        return True
+    from flash.providers.runpod import slots
+
+    # mode == "shared": this process holds the row. mode is None: either a cross-replica teardown
+    # (release the shared row anyway) or — with no shared store at all — genuinely nothing to do.
+    cross_replica = mode is None
+    if cross_replica and slots.internal_key() is None:
+        return False
+
+    try:
+        released = slots.release(name)
+    except slots.SlotStoreError as exc:
+        # A transient release failure can't leak the slot permanently: the endpoint is gone, so
+        # the next startup reconcile reclaims its row against the live endpoint list.
+        logger.warning(
+            "slot-store release failed for %s (%s); reconcile will reclaim it on restart",
+            name,
+            exc,
+        )
+        return not cross_replica
+    return released if cross_replica else True
+
+
+def reconcile_endpoint_slots() -> None:
+    """Reconcile the shared slot store against the live RunPod endpoint list (control-plane
+    startup), so a crash can't leak slots: rows for endpoints that no longer exist are reclaimed
+    and the in-use count recovers to the truth. No-op without an internal key (the local
+    semaphore needs no reconciliation — a fresh process starts empty). Best-effort: never raises.
+    """
+    from flash.providers.runpod import slots
+
+    if slots.internal_key() is None:
+        return
+    try:
+        from flash.providers.runpod import api as runpod_api
+
+        live = [
+            name
+            for e in runpod_api.list_endpoints()
+            if (name := (e.get("name") or "")).startswith("flash-")
+        ]
+    except Exception as exc:  # listing failed: do NOT reconcile against a partial/empty list
+        logger.warning("slot reconcile skipped: could not list RunPod endpoints (%s)", exc)
+        return
+    try:
+        result = slots.reconcile(live)
+        logger.info(
+            "RunPod slot reconcile: %s in use, %s reclaimed",
+            result.get("inUse"),
+            result.get("reclaimed"),
+        )
+    except slots.SlotStoreError as exc:
+        logger.warning("slot reconcile failed (%s)", exc)
 
 
 def _train_body(input_data: dict) -> dict:
@@ -354,15 +501,10 @@ def get_train_endpoint(
     if name in _ENDPOINT_CACHE:
         # Slot was already acquired when the entry was first created; don't re-acquire.
         return _ENDPOINT_CACHE[name]
-    # Acquire a quota slot before creating the endpoint.  This blocks when all 28 slots are
-    # occupied, making new runs queue here instead of failing with RunPod's worker-quota
-    # error.  The slot is released by terminate_endpoint once the remote endpoint is provably
-    # torn down.
-    if not _ENDPOINT_SLOTS.acquire(blocking=False):
-        logger.info("Quota full (28/28 slots occupied) — waiting for a free slot...")
-        _ENDPOINT_SLOTS.acquire()
-    with _ACQUIRED_NAMES_LOCK:
-        _ACQUIRED_NAMES.add(name)
+    # Claim a quota slot before creating the endpoint. This QUEUES (blocks) when the quota is
+    # full, making new runs wait here instead of failing with RunPod's worker-quota error. The
+    # slot is released by terminate_endpoint once the remote endpoint is provably torn down.
+    _acquire_endpoint_slot(name)
     try:
         kwargs = dict(
             name=name,
@@ -567,8 +709,9 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             # as "absent" — releasing on an unverified absence risks oversubscribing the quota.
             logger.debug("REST endpoint lookup failed for %s: %s", target, exc)
 
-    # Release the quota slot for this run's endpoint.  Only releases if this process
-    # previously acquired one (no-op in a fresh ``flash cancel`` process).  Release ONLY when
+    # Release the quota slot for this run's endpoint.  Releases the slot this process acquired,
+    # or — when a shared store is configured — the row a different replica claimed (a ``flash
+    # cancel`` may run on another replica than the one that deployed).  Release ONLY when
     # the remote endpoint is provably gone: (a) at least one undeploy/delete succeeded, or
     # (b) we positively verified no remote endpoint exists (registry returned no uids AND the
     # REST lookup confirmed none — e.g. the endpoint never finished deploying, so its slot
