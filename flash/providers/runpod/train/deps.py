@@ -191,53 +191,6 @@ DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
 _RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 
 
-# RunPod mounts the opt-in persistent network volume here; everything written under it
-# survives across runs that share the same volume name (and across cold workers).
-_NETWORK_VOLUME_MOUNT = "/runpod-volume"
-
-
-def network_volume_env(mount: str = _NETWORK_VOLUME_MOUNT) -> dict[str, str]:
-    """Env that redirects the worker's heavy, reusable caches onto the persistent volume.
-
-    Two cold-start costs dominate a fresh worker, both one-time-*per-cache* rather than
-    per-run:
-
-      * the model-weight download -> ``HF_HOME``; and
-      * the JIT compile of the fused Triton / Inductor / tilelang kernels the trainer
-        builds on first use. ``SFTTrainer``/``GRPOTrainer`` init blocks ~10-15 min the
-        first time these compile (engine.worker notes this; flash #163's init heartbeat
-        keeps the stall detector quiet through it) — on PAID GPU time, every cold worker.
-
-    The compiled kernels are content-addressed by kernel source + GPU arch + toolchain
-    version, so a shared cache is safe across arches (distinct keys never collide) and
-    across concurrent workers (Triton and Inductor publish entries atomically via a
-    temp-file + rename, so a half-written kernel is never observed). Each cache library
-    ``os.makedirs(..., exist_ok=True)`` its own directory on first use, so the worker
-    creates these lazily — the control plane only needs to point at them.
-
-    Pointing these dirs at the volume turns each into a one-time-per-volume cost: the
-    SECOND run on a given volume reaches the first training step in seconds. A genuinely
-    cold first build still pays the full compile (and #163's heartbeat still fires) — the
-    volume is the warm path, not a replacement for the safety net.
-
-    Returns a flat env mapping; callers merge it into the worker env when (and only when)
-    a network volume is attached.
-    """
-    kc = f"{mount}/kernel-cache"
-    return {
-        # Model weights — downloaded once per volume instead of once per run.
-        "HF_HOME": f"{mount}/hf-cache",
-        # Liger / fla / chalk fused Triton kernels (the dominant first-use JIT cost).
-        "TRITON_CACHE_DIR": f"{kc}/triton",
-        # torch.compile / TorchInductor (multi-turn rollout dynamo path).
-        "TORCHINDUCTOR_CACHE_DIR": f"{kc}/inductor",
-        # Hopper (sm90) Gated-DeltaNet tilelang kernels — a slow TVM compile when cold.
-        "TILELANG_CACHE_DIR": f"{kc}/tilelang",
-        # Any torch.utils.cpp_extension JIT build (compiled CUDA ops).
-        "TORCH_EXTENSIONS_DIR": f"{kc}/torch-extensions",
-    }
-
-
 def build_worker_env(
     spec: JobSpec,
     seed: int,
@@ -292,13 +245,6 @@ def build_worker_env(
     # code storage + heartbeats). The worker reads HF_REPO from its own process env; that env
     # is now sourced from the spec, not the operator's HF_REPO.
     env["HF_REPO"] = spec.train.hf_repo
-    # Opt-in network volume: redirect the heavy, reusable caches onto the persistent mount
-    # so they survive across runs sharing the volume. That covers the model-weight download
-    # (HF_HOME) AND the fused Triton/Inductor/tilelang kernel JIT — the ~10-15 min cold-start
-    # compile (#163 heartbeats through it) that every cold worker otherwise re-pays on paid
-    # GPU time. With a volume the SECOND run reaches the first training step in seconds.
-    if getattr(spec.gpu, "network_volume", None):
-        env.update(network_volume_env())
     if spec.train.steps is not None:
         env["RL_STEPS"] = str(spec.train.steps)
     if spec.train.epochs is not None:

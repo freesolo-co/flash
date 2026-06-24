@@ -61,7 +61,6 @@ __all__ = [
     "make_hf_text_reader",
     "poll_job",
     "submit_run",
-    "volume_endpoint_kwargs",
 ]
 
 TERMINAL_OK = {"COMPLETED"}
@@ -87,31 +86,6 @@ def stall_kwargs() -> dict:
     pinned GPU class as out of capacity and walk to the next-best one.
     """
     return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 900.0}
-
-
-def volume_endpoint_kwargs(spec) -> dict:
-    """Endpoint kwargs for the OPT-IN persistent network volume (cross-run HF cache).
-
-    Returns {} unless ``gpu.network_volume`` is set. The volume pins the endpoint to
-    one datacenter (``gpu.datacenter``, default EU-RO-1 — the SDK's storage default),
-    which shrinks the available GPU pool; that trade-off is why this is opt-in.
-    """
-    nv = getattr(spec.gpu, "network_volume", None) if spec is not None else None
-    if not nv:
-        return {}
-    from runpod_flash import NetworkVolume
-    from runpod_flash.core.resources.datacenter import DataCenter
-
-    dc = DataCenter.from_string(spec.gpu.datacenter) if spec.gpu.datacenter else None
-    volume = NetworkVolume(
-        name=str(nv),
-        size=int(getattr(spec.gpu, "network_volume_gb", 100) or 100),
-        **({"datacenter": dc} if dc else {}),
-    )
-    kwargs: dict = {"volume": volume}
-    if dc:
-        kwargs["datacenter"] = dc
-    return kwargs
 
 
 def apply_disk_gb(config, disk_gb: int | None) -> None:
@@ -299,15 +273,14 @@ def deploy_train_endpoint(
         # scope or race the event loop mid-deploy.
         with FLASH_SDK_LOCK:
             isolate_flash_state(name_suffix)
-            kwargs = dict(
-                name=name,
-                gpu=flash_gpu(friendly),
-                gpu_count=1,
-                min_cuda_version=min_cuda_for(friendly),
-                execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-                workers=(0, 1),
-                **volume_endpoint_kwargs(spec),
-            )
+            kwargs = {
+                "name": name,
+                "gpu": flash_gpu(friendly),
+                "gpu_count": 1,
+                "min_cuda_version": min_cuda_for(friendly),
+                "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+                "workers": (0, 1),
+            }
             if image:
                 kwargs["image"] = image
             else:

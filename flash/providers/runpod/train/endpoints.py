@@ -490,7 +490,6 @@ def get_train_endpoint(
     from runpod_flash import Endpoint
 
     from flash.providers.runpod.auth import ensure_auth
-    from flash.providers.runpod.jobs import volume_endpoint_kwargs
 
     ensure_auth()
     _patch_runpod_backoff()
@@ -506,15 +505,14 @@ def get_train_endpoint(
     # slot is released by terminate_endpoint once the remote endpoint is provably torn down.
     _acquire_endpoint_slot(name)
     try:
-        kwargs = dict(
-            name=name,
-            gpu=flash_gpu(friendly),
-            gpu_count=1,
-            min_cuda_version=min_cuda_for(friendly),
-            execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-            workers=(0, 1),  # one dedicated worker per run; scale to zero when idle
-            **volume_endpoint_kwargs(spec),
-        )
+        kwargs = {
+            "name": name,
+            "gpu": flash_gpu(friendly),
+            "gpu_count": 1,
+            "min_cuda_version": min_cuda_for(friendly),
+            "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+            "workers": (0, 1),  # one dedicated worker per run; scale to zero when idle
+        }
         # RunPod Flash needs its serverless runtime baked into the worker image. Boot-install
         # WORKER_DEPS on Flash's default template instead (cached as a Flash artifact). Optional
         # FLASH_WORKER_IMAGE override for a RunPod-serverless-compatible image.
