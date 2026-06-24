@@ -931,3 +931,60 @@ def test_find_real_libcudart_safe_when_nothing_matches(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", _no_nvidia)
     assert perf._find_real_libcudart() is None
+
+
+def _compile_so(c_path, so_path, src):
+    """Compile a tiny shared object; return True on success (skip the test if no toolchain)."""
+    import shutil
+    import subprocess
+
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if not cc:
+        return False
+    with open(c_path, "w") as f:
+        f.write(src)
+    return subprocess.run([cc, "-shared", "-fPIC", "-o", so_path, c_path]).returncode == 0
+
+
+def _maps_has(name):
+    with open("/proc/self/maps") as f:
+        return any(name in line for line in f)
+
+
+def test_neutralize_never_loads_the_stub_into_the_process(tmp_path, monkeypatch):
+    """The crux of #184: the neutralize step must NEVER dlopen the stub. Loading it (even just to
+    inspect it) maps `libcudart_stub.so` into /proc/self/maps, which is the exact line vLLM's
+    CudaRTLibrary scan would then resolve -> the crash we're preventing. Compile a REAL stub .so
+    missing cudaDeviceReset, run neutralize, and assert it was never mapped."""
+    import os
+
+    pkg = tmp_path / "tilelang"
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    stub = str(pkg / "lib" / "libcudart_stub.so")
+    real = str(tmp_path / "libcudart.so.12")
+    if not _compile_so(str(tmp_path / "stub.c"), stub, "void cudaOther(void){}"):
+        import pytest
+
+        pytest.skip("no C toolchain to build a real stub .so")
+    assert _compile_so(str(tmp_path / "real.c"), real, "void cudaDeviceReset(void){}")
+
+    import importlib
+
+    from flash.engine.worker import perf
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    monkeypatch.setattr(perf, "_find_real_libcudart", lambda: real)
+
+    assert not _maps_has("libcudart_stub.so"), "precondition: stub not yet loaded"
+    perf._neutralize_tilelang_cudart_stub()
+    # THE regression assertion: the stub was redirected on disk WITHOUT ever being dlopen'd.
+    assert not _maps_has("libcudart_stub.so"), "neutralize must not load the stub into the process"
+    assert os.path.islink(stub)
+    assert os.path.realpath(stub) == os.path.realpath(real)
+
+    # And the redirected path now resolves a libcudart that DOES export cudaDeviceReset.
+    import ctypes
+
+    assert hasattr(ctypes.CDLL(stub), "cudaDeviceReset")
