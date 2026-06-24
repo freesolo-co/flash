@@ -297,7 +297,6 @@ class PollResult:
     detail: str | None = None
 
 
-# Allocation result
 @dataclass(frozen=True)
 class Candidate:
     provider: str

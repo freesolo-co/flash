@@ -564,9 +564,6 @@ def graded_text(completion: str | None) -> str | None:
     return strip_think(completion) if THINKING else completion
 
 
-# SFT
-
-
 def force_vllm_backend_for_sm120() -> str | None:
     """On RTX 5090 / consumer Blackwell (sm120), force a PTX-independent vLLM attention backend.
 
@@ -1102,7 +1099,6 @@ def run_sft():
     hf_upload_folder(adapter_dir, "adapter", required=True)
     heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
-    # count train tokens
     train_tokens = int(sum(len(tok(t["text"])["input_ids"]) for t in texts) * epochs)
 
     # Write train metadata + the completion sentinel (metrics.json/DONE) for this phase.
@@ -1152,7 +1148,6 @@ def run_sft():
     free_gpu(trainer)
 
 
-# RL (GRPO) with TRL + colocated vLLM
 def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_comps: int) -> dict:
     """Translate an intended ``prompts_per_step`` into a TRL GRPO batch configuration.
 

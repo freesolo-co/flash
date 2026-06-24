@@ -6,7 +6,6 @@ from __future__ import annotations
 from flash.catalog import MODELS
 from flash.providers.base import GPU_INFO, GpuClass, providers_for
 
-# GPU facts
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "RTX 3090": 71.0,
     "L4": 60.0,
@@ -85,7 +84,6 @@ def download_weight_gb(model_id: str) -> float:
     return total_params_b(model_id) * 2.0
 
 
-# Reward-grader latency (GRPO)
 # A single average grader latency (s/completion) for every env. Graders span ~0.01s (regex/math)
 # to ~3s (LLM judge/code); ~1s is a middle-of-the-road default (a run can override it).
 AVG_REWARD_SECONDS_PER_COMPLETION = 1.0

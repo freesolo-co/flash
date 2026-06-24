@@ -141,8 +141,6 @@ def login_failed(reason: str) -> str:
     )
 
 
-# Theme — one visual language shared by every styled command.
-#
 # These renderers are only ever called when `styled()` is true (an interactive stdout, or
 # FLASH_STYLE=1). Each command keeps its exact plain/JSON output on the machine path, so
 # `jq`, scripts, and the agent contract are untouched; this is purely the human view.
