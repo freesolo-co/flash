@@ -466,7 +466,7 @@ def run_status(obj: dict) -> str:
     provider = remote.get("provider")
     where = f"{gpu} @ {provider}" if gpu and provider else gpu
     pairs = [
-        ("run", _paint(obj.get("run_id", ""), _ACCENT2)),
+        ("run id", _paint(obj.get("run_id", ""), _ACCENT2)),
         ("model", spec.get("model")),
         ("algorithm", (spec.get("algorithm") or "").upper() or None),
         ("gpu", where),
