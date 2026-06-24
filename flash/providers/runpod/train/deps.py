@@ -12,6 +12,7 @@ import os
 
 from flash._logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+from flash.providers.base import get_gpu_info
 from flash.spec import JobSpec
 
 # Literal name (NOT __name__) so the logger stays "flash.providers.runpod.train" after the
@@ -102,6 +103,48 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 #     only when the operator sets FLASH_WORKER_IMAGE to a RunPod-serverless-compatible one.
 # So FLASH_WORKER_IMAGE IS an operator override (consulted by every RunPod path).
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
+WORKER_IMAGE_TEMPLATE_ENV = "FLASH_WORKER_IMAGE_TEMPLATE"
+WORKER_IMAGE_PER_SM_ENV = "FLASH_WORKER_IMAGE_PER_SM"
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _append_tag_suffix(image: str, suffix: str) -> str:
+    slash = image.rfind("/")
+    colon = image.rfind(":")
+    if colon > slash:
+        return f"{image[:colon]}:{image[colon + 1:]}-{suffix}"
+    return f"{image}-{suffix}"
+
+
+def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
+    """Return the RunPod worker image for a GPU class.
+
+    ``FLASH_WORKER_IMAGE`` remains the absolute override. Per-SM warmed images are opt-in through
+    either ``FLASH_WORKER_IMAGE_TEMPLATE`` (for custom tag layouts) or ``FLASH_WORKER_IMAGE_PER_SM``
+    (which appends ``-smXX`` to ``WORKER_IMAGE``'s tag). Without either opt-in, the current base
+    image is returned for durable jobs and ``None`` is returned for live endpoints that request no
+    default image.
+    """
+    override = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
+    if override:
+        return override
+    if friendly_gpu:
+        info = get_gpu_info(friendly_gpu)
+        template = os.environ.get(WORKER_IMAGE_TEMPLATE_ENV, "").strip()
+        if template:
+            return template.format(
+                base_image=WORKER_IMAGE,
+                gpu=info.name,
+                gpu_short=info.short,
+                sm=info.sm,
+                sm_num=info.sm.removeprefix("sm"),
+            )
+        if _truthy(os.environ.get(WORKER_IMAGE_PER_SM_ENV)):
+            return _append_tag_suffix(WORKER_IMAGE, info.sm)
+    return WORKER_IMAGE if allow_default else None
 
 
 def resolve_worker_deps() -> list[str]:
