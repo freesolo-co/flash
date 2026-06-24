@@ -189,6 +189,64 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+# Per-org persistent cache volume (platform-managed). Attaching a RunPod network volume makes the
+# worker's heavy, reusable caches survive across runs: the model-weight download AND the fused
+# Triton/Inductor/tilelang kernel JIT — the ~10-15 min cold-start compile every cold worker
+# otherwise re-pays on paid GPU time (build_worker_env -> deps.network_volume_env redirects them
+# onto the mount). The volume name is keyed per ORG and stable across that org's runs, so the
+# SECOND run on it reaches the first training step in seconds instead of recompiling.
+#
+# Tradeoff (why it's operator-gated, default ON): the volume pins every run to ONE datacenter — a
+# smaller GPU pool, possibly higher queue/price — and bills monthly. FLASH_KERNEL_CACHE_VOLUME=0
+# disables it entirely (every run goes back to the cold/heartbeat path); FLASH_KERNEL_CACHE_DATACENTER
+# and FLASH_KERNEL_CACHE_VOLUME_GB tune the datacenter pin and the volume size.
+_KERNEL_CACHE_SLUG_RE = re.compile(r"[^a-z0-9-]+")
+_KERNEL_CACHE_DEFAULT_DC = "EU-RO-1"
+
+
+def _kernel_cache_volume_enabled() -> bool:
+    return os.environ.get("FLASH_KERNEL_CACHE_VOLUME", "1").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _assign_kernel_cache_volume(spec: JobSpec, platform_context: dict | None) -> JobSpec:
+    """Attach the org's stable persistent cache volume (platform-managed; see note above).
+
+    No-op when the feature is disabled, when no stable org identity is available
+    (programmatic/test callers with no ``platform_context``), or when a volume is already set on
+    the spec (defensive — nothing sets it upstream today, but never override an explicit choice).
+    A run with no org key can't share a warm cache with anything, so it stays volume-less rather
+    than each getting its own single-use volume (which would pay the datacenter pin for no reuse).
+    """
+    if not _kernel_cache_volume_enabled():
+        return spec
+    if getattr(spec.gpu, "network_volume", None):
+        return spec
+    ctx = platform_context or {}
+    org = str(ctx.get("org_id") or ctx.get("user_id") or "").strip().lower()
+    slug = _KERNEL_CACHE_SLUG_RE.sub("-", org).strip("-")
+    if not slug:
+        return spec
+    dc = (os.environ.get("FLASH_KERNEL_CACHE_DATACENTER", "").strip() or _KERNEL_CACHE_DEFAULT_DC)
+    try:
+        gb = int(os.environ.get("FLASH_KERNEL_CACHE_VOLUME_GB", "100"))
+    except ValueError:
+        gb = 100
+    d = spec.to_dict()
+    d["gpu"] = {
+        **d["gpu"],
+        "network_volume": f"flash-kernel-cache-{slug}",
+        "network_volume_gb": gb,
+        "datacenter": dc,
+    }
+    return JobSpec.from_dict(d)
+
+
 def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     """Daemon-thread entrypoint for background runs.
 
@@ -241,6 +299,10 @@ def submit_job(
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
     spec = _assign_managed_hf_repo(spec)
+    # Attach the org's stable persistent cache volume (platform-managed) so model weights + the
+    # fused-kernel JIT compile become one-time-per-org instead of per cold worker. Org identity
+    # comes from platform_context; no-op without it or when disabled (FLASH_KERNEL_CACHE_VOLUME=0).
+    spec = _assign_kernel_cache_volume(spec, platform_context)
     status = RunStatus(
         run_id=spec.run_id,
         state="queued",
