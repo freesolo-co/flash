@@ -304,20 +304,26 @@ def build_rollout_func(
         # the engine resident across steps). See flash issue #162.
         sleep_mode = bool(getattr(getattr(trainer, "args", None), "vllm_enable_sleep_mode", False))
         vocab_size = _engine_vocab_size(engine)
-        bounds_checked = [False]
+        # Bounds-check EACH rollout's prompt exactly once, keyed on the identity of the token list.
+        # rollout_one passes the SAME growing `cur_ids` list to every generate() within a rollout
+        # and a FRESH list per rollout (one per prompt in the batch). So we validate the first time
+        # we see a given list object — its initial, externally-rendered prompt, the only segment
+        # that can carry tokenizer/model-mismatch ids — and skip that rollout's later turns (whose
+        # appended ids are vLLM-generated or tokenizer-derived glue, both in range). Holding the
+        # list REFERENCE (not its id()) keeps the checked object alive so a later rollout's list
+        # can't reuse a freed id and be wrongly skipped. This validates every prompt in the batch
+        # (not just the first) without re-scanning the growing prefix each turn (O(total_tokens^2)).
+        last_checked: list[int] | None = None
 
         def generate(prefix_ids: list[int], max_tokens: int):
+            nonlocal last_checked
             # Fail loudly on a degenerate prompt instead of letting a bad id reach the embedding
             # gather as an opaque async CUDA illegal-access (the exact failure mode #162 was first
             # mistaken for): the prompt_token_ids path does no bounds checking.
             if not prefix_ids:
                 raise ValueError("multi-turn rollout produced an empty prompt for engine.generate()")
-            # Bounds-check token ids ONCE per rollout (on the initial prompt — the only
-            # externally-rendered segment). Later generate() calls pass a GROWING prefix whose new
-            # tokens are vLLM-generated or tokenizer-derived glue, both in-range, so re-scanning the
-            # whole prefix every turn would be O(total_tokens^2) for nothing.
-            if not bounds_checked[0]:
-                bounds_checked[0] = True
+            if prefix_ids is not last_checked:  # first generate() of a rollout -> its initial prompt
+                last_checked = prefix_ids
                 lo, hi = min(prefix_ids), max(prefix_ids)
                 if lo < 0 or (vocab_size is not None and hi >= vocab_size):
                     raise ValueError(
@@ -370,12 +376,6 @@ def build_rollout_func(
             # glue let a step finish.)
             out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
             for prompt in prompts:
-                # Re-arm the bounds check for EACH prompt in the batch: it validates the first
-                # generate() call (this prompt's externally-rendered initial prompt) and then skips
-                # the growing in-range prefixes of later turns. `bounds_checked` is batch-scoped, so
-                # without this reset only the first prompt would be validated and later prompts could
-                # still carry out-of-range ids into vLLM.
-                bounds_checked[0] = False
                 example = examples_by_key.get(_prompt_key(prompt), {"prompt": prompt})
                 r = rollout_one(
                     example=example,
