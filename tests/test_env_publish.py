@@ -41,6 +41,26 @@ def test_namespace_requires_email():
             envs.namespace_for(key)
 
 
+def test_internal_key_gets_reserved_namespace_without_email():
+    # The internal/operator service key has a synthetic/shared identity (no per-user email) but is
+    # trusted to submit runs and read everything, so it must be able to publish too. It gets a
+    # fixed reserved namespace instead of raising — regardless of whether its row carries an email.
+    assert envs.namespace_for({"auth_kind": "internal"}) == envs._INTERNAL_NAMESPACE
+    assert envs.namespace_for({"auth_kind": "internal", "email": ""}) == envs._INTERNAL_NAMESPACE
+    assert (
+        envs.namespace_for({"auth_kind": "internal", "email": "missing-email"})
+        == envs._INTERNAL_NAMESPACE
+    )
+
+
+def test_internal_special_case_does_not_loosen_user_keys():
+    # The bypass is reserved for auth_kind == "internal" ONLY: a user key (any other auth_kind, or
+    # none) without a valid email must still be rejected so two users can't collide on a namespace.
+    for key in ({"auth_kind": "external"}, {"auth_kind": "user", "email": "no-at"}, {"email": ""}):
+        with pytest.raises(envs.EnvPublishError, match="email"):
+            envs.namespace_for(key)
+
+
 def test_sanitize_name_never_returns_path_segments():
     assert envs._sanitize_name("..") == "env"
     assert envs._sanitize_name(".") == "env"
