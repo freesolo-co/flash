@@ -115,10 +115,11 @@ def test_cli_train_dry_run():
                 'algorithm = "grpo"\n'
                 "[environment]\n"
                 'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+                # NOTE: no [train] hf_repo — it is platform-managed and now warns on stderr when
+                # set, which would corrupt this test's merged stdout/stderr JSON parse.
                 "[train]\n"
                 "steps = 1\n"
                 "seeds = [0]\n"
-                'hf_repo = "owner/runs"\n'
                 "[gpu]\n"
                 'type = "RTX 5090"\n'
             )
