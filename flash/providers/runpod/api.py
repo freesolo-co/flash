@@ -56,8 +56,21 @@ def request_with_retries(
 # Endpoints
 # ---------------------------------------------------------------------------
 def list_endpoints() -> list[dict]:
-    out = request_with_retries(f"{REST_BASE}/endpoints")
-    return out if isinstance(out, list) else []
+    # ``RUNPOD_API_KEY`` may be a comma-separated pool of per-account keys. RunPod
+    # endpoints are account-scoped: a plain request_with_retries() call stops at the
+    # first key that succeeds and returns only *that* account's endpoints. Idle-sweep
+    # and slot-reconcile need the full fleet across every account in the pool, so we
+    # query each key independently (with per-key retries) and aggregate.
+    #
+    # Raises on any per-key failure so callers that treat an empty result as "confirmed
+    # absent" (teardown, slot-reconcile) don't act on an incomplete view. Both
+    # sweep_idle_endpoints() and the slot reconcile already catch and skip on exception.
+    all_endpoints: list[dict] = []
+    for key in _keys.keys():  # noqa: SIM118  (_keys is a module, not a dict)
+        out = _CLIENT.request_with_retries_for_key(key, f"{REST_BASE}/endpoints", retries=2)
+        if isinstance(out, list):
+            all_endpoints.extend(out)
+    return all_endpoints
 
 
 def find_endpoints_by_name(substr: str) -> list[dict]:
