@@ -327,10 +327,6 @@ def cmd_env_list(args) -> int:
     from flash.envs.registry import list_installed_environments
 
     installed = list_installed_environments()
-    if installed:
-        print("installed environments:")
-        for env_id in installed:
-            print(f"  {env_id}")
     paths: list[str] = []
     if Path("environment.py").is_file():
         paths.append(".")
@@ -348,9 +344,14 @@ def cmd_env_list(args) -> int:
                     paths.append(f"environments/{p.name}")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
+    # Decide the rendering up front so the themed panel and the legacy lines never both print.
     if render.styled():
         print(render.env_list(list(installed), sorted(paths)))
         return 0
+    if installed:
+        print("installed environments:")
+        for env_id in installed:
+            print(f"  {env_id}")
     if paths:
         print("local env sources (publish with `flash env push --name <name> <path>`):")
         for path in sorted(paths):

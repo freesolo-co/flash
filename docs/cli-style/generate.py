@@ -173,8 +173,10 @@ def _set_style(styled: bool, theme: str = "dark") -> None:
     os.environ["FLASH_STYLE"] = "1" if styled else "0"
     os.environ.pop("NO_COLOR", None)
     os.environ["COLUMNS"] = "76"
-    # advertise truecolor so the theme emits the exact brand hex (not the 256-color fallback)
+    # advertise a color-capable terminal so the gallery is identical even under TERM=dumb CI:
+    # COLORTERM=truecolor emits exact brand hex, and TERM must not be "dumb" (which disables color).
     os.environ["COLORTERM"] = "truecolor"
+    os.environ["TERM"] = "xterm-256color"
     os.environ["FLASH_THEME"] = theme
 
 
@@ -472,7 +474,13 @@ library, no new dependencies. Regenerate with <code>uv run python docs/cli-style
 
 def main():
     out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "index.html"
+    # Deterministic preview: pin the dry-run id (cmd_train calls new_run_id() every time) so the
+    # committed gallery doesn't churn on every regeneration.
+    sys.modules["flash.cli.main.commands"].new_run_id = lambda: "flash-1718900000-d0cf00ed"
     with tempfile.TemporaryDirectory() as td:
+        # Point the installed-env registry at an empty temp manifest so `flash env list` never
+        # leaks a developer's real installed env slugs (~/.flash/envs.json) into the preview.
+        os.environ["FLASH_ENVS_MANIFEST"] = str(Path(td) / "empty-envs.json")
         cases = build_cases(Path(td))
     blocks = [HEAD]
     for title, sub, plain, dark, light in cases:

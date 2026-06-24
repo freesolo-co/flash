@@ -377,14 +377,15 @@ def submitted(run_id: str) -> str:
     """The `flash train` hand-off note (printed to stderr before logs start streaming)."""
     head = ok(f"run {_paint(run_id, _ACCENT2)} submitted")
     hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash status {run_id} --follow`")
-    return f"{head}\n{hint}"
+    return _safe(f"{head}\n{hint}")
 
 
 def models_table(rows: list[dict]) -> str:
     """Supported base models — a clean themed list of ids (the CLI lists ids only)."""
-    ids = "\n".join(f"  {_paint('•', _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
+    dot = _glyph("•", "-")
+    ids = "\n".join(f"  {_paint(dot, _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
     foot = arrow("train one with: flash train configs/rl.toml")
-    return f"{header('models', 'supported base models')}\n{ids}\n\n{foot}"
+    return _safe(f"{header('models', 'supported base models')}\n{ids}\n\n{foot}")
 
 
 def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
@@ -394,7 +395,7 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
         rate_cell = (f"${rate:.2f}", _TEAL) if rate else ("-", _FAINT)
         body.append([(name, _ACCENT2), (f"{vram} GB", _GRAY), rate_cell])
     table = _table(["GPU", "VRAM", "$/HR"], body, aligns=["l", "r", "r"])
-    return f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}"
+    return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
 
 
 def runs_table(runs: list[dict]) -> str:
@@ -426,7 +427,7 @@ def runs_table(runs: list[dict]) -> str:
         body,
         aligns=["l", "l", "l", "r", "l", "l"],
     )
-    return f"{header('runs', f'{len(runs)} run(s)')}\n{table}"
+    return _safe(f"{header('runs', f'{len(runs)} run(s)')}\n{table}")
 
 
 def deployments_table(rows: list[dict]) -> str:
@@ -441,12 +442,12 @@ def deployments_table(rows: list[dict]) -> str:
             ]
         )
     table = _table(["RUN ID", "GPU", "ENDPOINT"], body)
-    return f"{header('deployments', f'{len(rows)} active')}\n{table}"
+    return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 
 def empty(cmd: str, desc: str, message: str) -> str:
     """A styled empty state (e.g. no runs yet)."""
-    return f"{header(cmd, desc)}\n{_dim('  ' + message)}"
+    return _safe(f"{header(cmd, desc)}\n{_dim('  ' + message)}")
 
 
 def _humanize_ts(value) -> str | None:
@@ -485,7 +486,7 @@ def run_status(obj: dict) -> str:
         pairs.append(("error", _paint(str(obj["error"]), _RED)))
     head = f"{header('status')}\n  {badge(obj.get('state', 'unknown'))}\n\n{_kv(pairs)}"
     raw = f"{_dim('details')}\n{_json(obj)}"
-    return f"{head}\n\n{raw}"
+    return _safe(f"{head}\n\n{raw}")
 
 
 def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
@@ -498,7 +499,7 @@ def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
             line += "   " + _paint(rid, _ACCENT2)
         parts.append(line + "\n")
     parts.append(_json(obj))
-    return "\n".join(parts)
+    return _safe("\n".join(parts))
 
 
 def cost_panel(est) -> str:
@@ -533,7 +534,7 @@ def cost_panel(est) -> str:
     if est.notes:
         notes = "\n".join(f"  {_paint(_glyph('·', '-'), _FAINT)} {_dim(n)}" for n in est.notes)
         out += f"\n\n{_dim('notes')}\n{notes}"
-    return out
+    return _safe(out)
 
 
 def env_setup(paths: list[str]) -> str:
@@ -550,7 +551,7 @@ def env_setup(paths: list[str]) -> str:
     )
     head = f"{header('env setup', 'starter Freesolo environment')}\n{ok('scaffold ready')}\n"
     nxt = arrow("publish it: flash env push --name my-env .")
-    return f"{head}\n{tree}\n\n{nxt}"
+    return _safe(f"{head}\n{tree}\n\n{nxt}")
 
 
 def env_list(installed: list[str], local: list[str]) -> str:
@@ -570,13 +571,13 @@ def env_list(installed: list[str], local: list[str]) -> str:
         parts.extend(f"  {_paint(_glyph('·', '-'), _FAINT)} {_paint(p, _ACCENT2)}" for p in local)
     if not installed and not local:
         parts.append(_dim("  no environments yet — scaffold one with `flash env setup`"))
-    return "\n".join(parts)
+    return _safe("\n".join(parts))
 
 
 def env_installed(env_id: str, manifest: str) -> str:
     snippet = f'[environment]\nid = "{env_id}"'
     body = "\n".join(f"  {_paint(line, _ACCENT2)}" for line in snippet.splitlines())
-    return (
+    return _safe(
         f"{ok(f'recorded {_bold(env_id)}')}\n"
         f"{_dim(f'  manifest: {manifest}')}\n\n"
         f"{_dim('use it in your config:')}\n{body}"
@@ -592,4 +593,6 @@ def chat_label() -> str:
 def env_published(slug: str) -> str:
     snippet = f'[environment]\nid = "{slug}"'
     body = "\n".join(f"  {_paint(line, _ACCENT2)}" for line in snippet.splitlines())
-    return f"{ok(f'published {_bold(slug)}')}\n\n{_dim('reference it in your config:')}\n{body}"
+    return _safe(
+        f"{ok(f'published {_bold(slug)}')}\n\n{_dim('reference it in your config:')}\n{body}"
+    )
