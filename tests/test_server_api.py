@@ -574,6 +574,10 @@ def test_worker_output_route(api, monkeypatch):
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
 
+    # Stub _worker_artifacts to {} BEFORE the first request: the real impl would hf_hub_download from
+    # the run's HF repo (slow/flaky network in a unit test). This keeps the "no artifacts -> {}"
+    # assertion fully offline/deterministic.
+    monkeypatch.setattr(app_mod, "_worker_artifacts", lambda spec: {})
     empty = api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(key)).json()
     assert empty["run_id"] == run_id
     assert empty["worker"] == {}
