@@ -269,6 +269,31 @@ def _find_real_libcudart() -> str | None:
     import ctypes.util
     import glob
 
+    def _verify(cand: str) -> str | None:
+        """Absolute path to ``cand`` if it loads AND exports cudaDeviceReset, else None. Handles both
+        absolute paths (glob results) and bare sonames like ``libcudart.so.12`` (find_library, which
+        the loader resolves but ``os.path.exists`` would reject)."""
+        try:
+            lib = ctypes.CDLL(cand)  # an abs path opens directly; a bare soname is loader-resolved
+        except OSError:
+            return None
+        if not hasattr(lib, "cudaDeviceReset"):
+            return None
+        if os.path.isabs(cand) and os.path.exists(cand):
+            return os.path.realpath(cand)
+        # Bare soname: resolve to the file the loader actually opened, via /proc/self/maps.
+        base = os.path.basename(cand)
+        try:
+            with open("/proc/self/maps") as f:
+                for line in f:
+                    if base in line and "/" in line:
+                        p = line[line.index("/"):].rstrip()
+                        if os.path.basename(p).startswith(base) and os.path.exists(p):
+                            return os.path.realpath(p)
+        except OSError:
+            pass
+        return None
+
     candidates: list[str] = []
     # 1. nvidia-cuda-runtime PyPI wheel (a torch/vLLM dep on many images).
     try:
@@ -286,29 +311,14 @@ def _find_real_libcudart() -> str | None:
         "/usr/lib/x86_64-linux-gnu/libcudart.so.12*",
     ):
         candidates += glob.glob(pat)
-    # 3. The loader's own resolver (LD_LIBRARY_PATH / ldconfig).
+    # 3. The loader's own resolver (LD_LIBRARY_PATH / ldconfig) — returns a bare soname, handled above.
     found = ctypes.util.find_library("cudart")
     if found:
         candidates.append(found)
-    for path in candidates:
-        try:
-            lib = ctypes.CDLL(path)
-            if not hasattr(lib, "cudaDeviceReset"):
-                continue
-            # `find_library` often returns a soname (e.g. "libcudart.so.12"); resolve it to an
-            # on-disk path so callers can safely create a symlink to it.
-            if not os.path.isabs(path):
-                with contextlib.suppress(Exception), open("/proc/self/maps") as f:
-                    for line in f:
-                        if "libcudart.so.12" in line and "libcudart_stub" not in line:
-                            mapped = line.strip().split()[-1]
-                            if os.path.exists(mapped):
-                                return os.path.realpath(mapped)
-                continue
-            if os.path.exists(path):
-                return os.path.realpath(path)
-        except Exception:
-            continue
+    for cand in candidates:
+        real = _verify(cand)
+        if real is not None:
+            return real
     return None
 
 
@@ -356,12 +366,14 @@ def _neutralize_tilelang_cudart_stub() -> None:
     if not os.path.lexists(stub):  # lexists: a dangling symlink still counts as present
         return
     # Idempotency WITHOUT loading the stub: we only ever turn the stub into a symlink, and a pristine
-    # tilelang always ships it as a regular file, so a symlink here means a prior pass already
-    # neutralized it. Crucially, do NOT probe the stub with ctypes.CDLL — that dlopens it (it loads
-    # fine under lazy binding despite the missing cudaDeviceReset) and maps it into THIS process's
-    # /proc/self/maps, which is exactly the libcudart line vLLM's CudaRTLibrary scan would then pick
-    # up -> the very crash we're preventing. The stub must never be loaded; only the file is touched.
-    if os.path.islink(stub):
+    # tilelang always ships it as a regular file, so a RESOLVING symlink here means a prior pass
+    # already neutralized it. Crucially, do NOT probe the stub with ctypes.CDLL — that dlopens it (it
+    # loads fine under lazy binding despite the missing cudaDeviceReset) and maps it into THIS
+    # process's /proc/self/maps, which is exactly the libcudart line vLLM's CudaRTLibrary scan would
+    # then pick up -> the very crash we're preventing. The stub must never be loaded; only the file
+    # is touched. A DANGLING symlink (our target moved/was removed) is NOT done — it leaves tilelang
+    # with a broken libcudart_stub.so, so fall through and re-point it (os.path.exists follows links).
+    if os.path.islink(stub) and os.path.exists(stub):
         return
     real = _find_real_libcudart()
     if real is None:
