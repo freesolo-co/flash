@@ -17,11 +17,10 @@ def normalize_algorithm(value: str) -> str:
     return value
 
 
-# The default GPU class a run lands on when none is pinned (also the open-model-policy
+# The default GPU class used as the open-model-policy
 # sizing reference and the spec/from_dict fallback). The managed GPU class set (KNOWN)
-# lives in providers.base; per-provider classes and pricing live under
-# providers/{runpod,vast}. Defined above ModelInfo so it can back the recommended_gpu
-# field default.
+# lives in providers.base; RunPod pricing lives under providers/runpod. Defined above
+# ModelInfo so it can back the recommended_gpu field default.
 DEFAULT_GPU = "RTX 5090"
 
 # Output vocab (== config.vocab_size, the lm_head / logits width — the PADDED model vocab,
@@ -74,7 +73,7 @@ class ModelInfo:
 
 # The default model Flash trains when a config omits one. A current-gen dense 4B
 # (text-only fine-tune) on the modern worker stack — the safe out-of-the-box choice for
-# the average developer. It is thinking-"hybrid"; the thinking flag now defaults ON.
+# the average developer. It is thinking-"hybrid"; the thinking flag defaults OFF.
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 MODELS: dict[str, ModelInfo] = {
@@ -138,20 +137,21 @@ MODELS: dict[str, ModelInfo] = {
         params_b=9.7,
         vocab_size=248_320,
         algos=("sft", "grpo"),
-        min_vram_gb=16,
-        # MEMORY-OPTIMIZED: 4-bit NF4 frozen base + bf16 LoRA adapter (QLoRA). The base
-        # drops from ~19 GB bf16 to ~5.3 GB, so colocated GRPO holds two 4-bit copies
-        # (trainer + bnb-quantized vLLM rollout) instead of two bf16 copies -> it fits a
-        # ~24-32 GB card instead of an 80 GB A100. NF4 is near-lossless for adapter training
-        # (QLoRA paper + follow-ups), a small quality trade for a ~3x cheaper GPU. No GRPO
-        # floor: the matrix sizes the (much smaller) 4-bit footprint directly.
-        grpo_min_vram_gb=0,
-        quant="4bit-qlora",
-        recommended_gpu="RTX 5090",
+        min_vram_gb=48,
+        # bf16 LoRA (NOT QLoRA). 4-bit QLoRA was abandoned for the 9B because the GRPO vLLM
+        # rollout MERGES the LoRA into the 4-bit base (peft bnb merge), and that rounding makes
+        # the sampler policy diverge from the bf16 trainer -> TRL importance-sampling ratio
+        # collapses to 0 (no learning) + runaway/non-terminating generations. bf16 keeps the
+        # rollout and trainer in the same precision so GRPO actually learns. Costs a bigger GPU:
+        # ~19 GB weights; SFT fits a 48 GB card, colocated GRPO (two bf16 copies + KV + the
+        # 248k-vocab fp32 logits) needs an 80 GB class -> grpo_min_vram_gb floor below.
+        grpo_min_vram_gb=80,
+        quant="bf16",
+        recommended_gpu="A100 PCIe",
         thinking="hybrid",
-        notes="QLoRA (4-bit NF4 base + bf16 LoRA). GRPO's colocated vLLM rollout loads the "
-        "base 4-bit via bitsandbytes too, so both copies are 4-bit -> fits ~24-32 GB "
-        "instead of 80 GB bf16. ~near-lossless vs bf16 LoRA.",
+        notes="bf16 LoRA. ~19 GB of weights; SFT fits a 48 GB card, while colocated GRPO "
+        "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
+        "(grpo_min_vram_gb floor).",
     ),
 }
 

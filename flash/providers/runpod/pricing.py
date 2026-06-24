@@ -1,117 +1,18 @@
-"""Per-GPU hourly rates: RunPod live pricing with a static fallback.
-
-Cost projection (runner, serve) and the ``gpu.type = "cheapest"`` policy both
-need $/hr per GPU class. Rates move with the market, so we read them live from the
-RunPod pricing API (the ``runpod`` SDK's GraphQL wrapper — the plain REST surface has
-no GPU-types route and direct GraphQL is 403 for scoped keys) and cache them on disk;
-any failure falls back to the static snapshot in ``providers.base.GPU_INFO``.
-
-Rates are RunPod secure-cloud on-demand — representative for ranking and projection,
-not an exact serverless invoice (the worker also records wall time; real cost comes
-from RunPod billing).
-"""
+"""Static per-GPU hourly rates for RunPod-provisionable Flash classes."""
 
 from __future__ import annotations
 
-import json
-import os
-import time
-from pathlib import Path
 
-from flash._logging import get_logger
-
-logger = get_logger(__name__)
-
-CACHE_TTL_S = 6 * 3600.0  # 6h price cache
-_CACHE_PATH = Path.home() / ".flash" / "gpu_rates.json"
-_MEM: dict = {"ts": 0.0, "rates": {}, "failed_ts": 0.0, "warned": False}
-
-
-def _static_rates() -> dict[str, float]:
+def static_rates() -> dict[str, float]:
+    """Friendly GPU name -> static $/hr snapshot."""
     from flash.providers.base import GPU_INFO
 
-    return {name: info.hourly_usd for name, info in GPU_INFO.items()}
-
-
-def _pick_rate(detail: dict) -> float | None:
-    """Best representative on-demand rate from a RunPod gpuTypes detail row."""
-    for key in ("securePrice", "communityPrice"):
-        v = detail.get(key)
-        if v:
-            return float(v)
-    v = (detail.get("lowestPrice") or {}).get("uninterruptablePrice")
-    return float(v) if v else None
-
-
-def _fetch_live_rates() -> dict[str, float]:
-    """One pricing call per managed GPU class (the list query carries no prices)."""
-    import runpod
-
-    from flash.providers.base import GPU_INFO
-    from flash.providers.runpod.gpus import gpu_api_id
-
-    if not runpod.api_key:
-        runpod.api_key = os.environ.get("RUNPOD_API_KEY")
-    rates: dict[str, float] = {}
-    for name, info in GPU_INFO.items():
-        if not info.enum_member:  # Vast-only class -> no RunPod pricing route
-            continue
-        try:
-            rate = _pick_rate(runpod.get_gpu(gpu_api_id(name)) or {})
-        except Exception as exc:
-            logger.debug("live rate fetch failed for %s: %s", name, exc)
-            continue
-        if rate:
-            rates[name] = rate
-    return rates
-
-
-def live_rates(refresh: bool = False) -> dict[str, float]:
-    """Friendly-name -> $/hr. Live (cached ``CACHE_TTL_S``) over the static snapshot.
-
-    Offline-safe: any fetch failure (no network / no RunPod key) returns the static rates.
-    """
-    static = _static_rates()
-    now = time.time()
-    if not refresh:
-        if _MEM["rates"] and now - _MEM["ts"] < CACHE_TTL_S:
-            return {**static, **_MEM["rates"]}
-        # A recent live fetch FAILED (e.g. the client has no `runpod` module, no network, or no
-        # RunPod key — none of which change mid-process). The static rates are correct, so don't
-        # re-attempt (and re-warn) on every lookup; without this a single `flash gpus`/`train`
-        # logs the warning once per GPU class. Retry only after the cache TTL.
-        if _MEM["failed_ts"] and now - _MEM["failed_ts"] < CACHE_TTL_S:
-            return static
-        try:
-            disk = json.loads(_CACHE_PATH.read_text())
-            if now - float(disk.get("ts", 0)) < CACHE_TTL_S and disk.get("rates"):
-                _MEM.update(ts=float(disk["ts"]), rates=dict(disk["rates"]))
-                return {**static, **_MEM["rates"]}
-        except Exception:
-            # Corrupt/unreadable cache: ignore and fall through to a live fetch.
-            pass
-    try:
-        fetched = _fetch_live_rates()
-    except Exception as exc:
-        _MEM["failed_ts"] = now  # remember the failure so we don't refetch/rewarn every call
-        if not _MEM["warned"]:  # warn once per process, not once per GPU class
-            logger.warning("live GPU pricing unavailable (%s); using static rates", exc)
-            _MEM["warned"] = True
-        fetched = {}
-    if fetched:
-        _MEM.update(ts=now, rates=fetched)
-        try:
-            _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _CACHE_PATH.write_text(json.dumps({"ts": now, "rates": fetched}))
-        except Exception:
-            # Cache write is an optimization; a read-only/full FS shouldn't fail pricing.
-            pass
-    return {**static, **_MEM["rates"]}
+    return {name: info.hourly_usd for name, info in GPU_INFO.items() if info.enum_member}
 
 
 def hourly_rate(gpu_name: str) -> float:
-    """$/hr for one friendly GPU name (live if available, else static)."""
+    """Static $/hr for one friendly GPU name."""
     from flash.providers.base import canonical_gpu
 
     name = canonical_gpu(gpu_name)
-    return live_rates().get(name) or _static_rates()[name]
+    return static_rates()[name]

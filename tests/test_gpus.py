@@ -25,12 +25,8 @@ def test_unknown_gpu_rejected():
 def test_providers_for():
     from flash.providers.base import providers_for
 
-    # RTX 4090 is provisionable on BOTH substrates; RTX Pro 6000 is RunPod-only
-    # (no vast_name); L40S / RTX Pro 4000 are vast-only (no Flash enum member).
-    assert providers_for("RTX 4090") == ("runpod", "vast")
+    assert providers_for("RTX 4090") == ("runpod",)
     assert providers_for("RTX Pro 6000") == ("runpod",)
-    assert providers_for("L40S") == ("vast",)
-    assert providers_for("RTX Pro 4000") == ("vast",)
 
 
 def test_expanded_gpu_table():
@@ -38,7 +34,6 @@ def test_expanded_gpu_table():
 
     # Cheap-capacity classes the cheapest policy exists for are all mapped.
     assert canonical_gpu("A100") == "A100 PCIe"
-    assert canonical_gpu("rtx a5000") == "RTX A5000"
     assert canonical_gpu("NVIDIA GeForce RTX 3090") == "RTX 3090"
     assert canonical_gpu("h100") == "H100"
     assert get_gpu_info("A40").vram_gb == 48
@@ -62,45 +57,50 @@ def test_cheapest_gpu_policy(monkeypatch):
     from flash.providers import base as gpus
     from flash.providers.runpod import pricing
 
-    # No validation gate: the cheapest enum class that fits each VRAM tier wins on static rates.
-    assert gpus.cheapest_gpu(16) == "RTX 2000 Ada"
-    assert gpus.cheapest_gpu(24) == "RTX A5000"  # cheapest >=24G enum class
-    # A40 (48G @ $0.44) beats RTX 5090 (32G @ $0.99) at the 32G tier — bigger AND cheaper.
-    assert gpus.cheapest_gpu(32) == "A40"
-    assert gpus.cheapest_gpu(48) == "A40"
-    # The error names the REAL constraint: this helper filters to RunPod-provisionable
-    # classes, so a fitting Vast-only class doesn't make the message a lie.
-    with pytest.raises(gpus.UnsupportedGpuError, match="no RunPod-provisionable GPU class"):
+    # Validated-only by default: the cheapest validated enum class that fits each VRAM tier
+    # wins on static rates. After the 2026-06-22 smoke expansion the pool includes RTX 2000 Ada
+    # (16G) and RTX A6000 (48G); A40 (48G) stays unvalidated (no RunPod capacity to smoke it in-window).
+    assert gpus.cheapest_gpu(16) == "RTX 2000 Ada"  # now validated, cheapest >=16G ($0.24)
+    # cheapest VALIDATED >=24G (16G cards don't fit).
+    assert gpus.cheapest_gpu(24) == "RTX 3090"
+    assert gpus.cheapest_gpu(32) == "RTX A6000"  # 48G A6000 now validated, $0.49 < 5090 $0.99
+    assert gpus.cheapest_gpu(48) == "RTX A6000"  # cheapest validated >=48G ($0.49, was A100 PCIe)
+    # The error names the REAL constraint: this helper filters to validated RunPod classes,
+    # so a fitting unvalidated class doesn't make the message a lie.
+    with pytest.raises(gpus.UnsupportedGpuError, match="no validated RunPod-provisionable GPU"):
         gpus.cheapest_gpu(4096)
-    # static fallback rates cover every known class
-    rates = pricing.live_rates()
-    assert set(rates) >= set(gpus.GPU_INFO)
+    # static rates cover every RunPod-provisionable class
+    rates = pricing.static_rates()
+    assert set(rates) == {name for name, info in gpus.GPU_INFO.items() if info.enum_member}
 
 
 def test_provisional_gpu_cheapest_for_model(monkeypatch):
     from flash.providers.base import provisional_gpu
 
-    # GPU pinning is gone: provisional_gpu always returns the cheapest fitting class for the
-    # model. 0.8B GRPO -> cheapest >=24G (A5000). 9B GRPO needs the 32G tier, where A40
-    # (48G @ $0.44) is cheaper than RTX 5090 (32G @ $0.99).
-    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX A5000"
-    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A40"
+    # GPU pinning is gone: provisional_gpu returns the cheapest fitting VALIDATED class for the
+    # model. 0.8B GRPO -> cheapest validated >=24G (RTX 3090). 9B is now bf16 (QLoRA dropped: the
+    # 4-bit vLLM-rollout merge broke GRPO learning), so colocated 9B GRPO needs an 80G-class card
+    # -> the cheapest validated 80G class (A100 PCIe).
+    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX 3090"
+    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A100 PCIe"
 
 
-def test_config_cheapest_policy_no_gate(monkeypatch):
+def test_config_cheapest_policy_validated_pool(monkeypatch):
     from flash.schema import spec_from_dict
 
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "environment": {"id": "primeintellect/gsm8k"},
+        "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "gpu": {"type": "cheapest"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    assert spec.gpu.type == "RTX 2000 Ada"  # cheapest fitting class for a small model (no gate)
+    # Cheapest fitting VALIDATED class for a small model: post-expansion that's the 16 GB RTX 2000
+    # Ada ($0.24, validated 2026-06-22 for SFT) — 0.8B SFT needs ~12 GB.
+    assert spec.gpu.type == "RTX 2000 Ada"
     # GPU pinning is gone: a config's gpu.type is IGNORED — the schema always resolves the
-    # cheapest fitting class, no matter what class the config names (no validation gate).
+    # cheapest fitting VALIDATED class, no matter what class the config names.
     for klass in ("L4", "L40S", "RTX 3090", "A40"):
         raw["gpu"] = {"type": klass}
         assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 2000 Ada"
@@ -125,12 +125,14 @@ def test_config_defaults_gpu_from_model():
 
     raw = {
         "model": "Qwen/Qwen3.5-9B",
-        "algorithm": "sft",  # 9B is SFT-only (colocated GRPO does not fit 32 GB bf16)
-        "environment": {"id": "primeintellect/gsm8k"},
+        "algorithm": "sft",
+        "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    assert spec.gpu.type == "RTX 2000 Ada"  # 9B 4-bit QLoRA fits 16GB; no gate -> cheapest class
+    # 9B is bf16 (QLoRA dropped): bf16 SFT needs ~29 GB but the catalog min_vram floor is 48 GB,
+    # so the cheapest validated class is the 48 GB RTX A6000.
+    assert spec.gpu.type == "RTX A6000"
 
 
 def test_build_worker_env():

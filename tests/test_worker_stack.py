@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 import types
 
+import pytest
+
 from flash.providers.runpod.train import (
     WORKER_DEPS,
     resolve_worker_deps,
@@ -57,7 +59,7 @@ def test_worker_stack_pins_qwen35_capable_versions():
     assert "vllm==0.19" in joined  # first transformers-5-compatible vllm line
     assert "transformers>=5" in joined  # qwen3_5 model types need transformers 5.x
     assert "trl>=1.6" in joined  # 1.6 adds the GRPO tools=/rollout_func multi-turn hooks
-    assert "bitsandbytes" in joined  # QLoRA tier for the 35B-A3B MoE
+    assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +129,44 @@ def _fake_bitsandbytes(monkeypatch):
     fake.optim = types.SimpleNamespace(PagedAdamW8bit=_PagedAdamW8bit)
     monkeypatch.setitem(sys.modules, "bitsandbytes", fake)
     return _PagedAdamW8bit
+
+
+def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
+    from flash.engine.worker import perf
+
+    class _Completed:
+        def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(cmd, **_kwargs):
+        joined = " ".join(cmd)
+        if "--query-gpu=" in joined:
+            return _Completed(
+                "0, GPU-abc, 575.57, NVIDIA GeForce RTX 5090, 98, 77, "
+                "32607, 24000, 8607, 69, 412.5, 575.0, P0, 2700, 14001, 5, 16\n"
+            )
+        if "--query-compute-apps=" in joined:
+            return _Completed("1234, /usr/bin/python, 23900\n")
+        return _Completed(returncode=1, stderr="unexpected command")
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    diag = perf.gpu_diagnostics()
+
+    assert diag["device_name"] == "NVIDIA GeForce RTX 5090"
+    assert diag["driver_version"] == "575.57"
+    assert diag["gpu_util_pct"] == 98
+    assert diag["mem_util_pct"] == 77
+    assert diag["memory_used_gb"] == pytest.approx(23.438)
+    assert diag["memory_total_gb"] == pytest.approx(31.8428, rel=1e-3)
+    assert diag["temperature_c"] == 69
+    assert diag["power_w"] == 412.5
+    assert diag["processes"][0]["process_name"] == "/usr/bin/python"
+    assert diag["processes"][0]["used_memory_gb"] == pytest.approx(23.34, rel=1e-3)
 
 
 def test_loraplus_optimizer_mirrors_8bit_optim(monkeypatch):
@@ -339,10 +379,11 @@ def test_liger_default_model_size_gate(monkeypatch):
     assert w.grad_checkpointing_on("openbmb/MiniCPM5-1B", 4096) is True
 
 
-def test_make_lora_skips_pissa_on_4bit_qlora(monkeypatch):
-    """PiSSA init raises on a 4-bit base (peft TypeError -> the whole run crashed), so make_lora
-    must SKIP PiSSA on the QLoRA tier (catalog 9B) and keep it on the bf16/LoRA tier. rsLoRA stays
-    on for both. Regression for the Qwen3.5-9B QLoRA training crash."""
+def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
+    """make_lora uses serve-safe, convergence-stable LoRA defaults for every model:
+    standard zero-B init (PiSSA removed — its residual corrupts serve + GRPO warm-start) and
+    standard alpha/r scaling (rsLoRA removed — alpha/sqrt(r) is ~5.6x larger and diverges the
+    SFT at the usual LoRA LR -> degenerate served adapter)."""
     captured = {}
     fake_peft = types.ModuleType("peft")
     fake_peft.LoraConfig = lambda **kw: (captured.update(kw), kw)[1]
@@ -351,21 +392,12 @@ def test_make_lora_skips_pissa_on_4bit_qlora(monkeypatch):
     worker = _import_worker(monkeypatch)
     monkeypatch.setattr(worker, "lora_exclude_modules", lambda m: None)
 
-    # 4-bit QLoRA tier -> NO PiSSA of ANY variant (any pissa_* init crashes on a 4-bit base);
-    # rsLoRA still on.
-    monkeypatch.setattr(worker, "model_quant", lambda m: "4bit-qlora")
-    captured.clear()
-    worker.make_lora("Qwen/Qwen3.5-9B")
-    _init = str(captured.get("init_lora_weights", "")).lower()
-    assert not _init.startswith("pissa"), f"PiSSA must be skipped on 4-bit, got {_init!r}"
-    assert captured.get("use_rslora") is True
-
-    # bf16/LoRA tier -> PiSSA on
-    monkeypatch.setattr(worker, "model_quant", lambda m: "bf16")
-    captured.clear()
-    worker.make_lora("Qwen/Qwen3.5-0.8B")
-    assert captured.get("init_lora_weights") == "pissa_niter_16"
-    assert captured.get("use_rslora") is True
+    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
+        captured.clear()
+        worker.make_lora(model_id)
+        assert captured.get("init_lora_weights") is True
+        assert "pissa" not in str(captured.get("init_lora_weights")).lower()
+        assert captured.get("use_rslora") is False
 
 
 def test_force_vllm_backend_for_sm120(monkeypatch):
@@ -733,3 +765,33 @@ def test_tilelang_pin_is_consistent_and_pinned():
     assert pm.group(1) == pin, (
         f"perf.py TILELANG_PIN must match WORKER_DEPS (deps={pin}, perf={pm.group(1)})"
     )
+def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):
+    # A GPU that never comes up is infra-shaped -> typed RetriableInfraError, not RuntimeError.
+    import time as _time
+
+    from flash.engine.worker.perf import RetriableInfraError, wait_for_gpu
+
+    monkeypatch.setattr(_time, "sleep", lambda *_a: None)
+    try:
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    except ImportError:
+        pass
+    with pytest.raises(RetriableInfraError):
+        wait_for_gpu()
+
+
+def test_required_upload_exhaustion_raises_retriable_infra_error(monkeypatch):
+    # A required upload that fails after its retries is bad host/network -> RetriableInfraError.
+    from flash.engine import worker
+    from flash.engine.worker.perf import RetriableInfraError
+
+    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
+    monkeypatch.setattr(worker.time, "sleep", lambda *_a: None)
+
+    def boom():
+        raise OSError("connection reset by peer")
+
+    with pytest.raises(RetriableInfraError):
+        worker._hf_upload(boom, "DONE", required=True, label="DONE")

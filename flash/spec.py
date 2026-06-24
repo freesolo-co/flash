@@ -29,8 +29,8 @@ def coerce_bool(value: Any) -> bool:
     """Parse a bool from loosely-typed sources (JSON request bodies / env / persisted dicts).
 
     bool(...) on a string is truthy for ANY non-empty string, so "false"/"0"/"no" would
-    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False, so
-    e.g. JSON ``"is_new": "false"`` is parsed as False. An already-bool value passes through.
+    wrongly become True; treat the usual falsey strings (see ``_FALSE_STRINGS``) as False.
+    An already-bool value passes through.
     """
     if isinstance(value, str):
         return value.strip().lower() not in _FALSE_STRINGS
@@ -98,14 +98,18 @@ def _opt_float(value: Any) -> float | None:
 
 @dataclass(frozen=True)
 class EnvironmentSpec:
-    # Verifiers/Prime Hub env slug ("owner/name") or installed/local env id. No default:
+    # Freesolo environment id. No default:
     # a run must name an environment explicitly (validated in schema / the worker).
     id: str = ""
     params: dict[str, Any] = field(default_factory=dict)
-    # Pip requirements the GPU worker needs for this environment (verifiers/Hub envs).
+    # Pip requirements the GPU worker needs for this environment.
     # Filled in client-side from the local install manifest so the managed control
     # plane never depends on client-local state; empty means "derive on the server".
     pip: tuple[str, ...] = ()
+    # Secret env var names the environment requires on the worker. Values are never stored in the
+    # spec; the client reads matching local env/.env values and sends them out-of-band via
+    # runtime_secrets.
+    secrets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,12 +119,14 @@ class TrainSpec:
     lora_rank: int = 32
     lora_alpha: int = 64
     seeds: tuple[int, ...] = (0,)
-    # Artifact-store adapter prefix (``<phase>/<run_id>/seed<N>``) to initialize the
-    # LoRA from instead of training fresh — e.g. a GRPO run continuing an SFT adapter.
+    # Artifact-store adapter ref output by `flash status`:
+    # ``<hf_repo>:<phase>/<run_id>/seed<N>``.
     init_from_adapter: str = ""
     # Per-run HuggingFace artifact repo ("owner/name") for this run's adapter/checkpoint/
-    # code storage AND serving. REQUIRED (validated in schema._validate_spec); there is no
-    # operator-wide default. The operator's HF_TOKEN must have write access to it.
+    # code storage AND serving. PLATFORM-MANAGED, not a user field: the control plane assigns
+    # it server-side in runner.submit_job (a per-run private dataset under the operator's
+    # namespace, written by the operator HF_TOKEN). A user-supplied value is ignored by
+    # schema.spec_from_dict; this field carries the control-plane-assigned repo to the worker.
     hf_repo: str = ""
     # Optimizer/batching knobs (SFT + GRPO). None -> the worker's tuned recipe default.
     # batch_size is the GLOBAL/effective batch (SFT: grad-accum is sized to hit it; GRPO:
@@ -135,7 +141,7 @@ class TrainSpec:
     max_steps: int | None = None
     max_examples: int | None = None
     # GRPO recipe knobs (datums parity), shipped by the SDK in [train] (NOT in
-    # [environment.params], which is forwarded verbatim to the verifiers env loader).
+    # [environment.params], which is forwarded verbatim to the Freesolo env loader).
     # None/() -> recipe default. group_size = completions per prompt; temperature = rollout
     # sampling temp; max_tokens = completion budget; kl_penalty_coef = KL beta;
     # advantage_clip = centered-advantage clamp; thinking_length_penalty_coef =
@@ -151,10 +157,11 @@ class TrainSpec:
 
 @dataclass(frozen=True)
 class GpuSpec:
-    # The parse-time provisional GPU class (cheapest that fits the model). GPU pinning is gone:
-    # the submit-time allocator always re-picks the cheapest fitting class across ALL providers,
-    # so a config's gpu.type does NOT pin — ``type`` is just the offline sizing/display default
-    # and the carrier the runner overwrites with the actually-allocated class.
+    # The parse-time provisional GPU class (cheapest VALIDATED class that fits the model). GPU
+    # pinning is gone: the submit-time allocator always re-picks the cheapest fitting validated
+    # active RunPod class, so a config's gpu.type does NOT pin — ``type`` is just the offline
+    # sizing/display default and the carrier the runner overwrites with the actually-allocated
+    # class.
     type: str = DEFAULT_GPU
     disk_gb: int = 60
     max_wall_seconds: int = 24 * 3600
@@ -165,8 +172,7 @@ class GpuSpec:
     # cross-run HF model cache (repeat runs skip the model download). Trade-offs: it
     # pins the run to the volume's datacenter (smaller GPU pool — usually the bigger
     # cost) and the volume bills monthly while it exists. Off (None) by default.
-    # RunPod-specific: network_volume/datacenter are read only by the RunPod provider
-    # and ignored by Vast (which rents single-GPU instances with no network volume).
+    # RunPod-specific: network_volume/datacenter are read only by the RunPod provider.
     network_volume: str | None = None
     network_volume_gb: int = 100
     datacenter: str | None = None  # e.g. "EU-RO-1"; required pool pin for the volume
@@ -220,11 +226,12 @@ class JobSpec:
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
         env = data.get("environment") or {}
         # Defense-in-depth: a stale/older payload may still carry a local `path`. The worker only
-        # runs published Hub env ids, so reject it here rather than silently dropping it.
+        # runs published Freesolo environment ids, so reject it here rather than silently
+        # dropping it.
         if isinstance(env, dict) and env.get("path"):
             raise ValueError(
                 "local environment paths are no longer supported; the worker only runs "
-                "published Hub env ids"
+                "published Freesolo environment ids"
             )
         train = data.get("train") or {}
         gpu = data.get("gpu") or {}
@@ -235,6 +242,7 @@ class JobSpec:
                 id=env.get("id", ""),
                 params=dict(env.get("params") or {}),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
+                secrets=_str_tuple(env.get("secrets")),
             ),
             train=TrainSpec(
                 steps=_opt_int(train.get("steps")),
