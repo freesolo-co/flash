@@ -452,3 +452,56 @@ def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
     )
     assert spec.train.steps == 10
     assert spec.train.epochs == 3
+
+
+def test_build_grpo_prompt_dataset_keeps_columns_arrow_safe() -> None:
+    # Reproduces the ifeval-lite crash: a VALID env whose per-row metadata.param is an int for some
+    # rows and a str for others. Embedding the rich record in the dataset makes PyArrow infer one
+    # column type across all rows and crash; build_grpo_prompt_dataset stores a stable int index
+    # instead, and reward_fn maps it back to the original record.
+    import flash.engine.worker as w
+
+    prompts = [
+        {"prompt": "p0", "example": {"id": "a", "metadata": {"param": 8}}},  # int param
+        {"prompt": "p1", "example": {"id": "b", "metadata": {"param": "gentle"}}},  # str param
+        {"prompt": "p2", "example": {"id": "c", "metadata": {"param": 12}}},
+    ]
+    rows, examples = w.build_grpo_prompt_dataset(prompts)
+
+    # Columns are trivially typed: the TRL-required prompt + an int index. The rich record is gone.
+    assert rows == [
+        {"prompt": "p0", "example_idx": 0},
+        {"prompt": "p1", "example_idx": 1},
+        {"prompt": "p2", "example_idx": 2},
+    ]
+    # The parallel lookup preserves each original record EXACTLY (no JSON/type coercion).
+    assert examples == [p["example"] for p in prompts]
+    # reward_fn maps the batch's example_idx column back to the original objects (heterogeneous
+    # params survive: 8 -> int, 'gentle' -> str), and a shuffled/repeated batch still resolves.
+    batch_idx = [2, 0, 1, 0]
+    mapped = [examples[int(i)] for i in batch_idx]
+    assert [e["metadata"]["param"] for e in mapped] == [12, 8, "gentle", 8]
+
+
+def test_build_grpo_prompt_dataset_survives_dataset_from_list() -> None:
+    # The actual failure point: Dataset.from_list over the rich records raises ArrowInvalid on the
+    # mixed-type column, while the index-based rows construct cleanly.
+    Dataset = pytest.importorskip("datasets").Dataset
+    ArrowInvalid = pytest.importorskip("pyarrow.lib").ArrowInvalid
+
+    import flash.engine.worker as w
+
+    prompts = [
+        {"prompt": "p0", "example": {"metadata": {"param": 8}}},
+        {"prompt": "p1", "example": {"metadata": {"param": "gentle"}}},
+    ]
+    # Old shape (rich record embedded) crashes exactly as observed in run_rl.
+    with pytest.raises(ArrowInvalid):
+        Dataset.from_list(prompts)
+
+    # The fix's rows build a valid dataset and round-trip the index column.
+    rows, examples = w.build_grpo_prompt_dataset(prompts)
+    ds = Dataset.from_list(rows)
+    assert ds.column_names == ["prompt", "example_idx"]
+    assert list(ds["example_idx"]) == [0, 1]
+    assert [examples[i]["metadata"]["param"] for i in ds["example_idx"]] == [8, "gentle"]

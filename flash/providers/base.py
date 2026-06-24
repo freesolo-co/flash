@@ -360,8 +360,13 @@ class Provider(Protocol):
         on_handle: Any = None,
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
+        on_last_gpu: bool = False,
     ) -> PollResult:
-        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll."""
+        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll.
+
+        ``on_last_gpu`` is True when the runner's gpu-walk has reached the last candidate class
+        (no next-best to fall to), so capacity backstops should wait longer before giving up.
+        """
         ...
 
     def poll(self, handle: JobHandle, spec: JobSpec, seed: int, *, log: Any = None) -> PollResult:
