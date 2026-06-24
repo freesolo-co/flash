@@ -368,9 +368,9 @@ def _color_json(obj, depth: int) -> str:
 
 
 def version(value: str) -> str:
-    """The wordmark + version + tagline."""
+    """The wordmark + version."""
     mark = _paint("flash", _ACCENT, "1")
-    return _safe(f"{mark} {_dim('v' + value)}\n{_dim('managed lora post-training')}")
+    return _safe(f"{mark} {_dim('v' + value)}")
 
 
 def models_table(rows: list[dict]) -> str:
