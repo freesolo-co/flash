@@ -104,6 +104,66 @@ async def _reconcile_cost_loop() -> None:
                 _log.info("reconciled realized cost for %d run(s)", reported)
 
 
+def _protected_train_endpoint_names() -> set[str]:
+    """Training-endpoint names that must NEVER be reaped: every endpoint tied to a LIVE
+    (non-terminal) run, in both the bare ``flash-...`` and SDK ``live-flash-...`` forms.
+
+    Derived from the run registry so the reaper can't delete a run that's merely idle between
+    jobs/seeds. Includes both the run's persisted handle name and the name re-derived from its
+    spec, so a run is protected even in the submit -> handle-persisted provisioning window.
+    """
+    from flash.providers.base import canonical_gpu
+    from flash.providers.runpod.train import _run_suffix, endpoint_name
+    from flash.runner import TERMINAL_STATES
+
+    names: set[str] = set()
+
+    def _protect(name: str | None) -> None:
+        if name:
+            names.add(name)
+            names.add(f"live-{name}")
+
+    for row in db.all_runs():
+        try:
+            status = get_status(row["run_id"])
+        except FileNotFoundError:
+            continue
+        if status.state in TERMINAL_STATES:
+            continue
+        _protect((status.remote or {}).get("endpoint_name"))
+        gpu = ((status.spec or {}).get("gpu") or {}).get("type")
+        if gpu:
+            with contextlib.suppress(Exception):
+                _protect(endpoint_name(canonical_gpu(gpu), _run_suffix(status.run_id)))
+    return names
+
+
+def _reap_idle_endpoints_once(min_idle_s: float) -> int:
+    """One run-aware sweep of idle, orphaned RunPod training endpoints. Returns count deleted."""
+    from flash.providers.runpod.jobs import _sweep_idle_flash_endpoints
+
+    return _sweep_idle_flash_endpoints(_protected_train_endpoint_names(), min_idle_s=min_idle_s)
+
+
+async def _reap_idle_endpoints_loop() -> None:
+    """Background loop: proactively delete idle, orphaned RunPod training endpoints (workers doing
+    nothing that still hold worker quota) so they don't linger between quota errors. Run-aware and
+    graced (see ``_sweep_idle_flash_endpoints``); the blocking RunPod calls are offloaded to a
+    thread, and a failed sweep is logged and retried next cycle."""
+    interval = 600.0  # sweep every 10 min
+    min_idle_s = 900.0  # only reap an endpoint idle for >= 15 min (well past any cold start)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            deleted = await asyncio.to_thread(_reap_idle_endpoints_once, min_idle_s)
+            if deleted:
+                _log.info("reaped %d idle RunPod endpoint(s) doing nothing", deleted)
+        except asyncio.CancelledError:
+            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+        except Exception:
+            _log.debug("idle-endpoint reaper sweep failed; retrying next cycle", exc_info=True)
+
+
 class _RunLock:
     """A weak-referenceable mutex usable as a context manager.
 
@@ -154,6 +214,46 @@ def _append_run_log(run_id: str, message: str) -> None:
 
     with open(runs_file_path(run_id, ".log"), "a") as f:
         f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
+
+
+def _worker_artifacts(spec) -> dict[str, str]:
+    """The run's train-subprocess stdout + traceback, fetched from its HF artifact repo.
+
+    The control-plane ``.log`` only carries orchestrator lines (and, on a terminal failure, a
+    truncated tail of the worker console). The full ``console_<phase>.txt`` / ``error_<phase>.txt``
+    the worker streams to HF are the real train stdout/traceback — but the repo is PRIVATE, so a
+    user's own HF token 404s. We fetch them here with the OPERATOR ``HF_TOKEN`` (the control plane
+    already holds it) so ``flash status --logs`` shows the real worker output regardless of run
+    state and without the user needing repo access. Best-effort: a missing file / no repo yields {}.
+    """
+    repo = getattr(getattr(spec, "train", None), "hf_repo", None)
+    if not repo:
+        return {}
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception:
+        return {}
+    prefix = adapter_prefix(spec)
+    out: dict[str, str] = {}
+    for name in (f"console_{spec.phase}.txt", f"error_{spec.phase}.txt"):
+        try:
+            path = hf_hub_download(
+                repo_id=repo,
+                repo_type="dataset",
+                filename=f"{prefix}/{name}",
+                token=os.environ.get("HF_TOKEN"),
+                # The worker appends to console/error files across the run, so a cached copy goes
+                # stale; force a fresh pull (matches other HF artifact readers, e.g.
+                # flash/providers/runpod/jobs.py:make_hf_text_reader).
+                force_download=True,
+            )
+            # errors="replace": worker stdout can carry non-UTF-8 bytes (tracebacks, progress bars);
+            # decode leniently so a single bad byte never drops the whole log on UnicodeDecodeError.
+            with open(path, encoding="utf-8", errors="replace") as f:
+                out[name] = f.read()
+        except Exception:
+            continue  # file not uploaded yet / not produced for this phase
+    return out
 
 
 def recover_runs() -> None:
@@ -208,8 +308,9 @@ def recover_runs() -> None:
                     _append_run_log(status.run_id, detail)
                 # The aborted attempt may STILL have registered its uniquely-named RunPod
                 # endpoint before crashing (the exact leak the good-spec branch's
-                # `_gc_run_endpoints` guards against). The orphan sweep below won't reap it —
-                # RunPod's `sweep_orphans` is a no-op — so do a best-effort RunPod GC HERE.
+                # `_gc_run_endpoints` guards against). The `sweep_orphans` dispatch below is a
+                # no-op for RunPod, and the periodic idle reaper would only reclaim this after its
+                # 15-min idle grace — so tear it down by name HERE for immediate cleanup.
                 # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
                 # endpoint name is derived deterministically from the run id + GPU class
                 # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
@@ -256,16 +357,31 @@ def create_app():
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
+        # Reconcile the shared RunPod endpoint-slot quota against the live endpoint list so a
+        # crash can't leak slots permanently (no-op without an internal key). Best-effort.
+        with contextlib.suppress(Exception):
+            from flash.providers.runpod.train.endpoints import reconcile_endpoint_slots
+
+            reconcile_endpoint_slots()
         # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
-        # internal key is configured. First (and only) asyncio task in the server.
+        # internal key is configured.
         cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
+        # Periodic idle-endpoint reaper: proactively delete RunPod training endpoints doing
+        # nothing (orphans from finished/crashed runs) so workers don't linger holding quota.
+        # Only when this plane manages RunPod (its API key is configured).
+        reap_task = (
+            asyncio.create_task(_reap_idle_endpoints_loop())
+            if os.environ.get("RUNPOD_API_KEY")
+            else None
+        )
         try:
             yield
         finally:
-            if cost_task is not None:
-                cost_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await cost_task
+            for task in (cost_task, reap_task):
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
 
@@ -482,6 +598,15 @@ def create_app():
             "last_heartbeat": status.last_heartbeat,
             "gpu_status": status.gpu_status,
         }
+
+    @app.get("/v1/runs/{run_id}/worker")
+    def run_worker_output(run_id: str, key: dict = Depends(require_key)):
+        # The full train-subprocess stdout/traceback, pulled from the run's HF artifact repo with
+        # the operator token — the real worker output the offset-paged .log can't carry. Kept off
+        # the hot /logs poll path (it hits HF) so streaming `--follow` stays fast; `--logs` calls
+        # this once. Best-effort: {} when nothing's been uploaded yet.
+        status = owned_run(run_id, key)
+        return {"run_id": run_id, "worker": _worker_artifacts(JobSpec.from_dict(status.spec))}
 
     @app.post("/v1/runs/{run_id}/cancel")
     def cancel(run_id: str, key: dict = Depends(require_key)):
