@@ -239,8 +239,10 @@ def build_rollout_func(
     """Return a TRL ``rollout_func`` closure that drives ``active_env`` on the colocate engine.
 
     The closure reaches the in-process vLLM engine through ``trainer.vllm_generation.llm`` and
-    samples each assistant turn with per-token logprobs; ``num_generations`` rollouts are
-    produced per prompt (TRL requires the flattened per-prompt grouping).
+    samples each assistant turn with per-token logprobs. It returns exactly ONE rollout per
+    prompt in the slice TRL passes: TRL's ``RepeatSampler`` already repeats each unique prompt
+    ``num_generations`` times before calling ``rollout_func`` (the consecutive repeats form the
+    GRPO group), so the closure must NOT multiply by ``num_generations`` again.
     """
     from vllm import SamplingParams  # gpu-only; imported lazily so the module loads on CPU
 
@@ -268,7 +270,6 @@ def build_rollout_func(
 
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
-        num_gen = int(getattr(trainer, "num_generations", 1) or 1)
         # Colocate vLLM sleep mode (GRPOConfig.vllm_enable_sleep_mode, ON for large / long-context
         # runs) offloads BOTH the rollout engine's weights and its KV cache between steps. TRL's
         # rollout_func path (GRPOTrainer._generate) calls vllm_generation.sync_weights() — which
@@ -324,23 +325,30 @@ def build_rollout_func(
         if sleep_mode:
             engine.wake_up(tags=["kv_cache"])
         try:
-            # One accumulator list per rollout field (batched dict-of-lists across all rollouts).
+            # ONE rollout per prompt: TRL's RepeatSampler already repeats each unique prompt
+            # num_generations times BEFORE handing the slice to rollout_func (trl 1.6/1.7:
+            # `prompts = [x["prompt"] for x in inputs]`, no dedup), and it expects exactly
+            # len(prompts) completions back — the GRPO group is the consecutive num_generations
+            # rows of the same prompt. Generating num_generations PER prompt here would return
+            # len(prompts) * num_generations completions, whose count mismatches the prompt batch
+            # and trips a CUDA device-side assert ("index out of bounds") in TRL's
+            # shuffle_sequence_dict once a step's rollout completes. (Latent until #162 + the env
+            # glue let a step finish.)
             out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
             for prompt in prompts:
                 example = examples_by_key.get(_prompt_key(prompt), {"prompt": prompt})
-                for _ in range(num_gen):
-                    r = rollout_one(
-                        example=example,
-                        active_env=active_env,
-                        render=render,
-                        generate=generate,
-                        env_glue=env_glue,
-                        max_turns=max_turns,
-                        per_turn_max_tokens=max_completion,
-                        engine_max_len=engine_max_len,
-                    )
-                    for k in out:
-                        out[k].append(r[k])
+                r = rollout_one(
+                    example=example,
+                    active_env=active_env,
+                    render=render,
+                    generate=generate,
+                    env_glue=env_glue,
+                    max_turns=max_turns,
+                    per_turn_max_tokens=max_completion,
+                    engine_max_len=engine_max_len,
+                )
+                for k in out:
+                    out[k].append(r[k])
             return out
         finally:
             if sleep_mode:

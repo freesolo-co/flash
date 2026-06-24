@@ -334,6 +334,23 @@ def test_rollout_func_wakes_kv_cache_around_generation_when_sleep_mode():
 
 
 @pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_returns_one_completion_per_prompt():
+    # TRL's RepeatSampler already repeats each unique prompt num_generations times before calling
+    # rollout_func, and expects exactly len(prompts) completions back. Producing num_generations
+    # PER prompt would over-generate and trip a CUDA device-side assert in shuffle_sequence_dict.
+    engine = _FakeEngine()
+    rf = _build(_FakeTok())
+    prompts = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}],
+               [{"role": "user", "content": "c"}]]
+    trainer = _fake_trainer(engine, sleep_mode=False)
+    trainer.num_generations = 4  # must be IGNORED by rollout_func (the sampler already repeated)
+    out = rf(prompts, trainer)
+    assert len(out["completion_ids"]) == len(prompts) == 3
+    assert len(out["reward"]) == 3
+    assert len(out["prompt_ids"]) == 3
+
+
+@pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_no_wakesleep_when_sleep_mode_off():
     engine = _FakeEngine()
     rf = _build(_FakeTok())
