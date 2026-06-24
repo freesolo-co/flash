@@ -106,33 +106,11 @@ class RunpodProvider:
 
         terminate_endpoint(spec.gpu.type, spec.run_id)
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[str]:
-        """Reclaim idle flash-* endpoints that no active run owns; return deleted ids.
-
-        RunPod serverless workers scale to zero, but the *endpoints* persist after a run
-        ends and a crash (or a control-plane restart that bypasses per-run GC) leaves the
-        worker warm with nothing to do — so they accumulate and keep eating the account's
-        worker quota. Run at server startup (crash recovery) and after runs, alongside
-        Vast's instance sweep. ``_endpoint_is_reclaimable`` only deletes endpoints that
-        have finished a job and are doing nothing now; ``active_labels`` (raw run ids) are
-        additionally shielded by their reconstructed endpoint-name suffix. Best-effort:
-        never raises. No RunPod key configured => nothing to sweep.
-        """
-        import os
-
-        if not os.environ.get("RUNPOD_API_KEY"):
-            return []
-        from flash.providers.runpod.jobs import _sweep_idle_flash_endpoints
-        from flash.providers.runpod.train import _run_suffix
-
-        # An active run's endpoint is named flash-<gpu>-<suffix>[rN]; protect by suffix token.
-        protected = frozenset(
-            s for s in (_run_suffix(rid) for rid in (active_labels or set())) if s
-        )
-        try:
-            return _sweep_idle_flash_endpoints(protected_names=protected)
-        except Exception:
-            return []
+    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
+        # No-op: RunPod serverless endpoints have no standing per-run billing to reap on
+        # crash recovery (a failed-before-submit endpoint is GC'd by reconstructed name in
+        # recover_runs). Present for the ``base.Provider`` protocol.
+        return []
 
 
 PROVIDER: Provider = RunpodProvider()
