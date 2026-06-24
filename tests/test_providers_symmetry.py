@@ -74,7 +74,7 @@ def test_allocator_picks_runpod_candidate(monkeypatch):
 
     a = allocate("Qwen/Qwen3.5-0.8B", "sft")
     assert a.provider == "runpod"
-    assert a.gpu == "RTX 2000 Ada"
+    assert a.gpu == "RTX 3090"
 
 
 def test_allocation_summary_formats_runpod_choice(monkeypatch):
