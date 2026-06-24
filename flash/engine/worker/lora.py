@@ -423,6 +423,15 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
             if len(header_bytes) < hdr_len:
                 raise ValueError(f"{st_path}: truncated safetensors header")
             header = json.loads(header_bytes)
+        # The safetensors header MUST be a JSON object keyed by tensor name. A corrupt/hostile file
+        # could decode to a list/int/str or carry non-string keys, which would later blow up with a
+        # confusing TypeError in _is_lora_key (substring search on a non-str). Validate the shape here
+        # (this reader is the "reject hostile headers early" hardening) and fail with a clear message.
+        if not isinstance(header, dict) or not all(isinstance(k, str) for k in header):
+            raise ValueError(
+                f"{st_path}: safetensors header is not a JSON object with string keys "
+                "(corrupt or not a safetensors file)"
+            )
         return [k for k in header if k != "__metadata__"]
     if os.path.isfile(bin_path):
         import torch

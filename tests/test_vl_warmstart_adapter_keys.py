@@ -186,6 +186,25 @@ def test_read_adapter_keys_rejects_oversized_header(tmp_path):
         lora._read_adapter_tensor_keys(str(adir))
 
 
+def test_read_adapter_keys_rejects_non_object_header(tmp_path):
+    # The safetensors header must decode to a JSON object with string keys. A header that decodes to
+    # a list/int (or carries non-string keys) would otherwise raise a confusing TypeError later in
+    # _is_lora_key (substring search on a non-str); fail with a clear ValueError here instead.
+    import json
+    import struct
+
+    import flash.engine.worker.lora as lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = adir / "adapter_model.safetensors"
+    # A well-formed length prefix + valid JSON that is a LIST, not an object.
+    body = json.dumps([1, 2, 3]).encode("utf-8")
+    st.write_bytes(struct.pack("<Q", len(body)) + body)
+    with pytest.raises(ValueError, match="not a JSON object with string keys"):
+        lora._read_adapter_tensor_keys(str(adir))
+
+
 def test_remap_raises_when_adapter_has_no_lora_keys(monkeypatch, tmp_path):
     # A corrupt / wrong-architecture warm-start adapter with no LoRA weights can't carry an SFT
     # delta -> it would load as the all-zero identity. Fail loudly at remap time (#286 cause 3).
