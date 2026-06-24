@@ -105,9 +105,38 @@ def test_train_submitted_note(monkeypatch) -> None:
     assert "--follow" in out  # tells the user how to re-attach after Ctrl-C
 
 
+def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
+    # On an ASCII / non-UTF-8 stdout, the themed renderers (which use em dashes, bullets, etc.)
+    # must degrade rather than raise UnicodeEncodeError once styling is forced on.
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    class _AsciiStdout:
+        encoding = "ascii"
+
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(render.sys, "stdout", _AsciiStdout())
+    outputs = [
+        render.models_table([{"id": "acme/x"}]),
+        render.gpus_table([("RTX 5090", 32, 0.99)], "Tip: selection is automatic — no pinning"),
+        render.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
+        render.deployments_table([{"run_id": "r", "deployment": {"gpu": "RTX 4090"}}]),
+        render.env_setup(["environment.py", "datasets/train.jsonl", "configs/rl.toml"]),
+        render.env_list([], []),
+        render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"),
+        render.submitted("flash-xyz"),
+        render.run_status({"run_id": "r", "state": "failed", "spec": {}, "error": "boom — bad"}),
+    ]
+    for out in outputs:
+        out.encode("ascii")  # raises if any non-ASCII slipped through
+
+
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.setenv("TERM", "xterm-256color")  # color stays on under TERM=dumb CI
     monkeypatch.delenv("NO_COLOR", raising=False)
 
     monkeypatch.setenv("FLASH_THEME", "dark")
