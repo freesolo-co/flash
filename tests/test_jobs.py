@@ -1488,3 +1488,36 @@ def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
     clock["t"] = 1400.0
     assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
     assert deleted == []
+
+
+def test_sweep_serializes_on_idle_since_lock(monkeypatch):
+    """_idle_since access is guarded: a sweep blocks while another holds the lock (the periodic
+    reaper and a deploy-time sweep run on different threads, so the prune can't race mid-iteration)."""
+    import threading
+
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [{"id": "e", "name": "flash-a100-x"}])
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                     "jobs": {"inQueue": 0, "inProgress": 0}},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: True)
+    jobs._idle_since.clear()
+
+    done = threading.Event()
+
+    def run_sweep():
+        jobs._sweep_idle_flash_endpoints(protected=set())
+        done.set()
+
+    with jobs._idle_since_lock:
+        t = threading.Thread(target=run_sweep)
+        t.start()
+        # The sweep must block on the lock we hold -> it cannot finish.
+        assert not done.wait(0.2)
+    t.join(timeout=2)
+    assert done.is_set()  # completes as soon as the lock is released
