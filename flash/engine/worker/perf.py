@@ -21,21 +21,59 @@ import time
 from flash.engine.vram import _LIGER_LONG_CTX_TOKENS, _LIGER_MIN_PARAMS_B
 
 
-def _attn_impl_for_capability(major: int) -> str | None:
+def _attn_impl_for_capability(
+    major: int, minor: int = 0, *, fa3_available: bool = False
+) -> str | None:
     """Map a CUDA compute capability to the trainer ``attn_implementation``.
 
-    Attention uses PyTorch SDPA (its flash/efficient backend is already selected automatically
-    on Ampere/Ada/Hopper) — the HF Kernels-Hub FA path is disabled because the torch2.10-
-    compatible ``kernels`` versions break transformers' import. So:
-      sm120 (Blackwell consumer 5090/RTX Pro) -> "sdpa" (forced to the cuDNN backend at train
-      time — its default SDPA can fall to the slow math kernel); all other archs -> None (let
-      transformers pick SDPA, which already flash-backs on Ampere/Ada/Hopper). The big LoRA
-      win comes from the Liger fused kernels, not the attention path. Pure function (no torch)
-      so it's unit-testable on CPU.
-    """
+    Per-arch best exact-attention kernel for the model's FULL-attention (softmax) layers — the
+    Qwen3.5/3.6 Gated-DeltaNet *linear*-attention layers always keep their own path (fla, or the
+    native pure-PyTorch delta rule once fla is dropped on Hopper), since FlashAttention does not
+    apply to linear attention:
+      * Hopper (sm90, H100/H200) -> "flash_attention_3" WHEN the ``flash_attn_interface`` package is
+        installed (``fa3_available``). FA3's warp-specialized async kernels are the fastest exact
+        attention on Hopper; transformers routes ``flash_attention_3`` to the local
+        ``flash_attn_interface`` (no HF Kernels-Hub, whose torch2.10 versions break
+        ``import transformers``). Falls back to SDPA when FA3 isn't built into the image.
+      * sm120 (Blackwell consumer 5090/RTX Pro) -> "sdpa" (forced to the cuDNN backend at train
+        time — its default SDPA can fall to the slow math kernel). FA3/FA4 do NOT run on sm120
+        (no TMEM/tcgen05 subsystem), and SDPA already flash/efficient-backs there.
+      * all other archs (Ampere sm80 / Ada sm89) -> None: transformers picks SDPA, whose
+        flash/efficient backend is already selected automatically there.
+    Pure function (no torch / no imports) so it's unit-testable on CPU; ``fa3_available`` is the
+    caller's probe (``optimal_attn_impl``). The big LoRA win is still the Liger/chalk fused kernels;
+    FA3 helps only the ~25% full-attention layers of the hybrid arch."""
+    if major == 9 and fa3_available:  # Hopper: FlashAttention-3 on the full-attention layers
+        return "flash_attention_3"
     if major == 12:  # Blackwell consumer: force cuDNN SDPA (avoid the math fallback)
         return "sdpa"
     return None
+
+
+def _flash_attn_3_available() -> bool:
+    """True when FlashAttention-3 is usable by transformers on this worker — i.e. the
+    ``flash_attn_interface`` module (the ``flash-attn-3`` Hopper build) is importable.
+
+    transformers' ``flash_attention_3`` path does ``from flash_attn_interface import
+    flash_attn_func, ...`` (modeling_flash_attention_utils), so a present module is exactly what
+    makes ``attn_implementation="flash_attention_3"`` resolve WITHOUT the HF Kernels-Hub. Prefer
+    transformers' own ``is_flash_attn_3_available`` probe; fall back to a ``find_spec`` so this stays
+    a leaf (no import side effects, no CUDA init). The escape hatch ``FLASH_DISABLE_FA3=1`` forces it
+    off (drop back to SDPA on a Hopper host without rebuilding the image — e.g. if a model rejects
+    FA3)."""
+    if os.environ.get("FLASH_DISABLE_FA3", "").strip() not in ("", "0", "false", "False"):
+        return False
+    try:
+        from transformers.utils import is_flash_attn_3_available
+
+        return bool(is_flash_attn_3_available())
+    except Exception:
+        try:
+            import importlib.util
+
+            return importlib.util.find_spec("flash_attn_interface") is not None
+        except Exception:
+            return False
 
 
 def _flash_attn_available() -> bool:
@@ -65,9 +103,21 @@ def optimal_attn_impl() -> str | None:
     except Exception as e:
         print("optimal_attn_impl probe failed:", e)
         return None
-    impl = _attn_impl_for_capability(major)
+    # Probe FA3 only on Hopper (the only arch it selects it for) so a non-Hopper run never imports
+    # the transformers FA3 helpers needlessly.
+    fa3 = _flash_attn_3_available() if major == 9 else False
+    impl = _attn_impl_for_capability(major, minor, fa3_available=fa3)
     if impl:
-        print(f"[attn] sm{major}{minor} -> attn_implementation={impl}")
+        suffix = " (FlashAttention-3, full-attention layers)" if impl == "flash_attention_3" else ""
+        print(f"[attn] sm{major}{minor} -> attn_implementation={impl}{suffix}")
+    elif major == 9:
+        # Hopper but no flash_attn_interface: note the SDPA fallback so an E2E A/B can distinguish
+        # "FA3 engaged" from "FA3 absent -> SDPA" without guessing.
+        print(
+            f"[attn] sm{major}{minor}: flash_attn_interface absent -> SDPA "
+            "(build FA3 into the worker image / FLASH_ATTN_3_SPEC to enable, "
+            "or FLASH_DISABLE_FA3=1 to force off)"
+        )
     return impl
 
 

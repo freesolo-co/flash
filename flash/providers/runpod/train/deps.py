@@ -336,6 +336,14 @@ def build_worker_env(
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
+        # Rollout FlashAttention version override (vllm reads VLLM_FLASH_ATTN_VERSION=2|3): vLLM's
+        # FLASH_ATTN backend auto-selects FA3 on Hopper (sm90) when supported, FA2 otherwise. Forward
+        # this so a run can PIN the rollout FA version (e.g. =3 to confirm/force FA3 on H100/H200, the
+        # rollout analog of the trainer's flash_attention_3 selection). Unset -> vLLM auto-selects.
+        "VLLM_FLASH_ATTN_VERSION",
+        # The trainer-side FA3 escape hatch (engine.worker.perf._flash_attn_3_available): set =1 to
+        # force the Hopper trainer back to SDPA without rebuilding the worker image.
+        "FLASH_DISABLE_FA3",
         # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
         # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
         # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a

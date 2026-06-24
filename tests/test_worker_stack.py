@@ -308,6 +308,39 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
     assert w.optimal_attn_impl() is None
 
 
+def test_attn_impl_for_capability_per_arch(monkeypatch):
+    """Pure capability -> attn_implementation policy (no CUDA needed):
+    Hopper(sm90)+FA3 -> flash_attention_3 (full-attention layers); Hopper w/o FA3 -> None (SDPA);
+    consumer Blackwell sm120 -> sdpa (cuDNN, FA3/FA4 don't run there); Ampere/Ada -> None."""
+    monkeypatch.setenv("RUN_MODE", "sft")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    assert w._attn_impl_for_capability(9, 0, fa3_available=True) == "flash_attention_3"
+    assert w._attn_impl_for_capability(9, 0, fa3_available=False) is None  # Hopper, FA3 absent -> SDPA
+    # sm120 forces cuDNN SDPA regardless of the FA3 flag (FA3/FA4 can't run on consumer Blackwell).
+    assert w._attn_impl_for_capability(12, 0, fa3_available=True) == "sdpa"
+    assert w._attn_impl_for_capability(8, 0) is None  # Ampere
+    assert w._attn_impl_for_capability(8, 9) is None  # Ada
+
+
+def test_flash_attn_3_probe_absent_and_disable(monkeypatch):
+    """_flash_attn_3_available: False in CI (no flash_attn_interface built); the FLASH_DISABLE_FA3
+    escape hatch forces it off; a falsey hatch value does not disable."""
+    monkeypatch.setenv("RUN_MODE", "sft")
+    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
+    sys.modules.pop("flash.engine.worker", None)
+    import flash.engine.worker as w
+
+    monkeypatch.delenv("FLASH_DISABLE_FA3", raising=False)
+    assert w._flash_attn_3_available() is False  # flash_attn_interface absent in CI
+    monkeypatch.setenv("FLASH_DISABLE_FA3", "1")
+    assert w._flash_attn_3_available() is False  # hatch short-circuits the probe
+    monkeypatch.setenv("FLASH_DISABLE_FA3", "0")
+    assert w._flash_attn_3_available() is False  # falsey hatch -> not disabled (still absent in CI)
+
+
 def test_liger_on_requires_default_and_gpu(monkeypatch):
     """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
     liger_kernel (both absent in CI), so it's off here too."""

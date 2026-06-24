@@ -68,6 +68,7 @@ from flash.engine.worker.perf import (
     _attn_impl_for_capability,  # noqa: F401
     _drop_fla_on_hopper,
     _estimate_params,  # noqa: F401
+    _flash_attn_3_available,  # noqa: F401
     _flash_attn_available,
     _GpuPeakSampler,
     _liger_default_for_model,  # noqa: F401
