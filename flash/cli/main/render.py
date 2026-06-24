@@ -373,6 +373,13 @@ def version(value: str) -> str:
     return _safe(f"{mark} {_dim('v' + value)}")
 
 
+def submitted(run_id: str) -> str:
+    """The `flash train` hand-off note (printed to stderr before logs start streaming)."""
+    head = ok(f"run {_paint(run_id, _ACCENT2)} submitted")
+    hint = _dim(f"following logs — Ctrl-C detaches; resume with `flash status {run_id} --follow`")
+    return f"{head}\n{hint}"
+
+
 def models_table(rows: list[dict]) -> str:
     """Supported base models — a clean themed list of ids (the CLI lists ids only)."""
     ids = "\n".join(f"  {_paint('•', _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
