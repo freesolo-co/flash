@@ -99,11 +99,7 @@ RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
 # GPU of each catalog arch (8.0/8.6/8.9/9.0/12.0) — which the CI image builder doesn't have
 # (the FA2 *source* path above already OOMs runners; arch-specific kernel compiles are worse).
 # So that ~10-15 min first-use compile (engine.worker; flash #163's init heartbeat keeps the
-# stall detector quiet through it) is a RUNTIME cost. It is made one-time-per-volume instead of
-# per-run by pointing TRITON_CACHE_DIR / TORCHINDUCTOR_CACHE_DIR / TILELANG_CACHE_DIR at the
-# opt-in RunPod network volume — set per-run by providers/runpod/train/deps.py:network_volume_env
-# (next to HF_HOME) because the redirect is conditional on a volume being attached, which this
-# ONE image (shared by volume and non-volume runs) can't assume. See that helper for details.
+# stall detector quiet through it) is a per-run RUNTIME cost on a cold worker.
 
 # Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
 # Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/
