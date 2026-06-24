@@ -58,10 +58,11 @@ def test_cheapest_gpu_policy(monkeypatch):
     from flash.providers.runpod import pricing
 
     # Validated-only by default: the cheapest validated enum class that fits each VRAM tier
-    # wins on static rates. After the 2026-06-22 smoke expansion the pool includes RTX 2000 Ada
-    # (16G) and RTX A6000 (48G); A40 (48G) stays unvalidated (no RunPod capacity to smoke it in-window).
-    assert gpus.cheapest_gpu(16) == "RTX 2000 Ada"  # now validated, cheapest >=16G ($0.24)
-    # cheapest VALIDATED >=24G (16G cards don't fit).
+    # wins on static rates. 24 GB is the floor now (sub-24 GB classes dropped), so anything that
+    # fits <=24 GB resolves to the cheapest validated 24 GB card, RTX 3090. A40 (48G) stays
+    # unvalidated (no RunPod capacity to smoke it in-window).
+    assert gpus.cheapest_gpu(16) == "RTX 3090"  # no sub-24 GB tier -> cheapest validated 24G ($0.46)
+    # cheapest VALIDATED >=24G.
     assert gpus.cheapest_gpu(24) == "RTX 3090"
     assert gpus.cheapest_gpu(32) == "RTX A6000"  # 48G A6000 now validated, $0.49 < 5090 $0.99
     assert gpus.cheapest_gpu(48) == "RTX A6000"  # cheapest validated >=48G ($0.49, was A100 PCIe)
@@ -96,14 +97,15 @@ def test_config_cheapest_policy_validated_pool(monkeypatch):
         "gpu": {"type": "cheapest"},
     }
     spec = spec_from_dict(raw, run_id="x")
-    # Cheapest fitting VALIDATED class for a small model: post-expansion that's the 16 GB RTX 2000
-    # Ada ($0.24, validated 2026-06-22 for SFT) — 0.8B SFT needs ~12 GB.
-    assert spec.gpu.type == "RTX 2000 Ada"
+    # Cheapest fitting VALIDATED class for a small model: 0.8B SFT needs ~12 GB, but 24 GB is the
+    # floor now (sub-24 GB classes dropped), so it resolves to the cheapest validated 24 GB card,
+    # RTX 3090 ($0.46).
+    assert spec.gpu.type == "RTX 3090"
     # GPU pinning is gone: a config's gpu.type is IGNORED — the schema always resolves the
     # cheapest fitting VALIDATED class, no matter what class the config names.
-    for klass in ("L4", "L40S", "RTX 3090", "A40"):
+    for klass in ("L4", "A100 SXM", "RTX 4090", "A40"):
         raw["gpu"] = {"type": klass}
-        assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 2000 Ada"
+        assert spec_from_dict(raw, run_id="x").gpu.type == "RTX 3090"
 
 
 def test_flash_gpu_enum_members():

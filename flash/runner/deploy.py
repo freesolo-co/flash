@@ -114,6 +114,14 @@ def cancel_run(run_id: str) -> RunStatus:
     # an undeploy artifact (cancel wins); elsewhere a racing `done` is a genuine completion that
     # _update's CAS correctly protects (cancel loses to a real finish).
     _update(run_id, "cancelled", allow_from_terminal=entered_deployed)
+    # A run cancelled mid-RL keeps whatever per-step adapters the worker already streamed to
+    # HF; mirror them to the backend store now so the cancelled run is immediately listable +
+    # deployable (`flash checkpoints` / `flash deploy --step N`). Best-effort: never let
+    # checkpoint bookkeeping fail a cancel.
+    with contextlib.suppress(Exception):
+        from flash.server.checkpoints import register_checkpoints_best_effort
+
+        register_checkpoints_best_effort(get_status(run_id))
     return get_status(run_id)
 
 
@@ -327,6 +335,28 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
             return status
         status.deployment = deployment
         status.state = "deployed"
+        status.updated_at = time.time()
+        _save_status(status)
+        return status
+
+
+def attach_checkpoint_deployment(run_id: str, deployment: dict) -> RunStatus:
+    """Attach a serving deployment to a run WITHOUT changing its training state.
+
+    Used when deploying a specific intermediate checkpoint of a run that never reached
+    ``done`` — e.g. one cancelled or failed mid-RL. The checkpoint adapter exists on HF, so it
+    can be served, but the run's terminal training outcome (``cancelled``/``failed``) must be
+    preserved: flipping it to ``deployed`` would both erase that outcome and make a later
+    undeploy wrongly restore it to ``done`` (``mark_undeployed`` sends non-terminal runs to
+    ``done``). The deployment is tracked via the ``deployment`` field exactly like a normal
+    deploy, so ``/v1/deployments`` lists it and undeploy clears it. Lock-guarded so it
+    serializes with a racing deploy/undeploy on the same run.
+    """
+    from flash.runner import _STATUS_LOCK, _save_status, get_status
+
+    with _STATUS_LOCK:
+        status = get_status(run_id)
+        status.deployment = deployment
         status.updated_at = time.time()
         _save_status(status)
         return status

@@ -100,6 +100,8 @@ class RunStatus:
     billing_state: str | None = None
     billing_error: str | None = None
     billing_charge: dict | None = None
+    # Non-secret Freesolo identity used to mirror run status to the platform UI.
+    platform_context: dict | None = None
     # Last worker heartbeat observed by the provider poller. This is intentionally
     # duplicated from the HF artifact channel into local run status so `flash status`
     # can show live worker/GPU state without doing a fresh HF read.
@@ -227,6 +229,7 @@ def submit_job(
     background: bool = False,
     runtime_secrets: dict[str, str] | None = None,
     billing_context: dict | None = None,
+    platform_context: dict | None = None,
 ) -> RunStatus:
     """Submit a job. In real mode this allocates and provisions the cheapest validated GPU class
     that fits the run; dry-run only records state."""
@@ -244,11 +247,14 @@ def submit_job(
         spec=spec.to_dict(),
         billing_context=billing_context,
         billing_state="pending" if billing_context else None,
+        platform_context=platform_context,
     )
     _save_status(status)
+    _report_status(status)
     if dry_run:
         status.state = "dry_run"
         _save_status(status)
+        _report_status(status)
         return status
     if background:
         threading.Thread(
@@ -328,6 +334,8 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         status.gpu_status = gpu if isinstance(gpu, dict) else None
         status.updated_at = time.time()
         _save_status(status)
+    _report_status(status)
+
 
 def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
     """Write metrics to results/runpod/<phase>/<run_id>/seedN and return the cost.
@@ -355,6 +363,10 @@ def _persist_metrics(spec: JobSpec, seed: int, metrics: dict) -> float:
             metrics["notes"]["runpod_gpu"] = gpu_type
     with open(os.path.join(dest, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
+    with contextlib.suppress(Exception):
+        from flash.server.run_registry import record_training_checkpoint
+
+        record_training_checkpoint(spec=spec, seed=seed, metrics=metrics, artifact_path=dest)
     return float(cost)
 
 
@@ -371,6 +383,7 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     # otherwise be clobbered by this stale background update, resurrecting a cancelled
     # run. The control plane is single-instance with per-run threads, so a process-wide
     # lock serializes all status transitions into a compare-and-set.
+    report_status: RunStatus | None = None
     with _STATUS_LOCK:
         status = get_status(run_id)
         # Terminal states are STICKY: once a run is done/failed/cancelled/dry_run, no
@@ -398,7 +411,10 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         for key, value in updates.items():
             setattr(status, key, value)
         _save_status(status)
-        return True
+        report_status = status
+    if report_status is not None:
+        _report_status(report_status)
+    return True
 
 
 def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
@@ -417,6 +433,14 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
         status.reconciled_at = reconciled_at
         status.updated_at = time.time()
         _save_status(status)
+    _report_status(status)
+
+
+def _report_status(status: RunStatus) -> None:
+    with contextlib.suppress(Exception):
+        from flash.server.run_registry import record_training_run
+
+        record_training_run(status=status)
 
 
 def _save_status(status: RunStatus) -> None:
@@ -443,6 +467,7 @@ def _save_status(status: RunStatus) -> None:
 # run AFTER the store layer above is fully defined; lifecycle/deploy import the store via
 # FUNCTION-LOCAL lazy `from flash.runner import ...` to avoid a partially-initialized cycle.
 from flash.runner.deploy import (  # noqa: E402,F401
+    attach_checkpoint_deployment,
     attach_run,
     cancel_run,
     mark_deployed,
