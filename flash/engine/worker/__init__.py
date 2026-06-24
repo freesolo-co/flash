@@ -1959,6 +1959,30 @@ def run_rl():
     if "num_iterations" in _grpo_fields:
         grpo_kwargs["num_iterations"] = 2
         print("[rl] rollout amortization: num_iterations=2 (reuse each generation batch)")
+    # truncated importance sampling (tis): trl's grpo applies an importance-sampling correction by
+    # default, but with mode="sequence_mask" and clip_max=3.0. the verl/openrlhf recipe for the
+    # rollout(vllm)-vs-training token-distribution mismatch is TOKEN-LEVEL truncated is with the
+    # per-token ratio clipped at c=2 (verl rollout_is_threshold=2.0). adopt that recipe here:
+    # token_truncate + c_max=2.0. feature-detected against this trl's GRPOConfig fields (canonical
+    # clip field first, then the pre-2.0 deprecated alias), so a trl that lacks a field is skipped.
+    # note: this deliberately changes trl's defaults (sequence_mask / 3.0) to the recipe values.
+    if "vllm_importance_sampling_mode" in _grpo_fields:
+        grpo_kwargs["vllm_importance_sampling_mode"] = "token_truncate"
+        print("[rl] tis mode=token_truncate (token-level truncated importance sampling)")
+    _tis_c = 2.0
+    _tis_clip_field = next(
+        (
+            f
+            for f in ("vllm_importance_sampling_clip_max", "vllm_importance_sampling_cap")
+            if f in _grpo_fields
+        ),
+        None,
+    )
+    if _tis_clip_field:
+        grpo_kwargs[_tis_clip_field] = _tis_c
+        print(f"[rl] tis clip c_max={_tis_c} ({_tis_clip_field})")
+    else:
+        print("[rl] tis: trl default importance-sampling correction in effect; no clip field on this trl")
     cfg = GRPOConfig(**grpo_kwargs)
     setup_seconds = time.time() - t_start
     heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
