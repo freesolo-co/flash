@@ -462,17 +462,19 @@ class FreesoloEnvironment(BaseEnvironment):
         cap = 8
         if self.multi_turn:
             cap = 24  # safe default if no per-example budget can be read at all
-            budgets: list[int] = []
+            best: int | None = None  # running max — no intermediate list for large datasets
             for ex in self.dataset():  # cached; see dataset()
                 # Per-example so ONE malformed row (or an env whose max_episode_turns raises on it)
                 # is skipped rather than discarding every budget and silently falling back to 24,
                 # which would reintroduce the truncation this is meant to prevent.
                 try:
-                    budgets.append(int(self._env.max_episode_turns(self._task_example(ex))))
+                    turns = int(self._env.max_episode_turns(self._task_example(ex)))
                 except Exception:
                     continue
-            if budgets:
-                cap = max(8, min(64, max(budgets)))
+                if best is None or turns > best:
+                    best = turns
+            if best is not None:
+                cap = max(8, min(64, best))
         self._max_turns_cache = cap
         return cap
 

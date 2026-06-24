@@ -407,6 +407,28 @@ def test_rollout_func_guards_empty_prompt():
         rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
 
 
+class _EchoPromptEnv(_OneTurnEnv):
+    """Renders each example's OWN prompt (so a test can vary token ids per prompt in a batch)."""
+
+    def new_rollout_state(self, example):
+        return {"prompt": example["prompt"], "completion": []}
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_bounds_checks_every_prompt_not_just_the_first():
+    # Regression: the bounds guard is re-armed per prompt. A LATER prompt in the batch carrying an
+    # out-of-range id must still be caught — a batch-shared "already checked" flag would validate
+    # only prompt #0 and let prompt #1's bad ids reach vLLM (CUDA illegal-access).
+    engine = _FakeEngine(vocab=200)  # template wrapper chars (~117) in range; '￿' (65535) not
+    rf = _build(_FakeTok(), active_env=_EchoPromptEnv())
+    prompts = [
+        [{"role": "user", "content": "a"}],  # all ids < 200 -> generates fine
+        [{"role": "user", "content": "￿"}],  # id 65535 >= 200 -> must raise on the 2nd prompt
+    ]
+    with pytest.raises(ValueError, match="out-of-range token id"):
+        rf(prompts, _fake_trainer(engine, sleep_mode=False))
+
+
 def test_examples_index_and_collisions():
     rows = [
         {"prompt": [{"role": "user", "content": "a"}], "answer": "1"},

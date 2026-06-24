@@ -370,6 +370,12 @@ def build_rollout_func(
             # glue let a step finish.)
             out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
             for prompt in prompts:
+                # Re-arm the bounds check for EACH prompt in the batch: it validates the first
+                # generate() call (this prompt's externally-rendered initial prompt) and then skips
+                # the growing in-range prefixes of later turns. `bounds_checked` is batch-scoped, so
+                # without this reset only the first prompt would be validated and later prompts could
+                # still carry out-of-range ids into vLLM.
+                bounds_checked[0] = False
                 example = examples_by_key.get(_prompt_key(prompt), {"prompt": prompt})
                 r = rollout_one(
                     example=example,
