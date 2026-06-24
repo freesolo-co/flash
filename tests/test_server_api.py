@@ -1142,3 +1142,53 @@ def test_deploy_rejects_non_integer_step(api, monkeypatch):
     for bad in (True, 40.9, "40.9"):
         r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": bad}, headers=_bearer(key))
         assert r.status_code == 400, f"{bad!r} -> {r.status_code} {r.text}"
+
+
+def test_create_run_records_managed_environment_use(api, monkeypatch):
+    import flash.server.environment_registry as registry
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_environment_use",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    spec = {**SPEC, "environment": {"id": "dev-clado-ai/my-env"}}
+    key = _login()
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": spec, "dry_run": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert calls
+    assert calls[0]["slug"] == "dev-clado-ai/my-env"
+    assert calls[0]["run_id"] == resp.json()["run_id"]
+    assert calls[0]["key"]["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
+
+
+def test_create_run_records_flash_training_run(api, monkeypatch):
+    import flash.server.run_registry as registry
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        registry,
+        "record_training_run",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    key = _login()
+
+    resp = api.post(
+        "/v1/runs",
+        headers=_bearer(key),
+        json={"spec": SPEC, "dry_run": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert calls
+    last = calls[-1]
+    assert last["status"].run_id == resp.json()["run_id"]
+    assert last["status"].platform_context["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
+    assert last["key"]["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
