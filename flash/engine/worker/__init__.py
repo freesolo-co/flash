@@ -581,9 +581,7 @@ def force_vllm_backend_for_sm120() -> str | None:
     FLASHINFER is vLLM's Blackwell-native backend (no flash-attn PTX dependency) and trains on a 5090
     (measured: FLASHINFER/TORCH_SDPA/TRITON_ATTN all train, ~116 s). This mirrors the trainer's
     cuDNN-SDPA forcing on sm120 (``_attn_impl_for_capability``). The GRPO no-op guard remains the
-    backstop. Returns the backend set (None if not sm120, or the operator already pinned one)."""
-    if os.environ.get("VLLM_ATTENTION_BACKEND"):
-        return None  # operator override wins
+    backstop. Returns the backend set (None if not sm120). Fixed — no operator override."""
     try:
         import torch
 
@@ -601,17 +599,17 @@ def force_vllm_backend_for_sm120() -> str | None:
 
 
 def finalize_alloc_conf_for_sleep() -> None:
-    """Sync the CUDA allocator conf with the worker's RESOLVED vLLM sleep default.
+    """Sync the CUDA allocator conf with the worker's RESOLVED vLLM sleep default (RL runs only).
 
-    The launcher (providers/*/train.py build_worker_env) must pick PYTORCH_ALLOC_CONF before this
-    process starts, but it can't always know the GRPO sleep decision: for a small model the worker
-    resolves sleep OFF (the speed default), yet the launcher conservatively assumes sleep ON and
-    picks the non-expandable conf (safe, but fragments a long colocate run). When the launcher cedes
-    the decision (it sets FLASH_ALLOC_AUTO=1 for RL runs), we resolve the same sleep default here (we
-    have the model config + GPU) and, if sleep is OFF, switch to expandable_segments — which only
-    crashes WITH sleep on, a case we've just ruled out. PYTORCH_ALLOC_CONF is read lazily at the
-    first CUDA allocation, so this must run before any allocation (it does — called at boot)."""
-    if os.environ.get("FLASH_ALLOC_AUTO") != "1":
+    The launcher (providers/*/train.py build_worker_env) picks the sleep-SAFE non-expandable
+    PYTORCH_ALLOC_CONF for RL before this process starts, but it can't know the GRPO sleep decision:
+    for a small model the worker resolves sleep OFF (the speed default), so the non-expandable conf
+    is safe but fragments a long colocate run. Here (we have the model config + GPU) we resolve the
+    SAME deterministic sleep default (``_memory_mode``, exactly run_rl's gate) and, if sleep is OFF,
+    switch to expandable_segments — which only crashes WITH sleep on, a case we've just ruled out.
+    PYTORCH_ALLOC_CONF is read lazily at the first CUDA allocation, so this must run before any
+    allocation (it does — called at boot)."""
+    if PHASE != "rl":
         return
     try:
         model_id = JOB_SPEC.model if JOB_SPEC else ""

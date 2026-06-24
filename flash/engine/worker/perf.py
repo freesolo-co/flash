@@ -402,7 +402,7 @@ def _query_nvidia_gpu() -> dict:
         ["nvidia-smi", f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"],
         capture_output=True,
         text=True,
-        timeout=float(os.environ.get("FLASH_GPU_DIAG_TIMEOUT_S", "8")),
+        timeout=8.0,  # nvidia-smi diag timeout (fixed; flash is fully managed)
     )
     raw = (out.stdout or out.stderr).strip()
     if out.returncode != 0:
@@ -447,7 +447,7 @@ def _query_nvidia_processes() -> list[dict]:
         ],
         capture_output=True,
         text=True,
-        timeout=float(os.environ.get("FLASH_GPU_DIAG_TIMEOUT_S", "8")),
+        timeout=8.0,  # nvidia-smi diag timeout (fixed; flash is fully managed)
     )
     if out.returncode != 0 or not out.stdout.strip():
         return []
