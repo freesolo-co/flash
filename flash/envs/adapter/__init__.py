@@ -590,6 +590,43 @@ class FreesoloEnvironment(BaseEnvironment):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(self.scores_breakdown(completion, example, state)["total"])
 
+    def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
+        """Reward for many ``(example, state)`` rollouts at once, in input order.
+
+        For multi-turn, episodes that share a task go through ONE ``score_episodes`` call, which the
+        env scores concurrently (``Environment.max_score_concurrency``) — replacing one blocking
+        scoring call per rollout. For a judge / network-reward env (where scoring dominates) this is
+        the multi-turn analogue of batched generation. Equals one :meth:`reward` per item:
+        ``score_episodes`` scores each episode independently, so batching changes only concurrency,
+        not values. Single-turn falls back to per-item :meth:`reward`."""
+        if not self.multi_turn:
+            return [self.reward("", ex, st) for ex, st in items]
+        groups: dict[str, dict] = {}
+        order: list[str] = []
+        for i, (ex, st) in enumerate(items):
+            # Group rollouts of the same example (a GRPO group shares one prompt) so their episodes
+            # are scored together; the example dict is the stable grouping key.
+            key = json.dumps(ex, sort_keys=True, default=str)
+            grp = groups.get(key)
+            if grp is None:
+                grp = groups[key] = {
+                    "task": st.get("task") or self._task_example(ex),
+                    "idxs": [],
+                    "episodes": [],
+                }
+                order.append(key)
+            grp["idxs"].append(i)
+            grp["episodes"].append(self._episode_from_state(st))
+        out: list[float] = [0.0] * len(items)
+        for key in order:
+            grp = groups[key]
+            rewards = self._env.score_episodes(grp["task"], grp["episodes"])
+            if len(rewards) != len(grp["episodes"]):
+                raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
+            for idx, rw in zip(grp["idxs"], rewards, strict=True):
+                out[idx] = float(rw.score)
+        return out
+
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         if state and self.multi_turn:
             reward = self._score_episode(example, state)

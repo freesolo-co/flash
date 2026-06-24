@@ -317,6 +317,20 @@ def _turn_budget(r: _RolloutState, per_turn_max_tokens: int) -> int | None:
     return max(1, max_new)
 
 
+def _score_rollouts(active_env, rollouts: list[_RolloutState]) -> list[float]:
+    """Reward for each rollout, in order. Uses ``active_env.reward_many`` when the env provides it
+    (one batched, env-concurrent scoring call per task instead of a blocking call per rollout — the
+    win for judge/expensive-reward envs), else one sequential ``active_env.reward()`` per rollout.
+    Both yield identical values; reward_many only changes scoring concurrency."""
+    reward_many = getattr(active_env, "reward_many", None)
+    if callable(reward_many):
+        rewards = reward_many([(r.example, r.state) for r in rollouts])
+        if len(rewards) != len(rollouts):
+            raise RuntimeError("env.reward_many returned the wrong number of rewards")
+        return [float(x) for x in rewards]
+    return [float(active_env.reward("", r.example, r.state)) for r in rollouts]
+
+
 def rollout_batch(
     *,
     examples: list[dict],
@@ -368,8 +382,9 @@ def rollout_batch(
                 active_env=active_env, env_glue=env_glue, max_turns=max_turns,
             )
 
-    # Score with the ACTUAL accumulated rollout state (matches rollout_one).
-    return [r.result(float(active_env.reward("", r.example, r.state))) for r in rollouts]
+    # Score with the ACTUAL accumulated rollout state (matches rollout_one), batched per task.
+    rewards = _score_rollouts(active_env, rollouts)
+    return [r.result(rw) for r, rw in zip(rollouts, rewards, strict=True)]
 
 
 def rollout_async(
@@ -431,8 +446,9 @@ def rollout_async(
             if not r.done:
                 launch(r)
 
-    # Score with the ACTUAL accumulated rollout state (matches rollout_one), in input order.
-    return [r.result(float(active_env.reward("", r.example, r.state))) for r in rollouts]
+    # Score with the ACTUAL accumulated rollout state (matches rollout_one), batched per task.
+    rewards = _score_rollouts(active_env, rollouts)
+    return [r.result(rw) for r, rw in zip(rollouts, rewards, strict=True)]
 
 
 def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:

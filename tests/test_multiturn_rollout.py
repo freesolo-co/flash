@@ -609,6 +609,47 @@ def test_rollout_async_robust_to_arbitrary_finish_order():
     assert [r["reward"] for r in out] == [1.0, 3.0, 2.0, 1.0]
 
 
+class _BatchRewardEnv(_VarTurnEnv):
+    """_VarTurnEnv that also exposes reward_many (scores every rollout in ONE batched call) and
+    counts which scoring path the rollout took."""
+
+    def __init__(self):
+        self.reward_many_calls = 0
+        self.per_rollout_reward_calls = 0
+
+    def reward(self, completion, example, state=None):
+        self.per_rollout_reward_calls += 1
+        return super().reward(completion, example, state)
+
+    def reward_many(self, items):
+        self.reward_many_calls += 1
+        return [super(_BatchRewardEnv, self).reward("", ex, st) for ex, st in items]
+
+
+def test_reward_many_batches_scoring_in_both_paths():
+    """When the env exposes reward_many, BOTH rollout paths score every rollout in ONE batched call
+    (env scores them concurrently) instead of a blocking reward() per rollout — the judge/expensive-
+    reward win — at identical per-rollout values + order, and the batched result stays byte-identical
+    across sync and async."""
+    examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
+
+    def batched(prefixes, mt):
+        return [_det_generate(p, m) for p, m in zip(prefixes, mt, strict=True)]
+
+    env_b = _BatchRewardEnv()
+    out_b = rollout_batch(examples=examples, active_env=env_b, render=render, batched_generate=batched,
+                          env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    env_a = _BatchRewardEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    out_a = rollout_async(examples=examples, active_env=env_a, render=render, submit=submit, poll=poll,
+                          busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    for env, out in ((env_b, out_b), (env_a, out_a)):
+        assert env.reward_many_calls == 1  # ONE batched scoring call...
+        assert env.per_rollout_reward_calls == 0  # ...not one reward() per rollout
+        assert [r["reward"] for r in out] == [1.0, 3.0, 2.0]
+    assert out_a == out_b  # batched-reward path is byte-identical across sync/async
+
+
 @pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_no_wakesleep_when_sleep_mode_off():
     engine = _FakeEngine()
