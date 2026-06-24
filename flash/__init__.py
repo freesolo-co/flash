@@ -20,3 +20,5 @@ except PackageNotFoundError:  # source checkout without installed metadata
     __version__ = "0.0.0+unknown"
 
 del _pkg_version, PackageNotFoundError
+
+__all__ = ["__version__"]
