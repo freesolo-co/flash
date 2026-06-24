@@ -68,6 +68,7 @@ from flash.engine.worker.perf import (
     _attn_impl_for_capability,  # noqa: F401
     _ensure_fla_fastpath_on_hopper,
     _estimate_params,  # noqa: F401
+    _flash_attn_3_available,  # noqa: F401
     _flash_attn_available,
     _GpuPeakSampler,
     _liger_default_for_model,  # noqa: F401
@@ -953,13 +954,27 @@ def run_sft():
     if liger_on(_memory_mode(model_id, sft_max_len)):
         cfg_kwargs["use_liger_kernel"] = True
         print("[sft] liger fused kernels enabled")
-    _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
-    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen attn.
-    # With FA2 importable force flash_attention_2 — a pure win over the SDPA default which would
-    # cross-contaminate packed examples.
-    if cfg_kwargs.get("packing") and _fa_ok:
-        _attn = "flash_attention_2"
-        print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+    _attn = optimal_attn_impl()  # arch-best FlashAttention (FA3 Hopper / FA2 Ampere·Ada) or SDPA
+    # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen-capable attn
+    # (FA2 and FA3 both expose flash_attn_varlen_func; plain SDPA cross-contaminates packed examples).
+    # Use the ARCH-BEST flash impl optimal_attn_impl already picked (so Hopper packs under FA3, not
+    # FA2). Cases when it did NOT pick a flash impl:
+    #   * _attn == "sdpa" (sm120, the deliberate no-flash exception): DISABLE packing — consumer
+    #     Blackwell stays plain SDPA; do NOT force FA2 (its sm120 kernel coverage is unverified).
+    #   * _attn is None (Hopper without FA3): force FA2 for boundary-correct varlen IF the wheel is
+    #     importable; else drop packing rather than silently cross-contaminate.
+    if cfg_kwargs.get("packing"):
+        if _attn in ("flash_attention_2", "flash_attention_3"):
+            print(f"[sft] attn_implementation={_attn} (packing boundary-correct varlen)")
+        elif _attn == "sdpa":
+            cfg_kwargs["packing"] = False
+            print("[sft] packing disabled: selected attn_implementation=sdpa (no varlen flash backend)")
+        elif _fa_ok:
+            _attn = "flash_attention_2"
+            print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
+        else:
+            cfg_kwargs["packing"] = False
+            print("[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA")
     # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
     # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
     # accelerate-offload large models to meta ("expected device meta but got

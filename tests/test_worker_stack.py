@@ -330,6 +330,58 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
     assert w.optimal_attn_impl() is None
 
 
+def test_attn_impl_for_capability_per_arch(monkeypatch):
+    """Pure capability -> best-per-arch flash policy (no CUDA needed): flash on every arch EXCEPT
+    consumer Blackwell sm120. Hopper(sm90): FA3, else a UNIFORM fall back to plain SDPA (NO FA3->FA2
+    chain). Ampere(sm80/86)+Ada(sm89): FA2. sm120: cuDNN SDPA (FA3/FA4 can't run)."""
+    w = _import_worker(monkeypatch)
+    f = w._attn_impl_for_capability
+    # Hopper sm90: FA3 is the arch's best flash; absent -> plain SDPA (uniform fallback, NOT FA2).
+    assert f(9, 0, fa3_available=True, fa2_available=True) == "flash_attention_3"
+    assert f(9, 0, fa3_available=False, fa2_available=True) is None  # uniform: -> SDPA, not FA2
+    assert f(9, 0, fa3_available=False, fa2_available=False) is None
+    # Ampere (8.0/8.6) + Ada (8.9): FA2 when the wheel is present, else SDPA. FA3 never applies.
+    assert f(8, 0, fa2_available=True) == "flash_attention_2"  # A100
+    assert f(8, 6, fa2_available=True) == "flash_attention_2"  # 3090/A6000
+    assert f(8, 9, fa2_available=True) == "flash_attention_2"  # Ada 4090
+    assert f(8, 7, fa2_available=True) is None  # sm87 Jetson Orin: NOT a validated FA2 arch -> SDPA
+    assert f(8, 0, fa2_available=False) is None
+    # consumer Blackwell sm120: cuDNN SDPA regardless of flash availability (the one exception).
+    assert f(12, 0, fa3_available=True, fa2_available=True) == "sdpa"
+
+
+def test_env_flag_disabled_case_insensitive(monkeypatch):
+    """The FLASH_DISABLE_FA2/FA3 parser ``_env_flag_disabled`` is CASE-INSENSITIVE and hermetic (pure
+    string logic, no heavy imports): only truthy values disable; '', 0, false/False/FALSE, no, off
+    (any case) do NOT — so FLASH_DISABLE_FA3=FALSE never silently disables the kernel."""
+    _import_worker(monkeypatch)
+    from flash.engine.worker.perf import _env_flag_disabled
+
+    for falsey in ("", "0", "false", "False", "FALSE", "no", "NO", "off", "Off"):
+        monkeypatch.setenv("X_FLAG", falsey)
+        assert _env_flag_disabled("X_FLAG") is False, falsey
+    for truthy in ("1", "true", "TRUE", "Yes", "on", "enable"):
+        monkeypatch.setenv("X_FLAG", truthy)
+        assert _env_flag_disabled("X_FLAG") is True, truthy
+    monkeypatch.delenv("X_FLAG", raising=False)
+    assert _env_flag_disabled("X_FLAG") is False  # unset -> not disabled
+
+
+def test_flash_attn_probes_disable_hatch(monkeypatch):
+    """The disable hatches short-circuit to False BEFORE any heavy import (so this is deterministic
+    in the offline CI env, which has neither transformers nor flash_attn). With the hatches unset the
+    probes also report False here because the packages are absent."""
+    w = _import_worker(monkeypatch)
+    monkeypatch.delenv("FLASH_DISABLE_FA3", raising=False)
+    monkeypatch.delenv("FLASH_DISABLE_FA2", raising=False)
+    assert w._flash_attn_3_available() is False  # flash_attn_interface / transformers absent in CI
+    assert w._flash_attn_available() is False  # flash_attn wheel absent in CI
+    monkeypatch.setenv("FLASH_DISABLE_FA3", "1")
+    assert w._flash_attn_3_available() is False  # hatch short-circuits
+    monkeypatch.setenv("FLASH_DISABLE_FA2", "1")
+    assert w._flash_attn_available() is False  # hatch short-circuits
+
+
 def test_liger_on_requires_default_and_gpu(monkeypatch):
     """liger_on(False) is always off; liger_on(True) still needs a CUDA GPU + importable
     liger_kernel (both absent in CI), so it's off here too."""
