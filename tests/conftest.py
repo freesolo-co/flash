@@ -21,4 +21,19 @@ def _offline(monkeypatch):
     import flash.engine.vram as vram
 
     monkeypatch.setattr(vram, "fetch_hf_params_b", lambda model_id: None, raising=False)
-    return
+
+    # RunPod endpoint listing -> offline: the idle-endpoint sweep (deploy-time quota reclaim
+    # and the startup/post-run orphan sweep) lists account endpoints. Default to "no endpoints"
+    # so a sweep never reaches the real API; sweep tests monkeypatch it after this fixture.
+    import flash.providers.runpod.api as runpod_api
+
+    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [], raising=False)
+
+    # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
+    # it to a single active key never loses the rest of the pool). Reset it around every
+    # test so a key set/collapsed by one test can't leak into the next.
+    import flash.providers.runpod.keys as rp_keys
+
+    rp_keys.reset()
+    yield
+    rp_keys.reset()
