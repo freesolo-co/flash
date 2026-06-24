@@ -285,3 +285,39 @@ def test_list_endpoints_raises_when_any_key_fails(monkeypatch):
 
     with pytest.raises(runpod_api.RunpodApiError):
         runpod_api.list_endpoints()
+
+
+def test_list_endpoints_raises_when_no_key_configured(monkeypatch):
+    """No RUNPOD_API_KEY -> raise instead of returning [] without any authenticated call. Callers
+    (slot-reconcile/teardown) treat [] as 'fleet confirmed empty' and would act on a false view."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    keys.reset()
+    monkeypatch.setattr(
+        runpod_api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *a, **k: pytest.fail("must not hit RunPod with no key configured"),
+    )
+    monkeypatch.setattr(runpod_api, "list_endpoints", _real_list_endpoints)
+
+    with pytest.raises(runpod_api.RunpodApiError, match="not set"):
+        runpod_api.list_endpoints()
+
+
+def test_list_endpoints_raises_on_non_list_response(monkeypatch):
+    """A 200 whose body isn't a list is NOT an empty account — silently skipping it would yield a
+    partial fleet view callers trust as complete, so raise."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a")
+    keys.reset()
+    monkeypatch.setattr(
+        runpod_api._CLIENT, "request_with_retries_for_key", lambda *a, **k: {"unexpected": "shape"}
+    )
+    monkeypatch.setattr(runpod_api, "list_endpoints", _real_list_endpoints)
+
+    with pytest.raises(runpod_api.RunpodApiError, match="unexpected /endpoints response"):
+        runpod_api.list_endpoints()
