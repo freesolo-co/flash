@@ -56,6 +56,7 @@ from flash.engine.worker.lora import (
     is_vl_checkpoint,
     lora_exclude_modules,
     model_quant,  # noqa: F401
+    patch_grpo_mask_aware_lm_head,
     patch_vllm_language_model_only,
     patch_vllm_lm_weight_sync,
     remap_adapter_keys,  # noqa: F401
@@ -2044,6 +2045,12 @@ def run_rl():
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
     # Capture the install report so the engaged kernels land in metrics (active_kernels below).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+    # Mask-aware lm_head: for MULTI-TURN GRPO, skip the 248k-vocab projection at the ~half of
+    # completion tokens that are masked env/tool text (the trainer step — not the rollout — dominates
+    # multi-turn train_wall, and that projection is its most expensive op). Loss-preserving; only for
+    # the rollout_func (multi-turn) path with the Liger fused loss present. No-op otherwise.
+    if use_rollout_func and grpo_kwargs.get("use_liger_kernel") and patch_grpo_mask_aware_lm_head(trainer):
+        print("[rl] mask-aware lm_head: skipping masked (env/pad) positions in the GRPO loss")
     # The trainer (and its colocated vLLM engine + initial checkpoint load) is now built. Activate
     # the TRL->vLLM weight-sync name remap ONLY now (see patch_vllm_lm_weight_sync) so the initial
     # checkpoint load stayed untouched while the train-time syncs get remapped. No-op unless the VL
