@@ -254,7 +254,7 @@ def provisional_gpu(
     from flash.engine.vram import model_required_vram_gb
     from flash.providers.allocator import vram_headroom
 
-    # Honor FLASH_VRAM_HEADROOM so parse-time sizing matches the submit-time allocator exactly.
+    # Use the shared vram_headroom() so parse-time sizing matches the submit-time allocator exactly.
     min_vram = model_required_vram_gb(
         model_id,
         algorithm,
