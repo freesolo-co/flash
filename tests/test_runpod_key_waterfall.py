@@ -222,43 +222,7 @@ def test_rest_waterfall_persistent_5xx_does_not_fail_over(monkeypatch):
     assert "rk-b" not in seen  # never failed over on a server error
 
 
-# NOTE: the deploy_train_endpoint account-failover test lives in test_jobs.py, next to the
-# _patch_deploy_deps / _make_runpod_flash_mocks helpers it shares with the other deploy tests.
-
-
-# ---------------------------------------------------------------------------
-# sweep_orphans (proactive idle reclaim with active-run protection)
-# ---------------------------------------------------------------------------
-def test_sweep_orphans_no_key_is_noop(monkeypatch):
-    from flash.providers import get_provider
-
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    assert get_provider("runpod").sweep_orphans(active_labels={"flash-x"}) == []
-
-
-def test_sweep_orphans_reclaims_unowned_idle_endpoints(monkeypatch):
-    import flash.providers.runpod.api as runpod_api
-    from flash.providers import get_provider
-    from flash.providers.runpod.train import _run_suffix
-
-    monkeypatch.setenv("RUNPOD_API_KEY", "rk")
-    import flash.providers.runpod.keys as keys
-
-    keys.reset()
-
-    active_run = "flash-1782-live"
-    suffix = _run_suffix(active_run)
-    endpoints = [
-        {"id": "ep-active", "name": f"live-flash-a100-{suffix}"},   # active run -> protected
-        {"id": "ep-orphan", "name": "live-flash-a100-deadbeef99"},  # no owner -> reclaim
-    ]
-    idle_done = {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
-                 "jobs": {"inQueue": 0, "inProgress": 0, "completed": 1, "failed": 0}}
-    deleted = []
-    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: endpoints)
-    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: idle_done)
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
-
-    reaped = get_provider("runpod").sweep_orphans(active_labels={active_run})
-    assert reaped == ["ep-orphan"]
-    assert deleted == ["ep-orphan"]
+# NOTE: the deploy_train_endpoint account-failover test lives in test_jobs.py (next to the
+# _patch_deploy_deps / _make_runpod_flash_mocks helpers it shares with the other deploy tests),
+# and the idle-endpoint reaper / run-aware protection tests live in test_idle_endpoint_reaper.py
+# and test_jobs.py (the proactive reclaim mechanism from #190).
