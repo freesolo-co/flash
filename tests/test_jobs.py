@@ -366,9 +366,28 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
         queue_grace_s=900.0,
     )
     assert not res.ok
-    assert res.failure == "stalled"
+    # Never scheduled (no capacity) is reported distinctly from a scheduled-then-stalled worker.
+    assert res.failure == "no_capacity"
     assert "IN_QUEUE" in res.detail
     assert "next-best GPU" in res.detail
+
+
+def test_capacity_grace_defaults_are_one_minute():
+    # The two no-capacity backstops — IN_QUEUE with no worker (queue_grace_s) and a worker stuck
+    # THROTTLED (throttled_grace_s) — fail fast (~1 min) so the runner's gpu-walk re-provisions on
+    # the next-best class instead of blocking the run on a class that is out of capacity. A *placed*
+    # worker that is still cold-starting is governed by the much larger setup_grace_s and must NOT be
+    # shortened — assert it stays large so we never abandon a legitimately-initializing worker.
+    import inspect
+
+    from flash.providers.runpod import jobs
+
+    assert jobs.stall_kwargs()["queue_grace_s"] == 60.0
+    assert jobs.stall_kwargs()["setup_grace_s"] >= 1800.0  # cold-start budget unchanged
+    sig = inspect.signature(jobs.poll_job)
+    assert sig.parameters["queue_grace_s"].default == 60.0
+    assert sig.parameters["throttled_grace_s"].default == 60.0
+    assert sig.parameters["setup_grace_s"].default >= 1800.0
 
 
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
@@ -499,6 +518,7 @@ def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
         heartbeat_reader=lambda: None,
         stall_after_s=150.0,
         setup_grace_s=100000.0,  # huge: only the unhealthy fast-fail can trip here
+        queue_grace_s=100000.0,  # huge: isolate the unhealthy path from the (tight) queue backstop
         unhealthy_grace_s=240.0,
     )
     assert res.failure == "stalled"  # infra-shaped -> runner retries on a fresh endpoint
@@ -547,6 +567,7 @@ def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
         heartbeat_reader=lambda: None,
         stall_after_s=150.0,
         setup_grace_s=100000.0,
+        queue_grace_s=100000.0,  # huge: isolate the transient-unhealthy recovery from the queue backstop
         unhealthy_grace_s=240.0,
     )
     assert res.ok
@@ -580,10 +601,13 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
         stall_after_s=150.0,
         setup_grace_s=100000.0,  # huge: only the throttled fast-fail can trip here
         unhealthy_grace_s=100000.0,  # huge: isolate the throttled path
+        queue_grace_s=100000.0,  # huge: isolate the throttled path from the (tight) queue backstop
         throttled_grace_s=300.0,
     )
-    assert res.failure == "stalled"  # infra-shaped -> runner retries on the next-best GPU
-    assert "throttled" in res.detail
+    # A throttled-only worker was never usable -> reported as no_capacity (never scheduled),
+    # infra-shaped so the runner retries on the next-best GPU.
+    assert res.failure == "no_capacity"
+    assert "THROTTLED" in res.detail
 
 
 def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
@@ -628,6 +652,7 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
         heartbeat_reader=lambda: None,
         stall_after_s=150.0,
         setup_grace_s=100000.0,
+        queue_grace_s=100000.0,  # huge: isolate the transient-throttle recovery from the queue backstop
         throttled_grace_s=300.0,
     )
     assert res.ok
@@ -1353,6 +1378,40 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
     ep_id, _name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
     assert ep_id == "ep-on-kB"
     assert keys.active_key() == "kB"  # provisioning pointer advanced to the working account
+
+
+def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
+    """When EVERY account is quota-exhausted, deploy fails over once per account and then RAISES —
+    it must NOT loop forever. advance_key() wraps (always True for a multi-key pool), so the deploy
+    bounds its own failovers by key_count(); a regression would spin here indefinitely."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
+    keys.reset()
+
+    calls = {"count": 0}
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            calls["count"] += 1
+            if calls["count"] > 20:  # safety net: fail loudly instead of hanging on a regression
+                raise AssertionError("deploy failover did not terminate (looped past the pool)")
+            raise RuntimeError(
+                "GraphQL errors: Max workers across all endpoints must not exceed "
+                "your workers quota (30)"
+            )
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(
+        jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
+    )
+
+    with pytest.raises(RuntimeError, match="workers quota"):
+        jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    # 2 accounts x _QUOTA_MAX_RETRIES (3) = 6 deploy attempts, then it stops — never the unbounded spin.
+    assert calls["count"] == 6
 
 
 def test_sweep_idle_flash_endpoints(monkeypatch):

@@ -53,8 +53,10 @@ uv run flash-server                      # control plane (operator-side, run onc
 
 The control plane owns provider credentials: `RUNPOD_API_KEY` is always required,
 plus the shared `HF_TOKEN`.
-The artifact repo is per-run (the run TOML's `[train] hf_repo`), not an
-operator-wide env var. Clients authenticate with their freesolo API key (`flash login`).
+The artifact repo is platform-managed and per-run (each run gets its own
+`Freesolo-Co/flashrun-<run_id>`, written by the operator `HF_TOKEN`); it is not a user
+knob and not an operator-wide env var. Clients authenticate with their freesolo API key
+(`flash login`).
 
 ## Serving From an API
 
