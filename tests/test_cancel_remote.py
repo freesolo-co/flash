@@ -571,13 +571,13 @@ def _install_fake_sdk(monkeypatch, *, resources, undeploy, rest_find, rest_delet
     monkeypatch.setattr(runpod_api, "find_endpoints_by_name", rest_find)
     monkeypatch.setattr(runpod_api, "delete_endpoint", rest_delete)
 
-    # Fresh semaphore + tracking set, with one slot already "acquired" for this run's endpoint
-    # (as get_train_endpoint would have done). monkeypatch restores the module globals after.
+    # Fresh local semaphore + tracking map, with one slot already "acquired" (local mode, as a
+    # no-internal-key get_train_endpoint would have done). monkeypatch restores the globals after.
     target = endpoint_name(canonical_gpu("RTX 5090"), _run_suffix("flash-q-1"))
-    monkeypatch.setattr(ep_mod, "_ENDPOINT_SLOTS", threading.Semaphore(28))
-    monkeypatch.setattr(ep_mod, "_ACQUIRED_NAMES", set())
-    ep_mod._ACQUIRED_NAMES.add(target)
-    ep_mod._ENDPOINT_SLOTS.acquire()  # 27 free; releasing puts it back to 28
+    monkeypatch.setattr(ep_mod, "_LOCAL_SLOTS", threading.Semaphore(28))
+    monkeypatch.setattr(ep_mod, "_ACQUIRED", {})
+    ep_mod._ACQUIRED[target] = "local"
+    ep_mod._LOCAL_SLOTS.acquire()  # 27 free; releasing puts it back to 28
     return ep_mod, target
 
 
@@ -598,7 +598,7 @@ def test_terminate_releases_slot_when_undeploy_succeeds(monkeypatch):
         rest_find=lambda _s: [],
     )
     ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target not in ep_mod._ACQUIRED_NAMES, "a successful undeploy must release the slot"
+    assert target not in ep_mod._ACQUIRED, "a successful undeploy must release the slot"
 
 
 def test_terminate_does_not_release_slot_on_undeploy_failure(monkeypatch):
@@ -612,7 +612,7 @@ def test_terminate_does_not_release_slot_on_undeploy_failure(monkeypatch):
         rest_find=lambda _s: [],  # not consulted: uids was non-empty
     )
     ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target in ep_mod._ACQUIRED_NAMES, "a failed undeploy must NOT release the slot"
+    assert target in ep_mod._ACQUIRED, "a failed undeploy must NOT release the slot"
 
 
 def test_terminate_releases_slot_when_no_remote_endpoint_exists(monkeypatch):
@@ -626,7 +626,7 @@ def test_terminate_releases_slot_when_no_remote_endpoint_exists(monkeypatch):
         rest_find=lambda _s: [],  # REST confirms nothing remote
     )
     ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target not in ep_mod._ACQUIRED_NAMES, (
+    assert target not in ep_mod._ACQUIRED, (
         "a positively-verified-absent endpoint must release the slot (else the queue deadlocks)"
     )
 
@@ -645,7 +645,7 @@ def test_terminate_does_not_release_slot_when_rest_lookup_unreachable(monkeypatc
         rest_find=_boom,
     )
     out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target in ep_mod._ACQUIRED_NAMES, (
+    assert target in ep_mod._ACQUIRED, (
         "an unverifiable absence (REST unreachable) must NOT release the slot"
     )
     assert isinstance(out, list)  # still never raises
@@ -663,4 +663,4 @@ def test_terminate_releases_slot_when_rest_deletes_orphan(monkeypatch):
         rest_delete=lambda _id: True,
     )
     ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-    assert target not in ep_mod._ACQUIRED_NAMES, "a REST-deleted orphan must release the slot"
+    assert target not in ep_mod._ACQUIRED, "a REST-deleted orphan must release the slot"
