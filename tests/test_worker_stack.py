@@ -309,20 +309,26 @@ def test_optimal_attn_impl_no_cuda_is_none(monkeypatch):
 
 
 def test_attn_impl_for_capability_per_arch(monkeypatch):
-    """Pure capability -> attn_implementation policy (no CUDA needed):
-    Hopper(sm90)+FA3 -> flash_attention_3 (full-attention layers); Hopper w/o FA3 -> None (SDPA);
-    consumer Blackwell sm120 -> sdpa (cuDNN, FA3/FA4 don't run there); Ampere/Ada -> None."""
+    """Pure capability -> best-per-arch flash policy (no CUDA needed): flash on every arch EXCEPT
+    consumer Blackwell sm120. Hopper(sm90): FA3 > FA2 > SDPA. Ampere(sm80/86)+Ada(sm89): FA2.
+    sm120: cuDNN SDPA (FA3/FA4 can't run; FA2 wheel coverage unverified)."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     sys.modules.pop("flash.engine.worker", None)
     import flash.engine.worker as w
 
-    assert w._attn_impl_for_capability(9, 0, fa3_available=True) == "flash_attention_3"
-    assert w._attn_impl_for_capability(9, 0, fa3_available=False) is None  # Hopper, FA3 absent -> SDPA
-    # sm120 forces cuDNN SDPA regardless of the FA3 flag (FA3/FA4 can't run on consumer Blackwell).
-    assert w._attn_impl_for_capability(12, 0, fa3_available=True) == "sdpa"
-    assert w._attn_impl_for_capability(8, 0) is None  # Ampere
-    assert w._attn_impl_for_capability(8, 9) is None  # Ada
+    f = w._attn_impl_for_capability
+    # Hopper sm90: FA3 best, FA2 fallback, then SDPA.
+    assert f(9, 0, fa3_available=True, fa2_available=True) == "flash_attention_3"
+    assert f(9, 0, fa3_available=False, fa2_available=True) == "flash_attention_2"
+    assert f(9, 0, fa3_available=False, fa2_available=False) is None
+    # Ampere (8.0/8.6) + Ada (8.9): FA2 when the wheel is present, else SDPA. FA3 never applies.
+    assert f(8, 0, fa2_available=True) == "flash_attention_2"  # A100
+    assert f(8, 6, fa2_available=True) == "flash_attention_2"  # 3090/A6000
+    assert f(8, 9, fa2_available=True) == "flash_attention_2"  # Ada 4090
+    assert f(8, 0, fa2_available=False) is None
+    # consumer Blackwell sm120: cuDNN SDPA regardless of flash availability (the one exception).
+    assert f(12, 0, fa3_available=True, fa2_available=True) == "sdpa"
 
 
 def test_flash_attn_3_probe_absent_and_disable(monkeypatch):
@@ -339,6 +345,10 @@ def test_flash_attn_3_probe_absent_and_disable(monkeypatch):
     assert w._flash_attn_3_available() is False  # hatch short-circuits the probe
     monkeypatch.setenv("FLASH_DISABLE_FA3", "0")
     assert w._flash_attn_3_available() is False  # falsey hatch -> not disabled (still absent in CI)
+    # FA2 escape hatch: FLASH_DISABLE_FA2=1 forces _flash_attn_available off (reverts arch to SDPA +
+    # no packing). flash_attn is absent in CI so it's False regardless, but the hatch must short-circuit.
+    monkeypatch.setenv("FLASH_DISABLE_FA2", "1")
+    assert w._flash_attn_available() is False
 
 
 def test_liger_on_requires_default_and_gpu(monkeypatch):

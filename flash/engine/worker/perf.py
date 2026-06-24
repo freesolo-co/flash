@@ -22,30 +22,40 @@ from flash.engine.vram import _LIGER_LONG_CTX_TOKENS, _LIGER_MIN_PARAMS_B
 
 
 def _attn_impl_for_capability(
-    major: int, minor: int = 0, *, fa3_available: bool = False
+    major: int, minor: int = 0, *, fa3_available: bool = False, fa2_available: bool = False
 ) -> str | None:
-    """Map a CUDA compute capability to the trainer ``attn_implementation``.
+    """Map a CUDA compute capability to the trainer ``attn_implementation`` — the best per-arch
+    FlashAttention kernel for the model's FULL-attention (softmax) layers, so SFT *and* GRPO use a
+    real flash kernel on every arch where one exists (not plain SDPA). The Qwen3.5/3.6
+    Gated-DeltaNet *linear*-attention layers always keep their own path (fla, or the native
+    pure-PyTorch delta rule once fla is dropped on Hopper) — FlashAttention does not apply to linear
+    attention.
 
-    Per-arch best exact-attention kernel for the model's FULL-attention (softmax) layers — the
-    Qwen3.5/3.6 Gated-DeltaNet *linear*-attention layers always keep their own path (fla, or the
-    native pure-PyTorch delta rule once fla is dropped on Hopper), since FlashAttention does not
-    apply to linear attention:
-      * Hopper (sm90, H100/H200) -> "flash_attention_3" WHEN the ``flash_attn_interface`` package is
-        installed (``fa3_available``). FA3's warp-specialized async kernels are the fastest exact
-        attention on Hopper; transformers routes ``flash_attention_3`` to the local
-        ``flash_attn_interface`` (no HF Kernels-Hub, whose torch2.10 versions break
-        ``import transformers``). Falls back to SDPA when FA3 isn't built into the image.
-      * sm120 (Blackwell consumer 5090/RTX Pro) -> "sdpa" (forced to the cuDNN backend at train
-        time — its default SDPA can fall to the slow math kernel). FA3/FA4 do NOT run on sm120
-        (no TMEM/tcgen05 subsystem), and SDPA already flash/efficient-backs there.
-      * all other archs (Ampere sm80 / Ada sm89) -> None: transformers picks SDPA, whose
-        flash/efficient backend is already selected automatically there.
-    Pure function (no torch / no imports) so it's unit-testable on CPU; ``fa3_available`` is the
-    caller's probe (``optimal_attn_impl``). The big LoRA win is still the Liger/chalk fused kernels;
-    FA3 helps only the ~25% full-attention layers of the hybrid arch."""
-    if major == 9 and fa3_available:  # Hopper: FlashAttention-3 on the full-attention layers
-        return "flash_attention_3"
-    if major == 12:  # Blackwell consumer: force cuDNN SDPA (avoid the math fallback)
+      * Hopper (sm90, H100/H200): "flash_attention_3" when ``flash_attn_interface`` is installed
+        (``fa3_available``) — FA3's warp-specialized async kernels are the fastest exact attention
+        on Hopper; transformers routes it to the LOCAL ``flash_attn_interface`` (no HF Kernels-Hub,
+        whose torch2.10 versions break ``import transformers``). Falls back to FA2, then SDPA.
+      * Ampere (sm80 A100 / sm86 3090·A6000) + Ada (sm89 4090·L40S): "flash_attention_2" when the
+        ``flash_attn`` wheel is importable (``fa2_available``) — FA3 does NOT support these archs.
+        Previously these returned None (plain SDPA) in the GRPO path; FA2 is the real flash kernel.
+      * consumer Blackwell (sm120 5090 / RTX Pro): "sdpa" forced to the cuDNN backend. FA3/FA4 do
+        NOT run on sm120 (no TMEM/tcgen05), and the prebuilt FA2 CUDA wheel's sm120 coverage is
+        unverified, so cuDNN SDPA is the validated best here (the SFT packing path may still use FA2
+        varlen where the wheel supports it — that decision is separate).
+      * anything else / flash unavailable -> None: transformers picks SDPA (already flash-backed on
+        Ampere/Ada/Hopper).
+    Pure function (no torch / no imports) so it's unit-testable on CPU; ``fa2_available`` /
+    ``fa3_available`` are the caller's probes (``optimal_attn_impl``). The big LoRA win is still the
+    Liger/chalk fused kernels; flash helps only the ~25% full-attention layers of the hybrid arch."""
+    if major == 9:  # Hopper: FA3 (best) > FA2 > SDPA
+        if fa3_available:
+            return "flash_attention_3"
+        if fa2_available:
+            return "flash_attention_2"
+        return None
+    if major == 8 and fa2_available:  # Ampere (8.0/8.6) + Ada (8.9): FA2 (no FA3 on these archs)
+        return "flash_attention_2"
+    if major == 12:  # Blackwell consumer: cuDNN SDPA (FA3/FA4 can't run; FA2 sm120 coverage unverified)
         return "sdpa"
     return None
 
@@ -77,13 +87,17 @@ def _flash_attn_3_available() -> bool:
 
 
 def _flash_attn_available() -> bool:
-    """True when the ``flash_attn`` wheel is importable (our worker image builds it from source).
+    """True when the ``flash_attn`` (FA2) wheel is importable (baked into the worker image).
 
-    Gates the packing default: TRL's ``packing_strategy='bfd'`` produces flattened/padding-free
-    batches whose example boundaries are carried by ``position_ids`` and enforced ONLY by an
-    attention impl that honors them (FlashAttention-2 varlen / flex_attention). Under plain SDPA,
-    packed examples attend ACROSS boundaries (silent quality loss). find_spec only — no import side
-    effects (and no CUDA init)."""
+    Drives BOTH the FA2 attn_implementation selection (Ampere/Ada, and Hopper without FA3) AND the
+    SFT packing default: TRL's ``packing_strategy='bfd'`` produces flattened/padding-free batches
+    whose example boundaries are carried by ``position_ids`` and enforced ONLY by a varlen-capable
+    attention impl (FA2/FA3/flex). Under plain SDPA, packed examples attend ACROSS boundaries
+    (silent quality loss). find_spec only — no import side effects (and no CUDA init). The escape
+    hatch ``FLASH_DISABLE_FA2=1`` forces it off (reverts that arch to plain SDPA + no packing,
+    without rebuilding the image — e.g. if a wheel lacks kernels for the live arch)."""
+    if os.environ.get("FLASH_DISABLE_FA2", "").strip() not in ("", "0", "false", "False"):
+        return False
     try:
         import importlib.util
 
@@ -103,21 +117,26 @@ def optimal_attn_impl() -> str | None:
     except Exception as e:
         print("optimal_attn_impl probe failed:", e)
         return None
+    fa2 = _flash_attn_available()  # FA2 wheel importable (Ampere/Ada/Hopper)
     # Probe FA3 only on Hopper (the only arch it selects it for) so a non-Hopper run never imports
     # the transformers FA3 helpers needlessly.
     fa3 = _flash_attn_3_available() if major == 9 else False
-    impl = _attn_impl_for_capability(major, minor, fa3_available=fa3)
-    if impl:
-        suffix = " (FlashAttention-3, full-attention layers)" if impl == "flash_attention_3" else ""
-        print(f"[attn] sm{major}{minor} -> attn_implementation={impl}{suffix}")
-    elif major == 9:
-        # Hopper but no flash_attn_interface: note the SDPA fallback so an E2E A/B can distinguish
-        # "FA3 engaged" from "FA3 absent -> SDPA" without guessing.
+    impl = _attn_impl_for_capability(major, minor, fa3_available=fa3, fa2_available=fa2)
+    if impl in ("flash_attention_2", "flash_attention_3"):
+        ver = "FlashAttention-3" if impl == "flash_attention_3" else "FlashAttention-2"
+        print(f"[attn] sm{major}{minor} -> attn_implementation={impl} ({ver}, full-attention layers)")
+    elif major == 9 and not fa3:
+        # Hopper without FA3 built in -> FA2 if available, else SDPA; note it so an A/B is unambiguous.
         print(
-            f"[attn] sm{major}{minor}: flash_attn_interface absent -> SDPA "
-            "(build FA3 into the worker image / FLASH_ATTN_3_SPEC to enable, "
-            "or FLASH_DISABLE_FA3=1 to force off)"
+            f"[attn] sm{major}{minor}: flash_attn_interface absent -> "
+            f"{'flash_attention_2' if fa2 else 'SDPA'} (set FLASH_ATTN_3_SPEC to enable FA3)"
         )
+    elif major == 12:
+        print(f"[attn] sm{major}{minor} (consumer Blackwell) -> SDPA/cuDNN (FA3/FA4 need TMEM; n/a on sm120)")
+    elif impl == "sdpa":
+        print(f"[attn] sm{major}{minor} -> attn_implementation=sdpa")
+    elif not fa2:
+        print(f"[attn] sm{major}{minor}: flash_attn wheel absent -> SDPA")
     return impl
 
 
