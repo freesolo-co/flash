@@ -98,7 +98,10 @@ def _sleep_with_spinner(interval: float, spinner: _LogFollowSpinner, state: str)
 
 
 def cmd_version(args) -> int:
-    print(f"flash {__version__}")
+    if render.styled():
+        print(render.version(__version__))
+    else:
+        print(f"flash {__version__}")
     return 0
 
 
@@ -268,15 +271,25 @@ def cmd_env_setup(args) -> int:
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
+    if render.styled():
+        print(
+            render.env_setup(
+                ["environment.py", "datasets/train.jsonl", "configs/rl.toml", "configs/sft.toml"]
+            )
+        )
+        return 0
     print(
-        "ensured environment.py, datasets/train.jsonl, configs/, "
-        "configs/rl.toml, configs/sft.toml"
+        "ensured environment.py, datasets/train.jsonl, configs/, configs/rl.toml, configs/sft.toml"
     )
     return 0
 
 
 def cmd_models(args) -> int:
-    for row in public_model_rows():
+    rows = public_model_rows()
+    if render.styled():
+        print(render.models_table(rows))
+        return 0
+    for row in rows:
         print(row["id"])
     return 0
 
@@ -287,19 +300,26 @@ def cmd_gpus(args) -> int:
     from flash.providers.runpod.pricing import static_rates as runpod_static_rates
 
     runpod_rates = runpod_static_rates()
+    infos = sorted(
+        (info for info in GPU_INFO.values() if info.enum_member), key=lambda g: g.hourly_usd
+    )
+    tip = (
+        "Tip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
+        "cheapest validated RunPod class that fits the model, so you don't pin a GPU type."
+    )
+    if render.styled():
+        rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]
+        print(render.gpus_table(rows, tip))
+        return 0
 
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
     print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}")
-    infos = [info for info in GPU_INFO.values() if info.enum_member]
-    for info in sorted(infos, key=lambda g: g.hourly_usd):
-        runpod_rate = runpod_rates.get(info.name) if info.enum_member else None
+    for info in infos:
+        runpod_rate = runpod_rates.get(info.name)
         print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}")
-    print(
-        "\nTip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest validated RunPod class that fits the model, so you don't pin a GPU type."
-    )
+    print(f"\n{tip}")
     return 0
 
 
@@ -307,10 +327,6 @@ def cmd_env_list(args) -> int:
     from flash.envs.registry import list_installed_environments
 
     installed = list_installed_environments()
-    if installed:
-        print("installed environments:")
-        for env_id in installed:
-            print(f"  {env_id}")
     paths: list[str] = []
     if Path("environment.py").is_file():
         paths.append(".")
@@ -328,6 +344,14 @@ def cmd_env_list(args) -> int:
                     paths.append(f"environments/{p.name}")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
+    # Decide the rendering up front so the themed panel and the legacy lines never both print.
+    if render.styled():
+        print(render.env_list(list(installed), sorted(paths)))
+        return 0
+    if installed:
+        print("installed environments:")
+        for env_id in installed:
+            print(f"  {env_id}")
     if paths:
         print("local env sources (publish with `flash env push --name <name> <path>`):")
         for path in sorted(paths):
@@ -349,7 +373,11 @@ def _cmd_train_cost(args) -> int:
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
-    print(estimate_cost(runconfig_from_spec(spec)).breakdown())
+    estimate = estimate_cost(runconfig_from_spec(spec))
+    if render.styled():
+        print(render.cost_panel(estimate))
+    else:
+        print(estimate.breakdown())
     return 0
 
 
@@ -364,11 +392,13 @@ def cmd_train(args) -> int:
     )
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.
-        print(
-            json.dumps(
-                {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}, indent=2
+        payload = {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}
+        if render.styled():
+            print(
+                render.object_panel("train", payload, "dry run — validated locally, not submitted")
             )
-        )
+        else:
+            print(json.dumps(payload, indent=2))
         return 0
     client = client_from_config()
     status = client.create_run(
@@ -385,13 +415,19 @@ def cmd_train(args) -> int:
         list(spec.train.seeds),
     )
     if args.background:
-        print(json.dumps(status, indent=2))
+        if render.styled():
+            print(render.object_panel("train", status, "submitted (running in background)"))
+        else:
+            print(json.dumps(status, indent=2))
         return 0
-    print(
-        f"run {run_id} submitted; following logs "
-        f"(Ctrl-C detaches, `flash status {run_id} --follow` resumes)",
-        file=sys.stderr,
-    )
+    if render.styled():
+        print(render.submitted(run_id), file=sys.stderr)
+    else:
+        print(
+            f"run {run_id} submitted; following logs "
+            f"(Ctrl-C detaches, `flash status {run_id} --follow` resumes)",
+            file=sys.stderr,
+        )
     return _follow_run(client, run_id)
 
 
@@ -417,7 +453,11 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> str:
 def _follow_run(client: ApiClient, run_id: str) -> int:
     """Poll logs until the run reaches a terminal state, then print the final status."""
     state = _poll_logs(client, run_id, interval=2.0)
-    print(json.dumps(client.get_run(run_id), indent=2))
+    status = client.get_run(run_id)
+    if render.styled():
+        print(render.run_status(status))
+    else:
+        print(json.dumps(status, indent=2))
     return 0 if state in _OK_STATES else 1
 
 
@@ -431,14 +471,24 @@ def cmd_status(args) -> int:
             print(logs, end="")
             if not logs.endswith("\n"):
                 print()
-    print(json.dumps(client.get_run(args.run_id), indent=2))
+    status = client.get_run(args.run_id)
+    if render.styled():
+        print(render.run_status(status))
+    else:
+        print(json.dumps(status, indent=2))
     return 0
 
 
 def cmd_runs(args) -> int:
     runs = client_from_config().list_runs()
     if not runs:
-        print("no runs yet")
+        if render.styled():
+            print(render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"))
+        else:
+            print("no runs yet")
+        return 0
+    if render.styled():
+        print(render.runs_table(runs))
         return 0
     print(f"{'RUN_ID':<32}  {'STATE':<11}  {'ALGO':<5}  {'COST($)':>8}  {'GPU':<22}  MODEL")
     for r in sorted(runs, key=lambda r: r.get("updated_at", 0), reverse=True):
@@ -461,7 +511,29 @@ def cmd_runs(args) -> int:
 
 def cmd_cancel(args) -> int:
     status = client_from_config().cancel_run(args.run_id)
-    print(json.dumps({"run_id": args.run_id, "state": status["state"]}, indent=2))
+    payload = {"run_id": args.run_id, "state": status["state"]}
+    if render.styled():
+        print(render.object_panel("cancel", payload))
+    else:
+        print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_checkpoints(args) -> int:
+    checkpoints = client_from_config().checkpoints(args.run_id)
+    if not checkpoints:
+        print(
+            f"no deployable checkpoints for {args.run_id} yet "
+            "(RL streams one per save interval; SFT-only runs have none).",
+            file=sys.stderr,
+        )
+        return 0
+    for c in checkpoints:
+        print(f"step {c['step']:>6}  {c['repo_id']}:{c['subfolder']}")
+    print(
+        f"\ndeploy one with `flash deploy {args.run_id} --step <STEP>`.",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -469,8 +541,12 @@ def cmd_deploy(args) -> int:
     dep = client_from_config().deploy(
         args.run_id,
         dry_run=args.dry_run,
+        step=getattr(args, "step", None),
     )
-    print(json.dumps(dep, indent=2))
+    if render.styled():
+        print(render.object_panel("deploy", dep))
+    else:
+        print(json.dumps(dep, indent=2))
     print(
         "note: serving is billed per token only; use "
         f"`flash undeploy {args.run_id}` to deregister the adapter.",
@@ -480,14 +556,24 @@ def cmd_deploy(args) -> int:
 
 
 def cmd_undeploy(args) -> int:
-    print(json.dumps(client_from_config().undeploy(args.run_id), indent=2))
+    result = client_from_config().undeploy(args.run_id)
+    if render.styled():
+        print(render.object_panel("undeploy", result))
+    else:
+        print(json.dumps(result, indent=2))
     return 0
 
 
 def cmd_deployments(args) -> int:
     rows = client_from_config().deployments()
     if not rows:
-        print("no active deployments")
+        if render.styled():
+            print(render.empty("deployments", "0 active", "no active deployments"))
+        else:
+            print("no active deployments")
+        return 0
+    if render.styled():
+        print(render.deployments_table(rows))
         return 0
     print(f"{'RUN_ID':<32}  {'GPU':<9}  ENDPOINT")
     for r in rows:
@@ -499,6 +585,10 @@ def cmd_deployments(args) -> int:
 def cmd_chat(args) -> int:
     client = client_from_config()
     messages = [{"role": "user", "content": args.message}]
+    # A faint speaker label on a TTY; the reply text itself stays plain so a piped transcript
+    # is byte-for-byte the model's words.
+    if render.styled():
+        print(render.chat_label())
     stream = getattr(client, "chat_stream", None)
     if stream is not None:
         wrote = False
