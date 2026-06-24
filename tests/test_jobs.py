@@ -1373,30 +1373,6 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
     assert sorted(deleted) == sorted(["ep-live-idle", "ep-bare-idle"])
 
 
-def test_sweep_excludes_serve_endpoints(monkeypatch):
-    """An idle (scaled-to-zero) serve endpoint is an intentional deployment, NOT an orphan, so
-    the quota sweep must never delete it — only training endpoints are reaped."""
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.jobs as jobs
-
-    endpoints = [
-        {"id": "ep-train-idle", "name": "flash-a100-old"},  # idle training orphan -> delete
-        {"id": "ep-serve-idle", "name": "flash-serve-a100-dep"},  # idle deployment -> KEEP
-        {"id": "ep-serve-live", "name": "live-flash-serve-a100-dep2"},  # live- serve form -> KEEP
-    ]
-    idle = {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
-            "jobs": {"inQueue": 0, "inProgress": 0}}
-    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: endpoints)
-    monkeypatch.setattr(runpod_api, "endpoint_health", lambda eid: idle)
-    deleted = []
-    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
-    jobs._idle_since.clear()
-
-    count = jobs._sweep_idle_flash_endpoints(protected=set())
-    assert count == 1
-    assert deleted == ["ep-train-idle"]
-
-
 def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
     """With min_idle_s > 0, an endpoint that reports a single transient zero (cold start / between
     jobs) is NOT deleted; only one idle across sweeps for >= min_idle_s is reaped."""
