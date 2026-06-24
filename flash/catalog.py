@@ -89,7 +89,7 @@ MODELS: dict[str, ModelInfo] = {
         thinking="hybrid",
         notes="On-device class SLM (131k ctx); standard Llama architecture.",
     ),
-    # ---- Qwen3.5 dense family: validated on the modern worker stack ----
+    # Qwen3.5 dense family: validated on the modern worker stack
     # (trl 1.x / vllm 0.19 / transformers 5.x). Trained + served TEXT-ONLY: the
     # checkpoints are natively multimodal, so LoRA excludes the vision tower and vLLM
     # loads language_model_only (see flash.engine.worker). Each entry passed a real

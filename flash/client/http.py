@@ -201,14 +201,14 @@ class ApiClient:
                 "check your network connection and FLASH_API_URL"
             ) from exc
 
-    # -- identity ----------------------------------------------------------------------
+    # identity
     def me(self) -> dict:
         return self._request("GET", "/v1/me")
 
     def health(self) -> dict:
         return self._request("GET", "/v1/health", timeout=10.0)
 
-    # -- environments ------------------------------------------------------------------
+    # environments
     def publish_env(
         self,
         *,
@@ -226,7 +226,7 @@ class ApiClient:
             return self._request("POST", "/v1/envs", body=body, timeout=1800.0)
         return self._post_with_progress("/v1/envs", body, progress=progress, timeout=1800.0)
 
-    # -- runs --------------------------------------------------------------------------
+    # runs
     def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
         body = {"spec": spec}
         if runtime_secrets:
@@ -265,7 +265,7 @@ class ApiClient:
         """Deployable per-step RL checkpoints for a run (each `flash deploy --step N`-able)."""
         return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
 
-    # -- serving -----------------------------------------------------------------------
+    # serving
     def deploy(
         self,
         run_id: str,

@@ -52,9 +52,7 @@ def request_with_retries(
     )
 
 
-# ---------------------------------------------------------------------------
 # Endpoints
-# ---------------------------------------------------------------------------
 def list_endpoints() -> list[dict]:
     out = request_with_retries(f"{REST_BASE}/endpoints")
     return out if isinstance(out, list) else []
@@ -96,9 +94,7 @@ def endpoint_health(endpoint_id: str) -> dict:
     return request_with_retries(f"{QUEUE_BASE}/{endpoint_id}/health")
 
 
-# ---------------------------------------------------------------------------
 # Queue jobs
-# ---------------------------------------------------------------------------
 def submit_job(endpoint_id: str, input_payload: dict) -> str:
     """POST /run -> job id (async queue submission)."""
     out = request_with_retries(
@@ -121,9 +117,7 @@ def cancel_job(endpoint_id: str, job_id: str) -> dict:
     )
 
 
-# ---------------------------------------------------------------------------
 # Realized billing (COGS) -- what RunPod actually charged, for estimator accuracy.
-# ---------------------------------------------------------------------------
 def billing_endpoints(
     *,
     start_time: str,

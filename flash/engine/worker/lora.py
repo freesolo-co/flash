@@ -189,7 +189,6 @@ def patch_vllm_lm_weight_sync(model_id: str) -> bool:
     return patched_any
 
 
-# --------------------------------------------------------------------------------------------
 # Warm-start (init_from_adapter) SFT-adapter key remap for VL checkpoints.
 #
 # SFT (run_sft) trains the FULL multimodal model: ``SFTTrainer(model=model_id,
@@ -206,7 +205,6 @@ def patch_vllm_lm_weight_sync(model_id: str) -> bool:
 # ``AutoModelForCausalLM`` trainer (proven workaround: remapped adapters train correctly). We keep
 # the trainer as ``AutoModelForCausalLM`` so the train-time vLLM weight-sync remap
 # (``patch_vllm_lm_weight_sync`` / ``_remap_vl_sync_weights``) stays consistent.
-# --------------------------------------------------------------------------------------------
 
 _LANGUAGE_MODEL_INFIX = ".language_model."
 

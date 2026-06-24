@@ -141,14 +141,12 @@ def login_failed(reason: str) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
 # Theme — one visual language shared by every styled command.
 #
 # These renderers are only ever called when `styled()` is true (an interactive stdout, or
 # FLASH_STYLE=1). Each command keeps its exact plain/JSON output on the machine path, so
 # `jq`, scripts, and the agent contract are untouched; this is purely the human view.
 # 256-color SGR keeps the palette readable on essentially every modern terminal.
-# ---------------------------------------------------------------------------
 
 # The Freesolo brand palette, pulled from the website (frontend/app/globals.css): navy
 # `--special` #1b1b4b, periwinkle `--periwinkle` #5f72ff (the accent/ring), green `--green`
@@ -362,9 +360,7 @@ def _color_json(obj, depth: int) -> str:
     return _paint(json.dumps(obj), _GREEN)
 
 
-# ---------------------------------------------------------------------------
 # Per-command renderers (themed view only; the command supplies the data).
-# ---------------------------------------------------------------------------
 
 
 def version(value: str) -> str:

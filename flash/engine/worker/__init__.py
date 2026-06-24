@@ -161,9 +161,7 @@ def require_active_env():
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
 
 
-# ---------------------------------------------------------------------------
 # HF helpers (code-delivery + artifact channel; works without inbound network)
-# ---------------------------------------------------------------------------
 def error_artifact_name(mode: str) -> str:
     """Per-mode error filename (e.g. error_sft.txt) so a run's traceback is uploaded
     under a stable name even though heartbeat.json is single-file/overwritten."""
@@ -526,11 +524,9 @@ def heartbeat(stage: str, **kw):
     print("HEARTBEAT", json.dumps(payload))
 
 
-# ---------------------------------------------------------------------------
 # Decoding parity: render with the model's own chat template and one run-wide thinking
 # flag (off by default), so SFT targets and RL rollouts use identical prompt
 # formatting within a run.
-# ---------------------------------------------------------------------------
 def render_prompt(tokenizer, item) -> str:
     item = item if isinstance(item, dict) else {"question": item}
     msgs = require_active_env().prompt_messages(item)
@@ -568,9 +564,7 @@ def graded_text(completion: str | None) -> str | None:
     return strip_think(completion) if THINKING else completion
 
 
-# ---------------------------------------------------------------------------
 # SFT
-# ---------------------------------------------------------------------------
 
 
 def force_vllm_backend_for_sm120() -> str | None:
@@ -1158,9 +1152,7 @@ def run_sft():
     free_gpu(trainer)
 
 
-# ---------------------------------------------------------------------------
 # RL (GRPO) with TRL + colocated vLLM
-# ---------------------------------------------------------------------------
 def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_comps: int) -> dict:
     """Translate an intended ``prompts_per_step`` into a TRL GRPO batch configuration.
 
@@ -2119,9 +2111,7 @@ def run_rl():
     free_gpu(trainer)
 
 
-# ---------------------------------------------------------------------------
 # Completion: train phase writes metrics.json + the DONE sentinel (see _finalize).
-# ---------------------------------------------------------------------------
 
 
 def write_train_meta(
