@@ -374,41 +374,149 @@ def _rewrite_bin_keys(path: str, rename) -> int:
     return renamed
 
 
-def remap_vl_adapter_dir(adir: str, model_id: str) -> int:
-    """For a VL warm-start, strip the ``.language_model.`` infix from the downloaded SFT adapter so
-    its keys match the ``AutoModelForCausalLM`` trainer used by ``_init_adapter_model``.
+# Substrings that identify a peft LoRA weight key (vs a base-model param). The whole adapter file
+# is LoRA weights, but a wrong-arch / corrupt checkpoint can contain non-LoRA tensors, so we filter.
+_LORA_KEY_MARKERS = (".lora_A.", ".lora_B.", ".lora_embedding_A.", ".lora_embedding_B.", "lora_")
 
-    No-op (returns 0) when ``model_id`` is not a VL checkpoint, or the adapter has no
-    ``.language_model.`` keys (e.g. already remapped, or a text-only SFT). Rewrites whichever weight
-    file exists in ``adir`` (``adapter_model.safetensors`` preferred, else ``adapter_model.bin``).
-    Returns the number of keys renamed. Idempotent: a second call finds nothing to strip.
+
+def _is_lora_key(key: str) -> bool:
+    return any(m in key for m in _LORA_KEY_MARKERS)
+
+
+def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
+    """Tensor key names in the downloaded adapter, WITHOUT loading any tensor data.
+
+    Parses the ``.safetensors`` header (pure stdlib, keeps this module CPU-importable) or, for the
+    legacy ``.bin`` format, the pickled ``state_dict`` keys (needs torch — GPU-worker only). Returns
+    ``None`` when neither weight file exists in ``adir``.
     """
+    import json
     import os
-
-    if not is_vl_checkpoint(model_id):
-        return 0
+    import struct
 
     st_path = os.path.join(adir, "adapter_model.safetensors")
     bin_path = os.path.join(adir, "adapter_model.bin")
     if os.path.isfile(st_path):
-        n = _rewrite_safetensors_header_keys(st_path, strip_language_model_infix)
-    elif os.path.isfile(bin_path):
-        n = _rewrite_bin_keys(bin_path, strip_language_model_infix)
-    else:
+        with open(st_path, "rb") as f:
+            len_bytes = f.read(8)
+            if len(len_bytes) < 8:
+                raise ValueError(f"{st_path}: too small to be a safetensors file")
+            (hdr_len,) = struct.unpack("<Q", len_bytes)
+            header_bytes = f.read(hdr_len)
+            if len(header_bytes) < hdr_len:
+                raise ValueError(f"{st_path}: truncated safetensors header")
+            header = json.loads(header_bytes)
+        return [k for k in header if k != "__metadata__"]
+    if os.path.isfile(bin_path):
+        import torch
+
+        sd = torch.load(bin_path, map_location="cpu", weights_only=True)
+        return list(sd.keys())
+    return None
+
+
+def remap_vl_adapter_dir(adir: str, model_id: str) -> int:
+    """For a VL warm-start, strip the ``.language_model.`` infix from the downloaded SFT adapter so
+    its keys match the ``AutoModelForCausalLM`` trainer used by ``_init_adapter_model``.
+
+    The remap decision is driven by the ADAPTER'S OWN keys, not only the ``is_vl_checkpoint`` config
+    probe. ``is_vl_checkpoint`` calls ``AutoConfig.from_pretrained`` and swallows EVERY exception to
+    return False, so an HF rate-limit / network hiccup / uncached config silently turned a genuine
+    VL warm-start into a no-op: the ``.language_model.`` keys were left in place, the text-only base
+    couldn't match them, peft kept the zero-init LoRA, and GRPO aborted at
+    ``assert_adapter_delta_nonzero`` with all-zero ``lora_B`` (issue #286). Any adapter that actually
+    carries ``.language_model.`` LoRA keys was saved against the full multimodal model and MUST be
+    stripped regardless of the probe, so we key off the file contents and only fall back to the probe
+    for the (already-stripped / text-only) no-infix case.
+
+    Fails LOUDLY instead of silently dropping a mismatched adapter:
+    - a VL warm-start whose adapter has NO LoRA keys at all (corrupt / wrong-architecture) raises;
+    - any ``.language_model.`` LoRA key that SURVIVES the rewrite raises (it would be silently
+      discarded by the text-only base -> all-zero ``lora_B``).
+
+    Returns the number of keys renamed. No-op (returns 0) for a genuinely text-only model, or an
+    already-remapped adapter. Idempotent: a second call finds nothing to strip.
+    """
+    import os
+
+    keys = _read_adapter_tensor_keys(adir)
+    if keys is None:
         print(
             f"[init-adapter] remap_vl_adapter_dir: no adapter_model.safetensors/.bin in {adir!r}; "
             "nothing to remap"
         )
         return 0
+
+    lora_keys = [k for k in keys if _is_lora_key(k)]
+    infixed = [k for k in lora_keys if _LANGUAGE_MODEL_INFIX in k]
+    is_vl = is_vl_checkpoint(model_id)
+
+    if infixed and not is_vl:
+        # The adapter is ground truth: '.language_model.' LoRA keys only come from an SFT over the
+        # full multimodal model, and the GRPO trainer here is always AutoModelForCausalLM (text-only
+        # tree). A False is_vl here means the config probe FAILED, not that the model is text-only —
+        # remap from the file contents so a flaky probe can't silently skip a needed remap (#286).
+        print(
+            f"[init-adapter] WARNING: is_vl_checkpoint({model_id}) is False but the adapter carries "
+            f"{len(infixed)} '.language_model.' LoRA key(s) — the config probe likely failed "
+            "(HF rate-limit/network/uncached). Remapping from the adapter contents so the warm-start "
+            "matches the text-only trainer instead of being silently discarded (issue #286)."
+        )
+
+    if not (is_vl or infixed):
+        # Genuinely text-only model with text-only adapter keys: nothing to do.
+        return 0
+
+    # A VL warm-start with no LoRA weights at all carries no real SFT delta — it would load as the
+    # all-zero identity. Fail here, before the base-model download, with an actionable message.
+    if not lora_keys:
+        raise RuntimeError(
+            f"warm-start adapter in {adir!r} for {model_id} contains NO LoRA weight keys "
+            f"(found {len(keys)} tensor(s), 0 with a lora_ marker) — the adapter is corrupt, "
+            "incomplete, or from a different architecture, so GRPO would train from the base model. "
+            "Re-export the SFT adapter, or omit train.init_from_adapter to train a fresh LoRA."
+        )
+
+    st_path = os.path.join(adir, "adapter_model.safetensors")
+    bin_path = os.path.join(adir, "adapter_model.bin")
+    if os.path.isfile(st_path):
+        n = _rewrite_safetensors_header_keys(st_path, strip_language_model_infix)
+    else:  # bin_path exists — keys were read from one of the two files above
+        n = _rewrite_bin_keys(bin_path, strip_language_model_infix)
+
+    # Fail CLOSED: after the rewrite no LoRA key may still carry the infix. A survivor would be
+    # silently discarded by the text-only base (the exact #286 failure), so raise here with a precise
+    # message at remap time instead of crashing later with the generic all-zero-lora_B guard.
+    survivors = [
+        k
+        for k in (_read_adapter_tensor_keys(adir) or [])
+        if _is_lora_key(k) and _LANGUAGE_MODEL_INFIX in k
+    ]
+    if survivors:
+        raise RuntimeError(
+            f"remap_vl_adapter_dir: {len(survivors)} LoRA key(s) in {adir!r} for {model_id} still "
+            f"carry '.language_model.' after the remap (e.g. {survivors[0]!r}) — they will NOT match "
+            "the AutoModelForCausalLM trainer and would be silently discarded -> all-zero lora_B. The "
+            "adapter's key layout is unexpected; verify it was saved by this SFT pipeline."
+        )
+
     if n:
         print(
             f"[init-adapter] remapped {n} VL SFT adapter key(s): stripped '.language_model.' infix "
             f"to match the AutoModelForCausalLM trainer for {model_id}"
         )
     else:
+        # VL checkpoint but nothing to strip: legitimately already-remapped (idempotent re-run) or a
+        # text-only SFT. Surface the adapter's actual LoRA prefix so a real key mismatch isn't a
+        # silent no-op — if GRPO later aborts with all-zero lora_B, these keys didn't match the base.
+        sample_prefix = next(
+            (k.split(".lora_")[0] for k in lora_keys if ".lora_" in k), lora_keys[0]
+        )
         print(
-            f"[init-adapter] no '.language_model.' adapter keys to remap for {model_id} "
-            "(already remapped or a text-only adapter)"
+            f"[init-adapter] remap_vl_adapter_dir: 0 '.language_model.' keys to strip for VL "
+            f"checkpoint {model_id} ({len(lora_keys)} LoRA key(s); e.g. prefix {sample_prefix!r}) — "
+            "treating as already-remapped/text-only. If the warm-start later aborts with all-zero "
+            "lora_B, these keys did not match the base model."
         )
     return n
 

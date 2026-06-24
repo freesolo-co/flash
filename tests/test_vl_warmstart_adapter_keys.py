@@ -130,13 +130,15 @@ def test_safetensors_remap_for_vl_strips_infix_and_preserves_data(monkeypatch, t
 
 
 def test_safetensors_remap_noop_for_non_vl(monkeypatch, tmp_path):
+    # A genuinely text-only model's SFT adapter has NO '.language_model.' keys (text-only models
+    # have no language_model submodule), so remap is a no-op and leaves the file byte-identical.
     import flash.engine.worker.lora as lora
 
     monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: False)
     adir = tmp_path / "adapter"
     adir.mkdir()
     st = str(adir / "adapter_model.safetensors")
-    _write_safetensors(st, VL_KEYS)
+    _write_safetensors(st, CAUSAL_LM_KEYS)
     with open(st, "rb") as f:
         before = f.read()
 
@@ -144,6 +146,64 @@ def test_safetensors_remap_noop_for_non_vl(monkeypatch, tmp_path):
     assert n == 0
     with open(st, "rb") as f:
         assert f.read() == before  # file untouched for a text model
+
+
+def test_remap_strips_vl_keys_by_evidence_when_probe_says_text_only(monkeypatch, tmp_path):
+    # Issue #286 root cause: is_vl_checkpoint() swallows every exception and returns False, so a
+    # flaky/rate-limited config probe previously SKIPPED the remap on a genuine VL warm-start --
+    # leaving '.language_model.' keys that the text-only base discards -> all-zero lora_B crash.
+    # The adapter's own keys are ground truth: a '.language_model.' LoRA key only comes from a VL
+    # SFT, so the remap must strip it regardless of the probe result.
+    import flash.engine.worker.lora as lora
+
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: False)
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = str(adir / "adapter_model.safetensors")
+    _write_safetensors(st, VL_KEYS)
+
+    # Despite the probe saying "not VL", the infixed keys are stripped from the file contents.
+    n = remap_vl_adapter_dir(str(adir), "Qwen/Qwen3.5-9B")
+    assert n == len(VL_KEYS)
+    keys = [k for k in _read_safetensors_header(st) if k != "__metadata__"]
+    assert sorted(keys) == sorted(CAUSAL_LM_KEYS)
+    assert not any(".language_model." in k for k in keys)
+
+
+def test_remap_raises_when_adapter_has_no_lora_keys(monkeypatch, tmp_path):
+    # A corrupt / wrong-architecture warm-start adapter with no LoRA weights can't carry an SFT
+    # delta -> it would load as the all-zero identity. Fail loudly at remap time (#286 cause 3).
+    import flash.engine.worker.lora as lora
+
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: True)
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = str(adir / "adapter_model.safetensors")
+    # Base-model param names (no 'lora_' marker) -> 0 LoRA keys.
+    _write_safetensors(st, ["base_model.model.model.layers.0.self_attn.q_proj.weight"])
+
+    with pytest.raises(RuntimeError, match="NO LoRA weight keys"):
+        remap_vl_adapter_dir(str(adir), "Qwen/Qwen3.5-9B")
+
+
+def test_remap_raises_when_infix_survives_rewrite(monkeypatch, tmp_path):
+    # Fail-closed backstop: if a LoRA key still carries '.language_model.' after the rewrite (an
+    # unexpected key layout the strip can't fully clean), it would be silently discarded by the
+    # text-only base -> all-zero lora_B. Raise at remap time with a precise message instead.
+    import flash.engine.worker.lora as lora
+
+    monkeypatch.setattr(lora, "is_vl_checkpoint", lambda model_id: True)
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = str(adir / "adapter_model.safetensors")
+    # A double-infix key: strip removes only the FIRST '.language_model.', so one survives.
+    double = (
+        "base_model.model.model.language_model.layers.0.language_model.q_proj.lora_B.default.weight"
+    )
+    _write_safetensors(st, [double])
+
+    with pytest.raises(RuntimeError, match="after the remap"):
+        remap_vl_adapter_dir(str(adir), "Qwen/Qwen3.5-9B")
 
 
 def test_safetensors_remap_idempotent(monkeypatch, tmp_path):
