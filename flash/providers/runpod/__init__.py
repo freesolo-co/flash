@@ -106,7 +106,7 @@ class RunpodProvider:
 
         terminate_endpoint(spec.gpu.type, spec.run_id)
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list:
+    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[str]:
         """Reclaim idle flash-* endpoints that no active run owns; return deleted ids.
 
         RunPod serverless workers scale to zero, but the *endpoints* persist after a run

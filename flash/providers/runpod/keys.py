@@ -134,8 +134,12 @@ def is_failover_error(exc: Exception) -> bool:
     cause = exc.__cause__
     if isinstance(cause, urllib.error.HTTPError):
         return cause.code in _FAILOVER_CODES
-    text = str(exc).lower()
-    if any(hint in text for hint in _QUOTA_HINTS):
+    if any(hint in str(exc).lower() for hint in _QUOTA_HINTS):
         return True
-    # No HTTPError cause => network/timeout/"failed after N attempts": worth another account.
-    return cause is None and "http" not in text
+    # A non-HTTP failure — a network/timeout error (which the retry loop chains as __cause__)
+    # or a bare transient with no cause — isn't account-specific, but another account may still
+    # be reachable, so fail over. A 5xx keeps its HTTPError cause above and does NOT fail over
+    # (a RunPod server error is the same on every account).
+    return cause is None or isinstance(
+        cause, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)
+    )

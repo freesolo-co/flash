@@ -248,8 +248,10 @@ def recover_runs() -> None:
                     _append_run_log(status.run_id, detail)
                 # The aborted attempt may STILL have registered its uniquely-named RunPod
                 # endpoint before crashing (the exact leak the good-spec branch's
-                # `_gc_run_endpoints` guards against). The orphan sweep below won't reap it —
-                # RunPod's `sweep_orphans` is a no-op — so do a best-effort RunPod GC HERE.
+                # `_gc_run_endpoints` guards against). The orphan sweep below won't reap it:
+                # that endpoint crashed before running any job, and `sweep_orphans` only
+                # reclaims endpoints that have finished one (so it never kills a just-deployed
+                # worker). So do a best-effort RunPod GC by name HERE.
                 # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
                 # endpoint name is derived deterministically from the run id + GPU class
                 # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
