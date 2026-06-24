@@ -460,8 +460,8 @@ def poll_job(
     unhealthy fast-fails never arm — so without this it would burn the full ``setup_grace_s``
     (~50 min). Keyed off the authoritative job status (robust to a failing health probe), it
     returns a retryable stall once a job has been IN_QUEUE longer than ``queue_grace_s`` (~1 min
-    by default). Both capacity graces gate only the *no-worker* phase; once a worker is placed
-    and cold-starting, ``setup_grace_s`` governs and the run is never walked off at one minute.
+    by default). The queue timer applies only while the job status remains IN_QUEUE; once a worker
+    picks the job up (status leaves IN_QUEUE), it resets and ``setup_grace_s`` governs cold start.
     """
 
     say = make_say(log)
