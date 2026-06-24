@@ -370,9 +370,11 @@ class _FakeEngine:
     RequestOutput per finished request, ``has_unfinished_requests`` reports the queue. Records
     ('wake'|'add'|'step'|'sleep', ...) events in order so the wake/sleep ordering can be asserted."""
 
-    def __init__(self, vocab=1000, gen=None):
+    def __init__(self, vocab=1000, gen=None, finish="all"):
         self.events = []
         self._pending = []  # (req_id, prompt_ids, sampling_params)
+        self._finish = finish  # "all" -> finish every pending request per step; "one" -> one per step
+        self.aborted = []
         # default generation: two tokens, no logprobs, text 'ok' (matches the prior fake)
         self._gen = gen or (lambda ids, sp: ([5, 6], None, "ok"))
         self.llm_engine = types.SimpleNamespace(
@@ -380,15 +382,24 @@ class _FakeEngine:
             add_request=self._add_request,
             step=self._step,
             has_unfinished_requests=lambda: bool(self._pending),
+            abort_request=self._abort_request,
         )
 
     def _add_request(self, req_id, prompt, sampling_params):
         self.events.append(("add", req_id))
         self._pending.append((req_id, list(prompt["prompt_token_ids"]), sampling_params))
 
+    def _abort_request(self, ids):
+        self.aborted.extend(ids)
+        drop = set(ids)
+        self._pending = [p for p in self._pending if p[0] not in drop]
+
     def _step(self):
         self.events.append(("step", len(self._pending)))
-        batch, self._pending = self._pending, []
+        if self._finish == "one":
+            batch, self._pending = self._pending[:1], self._pending[1:]
+        else:
+            batch, self._pending = self._pending, []
         outs = []
         for req_id, ids, sp in batch:
             token_ids, lps, text = self._gen(ids, sp)
@@ -668,6 +679,28 @@ def test_rollout_func_re_sleeps_even_if_generation_raises():
         rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=True))
     assert engine.events[0] == ("wake", ("kv_cache",))
     assert engine.events[-1] == ("sleep", 2)
+
+
+class _RaiseEnvReplyEnv(_TwoTurnEnv):
+    """Raises during the env reply (after the first model turn), to exercise a mid-rollout failure
+    while OTHER rollouts still have in-flight engine requests."""
+
+    def env_reply(self, messages, state):
+        raise RuntimeError("boom in env_reply")
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_aborts_inflight_requests_on_error():
+    # A rollout that raises mid-flight must not leak the OTHER rollouts' in-flight requests into the
+    # next GRPO step — the finally aborts them. finish="one" leaves r1/r2 in flight when r0's env
+    # reply raises on its first turn.
+    engine = _FakeEngine(finish="one")
+    rf = _build(_FakeTok(), active_env=_RaiseEnvReplyEnv())
+    prompts = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}],
+               [{"role": "user", "content": "c"}]]
+    with pytest.raises(RuntimeError, match="boom in env_reply"):
+        rf(prompts, _fake_trainer(engine, sleep_mode=False))
+    assert engine.aborted  # leftover in-flight requests were aborted, not leaked
 
 
 @pytest.mark.usefixtures("_stub_vllm")

@@ -29,6 +29,7 @@ the real tokenizer + the colocate vLLM engine into it at runtime.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import Callable
 from typing import TypedDict
@@ -578,6 +579,7 @@ def build_rollout_func(
         # mode is off (small/short-context runs keep the engine resident). See flash issue #162.
         sleep_mode = bool(getattr(getattr(trainer, "args", None), "vllm_enable_sleep_mode", False))
         vocab_size = _engine_vocab_size(engine)
+        active_ids: set[str] = set()  # submitted-but-not-finished requests, for abort-on-exit
 
         def submit(req_id: str, prefix_ids: list[int], max_tokens: int, initial: bool) -> None:
             """Enqueue one assistant-turn request on the colocate engine."""
@@ -607,6 +609,7 @@ def build_rollout_func(
             if _final_only_kind is not None:
                 sp_kwargs["output_kind"] = _final_only_kind
             llm_engine.add_request(req_id, {"prompt_token_ids": list(prefix_ids)}, SamplingParams(**sp_kwargs))
+            active_ids.add(req_id)
 
         def poll() -> list[tuple[str, list[int], list[float], str]]:
             """Advance the engine one step; return (req_id, token_ids, logprobs, text) for every
@@ -624,6 +627,7 @@ def build_rollout_func(
                     entry = (comp.logprobs or [])[pos] if comp.logprobs else None
                     lp = entry.get(tid) if entry else None
                     lps.append(float(getattr(lp, "logprob", 0.0)) if lp is not None else 0.0)
+                active_ids.discard(out.request_id)
                 finished.append((out.request_id, token_ids, lps, comp.text))
             return finished
 
@@ -665,6 +669,12 @@ def build_rollout_func(
                     out[k].append(r[k])
             return out
         finally:
+            # Abort any still-in-flight requests so a mid-rollout error (e.g. an env_glue/template
+            # failure on a later turn) can't leak live requests into the engine and corrupt the
+            # next GRPO step. No-op on the success path (every request finished -> active_ids empty).
+            if active_ids:
+                with contextlib.suppress(Exception):
+                    llm_engine.abort_request(list(active_ids))
             if woke:
                 engine.sleep(level=2)
 
