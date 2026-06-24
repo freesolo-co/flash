@@ -599,9 +599,9 @@ def submit_run(
         suffix = f"{suffix}r{attempt}"
     # Resolve worker pip deps BEFORE provisioning, so deterministic dependency issues surface
     # before the endpoint exists.
-    # extra_pip runs for EVERY job here (the durable baked-image path skips resolve_worker_deps /
-    # FLASH_WORKER_EXTRA_DEPS in build_function_input, but _train_body always pip-installs
-    # extra_pip), so the opt-in chalk spec is appended here to reach default runs.
+    # extra_pip runs for EVERY job here (the durable baked-image path skips resolve_worker_deps
+    # in build_function_input, but _train_body always pip-installs extra_pip), so the chalk spec
+    # is appended here to reach default runs.
     extra_pip = (
         list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
     ) + chalk_extra_pip(spec)

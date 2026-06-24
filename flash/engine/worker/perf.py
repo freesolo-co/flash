@@ -37,7 +37,7 @@ def _attn_impl_for_capability(
         fastest exact attention on Hopper; transformers routes it to the LOCAL ``flash_attn_interface``
         (no HF Kernels-Hub, whose torch2.10 versions break ``import transformers``). FA3 is baked into
         the worker image by default (Dockerfile FLASH_ATTN_3_SPEC), so ``fa3_available`` is normally
-        True; absent (or ``FLASH_DISABLE_FA3``) -> plain SDPA, same as every other arch.
+        True; absent -> plain SDPA, same as every other arch.
       * Ampere (sm80 A100 / sm86 3090·A6000) + Ada (sm89 4090·L40S): "flash_attention_2" when the
         ``flash_attn`` wheel is importable (``fa2_available``) — FA3 does NOT support these archs.
       * consumer Blackwell (sm120 5090 / RTX Pro): "sdpa" forced to the cuDNN backend. THE ONE arch
@@ -53,18 +53,11 @@ def _attn_impl_for_capability(
     if major == 8 and minor in (0, 6, 9) and fa2_available:  # Ampere 8.0/8.6 + Ada 8.9 ONLY: FA2
         # (gate the minor so an unsupported sm8x like sm87 Jetson Orin doesn't get FA2 forced on it)
         return "flash_attention_2"
-    if major == 12:  # consumer Blackwell: cuDNN SDPA (the one exception — FA3/FA4 need TMEM/tcgen05)
+    if (
+        major == 12
+    ):  # consumer Blackwell: cuDNN SDPA (the one exception — FA3/FA4 need TMEM/tcgen05)
         return "sdpa"
     return None  # the arch's flash kernel is absent -> plain SDPA (the SAME fallback on every arch)
-
-
-def _env_flag_disabled(name: str) -> bool:
-    """Whether the escape-hatch env var ``name`` is set to a truthy value — CASE-INSENSITIVELY.
-
-    Falsey (NOT disabled): unset / empty / ``0`` / ``false`` / ``no`` / ``off`` in ANY case, so the
-    common ``FLASH_DISABLE_FA3=FALSE`` / ``False`` spellings read as 'not disabled' rather than
-    silently disabling the kernel. Anything else (``1``/``true``/``yes``/...) -> disabled."""
-    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def _flash_attn_3_available() -> bool:
@@ -78,10 +71,7 @@ def _flash_attn_3_available() -> bool:
     that probe is itself unavailable (transformers not importable here) fall back to a GUARDED import
     of ``flash_attn_interface`` — NOT a bare ``find_spec``, so an on-disk-but-broken install (ABI
     mismatch / missing .so) reads as unavailable instead of a false positive that would later crash
-    transformers at model load. The escape hatch ``FLASH_DISABLE_FA3=1`` forces it off (drop back to
-    SDPA on a Hopper host without rebuilding the image — e.g. if a model rejects FA3)."""
-    if _env_flag_disabled("FLASH_DISABLE_FA3"):
-        return False
+    transformers at model load. FA3 is used whenever it's importable — fixed, no disable knob."""
     try:
         from transformers.utils import is_flash_attn_3_available
 
@@ -107,11 +97,8 @@ def _flash_attn_available() -> bool:
     produces flattened/padding-free
     batches whose example boundaries are carried by ``position_ids`` and enforced ONLY by a
     varlen-capable attention impl (FA2/FA3/flex). Under plain SDPA, packed examples attend ACROSS
-    boundaries (silent quality loss). find_spec only — no import side effects (no CUDA init). The escape
-    hatch ``FLASH_DISABLE_FA2=1`` forces it off (reverts that arch to plain SDPA + no packing,
-    without rebuilding the image — e.g. if a wheel lacks kernels for the live arch)."""
-    if _env_flag_disabled("FLASH_DISABLE_FA2"):
-        return False
+    boundaries (silent quality loss). find_spec only — no import side effects (no CUDA init). FA2 is
+    used whenever the wheel is importable — fixed, no disable knob."""
     try:
         import importlib.util
 
@@ -138,22 +125,20 @@ def optimal_attn_impl() -> str | None:
     impl = _attn_impl_for_capability(major, minor, fa3_available=fa3, fa2_available=fa2)
     if impl in ("flash_attention_2", "flash_attention_3"):
         ver = "FlashAttention-3" if impl == "flash_attention_3" else "FlashAttention-2"
-        print(f"[attn] sm{major}{minor} -> attn_implementation={impl} ({ver}, full-attention layers)")
-    elif major == 9 and not fa3:
-        # Hopper but FA3 not selected -> plain SDPA (uniform fallback). Distinguish the two causes so
-        # an A/B log is unambiguous: explicitly disabled vs the package genuinely missing.
-        why = (
-            "disabled via FLASH_DISABLE_FA3"
-            if _env_flag_disabled("FLASH_DISABLE_FA3")
-            else "flash_attn_interface absent (FA3 is baked into the worker image by default — check the install)"
+        print(
+            f"[attn] sm{major}{minor} -> attn_implementation={impl} ({ver}, full-attention layers)"
         )
-        print(f"[attn] sm{major}{minor}: FA3 {why} -> SDPA")
+    elif major == 9 and not fa3:
+        # Hopper but FA3 not selected -> plain SDPA (uniform fallback). FA3 is baked into the worker
+        # image by default, so this means flash_attn_interface is absent/broken — check the install.
+        print(f"[attn] sm{major}{minor}: FA3 unavailable (flash_attn_interface absent) -> SDPA")
     elif major == 12:  # the only arch that returns impl=="sdpa" -> this branch covers all of it
-        print(f"[attn] sm{major}{minor} (consumer Blackwell) -> SDPA/cuDNN (FA3/FA4 need TMEM; n/a on sm120)")
+        print(
+            f"[attn] sm{major}{minor} (consumer Blackwell) -> SDPA/cuDNN (FA3/FA4 need TMEM; n/a on sm120)"
+        )
     elif not fa2:
         print(f"[attn] sm{major}{minor}: flash_attn wheel absent -> SDPA")
     return impl
-
 
 
 # Liger's fused linear cross-entropy is a MEMORY optimization (it never materializes the fp32
@@ -234,7 +219,6 @@ def setup_perf_backends() -> None:
         print("[perf] TF32 matmul/cuDNN enabled")
     except Exception as e:
         print("setup_perf_backends skipped:", e)
-
 
 
 def _remove_fla_from_disk() -> tuple[list[str], bool]:
@@ -433,7 +417,6 @@ def _sdpa_cudnn_ctx(attn_impl: str | None):
         return contextlib.nullcontext()
 
 
-
 def _float_or_none(value) -> float | None:
     try:
         text = str(value).strip()
@@ -486,7 +469,7 @@ def _query_nvidia_gpu() -> dict:
         ["nvidia-smi", f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"],
         capture_output=True,
         text=True,
-        timeout=float(os.environ.get("FLASH_GPU_DIAG_TIMEOUT_S", "8")),
+        timeout=8.0,  # nvidia-smi diag timeout (fixed; flash is fully managed)
     )
     raw = (out.stdout or out.stderr).strip()
     if out.returncode != 0:
@@ -531,7 +514,7 @@ def _query_nvidia_processes() -> list[dict]:
         ],
         capture_output=True,
         text=True,
-        timeout=float(os.environ.get("FLASH_GPU_DIAG_TIMEOUT_S", "8")),
+        timeout=8.0,  # nvidia-smi diag timeout (fixed; flash is fully managed)
     )
     if out.returncode != 0 or not out.stdout.strip():
         return []
