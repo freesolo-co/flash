@@ -181,7 +181,14 @@ def _submit_seed_supervised(
             # first attempt takes the cheapest; each retry that provisioned a class and lost
             # it to an infra failure steps to the next-cheapest, so a capacity-starved class
             # can't burn the whole budget.
-            chosen = alloc.candidates[min(gpu_walk_offset, len(alloc.candidates) - 1)]
+            last_idx = len(alloc.candidates) - 1
+            walk_idx = min(gpu_walk_offset, last_idx)
+            chosen = alloc.candidates[walk_idx]
+            # Once the walk lands on (or clamps to) the last candidate there is no next-best class
+            # left to fall to — tell the provider so its no-capacity backstops wait longer before
+            # giving up rather than burning a retry on a class with no fallback. A pinned/single-
+            # candidate run is "last" from attempt 0, which is what we want.
+            on_last_gpu = walk_idx == last_idx
             print(allocation_summary(alloc), file=log, flush=True)
             if chosen.gpu != alloc.gpu:
                 print(
@@ -198,6 +205,7 @@ def _submit_seed_supervised(
                     "log": log,
                     "on_handle": on_handle,
                     "attempt": attempt,
+                    "on_last_gpu": on_last_gpu,
                 }
                 if runtime_secrets:
                     submit_kwargs["runtime_secrets"] = runtime_secrets
