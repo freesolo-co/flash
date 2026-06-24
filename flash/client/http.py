@@ -242,6 +242,12 @@ class ApiClient:
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}/logs?offset={int(offset)}")
 
+    def get_worker_output(self, run_id: str) -> dict[str, str]:
+        # The train-subprocess console/traceback ({console_<phase>.txt, error_<phase>.txt}) from the
+        # run's HF artifact repo, fetched server-side with the operator token — the real worker
+        # output the offset-paged log can't carry. Kept off the hot get_logs poll path. {} if none.
+        return self._request("GET", f"/v1/runs/{run_id}/worker").get("worker", {})
+
     def cancel_run(self, run_id: str) -> dict:
         return self._request("POST", f"/v1/runs/{run_id}/cancel")
 
