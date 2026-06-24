@@ -1705,9 +1705,21 @@ def run_rl():
     _params_b = resolve_params_b(model_id)
     from flash.catalog import vocab_size_for
 
+    # Per-device completion-logits cap: a multi-turn rollout accumulates a FULL transcript (model
+    # turns + masked env tokens) up to the engine context — far longer than the single-turn per-turn
+    # budget `_max_completion` — and the trainer's logprob forward processes that whole completion.
+    # So size the fp32 [per_device, completion, vocab] cap against the WORST-CASE multi-turn
+    # completion length (the engine context) instead of `_max_completion`, or a long multi-turn run
+    # OOMs the trainer forward. Single-turn keeps `_max_completion` (its true completion length).
+    _cap_completion_len = vllm_max_len if is_multi_turn else _max_completion
     per_device_comps = rl_per_device_comps(
-        _max_completion, vocab=vocab_size_for(model_id), use_vllm=use_vllm, params_b=_params_b
+        _cap_completion_len, vocab=vocab_size_for(model_id), use_vllm=use_vllm, params_b=_params_b
     )
+    if is_multi_turn and _cap_completion_len != _max_completion:
+        print(
+            f"[rl] multi-turn: sizing the per-device logits cap against the full transcript length "
+            f"{_cap_completion_len} (engine context), not the per-turn budget {_max_completion}"
+        )
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
         print(
