@@ -366,7 +366,8 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
         queue_grace_s=900.0,
     )
     assert not res.ok
-    assert res.failure == "stalled"
+    # Never scheduled (no capacity) is reported distinctly from a scheduled-then-stalled worker.
+    assert res.failure == "no_capacity"
     assert "IN_QUEUE" in res.detail
     assert "next-best GPU" in res.detail
 
@@ -603,8 +604,10 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
         queue_grace_s=100000.0,  # huge: isolate the throttled path from the (tight) queue backstop
         throttled_grace_s=300.0,
     )
-    assert res.failure == "stalled"  # infra-shaped -> runner retries on the next-best GPU
-    assert "throttled" in res.detail
+    # A throttled-only worker was never usable -> reported as no_capacity (never scheduled),
+    # infra-shaped so the runner retries on the next-best GPU.
+    assert res.failure == "no_capacity"
+    assert "THROTTLED" in res.detail
 
 
 def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
@@ -1375,6 +1378,40 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
     ep_id, _name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
     assert ep_id == "ep-on-kB"
     assert keys.active_key() == "kB"  # provisioning pointer advanced to the working account
+
+
+def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
+    """When EVERY account is quota-exhausted, deploy fails over once per account and then RAISES —
+    it must NOT loop forever. advance_key() wraps (always True for a multi-key pool), so the deploy
+    bounds its own failovers by key_count(); a regression would spin here indefinitely."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
+    keys.reset()
+
+    calls = {"count": 0}
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            calls["count"] += 1
+            if calls["count"] > 20:  # safety net: fail loudly instead of hanging on a regression
+                raise AssertionError("deploy failover did not terminate (looped past the pool)")
+            raise RuntimeError(
+                "GraphQL errors: Max workers across all endpoints must not exceed "
+                "your workers quota (30)"
+            )
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(
+        jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
+    )
+
+    with pytest.raises(RuntimeError, match="workers quota"):
+        jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    # 2 accounts x _QUOTA_MAX_RETRIES (3) = 6 deploy attempts, then it stops — never the unbounded spin.
+    assert calls["count"] == 6
 
 
 def test_sweep_idle_flash_endpoints(monkeypatch):

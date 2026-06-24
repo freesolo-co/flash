@@ -230,7 +230,7 @@ def _submit_seed_supervised(
         last_detail = f"{res.failure}: {res.detail}"
         # Retry only on a structured failure category the provider already classified; a real job
         # failure fails fast. No detail-string parsing. (USER cancels are caught below, not here.)
-        infra_shaped = res.failure in ("stalled", "poll_error", "job_preempted")
+        infra_shaped = res.failure in ("stalled", "no_capacity", "poll_error", "job_preempted")
         # A cancel deletes the endpoint, which the poller sees as an
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.
