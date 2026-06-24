@@ -50,7 +50,8 @@ def _attn_impl_for_capability(
     Liger/chalk fused kernels; flash helps only the ~25% full-attention layers of the hybrid arch."""
     if major == 9 and fa3_available:  # Hopper: FA3 is the arch's best flash kernel
         return "flash_attention_3"
-    if major == 8 and fa2_available:  # Ampere (8.0/8.6) + Ada (8.9): FA2 is the arch's best flash
+    if major == 8 and minor in (0, 6, 9) and fa2_available:  # Ampere 8.0/8.6 + Ada 8.9 ONLY: FA2
+        # (gate the minor so an unsupported sm8x like sm87 Jetson Orin doesn't get FA2 forced on it)
         return "flash_attention_2"
     if major == 12:  # consumer Blackwell: cuDNN SDPA (the one exception — FA3/FA4 need TMEM/tcgen05)
         return "sdpa"
@@ -73,10 +74,12 @@ def _flash_attn_3_available() -> bool:
     transformers' ``flash_attention_3`` path does ``from flash_attn_interface import
     flash_attn_func, ...`` (modeling_flash_attention_utils), so a present module is exactly what
     makes ``attn_implementation="flash_attention_3"`` resolve WITHOUT the HF Kernels-Hub. Prefer
-    transformers' own ``is_flash_attn_3_available`` probe; fall back to a ``find_spec`` so this stays
-    a leaf (no import side effects, no CUDA init). The escape hatch ``FLASH_DISABLE_FA3=1`` forces it
-    off (drop back to SDPA on a Hopper host without rebuilding the image — e.g. if a model rejects
-    FA3)."""
+    transformers' own ``is_flash_attn_3_available`` probe (it verifies real importability). Only if
+    that probe is itself unavailable (transformers not importable here) fall back to a GUARDED import
+    of ``flash_attn_interface`` — NOT a bare ``find_spec``, so an on-disk-but-broken install (ABI
+    mismatch / missing .so) reads as unavailable instead of a false positive that would later crash
+    transformers at model load. The escape hatch ``FLASH_DISABLE_FA3=1`` forces it off (drop back to
+    SDPA on a Hopper host without rebuilding the image — e.g. if a model rejects FA3)."""
     if _env_flag_disabled("FLASH_DISABLE_FA3"):
         return False
     try:
@@ -85,9 +88,9 @@ def _flash_attn_3_available() -> bool:
         return bool(is_flash_attn_3_available())
     except Exception:
         try:
-            import importlib.util
+            import flash_attn_interface  # noqa: F401  (guarded: verifies real importability)
 
-            return importlib.util.find_spec("flash_attn_interface") is not None
+            return True
         except Exception:
             return False
 
