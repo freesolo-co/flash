@@ -292,7 +292,20 @@ def _find_real_libcudart() -> str | None:
         candidates.append(found)
     for path in candidates:
         try:
-            if os.path.exists(path) and hasattr(ctypes.CDLL(path), "cudaDeviceReset"):
+            lib = ctypes.CDLL(path)
+            if not hasattr(lib, "cudaDeviceReset"):
+                continue
+            # `find_library` often returns a soname (e.g. "libcudart.so.12"); resolve it to an
+            # on-disk path so callers can safely create a symlink to it.
+            if not os.path.isabs(path):
+                with contextlib.suppress(Exception), open("/proc/self/maps") as f:
+                    for line in f:
+                        if "libcudart.so.12" in line and "libcudart_stub" not in line:
+                            mapped = line.strip().split()[-1]
+                            if os.path.exists(mapped):
+                                return os.path.realpath(mapped)
+                continue
+            if os.path.exists(path):
                 return os.path.realpath(path)
         except Exception:
             continue
