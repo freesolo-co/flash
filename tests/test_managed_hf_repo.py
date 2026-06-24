@@ -134,6 +134,16 @@ def test_kernel_cache_volume_env_overrides_dc_and_size(monkeypatch):
     assert gpu["network_volume_gb"] == 250
 
 
+def test_kernel_cache_volume_rejects_out_of_range_size(monkeypatch):
+    """A fat-fingered size falls back to the default instead of crashing at provision (the RunPod
+    SDK requires 10 <= size <= 4096)."""
+    _no_cache_env(monkeypatch)
+    for bad in ("0", "-5", "999999", "notanint"):
+        monkeypatch.setenv("FLASH_KERNEL_CACHE_VOLUME_GB", bad)
+        gpu = _submit(monkeypatch, _spec(), platform_context={"org_id": "acme"})["gpu"]
+        assert gpu["network_volume_gb"] == 100, bad
+
+
 def test_assigned_volume_redirects_worker_caches(monkeypatch):
     """End-to-end: org -> assigned volume -> build_worker_env redirects the kernel caches onto it.
     This is the whole chain that turns the cold-start compile into a one-time-per-org cost."""

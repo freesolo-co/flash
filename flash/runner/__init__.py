@@ -237,6 +237,10 @@ def _assign_kernel_cache_volume(spec: JobSpec, platform_context: dict | None) ->
         gb = int(os.environ.get("FLASH_KERNEL_CACHE_VOLUME_GB", "100"))
     except ValueError:
         gb = 100
+    # Reject a fat-fingered override (negative / zero / absurd) rather than letting the RunPod SDK
+    # reject NetworkVolume.size (ge=10, le=4096) at provision time, which would fail the whole run.
+    if not (10 <= gb <= 4096):
+        gb = 100
     d = spec.to_dict()
     d["gpu"] = {
         **d["gpu"],
