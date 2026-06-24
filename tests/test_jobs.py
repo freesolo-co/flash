@@ -1293,7 +1293,7 @@ def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
 
-    def fake_sweep(skip_name):
+    def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
         swept["count"] += 1
         return 5
 
@@ -1319,10 +1319,41 @@ def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
 
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda skip_name: 0)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0)
 
     with pytest.raises(RuntimeError, match="workers quota"):
         jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+
+
+def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
+    """A multi-account RUNPOD_API_KEY fails the deploy over to the next account on quota."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
+    keys.reset()
+
+    class FakeResource:
+        id = "ep-on-kB"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            # Account kA is out of worker quota; kB has room. advance_key() (the deploy's
+            # failover) moves keys.active_key() from kA to kB.
+            if keys.active_key() == "kA":
+                raise RuntimeError(
+                    "GraphQL errors: Max workers across all endpoints must not exceed "
+                    "your workers quota (30)"
+                )
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0)
+
+    ep_id, _name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    assert ep_id == "ep-on-kB"
+    assert keys.active_key() == "kB"  # provisioning pointer advanced to the working account
 
 
 def test_sweep_idle_flash_endpoints(monkeypatch):
@@ -1334,8 +1365,10 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
     # "live-flash-<gpu>-<suffix>". Both the bare "flash-*" and "live-flash-*" forms
     # must be swept; the current run's endpoint (and its "live-" form) must be skipped.
     endpoints = [
-        {"id": "ep-live-idle", "name": "live-flash-a100-abc"},  # live- prefix, idle → delete
-        {"id": "ep-live-busy", "name": "live-flash-a100-xyz"},  # live- prefix, busy → keep
+        {"id": "ep-live-idle", "name": "live-flash-a100-abc"},  # scaled to zero, idle → delete
+        {"id": "ep-warm-idle", "name": "live-flash-a100-warm"}, # WARM idle/ready worker → delete
+        {"id": "ep-live-busy", "name": "live-flash-a100-xyz"},  # running a job → keep
+        {"id": "ep-initing",   "name": "flash-a100-init"},      # worker spinning up → keep
         {"id": "ep-live-skip", "name": "live-flash-a100-cur"},  # live- form of current → skip
         {"id": "ep-bare-idle", "name": "flash-a100-old"},       # bare prefix, idle → delete
         {"id": "ep-skip-bare", "name": "flash-a100-cur"},       # current run (bare) → skip
@@ -1349,9 +1382,15 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
         if eid in ("ep-live-idle", "ep-bare-idle"):
             return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
                     "jobs": {"inQueue": 0, "inProgress": 0}}
+        if eid == "ep-warm-idle":  # warm worker left over after a job, nothing pending → reapable
+            return {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
+                    "jobs": {"inQueue": 0, "inProgress": 0}}
         if eid == "ep-live-busy":
             return {"workers": {"running": 1, "ready": 0, "idle": 0, "initializing": 0},
                     "jobs": {"inQueue": 0, "inProgress": 1}}
+        if eid == "ep-initing":  # initializing worker is busy (spinning up) → not reapable
+            return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 1},
+                    "jobs": {"inQueue": 0, "inProgress": 0}}
         return {}
 
     deleted = []
@@ -1363,8 +1402,157 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
     monkeypatch.setattr(runpod_api, "list_endpoints", fake_list_endpoints)
     monkeypatch.setattr(runpod_api, "endpoint_health", fake_health)
     monkeypatch.setattr(runpod_api, "delete_endpoint", fake_delete)
+    jobs._idle_since.clear()
 
-    count = jobs._sweep_idle_flash_endpoints(skip_name="flash-a100-cur")
+    count = jobs._sweep_idle_flash_endpoints(
+        protected={"flash-a100-cur", "live-flash-a100-cur"}
+    )
 
-    assert count == 2
-    assert sorted(deleted) == sorted(["ep-live-idle", "ep-bare-idle"])
+    # warm idle/ready (ep-warm-idle) is reaped too — the dominant leak the old scaled-to-zero rule
+    # never caught; running/initializing stay, current-run endpoints are protected.
+    assert count == 3
+    assert sorted(deleted) == sorted(["ep-live-idle", "ep-warm-idle", "ep-bare-idle"])
+
+
+def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
+    """reap_warm=False (the deploy-time reactive sweep, which protects only the current run) reaps
+    ONLY fully scaled-to-zero endpoints — never another run's warm idle/ready between-seeds one."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    endpoints = [
+        {"id": "ep-warm", "name": "live-flash-a100-warm"},  # warm idle/ready worker
+        {"id": "ep-zero", "name": "flash-a100-zero"},       # fully scaled to zero
+    ]
+
+    def health(eid):
+        if eid == "ep-warm":
+            return {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
+                    "jobs": {"inQueue": 0, "inProgress": 0}}
+        return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                "jobs": {"inQueue": 0, "inProgress": 0}}
+
+    deleted = []
+    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: endpoints)
+    monkeypatch.setattr(runpod_api, "endpoint_health", health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+
+    # Deploy-path mode: warm endpoint is treated as busy and kept; only scaled-to-zero is reaped.
+    jobs._idle_since.clear()
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), reap_warm=False) == 1
+    assert deleted == ["ep-zero"]
+
+    # Periodic-reaper mode (default): the warm endpoint is reaped too.
+    deleted.clear()
+    jobs._idle_since.clear()
+    assert jobs._sweep_idle_flash_endpoints(protected=set()) == 2
+    assert sorted(deleted) == sorted(["ep-warm", "ep-zero"])
+
+
+def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
+    """With min_idle_s > 0, an endpoint that reports a single transient zero (cold start / between
+    jobs) is NOT deleted; only one idle across sweeps for >= min_idle_s is reaped."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    monkeypatch.setattr(
+        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                     "jobs": {"inQueue": 0, "inProgress": 0}},
+    )
+    deleted = []
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    jobs._idle_since.clear()
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+
+    # First sweep: idle observed, but grace (300s) not elapsed -> not deleted, timer recorded.
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert deleted == []
+    assert "ep-x" in jobs._idle_since
+
+    # Still within grace -> still not deleted.
+    clock["t"] = 1200.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert deleted == []
+
+    # Past grace -> reaped.
+    clock["t"] = 1400.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 1
+    assert deleted == ["ep-x"]
+
+
+def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
+    """A busy reading clears the grace timer, so the idle clock restarts if it goes idle again —
+    a long-running endpoint that dips idle briefly is never reaped."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    state = {"busy": False}
+    monkeypatch.setattr(
+        runpod_api, "list_endpoints", lambda: [{"id": "ep-x", "name": "flash-a100-x"}]
+    )
+
+    def health(eid):
+        w = {"running": 1 if state["busy"] else 0, "ready": 0, "idle": 0, "initializing": 0}
+        j = {"inQueue": 0, "inProgress": 1 if state["busy"] else 0}
+        return {"workers": w, "jobs": j}
+
+    monkeypatch.setattr(runpod_api, "endpoint_health", health)
+    deleted = []
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+    jobs._idle_since.clear()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+
+    # idle at t=1000 -> timer set
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert "ep-x" in jobs._idle_since
+    # busy at t=1200 -> timer cleared
+    state["busy"] = True
+    clock["t"] = 1200.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert "ep-x" not in jobs._idle_since
+    # idle again at t=1400 -> fresh timer (not deleted: only 0s of new idleness)
+    state["busy"] = False
+    clock["t"] = 1400.0
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert deleted == []
+
+
+def test_sweep_serializes_on_idle_since_lock(monkeypatch):
+    """_idle_since access is guarded: a sweep blocks while another holds the lock (the periodic
+    reaper and a deploy-time sweep run on different threads, so the prune can't race mid-iteration)."""
+    import threading
+
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [{"id": "e", "name": "flash-a100-x"}])
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health",
+        lambda eid: {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                     "jobs": {"inQueue": 0, "inProgress": 0}},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: True)
+    jobs._idle_since.clear()
+
+    done = threading.Event()
+
+    def run_sweep():
+        jobs._sweep_idle_flash_endpoints(protected=set())
+        done.set()
+
+    with jobs._idle_since_lock:
+        t = threading.Thread(target=run_sweep)
+        t.start()
+        # The sweep must block on the lock we hold -> it cannot finish.
+        assert not done.wait(0.2)
+    t.join(timeout=2)
+    assert done.is_set()  # completes as soon as the lock is released
