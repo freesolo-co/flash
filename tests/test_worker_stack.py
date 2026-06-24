@@ -334,11 +334,7 @@ def test_attn_impl_for_capability_per_arch(monkeypatch):
     """Pure capability -> best-per-arch flash policy (no CUDA needed): flash on every arch EXCEPT
     consumer Blackwell sm120. Hopper(sm90): FA3 > FA2 > SDPA. Ampere(sm80/86)+Ada(sm89): FA2.
     sm120: cuDNN SDPA (FA3/FA4 can't run; FA2 wheel coverage unverified)."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
-
+    w = _import_worker(monkeypatch)
     f = w._attn_impl_for_capability
     # Hopper sm90: FA3 is the arch's best flash; absent -> plain SDPA (uniform fallback, NOT FA2).
     assert f(9, 0, fa3_available=True, fa2_available=True) == "flash_attention_3"
@@ -353,23 +349,32 @@ def test_attn_impl_for_capability_per_arch(monkeypatch):
     assert f(12, 0, fa3_available=True, fa2_available=True) == "sdpa"
 
 
-def test_flash_attn_3_probe_absent_and_disable(monkeypatch):
-    """_flash_attn_3_available: False in CI (no flash_attn_interface built); the FLASH_DISABLE_FA3
-    escape hatch forces it off; a falsey hatch value does not disable."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+def test_flash_attn_3_disable_hatch_case_insensitive(monkeypatch):
+    """The FLASH_DISABLE_FA3 escape hatch is honored CASE-INSENSITIVELY: only truthy values disable;
+    FALSE/False/0/off/'' (any case) do NOT. Stub transformers' FA3 probe so the test is hermetic —
+    it asserts the hatch logic, not whether flash_attn_interface happens to be installed in CI."""
+    w = _import_worker(monkeypatch)
+    import transformers.utils as tu
 
+    monkeypatch.setattr(tu, "is_flash_attn_3_available", lambda: True, raising=False)
     monkeypatch.delenv("FLASH_DISABLE_FA3", raising=False)
-    assert w._flash_attn_3_available() is False  # flash_attn_interface absent in CI
-    monkeypatch.setenv("FLASH_DISABLE_FA3", "1")
-    assert w._flash_attn_3_available() is False  # hatch short-circuits the probe
-    monkeypatch.setenv("FLASH_DISABLE_FA3", "0")
-    assert w._flash_attn_3_available() is False  # falsey hatch -> not disabled (still absent in CI)
-    # FA2 escape hatch: FLASH_DISABLE_FA2=1 forces _flash_attn_available off (reverts arch to SDPA +
-    # no packing). flash_attn is absent in CI so it's False regardless, but the hatch must short-circuit.
+    assert w._flash_attn_3_available() is True  # probe available, hatch unset
+    for truthy in ("1", "true", "TRUE", "Yes", "on"):
+        monkeypatch.setenv("FLASH_DISABLE_FA3", truthy)
+        assert w._flash_attn_3_available() is False, truthy  # hatch disables
+    for falsey in ("0", "false", "False", "FALSE", "off", ""):
+        monkeypatch.setenv("FLASH_DISABLE_FA3", falsey)
+        assert w._flash_attn_3_available() is True, falsey  # case-insensitive -> NOT disabled
+
+
+def test_flash_attn_2_disable_hatch(monkeypatch):
+    """FLASH_DISABLE_FA2=1 short-circuits _flash_attn_available off (reverts the arch to SDPA + no
+    packing) regardless of whether the flash_attn wheel is present; a falsey value does not."""
+    w = _import_worker(monkeypatch)
     monkeypatch.setenv("FLASH_DISABLE_FA2", "1")
+    assert w._flash_attn_available() is False  # hatch forces off even if the wheel were importable
+    monkeypatch.setenv("FLASH_DISABLE_FA2", "FALSE")
+    # falsey (case-insensitive) -> hatch does NOT disable; result then reflects the wheel (absent in CI).
     assert w._flash_attn_available() is False
 
 

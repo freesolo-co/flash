@@ -344,9 +344,13 @@ def build_worker_env(
         # this so a run can PIN the rollout FA version (e.g. =3 to confirm/force FA3 on H100/H200, the
         # rollout analog of the trainer's flash_attention_3 selection). Unset -> vLLM auto-selects.
         "VLLM_FLASH_ATTN_VERSION",
-        # The trainer-side FA3 escape hatch (engine.worker.perf._flash_attn_3_available): set =1 to
-        # force the Hopper trainer back to SDPA without rebuilding the worker image.
+        # Trainer-side flash escape hatches (engine.worker.perf): set =1 to force a host back to
+        # plain SDPA without rebuilding the image. FLASH_DISABLE_FA3 -> Hopper drops FA3->SDPA;
+        # FLASH_DISABLE_FA2 -> Ampere/Ada drop FA2->SDPA AND SFT packing is disabled (it needs a
+        # varlen flash backend). Forwarded so an operator can remotely troubleshoot without editing
+        # the structured spec.
         "FLASH_DISABLE_FA3",
+        "FLASH_DISABLE_FA2",
         # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
         # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
         # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a

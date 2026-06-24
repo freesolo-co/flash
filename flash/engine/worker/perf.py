@@ -57,6 +57,15 @@ def _attn_impl_for_capability(
     return None  # the arch's flash kernel is absent -> plain SDPA (the SAME fallback on every arch)
 
 
+def _env_flag_disabled(name: str) -> bool:
+    """Whether the escape-hatch env var ``name`` is set to a truthy value — CASE-INSENSITIVELY.
+
+    Falsey (NOT disabled): unset / empty / ``0`` / ``false`` / ``no`` / ``off`` in ANY case, so the
+    common ``FLASH_DISABLE_FA3=FALSE`` / ``False`` spellings read as 'not disabled' rather than
+    silently disabling the kernel. Anything else (``1``/``true``/``yes``/...) -> disabled."""
+    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def _flash_attn_3_available() -> bool:
     """True when FlashAttention-3 is usable by transformers on this worker — i.e. the
     ``flash_attn_interface`` module (the ``flash-attn-3`` Hopper build) is importable.
@@ -68,7 +77,7 @@ def _flash_attn_3_available() -> bool:
     a leaf (no import side effects, no CUDA init). The escape hatch ``FLASH_DISABLE_FA3=1`` forces it
     off (drop back to SDPA on a Hopper host without rebuilding the image — e.g. if a model rejects
     FA3)."""
-    if os.environ.get("FLASH_DISABLE_FA3", "").strip() not in ("", "0", "false", "False"):
+    if _env_flag_disabled("FLASH_DISABLE_FA3"):
         return False
     try:
         from transformers.utils import is_flash_attn_3_available
@@ -93,7 +102,7 @@ def _flash_attn_available() -> bool:
     (silent quality loss). find_spec only — no import side effects (and no CUDA init). The escape
     hatch ``FLASH_DISABLE_FA2=1`` forces it off (reverts that arch to plain SDPA + no packing,
     without rebuilding the image — e.g. if a wheel lacks kernels for the live arch)."""
-    if os.environ.get("FLASH_DISABLE_FA2", "").strip() not in ("", "0", "false", "False"):
+    if _env_flag_disabled("FLASH_DISABLE_FA2"):
         return False
     try:
         import importlib.util
@@ -123,12 +132,14 @@ def optimal_attn_impl() -> str | None:
         ver = "FlashAttention-3" if impl == "flash_attention_3" else "FlashAttention-2"
         print(f"[attn] sm{major}{minor} -> attn_implementation={impl} ({ver}, full-attention layers)")
     elif major == 9 and not fa3:
-        # Hopper but FA3 not importable (FLASH_DISABLE_FA3, or a broken/absent flash_attn_interface
-        # despite the default image baking it in) -> plain SDPA, same uniform fallback as every arch.
-        print(
-            f"[attn] sm{major}{minor}: flash_attn_interface absent -> SDPA "
-            "(FA3 is baked into the worker image by default; check FLASH_DISABLE_FA3 / the FA3 install)"
+        # Hopper but FA3 not selected -> plain SDPA (uniform fallback). Distinguish the two causes so
+        # an A/B log is unambiguous: explicitly disabled vs the package genuinely missing.
+        why = (
+            "disabled via FLASH_DISABLE_FA3"
+            if _env_flag_disabled("FLASH_DISABLE_FA3")
+            else "flash_attn_interface absent (FA3 is baked into the worker image by default — check the install)"
         )
+        print(f"[attn] sm{major}{minor}: FA3 {why} -> SDPA")
     elif major == 12:
         print(f"[attn] sm{major}{minor} (consumer Blackwell) -> SDPA/cuDNN (FA3/FA4 need TMEM; n/a on sm120)")
     elif impl == "sdpa":
