@@ -956,6 +956,9 @@ def run_sft():
     if cfg_kwargs.get("packing"):
         if _attn in ("flash_attention_2", "flash_attention_3"):
             print(f"[sft] attn_implementation={_attn} (packing boundary-correct varlen)")
+        elif _attn == "sdpa":
+            cfg_kwargs["packing"] = False
+            print("[sft] packing disabled: selected attn_implementation=sdpa (no varlen flash backend)")
         elif _fa_ok:
             _attn = "flash_attention_2"
             print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
