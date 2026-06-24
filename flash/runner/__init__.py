@@ -189,29 +189,22 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-# Per-org persistent cache volume (platform-managed). Attaching a RunPod network volume makes the
-# worker's heavy, reusable caches survive across runs: the model-weight download AND the fused
-# Triton/Inductor/tilelang kernel JIT — the ~10-15 min cold-start compile every cold worker
-# otherwise re-pays on paid GPU time (build_worker_env -> deps.network_volume_env redirects them
-# onto the mount). The volume name is keyed per ORG and stable across that org's runs, so the
-# SECOND run on it reaches the first training step in seconds instead of recompiling.
+# Per-org persistent cache volume (platform-managed, deterministic). Attaching a RunPod network
+# volume makes the worker's heavy, reusable caches survive across an org's runs: the model-weight
+# download AND the fused Triton/Inductor/tilelang kernel JIT — the ~10-15 min cold-start compile
+# every cold worker otherwise re-pays on paid GPU time (build_worker_env -> deps.network_volume_env
+# redirects them onto the mount). The volume name is keyed per ORG and stable across that org's
+# runs, so the SECOND run on it reaches the first training step in seconds instead of recompiling.
 #
-# Tradeoff (why it's operator-gated, default ON): the volume pins every run to ONE datacenter — a
-# smaller GPU pool, possibly higher queue/price — and bills monthly. FLASH_KERNEL_CACHE_VOLUME=0
-# disables it entirely (every run goes back to the cold/heartbeat path); FLASH_KERNEL_CACHE_DATACENTER
-# and FLASH_KERNEL_CACHE_VOLUME_GB tune the datacenter pin and the volume size.
+# flash is fully managed, so this is policy in CODE, not runtime env knobs (cf. the toggle env vars
+# removed for deterministic behavior). The tradeoff lives here: the volume pins every run to ONE
+# datacenter — a smaller GPU pool, possibly higher queue/price — and bills monthly. Flip
+# _KERNEL_CACHE_VOLUME_ENABLED to False to turn it off globally; the two policy values are the
+# datacenter pin and the volume size.
+_KERNEL_CACHE_VOLUME_ENABLED = True
+_KERNEL_CACHE_DATACENTER = "EU-RO-1"  # volume + endpoint co-locate here (RunPod storage default)
+_KERNEL_CACHE_VOLUME_GB = 100  # within the RunPod NetworkVolume bounds (10..4096)
 _KERNEL_CACHE_SLUG_RE = re.compile(r"[^a-z0-9-]+")
-_KERNEL_CACHE_DEFAULT_DC = "EU-RO-1"
-
-
-def _kernel_cache_volume_enabled() -> bool:
-    return os.environ.get("FLASH_KERNEL_CACHE_VOLUME", "1").strip().lower() not in (
-        "",
-        "0",
-        "false",
-        "no",
-        "off",
-    )
 
 
 def _assign_kernel_cache_volume(spec: JobSpec, platform_context: dict | None) -> JobSpec:
@@ -223,7 +216,7 @@ def _assign_kernel_cache_volume(spec: JobSpec, platform_context: dict | None) ->
     A run with no org key can't share a warm cache with anything, so it stays volume-less rather
     than each getting its own single-use volume (which would pay the datacenter pin for no reuse).
     """
-    if not _kernel_cache_volume_enabled():
+    if not _KERNEL_CACHE_VOLUME_ENABLED:
         return spec
     if getattr(spec.gpu, "network_volume", None):
         return spec
@@ -232,21 +225,12 @@ def _assign_kernel_cache_volume(spec: JobSpec, platform_context: dict | None) ->
     slug = _KERNEL_CACHE_SLUG_RE.sub("-", org).strip("-")
     if not slug:
         return spec
-    dc = (os.environ.get("FLASH_KERNEL_CACHE_DATACENTER", "").strip() or _KERNEL_CACHE_DEFAULT_DC)
-    try:
-        gb = int(os.environ.get("FLASH_KERNEL_CACHE_VOLUME_GB", "100"))
-    except ValueError:
-        gb = 100
-    # Reject a fat-fingered override (negative / zero / absurd) rather than letting the RunPod SDK
-    # reject NetworkVolume.size (ge=10, le=4096) at provision time, which would fail the whole run.
-    if not (10 <= gb <= 4096):
-        gb = 100
     d = spec.to_dict()
     d["gpu"] = {
         **d["gpu"],
         "network_volume": f"flash-kernel-cache-{slug}",
-        "network_volume_gb": gb,
-        "datacenter": dc,
+        "network_volume_gb": _KERNEL_CACHE_VOLUME_GB,
+        "datacenter": _KERNEL_CACHE_DATACENTER,
     }
     return JobSpec.from_dict(d)
 
@@ -305,7 +289,7 @@ def submit_job(
     spec = _assign_managed_hf_repo(spec)
     # Attach the org's stable persistent cache volume (platform-managed) so model weights + the
     # fused-kernel JIT compile become one-time-per-org instead of per cold worker. Org identity
-    # comes from platform_context; no-op without it or when disabled (FLASH_KERNEL_CACHE_VOLUME=0).
+    # comes from platform_context; no-op without it or when _KERNEL_CACHE_VOLUME_ENABLED is False.
     spec = _assign_kernel_cache_volume(spec, platform_context)
     status = RunStatus(
         run_id=spec.run_id,
