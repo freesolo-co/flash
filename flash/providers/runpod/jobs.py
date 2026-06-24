@@ -160,14 +160,33 @@ def _is_workers_quota_error(exc: Exception) -> bool:
     return "max workers across all endpoints" in msg
 
 
-def _sweep_idle_flash_endpoints(skip_name: str) -> int:
-    """Delete idle flash-* endpoints to reclaim worker quota. Returns count deleted.
+# Per-endpoint "first observed idle" timestamps, so a candidate must STAY idle across sweeps for
+# ``min_idle_s`` before deletion (a cold-starting / between-jobs endpoint reports a transient zero
+# we must not act on). Pruned each sweep to the still-idle set, so it can't grow unbounded.
+_idle_since: dict[str, float] = {}
 
-    RunPod Flash registers each endpoint as ``live-<endpoint_name>`` in its resource
-    registry, so the actual RunPod endpoint name is ``live-flash-<gpu>-<suffix>``.
-    An endpoint is idle when health reports zero active workers (running/ready/idle/
-    initializing) and no jobs in queue or in progress. These belong to runs that finished
-    or crashed without cleaning up their endpoint. ``skip_name`` is never deleted.
+
+def _is_train_endpoint(name: str) -> bool:
+    """True for a training endpoint this sweep may reap. Matches the SDK's ``live-`` form, and
+    EXCLUDES serve endpoints (``flash-serve-*``): a deployment scaled to zero is intentionally
+    idle (the warm-start contract), not an orphan — it's managed by deploy/undeploy, not here."""
+    bare = name.removeprefix("live-")
+    return bare.startswith("flash-") and not bare.startswith("flash-serve-")
+
+
+def _sweep_idle_flash_endpoints(protected: set[str], min_idle_s: float = 0.0) -> int:
+    """Delete idle, ORPHANED flash training endpoints — workers doing nothing that still hold
+    RunPod worker quota (runs that finished/crashed without tearing their endpoint down). Returns
+    the count deleted.
+
+    Safe by construction:
+
+    - ``protected`` — endpoint names tied to a LIVE run (both the bare ``flash-...`` and the SDK's
+      ``live-flash-...`` form). Never deleted, even if momentarily idle (e.g. between seeds).
+    - serve endpoints (``flash-serve-*``) are skipped entirely (see ``_is_train_endpoint``).
+    - an endpoint is a candidate only when health reports zero active workers AND zero in-flight
+      jobs, and ``min_idle_s`` requires that to PERSIST across sweeps — a single transient zero
+      (cold start / between jobs) never triggers a delete.
     """
     deleted = 0
     try:
@@ -175,33 +194,47 @@ def _sweep_idle_flash_endpoints(skip_name: str) -> int:
     except Exception:
         logger.debug("quota-sweep: failed to list endpoints", exc_info=True)
         return 0
+    now = time.time()
+    still_idle: set[str] = set()
     for ep in endpoints:
         ep_name = ep.get("name") or ""
         eid = ep.get("id")
-        # Endpoints are registered as "live-<endpoint_name>" by the Flash SDK; both the
-        # bare "flash-" prefix and the "live-flash-" prefix must match.
-        is_flash = ep_name.startswith("flash-") or ep_name.startswith("live-flash-")
-        if not (is_flash and eid and ep_name != skip_name and f"live-{skip_name}" != ep_name):
+        if not (eid and _is_train_endpoint(ep_name)):
+            continue
+        # Protect the run's endpoint in either registered form.
+        if ep_name in protected or ep_name.removeprefix("live-") in protected:
             continue
         try:
             health = runpod_api.endpoint_health(eid) or {}
             workers = health.get("workers")
             jobs_info = health.get("jobs")
-            # Require non-empty dicts: a missing or empty workers section means the health
-            # response is incomplete and we can't confirm the endpoint is idle.
+            # Require non-empty dicts: a missing/empty workers section means the health response
+            # is incomplete and we can't confirm the endpoint is idle.
             if not isinstance(workers, dict) or not workers or not isinstance(jobs_info, dict):
                 continue
             active_workers = sum(
-                workers.get(k, 0) or 0
-                for k in ("running", "ready", "idle", "initializing")
+                workers.get(k, 0) or 0 for k in ("running", "ready", "idle", "initializing")
             )
             in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
-            if active_workers == 0 and in_flight == 0 and runpod_api.delete_endpoint(eid):
+            if active_workers != 0 or in_flight != 0:
+                _idle_since.pop(eid, None)  # busy again -> reset the grace timer
+                continue
+            still_idle.add(eid)
+            first_idle = _idle_since.setdefault(eid, now)
+            if now - first_idle < min_idle_s:
+                continue  # idle, but not for long enough yet — wait for the next sweep
+            if runpod_api.delete_endpoint(eid):
                 deleted += 1
+                _idle_since.pop(eid, None)
                 logger.info("quota-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
         except Exception:
-            logger.debug("quota-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True)
+            logger.debug(
+                "quota-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True
+            )
             continue
+    # Drop grace timers for endpoints no longer idle/present (busy, deleted, gone, or protected).
+    for stale in set(_idle_since) - still_idle:
+        _idle_since.pop(stale, None)
     return deleted
 
 
@@ -239,8 +272,10 @@ def deploy_train_endpoint(
     resource = None
     for quota_attempt in range(_QUOTA_MAX_RETRIES):
         if quota_attempt > 0:
-            # Sweep idle flash-* endpoints to free quota, then backoff.
-            swept = _sweep_idle_flash_endpoints(skip_name=name)
+            # Under acute quota pressure, sweep idle orphaned flash training endpoints NOW
+            # (min_idle_s=0) to free a slot, protecting this run's own endpoint. The periodic
+            # reaper (control plane) does the run-aware, graced sweep across all live runs.
+            swept = _sweep_idle_flash_endpoints(protected={name, f"live-{name}"}, min_idle_s=0.0)
             wait_s = 30 * quota_attempt
             logger.warning(
                 "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
