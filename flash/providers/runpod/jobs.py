@@ -181,7 +181,9 @@ def _is_flash_endpoint(name: str) -> bool:
     return name.removeprefix("live-").startswith("flash-")
 
 
-def _sweep_idle_flash_endpoints(protected: set[str], min_idle_s: float = 0.0) -> int:
+def _sweep_idle_flash_endpoints(
+    protected: set[str], min_idle_s: float = 0.0, reap_warm: bool = True
+) -> int:
     """Delete idle, ORPHANED flash training endpoints — workers doing nothing that still hold
     RunPod worker quota (runs that finished/crashed without tearing their endpoint down). Returns
     the count deleted.
@@ -190,11 +192,14 @@ def _sweep_idle_flash_endpoints(protected: set[str], min_idle_s: float = 0.0) ->
 
     - ``protected`` — endpoint names tied to a LIVE run (both the bare ``flash-...`` and the SDK's
       ``live-flash-...`` form). Never deleted, even if momentarily idle (e.g. between seeds).
-    - an endpoint is a candidate only when it is doing nothing — no ``running``/``initializing``
-      worker and nothing in flight (a merely *warm* ``idle``/``ready`` worker left over after a
-      job counts as doing nothing; that warm-idle state is the dominant leak, since RunPod keeps a
-      worker warm after each job) — and ``min_idle_s`` requires that to PERSIST across sweeps, so a
-      single transient zero (cold start / between jobs) never triggers a delete.
+    - ``reap_warm`` — when True (the run-aware periodic reaper, which protects EVERY live run),
+      a merely *warm* ``idle``/``ready`` worker left over after a job counts as doing nothing and
+      is reclaimable; that warm-idle state is the dominant leak, since RunPod keeps a worker warm
+      after each job. When False (the deploy-time reactive sweep, which only protects the current
+      run), a warm worker is treated as busy so the sweep reaps only endpoints that have FULLY
+      scaled to zero — it must not delete another live run's between-seeds warm endpoint.
+    - ``min_idle_s`` requires the idle reading to PERSIST across sweeps, so a single transient
+      zero (cold start / between jobs) never triggers a delete.
     """
     deleted = 0
     try:
@@ -224,9 +229,12 @@ def _sweep_idle_flash_endpoints(protected: set[str], min_idle_s: float = 0.0) ->
                 if not isinstance(workers, dict) or not workers or not isinstance(jobs_info, dict):
                     continue
                 # "Busy" = a worker actually working or spinning up, OR a job queued/in progress.
-                # A warm idle/ready worker with no pending work is NOT busy — it is the leftover we
-                # reclaim (subject to the protected set + idle grace below).
+                # With reap_warm, a warm idle/ready worker with no pending work is NOT busy — it is
+                # the leftover we reclaim (the protected set + grace keep it safe). Without it, a
+                # warm worker counts as busy so only fully-scaled-to-zero endpoints are reaped.
                 busy_workers = (workers.get("running") or 0) + (workers.get("initializing") or 0)
+                if not reap_warm:
+                    busy_workers += (workers.get("ready") or 0) + (workers.get("idle") or 0)
                 in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
                 if busy_workers != 0 or in_flight != 0:
                     _idle_since.pop(eid, None)  # busy again -> reset the grace timer
@@ -324,9 +332,13 @@ def deploy_train_endpoint(
         for quota_attempt in range(_QUOTA_MAX_RETRIES):
             if quota_attempt > 0:
                 # Under acute quota pressure, sweep idle orphaned flash training endpoints on THIS
-                # account NOW (min_idle_s=0) to free a slot, protecting this run's own endpoint. The
-                # periodic reaper (control plane) does the run-aware, graced sweep across live runs.
-                swept = _sweep_idle_flash_endpoints(protected={name, f"live-{name}"}, min_idle_s=0.0)
+                # account NOW (min_idle_s=0) to free a slot. This only protects THIS run's endpoint,
+                # so it stays conservative (reap_warm=False): it reaps only endpoints fully scaled
+                # to zero, never another live run's between-seeds WARM endpoint. The control-plane
+                # periodic reaper does the run-aware, graced warm-idle sweep across all live runs.
+                swept = _sweep_idle_flash_endpoints(
+                    protected={name, f"live-{name}"}, min_idle_s=0.0, reap_warm=False
+                )
                 wait_s = 30 * quota_attempt
                 logger.warning(
                     "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "

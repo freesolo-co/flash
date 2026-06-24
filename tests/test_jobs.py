@@ -1293,7 +1293,7 @@ def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
 
-    def fake_sweep(protected, min_idle_s=0.0):
+    def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
         swept["count"] += 1
         return 5
 
@@ -1319,7 +1319,7 @@ def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
 
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0: 0)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0)
 
     with pytest.raises(RuntimeError, match="workers quota"):
         jobs.deploy_train_endpoint("A100", name_suffix="testrun")
@@ -1349,7 +1349,7 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
 
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0: 0)
+    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0)
 
     ep_id, _name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
     assert ep_id == "ep-on-kB"
@@ -1412,6 +1412,41 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
     # never caught; running/initializing stay, current-run endpoints are protected.
     assert count == 3
     assert sorted(deleted) == sorted(["ep-live-idle", "ep-warm-idle", "ep-bare-idle"])
+
+
+def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
+    """reap_warm=False (the deploy-time reactive sweep, which protects only the current run) reaps
+    ONLY fully scaled-to-zero endpoints — never another run's warm idle/ready between-seeds one."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.jobs as jobs
+
+    endpoints = [
+        {"id": "ep-warm", "name": "live-flash-a100-warm"},  # warm idle/ready worker
+        {"id": "ep-zero", "name": "flash-a100-zero"},       # fully scaled to zero
+    ]
+
+    def health(eid):
+        if eid == "ep-warm":
+            return {"workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
+                    "jobs": {"inQueue": 0, "inProgress": 0}}
+        return {"workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
+                "jobs": {"inQueue": 0, "inProgress": 0}}
+
+    deleted = []
+    monkeypatch.setattr(runpod_api, "list_endpoints", lambda: endpoints)
+    monkeypatch.setattr(runpod_api, "endpoint_health", health)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda eid: deleted.append(eid) or True)
+
+    # Deploy-path mode: warm endpoint is treated as busy and kept; only scaled-to-zero is reaped.
+    jobs._idle_since.clear()
+    assert jobs._sweep_idle_flash_endpoints(protected=set(), reap_warm=False) == 1
+    assert deleted == ["ep-zero"]
+
+    # Periodic-reaper mode (default): the warm endpoint is reaped too.
+    deleted.clear()
+    jobs._idle_since.clear()
+    assert jobs._sweep_idle_flash_endpoints(protected=set()) == 2
+    assert sorted(deleted) == sorted(["ep-warm", "ep-zero"])
 
 
 def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
