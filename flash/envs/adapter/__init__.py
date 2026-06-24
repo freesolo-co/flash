@@ -574,6 +574,24 @@ class FreesoloEnvironment(BaseEnvironment):
             return [dict(m) for m in value]
         return None
 
+    def sft_completion(self, example: dict) -> list[dict]:
+        """Gold completion messages to append after the prompt for one SFT example.
+
+        Delegates to the freesolo-sdk env's first-class ``Environment.sft_completion`` (the full
+        multi-turn gold trajectory — assistant turns, tool calls, tool results, replies — when the
+        row ships one, else a single gold assistant turn), so the SFT example shape is owned by the
+        SDK rather than reconstructed here. Falls back to building it from
+        :meth:`sft_messages`/:meth:`sft_target` only for an older installed SDK."""
+        fn = getattr(self._env, "sft_completion", None)
+        if callable(fn):
+            msgs = fn(self._task_example(example))
+            if msgs:
+                return [dict(m) for m in msgs]
+        gold = self.sft_messages(example)
+        if gold:
+            return gold
+        return [{"role": "assistant", "content": self.sft_target(example)}]
+
     def scores_breakdown(
         self, completion: str, example: dict, state: dict | None = None
     ) -> dict[str, float]:

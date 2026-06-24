@@ -800,16 +800,18 @@ def run_sft():
     texts = []
     gold_multiturn = 0
     for ex in train:
-        # A multi-turn env can ship a full gold trajectory (assistant + tool/env turns) per row
-        # via sft_messages; train on the WHOLE transcript then, instead of collapsing to the
-        # single final assistant target (sft_target) — that is what makes SFT actually multi-turn
-        # (teaching the tool-call protocol + replies), the warm start the GRPO recipe expects.
-        gold = env.sft_messages(ex) if hasattr(env, "sft_messages") else None
-        if gold:
-            msgs = [*env.prompt_messages(ex), *gold]
+        # The env (via the freesolo-sdk Environment.sft_completion) owns the gold completion: the
+        # full multi-turn gold trajectory (assistant turns + tool calls + tool results + replies)
+        # when the row ships one, else a single gold assistant turn. Training on the whole
+        # transcript is what makes SFT actually multi-turn (the tool-call protocol + replies) — the
+        # warm start the GRPO recipe expects. A >1-message completion is a multi-turn trajectory.
+        completion = env.sft_completion(ex) if hasattr(env, "sft_completion") else None
+        if completion is None:  # older adapter without sft_completion
+            gold = env.sft_messages(ex) if hasattr(env, "sft_messages") else None
+            completion = gold or [{"role": "assistant", "content": env.sft_target(ex)}]
+        if len(completion) > 1:
             gold_multiturn += 1
-        else:
-            msgs = [*env.prompt_messages(ex), {"role": "assistant", "content": env.sft_target(ex)}]
+        msgs = [*env.prompt_messages(ex), *completion]
         texts.append(
             {
                 "text": tok.apply_chat_template(
