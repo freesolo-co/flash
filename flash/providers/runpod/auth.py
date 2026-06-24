@@ -9,7 +9,8 @@ must never be mistaken for a RunPod key.
 
 from __future__ import annotations
 
-from .._auth import ensure_provider_auth, load_provider_key
+from .._auth import load_provider_key
+from . import keys as _keys
 
 _ENV_VAR = "RUNPOD_API_KEY"
 
@@ -20,5 +21,17 @@ def load_api_key() -> str | None:
 
 
 def ensure_auth() -> str:
-    """Ensure ``RUNPOD_API_KEY`` is set; raise if unavailable."""
-    return ensure_provider_auth(_ENV_VAR, "no RunPod API key found; set RUNPOD_API_KEY on the control-plane host")
+    """Select the active account and collapse ``RUNPOD_API_KEY`` to that single key.
+
+    ``RUNPOD_API_KEY`` may be a comma-separated pool of per-account keys (see
+    ``runpod.keys``). The runpod_flash SDK reads the raw env var, so a multi-key value
+    would be sent as one bearer token (a 401); ``select_active`` collapses it to the
+    single active key while the cached pool keeps the rest for failover. Raises if no
+    key is configured.
+    """
+    key = _keys.select_active()
+    if not key:
+        raise RuntimeError(
+            "no RunPod API key found; set RUNPOD_API_KEY on the control-plane host"
+        )
+    return key
