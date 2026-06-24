@@ -1227,6 +1227,27 @@ def resolve_grpo_prompts_per_step(requested: int, available_prompts: int) -> int
     return min(requested, available_prompts)
 
 
+def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
+    """Arrow-safe GRPO rollout rows + the parallel example lookup ``reward_fn`` maps back through.
+
+    ``Dataset.from_list`` lets PyArrow infer ONE column type per (nested) field across ALL rows, so
+    embedding the rich per-example record makes a *valid* env whose per-row ``info``/``metadata``
+    legitimately mixes types crash dataset construction with ``ArrowInvalid`` — and the whole RL
+    phase dies at startup, AFTER the paid GPU is provisioned, on input that passed offline
+    single-example validation. (Observed with ifeval-lite: ``metadata.param`` is an int target word
+    count for some rows and a required-word string ``'gentle'`` for others; Arrow infers ``int64``
+    from the leading rows then fails on the first string.)
+
+    Fix: keep the dataset columns trivially typed — the TRL-required ``prompt`` plus a stable integer
+    ``example_idx`` — and return the original example objects in a parallel list. ``reward_fn`` maps
+    the index back, so the env still sees its EXACT record (no JSON/Arrow round-trip, no type
+    coercion). ``rows[i]["example_idx"] == i`` and ``examples[i]`` is that row's record.
+    """
+    examples = [p["example"] for p in prompts]
+    rows = [{"prompt": p["prompt"], "example_idx": i} for i, p in enumerate(prompts)]
+    return rows, examples
+
+
 def rl_per_device_comps(
     completion_len: int = 0,
     vocab: int = 248_320,
@@ -1644,7 +1665,11 @@ def run_rl():
             f"{resolved_prompts_per_step}: only {len(prompts)} prompt(s) fit after filtering"
         )
         prompts_per_step = resolved_prompts_per_step
-    ds = Dataset.from_list(prompts)
+    # Carry a stable integer index instead of the rich record so PyArrow can't crash on an env whose
+    # per-row info/metadata legitimately mixes types (see build_grpo_prompt_dataset). reward_fn maps
+    # the index back to the original example object below.
+    ds_rows, rollout_examples = build_grpo_prompt_dataset(prompts)
+    ds = Dataset.from_list(ds_rows)
 
     def reward_fn(completions, **kwargs):
         # rollout_func (pure multi-turn) path: the per-rollout reward is computed by the env
@@ -1653,7 +1678,8 @@ def run_rl():
             return [float(r) for r in kwargs["reward"]]
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
-        examples = kwargs.get("example")
+        # The dataset carries example_idx (not the record); map each back to its original object.
+        examples = [rollout_examples[int(i)] for i in kwargs.get("example_idx", [])]
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
