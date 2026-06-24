@@ -35,13 +35,6 @@ from collections.abc import Callable
 from typing import TypedDict
 
 
-def _sequential_rollout() -> bool:
-    """A/B + escape hatch: ``FLASH_MT_SEQUENTIAL=1`` drives the multi-turn rollout one prompt at a
-    time (the pre-batching path) instead of the turn-synchronized batched generation. Default OFF
-    (batched). Case-insensitive truthy parse so ``FALSE``/``0`` don't accidentally enable it."""
-    return os.environ.get("FLASH_MT_SEQUENTIAL", "").strip().lower() not in ("", "0", "false", "no", "off")
-
-
 class RolloutResult(TypedDict):
     """Token-aligned fields returned per rollout for TRL's ``rollout_func``."""
 
@@ -245,16 +238,6 @@ class _RolloutState:
         }
 
 
-def _parallel_env() -> bool:
-    """A/B + opt-in: ``FLASH_MT_PARALLEL_ENV=1`` runs the per-turn ``env_reply`` and the final reward
-    scoring across rollouts in a thread pool. Default OFF. The win is for LLM-in-the-loop envs whose
-    env turn / reward is a network call (simulated-user model, LLM judge, tool API) — now that GPU
-    generation is batched, 64 sequential env calls per turn become the bottleneck. No effect on
-    cheap/deterministic envs. Safe by default (off); each rollout's state is independent, so opt-in
-    parallelism is correct for envs whose ``env_reply``/``reward`` don't mutate shared object state."""
-    return os.environ.get("FLASH_MT_PARALLEL_ENV", "").strip().lower() not in ("", "0", "false", "no", "off")
-
-
 def _env_max_workers(n: int) -> int:
     try:
         cap = int(os.environ.get("FLASH_MT_ENV_WORKERS", "16"))
@@ -264,12 +247,17 @@ def _env_max_workers(n: int) -> int:
 
 
 def _run_env_replies(rollouts: list[_RolloutState], active_env) -> list:
-    """``env_reply`` for each rollout (independent per-rollout state), in order. Parallel via a
-    thread pool when ``FLASH_MT_PARALLEL_ENV`` overlaps network/LLM env turns; else sequential."""
+    """``env_reply`` for each rollout (independent per-rollout state), in order. Run across a thread
+    pool whenever there's more than one rollout — once GPU generation is batched, the per-rollout env
+    turns are the serial tail, and overlapping them is a strict win for LLM-in-the-loop envs
+    (simulated-user model / LLM judge / tool API) and free for cheap/deterministic ones. Always on:
+    each rollout's state is independent (a Freesolo env's ``env_reply`` operates on the passed
+    ``state``, not shared object state), so the parallel result is identical to sequential (tested:
+    ``rollout_batch`` == per-example ``rollout_one``)."""
     if not rollouts:
         return []
-    if not _parallel_env() or len(rollouts) == 1:
-        return [active_env.env_reply(r.messages, r.state) for r in rollouts]
+    if len(rollouts) == 1:
+        return [active_env.env_reply(rollouts[0].messages, rollouts[0].state)]
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=_env_max_workers(len(rollouts))) as ex:
@@ -277,13 +265,13 @@ def _run_env_replies(rollouts: list[_RolloutState], active_env) -> list:
 
 
 def _score_rewards(rollouts: list[_RolloutState], active_env) -> list[float]:
-    """Per-rollout reward scoring, in order. Parallel (thread pool) when ``FLASH_MT_PARALLEL_ENV`` —
-    overlaps an LLM-judge reward across the whole batch — else sequential. ``reward("", ex, state)``
+    """Per-rollout reward scoring, in order — across a thread pool for >1 rollout (overlaps an
+    LLM-judge reward across the whole batch; free for cheap rewards). ``reward("", ex, state)``
     matches :func:`rollout_one` (score against the accumulated rollout state)."""
     if not rollouts:
         return []
-    if not _parallel_env() or len(rollouts) == 1:
-        return [float(active_env.reward("", r.example, r.state)) for r in rollouts]
+    if len(rollouts) == 1:
+        return [float(active_env.reward("", rollouts[0].example, rollouts[0].state))]
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=_env_max_workers(len(rollouts))) as ex:
@@ -416,8 +404,8 @@ def rollout_batch(
         for r, (asst_ids, asst_lp, text) in zip(batch, gen, strict=True):
             if _advance_model_turn(r, asst_ids, asst_lp, text, active_env=active_env, max_turns=max_turns):
                 needing.append(r)
-        # Phase 2: compute env replies (parallel across rollouts under FLASH_MT_PARALLEL_ENV — the
-        # win for network/LLM env turns), then apply + glue each in order.
+        # Phase 2: compute env replies (parallel across rollouts — the win for network/LLM env
+        # turns, free for cheap ones), then apply + glue each in order.
         replies = _run_env_replies(needing, active_env)
         for r, env_msgs in zip(needing, replies, strict=True):
             _advance_env_reply(r, env_msgs, active_env=active_env, env_glue=env_glue, max_turns=max_turns)
@@ -626,38 +614,16 @@ def build_rollout_func(
             # of the same prompt. rollout_batch advances every active rollout's turn in a single
             # batched_generate call and returns results in input order, so the group stays aligned.
             examples = [examples_by_key.get(_prompt_key(p), {"prompt": p}) for p in prompts]
-            if _sequential_rollout():
-                # A/B + escape hatch (FLASH_MT_SEQUENTIAL=1): drive each prompt's rollout one at a
-                # time through a batch-of-1 generate — the pre-batching behavior. Identical results
-                # to rollout_batch (proven in tests); only the vLLM batch size differs, which is
-                # exactly the variable the A/B isolates. Default OFF -> the batched fast path.
-                def _gen(prefix: list[int], mt: int):
-                    return batched_generate([prefix], [mt])[0]
-
-                rollouts = [
-                    rollout_one(
-                        example=ex,
-                        active_env=active_env,
-                        render=render,
-                        generate=_gen,
-                        env_glue=env_glue,
-                        max_turns=max_turns,
-                        per_turn_max_tokens=max_completion,
-                        engine_max_len=engine_max_len,
-                    )
-                    for ex in examples
-                ]
-            else:
-                rollouts = rollout_batch(
-                    examples=examples,
-                    active_env=active_env,
-                    render=render,
-                    batched_generate=batched_generate,
-                    env_glue=env_glue,
-                    max_turns=max_turns,
-                    per_turn_max_tokens=max_completion,
-                    engine_max_len=engine_max_len,
-                )
+            rollouts = rollout_batch(
+                examples=examples,
+                active_env=active_env,
+                render=render,
+                batched_generate=batched_generate,
+                env_glue=env_glue,
+                max_turns=max_turns,
+                per_turn_max_tokens=max_completion,
+                engine_max_len=engine_max_len,
+            )
             out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
             for r in rollouts:
                 for k in out:

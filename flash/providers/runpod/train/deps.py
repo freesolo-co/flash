@@ -265,11 +265,6 @@ def build_worker_env(
         # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a
         # control-plane `FLASH_UPLOAD_CONSOLE=1` only reaches run_mode if it's forwarded here.
         "FLASH_UPLOAD_CONSOLE",
-        # Multi-turn GRPO rollout A/B + escape hatch (engine.multiturn_rollout._sequential_rollout):
-        # FLASH_MT_SEQUENTIAL=1 drives the pre-batching one-prompt-at-a-time path instead of the
-        # default turn-synchronized batched generation. Forwarded so an operator can A/B / fall back
-        # without rebuilding the image.
-        "FLASH_MT_SEQUENTIAL",
         # The chalk install SOURCE (an exact version / git URL / wheel). Kernel SELECTION is fixed
         # in engine.chalk_kernels (no env flags); this only points install_chalk_kernels at a
         # specific chalk build, and is also consumed at submit time to add chalk to extra_pip.

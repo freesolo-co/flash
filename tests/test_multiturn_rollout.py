@@ -165,27 +165,6 @@ def test_rollout_batch_equals_rollout_one_per_example():
     assert 1 in three_turn["env_mask"]  # trained model tokens
 
 
-def test_parallel_env_matches_sequential(monkeypatch):
-    """FLASH_MT_PARALLEL_ENV=1 (env_reply + reward run across rollouts in a thread pool) yields
-    byte-identical results to sequential — each rollout's state is independent."""
-    examples = [{"max_model": 3}, {"max_model": 2}, {"max_model": 4}, {"max_model": 1}]
-
-    def batched(prefixes, max_tokens_list):
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
-
-    monkeypatch.delenv("FLASH_MT_PARALLEL_ENV", raising=False)
-    seq = rollout_batch(
-        examples=examples, active_env=_VarTurnEnv(), render=render, batched_generate=batched,
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
-    )
-    monkeypatch.setenv("FLASH_MT_PARALLEL_ENV", "1")
-    par = rollout_batch(
-        examples=examples, active_env=_VarTurnEnv(), render=render, batched_generate=batched,
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
-    )
-    assert par == seq
-
-
 def test_rollout_batch_preserves_input_order_and_count():
     """One result per example, in input order (so TRL's GRPO group stays aligned)."""
 
@@ -503,50 +482,45 @@ def test_rollout_func_returns_one_completion_per_prompt():
     assert len(out["prompt_ids"]) == 3
 
 
-@pytest.mark.usefixtures("_stub_vllm")
-def test_batched_makes_far_fewer_engine_calls_than_sequential(monkeypatch):
-    # The CPU-measurable heart of the optimization: batched mode issues ONE engine.generate per TURN
-    # (every active rollout together) vs the sequential path's one call per prompt per turn. For P
-    # prompts over T model turns the batched path makes ~T dispatches, the sequential path ~P*T —
-    # far fewer, far larger GPU calls (vLLM batches the decode), at identical results.
-    prompts = [[{"role": "user", "content": c}] for c in "abcdef"]  # 6 prompts, _TwoTurnEnv -> 2 turns
+def test_batched_makes_far_fewer_engine_calls_than_sequential():
+    # The CPU-measurable heart of the optimization: rollout_batch issues ONE batched generate per
+    # TURN (every active rollout together) vs one generate per prompt per turn for per-example
+    # rollout_one. For P prompts over T model turns the batched path makes ~T dispatches, the
+    # sequential path ~P*T — far fewer, far larger GPU calls (vLLM batches the decode), at identical
+    # results. Measured at the core-function level (no env toggle — batching is always on).
+    examples = [{"max_model": 2} for _ in range(6)]  # 6 prompts, _VarTurnEnv -> 2 model turns each
 
-    monkeypatch.delenv("FLASH_MT_SEQUENTIAL", raising=False)
-    eng_b = _FakeEngine()
-    out_b = _build(_FakeTok(), active_env=_TwoTurnEnv())(prompts, _fake_trainer(eng_b, sleep_mode=False))
+    seq_calls = 0
 
-    monkeypatch.setenv("FLASH_MT_SEQUENTIAL", "1")
-    eng_s = _FakeEngine()
-    out_s = _build(_FakeTok(), active_env=_TwoTurnEnv())(prompts, _fake_trainer(eng_s, sleep_mode=False))
+    def counting_gen(prefix, mt):
+        nonlocal seq_calls
+        seq_calls += 1
+        return _det_generate(prefix, mt)
 
-    n_b = sum(1 for e in eng_b.events if e[0] == "generate")
-    n_s = sum(1 for e in eng_s.events if e[0] == "generate")
-    assert out_b == out_s  # byte-identical rollouts
-    assert n_s == 6 * 2  # sequential: one engine call per prompt per turn
-    assert n_b == 2  # batched: one engine call per turn (all 6 rollouts in each)
-    assert n_b < n_s
-
-
-@pytest.mark.usefixtures("_stub_vllm")
-def test_rollout_func_sequential_toggle_matches_batched(monkeypatch):
-    # FLASH_MT_SEQUENTIAL=1 (the A/B baseline / escape hatch) must yield byte-identical rollouts to
-    # the default batched path — only the vLLM batch size differs (that's the variable the A/B
-    # isolates). Use a 2-turn env so the env_glue / multi-turn machinery actually runs.
-    prompts = [
-        [{"role": "user", "content": "a"}],
-        [{"role": "user", "content": "b"}],
-        [{"role": "user", "content": "c"}],
+    seq = [
+        rollout_one(
+            example=e, active_env=_VarTurnEnv(), render=render, generate=counting_gen,
+            env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+        )
+        for e in examples
     ]
-    monkeypatch.delenv("FLASH_MT_SEQUENTIAL", raising=False)
-    batched = _build(_FakeTok(), active_env=_TwoTurnEnv())(
-        prompts, _fake_trainer(_FakeEngine(), sleep_mode=False)
+
+    batch_calls = 0
+
+    def counting_batched(prefixes, max_tokens_list):
+        nonlocal batch_calls
+        batch_calls += 1
+        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
+
+    batch = rollout_batch(
+        examples=examples, active_env=_VarTurnEnv(), render=render, batched_generate=counting_batched,
+        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
     )
-    monkeypatch.setenv("FLASH_MT_SEQUENTIAL", "1")
-    seq = _build(_FakeTok(), active_env=_TwoTurnEnv())(
-        prompts, _fake_trainer(_FakeEngine(), sleep_mode=False)
-    )
-    assert batched == seq
-    assert len(batched["completion_ids"]) == 3
+
+    assert batch == seq  # byte-identical rollouts
+    assert seq_calls == 6 * 2  # sequential: one engine call per prompt per turn
+    assert batch_calls == 2  # batched: one engine call per turn (all 6 rollouts in each)
+    assert batch_calls < seq_calls
 
 
 @pytest.mark.usefixtures("_stub_vllm")
