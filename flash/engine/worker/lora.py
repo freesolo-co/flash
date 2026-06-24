@@ -9,45 +9,6 @@ CPU-importable.
 
 from __future__ import annotations
 
-
-def _patch_peft_weight_converter_compat() -> None:
-    """peft 0.19.1 x transformers 5.6-5.10: make MoE adapter loading work.
-
-    peft's ``build_peft_weight_mapping`` reconstructs transformers ``WeightConverter``
-    objects passing ``distributed_operation=`` / ``quantization_operation=`` — kwargs
-    the WeightConverter in transformers <5.11 doesn't accept (init=False dataclass
-    fields), so loading a LoRA adapter onto any arch WITH weight conversions dies with
-    ``TypeError: unexpected keyword argument 'distributed_operation'`` (observed on a
-    weight-converting checkpoint eval). The
-    worker can't take transformers>=5.11 (vllm 0.19.1 compat), so accept-and-drop
-    unknown kwargs; on a single GPU those fields are unused. No-op once signatures
-    match.
-    """
-    import inspect
-
-    try:
-        from transformers import core_model_loading as cml
-    except Exception:  # pragma: no cover - older stacks have no converter module
-        return
-    converter = getattr(cml, "WeightConverter", None)
-    if converter is None or getattr(converter, "_flash_compat", False):
-        return
-    accepted = set(inspect.signature(converter.__init__).parameters)
-    if "distributed_operation" in accepted:
-        return
-    orig_init = converter.__init__
-
-    def _compat_init(self, *args, **kwargs):
-        dropped = [k for k in kwargs if k not in accepted]
-        for k in dropped:
-            kwargs.pop(k)
-        orig_init(self, *args, **kwargs)
-
-    converter.__init__ = _compat_init
-    converter._flash_compat = True
-    print("[compat] WeightConverter patched (peft<->transformers signature drift)")
-
-
 # Module-path segments that must never receive LoRA on natively-multimodal checkpoints
 # trained text-only: the vision tower / projector / MTP head. Critically, adapters that
 # DO touch them cannot be loaded by vLLM in text-only (language_model_only) serving —
