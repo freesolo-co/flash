@@ -90,33 +90,6 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     assert spec_from_dict(raw).train.hf_repo == ""
 
 
-def test_spec_from_file_warns_on_user_set_hf_repo(tmp_path, capsys) -> None:
-    # A user-set [train] hf_repo is accepted-then-discarded; spec_from_file (the user config-load
-    # path) must WARN so it isn't silently ignored. The warning goes to stderr only on the file path
-    # — NOT in spec_from_dict, which the control plane also re-parses on a round-tripped spec that
-    # legitimately carries the platform-assigned hf_repo.
-    from flash.schema import spec_from_file
-
-    cfg = tmp_path / "rl.toml"
-    cfg.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\nalgorithm = "grpo"\n'
-        '[environment]\nid = "freesolo/gsm8k"\n'
-        '[train]\nsteps = 10\nlora_rank = 8\nseeds = [0]\nhf_repo = "DavidBShan/flashtest-x"\n'
-    )
-    spec = spec_from_file(str(cfg))
-    err = capsys.readouterr().err
-    assert "hf_repo is managed by the platform" in err
-    assert spec.train.hf_repo == ""  # still discarded
-
-    # No warning when the user omits hf_repo.
-    cfg.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\nalgorithm = "grpo"\n'
-        '[environment]\nid = "freesolo/gsm8k"\n[train]\nsteps = 10\nlora_rank = 8\nseeds = [0]\n'
-    )
-    spec_from_file(str(cfg))
-    assert "hf_repo" not in capsys.readouterr().err
-
-
 def test_environment_path_is_rejected() -> None:
     # Local environment paths are gone; a `path` (alone or alongside `id`) must fail loudly.
     raw = _raw()

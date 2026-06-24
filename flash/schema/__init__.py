@@ -52,23 +52,7 @@ def spec_from_file(
     # `--set key=value` dotted overrides (highest precedence).
     for item in overrides or []:
         _apply_override(raw, item)
-    _warn_ignored_managed_train_keys(raw)
     return spec_from_dict(raw, run_id=run_id)
-
-
-def _warn_ignored_managed_train_keys(raw: dict[str, Any]) -> None:
-    """Warn (don't fail) when a user's config sets a platform-MANAGED [train] key that the control
-    plane assigns itself, so it isn't silently accepted-then-discarded. Lives here (the user
-    file-load path) rather than in spec_from_dict, which the control plane also runs on a round-
-    tripped spec that legitimately carries the platform-assigned value. stderr, not stdout (the MCP
-    server speaks JSON on stdout)."""
-    train = raw.get("train")
-    if isinstance(train, dict) and str(train.get("hf_repo") or "").strip():
-        print(
-            "warning: [train] hf_repo is managed by the platform and is ignored — each run gets its "
-            "own artifact repo (Freesolo-Co/flashrun-<run_id>). Remove it from your config.",
-            file=sys.stderr,
-        )
 
 
 def _deep_merge(base: dict, extra: dict) -> dict:
