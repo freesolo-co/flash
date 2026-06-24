@@ -86,20 +86,28 @@ def rollout_one(
     active_env,
     render: Callable[[list, bool], list[int]],
     generate: Callable[[list, int], tuple[list[int], list[float], str]],
+    env_glue: Callable[[list], list[int]],
     max_turns: int,
     per_turn_max_tokens: int,
     engine_max_len: int | None = None,
-    on_warn: Callable[[str], None] | None = None,
 ) -> RolloutResult:
     """Run one multi-turn/tool rollout and return TRL ``rollout_func`` fields for it.
 
     Args:
         example: the dataset row carried into environment scoring.
         active_env: the Freesolo environment adapter (drives the turn loop + scoring).
-        render: ``render(messages, add_generation_prompt) -> token_ids`` (chat template).
+        render: ``render(messages, add_generation_prompt) -> token_ids`` (chat template) — used
+            only for the INITIAL prompt.
         generate: ``generate(prefix_token_ids, max_tokens) -> (token_ids, token_logprobs,
             text)`` for one sampled assistant turn (model tokens + sampling logprobs + text);
             ``max_tokens`` bounds that turn so it can't overflow the engine context.
+        env_glue: ``env_glue(env_messages) -> token_ids`` — the tokens that CLOSE the
+            just-finished assistant turn, render the env reply message(s), and OPEN the next
+            generation prompt. The running token sequence is built incrementally from these
+            (the model's generated ids + env glue), never by re-rendering the whole
+            conversation — so a chat template that does not round-trip prior turns (e.g. Qwen3's
+            empty ``<think>`` block, which is injected into the generation prompt but stripped
+            from history) stays token-aligned instead of failing the old prefix check.
         max_turns: hard cap on model turns (defense against a non-terminating env).
 
     Returns a dict with ``prompt_ids``, ``completion_ids``, ``logprobs``, ``env_mask`` (all
@@ -147,28 +155,30 @@ def rollout_one(
         if not env_msgs:
             break
         messages.extend(env_msgs)
+        # If the env step finished the episode (it can set done / hit its budget while replying),
+        # stop here: do NOT append the next-generation glue — there is no next model turn, and the
+        # glue would leave a trailing assistant prompt in completion_ids (and could trigger one
+        # more generate()).
+        if active_env.rollout_done(state, max_turns):
+            break
 
-        # Env-segment tokens = the suffix added by re-rendering the conversation (with the next
-        # generation prompt) beyond what we already have. Masked (0) — they are not the
-        # policy's tokens — but kept in completion_ids so the next turn conditions on them. This
-        # REQUIRES a prefix-preserving template (appending a message must not retokenize earlier
-        # turns); otherwise the model/env token boundary is wrong and the loss mask is garbage —
-        # so fail loudly rather than silently mis-train.
-        new_ids = render(messages, True)
-        if new_ids[: len(cur_ids)] != cur_ids:
-            msg = (
-                "multi-turn rollout requires a prefix-preserving chat template (appending a "
-                "message must not retokenize earlier turns); this model's template is not. Use "
-                "a single-turn/tool env, or a model whose template is prefix-preserving."
-            )
-            if on_warn:
-                on_warn(msg)
-            raise ValueError(msg)
-        env_seg = new_ids[len(cur_ids) :]
-        completion_ids.extend(env_seg)
-        logprobs.extend([0.0] * len(env_seg))
-        env_mask.extend([0] * len(env_seg))
-        cur_ids = list(new_ids)
+        # Env-segment tokens = close the just-finished assistant turn + render the env reply +
+        # open the next generation prompt, computed INCREMENTALLY (env_glue) rather than by
+        # re-rendering the whole conversation. Masked (0) — they are not the policy's tokens —
+        # but kept in completion_ids so the next turn conditions on them. Building the sequence
+        # by id-concatenation (model ids + glue) keeps it token-aligned even for templates that
+        # don't round-trip history (Qwen3's empty <think> block), which the old re-render +
+        # prefix-check could not handle.
+        glue = env_glue(env_msgs)
+        # Don't append glue that would push prompt+completion past the engine budget (the next
+        # generate() would be skipped anyway); end the rollout cleanly instead of returning an
+        # over-length sequence that could break the trainer's forward/loss pass.
+        if token_budget is not None and len(completion_ids) + len(glue) > token_budget:
+            break
+        completion_ids.extend(glue)
+        logprobs.extend([0.0] * len(glue))
+        env_mask.extend([0] * len(glue))
+        cur_ids.extend(glue)
 
     # Score with the ACTUAL rollout state (not a fresh one) so reward funcs see the tool/env
     # state the rollout accumulated. state["completion"] holds the full transcript.
@@ -200,6 +210,30 @@ def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: 
     return [int(t) for t in tok(text, add_special_tokens=False).input_ids]
 
 
+def _engine_vocab_size(engine) -> int | None:
+    """Best-effort vocab size of the colocate vLLM engine, or None if it can't be read.
+
+    Used only for a cheap fail-loud bounds check on the pre-tokenized prompt ids before they
+    reach ``engine.generate`` (the ``prompt_token_ids`` path does no bounds checking, so an
+    out-of-range id would otherwise surface as an opaque CUDA illegal-access). Never raises.
+    """
+    try:
+        mc = engine.llm_engine.model_config
+    except Exception:
+        return None
+    for attr in ("get_vocab_size", "get_hf_config_vocab_size"):
+        getter = getattr(mc, attr, None)
+        if callable(getter):
+            try:
+                return int(getter())
+            except Exception:
+                pass
+    try:
+        return int(mc.hf_text_config.vocab_size)
+    except Exception:
+        return None
+
+
 def build_rollout_func(
     *,
     active_env,
@@ -216,19 +250,86 @@ def build_rollout_func(
     """Return a TRL ``rollout_func`` closure that drives ``active_env`` on the colocate engine.
 
     The closure reaches the in-process vLLM engine through ``trainer.vllm_generation.llm`` and
-    samples each assistant turn with per-token logprobs; ``num_generations`` rollouts are
-    produced per prompt (TRL requires the flattened per-prompt grouping).
+    samples each assistant turn with per-token logprobs. It returns exactly ONE rollout per
+    prompt in the slice TRL passes: TRL's ``RepeatSampler`` already repeats each unique prompt
+    ``num_generations`` times before calling ``rollout_func`` (the consecutive repeats form the
+    GRPO group), so the closure must NOT multiply by ``num_generations`` again.
     """
     from vllm import SamplingParams  # gpu-only; imported lazily so the module loads on CPU
 
     def render(messages: list, add_generation_prompt: bool) -> list[int]:
         return render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
 
+    def env_glue(env_messages: list) -> list[int]:
+        # Tokens between two assistant turns: close the previous assistant turn, render the env
+        # reply message(s), and open the next generation prompt. Derived by rendering a probe
+        # assistant turn followed by the env messages (+ generation prompt) and taking everything
+        # AFTER the probe content — so the glue is exactly the template's inter-turn wrapper,
+        # whatever it is (Qwen's <|im_end|> + user turn + <|im_start|>assistant + <think> block).
+        # This avoids re-rendering history (which Qwen3 does not round-trip) and matches how the
+        # model actually conditioned during generation. The probe is plain text the template
+        # inserts verbatim into assistant content; its FIRST occurrence is the probe turn.
+        probe = "flash-env-glue-probe"
+        text = tok.apply_chat_template(
+            [{"role": "assistant", "content": probe}, *env_messages],
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=thinking,
+        )
+        # Locate the probe to slice off the inter-turn glue. Fail LOUD with context if the
+        # template did not insert the assistant content verbatim (some templates strip/escape it,
+        # or could emit the probe more than once) instead of a bare "substring not found".
+        first = text.find(probe)
+        if first == -1 or text.find(probe, first + len(probe)) != -1:
+            raise ValueError(
+                "multi-turn env_glue could not uniquely locate its probe in the rendered chat "
+                "template; this model's template does not insert assistant content verbatim, so "
+                "token-aligned multi-turn rollout is unsupported for it (use a single-turn/tool "
+                "env or a different model)."
+            )
+        glue_text = text[first + len(probe) :]
+        return [int(t) for t in tok(glue_text, add_special_tokens=False).input_ids]
+
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
-        num_gen = int(getattr(trainer, "num_generations", 1) or 1)
+        # Colocate vLLM sleep mode (GRPOConfig.vllm_enable_sleep_mode, ON for large / long-context
+        # runs) offloads BOTH the rollout engine's weights and its KV cache between steps. TRL's
+        # rollout_func path (GRPOTrainer._generate) calls vllm_generation.sync_weights() — which
+        # wakes only tags=["weights"] — and then hands control to this closure, but, UNLIKE TRL's
+        # own single-turn generate() path, it never wakes tags=["kv_cache"]. So engine.generate()
+        # below would run against a freed/offloaded KV cache and fault with CUDA "illegal memory
+        # access" on the very first generate of step 0. Wake the KV cache here and re-sleep after
+        # the whole batch, mirroring trl.generation.vllm_generation.generate (and
+        # trl.experimental.openenv). No-op when sleep mode is off (small/short-context runs keep
+        # the engine resident across steps). See flash issue #162.
+        sleep_mode = bool(getattr(getattr(trainer, "args", None), "vllm_enable_sleep_mode", False))
+        vocab_size = _engine_vocab_size(engine)
+        # Bounds-check EACH rollout's prompt exactly once, keyed on the identity of the token list.
+        # rollout_one passes the SAME growing `cur_ids` list to every generate() within a rollout
+        # and a FRESH list per rollout (one per prompt in the batch). So we validate the first time
+        # we see a given list object — its initial, externally-rendered prompt, the only segment
+        # that can carry tokenizer/model-mismatch ids — and skip that rollout's later turns (whose
+        # appended ids are vLLM-generated or tokenizer-derived glue, both in range). Holding the
+        # list REFERENCE (not its id()) keeps the checked object alive so a later rollout's list
+        # can't reuse a freed id and be wrongly skipped. This validates every prompt in the batch
+        # (not just the first) without re-scanning the growing prefix each turn (O(total_tokens^2)).
+        last_checked: list[int] | None = None
 
         def generate(prefix_ids: list[int], max_tokens: int):
+            nonlocal last_checked
+            # Fail loudly on a degenerate prompt instead of letting a bad id reach the embedding
+            # gather as an opaque async CUDA illegal-access (the exact failure mode #162 was first
+            # mistaken for): the prompt_token_ids path does no bounds checking.
+            if not prefix_ids:
+                raise ValueError("multi-turn rollout produced an empty prompt for engine.generate()")
+            if prefix_ids is not last_checked:  # first generate() of a rollout -> its initial prompt
+                last_checked = prefix_ids
+                lo, hi = min(prefix_ids), max(prefix_ids)
+                if lo < 0 or (vocab_size is not None and hi >= vocab_size):
+                    raise ValueError(
+                        f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
+                        f"vocab size {vocab_size} (tokenizer/model mismatch)"
+                    )
             sp = SamplingParams(
                 max_tokens=max(1, int(max_tokens)),
                 temperature=temperature,
@@ -254,23 +355,43 @@ def build_rollout_func(
                 lps.append(float(getattr(lp, "logprob", 0.0)) if lp is not None else 0.0)
             return token_ids, lps, comp.text
 
-        # One accumulator list per rollout field (batched dict-of-lists across all rollouts).
-        out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
-        for prompt in prompts:
-            example = examples_by_key.get(_prompt_key(prompt), {"prompt": prompt})
-            for _ in range(num_gen):
+        # Wake the KV cache for the whole batch (see the note above), then re-sleep so the engine
+        # returns to its fully-offloaded state and the optimizer step has the freed memory back.
+        # `woke` is set AFTER a successful wake so the finally re-sleeps ONLY when we actually woke
+        # the engine — a wake_up() that raises leaves the engine asleep (its resting state), and we
+        # must not then call sleep() on it; a failure DURING the rollout still re-sleeps.
+        woke = False
+        try:
+            if sleep_mode:
+                engine.wake_up(tags=["kv_cache"])
+                woke = True
+            # ONE rollout per prompt: TRL's RepeatSampler already repeats each unique prompt
+            # num_generations times BEFORE handing the slice to rollout_func (trl 1.6/1.7:
+            # `prompts = [x["prompt"] for x in inputs]`, no dedup), and it expects exactly
+            # len(prompts) completions back — the GRPO group is the consecutive num_generations
+            # rows of the same prompt. Generating num_generations PER prompt here would return
+            # len(prompts) * num_generations completions, whose count mismatches the prompt batch
+            # and trips a CUDA device-side assert ("index out of bounds") in TRL's
+            # shuffle_sequence_dict once a step's rollout completes. (Latent until #162 + the env
+            # glue let a step finish.)
+            out: dict[str, list] = {k: [] for k in _ROLLOUT_FIELDS}
+            for prompt in prompts:
+                example = examples_by_key.get(_prompt_key(prompt), {"prompt": prompt})
                 r = rollout_one(
                     example=example,
                     active_env=active_env,
                     render=render,
                     generate=generate,
+                    env_glue=env_glue,
                     max_turns=max_turns,
                     per_turn_max_tokens=max_completion,
                     engine_max_len=engine_max_len,
-                    on_warn=print,
                 )
                 for k in out:
                     out[k].append(r[k])
-        return out
+            return out
+        finally:
+            if woke:
+                engine.sleep(level=2)
 
     return rollout_func
