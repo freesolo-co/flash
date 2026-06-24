@@ -132,6 +132,77 @@ class _FakeMultiTurnEnv(_EnvironmentMultiTurn):
         ]
 
 
+class _BudgetMultiTurnEnv(_EnvironmentMultiTurn):
+    """Multi-turn env with a per-example budget that never self-terminates (done=False),
+    so the rollout cap (max_episode_turns) is what must stop it."""
+
+    def start_episode(self, example, prompt_text):
+        return [{"role": "user", "content": "go"}]
+
+    def max_episode_turns(self, example):
+        return 15
+
+    def step_episode(self, example, messages, assistant_response):
+        return _EnvironmentStepResult(
+            done=False,
+            messages=({"role": "user", "content": "more"},),
+            final_response_text=None,
+            metadata={},
+        )
+
+    def score_episodes(self, example, episodes):
+        return [_RewardResult(score=0.0, success=False, metrics=()) for _ in episodes]
+
+
+def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
+    _install_fake_freesolo(monkeypatch)
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
+    # A record whose `output` is a chat-message list -> the full gold trajectory (multi-turn SFT).
+    gold = [
+        {"role": "assistant", "content": "<tool_call>...</tool_call>"},
+        {"role": "user", "content": "<tool_result>...</tool_result>"},
+        {"role": "assistant", "content": "done"},
+    ]
+    assert env.sft_completion({"input": "x", "output": gold}) == gold  # len>1 -> multi-turn
+    # A scalar `output` is single-turn SFT -> one assistant turn.
+    assert env.sft_completion({"input": "x", "output": "4"}) == [
+        {"role": "assistant", "content": "4"}
+    ]
+    assert env.sft_completion({"input": "x"}) == [{"role": "assistant", "content": ""}]
+
+
+def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):
+    _install_fake_freesolo(monkeypatch, sdk_env=_BudgetMultiTurnEnv())
+
+    from flash.envs.adapter import FreesoloEnvironment
+
+    env = FreesoloEnvironment(
+        _BudgetMultiTurnEnv(),
+        "owner/env",
+        source=[{"input": "go", "output": ""}],
+        contract_text="",
+    )
+    # max_turns is now the dataset-wide max_episode_turns (15), not the old hardcoded 8 —
+    # otherwise the rollout loop would truncate this 15-turn scenario at turn 8.
+    assert env.max_turns == 15
+
+    state = env.new_rollout_state({"input": "go", "output": ""})
+    assert state["max_episode_turns"] == 15
+    # rollout_done honors THIS rollout's budget even when the batch cap is larger, and even
+    # though the env never sets done=True.
+    state["turn"] = 14
+    assert env.rollout_done(state, max_turns=999) is False
+    state["turn"] = 15
+    assert env.rollout_done(state, max_turns=999) is True
+    # done=True still short-circuits before the budget.
+    state["turn"] = 0
+    state["done"] = True
+    assert env.rollout_done(state, max_turns=999) is True
+
+
 def _install_fake_freesolo(monkeypatch, *, sdk_env=None, seen=None):
     sdk_env = sdk_env or _FakeSingleTurnEnv()
     seen = seen if seen is not None else {}
@@ -242,7 +313,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
     assert env.grade("the answer is 4", train[0]) is True
     assert env.reward("nope", train[0]) == 0.0
     assert env.scores_breakdown("the answer is 4", train[0]) == {"match": 1.0, "total": 1.0}
-    assert env.sft_target({"output": "4"}) == "4"
+    assert env.sft_completion({"output": "4"}) == [{"role": "assistant", "content": "4"}]
 
 
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
@@ -302,7 +373,8 @@ def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
         source=None,
         contract_text="",
     )
-    assert env.sft_target({"expected_output": "4"}) == ""
+    # `expected_output` is NOT an alias for `output`, so there is no gold completion (empty turn).
+    assert env.sft_completion({"expected_output": "4"}) == [{"role": "assistant", "content": ""}]
     with pytest.raises(ValueError, match="input field"):
         env.prompt_messages({"task": "2+2?", "output": "4"})
 

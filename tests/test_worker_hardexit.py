@@ -31,8 +31,8 @@ def _patch_common(monkeypatch, fake_exit):
     monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     # main() runs the real boot steps before the handler; this test exercises the hard-exit flow,
-    # so stub out the Hopper fla guard and the alloc-conf finalize.
-    monkeypatch.setattr(worker, "_drop_fla_on_hopper", lambda: None)
+    # so stub out the Hopper fla fast-path setup and the alloc-conf finalize.
+    monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
     monkeypatch.setattr(worker, "finalize_alloc_conf_for_sleep", lambda: None)
 
 
