@@ -86,8 +86,8 @@ def stall_kwargs() -> dict:
     pinned GPU class as out of capacity and walk to the next-best one. Kept tight (~1 min): a
     class that can't place a worker within a minute is out of capacity *now*, and the gpu-walk
     re-provisions on the next-best class far faster than waiting out a multi-minute queue. This
-    is a no-capacity backstop only — a worker that has been placed and is cold-starting is
-    governed by the much larger ``setup_grace_s`` and is never abandoned at one minute.
+    is a no-capacity backstop only — once the job leaves IN_QUEUE (a worker picks it up), the much
+    larger ``setup_grace_s`` governs cold start and we don't walk off an IN_PROGRESS job at one minute.
     """
     return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 60.0}
 
