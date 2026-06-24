@@ -1815,7 +1815,12 @@ def run_rl():
                 import torch as _torch_vram
 
                 _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
-                _kv_target_gb = 8.0  # matches estimator's _KV_CAP (flash.engine.vram)
+                # Multi-turn batched generation keeps MANY long rollouts (prompts_per_step *
+                # group_size) in flight at once per batched decode, so an 8 GB KV pool is easily
+                # exhausted -> vLLM preempts/recomputes mid-rollout (slow). Raise the non-sleep KV
+                # target for multi-turn so the concurrent rollout KV fits; still capped at the 0.45
+                # colocate ceiling so the resident training peak stays in budget.
+                _kv_target_gb = 16.0 if is_multi_turn else 8.0  # matches estimator's _KV_CAP
                 _vllm_gpu_mem_util = min(0.45, _kv_target_gb / max(1.0, _total_vram_gb))
             except Exception:
                 _vllm_gpu_mem_util = 0.10  # safe fallback: ~8 GB KV on worst-case 80 GB card

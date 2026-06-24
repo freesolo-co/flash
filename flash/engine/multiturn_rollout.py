@@ -245,20 +245,57 @@ class _RolloutState:
         }
 
 
-def _advance_after_turn(
-    r: _RolloutState,
-    asst_ids: list[int],
-    asst_lp: list[float],
-    text: str,
-    *,
-    active_env,
-    env_glue: Callable[[list], list[int]],
-    max_turns: int,
-) -> None:
-    """Fold one freshly-sampled assistant turn into rollout ``r`` and run its env step, mirroring
-    the body of :func:`rollout_one`'s loop EXACTLY. Sets ``r.done`` when the rollout should stop.
-    Shared by :func:`rollout_batch` so batched and single-rollout paths can never drift.
-    """
+def _parallel_env() -> bool:
+    """A/B + opt-in: ``FLASH_MT_PARALLEL_ENV=1`` runs the per-turn ``env_reply`` and the final reward
+    scoring across rollouts in a thread pool. Default OFF. The win is for LLM-in-the-loop envs whose
+    env turn / reward is a network call (simulated-user model, LLM judge, tool API) — now that GPU
+    generation is batched, 64 sequential env calls per turn become the bottleneck. No effect on
+    cheap/deterministic envs. Safe by default (off); each rollout's state is independent, so opt-in
+    parallelism is correct for envs whose ``env_reply``/``reward`` don't mutate shared object state."""
+    return os.environ.get("FLASH_MT_PARALLEL_ENV", "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _env_max_workers(n: int) -> int:
+    try:
+        cap = int(os.environ.get("FLASH_MT_ENV_WORKERS", "16"))
+    except ValueError:
+        cap = 16
+    return max(1, min(n, cap))
+
+
+def _run_env_replies(rollouts: list[_RolloutState], active_env) -> list:
+    """``env_reply`` for each rollout (independent per-rollout state), in order. Parallel via a
+    thread pool when ``FLASH_MT_PARALLEL_ENV`` overlaps network/LLM env turns; else sequential."""
+    if not rollouts:
+        return []
+    if not _parallel_env() or len(rollouts) == 1:
+        return [active_env.env_reply(r.messages, r.state) for r in rollouts]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=_env_max_workers(len(rollouts))) as ex:
+        return list(ex.map(lambda r: active_env.env_reply(r.messages, r.state), rollouts))
+
+
+def _score_rewards(rollouts: list[_RolloutState], active_env) -> list[float]:
+    """Per-rollout reward scoring, in order. Parallel (thread pool) when ``FLASH_MT_PARALLEL_ENV`` —
+    overlaps an LLM-judge reward across the whole batch — else sequential. ``reward("", ex, state)``
+    matches :func:`rollout_one` (score against the accumulated rollout state)."""
+    if not rollouts:
+        return []
+    if not _parallel_env() or len(rollouts) == 1:
+        return [float(active_env.reward("", r.example, r.state)) for r in rollouts]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=_env_max_workers(len(rollouts))) as ex:
+        return [float(x) for x in ex.map(lambda r: active_env.reward("", r.example, r.state), rollouts)]
+
+
+def _advance_model_turn(
+    r: _RolloutState, asst_ids: list[int], asst_lp: list[float], text: str, *, active_env, max_turns: int
+) -> bool:
+    """Fold a freshly-sampled assistant turn into ``r`` and apply the done-checks that DON'T need an
+    env reply. Returns True if ``r`` still needs an ``env_reply`` (else sets ``r.done``). Phase 1 of
+    the turn body, split out so :func:`rollout_batch` can batch/parallelize the env replies."""
     r.completion_ids.extend(asst_ids)
     r.logprobs.extend(asst_lp)
     r.env_mask.extend([1] * len(asst_ids))
@@ -266,14 +303,20 @@ def _advance_after_turn(
     active_env.record_model_turn(r.state, text)
     r.messages.append({"role": "assistant", "content": text})
     r.turns += 1
-
     if r.budget is not None and len(r.completion_ids) >= r.budget:
         r.done = True
-        return
+        return False
     if r.turns >= max_turns or active_env.rollout_done(r.state, max_turns):
         r.done = True
-        return
-    env_msgs = active_env.env_reply(r.messages, r.state)
+        return False
+    return True
+
+
+def _advance_env_reply(
+    r: _RolloutState, env_msgs, *, active_env, env_glue: Callable[[list], list[int]], max_turns: int
+) -> None:
+    """Apply a (possibly parallel-computed) env reply to ``r`` + the inter-turn glue. Phase 2 of the
+    turn body. Sets ``r.done`` when the rollout should stop."""
     if not env_msgs:
         r.done = True
         return
@@ -289,6 +332,25 @@ def _advance_after_turn(
     r.logprobs.extend([0.0] * len(glue))
     r.env_mask.extend([0] * len(glue))
     r.cur_ids.extend(glue)
+
+
+def _advance_after_turn(
+    r: _RolloutState,
+    asst_ids: list[int],
+    asst_lp: list[float],
+    text: str,
+    *,
+    active_env,
+    env_glue: Callable[[list], list[int]],
+    max_turns: int,
+) -> None:
+    """Fold one freshly-sampled assistant turn into rollout ``r`` and run its env step (phase 1 +
+    a sequential env_reply + phase 2), mirroring the body of :func:`rollout_one`'s loop EXACTLY.
+    Sets ``r.done`` when the rollout should stop. Shared by :func:`rollout_one` so the single-rollout
+    path and the batched path (which splits the phases) can never drift."""
+    if _advance_model_turn(r, asst_ids, asst_lp, text, active_env=active_env, max_turns=max_turns):
+        env_msgs = active_env.env_reply(r.messages, r.state)
+        _advance_env_reply(r, env_msgs, active_env=active_env, env_glue=env_glue, max_turns=max_turns)
 
 
 def rollout_batch(
@@ -349,18 +411,20 @@ def rollout_batch(
         if not batch:
             break
         gen = batched_generate([r.cur_ids for r in batch], max_news)
+        # Phase 1: fold each generated turn in; collect the rollouts that still need an env reply.
+        needing: list[_RolloutState] = []
         for r, (asst_ids, asst_lp, text) in zip(batch, gen, strict=True):
-            _advance_after_turn(
-                r, asst_ids, asst_lp, text,
-                active_env=active_env, env_glue=env_glue, max_turns=max_turns,
-            )
+            if _advance_model_turn(r, asst_ids, asst_lp, text, active_env=active_env, max_turns=max_turns):
+                needing.append(r)
+        # Phase 2: compute env replies (parallel across rollouts under FLASH_MT_PARALLEL_ENV — the
+        # win for network/LLM env turns), then apply + glue each in order.
+        replies = _run_env_replies(needing, active_env)
+        for r, env_msgs in zip(needing, replies, strict=True):
+            _advance_env_reply(r, env_msgs, active_env=active_env, env_glue=env_glue, max_turns=max_turns)
 
-    results: list[RolloutResult] = []
-    for r in rollouts:
-        # Score with the ACTUAL accumulated rollout state (matches rollout_one).
-        reward = active_env.reward("", r.example, r.state)
-        results.append(r.result(reward))
-    return results
+    # Score with the ACTUAL accumulated rollout state (matches rollout_one); parallel under the flag.
+    rewards = _score_rewards(rollouts, active_env)
+    return [r.result(reward) for r, reward in zip(rollouts, rewards, strict=True)]
 
 
 def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:

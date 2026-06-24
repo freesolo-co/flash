@@ -165,6 +165,27 @@ def test_rollout_batch_equals_rollout_one_per_example():
     assert 1 in three_turn["env_mask"]  # trained model tokens
 
 
+def test_parallel_env_matches_sequential(monkeypatch):
+    """FLASH_MT_PARALLEL_ENV=1 (env_reply + reward run across rollouts in a thread pool) yields
+    byte-identical results to sequential — each rollout's state is independent."""
+    examples = [{"max_model": 3}, {"max_model": 2}, {"max_model": 4}, {"max_model": 1}]
+
+    def batched(prefixes, max_tokens_list):
+        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
+
+    monkeypatch.delenv("FLASH_MT_PARALLEL_ENV", raising=False)
+    seq = rollout_batch(
+        examples=examples, active_env=_VarTurnEnv(), render=render, batched_generate=batched,
+        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+    )
+    monkeypatch.setenv("FLASH_MT_PARALLEL_ENV", "1")
+    par = rollout_batch(
+        examples=examples, active_env=_VarTurnEnv(), render=render, batched_generate=batched,
+        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+    )
+    assert par == seq
+
+
 def test_rollout_batch_preserves_input_order_and_count():
     """One result per example, in input order (so TRL's GRPO group stays aligned)."""
 
