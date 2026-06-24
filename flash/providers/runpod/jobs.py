@@ -284,10 +284,7 @@ def deploy_train_endpoint(
             if image:
                 kwargs["image"] = image
             else:
-                # Pass the resolved GPU so Hopper (sm90) gets its fla-drop treatment
-                # (resolve_worker_deps is GPU-scoped); a bare call would ship the generic deps
-                # and run fla's #640-buggy GDN Triton kernel on an H100.
-                kwargs["dependencies"] = resolve_worker_deps(friendly)
+                kwargs["dependencies"] = resolve_worker_deps()
                 kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
             ep = Endpoint(**kwargs)
             ep._qb_target = _train_body
@@ -344,21 +341,15 @@ def deploy_train_endpoint(
     return endpoint_id, name
 
 
-def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict:
-    """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`.
-
-    ``friendly_gpu`` is threaded into ``resolve_worker_deps`` for GPU-scoped deps parity with the
-    endpoint config (deploy_train_endpoint). fla is kept on every arch now; on Hopper (sm90) the
-    worker's _ensure_fla_fastpath_on_hopper makes fla correct+fast via its tilelang backend (fla #640),
-    so there is no longer a per-GPU drop here. (``friendly_gpu`` retained for signature parity.)
-    """
+def build_function_input(payload: dict) -> dict:
+    """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`."""
     if os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE:
         # Baked serverless-worker image (client mode): the image's rp_handler reads job["input"]
         # and calls _train_body, so the job input IS the train payload (submit_job wraps it in
         # {"input": ...}). No live-function source, no boot-install deps.
         return payload
     # Boot-install fallback (Flash default image + live function): ship _train_body's source for the
-    # generic worker to run, plus the GPU-scoped deps to install on first use (fla kept on all archs; tilelang fixes Hopper).
+    # generic worker to run, plus the pinned worker deps to install on first use.
     from runpod_flash.runtime.serialization import serialize_args
     from runpod_flash.stubs.live_serverless import get_function_source
 
@@ -368,7 +359,7 @@ def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict
         "function_code": source,
         "args": serialize_args((payload,)),
         "accelerate_downloads": True,
-        "dependencies": resolve_worker_deps(canonical_gpu(friendly_gpu) if friendly_gpu else None),
+        "dependencies": resolve_worker_deps(),
         "system_dependencies": WORKER_SYSTEM_DEPS,
     }
 
@@ -678,7 +669,7 @@ def submit_run(
         "extra_pip": extra_pip,
     }
     try:
-        job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload, spec.gpu.type))
+        job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
     except Exception:
         # The endpoint is registered but no run handle exists yet, and a
         # retry endpoint's rN-suffixed name can't be reconstructed from the run

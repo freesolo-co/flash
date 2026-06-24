@@ -29,7 +29,6 @@ from flash.providers.runpod.train.deps import (  # noqa: F401
     WORKER_DEPS,
     WORKER_IMAGE,
     WORKER_SYSTEM_DEPS,
-    _chalk_selected,
     _effective_worker_env,
     build_worker_env,
     chalk_extra_pip,

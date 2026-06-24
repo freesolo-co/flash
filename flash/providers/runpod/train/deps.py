@@ -104,21 +104,16 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 
 
-def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
+def resolve_worker_deps() -> list[str]:
     """The dependency list Flash installs on the GPU worker for this run.
 
     The pinned ``WORKER_DEPS`` is authoritative — flash is fully managed, no per-run override.
 
-    fla is kept on ALL arches now (including Hopper): the worker's
-    _ensure_fla_fastpath_on_hopper ensures fla's correct ``tilelang`` backend is live on sm90
-    before any model import (fla #640's Triton>=3.4 miscompute is a tilelang-backend fix, not a
-    reason to drop fla). This makes Hopper GDN training ~4-13x faster + ~2x less memory than the
-    pure-PyTorch delta fallback.
+    fla is kept on ALL arches (including Hopper): the worker's _ensure_fla_fastpath_on_hopper
+    ensures fla's correct ``tilelang`` backend is live on sm90 before any model import (fla #640's
+    Triton>=3.4 miscompute is a tilelang-backend fix, not a reason to drop fla). This makes Hopper
+    GDN training ~4-13x faster + ~2x less memory than the pure-PyTorch delta fallback.
     """
-    # fla is kept on ALL arches (incl. Hopper sm90). On Hopper the correctness fix is fla's
-    # tilelang backend (baked into WORKER_DEPS + ensured by _ensure_fla_fastpath_on_hopper), NOT
-    # dropping fla — keeping it gives the ~4-13x faster / ~2x lighter GDN training the pure-PyTorch
-    # delta fallback can't. (friendly_gpu retained for signature/back-compat; no longer drops fla.)
     return list(WORKER_DEPS)
 
 
@@ -140,14 +135,6 @@ def _effective_worker_env(spec=None) -> dict[str, str]:
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         eff[str(k)] = str(v)
     return eff
-
-
-def _chalk_selected(spec=None) -> bool:
-    """Always True: chalk's gap-filler kernels (RoPE/LoRA/embedding) run on every supported run
-    (engine.chalk_kernels — fixed selection, no env override), so chalk must always be installed.
-    (``spec`` retained for signature/back-compat.)
-    """
-    return True
 
 
 # Default chalk install spec when FLASH_CHALK_SPEC is unset. VERSION-PINNED (bounded range, like the
@@ -175,8 +162,6 @@ def chalk_extra_pip(spec=None) -> list[str]:
     :data:`DEFAULT_CHALK_SPEC`. Set ``FLASH_CHALK_SPEC`` to override the source (an exact version, a
     git URL, or a wheel/path), or disable every kernel (``FLASH_<K>=0``) to skip the install.
     """
-    if not _chalk_selected(spec):
-        return []
     # PyPI default (version-pinned for reproducibility) — chalk is published, so a normal run
     # installs + applies it automatically. An explicit FLASH_CHALK_SPEC overrides the source.
     spec_str = _effective_worker_env(spec).get("FLASH_CHALK_SPEC", "").strip() or DEFAULT_CHALK_SPEC
