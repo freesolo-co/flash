@@ -472,7 +472,10 @@ def rollout_async(
     def take(msg) -> None:
         nonlocal completed
         if msg[0] == "error":
-            raise msg[1]  # re-raise the worker's env/template error on the main thread
+            # Re-raise the worker's env/template error on the main thread (the engine owner),
+            # preserving the ORIGINAL worker traceback so the stack points at the real failing line.
+            err = msg[1]
+            raise err.with_traceback(err.__traceback__)
         if msg[0] == "done":
             completed += 1
         else:
@@ -698,7 +701,9 @@ def build_rollout_func(
             }
             if _final_only_kind is not None:
                 sp_kwargs["output_kind"] = _final_only_kind
-            llm_engine.add_request(req_id, {"prompt_token_ids": list(prefix_ids)}, SamplingParams(**sp_kwargs))
+            llm_engine.add_request(
+                req_id, {"prompt_token_ids": list(prefix_ids)}, SamplingParams(**sp_kwargs)
+            )
             active_ids.add(req_id)
 
         def poll() -> list[tuple[str, list[int], list[float], str]]:

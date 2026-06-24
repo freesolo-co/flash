@@ -600,7 +600,9 @@ class FreesoloEnvironment(BaseEnvironment):
         ``score_episodes`` scores each episode independently, so batching changes only concurrency,
         not values. Single-turn falls back to per-item :meth:`reward`."""
         if not self.multi_turn:
-            return [self.reward("", ex, st) for ex, st in items]
+            # Single-turn scoring ignores state and grades the completion, so pass the rollout's
+            # actual response (stored on the state) — not "" (which would score every item empty).
+            return [self.reward(str(st.get("response_text") or ""), ex, st) for ex, st in items]
         groups: dict[str, dict] = {}
         order: list[str] = []
         for i, (ex, st) in enumerate(items):
