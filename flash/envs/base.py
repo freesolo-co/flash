@@ -37,8 +37,8 @@ class BaseEnvironment:
         return [{"role": "user", "content": str(example.get("input") or "")}]
 
     def sft_completion(self, example: dict) -> list[dict]:
-        # Single-turn default: one gold assistant turn from the record's scalar ``output``.
-        # FreesoloEnvironment overrides this to support multi-turn gold trajectories via the
+        # Single-turn default: one target assistant turn from the record's scalar ``output``.
+        # FreesoloEnvironment overrides this to support multi-turn target trajectories via the
         # freesolo-sdk (``Environment.sft_completion`` -> ``datasets.target_messages``).
         return [{"role": "assistant", "content": str(example.get("output") or "")}]
 

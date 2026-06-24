@@ -442,6 +442,7 @@ class FreesoloEnvironment(BaseEnvironment):
         self.multi_turn = isinstance(sdk_env, tools["EnvironmentMultiTurn"])
         self.is_tool_env = False
         self._max_turns_cache: int | None = None
+        self._dataset_cache: list[dict] | None = None
 
     @property
     def max_turns(self) -> int:
@@ -460,16 +461,18 @@ class FreesoloEnvironment(BaseEnvironment):
             return self._max_turns_cache
         cap = 8
         if self.multi_turn:
-            cap = 24  # safe default if the per-example budgets can't be read
-            try:
-                budgets = [
-                    int(self._env.max_episode_turns(self._task_example(ex)))
-                    for ex in self.dataset()
-                ]
-                if budgets:
-                    cap = max(8, min(64, max(budgets)))
-            except Exception:
-                pass
+            cap = 24  # safe default if no per-example budget can be read at all
+            budgets: list[int] = []
+            for ex in self.dataset():  # cached; see dataset()
+                # Per-example so ONE malformed row (or an env whose max_episode_turns raises on it)
+                # is skipped rather than discarding every budget and silently falling back to 24,
+                # which would reintroduce the truncation this is meant to prevent.
+                try:
+                    budgets.append(int(self._env.max_episode_turns(self._task_example(ex))))
+                except Exception:
+                    continue
+            if budgets:
+                cap = max(8, min(64, max(budgets)))
         self._max_turns_cache = cap
         return cap
 
@@ -508,6 +511,11 @@ class FreesoloEnvironment(BaseEnvironment):
         return out
 
     def dataset(self) -> list[dict]:
+        # Parse once and cache: the worker reads ``env.dataset()`` AND ``env.max_turns`` (which
+        # also scans the dataset), so without this a multi-turn run would parse/load the whole
+        # dataset twice at startup.
+        if self._dataset_cache is not None:
+            return self._dataset_cache
         if self._source is None:
             rows = getattr(self._env, "dataset", None) or getattr(self._env, "examples", None)
             if rows is None:
@@ -535,6 +543,7 @@ class FreesoloEnvironment(BaseEnvironment):
                 raw.setdefault("metadata", metadata)
             record = self._canonical_record(raw)
             records.append(record)
+        self._dataset_cache = records
         return records
 
     def prompt_messages(self, example: dict) -> list[dict]:
@@ -542,13 +551,13 @@ class FreesoloEnvironment(BaseEnvironment):
         return [dict(message) for message in messages]
 
     def sft_completion(self, example: dict) -> list[dict]:
-        """Gold completion messages to append after the prompt for one SFT example.
+        """Target completion messages to append after the prompt for one SFT example.
 
         Delegates to the freesolo-sdk env's first-class ``Environment.sft_completion``, which turns
-        the record's ``output`` into the gold messages: a MULTI-TURN gold trajectory — assistant
-        turns, tool calls, tool results, replies (authored as ``output = {"messages": [...]}`` or a
-        bare message list) — when the row ships one, else a single assistant turn from a scalar
-        output. So the SFT example shape is owned by the freesolo-sdk dataset layer
+        the record's ``output`` into the target messages: a MULTI-TURN target trajectory —
+        assistant turns, tool calls, tool results, replies (authored as ``output = {"messages":
+        [...]}`` or a bare message list) — when the row ships one, else a single assistant turn from
+        a scalar output. So the SFT example shape is owned by the freesolo-sdk dataset layer
         (``freesolo.datasets.target_messages``), not a flash-only convention; ``len(...) > 1`` is
         multi-turn. Falls back to reading the raw record only for an older installed SDK that
         predates the method."""

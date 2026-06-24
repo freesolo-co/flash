@@ -155,6 +155,12 @@ def rollout_one(
         if not env_msgs:
             break
         messages.extend(env_msgs)
+        # If the env step finished the episode (it can set done / hit its budget while replying),
+        # stop here: do NOT append the next-generation glue — there is no next model turn, and the
+        # glue would leave a trailing assistant prompt in completion_ids (and could trigger one
+        # more generate()).
+        if active_env.rollout_done(state, max_turns):
+            break
 
         # Env-segment tokens = close the just-finished assistant turn + render the env reply +
         # open the next generation prompt, computed INCREMENTALLY (env_glue) rather than by
@@ -164,6 +170,11 @@ def rollout_one(
         # don't round-trip history (Qwen3's empty <think> block), which the old re-render +
         # prefix-check could not handle.
         glue = env_glue(env_msgs)
+        # Don't append glue that would push prompt+completion past the engine budget (the next
+        # generate() would be skipped anyway); end the rollout cleanly instead of returning an
+        # over-length sequence that could break the trainer's forward/loss pass.
+        if token_budget is not None and len(completion_ids) + len(glue) > token_budget:
+            break
         completion_ids.extend(glue)
         logprobs.extend([0.0] * len(glue))
         env_mask.extend([0] * len(glue))
@@ -265,7 +276,18 @@ def build_rollout_func(
             tokenize=False,
             enable_thinking=thinking,
         )
-        glue_text = text[text.index(probe) + len(probe) :]
+        # Locate the probe to slice off the inter-turn glue. Fail LOUD with context if the
+        # template did not insert the assistant content verbatim (some templates strip/escape it,
+        # or could emit the probe more than once) instead of a bare "substring not found".
+        first = text.find(probe)
+        if first == -1 or text.find(probe, first + len(probe)) != -1:
+            raise ValueError(
+                "multi-turn env_glue could not uniquely locate its probe in the rendered chat "
+                "template; this model's template does not insert assistant content verbatim, so "
+                "token-aligned multi-turn rollout is unsupported for it (use a single-turn/tool "
+                "env or a different model)."
+            )
+        glue_text = text[first + len(probe) :]
         return [int(t) for t in tok(glue_text, add_special_tokens=False).input_ids]
 
     def rollout_func(prompts, trainer):
@@ -282,6 +304,7 @@ def build_rollout_func(
         # the engine resident across steps). See flash issue #162.
         sleep_mode = bool(getattr(getattr(trainer, "args", None), "vllm_enable_sleep_mode", False))
         vocab_size = _engine_vocab_size(engine)
+        bounds_checked = [False]
 
         def generate(prefix_ids: list[int], max_tokens: int):
             # Fail loudly on a degenerate prompt instead of letting a bad id reach the embedding
@@ -289,12 +312,18 @@ def build_rollout_func(
             # mistaken for): the prompt_token_ids path does no bounds checking.
             if not prefix_ids:
                 raise ValueError("multi-turn rollout produced an empty prompt for engine.generate()")
-            lo, hi = min(prefix_ids), max(prefix_ids)
-            if lo < 0 or (vocab_size is not None and hi >= vocab_size):
-                raise ValueError(
-                    f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
-                    f"vocab size {vocab_size} (tokenizer/model mismatch)"
-                )
+            # Bounds-check token ids ONCE per rollout (on the initial prompt — the only
+            # externally-rendered segment). Later generate() calls pass a GROWING prefix whose new
+            # tokens are vLLM-generated or tokenizer-derived glue, both in-range, so re-scanning the
+            # whole prefix every turn would be O(total_tokens^2) for nothing.
+            if not bounds_checked[0]:
+                bounds_checked[0] = True
+                lo, hi = min(prefix_ids), max(prefix_ids)
+                if lo < 0 or (vocab_size is not None and hi >= vocab_size):
+                    raise ValueError(
+                        f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
+                        f"vocab size {vocab_size} (tokenizer/model mismatch)"
+                    )
             sp = SamplingParams(
                 max_tokens=max(1, int(max_tokens)),
                 temperature=temperature,
@@ -322,9 +351,14 @@ def build_rollout_func(
 
         # Wake the KV cache for the whole batch (see the note above), then re-sleep so the engine
         # returns to its fully-offloaded state and the optimizer step has the freed memory back.
-        if sleep_mode:
-            engine.wake_up(tags=["kv_cache"])
+        # `woke` is set AFTER a successful wake so the finally re-sleeps ONLY when we actually woke
+        # the engine — a wake_up() that raises leaves the engine asleep (its resting state), and we
+        # must not then call sleep() on it; a failure DURING the rollout still re-sleeps.
+        woke = False
         try:
+            if sleep_mode:
+                engine.wake_up(tags=["kv_cache"])
+                woke = True
             # ONE rollout per prompt: TRL's RepeatSampler already repeats each unique prompt
             # num_generations times BEFORE handing the slice to rollout_func (trl 1.6/1.7:
             # `prompts = [x["prompt"] for x in inputs]`, no dedup), and it expects exactly
@@ -351,7 +385,7 @@ def build_rollout_func(
                     out[k].append(r[k])
             return out
         finally:
-            if sleep_mode:
+            if woke:
                 engine.sleep(level=2)
 
     return rollout_func

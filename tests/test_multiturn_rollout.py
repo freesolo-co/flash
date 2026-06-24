@@ -301,11 +301,11 @@ def _stub_vllm():
             sys.modules["vllm"] = prev
 
 
-def _build(tok):
+def _build(tok, active_env=None):
     from flash.engine.multiturn_rollout import build_rollout_func
 
     return build_rollout_func(
-        active_env=_OneTurnEnv(),
+        active_env=active_env or _OneTurnEnv(),
         tok=tok,
         examples_by_key={},
         max_completion=8,
@@ -316,6 +316,35 @@ def _build(tok):
         thinking=False,
         engine_max_len=None,
     )
+
+
+class _TwoTurnEnv(_OneTurnEnv):
+    """Replies once (so the rollout must derive env_glue) before stopping."""
+
+    def rollout_done(self, state, max_turns):
+        # not done after the first model turn -> env_reply + env_glue run
+        return sum(1 for m in state["completion"] if m["role"] == "assistant") >= 2
+
+    def env_reply(self, messages, state):
+        msg = {"role": "user", "content": "result"}
+        state["completion"].append(msg)
+        return [msg]
+
+
+class _ProbeDropTok(_FakeTok):
+    """A chat template that does NOT insert assistant content verbatim (drops the probe)."""
+
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize, enable_thinking):
+        return "<no-probe-in-this-template>"
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_env_glue_fails_loud_when_template_drops_probe():
+    # If a template doesn't round-trip the probe, env_glue must raise a CLEAR error (not a bare
+    # "substring not found") so the failure points at glue derivation / template behavior.
+    rf = _build(_ProbeDropTok(), active_env=_TwoTurnEnv())
+    with pytest.raises(ValueError, match="could not uniquely locate its probe"):
+        rf([[{"role": "user", "content": "hi"}]], _fake_trainer(_FakeEngine(), sleep_mode=False))
 
 
 @pytest.mark.usefixtures("_stub_vllm")
