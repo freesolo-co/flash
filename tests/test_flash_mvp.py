@@ -124,7 +124,7 @@ def test_cli_train_dry_run():
             )
         env = os.environ.copy()
         proc = subprocess.run(
-            [sys.executable, "-m", "flash.cli.main", "train", config, "--dry-run"],
+            [sys.executable, "-m", "flash.cli", "train", config, "--dry-run"],
             cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
             env=env,
             text=True,

@@ -11,7 +11,7 @@ import io
 
 import pytest
 
-from flash.cli import main as cli
+import flash.cli as cli
 
 
 class _FakeClient:
@@ -154,7 +154,7 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
 def test_identity_render_is_ascii_locale_safe(monkeypatch) -> None:
     # Under an ASCII / non-UTF-8 stdout, neither a non-ASCII identity value nor our own
     # punctuation may raise UnicodeEncodeError after a login has already succeeded.
-    from flash.cli.main import render
+    from flash.cli import render
 
     class _AsciiStdout:
         encoding = "ascii"

@@ -94,7 +94,7 @@ def _run(args, home: str, api_url: str):
     # The stub serves both the freesolo verify endpoint and the flash control plane.
     env.update({"HOME": home, "FLASH_API_URL": api_url, "FREESOLO_BASE_URL": api_url})
     return subprocess.run(
-        [sys.executable, "-m", "flash.cli.main", *args],
+        [sys.executable, "-m", "flash.cli", *args],
         cwd=ROOT,
         text=True,
         env=env,

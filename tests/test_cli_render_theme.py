@@ -10,9 +10,9 @@ import json
 
 import pytest
 
+import flash.cli as cli
 from flash import __version__
-from flash.cli import main as cli
-from flash.cli.main import render
+from flash.cli import render
 
 
 class _Client:

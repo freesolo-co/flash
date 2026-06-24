@@ -38,7 +38,7 @@ def test_env_setup_scaffolds_a_loadable_freesolo_env(tmp_path, monkeypatch) -> N
     """`flash env setup` must scaffold a Freesolo SDK env, not a BaseEnvironment subclass."""
     from argparse import Namespace
 
-    from flash.cli.main import cmd_env_setup
+    from flash.cli import cmd_env_setup
 
     monkeypatch.chdir(tmp_path)
     assert cmd_env_setup(Namespace()) == 0
