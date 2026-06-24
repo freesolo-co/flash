@@ -466,11 +466,18 @@ def cmd_status(args) -> int:
     if getattr(args, "follow", False):
         return _follow_run(client, args.run_id)
     if getattr(args, "logs", False):
-        logs = client.get_logs(args.run_id)["logs"]
+        logs = client.get_logs(args.run_id).get("logs", "")
         if logs:
             print(logs, end="")
             if not logs.endswith("\n"):
                 print()
+        # Always append the real train-subprocess output (the orchestrator log can't carry it);
+        # the server fetches console_/error_<phase>.txt from HF with the operator token.
+        for name, text in (client.get_worker_output(args.run_id) or {}).items():
+            if not text:
+                continue
+            print(f"\n----- {name} -----")
+            print(text, end="" if text.endswith("\n") else "\n")
     status = client.get_run(args.run_id)
     if render.styled():
         print(render.run_status(status))
