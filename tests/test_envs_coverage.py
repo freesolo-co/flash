@@ -16,7 +16,7 @@ def test_base_environment_defaults() -> None:
     env = BaseEnvironment(id="x")
     example = {"input": "Q?", "output": "42"}
     assert env.prompt_messages(example) == [{"role": "user", "content": "Q?"}]
-    assert env.sft_target(example) == "42"
+    assert env.sft_completion(example) == [{"role": "assistant", "content": "42"}]
     assert env.grade("the answer is 42", example) is True
     assert env.reward("nope", example) == 0.0
 
