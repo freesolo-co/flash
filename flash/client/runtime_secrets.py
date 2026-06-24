@@ -12,10 +12,6 @@ from pathlib import Path
 DEFAULT_RUNTIME_SECRET_KEYS = frozenset({"WANDB_API_KEY"})
 
 
-def _runtime_secret_keys(keys: tuple[str, ...] | list[str] | set[str] | None = None) -> set[str]:
-    return set(DEFAULT_RUNTIME_SECRET_KEYS) | {str(key) for key in (keys or ())}
-
-
 def _read_env_file(path: Path, keys: set[str]) -> dict[str, str]:
     if not path.exists() or not path.is_file():
         return {}
@@ -49,7 +45,7 @@ def runtime_secrets_from_local_env(
     scan arbitrary parent directories or serialize secrets into the run spec.
     """
 
-    wanted = _runtime_secret_keys(keys)
+    wanted = set(DEFAULT_RUNTIME_SECRET_KEYS) | {str(key) for key in (keys or ())}
     secrets = {key: value for key in wanted if (value := os.environ.get(key))}
     candidates = [Path.cwd() / ".env", Path.cwd() / ".env.local"]
     if config_path:
