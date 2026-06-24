@@ -371,6 +371,22 @@ def _run_seed_loop(
         resume_seed_index=None,
     )
     _charge_completed_run_best_effort(spec, log)
+    _register_checkpoints_best_effort(spec, log)
+
+
+def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
+    """Mirror a finished run's deployable per-step checkpoints to the backend store.
+
+    Best-effort and isolated from billing: the checkpoints live on HF regardless, so a
+    persistence miss never changes the run's outcome."""
+    from flash.runner import get_status
+
+    try:
+        from flash.server.checkpoints import register_checkpoints_best_effort
+
+        register_checkpoints_best_effort(get_status(spec.run_id), log=log)
+    except Exception as exc:  # never let checkpoint bookkeeping disturb a run
+        print(f"[ckpt] register warn ({spec.run_id}): {exc}", file=log, flush=True)
 
 
 def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:

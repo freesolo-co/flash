@@ -245,18 +245,27 @@ class ApiClient:
     def cancel_run(self, run_id: str) -> dict:
         return self._request("POST", f"/v1/runs/{run_id}/cancel")
 
+    def checkpoints(self, run_id: str) -> list[dict]:
+        """Deployable per-step RL checkpoints for a run (each `flash deploy --step N`-able)."""
+        return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
+
     # -- serving -----------------------------------------------------------------------
     def deploy(
         self,
         run_id: str,
         dry_run: bool = False,
+        step: int | None = None,
     ) -> dict:
         # Deploy blocks on registration and serving warmup, which can take many minutes.
         deploy_timeout = 30 * 60 if not dry_run else None
+        body: dict = {"dry_run": dry_run}
+        if step is not None:
+            # Deploy a specific intermediate checkpoint instead of the run's final adapter.
+            body["step"] = int(step)
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/deploy",
-            body={"dry_run": dry_run},
+            body=body,
             timeout=deploy_timeout,
         )
 
