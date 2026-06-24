@@ -35,7 +35,7 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
     # allocation must only ever pick a class in the validated pool — across ALL candidates,
     # not just the chosen one. Offline only RunPod is available; 0.8B GRPO needs the 24 GB tier
     # whose cheapest VALIDATED RunPod class is RTX 3090 @ $0.46 (cheaper unvalidated 24 GB classes
-    # like L4 are excluded). 16 GB unvalidated classes (RTX 2000 Ada @ $0.24) never appear.
+    # like L4 are excluded). 24 GB is the floor — sub-24 GB classes were dropped.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert all(c.gpu in VALIDATED for c in a.candidates), [
@@ -45,9 +45,9 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
 
 
 def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
-    """A small SFT fits a 16-17 GB card; the absolute-cheapest fitting class (RTX 2000 Ada /
-    RTX A4000, ~$0.24-0.25) is UNVALIDATED and must be skipped for the cheapest VALIDATED one,
-    so the run actually submits (the live `flash train` default-submit failure this fixes)."""
+    """A small SFT down-routes below 24 GB; the absolute-cheapest fitting class (L4 @ $0.39, 24 GB)
+    is UNVALIDATED and must be skipped for the cheapest VALIDATED one (RTX 3090 @ $0.46), so the
+    run actually submits (the live `flash train` default-submit failure this fixes)."""
     from flash.providers import allocator
     from flash.providers.base import GPU_INFO, VALIDATED
 
