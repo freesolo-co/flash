@@ -237,39 +237,19 @@ class _RolloutState:
         }
 
 
-# Cap concurrent env-side threads. Once GPU generation is batched, the per-rollout env_reply / reward
-# are the serial tail; for LLM-in-the-loop envs (simulated-user model / LLM judge / tool API) those
-# are I/O-bound network calls, so running them across a small thread pool is a strict win and free
-# for cheap/deterministic envs. Each rollout's state is independent (a Freesolo env operates on the
-# passed ``state``, not shared object state), so the parallel result equals sequential — proven by
-# the ``rollout_batch`` == per-example ``rollout_one`` test.
-_ENV_THREAD_CAP = 16
-
-
-def _env_map(rollouts: list[_RolloutState], fn) -> list:
-    """``fn(rollout)`` for each rollout, in order — across a thread pool for >1 (inline for 0/1)."""
-    if len(rollouts) <= 1:
-        return [fn(r) for r in rollouts]
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=min(len(rollouts), _ENV_THREAD_CAP)) as ex:
-        return list(ex.map(fn, rollouts))
-
-
-def _run_env_replies(rollouts: list[_RolloutState], active_env) -> list:
-    return _env_map(rollouts, lambda r: active_env.env_reply(r.messages, r.state))
-
-
-def _score_rewards(rollouts: list[_RolloutState], active_env) -> list[float]:
-    return [float(x) for x in _env_map(rollouts, lambda r: active_env.reward("", r.example, r.state))]
-
-
-def _advance_model_turn(
-    r: _RolloutState, asst_ids: list[int], asst_lp: list[float], text: str, *, active_env, max_turns: int
-) -> bool:
-    """Fold a freshly-sampled assistant turn into ``r`` and apply the done-checks that DON'T need an
-    env reply. Returns True if ``r`` still needs an ``env_reply`` (else sets ``r.done``). Phase 1 of
-    the turn body, split out so :func:`rollout_batch` can batch/parallelize the env replies."""
+def _advance_after_turn(
+    r: _RolloutState,
+    asst_ids: list[int],
+    asst_lp: list[float],
+    text: str,
+    *,
+    active_env,
+    env_glue: Callable[[list], list[int]],
+    max_turns: int,
+) -> None:
+    """Fold one freshly-sampled assistant turn into rollout ``r`` and run its env step, mirroring the
+    body of :func:`rollout_one`'s loop EXACTLY. Sets ``r.done`` when the rollout should stop. Used by
+    :func:`rollout_batch` so the batched and single-rollout paths can never drift."""
     r.completion_ids.extend(asst_ids)
     r.logprobs.extend(asst_lp)
     r.env_mask.extend([1] * len(asst_ids))
@@ -279,18 +259,11 @@ def _advance_model_turn(
     r.turns += 1
     if r.budget is not None and len(r.completion_ids) >= r.budget:
         r.done = True
-        return False
+        return
     if r.turns >= max_turns or active_env.rollout_done(r.state, max_turns):
         r.done = True
-        return False
-    return True
-
-
-def _advance_env_reply(
-    r: _RolloutState, env_msgs, *, active_env, env_glue: Callable[[list], list[int]], max_turns: int
-) -> None:
-    """Apply a (possibly parallel-computed) env reply to ``r`` + the inter-turn glue. Phase 2 of the
-    turn body. Sets ``r.done`` when the rollout should stop."""
+        return
+    env_msgs = active_env.env_reply(r.messages, r.state)
     if not env_msgs:
         r.done = True
         return
@@ -366,20 +339,14 @@ def rollout_batch(
         if not batch:
             break
         gen = batched_generate([r.cur_ids for r in batch], max_news)
-        # Phase 1: fold each generated turn in; collect the rollouts that still need an env reply.
-        needing: list[_RolloutState] = []
         for r, (asst_ids, asst_lp, text) in zip(batch, gen, strict=True):
-            if _advance_model_turn(r, asst_ids, asst_lp, text, active_env=active_env, max_turns=max_turns):
-                needing.append(r)
-        # Phase 2: compute env replies (parallel across rollouts — the win for network/LLM env
-        # turns, free for cheap ones), then apply + glue each in order.
-        replies = _run_env_replies(needing, active_env)
-        for r, env_msgs in zip(needing, replies, strict=True):
-            _advance_env_reply(r, env_msgs, active_env=active_env, env_glue=env_glue, max_turns=max_turns)
+            _advance_after_turn(
+                r, asst_ids, asst_lp, text,
+                active_env=active_env, env_glue=env_glue, max_turns=max_turns,
+            )
 
-    # Score with the ACTUAL accumulated rollout state (matches rollout_one); parallel under the flag.
-    rewards = _score_rewards(rollouts, active_env)
-    return [r.result(reward) for r, reward in zip(rollouts, rewards, strict=True)]
+    # Score with the ACTUAL accumulated rollout state (matches rollout_one).
+    return [r.result(float(active_env.reward("", r.example, r.state))) for r in rollouts]
 
 
 def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:
