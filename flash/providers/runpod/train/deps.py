@@ -43,7 +43,9 @@ WORKER_DEPS = [
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
-    "freesolo>=0.2.46",
+    # >=0.2.49: first version exposing Environment.sft_completion + datasets.target_messages,
+    # which the worker's SFT/multi-turn path now calls (flash #162 multi-turn SFT).
+    "freesolo>=0.2.49",
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
     # NB: the HF `kernels` Hub package is intentionally NOT pinned here — the versions
@@ -58,13 +60,23 @@ WORKER_DEPS = [
     # (use_liger_loss) — the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
     "wandb>=0.17",
     "liger-kernel>=0.5",
-    # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this,
-    # transformers falls back to a pure-PyTorch delta rule and GRPO trainer steps are
-    # 2-3x slower (measured A/B on Qwen3.5-2B: ~65 s/step -> ~20 s/step steady).
-    "flash-linear-attention==0.5.0",
-    # NB: fla's gated chunk_bwd is broken on HOPPER (H100) with Triton >= 3.4 (fla #640), so
-    # resolve_worker_deps DROPS fla on sm90 (the correct pure-PyTorch delta rule runs instead). The
-    # dense Qwen3.5 GDN models route to consumer cards by default, where fla works.
+    # Fused Triton kernels for Gated-DeltaNet (Qwen3.5/3.6 family): without this, transformers
+    # falls back to a pure-PyTorch delta rule that is dramatically slower + memory-heavier (measured
+    # A/B, H100 SXM, Qwen3.5 hidden-2560 LoRA: seq4096 435->105 ms/step & 9.9->6.1 GB = 4.2x/1.6x;
+    # seq16384 3106->247 ms & 32->17 GB = 12.6x/1.9x; forward loss matches to 1.8e-4). Installed
+    # from git: the PyPI ``flash-linear-attention`` wheel is a broken stub missing ``fla.modules``.
+    # PINNED to a specific commit (not the moving default branch) so cold-start installs are
+    # reproducible and a breaking upstream change can't silently land on a run; bump intentionally
+    # after validating. Keep this SHA in lockstep with Dockerfile.worker's fla install.
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@f0e213dbd8b5fb90c3c7eca869ac1706d5377139",
+    # fla's gated chunk_bwd is INCORRECT on Hopper (H100) with Triton>=3.4 (fla #640); its
+    # ``tilelang`` backend is the correct path there, so we KEEP fla on every arch (the worker's
+    # _ensure_fla_fastpath_on_hopper ensures tilelang is live on sm90 before any model import).
+    # PINNED (like the fla SHA) so cold-start installs / image rebuilds are reproducible and a
+    # breaking upstream tilelang can't silently land on the Hopper correctness path. Keep this
+    # version in lockstep with Dockerfile.worker + perf.py's runtime reinstall.
+    "tilelang==0.1.11",
+    "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
     # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
     # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
     # (chalk_extra_pip) appends the version-pinned ``freesolo-chalk`` (DEFAULT_CHALK_SPEC) from PyPI
@@ -103,10 +115,11 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
 
     Precedence: FLASH_WORKER_DEPS (explicit list) > the pinned ``WORKER_DEPS``.
 
-    GPU-specific: on HOPPER (sm90, H100), DROP flash-linear-attention — its gated
-    chunk_bwd Triton kernel is miscomputed there (Triton>=3.4, fla #640). Without fla,
-    transformers uses the correct pure-PyTorch delta rule (slower but correct).
-    Ampere/Ada/Blackwell keep fla for the speedup.
+    fla is kept on ALL arches now (including Hopper): the worker's
+    _ensure_fla_fastpath_on_hopper ensures fla's correct ``tilelang`` backend is live on sm90
+    before any model import (fla #640's Triton>=3.4 miscompute is a tilelang-backend fix, not a
+    reason to drop fla). This makes Hopper GDN training ~4-13x faster + ~2x less memory than the
+    pure-PyTorch delta fallback.
     """
     explicit = os.environ.get("FLASH_WORKER_DEPS")
     if explicit:
@@ -125,18 +138,10 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
         if deps:
             return deps
     deps = list(WORKER_DEPS)
-    # Hopper (sm90) fla strategy: DROP flash-linear-attention -> the correct pure-PyTorch delta
-    # rule. fla's gated chunk_bwd Triton kernel is miscomputed on Hopper (Triton>=3.4, fla #640),
-    # so on H100 we run without it (the dense Qwen3.5 GDN models route to consumer cards by
-    # default, where fla stays). Ampere/Ada/Blackwell keep fla for the speedup.
-    if friendly_gpu:
-        try:
-            from flash.providers.base import get_gpu_info
-
-            if get_gpu_info(friendly_gpu).sm == "sm90":
-                deps = [d for d in deps if not d.startswith("flash-linear-attention")]
-        except Exception:
-            pass
+    # fla is kept on ALL arches (incl. Hopper sm90). On Hopper the correctness fix is fla's
+    # tilelang backend (baked into WORKER_DEPS + ensured by _ensure_fla_fastpath_on_hopper), NOT
+    # dropping fla — keeping it gives the ~4-13x faster / ~2x lighter GDN training the pure-PyTorch
+    # delta fallback can't. (friendly_gpu retained for signature/back-compat; no longer drops fla.)
     # Additive per-run extras (e.g. an extra pinned wheel for an A/B) without
     # restating the whole pinned stack the way FLASH_WORKER_DEPS requires.
     extra = os.environ.get("FLASH_WORKER_EXTRA_DEPS")
@@ -336,6 +341,20 @@ def build_worker_env(
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
+        # Rollout FlashAttention version override (vllm reads VLLM_FLASH_ATTN_VERSION=2|3): vLLM's
+        # FLASH_ATTN backend auto-selects FA3 on Hopper (sm90) when supported, FA2 otherwise. Forward
+        # this so a run can PIN the rollout FA version (e.g. =3 to confirm/force FA3 on H100/H200, the
+        # rollout analog of the trainer's flash_attention_3 selection). Unset -> vLLM auto-selects.
+        "VLLM_FLASH_ATTN_VERSION",
+        # Trainer-side flash escape hatches (engine.worker.perf): set =1 to force a host off a flash
+        # kernel without rebuilding the image. FLASH_DISABLE_FA3 -> the Hopper attn_implementation
+        # SELECTION drops FA3 (optimal_attn_impl returns SDPA); NOTE an SFT run can still pack under
+        # flash_attention_2 if the FA2 wheel is present, so to force *plain* SDPA on Hopper SFT also
+        # set FLASH_DISABLE_FA2 (which disables FA2 selection AND packing). FLASH_DISABLE_FA2 alone ->
+        # Ampere/Ada drop FA2->SDPA and packing is disabled. Forwarded so an operator can remotely
+        # troubleshoot without editing the structured spec.
+        "FLASH_DISABLE_FA3",
+        "FLASH_DISABLE_FA2",
         # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
         # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
         # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a

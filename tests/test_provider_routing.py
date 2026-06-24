@@ -118,7 +118,7 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     from flash.providers.runpod import jobs as rp_jobs
 
     candidates = (
-        Candidate("runpod", "RTX 2000 Ada", 0.24, 16),
+        Candidate("runpod", "L4", 0.39, 24),
         Candidate("runpod", "RTX 3090", 0.46, 24),
     )
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
@@ -140,7 +140,7 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     log = io.StringIO()
     metrics = orch._submit_seed_supervised(spec, 0, log)
     assert metrics["train_tokens"] == 4096
-    assert submitted_gpus == ["RTX 2000 Ada", "RTX 3090"]
+    assert submitted_gpus == ["L4", "RTX 3090"]
     assert cancelled == [("ep1", "j1")]
     assert "ep1" in deleted
     assert "walking past the cheapest class" in log.getvalue()
@@ -195,8 +195,8 @@ def test_config_gpu_fields(monkeypatch):
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
     spec = spec_from_dict(dict(base), run_id="x")
-    assert spec.gpu.type == "RTX 2000 Ada"
+    assert spec.gpu.type == "RTX 3090"
     again = JobSpec.from_dict(spec.to_dict())
-    assert again.gpu.type == "RTX 2000 Ada"
-    spec = spec_from_dict({**base, "gpu": {"type": "L40S"}}, run_id="x")
-    assert spec.gpu.type == "RTX 2000 Ada"
+    assert again.gpu.type == "RTX 3090"
+    spec = spec_from_dict({**base, "gpu": {"type": "A100 SXM"}}, run_id="x")
+    assert spec.gpu.type == "RTX 3090"
