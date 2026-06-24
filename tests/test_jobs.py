@@ -1263,7 +1263,6 @@ def _patch_deploy_deps(monkeypatch, jobs):
     monkeypatch.setattr(jobs, "canonical_gpu", lambda g: g)
     monkeypatch.setattr(jobs, "endpoint_name", lambda g, s: f"flash-{g}-test")
     monkeypatch.setattr(jobs, "min_cuda_for", lambda g: "12.8")
-    monkeypatch.setattr(jobs, "volume_endpoint_kwargs", lambda s: {})
     monkeypatch.setattr(jobs, "WORKER_IMAGE", "fake-image")
     monkeypatch.setattr(jobs, "DEFAULT_EXECUTION_TIMEOUT_MS", 3600000)
     monkeypatch.setattr(jobs, "apply_disk_gb", lambda c, d: None)

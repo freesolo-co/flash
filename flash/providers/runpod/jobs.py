@@ -61,7 +61,6 @@ __all__ = [
     "make_hf_text_reader",
     "poll_job",
     "submit_run",
-    "volume_endpoint_kwargs",
 ]
 
 TERMINAL_OK = {"COMPLETED"}
@@ -87,31 +86,6 @@ def stall_kwargs() -> dict:
     pinned GPU class as out of capacity and walk to the next-best one.
     """
     return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 900.0}
-
-
-def volume_endpoint_kwargs(spec) -> dict:
-    """Endpoint kwargs for the OPT-IN persistent network volume (cross-run HF cache).
-
-    Returns {} unless ``gpu.network_volume`` is set. The volume pins the endpoint to
-    one datacenter (``gpu.datacenter``, default EU-RO-1 — the SDK's storage default),
-    which shrinks the available GPU pool; that trade-off is why this is opt-in.
-    """
-    nv = getattr(spec.gpu, "network_volume", None) if spec is not None else None
-    if not nv:
-        return {}
-    from runpod_flash import NetworkVolume
-    from runpod_flash.core.resources.datacenter import DataCenter
-
-    dc = DataCenter.from_string(spec.gpu.datacenter) if spec.gpu.datacenter else None
-    volume = NetworkVolume(
-        name=str(nv),
-        size=int(getattr(spec.gpu, "network_volume_gb", 100) or 100),
-        **({"datacenter": dc} if dc else {}),
-    )
-    kwargs: dict = {"volume": volume}
-    if dc:
-        kwargs["datacenter"] = dc
-    return kwargs
 
 
 def apply_disk_gb(config, disk_gb: int | None) -> None:
@@ -299,22 +273,18 @@ def deploy_train_endpoint(
         # scope or race the event loop mid-deploy.
         with FLASH_SDK_LOCK:
             isolate_flash_state(name_suffix)
-            kwargs = dict(
-                name=name,
-                gpu=flash_gpu(friendly),
-                gpu_count=1,
-                min_cuda_version=min_cuda_for(friendly),
-                execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-                workers=(0, 1),
-                **volume_endpoint_kwargs(spec),
-            )
+            kwargs = {
+                "name": name,
+                "gpu": flash_gpu(friendly),
+                "gpu_count": 1,
+                "min_cuda_version": min_cuda_for(friendly),
+                "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+                "workers": (0, 1),
+            }
             if image:
                 kwargs["image"] = image
             else:
-                # Pass the resolved GPU so Hopper (sm90) gets its fla-drop treatment
-                # (resolve_worker_deps is GPU-scoped); a bare call would ship the generic deps
-                # and run fla's #640-buggy GDN Triton kernel on an H100.
-                kwargs["dependencies"] = resolve_worker_deps(friendly)
+                kwargs["dependencies"] = resolve_worker_deps()
                 kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
             ep = Endpoint(**kwargs)
             ep._qb_target = _train_body
@@ -371,21 +341,15 @@ def deploy_train_endpoint(
     return endpoint_id, name
 
 
-def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict:
-    """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`.
-
-    ``friendly_gpu`` is threaded into ``resolve_worker_deps`` for GPU-scoped deps parity with the
-    endpoint config (deploy_train_endpoint). fla is kept on every arch now; on Hopper (sm90) the
-    worker's _ensure_fla_fastpath_on_hopper makes fla correct+fast via its tilelang backend (fla #640),
-    so there is no longer a per-GPU drop here. (``friendly_gpu`` retained for signature parity.)
-    """
+def build_function_input(payload: dict) -> dict:
+    """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`."""
     if os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE:
         # Baked serverless-worker image (client mode): the image's rp_handler reads job["input"]
         # and calls _train_body, so the job input IS the train payload (submit_job wraps it in
         # {"input": ...}). No live-function source, no boot-install deps.
         return payload
     # Boot-install fallback (Flash default image + live function): ship _train_body's source for the
-    # generic worker to run, plus the GPU-scoped deps to install on first use (fla kept on all archs; tilelang fixes Hopper).
+    # generic worker to run, plus the pinned worker deps to install on first use.
     from runpod_flash.runtime.serialization import serialize_args
     from runpod_flash.stubs.live_serverless import get_function_source
 
@@ -395,7 +359,7 @@ def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict
         "function_code": source,
         "args": serialize_args((payload,)),
         "accelerate_downloads": True,
-        "dependencies": resolve_worker_deps(canonical_gpu(friendly_gpu) if friendly_gpu else None),
+        "dependencies": resolve_worker_deps(),
         "system_dependencies": WORKER_SYSTEM_DEPS,
     }
 
@@ -705,7 +669,7 @@ def submit_run(
         "extra_pip": extra_pip,
     }
     try:
-        job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload, spec.gpu.type))
+        job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
     except Exception:
         # The endpoint is registered but no run handle exists yet, and a
         # retry endpoint's rN-suffixed name can't be reconstructed from the run

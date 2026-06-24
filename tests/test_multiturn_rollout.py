@@ -15,6 +15,7 @@ import pytest
 from flash.engine.multiturn_rollout import (
     build_examples_index,
     index_collisions,
+    rollout_batch,
     rollout_one,
 )
 
@@ -85,6 +86,103 @@ def _generator(turn_texts):
         return token_ids, logprobs, text
 
     return generate
+
+
+class _VarTurnEnv:
+    """Multi-turn env that stops after a PER-EXAMPLE number of model turns, so a batch contains
+    rollouts of different lengths (exercises rollout_batch's lockstep drop-out)."""
+
+    multi_turn = True
+
+    def new_rollout_state(self, example):
+        return {
+            "prompt": [{"role": "user", "content": "u1"}],
+            "completion": [],
+            "max_model": example["max_model"],
+        }
+
+    def record_model_turn(self, state, content):
+        state["completion"].append({"role": "assistant", "content": content})
+
+    def rollout_done(self, state, max_turns):
+        n_model = sum(1 for m in state["completion"] if m["role"] == "assistant")
+        return n_model >= state["max_model"]
+
+    def env_reply(self, messages, state):
+        msg = {"role": "user", "content": "u2"}
+        state["completion"].append(msg)
+        return [msg]
+
+    def reward(self, completion, example, state=None):
+        # distinct per rollout -> proves per-rollout scoring survives batching
+        return float(sum(1 for m in (state or {}).get("completion", []) if m["role"] == "assistant"))
+
+
+def _det_generate(prefix_ids, max_tokens):
+    """Deterministic single-turn generation: a pure function of nothing but the call, so running
+    rollout_one per example and rollout_batch over all examples see byte-identical turns."""
+    return [CONTENT["a1"], END], [-0.1, -0.2], "a1"
+
+
+def test_rollout_batch_equals_rollout_one_per_example():
+    """rollout_batch is exactly N independent rollout_one() calls — same token alignment, env_mask,
+    logprobs and per-rollout reward, in input order — only the generation is batched. Different
+    per-example turn counts force the batch to shrink as rollouts finish at different turns."""
+    examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
+
+    ones = [
+        rollout_one(
+            example=e,
+            active_env=_VarTurnEnv(),
+            render=render,
+            generate=_det_generate,
+            env_glue=env_glue,
+            max_turns=8,
+            per_turn_max_tokens=8,
+        )
+        for e in examples
+    ]
+
+    def batched(prefixes, max_tokens_list):
+        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
+
+    batch = rollout_batch(
+        examples=examples,
+        active_env=_VarTurnEnv(),
+        render=render,
+        batched_generate=batched,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
+    )
+    assert batch == ones
+    # rewards differ per rollout (per-rollout scoring survived batching)
+    assert [r["reward"] for r in batch] == [1.0, 3.0, 2.0]
+    # the multi-turn rollouts carry masked (0) env-glue tokens; the single-turn one does not
+    assert set(batch[0]["env_mask"]) == {1}  # max_model=1: one turn, no env tokens
+    three_turn = batch[1]  # max_model=3: env replies -> masked glue tokens present
+    assert 0 in three_turn["env_mask"]  # masked env-glue tokens
+    assert 1 in three_turn["env_mask"]  # trained model tokens
+
+
+def test_rollout_batch_preserves_input_order_and_count():
+    """One result per example, in input order (so TRL's GRPO group stays aligned)."""
+
+    def batched(prefixes, max_tokens_list):
+        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
+
+    examples = [{"max_model": 2}, {"max_model": 1}, {"max_model": 1}, {"max_model": 3}]
+    out = rollout_batch(
+        examples=examples,
+        active_env=_VarTurnEnv(),
+        render=render,
+        batched_generate=batched,
+        env_glue=env_glue,
+        max_turns=8,
+        per_turn_max_tokens=8,
+    )
+    assert len(out) == 4
+    assert [r["reward"] for r in out] == [2.0, 1.0, 1.0, 3.0]
 
 
 def test_rollout_one_interleaves_and_masks_env_tokens():
@@ -272,9 +370,14 @@ class _FakeEngine:
         self.events.append(("sleep", level))
 
     def generate(self, prompts, sampling_params=None, use_tqdm=False):
-        self.events.append(("generate", tuple(prompts[0]["prompt_token_ids"])))
-        comp = types.SimpleNamespace(token_ids=[5, 6], logprobs=None, text="ok")
-        return [types.SimpleNamespace(outputs=[comp])]
+        # Batched decode: record the batch's prompts and return ONE output per prompt (in order).
+        self.events.append(("generate", tuple(tuple(p["prompt_token_ids"]) for p in prompts)))
+        return [
+            types.SimpleNamespace(
+                outputs=[types.SimpleNamespace(token_ids=[5, 6], logprobs=None, text="ok")]
+            )
+            for _ in prompts
+        ]
 
 
 def _fake_trainer(engine, *, sleep_mode):
@@ -377,6 +480,47 @@ def test_rollout_func_returns_one_completion_per_prompt():
     assert len(out["completion_ids"]) == len(prompts) == 3
     assert len(out["reward"]) == 3
     assert len(out["prompt_ids"]) == 3
+
+
+def test_batched_makes_far_fewer_engine_calls_than_sequential():
+    # The CPU-measurable heart of the optimization: rollout_batch issues ONE batched generate per
+    # TURN (every active rollout together) vs one generate per prompt per turn for per-example
+    # rollout_one. For P prompts over T model turns the batched path makes ~T dispatches, the
+    # sequential path ~P*T — far fewer, far larger GPU calls (vLLM batches the decode), at identical
+    # results. Measured at the core-function level (no env toggle — batching is always on).
+    examples = [{"max_model": 2} for _ in range(6)]  # 6 prompts, _VarTurnEnv -> 2 model turns each
+
+    seq_calls = 0
+
+    def counting_gen(prefix, mt):
+        nonlocal seq_calls
+        seq_calls += 1
+        return _det_generate(prefix, mt)
+
+    seq = [
+        rollout_one(
+            example=e, active_env=_VarTurnEnv(), render=render, generate=counting_gen,
+            env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+        )
+        for e in examples
+    ]
+
+    batch_calls = 0
+
+    def counting_batched(prefixes, max_tokens_list):
+        nonlocal batch_calls
+        batch_calls += 1
+        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
+
+    batch = rollout_batch(
+        examples=examples, active_env=_VarTurnEnv(), render=render, batched_generate=counting_batched,
+        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+    )
+
+    assert batch == seq  # byte-identical rollouts
+    assert seq_calls == 6 * 2  # sequential: one engine call per prompt per turn
+    assert batch_calls == 2  # batched: one engine call per turn (all 6 rollouts in each)
+    assert batch_calls < seq_calls
 
 
 @pytest.mark.usefixtures("_stub_vllm")
