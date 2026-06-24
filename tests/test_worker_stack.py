@@ -33,8 +33,8 @@ def test_gdn_fastpath_deps_present_and_kept_on_hopper():
         d.startswith("apache-tvm-ffi==0.1.11") for d in WORKER_DEPS
     )  # pin (0.1.12 aborts tilelang import)
     # fla must NOT be dropped on Hopper anymore (it was, pre-fix).
-    deps_h100 = resolve_worker_deps("H100")
-    assert any("flash-linear-attention" in d for d in deps_h100), (
+    deps = resolve_worker_deps()
+    assert any("flash-linear-attention" in d for d in deps), (
         "fla must be kept on Hopper for the tilelang fast path"
     )
 
