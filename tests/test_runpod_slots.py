@@ -132,14 +132,37 @@ def test_acquire_local_without_internal_key(monkeypatch):
 
 def test_release_shared_calls_store_and_is_idempotent(monkeypatch):
     monkeypatch.setattr(ep, "_ACQUIRED", {"flash-x": "shared"})
+    # No internal key: the second (untracked) call is a no-op rather than a cross-replica release.
+    monkeypatch.setattr(slots, "internal_key", lambda: None)
     released = []
     monkeypatch.setattr(slots, "release", lambda name: (released.append(name) or True))
     assert ep._release_endpoint_slot("flash-x") is True
     assert released == ["flash-x"]
     assert "flash-x" not in ep._ACQUIRED
-    # Second call: never acquired now -> no-op (no second store call).
+    # Second call: never acquired now + no shared store -> no-op (no second store call).
     assert ep._release_endpoint_slot("flash-x") is False
     assert released == ["flash-x"]
+
+
+def test_release_cross_replica_releases_shared_row(monkeypatch):
+    # Teardown on a different replica than the claimer: _ACQUIRED has no entry, but an internal key
+    # is set, so we still issue an idempotent store release (else the slot leaks until reconcile).
+    monkeypatch.setattr(ep, "_ACQUIRED", {})
+    monkeypatch.setattr(slots, "internal_key", lambda: "k")
+    released = []
+    monkeypatch.setattr(slots, "release", lambda name: (released.append(name) or True))
+    assert ep._release_endpoint_slot("flash-x") is True
+    assert released == ["flash-x"]
+
+
+def test_release_untracked_without_key_is_noop(monkeypatch):
+    # Nothing tracked locally and no shared store: a no-op that never touches the store.
+    monkeypatch.setattr(ep, "_ACQUIRED", {})
+    monkeypatch.setattr(slots, "internal_key", lambda: None)
+    monkeypatch.setattr(
+        slots, "release", lambda name: pytest.fail("must not hit the store without a key")
+    )
+    assert ep._release_endpoint_slot("flash-x") is False
 
 
 def test_release_shared_swallows_store_error(monkeypatch):
