@@ -2258,6 +2258,40 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
+# Baked compiled-kernel cache (opt-in; see Dockerfile.worker + flash/engine/worker/kernel_warmup.py).
+# The Dockerfile points TRITON_CACHE_DIR/TORCHINDUCTOR_CACHE_DIR here and, when built with
+# --build-arg BUILD_KERNEL_CACHE=true, bakes a portable mega-cache produced on a real GPU. These
+# names are kept in lockstep with kernel_warmup.DEFAULT_CACHE_DIR / MEGA_CACHE_FILENAME.
+_KERNEL_CACHE_DIR = "/opt/flash/kernelcache"
+_KERNEL_CACHE_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.bin")
+
+
+def _load_kernel_cache_if_present() -> bool:
+    """Best-effort: if a baked mega-cache blob exists, load it so the worker skips first-run JIT.
+
+    Loads the portable cache that kernel_warmup.py wrote on a GPU builder via
+    ``torch.compiler.load_cache_artifacts()`` — measured cold compile ~124s -> warm load ~0.2s.
+    OPT-IN: when no baked cache is present (the default image build), this is a no-op and the worker
+    JITs on first use exactly as before (#163's init heartbeat covers that stall). Never raises:
+    a missing torch / missing file / unusable blob just logs and leaves the JIT path intact.
+    """
+    if not os.path.isfile(_KERNEL_CACHE_FILE):
+        print(f"[kernel-cache] no baked cache at {_KERNEL_CACHE_FILE} -> first-run JIT (expected default)")
+        return False
+    try:
+        import torch
+
+        with open(_KERNEL_CACHE_FILE, "rb") as f:
+            blob = f.read()
+        torch.compiler.load_cache_artifacts(blob)
+        print(f"[kernel-cache] loaded baked mega-cache ({len(blob)} bytes) -> skipping first-run JIT")
+        return True
+    except Exception as e:
+        # never block boot on a bad/absent cache: fall back to the normal JIT path.
+        print(f"[kernel-cache] load skipped ({e}) -> first-run JIT fallback")
+        return False
+
+
 def main():
     # Idempotency: if DONE was already uploaded, a re-delivered job re-fetches the final
     # metrics from HF and returns them immediately. (The previous behavior — sleeping in
@@ -2304,6 +2338,11 @@ def main():
         # init, any model size/arch). AFTER the fla fast path (a tilelang reinstall there rewrites
         # the stub) and BEFORE the model/vLLM import. See perf.py / flash #184.
         _neutralize_tilelang_cudart_stub()
+        # Opt-in: load a baked compiled-kernel mega-cache (if the image shipped one) so the worker
+        # skips the ~10-15 min first-run JIT. Best-effort + no-op when absent (the default), so the
+        # normal JIT path is untouched. Runs here, early in boot near the perf setup, before any
+        # model/kernel import that would otherwise trigger compilation.
+        _load_kernel_cache_if_present()
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
