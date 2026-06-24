@@ -865,16 +865,30 @@ def run_sft():
     # below, so the cap binds exactly when the worker won't fuse the CE.
     _sft_params_b = resolve_params_b(model_id)  # catalog stat else HF safetensors (open models)
     _sft_vocab = vocab_size_for(model_id)
-    # Actual fused-CE decision == what `use_liger_kernel` is set from below (line ~879). sft_logits_fused
-    # is the offline size/ctx mirror; liger_on(...) adds the runtime CUDA + liger_kernel-importable
-    # check, so the cap binds exactly when the fused CE is NOT really taken.
-    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and liger_on(
-        _memory_mode(model_id, sft_max_len)
-    )
+    # actual no-full-logits decision == liger fused ce or trl chunked_nll. decide before sizing so
+    # the per-device micro-batch is not unnecessarily capped when chunked_nll can avoid materializing
+    # the full [batch, seq, vocab] logits tensor.
+    _sft_memory_mode = _memory_mode(model_id, sft_max_len)
+    _sft_liger = liger_on(_sft_memory_mode)
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and _sft_liger
+    _sft_chunked_nll = False
+    _sft_chunked_nll_unavailable = False
+    if not _sft_liger and _sft_vocab > 100_000:
+        import dataclasses as _dc_sft
+
+        try:
+            _sft_fields = {f.name for f in _dc_sft.fields(TRLSFTConfig)}
+        except TypeError:
+            _sft_fields = set()
+        if "loss_type" in _sft_fields:
+            _sft_chunked_nll = True
+        else:
+            _sft_chunked_nll_unavailable = True
+    _sft_no_full_logits = _sft_fused or _sft_chunked_nll
     per_device_bs, grad_accum = sft_grad_accum(
-        effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
+        effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_no_full_logits
     )
-    if not _sft_fused and per_device_bs < min(effective_batch, 4):
+    if not _sft_no_full_logits and per_device_bs < min(effective_batch, 4):
         print(
             f"[sft] large-vocab logits cap: per_device={per_device_bs} grad_accum={grad_accum} "
             f"(seq={sft_max_len}, vocab={_sft_vocab}; realized batch "
@@ -950,32 +964,25 @@ def run_sft():
         )
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
-    _sft_liger = liger_on(_memory_mode(model_id, sft_max_len))
     if _sft_liger:
         cfg_kwargs["use_liger_kernel"] = True
         print("[sft] liger fused kernels enabled")
-    elif _sft_vocab > 100_000:
+    elif _sft_chunked_nll:
         # liger fused-ce is off but the vocab is huge (qwen3.5 ~248k): use trl's chunked_nll loss,
         # which gathers the supervised (non -100) positions before the lm_head matmul so the
         # [seq, vocab] logits never materialize for masked tokens (~30% peak vram, up to ~50% on
-        # large vocab per trl docs). feature-detected: only set if this trl's SFTConfig supports it.
-        import dataclasses as _dc_sft
-
-        try:
-            _sft_fields = {f.name for f in _dc_sft.fields(TRLSFTConfig)}
-        except TypeError:
-            _sft_fields = set()
-        if "loss_type" in _sft_fields:
-            cfg_kwargs["loss_type"] = "chunked_nll"
-            print(
-                f"[sft] chunked_nll loss enabled (large vocab {_sft_vocab}, liger off; "
-                "drops -100 positions before the lm_head matmul)"
-            )
-        else:
-            print(
-                f"[sft] chunked_nll unavailable on this trl (no loss_type field); "
-                f"large-vocab logits cap still applies (vocab {_sft_vocab})"
-            )
+        # large vocab per trl docs). it is decided before batch sizing so these runs use the normal
+        # no-full-logits micro-batch instead of the old full-logits cap.
+        cfg_kwargs["loss_type"] = "chunked_nll"
+        print(
+            f"[sft] chunked_nll loss enabled (large vocab {_sft_vocab}, liger off; "
+            "drops -100 positions before the lm_head matmul)"
+        )
+    elif _sft_chunked_nll_unavailable:
+        print(
+            f"[sft] chunked_nll unavailable on this trl (no loss_type field); "
+            f"large-vocab logits cap still applies (vocab {_sft_vocab})"
+        )
     _attn = optimal_attn_impl()  # arch-best FlashAttention (FA3 Hopper / FA2 Ampere·Ada) or SDPA
     # Packing correctness: 'bfd' packed batches are boundary-correct ONLY under a varlen-capable attn
     # (FA2 and FA3 both expose flash_attn_varlen_func; plain SDPA cross-contaminates packed examples).
