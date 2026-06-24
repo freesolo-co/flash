@@ -78,18 +78,31 @@ _SETUP_HEARTBEAT_STAGES = frozenset(
 )
 
 
-def stall_kwargs() -> dict:
+def stall_kwargs(on_last_gpu: bool = False) -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
     run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
     window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat;
-    ``queue_grace_s`` = how long a job may sit IN_QUEUE (no worker assigned) before we treat the
-    pinned GPU class as out of capacity and walk to the next-best one. Kept tight (~1 min): a
-    class that can't place a worker within a minute is out of capacity *now*, and the gpu-walk
-    re-provisions on the next-best class far faster than waiting out a multi-minute queue. This
-    is a no-capacity backstop only — once the job leaves IN_QUEUE (a worker picks it up), the much
-    larger ``setup_grace_s`` governs cold start and we don't walk off an IN_PROGRESS job at one minute.
+    ``queue_grace_s``/``throttled_grace_s`` = the two no-capacity backstops — how long a job may
+    sit IN_QUEUE with no worker (``queue_grace_s``) or wait on a worker stuck THROTTLED
+    (``throttled_grace_s``) before we treat the pinned GPU class as out of capacity and walk to
+    the next-best one.
+
+    These backstops are tuned to the gpu-walk position. While there is still a next-best class to
+    fall to (``on_last_gpu`` False) we wait ~5 min: long enough to ride out a brief capacity blip,
+    short enough that a genuinely starved class hands off to the next-best one promptly. On the
+    LAST candidate (``on_last_gpu`` True) there is nowhere left to walk, so we wait ~15 min before
+    giving up — burning a retry on a class with no fallback is worse than waiting out a longer
+    queue. Both are no-capacity backstops only: once the job leaves IN_QUEUE (a worker picks it
+    up), the much larger ``setup_grace_s`` governs cold start and we never walk off an IN_PROGRESS
+    job at the capacity grace.
     """
-    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 60.0}
+    grace = 900.0 if on_last_gpu else 300.0
+    return {
+        "stall_after_s": 1500.0,
+        "setup_grace_s": 3000.0,
+        "queue_grace_s": grace,
+        "throttled_grace_s": grace,
+    }
 
 
 def apply_disk_gb(config, disk_gb: int | None) -> None:
@@ -439,8 +452,8 @@ def poll_job(
     stall_after_s: float = 1200.0,
     setup_grace_s: float = 3000.0,
     unhealthy_grace_s: float = 240.0,
-    throttled_grace_s: float = 60.0,
-    queue_grace_s: float = 60.0,
+    throttled_grace_s: float = 300.0,
+    queue_grace_s: float = 300.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
@@ -458,18 +471,20 @@ def poll_job(
 
     ``throttled_grace_s`` bounds how long we wait on a worker stuck THROTTLED (no RunPod
     capacity for the pinned GPU class) before returning a retryable stall so the runner
-    walks to the next-best GPU. Tight by default (~1 min): THROTTLED means there is no
-    capacity for this class right now, so failing fast onto the next-best class beats blocking
-    the run on a host that won't free up.
+    walks to the next-best GPU. THROTTLED means there is no capacity for this class right now, so
+    once a class with a cheaper fallback has stayed throttled this long, failing over beats
+    blocking the run on a host that won't free up. ``stall_kwargs`` sets this to ~5 min while the
+    gpu-walk still has a next-best class, and ~15 min on the last candidate (nowhere left to walk).
 
     ``queue_grace_s`` is the capacity backstop for that same walk when RunPod *doesn't* surface
     a THROTTLED/UNHEALTHY worker: a job can sit IN_QUEUE with zero workers assigned (or one stuck
     INITIALIZING, or while ``endpoint_health`` errors are swallowed below) and the throttled/
     unhealthy fast-fails never arm — so without this it would burn the full ``setup_grace_s``
     (~50 min). Keyed off the authoritative job status (robust to a failing health probe), it
-    returns a retryable stall once a job has been IN_QUEUE longer than ``queue_grace_s`` (~1 min
-    by default). The queue timer applies only while the job status remains IN_QUEUE; once a worker
-    picks the job up (status leaves IN_QUEUE), it resets and ``setup_grace_s`` governs cold start.
+    returns a retryable stall once a job has been IN_QUEUE longer than ``queue_grace_s`` (tuned by
+    ``stall_kwargs`` like ``throttled_grace_s``: ~5 min normally, ~15 min on the last GPU class).
+    The queue timer applies only while the job status remains IN_QUEUE; once a worker picks the
+    job up (status leaves IN_QUEUE), it resets and ``setup_grace_s`` governs cold start.
     """
 
     say = make_say(log)
@@ -643,11 +658,15 @@ def submit_run(
     on_handle=None,
     attempt: int = 0,
     runtime_secrets: dict[str, str] | None = None,
+    on_last_gpu: bool = False,
 ) -> PollResult:
     """Durable equivalent of ``submit_train``: deploy, submit, persist handle, poll.
 
     ``on_handle(handle_dict)`` is invoked as soon as the job is queued so the
     runner can persist {endpoint_id, job_id} for cross-process reattach.
+
+    ``on_last_gpu`` tells the no-capacity backstops there is no next-best class left to walk to,
+    so they wait longer before giving up (see ``stall_kwargs``).
     """
     from flash.envs.registry import worker_pip_for_env
     from flash.providers.runpod.train import _run_suffix, build_worker_env, chalk_extra_pip
@@ -715,7 +734,7 @@ def submit_run(
         log=log,
         heartbeat_reader=reader,
         failure_detail_reader=failure_reader,
-        **stall_kwargs(),
+        **stall_kwargs(on_last_gpu=on_last_gpu),
     )
 
 
