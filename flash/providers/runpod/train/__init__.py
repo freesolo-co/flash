@@ -103,7 +103,9 @@ def upload_code(repo: str | None = None) -> str:
     return repo
 
 
-def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
+def submit_train(
+    spec: JobSpec, seed: int, log=None, runtime_secrets: dict[str, str] | None = None
+) -> dict:
     """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
     from flash.envs.registry import worker_pip_for_env
@@ -120,9 +122,10 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
-        "env": build_worker_env(spec, seed),
-        # extra_pip is installed by the worker for EVERY job, so it's where the chalk spec must
-        # go to reach a default run — see chalk_extra_pip().
+        "env": build_worker_env(spec, seed, runtime_secrets=runtime_secrets),
+        # extra_pip is installed by the worker for EVERY job (baked-image RunPod _train_body and
+        # Vast bootstrap both pip-install it), so it's where the chalk spec must go to reach a
+        # default run — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
         + chalk_extra_pip(spec),
     }
