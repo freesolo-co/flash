@@ -542,6 +542,12 @@ class FreesoloEnvironment(BaseEnvironment):
         return [dict(message) for message in messages]
 
     def sft_target(self, example: dict) -> str:
+        # Delegate to the SDK env's first-class sft_target (reads TaskExample.output) so flash
+        # goes through the freesolo-sdk dataset abstraction; fall back to the raw record only for
+        # an older installed SDK that predates the method.
+        fn = getattr(self._env, "sft_target", None)
+        if callable(fn):
+            return str(fn(self._task_example(example)) or "")
         value = example.get(_CANONICAL_OUTPUT_KEY)
         if value is not None:
             if isinstance(value, list) and value and isinstance(value[-1], dict):
@@ -552,11 +558,17 @@ class FreesoloEnvironment(BaseEnvironment):
     def sft_messages(self, example: dict) -> list[dict] | None:
         """Full gold trajectory (assistant + tool/env messages) for multi-turn SFT, or None.
 
-        When a record's ``output`` is a chat-message LIST (e.g. a distilled gold support
-        transcript), return it so the worker can train SFT on the whole multi-turn trajectory
-        instead of collapsing it to the single final assistant turn (:meth:`sft_target`). The
-        returned messages are appended after :meth:`prompt_messages` to form the SFT example.
-        Returns None when the record carries only a scalar target (single-turn SFT)."""
+        Delegates to the freesolo-sdk env's first-class ``Environment.sft_messages`` (which reads
+        the gold transcript off ``TaskExample.output``), so the multi-turn SFT target is a
+        freesolo-sdk dataset concept, not a flash-only convention. When a record's ``output`` is a
+        chat-message LIST (a distilled gold support transcript), the worker trains SFT on the whole
+        trajectory instead of collapsing to the single final assistant turn (:meth:`sft_target`).
+        Falls back to reading the raw record only for an older installed SDK; returns None for a
+        scalar target (single-turn SFT)."""
+        fn = getattr(self._env, "sft_messages", None)
+        if callable(fn):
+            msgs = fn(self._task_example(example))
+            return [dict(m) for m in msgs] if msgs else None
         value = example.get(_CANONICAL_OUTPUT_KEY)
         if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
             return [dict(m) for m in value]
