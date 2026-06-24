@@ -11,14 +11,12 @@ the same HF repo for serving and preemption-resilient resume.
 
 This is a package: the worker dependency stack + per-run env / chalk selection live in
 ``.deps`` (the leaf), the endpoint lifecycle + worker handler in ``.endpoints``; this
-``__init__`` owns code upload + submit and re-exports the package's public surface so the
+``__init__`` owns code upload and re-exports the package's public surface so the
 import path ``flash.providers.runpod.train`` is unchanged.
 """
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 import os
 
 # Re-export the package's public surface so ``from flash.providers.runpod.train import <name>``
@@ -49,7 +47,6 @@ from flash.providers.runpod.train.endpoints import (  # noqa: F401
     stop_endpoint,
     terminate_endpoint,
 )
-from flash.spec import JobSpec
 
 
 def upload_code(repo: str | None = None) -> str:
@@ -100,49 +97,3 @@ def upload_code(repo: str | None = None) -> str:
         delete_patterns=["**"],
     )
     return repo
-
-
-def submit_train(
-    spec: JobSpec, seed: int, log=None, runtime_secrets: dict[str, str] | None = None
-) -> dict:
-    """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
-    timeout_s = max(60, int(spec.gpu.max_wall_seconds))
-    from flash.envs.registry import worker_pip_for_env
-
-    handler = get_train_endpoint(
-        spec.gpu.type,
-        execution_timeout_ms=timeout_s * 1000,
-        name_suffix=_run_suffix(spec.run_id),
-        disk_gb=spec.gpu.disk_gb,
-        spec=spec,
-    )
-    payload = {
-        "hf_repo": spec.train.hf_repo,
-        "job_spec_json": spec.to_json(),
-        "phase": spec.phase,
-        "seed": int(seed),
-        "env": build_worker_env(spec, seed, runtime_secrets=runtime_secrets),
-        # extra_pip is installed by the worker for EVERY job (baked-image RunPod _train_body and
-        # Vast bootstrap both pip-install it), so it's where the chalk spec must go to reach a
-        # default run — see chalk_extra_pip().
-        "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
-        + chalk_extra_pip(spec),
-    }
-    if log is not None:
-        print(
-            f"submitting Flash job: gpu={spec.gpu.type} phase={spec.phase} "
-            f"seed={seed} model={spec.model}",
-            file=log,
-            flush=True,
-        )
-
-    async def _call():
-        res = handler(payload)
-        if inspect.isawaitable(res):
-            res = await res
-        return res
-
-    out = asyncio.run(_call())
-    if not isinstance(out, dict):
-        raise RuntimeError(f"flash job returned no metrics: {out!r}")
-    return out
