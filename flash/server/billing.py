@@ -1,9 +1,9 @@
-"""Charge a run's pre-flight cost estimate to the freesolo backend at submit time.
+"""Charge completed Flash training runs to the freesolo backend.
 
-The control plane computes the estimate from the spec and POSTs it (authenticated with the
-submitting user's freesolo key) to the billing endpoint, which debits the org. The charge GATES
-the run: a non-2xx (e.g. 402) or an unreachable backend raises ``BillingError`` so the run never
-starts unpaid. Tests stub the network boundary directly."""
+The control plane records the submitting org id when a run is accepted, then POSTs the final
+``RunStatus.cost_usd`` after the run reaches ``done``. The call is authenticated with the
+operator internal key, so Flash never persists a user's freesolo API key while training runs.
+Tests stub the network boundary directly."""
 
 from __future__ import annotations
 
@@ -12,15 +12,11 @@ import urllib.error
 import urllib.request
 from decimal import ROUND_HALF_UP, Decimal
 
-from flash.cost.spec import estimate_for_spec
-
 from .auth import freesolo_base_url
 
 # A charge does more than a verify; allow a bit more than auth's 5s but stay bounded.
 _CHARGE_TIMEOUT_S = 10.0
-# The backend route family the charge (and its reversal) POST to.
-_CHARGE_PATH = "/api/billing/training-usage"
-_REVERSE_PATH = "/api/billing/training-usage/reverse"
+_COMPLETION_CHARGE_PATH = "/api/billing/training-usage/internal"
 
 
 class BillingError(Exception):
@@ -87,7 +83,6 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
     except urllib.error.HTTPError as exc:
         raise BillingError(exc.code, _http_error_detail(exc)) from exc
     except (urllib.error.URLError, OSError) as exc:
-        # Unreachable billing service: block the run (503, retry later) rather than run free.
         raise BillingError(503, f"billing service unavailable: {exc}") from exc
     try:
         return json.loads(raw or b"{}")
@@ -96,33 +91,34 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
         raise BillingError(502, f"billing service returned an invalid response: {exc}") from exc
 
 
-def charge_run_estimate(*, token: str, spec) -> dict:
-    """Compute ``spec``'s estimate and charge it to the submitting user's org; return the backend
-    response. Raises ``BillingError`` on a non-2xx or unreachable backend. The charge equals the
-    ``flash train --cost`` quote (same catalog-only, cheapest-fit basis)."""
-    estimate = estimate_for_spec(spec)
+def charge_completed_run(*, internal_key: str, status) -> dict:
+    """Charge one completed external run using its persisted non-secret billing context.
+
+    The backend route is idempotent by ``runId``. Raises ``BillingError`` on a non-2xx or
+    unreachable backend; callers should record that billing failed without changing the run's
+    terminal training state.
+    """
+    context = status.billing_context if isinstance(status.billing_context, dict) else {}
+    org_id = str(context.get("org_id") or "").strip()
+    if not org_id:
+        raise BillingError(400, "missing billing org id for completed training run")
+    spec = status.spec or {}
+    remote = status.remote or {}
+    gpu = remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type")
+    provider = remote.get("provider")
+    total_usd = float(status.cost_usd or 0.0)
     body = {
-        "runId": spec.run_id,
-        "costCents": _cents(estimate.total_usd),
-        "gpu": estimate.gpu,
-        "provider": estimate.provider,
-        "method": estimate.method,
-        "model": estimate.model_id,
+        "orgId": org_id,
+        "runId": status.run_id,
+        "costCents": _cents(total_usd),
+        "gpu": gpu,
+        "provider": provider,
+        "method": spec.get("algorithm"),
+        "model": spec.get("model"),
         "estimate": {
-            "totalUsd": estimate.total_usd,
-            "gpuHourlyUsd": estimate.gpu_hourly_usd,
-            "wallClockHours": estimate.wall_clock_hours,
-            "steps": estimate.steps,
+            "totalUsd": total_usd,
+            "costBasis": "final",
+            "costSource": "run_status.cost_usd",
         },
     }
-    return _post_billing(token=token, path=_CHARGE_PATH, body=body)
-
-
-def reverse_run_charge(*, token: str, run_id: str, charge: dict | None = None) -> dict:
-    """Refund the charge for a run whose submit failed (create_run charges before handing off).
-    Best-effort + idempotent by ``runId`` (a retried submit re-charges cleanly); ``charge`` is
-    forwarded so the backend can match the exact debit."""
-    body: dict = {"runId": run_id, "reverse": True}
-    if isinstance(charge, dict) and charge.get("amountCents") is not None:
-        body["costCents"] = int(charge["amountCents"])
-    return _post_billing(token=token, path=_REVERSE_PATH, body=body)
+    return _post_billing(token=internal_key, path=_COMPLETION_CHARGE_PATH, body=body)

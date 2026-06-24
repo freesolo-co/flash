@@ -22,7 +22,7 @@ import inspect
 import os
 
 # Re-export the package's public surface so ``from flash.providers.runpod.train import <name>``
-# (callers in providers/runpod, providers/vast, runner, and the tests) keeps working unchanged.
+# keeps working unchanged for callers and tests.
 from flash.providers.runpod.train.deps import (  # noqa: F401
     DEFAULT_CHALK_SPEC,
     DEFAULT_EXECUTION_TIMEOUT_MS,
@@ -60,13 +60,13 @@ def upload_code(repo: str | None = None) -> str:
     ``code/**`` from the same repo it is given in the submit payload, so the code must land in
     that per-run repo.
 
-    The worker downloads ``code/**`` to ``/runcode``. Verifiers-only: there are no built-in
-    example environments to ship — Hub/installed envs are pip-installed on the worker (see
-    ``registry.worker_pip_for_env``).
+    The worker downloads ``code/**`` to ``/runcode``. There are no built-in example
+    environments to ship; Freesolo SDK support is installed through
+    ``registry.worker_pip_for_env`` and environment ids are resolved by the adapter at load time.
 
     Only the ``flash`` package is uploaded, NOT the client's project tree. Managed runs must
-    reference a published Hub env by ``id`` (``flash env push`` to publish a local env first); the
-    worker pip-installs the env wheel.
+    reference a published Freesolo environment by ``id`` (``flash env push`` to publish a local
+    env first).
     """
     from huggingface_hub import HfApi
 
@@ -77,7 +77,10 @@ def upload_code(repo: str | None = None) -> str:
             "hf_repo must be set (the run's [train] hf_repo: HF dataset repo for code + artifacts)"
         )
     token = os.environ.get("HF_TOKEN")
-    pkg_dir = os.path.dirname(os.path.abspath(flash.__file__))
+    # ``realpath`` collapses any symlink in the package path so the upload reads the REAL installed
+    # tree, not a link target a redeploy may have re-pointed (e.g. a /current -> /releases/<sha>
+    # symlink layout). This is the package the worker re-imports, so what we upload == what runs.
+    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     api = HfApi(token=token)
     # Run artifact repos are always private (they carry run code, adapters, and metrics).
     api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True)
@@ -92,6 +95,10 @@ def upload_code(repo: str | None = None) -> str:
         repo_id=repo,
         repo_type="dataset",
         ignore_patterns=["__pycache__/*", "*.pyc"],
+        # Exact-mirror code/flash so the worker never re-imports an orphaned/renamed module a prior
+        # additive upload left behind. delete_patterns are relative to path_in_repo, so "**" is
+        # scoped to code/flash (only orphans there are purged; unchanged files are kept).
+        delete_patterns=["**"],
     )
     return repo
 
@@ -99,7 +106,7 @@ def upload_code(repo: str | None = None) -> str:
 def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
     """Provision a dedicated GPU via Flash, run training, return the metrics dict."""
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
-    from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
+    from flash.envs.registry import worker_pip_for_env
 
     handler = get_train_endpoint(
         spec.gpu.type,
@@ -114,12 +121,10 @@ def submit_train(spec: JobSpec, seed: int, log=None) -> dict:
         "phase": spec.phase,
         "seed": int(seed),
         "env": build_worker_env(spec, seed),
-        # extra_pip is installed by the worker for EVERY job (baked-image RunPod _train_body and
-        # Vast bootstrap both pip-install it), so it's where the chalk spec must go to reach a
-        # default run — see chalk_extra_pip().
+        # extra_pip is installed by the worker for EVERY job, so it's where the chalk spec must
+        # go to reach a default run — see chalk_extra_pip().
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
         + chalk_extra_pip(spec),
-        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     if log is not None:
         print(

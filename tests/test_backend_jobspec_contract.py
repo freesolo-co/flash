@@ -39,7 +39,7 @@ def _representative_config() -> dict:
     return {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "environment": {"id": "owner/my-env", "params": {"split": "train"}},
+        "environment": {"id": "github:owner/repo@main:my-env/environment.py", "params": {"split": "train"}},
         "train": {
             "hf_repo": "owner/my-runs",
             "steps": 120,
@@ -62,9 +62,11 @@ def test_backend_run_config_parses_into_valid_jobspec() -> None:
     assert isinstance(spec, JobSpec)
     assert spec.model == "Qwen/Qwen3.5-4B"
     assert spec.algorithm == "grpo"
-    assert spec.environment.id == "owner/my-env"
+    assert spec.environment.id == "github:owner/repo@main:my-env/environment.py"
     assert spec.environment.params == {"split": "train"}
-    assert spec.train.hf_repo == "owner/my-runs"
+    # hf_repo is platform-managed: a user/backend-supplied value is ignored (left blank for the
+    # control plane to assign per run at submit), so it must NOT survive parsing.
+    assert spec.train.hf_repo == ""
     assert spec.train.steps == 120
     assert tuple(spec.train.seeds) == (0, 1)
     assert spec.train.group_size == 8
@@ -93,7 +95,7 @@ def test_backend_config_through_runcreaterequest_then_jobspec() -> None:
     req = RunCreateRequest(name="my run", config=_representative_config())
     assert req.config is not None
     spec = spec_from_dict(req.config, run_id="flash-test-3")
-    assert spec.environment.id == "owner/my-env"
+    assert spec.environment.id == "github:owner/repo@main:my-env/environment.py"
     assert spec.algorithm == "grpo"
 
 
@@ -103,7 +105,7 @@ def test_sft_backend_config_maps_to_jobspec() -> None:
     config = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "sft",
-        "environment": {"id": "owner/my-env"},
+        "environment": {"id": "github:owner/repo@main:my-env/environment.py"},
         "train": {"hf_repo": "owner/my-runs", "epochs": 3, "batch_size": 8},
         "gpu": {"type": "RTX 5090"},
     }
@@ -116,28 +118,19 @@ def test_sft_backend_config_maps_to_jobspec() -> None:
 
 def test_backend_config_missing_required_fields_is_rejected_consistently() -> None:
     """The contract also covers the negative: a config the agent could author wrong
-    (no [environment] id, or no train.hf_repo) must be rejected by flash with a
-    ConfigError (-> HTTP 400 on the control plane), not silently accepted. This keeps
-    the backend/agent and flash agreeing on what a *complete* job spec is.
+    (no [environment] id) must be rejected by flash with a ConfigError (-> HTTP 400 on
+    the control plane), not silently accepted. This keeps the backend/agent and flash
+    agreeing on what a *complete* job spec is. (hf_repo is platform-managed, not a
+    required user field — see test_backend_run_config_parses_into_valid_jobspec.)
     """
     no_env = {
         "model": "Qwen/Qwen3.5-4B",
         "algorithm": "grpo",
-        "train": {"hf_repo": "owner/my-runs", "steps": 10},
-        "gpu": {"type": "RTX 5090"},
-    }
-    with pytest.raises(ConfigError):
-        spec_from_dict(no_env)
-
-    no_repo = {
-        "model": "Qwen/Qwen3.5-4B",
-        "algorithm": "grpo",
-        "environment": {"id": "owner/my-env"},
         "train": {"steps": 10},
         "gpu": {"type": "RTX 5090"},
     }
     with pytest.raises(ConfigError):
-        spec_from_dict(no_repo)
+        spec_from_dict(no_env)
 
 
 def test_stale_local_env_path_is_rejected_at_both_layers() -> None:

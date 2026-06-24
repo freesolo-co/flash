@@ -13,6 +13,8 @@ import importlib
 import json
 import os
 
+import pytest
+
 _WORKER_ENV = (
     "HF_REPO",
     "RUN_MODE",
@@ -68,7 +70,7 @@ def test_strip_think_unit():
 
 def test_thinking_budget_selection(monkeypatch):
     # A JobSpec with an env id makes the worker resolve ACTIVE_ENV at import; stub the loader so
-    # this CPU dry-run doesn't reach the Prime Hub. We only exercise THINKING / micro-batch here.
+    # this CPU dry-run doesn't load the Freesolo env. We only exercise THINKING / micro-batch here.
     monkeypatch.setattr("flash.envs.registry.load_environment", lambda *a, **k: object())
     saved = _set_thinking_worker_env()
     import flash.engine.worker as ne
@@ -140,3 +142,13 @@ def test_grpo_batching_caps_per_device_at_target():
     b = ne.compute_grpo_batching(prompts_per_step=64, group_size=8, per_device_comps=2)
     assert b["per_device_train_batch_size"] == 2
     assert b["unique_prompts_per_step"] == 64
+
+
+def test_grpo_prompts_per_step_caps_to_available_dataset():
+    import flash.engine.worker as ne
+
+    importlib.reload(ne)
+    assert ne.resolve_grpo_prompts_per_step(requested=64, available_prompts=3) == 3
+    assert ne.resolve_grpo_prompts_per_step(requested=2, available_prompts=10) == 2
+    with pytest.raises(ValueError, match="at least one retained training prompt"):
+        ne.resolve_grpo_prompts_per_step(requested=64, available_prompts=0)

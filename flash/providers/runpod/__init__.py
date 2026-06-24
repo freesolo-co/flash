@@ -23,10 +23,9 @@ class RunpodProvider:
 
     def is_configured(self) -> bool:
         # RunPod is the ALWAYS-ON default substrate, so it is always "available" for
-        # allocation (offline pricing degrades to the static snapshot, and a missing
-        # RUNPOD_API_KEY surfaces at provision time via ensure_auth / the preflight —
-        # never as a silent empty candidate list). This matches the historical
-        # ``available_providers()`` which listed runpod unconditionally.
+        # allocation. Pricing is static, and a missing RUNPOD_API_KEY surfaces at provision time
+        # via ensure_auth / the preflight, never as a silent empty candidate list. This matches the
+        # historical ``available_providers()`` which listed runpod unconditionally.
         return True
 
     def preflight(self, require_hf: bool = True) -> list[str]:
@@ -52,19 +51,19 @@ class RunpodProvider:
         log: Any = None,
         on_handle: Any = None,
         attempt: int = 0,
-        offers: Any = None,
-        exclude_machine_ids: Any = frozenset(),
+        runtime_secrets: dict[str, str] | None = None,
     ) -> PollResult:
-        # ``offers``/``exclude_machine_ids`` are Vast live-market concerns; RunPod
-        # provisions a fresh serverless endpoint and never re-searches a market, so it
-        # ignores both (kept in the signature for cross-provider symmetry).
         from flash.providers.runpod.jobs import submit_run
 
-        return submit_run(spec, seed, log=log, on_handle=on_handle, attempt=attempt)
+        kwargs = {"log": log, "on_handle": on_handle, "attempt": attempt}
+        if runtime_secrets:
+            kwargs["runtime_secrets"] = runtime_secrets
+        return submit_run(spec, seed, **kwargs)
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.jobs import (
+            make_hf_failure_detail_reader,
             make_hf_heartbeat_reader,
             poll_job,
             stall_kwargs,
@@ -73,11 +72,20 @@ class RunpodProvider:
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
         reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
+        failure_reader = (
+            make_hf_failure_detail_reader(hf_repo, prefix, spec.phase) if hf_repo else None
+        )
         rh = RunpodJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         # Same stall tuning as the submit path so a reattached run isn't judged differently.
-        return poll_job(rh, log=log, heartbeat_reader=reader, **stall_kwargs())
+        return poll_job(
+            rh,
+            log=log,
+            heartbeat_reader=reader,
+            failure_detail_reader=failure_reader,
+            **stall_kwargs(),
+        )
 
     def cancel(self, handle: JobHandle) -> None:
         from flash.providers.runpod import api as runpod_api
@@ -101,7 +109,7 @@ class RunpodProvider:
     def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
         # No-op: RunPod serverless endpoints have no standing per-run billing to reap on
         # crash recovery (a failed-before-submit endpoint is GC'd by reconstructed name in
-        # recover_runs). Present for ``base.Provider`` symmetry with Vast's instance sweep.
+        # recover_runs). Present for the ``base.Provider`` protocol.
         return []
 
 

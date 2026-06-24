@@ -1,11 +1,11 @@
-"""Estimate-based run billing: the billing client (POST shape + error translation, network
-stubbed) and the ``POST /v1/runs`` charge gate (charge fires, 402 blocks, dry-run/internal skip)."""
+"""Completion-time run billing: the billing client POST shape and server submit contract."""
 
 from __future__ import annotations
 
 import importlib
 import io
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -17,12 +17,22 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "primeintellect/gsm8k"},
+    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
 
 _USER_PREFIX = "fslo-user-"
+
+
+def _identity_for_token(token: str) -> dict[str, str]:
+    if not token.startswith(_USER_PREFIX):
+        return {}
+    suffix = token.removeprefix(_USER_PREFIX)
+    identity = {"email": f"user-{suffix}@example.com", "key_prefix": "fslo_test"}
+    if suffix != "noorg":
+        identity["org_id"] = f"org-{suffix}"
+    return identity
 
 
 def _bearer(key: str) -> dict:
@@ -62,10 +72,23 @@ def test_cents_rounds_half_up_not_bankers():
     assert _cents(1.005) == 101  # classic banker's-rounding trap
 
 
-def test_charge_posts_estimate_and_parses_response(monkeypatch):
-    from flash.server import billing
+def _completed_status(monkeypatch, *, cost_usd: float = 12.345, org_id: str = "org-A"):
+    from flash.runner import RunStatus
 
     spec = _spec(monkeypatch)
+    return RunStatus(
+        run_id=spec.run_id,
+        state="done",
+        spec=spec.to_dict(),
+        cost_usd=cost_usd,
+        remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+        billing_context={"org_id": org_id},
+        billing_state="pending",
+    )
+
+
+def test_charge_posts_completed_run_cost_and_parses_response(monkeypatch):
+    from flash.server import billing
 
     captured = {}
 
@@ -88,23 +111,30 @@ def test_charge_posts_estimate_and_parses_response(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    out = billing.charge_run_estimate(token="fslo-user-7", spec=spec)
+    out = billing.charge_completed_run(
+        internal_key="fslo-internal", status=_completed_status(monkeypatch)
+    )
     assert out == {"amountCents": 1234, "balanceCents": 8766}
-    assert captured["url"].endswith("/api/billing/training-usage")
+    assert captured["url"].endswith("/api/billing/training-usage/internal")
     assert captured["method"] == "POST"
-    assert captured["headers"]["authorization"] == "Bearer fslo-user-7"
+    assert captured["headers"]["authorization"] == "Bearer fslo-internal"
     body = captured["body"]
+    assert body["orgId"] == "org-A"
     assert body["runId"] == "run-1"
-    assert isinstance(body["costCents"], int)
-    assert body["costCents"] >= 0
+    assert body["costCents"] == 1235
+    assert body["gpu"] == "RTX 5090"
+    assert body["provider"] == "runpod"
     assert body["method"] == "grpo"
     assert body["model"] == "Qwen/Qwen3.5-4B"
+    assert body["estimate"] == {
+        "totalUsd": 12.345,
+        "costBasis": "final",
+        "costSource": "run_status.cost_usd",
+    }
 
 
-def test_charge_raises_billing_error_on_402(monkeypatch):
+def test_charge_completed_run_raises_billing_error_on_402(monkeypatch):
     from flash.server import billing
-
-    spec = _spec(monkeypatch)
 
     def fake_urlopen(req, timeout=None):
         body = json.dumps(
@@ -120,15 +150,13 @@ def test_charge_raises_billing_error_on_402(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     with pytest.raises(billing.BillingError) as exc:
-        billing.charge_run_estimate(token="tok", spec=spec)
+        billing.charge_completed_run(internal_key="tok", status=_completed_status(monkeypatch))
     assert exc.value.status_code == 402
     assert "Insufficient balance" in exc.value.detail
 
 
-def test_charge_unreachable_raises_503(monkeypatch):
+def test_charge_completed_run_unreachable_raises_503(monkeypatch):
     from flash.server import billing
-
-    spec = _spec(monkeypatch)
 
     def fake_urlopen(req, timeout=None):
         raise urllib.error.URLError("connection refused")
@@ -136,8 +164,19 @@ def test_charge_unreachable_raises_503(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     with pytest.raises(billing.BillingError) as exc:
-        billing.charge_run_estimate(token="tok", spec=spec)
+        billing.charge_completed_run(internal_key="tok", status=_completed_status(monkeypatch))
     assert exc.value.status_code == 503
+
+
+def test_charge_completed_run_requires_billing_org(monkeypatch):
+    from flash.server import billing
+
+    status = _completed_status(monkeypatch, org_id="")
+
+    with pytest.raises(billing.BillingError) as exc:
+        billing.charge_completed_run(internal_key="tok", status=status)
+    assert exc.value.status_code == 400
+    assert "org id" in exc.value.detail
 
 
 def test_http_error_detail_falls_back_to_reason():
@@ -160,42 +199,13 @@ def test_http_error_detail_falls_back_to_reason():
     assert "Payment Required" in _http_error_detail(empty)
 
 
-def test_reverse_run_charge_posts_reversal(monkeypatch):
-    """The refund POSTs a reversal for the run, forwarding the original charge's amount for the
-    backend to match the exact debit."""
-    from flash.server import billing
-
-    captured = {}
-
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return json.dumps({"reversed": True, "amountCents": 50}).encode()
-
-    def fake_urlopen(req, timeout=None):
-        captured["url"] = req.full_url
-        captured["body"] = json.loads(req.data)
-        return _Resp()
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    out = billing.reverse_run_charge(token="tok", run_id="r1", charge={"amountCents": 50})
-    assert out == {"reversed": True, "amountCents": 50}
-    assert captured["url"].endswith("/api/billing/training-usage/reverse")
-    assert captured["body"] == {"runId": "r1", "reverse": True, "costCents": 50}
-
-
 # ------------------------------------------------------------------------- create_run gate
 
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("PRIME_API_KEY", "pit-test")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     import flash.runner as runner
     import flash.server.auth as auth_mod
@@ -213,112 +223,87 @@ def api(tmp_path, monkeypatch):
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
+    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
     with TestClient(app_mod.create_app()) as client:
         yield client
 
 
-def test_submit_charges_the_estimate(api, monkeypatch):
-    calls = []
-
-    def fake_charge(*, token, spec):
-        calls.append((token, spec.run_id))
-        return {"amountCents": 999}
-
-    monkeypatch.setattr("flash.server.billing.charge_run_estimate", fake_charge)
-
+def test_submit_records_pending_completion_billing(api):
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
     assert res.status_code == 200, res.text
-    run_id = res.json()["run_id"]
-    assert len(calls) == 1
-    assert calls[0] == ("fslo-user-1", run_id)
+    body = res.json()
+    run_id = body["run_id"]
+    assert body["billing_state"] == "pending"
+    assert body["billing_context"] == {"org_id": "org-1"}
     # The run was accepted + recorded.
     listed = api.get("/v1/runs", headers=_bearer("fslo-user-1")).json()["runs"]
     assert [r["run_id"] for r in listed] == [run_id]
 
 
-def test_insufficient_balance_blocks_and_records_nothing(api, monkeypatch):
-    from flash.server.billing import BillingError
-
-    def boom(*, token, spec):
-        raise BillingError(402, "Insufficient balance. Top up in Billing settings.")
-
-    monkeypatch.setattr("flash.server.billing.charge_run_estimate", boom)
-
-    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-2"))
-    assert res.status_code == 402, res.text
-    assert "Insufficient balance" in res.json()["detail"]
-    # A blocked submit must not leave a run row behind.
-    assert api.get("/v1/runs", headers=_bearer("fslo-user-2")).json()["runs"] == []
+def test_external_submit_requires_org_for_completion_billing(api):
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-noorg"))
+    assert res.status_code == 400, res.text
+    assert "org id" in res.json()["detail"]
+    assert api.get("/v1/runs", headers=_bearer("fslo-user-noorg")).json()["runs"] == []
 
 
-def test_dry_run_skips_billing(api, monkeypatch):
-    def boom(*, token, spec):
-        raise AssertionError("dry-run must not be billed")
-
-    monkeypatch.setattr("flash.server.billing.charge_run_estimate", boom)
-
+def test_dry_run_skips_billing(api):
     res = api.post("/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer("fslo-user-3"))
     assert res.status_code == 200, res.text
     assert res.json()["state"] == "dry_run"
+    assert res.json()["billing_state"] is None
+    assert res.json()["billing_context"] is None
 
 
 def test_internal_identity_skips_billing(api, monkeypatch):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-secret")
 
-    def boom(*, token, spec):
-        raise AssertionError("the internal service identity has no org to bill")
-
-    monkeypatch.setattr("flash.server.billing.charge_run_estimate", boom)
-
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-internal-secret"))
     assert res.status_code == 200, res.text
+    assert res.json()["billing_state"] is None
+    assert res.json()["billing_context"] is None
 
 
-def test_submit_failure_after_charge_reverses_the_debit(api, monkeypatch):
-    """If the charge succeeds but ``submit_job`` then fails, the debit is reversed (with run id +
-    original charge) and no run row is left behind."""
-    import flash.server.app as app_mod
+def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch):
+    import flash.server.auth as auth_mod
 
-    charged = {"amountCents": 777}
-    monkeypatch.setattr(
-        "flash.server.billing.charge_run_estimate", lambda *, token, spec: charged
+    token = "fslo-user-spoof"
+    auth_mod._identity_cache[token] = (
+        {"key_prefix": "internal", "email": "user@example.com", "org_id": "org-spoof"},
+        time.time() + auth_mod._VERIFY_CACHE_TTL_S,
     )
 
-    def failing_submit(spec, dry_run=False, background=True):
+    me = api.get("/v1/me", headers=_bearer(token))
+    assert me.status_code == 200
+    assert me.json()["kind"] == "freesolo_api_key"
+    assert me.json()["key_prefix"].startswith("fslo_")
+    assert me.json()["key_prefix"] != "internal"
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer(token))
+    assert res.status_code == 200, res.text
+    assert res.json()["billing_state"] == "pending"
+    assert res.json()["billing_context"] == {"org_id": "org-spoof"}
+
+
+def test_submit_failure_records_nothing(api, monkeypatch):
+    """If submit_job fails, no run row is left behind and no billing reversal is needed."""
+    import flash.server.app as app_mod
+
+    def failing_submit(spec, dry_run=False, background=True, **kwargs):
         raise RuntimeError("provider out of capacity")
 
     monkeypatch.setattr(app_mod, "submit_job", failing_submit)
 
-    reversed_calls = []
-    monkeypatch.setattr(
-        "flash.server.billing.reverse_run_charge",
-        lambda *, token, run_id, charge: reversed_calls.append((token, run_id, charge)) or {},
-    )
-
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-r"))
     assert res.status_code == 400, res.text
     assert "out of capacity" in res.json()["detail"]
-    # The charge was reversed for exactly this run, forwarding the original charge.
-    assert len(reversed_calls) == 1
-    token, run_id, charge = reversed_calls[0]
-    assert token == "fslo-user-r"
-    assert charge == charged
-    assert isinstance(run_id, str)
-    assert run_id
-    # A failed submit leaves no run row behind (so a retry re-charges cleanly).
     assert api.get("/v1/runs", headers=_bearer("fslo-user-r")).json()["runs"] == []
 
 
-def test_record_run_failure_after_charge_reverses_the_debit(api, monkeypatch):
-    """If the charge succeeds but ``db.record_run`` then fails (e.g. SQLite locked/full), the
-    org is debited for a run that never started — the reversal must still fire (record_run is
-    inside the same try as submit).."""
+def test_record_run_failure_does_not_submit(api, monkeypatch):
+    """If ``db.record_run`` fails (e.g. SQLite locked/full), submit_job is not reached."""
     import flash.server.app as app_mod
     import flash.server.db as db_mod
-
-    monkeypatch.setattr(
-        "flash.server.billing.charge_run_estimate", lambda *, token, spec: {"amountCents": 42}
-    )
 
     def failing_record(run_id, key_id):
         raise RuntimeError("database is locked")
@@ -331,62 +316,73 @@ def test_record_run_failure_after_charge_reverses_the_debit(api, monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("submit must not run")),
     )
 
-    reversed_calls = []
-    monkeypatch.setattr(
-        "flash.server.billing.reverse_run_charge",
-        lambda *, token, run_id, charge: reversed_calls.append((run_id, charge)) or {},
-    )
-
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-rec"))
     assert res.status_code == 400, res.text
     assert "database is locked" in res.json()["detail"]
-    assert len(reversed_calls) == 1
-    assert reversed_calls[0][1] == {"amountCents": 42}
 
 
-def test_refund_failure_does_not_mask_submit_error(api, monkeypatch):
-    """A best-effort refund: if the reversal ITSELF fails, the original submit error is still
-    surfaced (the refund failure is swallowed + logged, never raised to the client)."""
-    import flash.server.app as app_mod
+def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
+    import flash.runner as runner
+    from flash.runner import RunStatus, lifecycle
 
-    monkeypatch.setattr(
-        "flash.server.billing.charge_run_estimate", lambda *, token, spec: {"amountCents": 5}
+    spec = _spec(monkeypatch)
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    runner._save_status(
+        RunStatus(
+            run_id=spec.run_id,
+            state="done",
+            spec=spec.to_dict(),
+            cost_usd=1.23,
+            billing_context={"org_id": "org-A"},
+            billing_state="pending",
+        )
     )
 
-    def failing_submit(spec, dry_run=False, background=True):
-        raise RuntimeError("provider out of capacity")
+    calls = []
 
-    monkeypatch.setattr(app_mod, "submit_job", failing_submit)
+    def fake_charge(*, internal_key, status):
+        calls.append((internal_key, status.run_id, status.cost_usd))
+        return {"amountCents": 123, "balanceCents": 877, "replay": False}
 
-    def failing_reverse(*, token, run_id, charge):
-        raise RuntimeError("billing down during refund")
+    monkeypatch.setattr("flash.server.billing.charge_completed_run", fake_charge)
+    log = io.StringIO()
 
-    monkeypatch.setattr("flash.server.billing.reverse_run_charge", failing_reverse)
+    lifecycle._charge_completed_run_best_effort(spec, log)
 
-    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-rr"))
-    # The submit error wins; the refund failure does not turn into a 500.
-    assert res.status_code == 400, res.text
-    assert "out of capacity" in res.json()["detail"]
-    assert api.get("/v1/runs", headers=_bearer("fslo-user-rr")).json()["runs"] == []
+    assert calls == [("fslo-internal", "run-1", 1.23)]
+    status = runner.get_status("run-1")
+    assert status.billing_state == "charged"
+    assert status.billing_error is None
+    assert status.billing_charge == {"amountCents": 123, "balanceCents": 877, "replay": False}
+    assert "billing charged" in log.getvalue()
 
 
-def test_submit_failure_for_internal_identity_does_not_refund(api, monkeypatch):
-    """The internal service identity is never charged, so a submit failure must NOT attempt a
-    (meaningless) reversal."""
-    import flash.server.app as app_mod
+def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
+    import flash.runner as runner
+    from flash.runner import RunStatus, lifecycle
 
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-secret")
-
-    def failing_submit(spec, dry_run=False, background=True):
-        raise RuntimeError("provider out of capacity")
-
-    monkeypatch.setattr(app_mod, "submit_job", failing_submit)
+    spec = _spec(monkeypatch)
+    monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    runner._save_status(
+        RunStatus(
+            run_id=spec.run_id,
+            state="done",
+            spec=spec.to_dict(),
+            cost_usd=1.23,
+            billing_context={"org_id": "org-A"},
+            billing_state="pending",
+        )
+    )
     monkeypatch.setattr(
-        "flash.server.billing.reverse_run_charge",
-        lambda *, token, run_id, charge: (_ for _ in ()).throw(
-            AssertionError("internal identity was never charged; must not refund")
-        ),
+        "flash.server.billing.charge_completed_run",
+        lambda **_: (_ for _ in ()).throw(AssertionError("must not charge without internal key")),
     )
 
-    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-internal-secret"))
-    assert res.status_code == 400, res.text
+    lifecycle._charge_completed_run_best_effort(spec, io.StringIO())
+
+    status = runner.get_status("run-1")
+    assert status.billing_state == "failed"
+    assert "FREESOLO_INTERNAL_KEY" in (status.billing_error or "")
