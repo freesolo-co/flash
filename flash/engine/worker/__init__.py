@@ -48,7 +48,6 @@ from flash.engine.recipe import RECIPE
 from flash.engine.worker.lora import (
     _LM_SYNC_REMAP_ON,
     _VL_EXCLUDE_SEGMENTS,  # noqa: F401
-    _patch_peft_weight_converter_compat,  # noqa: F401
     _remap_vl_sync_weights,  # noqa: F401
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
