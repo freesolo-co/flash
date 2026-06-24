@@ -44,6 +44,14 @@ _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
 
 
+class GitHubRateLimitError(RuntimeError):
+    """Raised when the GitHub API returns a 429 or rate-limit 403.
+
+    The worker's top-level handler catches this and stamps ``retriable=True`` so the
+    control plane reschedules the job instead of permanently failing it.
+    """
+
+
 @dataclass(frozen=True)
 class GitHubEnvironmentRef:
     owner: str
@@ -228,6 +236,10 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
             return resp.read()
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
+        if exc.code == 429 or (exc.code == 403 and "rate limit" in body.lower()):
+            raise GitHubRateLimitError(
+                f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
+            ) from exc
         raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc

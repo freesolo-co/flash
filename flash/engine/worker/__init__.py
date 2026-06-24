@@ -86,6 +86,7 @@ from flash.engine.worker.perf import (
     setup_perf_backends,
     wait_for_gpu,
 )
+from flash.envs.adapter import GitHubRateLimitError
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
 
@@ -2101,7 +2102,7 @@ def main():
         os._exit(0)
     except Exception as e:
         # Structured retry signal both pollers read: an infra failure -> retry on a fresh worker.
-        retriable = isinstance(e, RetriableInfraError)
+        retriable = isinstance(e, (RetriableInfraError, GitHubRateLimitError))
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
