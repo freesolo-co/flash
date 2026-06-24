@@ -1432,9 +1432,9 @@ def run_rl():
     if conversational:
         # Message-list prompts so the chat template applies roles + (for tool envs) the tool
         # schemas; per-turn length is managed by the tool loop / rollout_func, not a flat budget.
-        prompts = [{"prompt": ACTIVE_ENV.prompt_messages(ex), "example": ex} for ex in train]
+        prompts = [{"prompt": ACTIVE_ENV.prompt_messages(ex), "example": json.dumps(ex, default=str)} for ex in train]
     else:
-        prompts = [{"prompt": render_prompt(tok, ex), "example": ex} for ex in train]
+        prompts = [{"prompt": render_prompt(tok, ex), "example": json.dumps(ex, default=str)} for ex in train]
     # The colocated vLLM engine's model length is the hard cap on prompt+completion at
     # rollout. Size it from [train].max_length and derive the prompt budget from it so a
     # bigger engine or a smaller completion automatically admits longer prompts (rather than
@@ -1530,6 +1530,10 @@ def run_rl():
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
         examples = kwargs.get("example")
+        # Deserialize examples serialized as JSON strings (see prompts construction above —
+        # json.dumps avoids PyArrow type-inference failures on mixed-type dataset fields).
+        if examples and isinstance(next(iter(examples), None), str):
+            examples = [json.loads(e) for e in examples]
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
