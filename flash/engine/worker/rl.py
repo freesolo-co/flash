@@ -213,7 +213,11 @@ def run_rl():
             f"{resolved_prompts_per_step}: only {len(prompts)} prompt(s) fit after filtering"
         )
         prompts_per_step = resolved_prompts_per_step
-    ds = Dataset.from_list(prompts)
+    # Carry a stable integer index instead of the rich record so PyArrow can't crash on an env whose
+    # per-row info/metadata legitimately mixes types (see build_grpo_prompt_dataset). reward_fn maps
+    # the index back to the original example object below.
+    ds_rows, rollout_examples = _w.build_grpo_prompt_dataset(prompts)
+    ds = Dataset.from_list(ds_rows)
 
     def reward_fn(completions, **kwargs):
         # rollout_func (pure multi-turn) path: the per-rollout reward is computed by the env
@@ -222,7 +226,8 @@ def run_rl():
             return [float(r) for r in kwargs["reward"]]
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
-        examples = kwargs.get("example")
+        # The dataset carries example_idx (not the record); map each back to its original object.
+        examples = [rollout_examples[int(i)] for i in kwargs.get("example_idx", [])]
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):

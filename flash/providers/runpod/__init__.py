@@ -52,10 +52,18 @@ class RunpodProvider:
         on_handle: Any = None,
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
+        on_last_gpu: bool = False,
     ) -> PollResult:
+        # ``on_last_gpu`` stretches the no-capacity grace when the gpu-walk has no next-best
+        # class to fall to (see ``jobs.stall_kwargs``).
         from flash.providers.runpod.jobs import submit_run
 
-        kwargs = {"log": log, "on_handle": on_handle, "attempt": attempt}
+        kwargs = {
+            "log": log,
+            "on_handle": on_handle,
+            "attempt": attempt,
+            "on_last_gpu": on_last_gpu,
+        }
         if runtime_secrets:
             kwargs["runtime_secrets"] = runtime_secrets
         return submit_run(spec, seed, **kwargs)

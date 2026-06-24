@@ -199,7 +199,7 @@ def load_jsonl(path: str | Path):
 
 
 def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult:
-    expected = str(example.expected_output or "").strip()
+    expected = str(example.output or "").strip()
     score = 1.0 if expected and expected in response_text else 0.0
     return RewardResult(score=score, threshold=1.0)
 
@@ -208,7 +208,7 @@ class StarterEnv(EnvironmentSingleTurn):
     dataset = load_jsonl(DEFAULT_DATASET_PATH)
 
     def build_prompt_messages(self, example: TaskExample, prompt_text: str):
-        return [{"role": "user", "content": example.task}]
+        return [{"role": "user", "content": example.input}]
 
     def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
         return exact_match_reward(example, response_text)

@@ -291,7 +291,11 @@ class PollResult:
     metrics: dict | None = None
     # "job_failed"    : genuine worker/job code error (NOT retried)
     # "job_preempted" : provider killed the worker (platform termination) -> infra-shaped, retried
-    # "stalled"       : no worker progress within the budget -> infra-shaped, retried
+    # "no_capacity"   : NEVER scheduled — no provider capacity for the pinned GPU class (job sat
+    #                   IN_QUEUE / the only worker stayed THROTTLED) -> infra-shaped, retried on the
+    #                   next-best GPU. Distinct from "stalled" (a worker WAS scheduled then stopped
+    #                   making progress) so the terminal message points at capacity, not worker health.
+    # "stalled"       : a scheduled worker made no progress within the budget -> infra-shaped, retried
     # "poll_error"    : client-side polling / deploy breakdown -> infra-shaped, retried
     failure: str | None = None
     detail: str | None = None
@@ -347,8 +351,13 @@ class Provider(Protocol):
         on_handle: Any = None,
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
+        on_last_gpu: bool = False,
     ) -> PollResult:
-        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll."""
+        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll.
+
+        ``on_last_gpu`` is True when the runner's gpu-walk has reached the last candidate class
+        (no next-best to fall to), so capacity backstops should wait longer before giving up.
+        """
         ...
 
     def poll(self, handle: JobHandle, spec: JobSpec, seed: int, *, log: Any = None) -> PollResult:

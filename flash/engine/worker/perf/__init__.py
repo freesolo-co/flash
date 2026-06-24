@@ -17,9 +17,9 @@ call the functions that use them (``_neutralize_tilelang_cudart_stub`` /
 namespace is what makes that monkeypatch take effect (the callers resolve the names through the
 patched module globals). Do NOT move this group into a submodule.
 
-NOTE: the sibling ``perf.py`` file (shadowed by this package at import time, so never imported) is a
-source-pin anchor read as TEXT by ``tests/test_worker_stack.py`` — keep its fla SHA / TILELANG_PIN
-in lockstep with ``_ensure_fla_fastpath_on_hopper`` below and with WORKER_DEPS / Dockerfile.worker.
+NOTE: ``tests/test_worker_stack.py`` reads THIS file as TEXT to assert the worker's runtime
+fla SHA / TILELANG_PIN stay in lockstep with WORKER_DEPS / Dockerfile.worker — keep the pins in
+``_ensure_fla_fastpath_on_hopper`` below consistent with those.
 """
 
 from __future__ import annotations

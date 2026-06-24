@@ -300,14 +300,14 @@ def build_cases(tmp: Path):
     cost_cfg.write_text(
         'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
         '[environment]\nid = "acme/math-grader"\n'
-        '[train]\nsteps = 150\nseeds = [0]\nhf_repo = "acme/runs"\n'
+        '[train]\nsteps = 150\nseeds = [0]\n'
         '[gpu]\ntype = "RTX 5090"\n'
     )
     dry_cfg = tmp / "sft.toml"
     dry_cfg.write_text(
         'model = "Qwen/Qwen3.5-4B"\nalgorithm = "sft"\n'
         '[environment]\nid = "acme/math-grader"\n'
-        '[train]\nepochs = 1\nseeds = [0]\nhf_repo = "acme/runs"\n'
+        '[train]\nepochs = 1\nseeds = [0]\n'
     )
 
     install_plain = (

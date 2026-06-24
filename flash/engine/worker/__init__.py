@@ -68,6 +68,7 @@ from flash.engine.worker.gpu_setup import (
 from flash.engine.worker.grpo import (
     _grpo_is_no_op_failure,
     _grpo_resume_already_complete,
+    build_grpo_prompt_dataset,
     compute_grpo_batching,
     grpo_overrides,
     resolve_grpo_prompts_per_step,
@@ -400,6 +401,7 @@ __all__ = [
     "assert_adapter_load_clean",
     "assert_lora_applied",
     # grpo batching / no-op guards
+    "build_grpo_prompt_dataset",
     "compute_grpo_batching",
     # hf artifact channel
     "error_artifact_name",
