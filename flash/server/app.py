@@ -95,7 +95,7 @@ async def _reconcile_cost_loop() -> None:
     next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled)."""
     from flash.server.reconcile import reconcile_once
 
-    interval = float(os.environ.get("FLASH_RECONCILE_INTERVAL_S", "3600"))
+    interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
     while True:
         await asyncio.sleep(interval)
         with contextlib.suppress(Exception):
