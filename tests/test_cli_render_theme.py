@@ -96,6 +96,15 @@ def test_render_json_plain_matches_json_dumps(monkeypatch) -> None:
     assert render._json(obj) == json.dumps(obj, indent=2)
 
 
+def test_train_submitted_note(monkeypatch) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    out = render.submitted("flash-xyz")
+    assert "flash-xyz" in out
+    assert "submitted" in out
+    assert "--follow" in out  # tells the user how to re-attach after Ctrl-C
+
+
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("COLORTERM", "truecolor")

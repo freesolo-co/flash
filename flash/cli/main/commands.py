@@ -419,11 +419,14 @@ def cmd_train(args) -> int:
         else:
             print(json.dumps(status, indent=2))
         return 0
-    print(
-        f"run {run_id} submitted; following logs "
-        f"(Ctrl-C detaches, `flash status {run_id} --follow` resumes)",
-        file=sys.stderr,
-    )
+    if render.styled():
+        print(render.submitted(run_id), file=sys.stderr)
+    else:
+        print(
+            f"run {run_id} submitted; following logs "
+            f"(Ctrl-C detaches, `flash status {run_id} --follow` resumes)",
+            file=sys.stderr,
+        )
     return _follow_run(client, run_id)
 
 
