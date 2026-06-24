@@ -806,10 +806,9 @@ def run_sft():
         # transcript is what makes SFT actually multi-turn (the tool-call protocol + replies) — the
         # warm start the GRPO recipe expects. A >1-message completion is a multi-turn trajectory.
         completion = env.sft_completion(ex) if hasattr(env, "sft_completion") else None
-        if completion is None:  # older adapter without sft_completion
-            gold = env.sft_messages(ex) if hasattr(env, "sft_messages") else None
-            completion = gold or [{"role": "assistant", "content": env.sft_target(ex)}]
-        if len(completion) > 1:
+        if completion is None:  # older adapter without sft_completion -> single-turn target
+            completion = [{"role": "assistant", "content": env.sft_target(ex)}]
+        if len(completion) > 1:  # a multi-turn gold trajectory (vs a single assistant turn)
             gold_multiturn += 1
         msgs = [*env.prompt_messages(ex), *completion]
         texts.append(

@@ -541,56 +541,36 @@ class FreesoloEnvironment(BaseEnvironment):
         messages = self._env.start_episode(self._task_example(example), self._contract_text)
         return [dict(message) for message in messages]
 
-    def sft_target(self, example: dict) -> str:
-        # Delegate to the SDK env's first-class sft_target (reads TaskExample.output) so flash
-        # goes through the freesolo-sdk dataset abstraction; fall back to the raw record only for
-        # an older installed SDK that predates the method.
-        fn = getattr(self._env, "sft_target", None)
-        if callable(fn):
-            return str(fn(self._task_example(example)) or "")
-        value = example.get(_CANONICAL_OUTPUT_KEY)
-        if value is not None:
-            if isinstance(value, list) and value and isinstance(value[-1], dict):
-                return str(value[-1].get("content", ""))
-            return str(value)
-        return ""
-
-    def sft_messages(self, example: dict) -> list[dict] | None:
-        """Full gold trajectory (assistant + tool/env messages) for multi-turn SFT, or None.
-
-        Delegates to the freesolo-sdk env's first-class ``Environment.sft_messages`` (which reads
-        the gold transcript off ``TaskExample.output``), so the multi-turn SFT target is a
-        freesolo-sdk dataset concept, not a flash-only convention. When a record's ``output`` is a
-        chat-message LIST (a distilled gold support transcript), the worker trains SFT on the whole
-        trajectory instead of collapsing to the single final assistant turn (:meth:`sft_target`).
-        Falls back to reading the raw record only for an older installed SDK; returns None for a
-        scalar target (single-turn SFT)."""
-        fn = getattr(self._env, "sft_messages", None)
-        if callable(fn):
-            msgs = fn(self._task_example(example))
-            return [dict(m) for m in msgs] if msgs else None
-        value = example.get(_CANONICAL_OUTPUT_KEY)
-        if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
-            return [dict(m) for m in value]
-        return None
-
     def sft_completion(self, example: dict) -> list[dict]:
         """Gold completion messages to append after the prompt for one SFT example.
 
-        Delegates to the freesolo-sdk env's first-class ``Environment.sft_completion`` (the full
-        multi-turn gold trajectory — assistant turns, tool calls, tool results, replies — when the
-        row ships one, else a single gold assistant turn), so the SFT example shape is owned by the
-        SDK rather than reconstructed here. Falls back to building it from
-        :meth:`sft_messages`/:meth:`sft_target` only for an older installed SDK."""
+        Delegates to the freesolo-sdk env's first-class ``Environment.sft_completion``, which turns
+        the record's ``output`` into the gold messages: a MULTI-TURN gold trajectory — assistant
+        turns, tool calls, tool results, replies (authored as ``output = {"messages": [...]}`` or a
+        bare message list) — when the row ships one, else a single assistant turn from a scalar
+        output. So the SFT example shape is owned by the freesolo-sdk dataset layer
+        (``freesolo.datasets.target_messages``), not a flash-only convention; ``len(...) > 1`` is
+        multi-turn. Falls back to reading the raw record only for an older installed SDK that
+        predates the method."""
         fn = getattr(self._env, "sft_completion", None)
         if callable(fn):
             msgs = fn(self._task_example(example))
             if msgs:
                 return [dict(m) for m in msgs]
-        gold = self.sft_messages(example)
-        if gold:
-            return gold
-        return [{"role": "assistant", "content": self.sft_target(example)}]
+        value = example.get(_CANONICAL_OUTPUT_KEY)
+        if isinstance(value, list) and value and all(isinstance(m, dict) for m in value):
+            return [dict(m) for m in value]
+        if isinstance(value, dict) and list(value) == ["messages"] and isinstance(value["messages"], list):
+            return [dict(m) for m in value["messages"]]
+        return [{"role": "assistant", "content": "" if value is None else str(value)}]
+
+    def sft_target(self, example: dict) -> str:
+        """Gold single assistant response (single-turn SFT): the final assistant turn of
+        :meth:`sft_completion` (delegated to the SDK env)."""
+        for m in reversed(self.sft_completion(example)):
+            if m.get("role") == "assistant":
+                return str(m.get("content") or "")
+        return ""
 
     def scores_breakdown(
         self, completion: str, example: dict, state: dict | None = None

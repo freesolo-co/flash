@@ -154,7 +154,7 @@ class _BudgetMultiTurnEnv(_EnvironmentMultiTurn):
         return [_RewardResult(score=0.0, success=False, metrics=()) for _ in episodes]
 
 
-def test_freesolo_sft_messages_full_gold_trajectory(monkeypatch):
+def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
     from flash.envs.adapter import FreesoloEnvironment
@@ -166,12 +166,14 @@ def test_freesolo_sft_messages_full_gold_trajectory(monkeypatch):
         {"role": "user", "content": "<tool_result>...</tool_result>"},
         {"role": "assistant", "content": "done"},
     ]
-    assert env.sft_messages({"input": "x", "output": gold}) == gold
-    # ...and sft_target still collapses to the final assistant turn for back-compat.
+    assert env.sft_completion({"input": "x", "output": gold}) == gold  # len>1 -> multi-turn
+    # sft_target is the final assistant turn of the completion.
     assert env.sft_target({"input": "x", "output": gold}) == "done"
-    # A scalar `output` is single-turn SFT -> no gold trajectory.
-    assert env.sft_messages({"input": "x", "output": "4"}) is None
-    assert env.sft_messages({"input": "x"}) is None
+    # A scalar `output` is single-turn SFT -> one assistant turn.
+    assert env.sft_completion({"input": "x", "output": "4"}) == [
+        {"role": "assistant", "content": "4"}
+    ]
+    assert env.sft_completion({"input": "x"}) == [{"role": "assistant", "content": ""}]
 
 
 def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):
