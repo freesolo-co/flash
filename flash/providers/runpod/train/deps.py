@@ -43,7 +43,9 @@ WORKER_DEPS = [
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
-    "freesolo>=0.2.46",
+    # >=0.2.49: first version exposing Environment.sft_completion + datasets.target_messages,
+    # which the worker's SFT/multi-turn path now calls (flash #162 multi-turn SFT).
+    "freesolo>=0.2.49",
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
     # NB: the HF `kernels` Hub package is intentionally NOT pinned here — the versions
