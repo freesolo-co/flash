@@ -465,10 +465,29 @@ def cmd_cancel(args) -> int:
     return 0
 
 
+def cmd_checkpoints(args) -> int:
+    checkpoints = client_from_config().checkpoints(args.run_id)
+    if not checkpoints:
+        print(
+            f"no deployable checkpoints for {args.run_id} yet "
+            "(RL streams one per save interval; SFT-only runs have none).",
+            file=sys.stderr,
+        )
+        return 0
+    for c in checkpoints:
+        print(f"step {c['step']:>6}  {c['repo_id']}:{c['subfolder']}")
+    print(
+        f"\ndeploy one with `flash deploy {args.run_id} --step <STEP>`.",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_deploy(args) -> int:
     dep = client_from_config().deploy(
         args.run_id,
         dry_run=args.dry_run,
+        step=getattr(args, "step", None),
     )
     print(json.dumps(dep, indent=2))
     print(
