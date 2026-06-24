@@ -102,16 +102,19 @@ def test_is_failover_error(monkeypatch):
             exc.__cause__ = cause
             return exc
 
-    # auth / payment / forbidden / not-found / quota-rate => try next account
+    # auth / payment / forbidden / not-found / quota-rate => try the next account
     for code in (401, 402, 403, 404, 429):
         assert keys.is_failover_error(with_cause(code)) is True
-    # a hard, key-agnostic 4xx is NOT a failover trigger
-    for code in (400, 409, 422):
+    # a hard, key-agnostic 4xx and a 5xx server error are the same on every account => no failover
+    for code in (400, 409, 422, 500, 503):
         assert keys.is_failover_error(with_cause(code)) is False
-    # quota wording with no HTTP cause still fails over
-    assert keys.is_failover_error(RuntimeError("Max workers across all endpoints ... quota")) is True
-    # a bare network failure (no cause, no "http") is worth another account
-    assert keys.is_failover_error(RuntimeError("connection reset")) is True
+
+    # Non-HTTP failures are account-agnostic (the per-key retry loop already absorbed transient
+    # blips), so they do NOT fail over — neither a chained network error nor a bare exception.
+    net = RuntimeError("connection reset")
+    net.__cause__ = urllib.error.URLError("connection reset")
+    assert keys.is_failover_error(net) is False
+    assert keys.is_failover_error(RuntimeError("Max workers across all endpoints ... quota")) is False
 
 
 # ---------------------------------------------------------------------------

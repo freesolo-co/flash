@@ -36,18 +36,8 @@ _idx = 0
 # HTTP statuses that mean "this account/key can't serve the request — try the next key":
 # 401 key rejected, 402 payment required (out of credits), 403 forbidden / spend limit,
 # 404 endpoint/job not on THIS account, 429 quota/rate. A genuine hard 4xx (400/409/422)
-# is the same on every account, so it is NOT a failover trigger.
+# and a 5xx server error are the same on every account, so they are NOT failover triggers.
 _FAILOVER_CODES = frozenset({401, 402, 403, 404, 429})
-# Quota/credit phrases RunPod returns in error bodies (worker-slot or balance limits).
-_QUOTA_HINTS = (
-    "max workers across all endpoints",
-    "insufficient",
-    "quota",
-    "spending limit",
-    "out of credits",
-    "balance",
-    "payment required",
-)
 
 
 def _ensure_pool() -> list[str]:
@@ -124,22 +114,14 @@ def reset() -> None:
 
 
 def is_failover_error(exc: Exception) -> bool:
-    """True when ``exc`` means "try the next account" rather than a hard, key-agnostic error.
+    """True only for an account-specific HTTP status — the cases where another account can
+    actually serve the request (auth/credit/quota/not-found, ``_FAILOVER_CODES``).
 
-    The REST client raises ``error_cls`` chaining the original ``HTTPError`` as ``__cause__``
-    (``raise ... from e``); the status code on the cause is authoritative. Transient
-    failures with no HTTPError cause (the "failed after N attempts" path) are also treated
-    as failover-eligible — a different account may be reachable.
+    The REST client chains the underlying ``HTTPError`` as ``__cause__`` (``raise ... from e``
+    on a fast-failed 4xx, ``raise ... from last`` after the retry loop), so the status code on
+    the cause is authoritative. A hard 4xx (400/409/422), a 5xx server error, and network /
+    timeout failures are the same on every account — the per-key retry loop already absorbs
+    transient blips — so none of them fail over.
     """
     cause = exc.__cause__
-    if isinstance(cause, urllib.error.HTTPError):
-        return cause.code in _FAILOVER_CODES
-    if any(hint in str(exc).lower() for hint in _QUOTA_HINTS):
-        return True
-    # A non-HTTP failure — a network/timeout error (which the retry loop chains as __cause__)
-    # or a bare transient with no cause — isn't account-specific, but another account may still
-    # be reachable, so fail over. A 5xx keeps its HTTPError cause above and does NOT fail over
-    # (a RunPod server error is the same on every account).
-    return cause is None or isinstance(
-        cause, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)
-    )
+    return isinstance(cause, urllib.error.HTTPError) and cause.code in _FAILOVER_CODES
