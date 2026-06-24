@@ -259,6 +259,119 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
     return removed, importlib.util.find_spec("fla") is not None
 
 
+def _find_real_libcudart() -> str | None:
+    """Path to a REAL ``libcudart.so.12`` that exports ``cudaDeviceReset`` (the symbol tilelang's
+    stub lacks), or None if none can be found. Prefers the nvidia-cuda-runtime wheel, then the CUDA
+    toolkit baked into the worker's -devel base image, then the system loader's own resolver — and
+    VERIFIES the symbol is actually present (a path is only returned if ``CDLL(path)`` exposes
+    ``cudaDeviceReset``). Never raises."""
+    import ctypes
+    import ctypes.util
+    import glob
+
+    candidates: list[str] = []
+    # 1. nvidia-cuda-runtime PyPI wheel (a torch/vLLM dep on many images).
+    try:
+        import nvidia.cuda_runtime as _cr  # type: ignore
+
+        candidates += glob.glob(
+            os.path.join(os.path.dirname(_cr.__file__), "lib", "libcudart.so.12*")
+        )
+    except Exception:
+        pass
+    # 2. CUDA toolkit in the -devel base image (Dockerfile.worker: cuda12.8-cudnn9-devel).
+    for pat in (
+        "/usr/local/cuda*/lib64/libcudart.so.12*",
+        "/usr/local/cuda*/targets/*/lib/libcudart.so.12*",
+        "/usr/lib/x86_64-linux-gnu/libcudart.so.12*",
+    ):
+        candidates += glob.glob(pat)
+    # 3. The loader's own resolver (LD_LIBRARY_PATH / ldconfig).
+    found = ctypes.util.find_library("cudart")
+    if found:
+        candidates.append(found)
+    for path in candidates:
+        try:
+            if os.path.exists(path) and hasattr(ctypes.CDLL(path), "cudaDeviceReset"):
+                return os.path.realpath(path)
+        except Exception:
+            continue
+    return None
+
+
+def _neutralize_tilelang_cudart_stub() -> None:
+    """Stop tilelang's bundled ``libcudart_stub.so`` from shadowing the real CUDA runtime in vLLM.
+
+    tilelang ships a minimal ``libcudart_stub.so`` (soname ``libcudart_stub.so``) that
+    ``libtilelang.so`` / ``libtvm.so`` link against; it exports only a SUBSET of the CUDA runtime —
+    notably it is MISSING ``cudaDeviceReset``. vLLM's ``vllm/device_allocator/cumem.py`` builds a
+    ``CudaRTLibrary`` at MODULE TOP LEVEL (``libcudart = CudaRTLibrary()``), and that module is
+    imported on EVERY vLLM init via ``gpu_worker.load_model`` ->
+    ``_maybe_get_memory_pool_context(tag="weights")`` — so the crash is NOT gated on sleep mode or
+    model size (a 0.8B GRPO run hit it too); any GRPO vLLM init is exposed. ``CudaRTLibrary`` finds
+    libcudart by a SUBSTRING scan of ``/proc/self/maps`` and returns the FIRST matching line
+    (address-ordered, so host-dependent ~coin-flip). Once tilelang is loaded — the Hopper fla fast
+    path, or fla's backend probe on any arch — the stub is mapped into the process and can win that
+    scan, so ``CudaRTLibrary()`` dlopens the stub and aborts the import with ``undefined symbol:
+    cudaDeviceReset`` before step 0. See flash #184.
+
+    Fix: BEFORE anything imports tilelang/fla/vllm, repoint the stub path at the REAL
+    ``libcudart.so.12`` via a symlink. Then whichever copy the loader (or vLLM's scan) resolves has
+    the full symbol set, and the real lib's soname (``libcudart.so.12``) dedupes against the copy
+    torch already loaded — so no second CUDA-runtime instance is created and the stub-named mapping
+    drops out of ``/proc/self/maps`` entirely. tilelang keeps working: the real runtime is a strict
+    superset of the stub it linked against. Applies on EVERY arch and model size (the crash spans
+    0.8B/4B and A100/cheaper classes) and to every provisioning path (baked image or runtime pip),
+    since it runs in the worker before the first tilelang load. Must run AFTER
+    ``_ensure_fla_fastpath_on_hopper`` (a tilelang (re)install there would otherwise rewrite the
+    stub) and BEFORE the model/vLLM import.
+
+    Idempotent and best-effort: a missing tilelang, a missing stub, an already-healthy stub, or no
+    discoverable real runtime is a clean no-op; any error is swallowed (the worker must never crash
+    on this hygiene step). No GPU required.
+    """
+    import ctypes
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("tilelang")
+    except Exception:
+        spec = None
+    locs = list(getattr(spec, "submodule_search_locations", None) or []) if spec else []
+    if not locs:
+        return  # tilelang not installed -> nothing can shadow libcudart
+    stub = os.path.join(locs[0], "lib", "libcudart_stub.so")
+    if not os.path.exists(stub):
+        return
+    # Already healthy? A prior neutralize (this run is re-entrant), or a tilelang build whose stub
+    # carries the symbol, means the stub path ALREADY exposes cudaDeviceReset — leave it untouched.
+    try:
+        if hasattr(ctypes.CDLL(stub), "cudaDeviceReset"):
+            return
+    except Exception:
+        pass  # an unloadable/partial stub still gets replaced below
+    real = _find_real_libcudart()
+    if real is None:
+        print(
+            "[worker] libcudart stub shadow: no real libcudart found; left as-is (flash #184)",
+            flush=True,
+        )
+        return
+    try:
+        # Preserve the original stub ONCE (reversible / debuggable), then point the stub path at the
+        # real runtime. os.replace is atomic; symlink keeps soname-dedup (no duplicate libcudart).
+        backup = stub + ".orig"
+        if not os.path.exists(backup):
+            os.replace(stub, backup)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(stub)
+        os.symlink(real, stub)
+        print(f"[worker] redirected tilelang libcudart_stub.so -> {real} (flash #184)", flush=True)
+    except Exception as e:
+        print(f"[worker] libcudart stub neutralize failed: {e}", flush=True)
+
+
 # Long-context runs are memory-bound (activations + vLLM KV cache scale with sequence length), so
 # they need the memory features even on a SMALL model — PR #174 measured a 1B model OOM on GRPO at
 # 4096 ctx in speed mode, but it fits in memory mode. So "memory mode" = large model OR long ctx.

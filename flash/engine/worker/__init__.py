@@ -74,6 +74,7 @@ from flash.engine.worker.perf import (
     _liger_default_for_model,  # noqa: F401
     _memory_mode,
     _metric_curve,
+    _neutralize_tilelang_cudart_stub,
     _peak_gpu_gb,
     _remove_fla_from_disk,  # noqa: F401
     _reset_peak_gpu,
@@ -2260,6 +2261,11 @@ def main():
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
         _ensure_fla_fastpath_on_hopper()  # Hopper: enable fla+tilelang GDN fast path (see perf.py)
+        # Repoint tilelang's libcudart_stub.so at the real CUDA runtime so it can't shadow libcudart
+        # in vLLM's CudaRTLibrary (intermittent `undefined symbol: cudaDeviceReset` on GRPO vLLM
+        # init, any model size/arch). AFTER the fla fast path (a tilelang reinstall there rewrites
+        # the stub) and BEFORE the model/vLLM import. See perf.py / flash #184.
+        _neutralize_tilelang_cudart_stub()
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
