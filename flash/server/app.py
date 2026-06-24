@@ -1,10 +1,9 @@
 """FastAPI control plane for the managed Flash service.
 
-This is the operator-side component. It holds the
-provider credentials (``RUNPOD_API_KEY``, ``HF_TOKEN``, ``PRIME_API_KEY`` —
-the worker needs the last to ``prime env install`` the run's Prime Hub env) and
-exposes the full run lifecycle to clients that authenticate with their freesolo API
-key (verified against the freesolo backend) — clients never see provider credentials.
+This is the operator-side component. It holds the provider credentials
+(``RUNPOD_API_KEY``, ``HF_TOKEN``, and environment source tokens) and exposes the
+full run lifecycle to clients that authenticate with their freesolo API key
+(verified against the freesolo backend) — clients never see provider credentials.
 
 Run state truth stays in the runner's JSON files; SQLite (server/db.py) holds
 keys and run ownership. Runs the server owns are recovered on startup by re-attaching
@@ -13,6 +12,7 @@ to their persisted RunPod job handles.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -21,8 +21,10 @@ import weakref
 
 from flash import __version__
 from flash.catalog import public_model_rows
+from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.runner import (
     adapter_prefix,
+    attach_checkpoint_deployment,
     cancel_run,
     get_status,
     mark_deployed,
@@ -31,35 +33,75 @@ from flash.runner import (
     runs_file_path,
     submit_job,
 )
+from flash.runner.checkpoints import checkpoint_adapter_prefix, list_checkpoints
 from flash.schema import ConfigError, spec_from_dict
+from flash.serve.deploy import ServingError, deploy_adapter, undeploy_adapter
 from flash.serve.deploy import chat as serve_chat
-from flash.serve.deploy import deploy_adapter, undeploy_adapter
-from flash.spec import JobSpec, coerce_bool
+from flash.serve.deploy import chat_stream as serve_chat_stream
+from flash.spec import JobSpec
 
 from . import auth, db
 
+_RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
+# A specific intermediate checkpoint can also be deployed from a run that stopped mid-RL
+# (cancelled/failed): the per-step adapter was already streamed to HF, so it serves even though
+# the run never sealed a final adapter. `dry_run` is excluded — it never trained.
+_CHECKPOINT_DEPLOYABLE_STATES = _DEPLOYABLE_STATES | {"cancelled", "failed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 _log = logging.getLogger("flash.server")
 
 
-def _reverse_charge_best_effort(*, token: str, run_id: str, charge: dict) -> None:
-    """Refund a run's pre-flight charge after its submit failed; never raises (logs on failure
-    so the refund error can't mask the submit error). Idempotent by ``run_id``."""
-    try:
-        from flash.server.billing import reverse_run_charge
+def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
+    """Validate an optional deploy ``step`` against the run's published checkpoints.
 
-        reverse_run_charge(token=token, run_id=run_id, charge=charge)
-    except Exception:
-        # A refund failure must NOT mask the submit error: log and swallow.
-        _log.exception(
-            "failed to reverse the pre-flight charge for run %s after a submit failure; "
-            "the org may be charged for a run that never started — reconcile manually",
-            run_id,
-        )
+    Returns the integer step to deploy, or ``None`` when no step was requested (deploy the
+    final adapter). Raises ``HTTPException(400)`` for a malformed step and ``HTTPException(404)``
+    — listing the available steps — when the run has no deployable checkpoint at that step."""
+    if raw_step is None:
+        return None
+    from fastapi import HTTPException
+
+    # Accept only an actual integer step — NOT a bool (True would coerce to step 1) and not a
+    # non-integer float/string (40.9 / "40.9" must not silently round to a different checkpoint).
+    want: int | None = None
+    if isinstance(raw_step, bool):
+        want = None
+    elif isinstance(raw_step, int):
+        want = raw_step
+    elif isinstance(raw_step, float):
+        want = int(raw_step) if raw_step.is_integer() else None
+    elif isinstance(raw_step, str) and raw_step.strip().lstrip("-").isdigit():
+        want = int(raw_step.strip())
+    if want is None:
+        raise HTTPException(status_code=400, detail=f"invalid checkpoint step: {raw_step!r}")
+    checkpoints = list_checkpoints(spec)
+    if any(c["step"] == want for c in checkpoints):
+        return want
+    available = ", ".join(str(c["step"]) for c in checkpoints) or "none"
+    raise HTTPException(
+        status_code=404,
+        detail=f"run {run_id} has no deployable checkpoint at step {want} (available: {available})",
+    )
+
+
+async def _reconcile_cost_loop() -> None:
+    """Background loop: periodically pull realized provider cost (COGS) for finished runs and
+    report it to the freesolo backend for estimator accuracy. The provider billing calls are
+    blocking urllib, so each sweep is offloaded to a thread; failures are swallowed and retried
+    next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled)."""
+    from flash.server.reconcile import reconcile_once
+
+    interval = float(os.environ.get("FLASH_RECONCILE_INTERVAL_S", "3600"))
+    while True:
+        await asyncio.sleep(interval)
+        with contextlib.suppress(Exception):
+            reported = await asyncio.to_thread(reconcile_once)
+            if reported:
+                _log.info("reconciled realized cost for %d run(s)", reported)
 
 
 class _RunLock:
@@ -106,11 +148,30 @@ def _deploy_lock(run_id: str) -> _RunLock:
         return lk
 
 
+def _append_run_log(run_id: str, message: str) -> None:
+    """Append a timestamped note to a run's log so it surfaces in `flash status --logs`."""
+    import time
+
+    with open(runs_file_path(run_id, ".log"), "a") as f:
+        f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
+
+
 def recover_runs() -> None:
-    """Re-attach to in-flight runs after a server restart (per-run daemon threads)."""
-    from flash.runner import _gc_run_endpoints, _update, attach_run, resume_run
+    """Recover every in-flight run after a restart so a redeploy never loses a training session:
+    re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
+    ``queued``/``provisioning`` runs that never reached a worker."""
+    from flash.runner import (
+        _gc_run_endpoints,
+        _run_job_background,
+        _update,
+        attach_run,
+        resume_run,
+    )
 
     active: set[str] = set()
+    # Deferred until after the orphan sweep so a half-rented instance from a crashed pre-handle
+    # attempt is reaped without racing the resubmit's fresh allocation.
+    resubmit: list[JobSpec] = []
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
@@ -119,44 +180,71 @@ def recover_runs() -> None:
         if status.state not in _RECOVERABLE:
             continue
         if status.remote:
-            # Only remote-backed runs are "active" (kept by the orphan sweep). A run
-            # with no handle is being failed below; if it had already rented a Vast
-            # instance (crash between rent and on_handle), it must NOT shield that
-            # instance from the sweep.
+            # Only handle-backed runs are kept by the sweep; a handle-less run is being
+            # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
         elif status.resume_seed_index is not None:
-            # Multi-seed run that restarted in the inter-seed gap: the completed seed's
-            # handle was deliberately cleared and the next index recorded. There is no
-            # live job to reattach to, so resume the remaining seeds rather than failing
-            # the run and discarding the already-completed work. Keep it in `active` so
-            # the orphan sweep below doesn't reap the label its next seed will reuse.
+            # Restarted between seeds: resume the remaining seeds, preserving the finished ones.
             active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: resume_run(rid), daemon=True).start()
         else:
-            # The first attempt may have registered its uniquely-named RunPod
-            # endpoint before on_handle() persisted the handle. GC it (by
-            # reconstructed name) before failing, so it doesn't hold worker quota
-            # until manual cleanup. Best-effort; vast orphans are swept below.
+            # No handle yet: the restart hit the submit->provisioning window, so no worker exists.
+            # A spec that won't parse can never be resubmitted -> mark it terminally failed
+            # (operator-visible, dropped from _RECOVERABLE so it isn't re-skipped every restart);
+            # otherwise GC any half-made endpoint and resubmit from scratch.
+            try:
+                spec = JobSpec.from_dict(status.spec)
+            except Exception as exc:
+                _log.warning(
+                    "marking run %s failed: persisted spec could not be parsed",
+                    status.run_id,
+                    exc_info=True,
+                )
+                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                with contextlib.suppress(Exception):
+                    _update(status.run_id, "failed", error=detail)
+                with contextlib.suppress(Exception):
+                    _append_run_log(status.run_id, detail)
+                # The aborted attempt may STILL have registered its uniquely-named RunPod
+                # endpoint before crashing (the exact leak the good-spec branch's
+                # `_gc_run_endpoints` guards against). The orphan sweep below won't reap it —
+                # RunPod's `sweep_orphans` is a no-op — so do a best-effort RunPod GC HERE.
+                # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
+                # endpoint name is derived deterministically from the run id + GPU class
+                # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
+                # persisted status without parsing the spec. Terminate by that reconstructed
+                # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
+                with contextlib.suppress(Exception):
+                    gpu_type = (status.spec.get("gpu") or {}).get("type")
+                    if gpu_type:
+                        from flash.providers.runpod.train import terminate_endpoint
+
+                        terminate_endpoint(gpu_type, status.run_id)
+                continue
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(JobSpec.from_dict(status.spec))
-            _update(status.run_id, "failed", error="server restarted before job submission")
-    # Standing per-run billing (Vast instances) survives a crash until destroyed:
-    # anything labeled ours that no recoverable run owns is an orphan. Each available
-    # provider's ``sweep_orphans`` hook reaps its own (RunPod's is a no-op). Dispatched
-    # generically through the registry — ``sweep_orphans`` is part of base.Provider, so
-    # no provider is special-cased. ``active`` carries raw run ids; each provider applies
-    # its own label-prefix transform. Best-effort: never raises.
+                _gc_run_endpoints(spec)
+            resubmit.append(spec)
+    # Reap orphaned per-run provider resources; each provider sweeps its own.
     from flash.providers import configured_providers
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):
             prov.sweep_orphans(active_labels=active)
 
+    for spec in resubmit:
+        _log.info("resubmitting run %s after control-plane restart", spec.run_id)
+        with contextlib.suppress(Exception):
+            _append_run_log(
+                spec.run_id, "control plane restarted before provisioning; resubmitting"
+            )
+        threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+
 
 def create_app():
     try:
         from fastapi import Depends, FastAPI, Header, HTTPException
+        from fastapi.responses import StreamingResponse
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     from contextlib import asynccontextmanager
@@ -164,10 +252,20 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app):
         from flash.providers.preflight import check_run_preflight
+        from flash.server.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
-        yield
+        # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
+        # internal key is configured. First (and only) asyncio task in the server.
+        cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
+        try:
+            yield
+        finally:
+            if cost_task is not None:
+                cost_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cost_task
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
 
@@ -196,11 +294,21 @@ def create_app():
 
     @app.get("/v1/me")
     def me(key: dict = Depends(require_key)):
-        return {
+        payload = {
+            "kind": "internal" if key.get("auth_kind") == "internal" else "freesolo_api_key",
             "key_prefix": key["key_prefix"],
-            "email": key["email"],
-            "created_at": key["created_at"],
         }
+        for field in (
+            "email",
+            "user_id",
+            "org_id",
+            "api_key_id",
+            "training_agent_job_id",
+            "project_id",
+        ):
+            if key.get(field):
+                payload[field] = key[field]
+        return payload
 
     @app.get("/v1/models")
     def models(_: dict = Depends(require_key)):
@@ -208,9 +316,8 @@ def create_app():
 
     @app.post("/v1/envs")
     def publish_env(payload: dict, key: dict = Depends(require_key)):
-        # Publish a client-built verifiers env package to the MANAGED Prime account (this control
-        # plane's PRIME_API_KEY), namespaced per identity and PRIVATE — so users never need their
-        # own Prime account. The client just packages local source and uploads it here.
+        # Publish a client-built Freesolo environment package to the managed
+        # environment repository. Users never need direct repository credentials.
         from flash.server import envs
 
         # Default to "" only when the key is missing/None — pass a present-but-falsy
@@ -222,13 +329,13 @@ def create_app():
             slug = envs.publish_package(
                 package_b64="" if _pkg is None else _pkg,
                 name="" if _name is None else _name,
-                # Robust bool parse: JSON `"is_new": "false"`/`"0"` must NOT become True
-                # (plain bool() is truthy for any non-empty string). Defaults True when absent.
-                is_new=coerce_bool(payload.get("is_new", True)),
                 key=key,
             )
         except envs.EnvPublishError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        from flash.server.environment_registry import record_published_environment
+
+        record_published_environment(slug=slug, name=str(_name), key=key)
         return {"id": slug}
 
     def _parse_spec(payload: dict, run_id: str) -> JobSpec:
@@ -238,50 +345,105 @@ def create_app():
             raise HTTPException(
                 status_code=400,
                 detail="local environment paths are not supported on the managed service; "
-                "publish the environment to the Prime Hub (`flash env push`), then reference it "
-                'by its Hub id (`[environment] id = "owner/name"`)',
+                "publish the environment with `flash env push --name <name>`, then reference it "
+                "by the returned environment id",
             )
         try:
             return spec_from_dict(spec_raw, run_id=run_id)
         except (ConfigError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    def _runtime_secrets(
+        payload: dict, spec: JobSpec, *, require_environment_secrets: bool
+    ) -> dict[str, str]:
+        raw = payload.get("runtime_secrets") or {}
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="runtime_secrets must be a JSON object")
+        allowed = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "unsupported runtime secret(s): "
+                    f"{', '.join(unknown)} (allowed: {', '.join(sorted(allowed))})"
+                ),
+            )
+        out: dict[str, str] = {}
+        for key, value in raw.items():
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise HTTPException(
+                    status_code=400, detail=f"runtime_secrets.{key} must be a string"
+                )
+            value = value.strip()
+            if value:
+                out[key] = value
+        if require_environment_secrets:
+            missing = sorted(set(spec.environment.secrets) - set(out))
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "missing runtime secret(s) required by [environment] secrets: "
+                        f"{', '.join(missing)}"
+                    ),
+                )
+        return out
+
     @app.post("/v1/runs")
     def create_run(
         payload: dict,
         key: dict = Depends(require_key),
-        authorization: str | None = Header(default=None),
     ):
         spec = _parse_spec(payload, run_id=new_run_id())
         dry_run = bool(payload.get("dry_run", False))
-        # Charge the pre-flight estimate to the user's org BEFORE accepting the run, so it's gated
-        # on balance and never starts unpaid. Skipped for --dry-run and the internal service
-        # identity (no user org to bill).
-        billed = not dry_run and key.get("key_prefix") != "internal"
-        token = (authorization or "").removeprefix("Bearer ").strip()
-        charge: dict = {}
-        if billed:
-            from flash.server.billing import BillingError as _BillingError
-            from flash.server.billing import charge_run_estimate
-
-            try:
-                charge = charge_run_estimate(token=token, spec=spec)
-            except _BillingError as exc:
-                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-            except ValueError as exc:
-                # Unpriceable config (e.g. uncapped SFT whose env can't be counted): 400 with a
-                # fixable message, not a 500.
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-        # record_run is inside the try so any post-charge failure (SQLite, submit) reverses the
-        # debit — the org must never pay for a run that didn't start.
+        runtime_secrets = _runtime_secrets(
+            payload, spec, require_environment_secrets=not dry_run
+        )
+        # External user-key runs are charged only after training succeeds. Persist the org id
+        # (non-secret) so the background runner can bill with the operator internal key at
+        # completion; never persist the submitting user's API key.
+        bill_on_completion = not dry_run and key.get("auth_kind") != "internal"
+        billing_context = None
+        if bill_on_completion:
+            org_id = str(key.get("org_id") or "").strip()
+            if not org_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="org id is required to bill a completed training run",
+                )
+            billing_context = {"org_id": org_id}
         try:
             db.record_run(spec.run_id, key["id"])
-            status = submit_job(spec, dry_run=dry_run, background=True)
+            submit_kwargs = {"dry_run": dry_run, "background": True}
+            if runtime_secrets:
+                submit_kwargs["runtime_secrets"] = runtime_secrets
+            if billing_context:
+                submit_kwargs["billing_context"] = billing_context
+            platform_context = {
+                field: value
+                for field, value in {
+                    "org_id": key.get("org_id"),
+                    "user_id": key.get("user_id"),
+                    "api_key_id": key.get("api_key_id"),
+                }.items()
+                if value
+            }
+            if platform_context:
+                submit_kwargs["platform_context"] = platform_context
+            status = submit_job(spec, **submit_kwargs)
+            from flash.server.run_registry import record_training_run
+
+            record_training_run(status=status, key=key)
+            from flash.envs.adapter import is_managed_environment_slug
+            from flash.server.environment_registry import record_environment_use
+
+            if is_managed_environment_slug(spec.environment.id):
+                record_environment_use(slug=spec.environment.id, run_id=spec.run_id, key=key)
         except Exception as exc:
             db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
-            # The run never started — reverse the charge so the org isn't billed for it.
-            if billed:
-                _reverse_charge_best_effort(token=token, run_id=spec.run_id, charge=charge)
             if isinstance(exc, HTTPException):
                 raise
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -312,7 +474,14 @@ def create_app():
                 f.seek(end)
                 chunk = f.read()
                 end = f.tell()
-        return {"run_id": run_id, "logs": chunk, "offset": end, "state": status.state}
+        return {
+            "run_id": run_id,
+            "logs": chunk,
+            "offset": end,
+            "state": status.state,
+            "last_heartbeat": status.last_heartbeat,
+            "gpu_status": status.gpu_status,
+        }
 
     @app.post("/v1/runs/{run_id}/cancel")
     def cancel(run_id: str, key: dict = Depends(require_key)):
@@ -329,14 +498,23 @@ def create_app():
             status = owned_run(run_id, key)
             spec = JobSpec.from_dict(status.spec)
             dry_run = bool(payload.get("dry_run", False))
-            if not dry_run and status.state not in _DEPLOYABLE_STATES:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"run {run_id} is {status.state!r}; only finished runs with "
-                        "trained adapter artifacts can be deployed"
-                    ),
+            # Optional `step`: deploy a specific intermediate checkpoint instead of the run's
+            # final adapter. We resolve it against what's actually on HF (the source of truth),
+            # so a missing step 404s with the available list rather than 500ing at serve time.
+            checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
+            is_checkpoint = checkpoint_step is not None
+            allowed_states = (
+                _CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _DEPLOYABLE_STATES
+            )
+            if not dry_run and status.state not in allowed_states:
+                detail = (
+                    f"run {run_id} is {status.state!r}; deploy a checkpoint only once the run "
+                    "has finished or been cancelled"
+                    if is_checkpoint
+                    else f"run {run_id} is {status.state!r}; only finished runs with "
+                    "trained adapter artifacts can be deployed"
                 )
+                raise HTTPException(status_code=409, detail=detail)
             # Legacy runs persisted before [train].hf_repo was mandatory rehydrate with an
             # empty hf_repo; without this guard freesolo serving cannot locate the adapter
             # artifacts (the per-run HF dataset repo). Reject early with a clear 409.
@@ -348,7 +526,12 @@ def create_app():
                         "cannot be located, so it cannot be deployed"
                     ),
                 )
-            mode = payload.get("mode", "dev")
+            # A checkpoint deploy serves the per-step adapter; otherwise the run's final adapter.
+            deploy_prefix = (
+                checkpoint_adapter_prefix(spec, checkpoint_step)
+                if is_checkpoint
+                else adapter_prefix(spec)
+            )
             # The state the run must still be in for this deploy to finalize — a CAS guard so
             # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't be
             # silently overwritten by the deployment record.
@@ -358,31 +541,59 @@ def create_app():
                     run_id=run_id,
                     model=spec.model,
                     hf_repo=spec.train.hf_repo,
-                    adapter_prefix=adapter_prefix(spec),
+                    adapter_prefix=deploy_prefix,
                     gpu_name=spec.gpu.type,
-                    mode=mode,
-                    idle_timeout_s=int(payload.get("idle_timeout_s", 300)),
                     dry_run=dry_run,
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                 )
+            except ServingError as exc:
+                # The serving backend rejected the registration or was unreachable. This is an
+                # upstream/gateway failure, not a flash bug, so surface a clean 502 with the
+                # real reason instead of letting httpx escape as an unhandled 500 + traceback.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
             except Exception as exc:
                 if isinstance(exc, ValueError):
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 raise
+            dep_dict = dep.to_dict()
+            if is_checkpoint:
+                dep_dict["checkpoint_step"] = checkpoint_step
             if not dry_run:
-                # Record the deployment. The CAS no-ops only if a /cancel raced finalization
-                # — then the adapter we just registered is orphaned, so deregister it and
-                # report the conflict instead of a bogus 200.
-                marked = mark_deployed(run_id, dep.to_dict(), expect_state=prev_state)
-                if marked.state != "deployed":
-                    with contextlib.suppress(Exception):
-                        undeploy_adapter(run_id)
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
-                    )
-            return dep.to_dict()
+                if is_checkpoint and status.state not in _DEPLOYABLE_STATES:
+                    # Deploying a checkpoint of a run that stopped mid-RL (cancelled/failed):
+                    # attach the serving deployment but KEEP the run's terminal training state
+                    # — flipping it to `deployed` would erase the outcome and make undeploy
+                    # wrongly restore it to `done`.
+                    attach_checkpoint_deployment(run_id, dep_dict)
+                else:
+                    # Record the deployment. The CAS no-ops only if a /cancel raced finalization
+                    # — then the adapter we just registered is orphaned, so deregister it and
+                    # report the conflict instead of a bogus 200.
+                    marked = mark_deployed(run_id, dep_dict, expect_state=prev_state)
+                    if marked.state != "deployed":
+                        with contextlib.suppress(Exception):
+                            undeploy_adapter(run_id)
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
+                        )
+            return dep_dict
+
+    @app.get("/v1/runs/{run_id}/checkpoints")
+    def run_checkpoints(run_id: str, key: dict = Depends(require_key)):
+        """List a run's deployable per-step RL checkpoints (each `flash deploy --step N`-able).
+
+        Reads the snapshots the worker streamed to HF, and best-effort mirrors them to the
+        backend store so a listing also persists them."""
+        status = owned_run(run_id, key)
+        spec = JobSpec.from_dict(status.spec)
+        checkpoints = list_checkpoints(spec)
+        with contextlib.suppress(Exception):
+            from flash.server.checkpoints import register_checkpoints_best_effort
+
+            register_checkpoints_best_effort(status)
+        return {"run_id": run_id, "checkpoints": checkpoints}
 
     @app.delete("/v1/runs/{run_id}/deploy")
     def undeploy(run_id: str, key: dict = Depends(require_key)):
@@ -390,21 +601,17 @@ def create_app():
         # deploy's provisioning/finalization.
         with _deploy_lock(run_id):
             status = owned_run(run_id, key)
-            deleted = undeploy_adapter(run_id)
-            # dev mode is scale-to-zero: the serve endpoint is created only on the first
-            # chat, so an empty deletion just means it was never warmed — still a clean
-            # undeploy. always-on provisions the endpoint at deploy time, so an empty
-            # deletion there is a transient RunPod failure that must NOT hide a
-            # still-billable endpoint (surface 502 so the user retries).
-            dev_mode = (status.deployment or {}).get("mode", "dev") == "dev"
-            if status.deployment and (deleted or dev_mode):
+            try:
+                deleted = undeploy_adapter(run_id)
+            except ServingError as exc:
+                # A serving-backend failure (unreachable / non-404 error) is an upstream/gateway
+                # problem, not a flash bug — surface a clean 502 with the real reason (mirrors the
+                # deploy handler) instead of letting the ServingError escape as an unhandled 500.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            # Delete is idempotent: a missing serving-side adapter still means the local
+            # deployment record can be cleared.
+            if status.deployment:
                 mark_undeployed(run_id)
-            elif status.deployment and not deleted:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"could not delete the serving endpoint for {run_id}; it may still "
-                    "be running — retry `flash undeploy`",
-                )
             return {"run_id": run_id, "deleted_endpoints": deleted}
 
     @app.get("/v1/deployments")
@@ -450,6 +657,18 @@ def create_app():
                 detail=f"run {run_id} has no [train].hf_repo (legacy run); its adapter cannot be served",
             )
         try:
+            if payload.get("stream") is True:
+                return StreamingResponse(
+                    serve_chat_stream(
+                        run_id=run_id,
+                        messages=payload.get("messages") or [],
+                        temperature=float(payload.get("temperature") or 0.0),
+                        max_tokens=int(payload.get("max_tokens") or 512),
+                        # a run trained with thinking serves with thinking (per-run parity)
+                        thinking=spec.thinking,
+                    ),
+                    media_type="text/plain; charset=utf-8",
+                )
             return serve_chat(
                 run_id=run_id,
                 messages=payload.get("messages") or [],

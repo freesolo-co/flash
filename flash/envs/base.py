@@ -33,17 +33,16 @@ class BaseEnvironment:
         raise NotImplementedError
 
     def prompt_messages(self, example: dict) -> list[dict]:
-        question = example.get("question") or example.get("prompt") or ""
-        return [{"role": "user", "content": question}]
+        return [{"role": "user", "content": str(example.get("input") or "")}]
 
     def sft_target(self, example: dict) -> str:
-        return str(example.get("target") or example.get("answer") or "")
+        return str(example.get("output") or "")
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return 1.0 if self.grade(completion, example, state) else 0.0
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
-        gold = str(example.get("gold") or example.get("answer") or "").strip()
-        # A missing/empty gold must NOT grade every completion correct (`"" in x` is
+        gold = str(example.get("output") or "").strip()
+        # A missing/empty output must NOT grade every completion correct (`"" in x` is
         # always True) — treat it as unscorable -> incorrect.
         return bool(gold) and gold in (completion or "")

@@ -3,9 +3,7 @@ emit a standalone RunPod Serverless handler (/rp_handler.py) baked into the work
 
 This makes the worker image a *self-contained RunPod Serverless worker* (Pattern D): when RunPod
 Flash deploys it as a custom image (client mode), the baked CMD runs this handler, which reads the
-job payload from job["input"] and runs the training via `_train_body`. On Vast the image is launched
-with args-mode (`bash -c <onstart>`), which OVERRIDES this CMD — so the same image serves both
-providers (Vast bash bootstrap vs RunPod serverless handler).
+job payload from job["input"] and runs the training via `_train_body`.
 
 `_train_body` is fully self-contained (every name it uses is imported inside its body and it fetches
 the flash `code/**` from HF at runtime), so extracting just its source needs no flash import.

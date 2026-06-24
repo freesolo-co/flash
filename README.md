@@ -1,23 +1,20 @@
 # Flash
 
-Managed LoRA post-training service: SFT and GRPO on managed GPUs across multiple
-providers — RunPod Flash (serverless queue; RTX 4090/5090 classes) and Vast.ai
-(rented verified-datacenter instances; L40S / RTX Pro 4000 / A100 classes). The
-allocator picks the cheapest GPU class that fits the run across both providers.
+Managed LoRA post-training service: SFT and GRPO on managed RunPod Flash GPUs.
+The allocator picks the cheapest validated RunPod GPU class that fits the run.
 
 ## Scope
 
 - `flash train <cfg.toml>` / control-plane `POST /runs` — submit a training job;
   one dedicated GPU per run, supervised server-side (stall watchdog, bounded
   auto-retry resuming from the last streamed checkpoint, endpoint GC).
-- `flash deploy` (scale-to-zero or always-on), `flash chat` —
-  serving for trained adapters.
-- **Verifiers-only environments.** Every run names a Prime Intellect `verifiers`
-  environment by its published Hub slug (`[environment] id = "owner/name"`).
-  Scaffold a local env, publish it with `flash env push`, then reference it by id.
-  The worker wraps it via `flash/envs/adapter.py`. There are no
-  built-in task environments and no freesolo bridge. Single-turn environments
-  are fully supported (SFT/GRPO/eval).
+- `flash deploy`, `flash chat` — serving for trained adapters.
+- **Freesolo SDK environments.** Every run names a Freesolo environment id.
+  Scaffold `environment.py` plus `datasets/train.jsonl`, upload `.` or another
+  folder with `flash env push --name <name> <folder>`, then reference the
+  returned id. The worker loads it through `freesolo.environments`. There are no
+  built-in task environments. Single-turn and bounded multi-turn environments are
+  supported.
 
 ## Layout
 
@@ -27,17 +24,16 @@ allocator picks the cheapest GPU class that fits the run across both providers.
 - `flash/schema.py`, `flash/spec.py` — TOML → `JobSpec`
 - `flash/runner.py` — server-side run supervisor (durable job handle,
   retries, cost guard, endpoint GC)
-- `flash/providers/` — RunPod Flash + Vast.ai provider subtrees (pricing,
-  gpus, durable submit/poll, preflight) behind one `base.Provider` protocol,
-  with a cross-provider `allocator.py` that picks the cheapest fitting class
+- `flash/providers/` — RunPod Flash provider code (pricing, gpus, durable
+  submit/poll, preflight) behind the `base.Provider` protocol, with an
+  `allocator.py` that picks the cheapest fitting class
 - `flash/engine/` — the on-GPU worker (TRL + colocated vLLM rollouts) and the
   shared recipe; SFT targets and RL rewards route through the active environment
   (task-specific grading lives with its example, not in the engine)
-- `flash/envs/` — environment machinery: registry and the
-  `adapter` that wraps Prime Intellect / Hub `verifiers`
-  environments onto the worker's interface
-- `flash lab setup` / `flash env init` — scaffold a starter local verifiers env and a
-  ready-to-run config to start from
+- `flash/envs/` — environment machinery: registry and the adapter that loads
+  Freesolo SDK environments onto the worker's interface
+- `flash env setup` — scaffold a starter local Freesolo env, `datasets/train.jsonl`,
+  and ready-to-run configs to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
   plane (run operator-side via the separate `flash-server` command)
 - `flash/mcp/` — stdio MCP bridge for coding agents
@@ -55,8 +51,75 @@ uv run flash --help
 uv run flash-server                      # control plane (operator-side, run once)
 ```
 
-The control plane owns provider credentials: `RUNPOD_API_KEY` is always required
-(RunPod is the default substrate), `VAST_API_KEY` is opt-in (only checked when set),
+The control plane owns provider credentials: `RUNPOD_API_KEY` is always required,
 plus the shared `HF_TOKEN`.
 The artifact repo is per-run (the run TOML's `[train] hf_repo`), not an
 operator-wide env var. Clients authenticate with their freesolo API key (`flash login`).
+
+## Serving From an API
+
+`flash chat` is a CLI wrapper around the Flash control-plane chat endpoint. To call a
+deployed adapter from your own app, deploy the finished run once and then POST chat
+requests with your freesolo API key:
+
+```bash
+export FLASH_API_URL=https://flash.freesolo.co
+export FREESOLO_API_KEY=fslo_...
+export RUN_ID=flash-1782194170-ce1cfcff
+
+curl -X POST "$FLASH_API_URL/v1/runs/$RUN_ID/deploy" \
+  -H "Authorization: Bearer $FREESOLO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"dry_run": false}'
+
+curl -X POST "$FLASH_API_URL/v1/runs/$RUN_ID/chat" \
+  -H "Authorization: Bearer $FREESOLO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "Write a two-sentence summary of the run."}
+    ],
+    "temperature": 0.0,
+    "max_tokens": 256
+  }'
+```
+
+The response uses the OpenAI chat-completions shape:
+
+```json
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "..."
+      }
+    }
+  ]
+}
+```
+
+Use `choices[0].message.content` for the generated text. The run id is the adapter id
+for serving. If the run is not deployed yet, `/v1/runs/<run_id>/chat` returns `409`
+with a hint to deploy first.
+
+Operators can also call the Modal serving app directly after the adapter is registered.
+The default serving app is `https://clado-ai--freesolo-lora-serving.modal.run`, and
+operators can point Flash at another serving app by setting `FREESOLO_SERVING_URL`.
+Use that same base URL when calling the app directly; pass the run id as `model`:
+
+```bash
+export FREESOLO_SERVING_URL=https://clado-ai--freesolo-lora-serving.modal.run
+
+curl -X POST "$FREESOLO_SERVING_URL/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "flash-1782194170-ce1cfcff",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "temperature": 0.0,
+    "max_tokens": 256
+  }'
+```
+
+Prefer the Flash control-plane endpoint for user apps because it enforces run ownership
+and forwards per-run serving options such as thinking-mode parity.

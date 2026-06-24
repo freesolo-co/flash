@@ -12,23 +12,17 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "RTX 2000 Ada": 89.0,
     "RTX A4500": 89.0,
     "RTX 4000 Ada": 90.0,
-    "RTX A5000": 89.0,
     "RTX 3090": 71.0,
     "L4": 60.0,
-    "RTX Pro 4000": 95.0,
     "RTX 4090": 165.0,
     "RTX 5090": 210.0,
     "RTX A6000": 155.0,
     "A40": 150.0,
     "RTX 6000 Ada": 182.0,
-    "L40S": 181.0,
-    "A100 SXM 40GB": 312.0,
     "A100 PCIe": 312.0,
     "A100 SXM": 312.0,
-    "H100 NVL": 835.0,
     "H100": 990.0,
     "RTX Pro 6000": 250.0,
-    "RTX Pro 6000 WK": 250.0,
 }
 _DEFAULT_TFLOPS = 100.0
 
@@ -39,31 +33,11 @@ def gpu_tflops(name: str) -> float:
 
 
 def gpu_hourly_usd(name: str) -> float:
-    """Static fallback (on-demand list) $/hr for a class."""
+    """Static representative $/hr for a class."""
     info = GPU_INFO.get(name)
     if info is None:
         raise KeyError(f"unknown GPU class {name!r}")
     return info.hourly_usd
-
-
-# Realized (spot/queue) $/hr per class -- the discount below on-demand list (RTX 5090 lists
-# $0.99, bills ~$0.87). ``realized_hourly_usd`` CLAMPS to the list price so it can never
-# over-quote; a class with no clean observed rate falls back to list.
-REALIZED_HOURLY_USD: dict[str, float] = {
-    "RTX 3090": 0.239,
-    "RTX 4090": 0.426,
-    "RTX 5090": 0.871,
-    "RTX A5000": 0.304,
-    "RTX 6000 Ada": 0.601,
-    "A100 PCIe": 1.035,
-    "A100 SXM": 1.133,
-}
-
-
-def realized_hourly_usd(name: str) -> float:
-    """Market (spot/queue) $/hr, clamped to the list price; the list price when not observed."""
-    list_price = gpu_hourly_usd(name)
-    return min(REALIZED_HOURLY_USD.get(name, list_price), list_price)
 
 
 def gpu_vram_gb(name: str) -> int:
@@ -74,10 +48,12 @@ def gpu_vram_gb(name: str) -> int:
 
 
 def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
-    """Cheapest GPU class that fits ``required_vram_gb``, ranked by the REALIZED (market) $/hr it
-    is BILLED at (ties: vram, name) -- so selection is consistent with the bill and approximates
-    the allocator, which provisions the cheapest live offer. No pin and no validation gate -- every
-    fitting class is eligible. ``provider`` restricts candidates to what it can provision.
+    """Cheapest GPU class that fits ``required_vram_gb``, ranked by static $/hr.
+
+    No pin; every fitting class is eligible, validated or not. NOTE this is intentionally
+    gate-free: the submit-time allocator restricts to the validated pool, so the
+    actually-provisioned class can be pricier than the one priced here. ``provider`` restricts
+    candidates to what it can provision.
     """
 
     def _selectable(g: GpuClass) -> bool:
@@ -86,7 +62,7 @@ def pick_gpu(required_vram_gb: int, *, provider: str | None = None) -> str:
     candidates = [g for g in GPU_INFO.values() if g.vram_gb >= required_vram_gb and _selectable(g)]
     if not candidates:
         raise ValueError(f"no GPU class fits >= {required_vram_gb} GB")
-    best = min(candidates, key=lambda g: (realized_hourly_usd(g.name), g.vram_gb, g.name))
+    best = min(candidates, key=lambda g: (gpu_hourly_usd(g.name), g.vram_gb, g.name))
     return best.name
 
 
@@ -103,7 +79,7 @@ def total_params_b(model_id: str) -> float:
 
 
 def model_quant(model_id: str) -> str:
-    """Quantization of the catalog entry (``"bf16"`` or ``"4bit-qlora"``); bf16 default."""
+    """Quantization of the catalog entry; ``"bf16"`` for the whole catalog today (bf16 default)."""
     info = MODELS.get(model_id)
     return (info.quant or "bf16") if info is not None else "bf16"
 

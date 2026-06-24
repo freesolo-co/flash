@@ -18,7 +18,7 @@ import time
 from flash.spec import JobSpec
 
 
-def _run_job(spec: JobSpec) -> None:
+def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     # Lazy import so dry-run / unit tests never construct a Flash endpoint.
     from flash.providers.runpod.train import upload_code
     from flash.runner import (
@@ -38,7 +38,7 @@ def _run_job(spec: JobSpec) -> None:
     _update(spec.run_id, "provisioning")
     log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
     try:
-        _run_job_inner(spec, log_path, upload_code)
+        _run_job_inner(spec, log_path, upload_code, runtime_secrets=runtime_secrets)
     finally:
         # Endpoint GC: every run leaves its uniquely-named endpoint registered, and the
         # account-wide *max workers quota* (5 by default) counts registered endpoints —
@@ -57,18 +57,21 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
+def _submit_seed_supervised(
+    spec: JobSpec,
+    seed: int,
+    log,
+    runtime_secrets: dict[str, str] | None = None,
+) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
-    Each attempt first ALLOCATES the GPU: the cheapest class across providers (RunPod
-    live pricing + Vast verified-datacenter offers) that fits the model — re-resolved
-    fresh per attempt because offers are a live market. There is no GPU pin, no validation
-    gate, and no provider pin — the cheapest fitting class always wins.
+    Each attempt first ALLOCATES the GPU: the cheapest active RunPod class that fits the model,
+    priced from the static GPU table. There is no GPU pin — the cheapest fitting class in the
+    validated pool always wins.
 
-    Retries (fresh job on a fresh host; worker resumes from the latest HF
-    checkpoint) when the failure looks infra-shaped: a stall (heartbeat frozen), a
-    client polling breakdown, or a platform TIMED_OUT/worker-loss. Sick Vast machines
-    are blacklisted for the run; failover naturally crosses providers.
+    Retries (fresh job on a fresh host; worker resumes from the latest HF checkpoint) when the
+    failure looks infra-shaped: a stall (heartbeat frozen), a client polling breakdown, or a
+    platform TIMED_OUT/worker-loss.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
     immediately.
     """
@@ -110,7 +113,6 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
 
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
-    bad_machines: set[int] = set()
     # Index into the ranked candidate list. It advances only after an attempt that
     # actually provisioned a class lost it to an infra failure (see the retry tail), so a
     # failed allocation — which never tried a card — can't skip past the cheapest class.
@@ -119,23 +121,7 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
-            # Dispatched generically via the handle's provider.
-            if last_handle.get("provider") == "vast":
-                with contextlib.suppress(Exception):
-                    from flash.providers import get_provider
-                    from flash.providers.base import JobHandle
-
-                    get_provider("vast").destroy(JobHandle.from_dict(last_handle))
-                if last_handle.get("machine_id"):
-                    bad_machines.add(int(last_handle["machine_id"]))
-                print(
-                    f"retry {attempt}: destroyed vast instance "
-                    f"{last_handle.get('instance_id')} (machine "
-                    f"{last_handle.get('machine_id')} blacklisted for this run)",
-                    file=log,
-                    flush=True,
-                )
-            elif last_handle.get("endpoint_id"):
+            if last_handle.get("endpoint_id"):
                 try:
                     from flash.providers.runpod import api as runpod_api
 
@@ -172,8 +158,6 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             alloc = allocate(
                 spec.model,
                 spec.algorithm,
-                disk_gb=spec.gpu.disk_gb,
-                exclude_machine_ids=frozenset(bad_machines),
                 # Pass the run's train knobs + thinking so the VRAM estimate reflects THIS job's
                 # max_length / group_size / batch_size / lora_rank (and the seq escalation) instead
                 # of the generic defaults — else a long-context / big-group run is sized at seq=1024
@@ -188,17 +172,15 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 raise  # config-shaped: no GPU anywhere can run this job
             res = PollResult(False, failure="poll_error", detail=f"allocation: {exc}")
         if alloc is not None:
-            # allocate() above ran a live-market price walk; re-check cancellation
-            # right before provisioning so a cancel during allocation doesn't still
-            # launch a paid worker.
+            # Re-check cancellation right before provisioning so a cancel during allocation
+            # doesn't still launch a paid worker.
             with contextlib.suppress(FileNotFoundError):
                 if get_status(spec.run_id).state == "cancelled":
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
             # Walk down the ranked candidates by the walk offset (clamped to the last): the
             # first attempt takes the cheapest; each retry that provisioned a class and lost
             # it to an infra failure steps to the next-cheapest, so a capacity-starved class
-            # can't burn the whole budget. A concrete pin yields a single candidate, so the
-            # clamp keeps a pinned run on its class.
+            # can't burn the whole budget.
             chosen = alloc.candidates[min(gpu_walk_offset, len(alloc.candidates) - 1)]
             print(allocation_summary(alloc), file=log, flush=True)
             if chosen.gpu != alloc.gpu:
@@ -211,32 +193,19 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
             run_spec = _spec_with_gpu(spec, chosen.gpu)
             current_gpu["name"] = chosen.gpu
             provider = get_provider(chosen.provider)
-            # Vast needs the live-market offer book for the chosen class first, then the
-            # other allocator-approved classes by price; RunPod ignores ``offers``.
-            offers = None
-            if chosen.provider == "vast":
-                ok_classes = {c.gpu for c in alloc.candidates if c.provider == "vast"}
-                offers = sorted(
-                    (o for o in alloc.provider_offers if o.gpu in ok_classes),
-                    key=lambda o: (o.gpu != chosen.gpu, o.dph_total),
-                )
             try:
-                res = provider.submit_run(
-                    run_spec,
-                    seed,
-                    log=log,
-                    on_handle=on_handle,
-                    attempt=attempt,
-                    offers=offers,
-                    # The run's machine blacklist must reach the provider so an in-provider
-                    # offer REFRESH (Vast) keeps stalled/sick machines excluded.
-                    exclude_machine_ids=frozenset(bad_machines),
-                )
+                submit_kwargs = {
+                    "log": log,
+                    "on_handle": on_handle,
+                    "attempt": attempt,
+                }
+                if runtime_secrets:
+                    submit_kwargs["runtime_secrets"] = runtime_secrets
+                res = provider.submit_run(run_spec, seed, **submit_kwargs)
             except Exception as exc:
                 # Deploy/submit themselves can fail transiently (observed: RunPod
-                # GraphQL "Something went wrong" x3 during a retry deploy; a vast offer
-                # pool emptying between search and rent). That must consume a retry, not
-                # kill the run — the budget exists precisely for flakes.
+                # GraphQL "Something went wrong" x3 during a retry deploy). That must
+                # consume a retry, not kill the run — the budget exists precisely for flakes.
                 res = PollResult(False, failure="poll_error", detail=f"deploy/submit: {exc}")
                 if attempt < max_retries:
                     time.sleep(10 * (attempt + 1))  # let the transient clear
@@ -259,27 +228,9 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
                 res.metrics.setdefault("allocated_gpu", chosen.gpu)
             return res.metrics
         last_detail = f"{res.failure}: {res.detail}"
-        # Infra-shaped failures are retried on a FRESH endpoint/host; genuine worker
-        # code errors are not. Detail markers cover the observed flake classes:
-        # platform timeouts, worker pip-install network timeouts, and sick-GPU hosts.
-        _infra_markers = (
-            "TIMED_OUT",
-            "Failed to fetch",
-            "operation timed out",
-            "python_dependencies failed",
-            "Connection reset",
-            "cuda not available",
-            "GPU never became ready",
-            # Host vanished mid-run: the instance went "missing"/dead and NOTHING was captured
-            # (no marker error, no error_<phase>.txt, no console log) so _failure_detail falls back
-            # to this bare sentinel. A genuine worker code crash instead yields a RICHER detail
-            # (the captured traceback), so this exact phrase only ever marks a dead host -> retry it
-            # on a fresh one. Without this, a single ~1-in-200 host death killed the whole run.
-            "terminated without a DONE sentinel",
-        )
-        infra_shaped = res.failure in ("stalled", "poll_error") or any(
-            m in (res.detail or "") for m in _infra_markers
-        )
+        # Retry only on a structured failure category the provider already classified; a real job
+        # failure fails fast. No detail-string parsing. (USER cancels are caught below, not here.)
+        infra_shaped = res.failure in ("stalled", "poll_error", "job_preempted")
         # A cancel deletes the endpoint, which the poller sees as an
         # infra-shaped failure; retrying would resurrect the run and keep
         # billing. The user's cancel wins over the retry budget.
@@ -310,7 +261,12 @@ def _submit_seed_supervised(spec: JobSpec, seed: int, log) -> dict:
     raise RuntimeError(f"seed {seed} failed after retries: {last_detail}")
 
 
-def _run_job_inner(spec: JobSpec, log_path: str, upload_code) -> None:
+def _run_job_inner(
+    spec: JobSpec,
+    log_path: str,
+    upload_code,
+    runtime_secrets: dict[str, str] | None = None,
+) -> None:
     from flash.runner import _run_seed_loop, _RunCancelled, _update, get_status
 
     try:
@@ -318,7 +274,13 @@ def _run_job_inner(spec: JobSpec, log_path: str, upload_code) -> None:
         # worker — which fetches code/** from that same repo — can run it.
         upload_code(spec.train.hf_repo)
         with open(log_path, "a") as log:
-            _run_seed_loop(spec, log, start_index=0, prior_cost=0.0)
+            _run_seed_loop(
+                spec,
+                log,
+                start_index=0,
+                prior_cost=0.0,
+                runtime_secrets=runtime_secrets,
+            )
     except _RunCancelled:
         return  # cancel_run already set the terminal state
     except Exception as exc:
@@ -327,12 +289,20 @@ def _run_job_inner(spec: JobSpec, log_path: str, upload_code) -> None:
         raise
 
 
-def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -> None:
+def _run_seed_loop(
+    spec: JobSpec,
+    log,
+    *,
+    start_index: int,
+    prior_cost: float,
+    runtime_secrets: dict[str, str] | None = None,
+) -> None:
     """Run spec.train.seeds[start_index:] under supervision; finalize the run.
 
     Shared by a fresh submit (start_index=0) and post-restart recovery, which
     resumes the remaining seeds after the in-flight one completes."""
     from flash.runner import (
+        TERMINAL_STATES,
         _persist_metrics,
         _RunCancelled,
         _submit_seed_supervised,
@@ -345,17 +315,22 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
     seeds = spec.train.seeds
     for i in range(start_index, len(seeds)):
         seed = seeds[i]
-        # An early cancel (before any remote handle existed) sets `cancelled`;
-        # do not overwrite it with `running` and submit the GPU job anyway.
-        if get_status(spec.run_id).state == "cancelled":
-            raise _RunCancelled(f"run {spec.run_id} was cancelled")
+        # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped
+        # into ANY terminal state — not just `cancelled` — by a concurrent thread/process
+        # (e.g. another recovery marking it failed/done) between the resume decision and here.
+        # Bail before _update + _submit_seed_supervised so we never submit PAID GPU work for an
+        # already-terminal run. (The `running` _update below would be CAS-rejected anyway, but
+        # the supervised submit would still have spent.) _RunCancelled is the loop's terminal
+        # signal; its callers already swallow it / leave the existing terminal state intact.
+        if get_status(spec.run_id).state in TERMINAL_STATES:
+            raise _RunCancelled(f"run {spec.run_id} is already terminal; not submitting seed")
         _update(spec.run_id, "running")
         print(
             f"starting seed={seed} phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
             file=log,
             flush=True,
         )
-        metrics = _submit_seed_supervised(spec, seed, log)
+        metrics = _submit_seed_supervised(spec, seed, log, runtime_secrets=runtime_secrets)
         total_cost += _persist_metrics(spec, seed, metrics)
         # A cancel can land while this thread writes metrics — after the supervised
         # late-cancel check. Re-read before the post-seed status writes so a late
@@ -395,6 +370,79 @@ def _run_seed_loop(spec: JobSpec, log, *, start_index: int, prior_cost: float) -
         artifacts_dir=artifacts_dir(spec),
         resume_seed_index=None,
     )
+    _charge_completed_run_best_effort(spec, log)
+    _register_checkpoints_best_effort(spec, log)
+
+
+def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
+    """Mirror a finished run's deployable per-step checkpoints to the backend store.
+
+    Best-effort and isolated from billing: the checkpoints live on HF regardless, so a
+    persistence miss never changes the run's outcome."""
+    from flash.runner import get_status
+
+    try:
+        from flash.server.checkpoints import register_checkpoints_best_effort
+
+        register_checkpoints_best_effort(get_status(spec.run_id), log=log)
+    except Exception as exc:  # never let checkpoint bookkeeping disturb a run
+        print(f"[ckpt] register warn ({spec.run_id}): {exc}", file=log, flush=True)
+
+
+def _charge_completed_run_best_effort(spec: JobSpec, log) -> None:
+    """Bill a successfully completed external run without changing its training result."""
+    from flash.runner import _update, get_status
+    from flash.server.auth import INTERNAL_KEY_ENV
+    from flash.server.billing import BillingError, charge_completed_run
+
+    status = get_status(spec.run_id)
+    if not status.billing_context or status.billing_state == "charged":
+        return
+
+    internal_key = os.environ.get(INTERNAL_KEY_ENV, "").strip()
+    if not internal_key:
+        detail = f"{INTERNAL_KEY_ENV} is not configured; completed run was not billed"
+        _update(
+            spec.run_id,
+            get_status(spec.run_id).state,
+            billing_state="failed",
+            billing_error=detail,
+        )
+        print(f"billing failed: {detail}", file=log, flush=True)
+        return
+
+    _update(
+        spec.run_id,
+        get_status(spec.run_id).state,
+        billing_state="charging",
+        billing_error=None,
+    )
+    status = get_status(spec.run_id)
+    try:
+        charge = charge_completed_run(internal_key=internal_key, status=status)
+    except BillingError as exc:
+        _update(
+            spec.run_id,
+            get_status(spec.run_id).state,
+            billing_state="failed",
+            billing_error=exc.detail,
+        )
+        print(f"billing failed: {exc.detail}", file=log, flush=True)
+        return
+
+    _update(
+        spec.run_id,
+        get_status(spec.run_id).state,
+        billing_state="charged",
+        billing_error=None,
+        billing_charge=charge,
+    )
+    print(
+        f"billing charged: amount_cents={charge.get('amountCents')} "
+        f"replay={bool(charge.get('replay'))}",
+        file=log,
+        flush=True,
+    )
 
 
 def _gc_run_endpoints(spec: JobSpec) -> None:
@@ -427,11 +475,3 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     except Exception:
         # Best-effort GC; an undeleted endpoint only holds worker quota, never blocks the run.
         pass
-    # Vast instances bill until destroyed: the runner's per-attempt `finally` already
-    # destroys them, but a crashed supervisor thread can leave one behind. Reap any
-    # instance still labeled for this run via the provider's gc (best-effort).
-    from flash.providers import available_providers, get_provider
-
-    if "vast" in available_providers():
-        with contextlib.suppress(Exception):
-            get_provider("vast").gc(spec)

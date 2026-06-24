@@ -13,6 +13,7 @@ import sys
 
 from flash import __version__
 from flash._logging import configure_logging, get_logger
+from flash._update_check import emit_update_notice, maybe_start_update_check
 
 # Command handlers + the patched client surface live in submodules; re-export them so
 # `flash.cli.main` stays the single public import surface (and so monkeypatching
@@ -25,20 +26,17 @@ from flash.cli.main.commands import (  # noqa: F401
     _follow_run,
     _poll_logs,
     client_from_config,
-    cmd_attach,
     cmd_cancel,
     cmd_chat,
-    cmd_cost,
+    cmd_checkpoints,
     cmd_deploy,
     cmd_deployments,
-    cmd_env_init,
     cmd_env_list,
+    cmd_env_setup,
     cmd_gpus,
-    cmd_lab_setup,
     cmd_login,
-    cmd_logs,
     cmd_models,
-    cmd_ps,
+    cmd_runs,
     cmd_status,
     cmd_train,
     cmd_undeploy,
@@ -71,15 +69,19 @@ def main(argv: list[str] | None = None) -> int:
     version = sub.add_parser("version", help="print the Flash version")
     version.set_defaults(func=cmd_version)
 
-    login = sub.add_parser("login", help="log in with your freesolo API key (verified by freesolo)")
+    login = sub.add_parser(
+        "login",
+        help="log in with your freesolo API key (create one at https://freesolo.co/sign-in)",
+    )
     login.add_argument(
         "--api-key",
-        help="your freesolo API key (default: FREESOLO_API_KEY); created in the dashboard",
+        help="your freesolo API key (default: FREESOLO_API_KEY); create it at "
+        "https://freesolo.co/sign-in",
     )
     login.add_argument(
         "--freesolo-url",
         dest="freesolo_url",
-        help="freesolo backend base URL (default: FREESOLO_BASE_URL or https://api-dev.freesolo.co)",
+        help="freesolo backend base URL (default: FREESOLO_BASE_URL or https://api.freesolo.co)",
     )
     login.add_argument(
         "--api-url", help="flash control-plane URL for training calls (default: FLASH_API_URL)"
@@ -89,32 +91,29 @@ def main(argv: list[str] | None = None) -> int:
     whoami = sub.add_parser("whoami", help="show the identity behind your stored key")
     whoami.set_defaults(func=cmd_whoami)
 
-    lab = sub.add_parser("lab", help="local authoring scaffolds")
-    lab_sub = lab.add_subparsers(dest="lab_cmd", required=True)
-    setup = lab_sub.add_parser("setup", help="scaffold environments/ + configs/ in the cwd")
-    setup.set_defaults(func=cmd_lab_setup)
-
     models = sub.add_parser("models", help="list supported base models")
     models.set_defaults(func=cmd_models)
 
     gpus = sub.add_parser("gpus", help="list managed GPU classes with live $/hr")
     gpus.set_defaults(func=cmd_gpus)
 
-    env = sub.add_parser("env", help="manage verifiers environments")
+    env = sub.add_parser("env", help="manage Freesolo environments")
     env_sub = env.add_subparsers(dest="env_cmd", required=True)
-    init = env_sub.add_parser("init", help="scaffold a new local verifiers environment")
-    init.add_argument("name")
-    init.set_defaults(func=cmd_env_init)
+    setup = env_sub.add_parser("setup", help="create a starter Freesolo environment scaffold")
+    setup.set_defaults(func=cmd_env_setup)
 
     env_list = env_sub.add_parser("list", help="list installed + local environments")
     env_list.set_defaults(func=cmd_env_list)
 
-    env_install = env_sub.add_parser("install", help="install a published Prime Hub environment")
-    env_install.add_argument("env_id", help='the env id to install (a Hub slug, "owner/name")')
+    env_install = env_sub.add_parser("install", help="record a Freesolo environment")
+    env_install.add_argument("env_id", help="the Freesolo environment id to record")
     env_install.set_defaults(func=cmd_env_install)
 
-    env_push = env_sub.add_parser(
-        "push", help="publish a local verifiers env to the Prime Hub (private); prints its env id"
+    env_push = env_sub.add_parser("push", help="upload a local Freesolo environment")
+    env_push.add_argument(
+        "--name",
+        required=True,
+        help="Freesolo environment name to publish or update",
     )
     env_push.add_argument("path", nargs="?", default=".")
     env_push.set_defaults(func=cmd_env_push)
@@ -149,48 +148,40 @@ def main(argv: list[str] | None = None) -> int:
     )
     train.set_defaults(func=cmd_train)
 
-    status = sub.add_parser("status", help="show a run's full status JSON")
+    status = sub.add_parser("status", help="show a run's status, logs, or follow logs")
     status.add_argument("run_id")
+    status.add_argument("--logs", action="store_true", help="print current logs before status")
+    status.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="stream logs until the run ends, then print final status",
+    )
     status.set_defaults(func=cmd_status)
 
-    attach = sub.add_parser(
-        "attach", help="follow a running job's logs to completion (resumable any time)"
-    )
-    attach.add_argument("run_id")
-    attach.set_defaults(func=cmd_attach)
+    runs = sub.add_parser("runs", help="list runs and their state/cost")
+    runs.set_defaults(func=cmd_runs)
 
-    ps = sub.add_parser("ps", help="list runs and their state/cost")
-    ps.set_defaults(func=cmd_ps)
-
-    cost = sub.add_parser("cost", help="show a run's accrued cost (USD)")
-    cost.add_argument("run_id")
-    cost.set_defaults(func=cmd_cost)
-
-    cancel = sub.add_parser("cancel", help="cancel a run (best-effort)")
+    cancel = sub.add_parser("cancel", help="cancel a run")
     cancel.add_argument("run_id")
     cancel.set_defaults(func=cmd_cancel)
 
-    logs = sub.add_parser("logs")
-    logs.add_argument("run_id")
-    logs.add_argument("-f", "--follow", action="store_true", help="stream new log lines")
-    logs.set_defaults(func=cmd_logs)
+    checkpoints = sub.add_parser(
+        "checkpoints", help="list a run's deployable per-step RL checkpoints"
+    )
+    checkpoints.add_argument("run_id")
+    checkpoints.set_defaults(func=cmd_checkpoints)
 
     deploy = sub.add_parser("deploy")
     deploy.add_argument("run_id")
-    deploy.add_argument(
-        "--mode",
-        choices=["dev", "always-on"],
-        default="dev",
-        help="dev: scale-to-zero, cold start after idle, $0 when unused (default). "
-        "always-on: one warm worker 24/7, no cold starts, continuous billing.",
-    )
-    deploy.add_argument(
-        "--idle-timeout",
-        type=int,
-        default=300,
-        help="dev mode: seconds of inactivity before the worker scales to zero (default 300)",
-    )
     deploy.add_argument("--dry-run", action="store_true")
+    deploy.add_argument(
+        "--step",
+        type=int,
+        default=None,
+        help="deploy a specific intermediate checkpoint (see `flash checkpoints <run_id>`) "
+        "instead of the run's final adapter; works even for a run cancelled mid-RL",
+    )
     deploy.set_defaults(func=cmd_deploy)
 
     undeploy = sub.add_parser("undeploy", help="tear down a run's serving endpoint")
@@ -213,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
+    # Kick off a once-a-day PyPI version check in the background; the "new release available"
+    # notice (if any) prints to stderr after the command output (see emit_update_notice).
+    update_check = maybe_start_update_check()
     try:
         return args.func(args)
     except _USER_ERRORS as exc:
@@ -223,3 +217,5 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("aborted", file=sys.stderr)
         return 130
+    finally:
+        emit_update_notice(update_check)
