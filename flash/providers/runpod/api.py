@@ -65,11 +65,27 @@ def list_endpoints() -> list[dict]:
     # Raises on any per-key failure so callers that treat an empty result as "confirmed
     # absent" (teardown, slot-reconcile) don't act on an incomplete view. Both
     # sweep_idle_endpoints() and the slot reconcile already catch and skip on exception.
+    pool = _keys.keys()
+    if not pool:
+        # No RUNPOD_API_KEY at all: an empty `pool` would make this return [] WITHOUT a single
+        # authenticated call, and callers read [] as "the fleet is empty / confirmed absent" and may
+        # act on that (teardown, slot-reconcile). Fail loud instead — matching the old single-call
+        # request_with_retries() behavior, which raised on a missing key.
+        raise RunpodApiError(
+            "RUNPOD_API_KEY is not set; refusing to report an empty endpoint fleet"
+        )
     all_endpoints: list[dict] = []
-    for key in _keys.keys():  # noqa: SIM118  (_keys is a module, not a dict)
+    for key in pool:
         out = _CLIENT.request_with_retries_for_key(key, f"{REST_BASE}/endpoints", retries=2)
-        if isinstance(out, list):
-            all_endpoints.extend(out)
+        if not isinstance(out, list):
+            # A 200 whose body isn't the expected list is NOT an empty account — silently skipping it
+            # (the old behavior) yields a partial fleet view that callers trust as complete. Raise so
+            # the per-key failure surfaces, consistent with this function's "fail, don't under-report"
+            # contract above.
+            raise RunpodApiError(
+                f"unexpected /endpoints response for a pool key (got {type(out).__name__}, want list)"
+            )
+        all_endpoints.extend(out)
     return all_endpoints
 
 

@@ -99,6 +99,12 @@ def advance_key() -> bool:
     (e.g. key1 → key2 → key1 → ...). With a single key there is nowhere to advance —
     the caller's quota-sweep retry loop handles the wait in that case.
 
+    Contract caveat: because it WRAPS, a multi-key pool ALWAYS returns True — a True return
+    does NOT mean "a fresh, untried account is now active". A `True` never means "more accounts
+    remain", so callers must NOT loop on ``while advance_key(): ...`` to drain the pool (that
+    spins forever when every account is exhausted); bound the number of failovers by
+    ``key_count()`` instead (see ``deploy_train_endpoint``).
+
     Also collapses ``RUNPOD_API_KEY`` to the newly-active key so the SDK and the
     preferred-first REST ordering both follow the failover.
     """
