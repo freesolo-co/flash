@@ -166,12 +166,11 @@ def _is_workers_quota_error(exc: Exception) -> bool:
 _idle_since: dict[str, float] = {}
 
 
-def _is_train_endpoint(name: str) -> bool:
-    """True for a training endpoint this sweep may reap. Matches the SDK's ``live-`` form, and
-    EXCLUDES serve endpoints (``flash-serve-*``): a deployment scaled to zero is intentionally
-    idle (the warm-start contract), not an orphan — it's managed by deploy/undeploy, not here."""
-    bare = name.removeprefix("live-")
-    return bare.startswith("flash-") and not bare.startswith("flash-serve-")
+def _is_flash_endpoint(name: str) -> bool:
+    """True for a flash training endpoint this sweep may reap (matches the SDK's ``live-`` form).
+    Serving runs on freesolo's Modal app, not RunPod, so the only flash-* RunPod endpoints are
+    training endpoints."""
+    return name.removeprefix("live-").startswith("flash-")
 
 
 def _sweep_idle_flash_endpoints(protected: set[str], min_idle_s: float = 0.0) -> int:
@@ -183,7 +182,6 @@ def _sweep_idle_flash_endpoints(protected: set[str], min_idle_s: float = 0.0) ->
 
     - ``protected`` — endpoint names tied to a LIVE run (both the bare ``flash-...`` and the SDK's
       ``live-flash-...`` form). Never deleted, even if momentarily idle (e.g. between seeds).
-    - serve endpoints (``flash-serve-*``) are skipped entirely (see ``_is_train_endpoint``).
     - an endpoint is a candidate only when health reports zero active workers AND zero in-flight
       jobs, and ``min_idle_s`` requires that to PERSIST across sweeps — a single transient zero
       (cold start / between jobs) never triggers a delete.
@@ -199,7 +197,7 @@ def _sweep_idle_flash_endpoints(protected: set[str], min_idle_s: float = 0.0) ->
     for ep in endpoints:
         ep_name = ep.get("name") or ""
         eid = ep.get("id")
-        if not (eid and _is_train_endpoint(ep_name)):
+        if not (eid and _is_flash_endpoint(ep_name)):
             continue
         # Protect the run's endpoint in either registered form.
         if ep_name in protected or ep_name.removeprefix("live-") in protected:
