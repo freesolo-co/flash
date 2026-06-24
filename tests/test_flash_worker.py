@@ -365,3 +365,93 @@ def test_train_body_uploads_console_on_missing_metrics(monkeypatch, tmp_path):
         for _p in ("/tmp/console_sft.txt", "/tmp/console_sft.txt.tail"):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(_p)
+
+
+# --- Persistent kernel-cache redirect onto the opt-in network volume (issue B / #258) ----------
+# The fused Triton/Inductor/tilelang kernels the trainer JIT-compiles on first use cost ~10-15 min
+# on a cold worker (engine.worker; #163 heartbeats through it), on paid GPU time. When a run opts
+# into a RunPod network volume, build_worker_env must point the kernel caches AND the HF cache at
+# the persistent mount so the SECOND run on that volume reaches the first training step in seconds
+# instead of recompiling. RunPod serverless mounts the volume at a fixed /runpod-volume.
+
+_VOLUME_CACHE_KEYS = (
+    "HF_HOME",
+    "TRITON_CACHE_DIR",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "TILELANG_CACHE_DIR",
+    "TORCH_EXTENSIONS_DIR",
+)
+
+
+def _spec_with_volume(nv):
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    return JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        gpu=GpuSpec(network_volume=nv),
+    )
+
+
+def test_build_worker_env_persists_kernel_caches_on_volume():
+    """With a network volume attached, the HF cache AND every JIT kernel cache are redirected onto
+    the persistent /runpod-volume mount — turning the cold-start compile into a one-time-per-volume
+    cost (warm repeat runs skip it)."""
+    from flash.providers.runpod.train import build_worker_env
+
+    env = build_worker_env(_spec_with_volume("vol-x"), 0)
+    # Every reusable cache lands on the persistent mount...
+    for k in _VOLUME_CACHE_KEYS:
+        assert env.get(k, "").startswith("/runpod-volume/"), f"{k} not redirected onto the volume: {env.get(k)!r}"
+    # ...with distinct dirs (a shared dir would let one cache's keys collide with another's).
+    paths = [env[k] for k in _VOLUME_CACHE_KEYS]
+    assert len(set(paths)) == len(paths), (
+        f"cache dirs collide: {dict(zip(_VOLUME_CACHE_KEYS, paths, strict=True))}"
+    )
+    # The three compile caches the issue names explicitly are present (FA2/Triton/Inductor + Hopper).
+    assert env["TRITON_CACHE_DIR"].endswith("/triton")
+    assert env["TORCHINDUCTOR_CACHE_DIR"].endswith("/inductor")
+    assert env["TILELANG_CACHE_DIR"].endswith("/tilelang")
+
+
+def test_build_worker_env_no_volume_leaves_caches_default():
+    """Without a volume the worker keeps the default (ephemeral) cache dirs — a genuinely cold first
+    build still pays the compile, guarded by #163's heartbeat. build_worker_env must NOT point a
+    cache at /runpod-volume when no volume exists (that path isn't a persistent mount then)."""
+    from flash.providers.runpod.train import build_worker_env
+
+    env = build_worker_env(_spec_with_volume(None), 0)
+    for k in _VOLUME_CACHE_KEYS:
+        assert k not in env, f"{k} set without a volume (would point at a non-persistent path): {env.get(k)!r}"
+
+
+def test_network_volume_env_helper_layout():
+    """The helper maps each cache onto the volume; default mount is the RunPod serverless path."""
+    from flash.providers.runpod.train.deps import network_volume_env
+
+    m = network_volume_env()
+    assert m["HF_HOME"] == "/runpod-volume/hf-cache"
+    assert set(m) == set(_VOLUME_CACHE_KEYS)
+    # The mount is overridable (keeps the helper unit-testable / pod-path reusable).
+    alt = network_volume_env("/workspace")
+    assert alt["TRITON_CACHE_DIR"] == "/workspace/kernel-cache/triton"
+
+
+def test_volume_cache_overridable_by_per_run_worker_env():
+    """A per-run [worker_env] still wins over the volume default (the override loop runs after the
+    redirect) — matches the existing HF_HOME precedence; run identity stays reserved."""
+    from flash.providers.runpod.train import build_worker_env
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-4B",
+        algorithm="grpo",
+        train=TrainSpec(steps=10, seeds=(0,), hf_repo="owner/runs"),
+        gpu=GpuSpec(network_volume="vol-x"),
+        worker_env={"TRITON_CACHE_DIR": "/custom/triton"},
+    )
+    env = build_worker_env(spec, 0)
+    assert env["TRITON_CACHE_DIR"] == "/custom/triton"
+    # the un-overridden caches still point at the volume
+    assert env["TORCHINDUCTOR_CACHE_DIR"] == "/runpod-volume/kernel-cache/inductor"

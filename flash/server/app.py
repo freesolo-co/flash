@@ -357,6 +357,12 @@ def create_app():
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         recover_runs()
+        # Reconcile the shared RunPod endpoint-slot quota against the live endpoint list so a
+        # crash can't leak slots permanently (no-op without an internal key). Best-effort.
+        with contextlib.suppress(Exception):
+            from flash.providers.runpod.train.endpoints import reconcile_endpoint_slots
+
+            reconcile_endpoint_slots()
         # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
         # internal key is configured.
         cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
