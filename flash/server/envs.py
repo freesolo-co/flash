@@ -107,10 +107,6 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
         raise EnvPublishError(f"env package could not be extracted: {exc}") from exc
 
 
-def _github_repo() -> str:
-    return _DEFAULT_GITHUB_REPO
-
-
 def _github_token() -> str | None:
     return os.environ.get("GITHUB_TOKEN")
 
@@ -268,13 +264,6 @@ def _github_publish_once(
             _push_environment_commit(checkout=checkout, token=token)
 
 
-def _environment_file_relative_path(root: Path) -> str:
-    canonical = root / _DEFAULT_ENVIRONMENT_FILE
-    if canonical.is_file():
-        return _DEFAULT_ENVIRONMENT_FILE
-    raise EnvPublishError("env package must contain environment.py")
-
-
 def _github_publish(dest: Path, *, name: str, key: dict) -> str:
     token = _github_token()
     if not token:
@@ -282,11 +271,12 @@ def _github_publish(dest: Path, *, name: str, key: dict) -> str:
             "GITHUB_TOKEN is required to upload environments to Freesolo",
             status=503,
         )
-    repo = _github_repo()
+    repo = _DEFAULT_GITHUB_REPO
     ns = namespace_for(key)
     clean = _sanitize_name(name)
     publish_root = f"{ns}/{clean}"
-    _environment_file_relative_path(dest)
+    if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
+        raise EnvPublishError("env package must contain environment.py")
     if not any(path.is_file() for path in dest.rglob("*")):
         raise EnvPublishError("env package contains no files")
     message = f"Upload Flash environment {ns}/{clean}"

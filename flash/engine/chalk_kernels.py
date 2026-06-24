@@ -49,11 +49,6 @@ _KERNELS: list[tuple[str, bool]] = [
 ]
 
 
-def _enabled_kwargs() -> dict[str, bool]:
-    """The fixed ``apply_chalk_kernel_to_qwen35`` boolean kwargs (gap-fillers on, the rest off)."""
-    return dict(_KERNELS)
-
-
 def active_kernels(report: Mapping[str, object] | None) -> list[str]:
     """The chalk kernels that actually ENGAGED (truthy, non-error result) in an apply report.
 
@@ -82,7 +77,7 @@ def install_chalk_kernels(model=None) -> dict:
         # chalk's apply patches the materialized module -> nothing to do before the model is built.
         return {}
 
-    kwargs = _enabled_kwargs()
+    kwargs = dict(_KERNELS)
     try:
         from chalk.transformers import apply_chalk_kernel_to_qwen35
     except ImportError:
