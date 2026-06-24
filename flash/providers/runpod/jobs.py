@@ -19,6 +19,7 @@ import base64
 import contextlib
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 
@@ -163,7 +164,14 @@ def _is_workers_quota_error(exc: Exception) -> bool:
 # Per-endpoint "first observed idle" timestamps, so a candidate must STAY idle across sweeps for
 # ``min_idle_s`` before deletion (a cold-starting / between-jobs endpoint reports a transient zero
 # we must not act on). Pruned each sweep to the still-idle set, so it can't grow unbounded.
+#
+# Two threads can run a sweep at once — the periodic control-plane reaper (via asyncio.to_thread)
+# and a deploy-time quota sweep — so every read/write of ``_idle_since`` is serialized by this lock
+# (a dedicated lock, NOT FLASH_SDK_LOCK, since the sweep uses the REST API, not the Flash SDK).
+# Holding it across the sweep also prevents a concurrent sweep's prune from disturbing this one's
+# grace timers; contention is negligible (the reaper runs every 10 min, deploy sweeps are rare).
 _idle_since: dict[str, float] = {}
+_idle_since_lock = threading.Lock()
 
 
 def _is_flash_endpoint(name: str) -> bool:
@@ -196,46 +204,49 @@ def _sweep_idle_flash_endpoints(protected: set[str], min_idle_s: float = 0.0) ->
         return 0
     now = time.time()
     still_idle: set[str] = set()
-    for ep in endpoints:
-        ep_name = ep.get("name") or ""
-        eid = ep.get("id")
-        if not (eid and _is_flash_endpoint(ep_name)):
-            continue
-        # Protect the run's endpoint in either registered form.
-        if ep_name in protected or ep_name.removeprefix("live-") in protected:
-            continue
-        try:
-            health = runpod_api.endpoint_health(eid) or {}
-            workers = health.get("workers")
-            jobs_info = health.get("jobs")
-            # Require non-empty dicts: a missing/empty workers section means the health response
-            # is incomplete and we can't confirm the endpoint is idle.
-            if not isinstance(workers, dict) or not workers or not isinstance(jobs_info, dict):
+    # Serialize all _idle_since access (see the lock's definition): a concurrent sweep must not
+    # mutate the dict mid-iteration (the prune below would raise) or disturb these grace timers.
+    with _idle_since_lock:
+        for ep in endpoints:
+            ep_name = ep.get("name") or ""
+            eid = ep.get("id")
+            if not (eid and _is_flash_endpoint(ep_name)):
                 continue
-            # "Busy" = a worker actually working or spinning up, OR a job queued/in progress.
-            # A warm idle/ready worker with no pending work is NOT busy — it is the leftover we
-            # reclaim (subject to the protected set + idle grace below).
-            busy_workers = (workers.get("running") or 0) + (workers.get("initializing") or 0)
-            in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
-            if busy_workers != 0 or in_flight != 0:
-                _idle_since.pop(eid, None)  # busy again -> reset the grace timer
+            # Protect the run's endpoint in either registered form.
+            if ep_name in protected or ep_name.removeprefix("live-") in protected:
                 continue
-            still_idle.add(eid)
-            first_idle = _idle_since.setdefault(eid, now)
-            if now - first_idle < min_idle_s:
-                continue  # idle, but not for long enough yet — wait for the next sweep
-            if runpod_api.delete_endpoint(eid):
-                deleted += 1
-                _idle_since.pop(eid, None)
-                logger.info("idle-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
-        except Exception:
-            logger.debug(
-                "idle-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True
-            )
-            continue
-    # Drop grace timers for endpoints no longer idle/present (busy, deleted, gone, or protected).
-    for stale in set(_idle_since) - still_idle:
-        _idle_since.pop(stale, None)
+            try:
+                health = runpod_api.endpoint_health(eid) or {}
+                workers = health.get("workers")
+                jobs_info = health.get("jobs")
+                # Require non-empty dicts: a missing/empty workers section means the health
+                # response is incomplete and we can't confirm the endpoint is idle.
+                if not isinstance(workers, dict) or not workers or not isinstance(jobs_info, dict):
+                    continue
+                # "Busy" = a worker actually working or spinning up, OR a job queued/in progress.
+                # A warm idle/ready worker with no pending work is NOT busy — it is the leftover we
+                # reclaim (subject to the protected set + idle grace below).
+                busy_workers = (workers.get("running") or 0) + (workers.get("initializing") or 0)
+                in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
+                if busy_workers != 0 or in_flight != 0:
+                    _idle_since.pop(eid, None)  # busy again -> reset the grace timer
+                    continue
+                still_idle.add(eid)
+                first_idle = _idle_since.setdefault(eid, now)
+                if now - first_idle < min_idle_s:
+                    continue  # idle, but not for long enough yet — wait for the next sweep
+                if runpod_api.delete_endpoint(eid):
+                    deleted += 1
+                    _idle_since.pop(eid, None)
+                    logger.info("idle-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
+            except Exception:
+                logger.debug(
+                    "idle-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True
+                )
+                continue
+        # Drop grace timers for endpoints no longer idle/present (busy, deleted, gone, protected).
+        for stale in set(_idle_since) - still_idle:
+            _idle_since.pop(stale, None)
     return deleted
 
 
