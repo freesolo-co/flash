@@ -103,6 +103,20 @@ class FakeClient:
             "artifacts_dir": "acme/qwen3.5-4b-grpo-runs",
         }
 
+    def create_run(self, payload, runtime_secrets=None):
+        return {"run_id": "flash-1718900000-a1b2c3d4", "state": "queued"}
+
+    def get_logs(self, run_id, offset=0):
+        logs = (
+            "worker: provisioning RTX 5090 on runpod ...\n"
+            "worker: loading Qwen/Qwen3.5-4B (bf16, LoRA r=32) ...\n"
+            "step  10/150  loss=1.842  reward=0.41  lr=1.0e-4\n"
+            "step 150/150  loss=0.213  reward=0.88  lr=2.0e-6\n"
+            "worker: pushing adapter -> acme/qwen3.5-4b-grpo-runs\n"
+        )
+        # one page, already terminal, so the CLI prints the logs once and stops (no polling)
+        return {"run_id": run_id, "logs": logs, "offset": len(logs), "state": "done"}
+
     def cancel_run(self, run_id):
         return {"run_id": run_id, "state": "cancelled"}
 
@@ -164,8 +178,10 @@ def _set_style(styled: bool, theme: str = "dark") -> None:
     os.environ["FLASH_THEME"] = theme
 
 
-def _capture_argv(argv, *, styled, theme="dark", cwd=None) -> str:
-    """Run a real `flash` invocation against the fake client and capture stdout."""
+def _capture_argv(argv, *, styled, theme="dark", cwd=None, with_stderr=False) -> str:
+    """Run a real `flash` invocation against the fake client and capture stdout. When
+    ``with_stderr`` is set, the stderr note (e.g. `flash train`'s hand-off line) is shown first,
+    as it appears in a real terminal before the streamed logs."""
     _set_style(styled, theme)
     commands = sys.modules["flash.cli.main.commands"]
     saved = commands.client_from_config
@@ -180,7 +196,10 @@ def _capture_argv(argv, *, styled, theme="dark", cwd=None) -> str:
     finally:
         os.chdir(prev)
         commands.client_from_config = saved
-    return out.getvalue().rstrip("\n")
+    stdout = out.getvalue().rstrip("\n")
+    if with_stderr and (note := err.getvalue().rstrip("\n")):
+        return f"{note}\n{stdout}"
+    return stdout
 
 
 # ---- xterm-256 -> hex --------------------------------------------------------------
@@ -300,14 +319,14 @@ def build_cases(tmp: Path):
 
     cases = []
 
-    def add_argv(title, sub, argv, cwd=None):
+    def add_argv(title, sub, argv, cwd=None, with_stderr=False):
         cases.append(
             (
                 title,
                 sub,
-                _capture_argv(argv, styled=False, cwd=cwd),
-                _capture_argv(argv, styled=True, theme="dark", cwd=cwd),
-                _capture_argv(argv, styled=True, theme="light", cwd=cwd),
+                _capture_argv(argv, styled=False, cwd=cwd, with_stderr=with_stderr),
+                _capture_argv(argv, styled=True, theme="dark", cwd=cwd, with_stderr=with_stderr),
+                _capture_argv(argv, styled=True, theme="light", cwd=cwd, with_stderr=with_stderr),
             )
         )
 
@@ -346,6 +365,12 @@ def build_cases(tmp: Path):
         "package + upload a local environment",
         lambda: render.env_published("acme/math-grader"),
         push_plain,
+    )
+    add_argv(
+        "flash train rl.toml",
+        "submit a run and follow its logs",
+        ["train", str(cost_cfg)],
+        with_stderr=True,
     )
     add_argv(
         "flash train --cost rl.toml", "pre-flight cost estimate", ["train", str(cost_cfg), "--cost"]
