@@ -142,21 +142,33 @@ def _acquire_endpoint_slot(name: str) -> None:
 def _release_endpoint_slot(name: str) -> bool:
     """Release the quota slot for ``name``, routed to the store it was claimed from.
 
-    Returns ``True`` if a slot was released, ``False`` if this process never acquired one for
-    ``name`` (e.g. a fresh ``flash cancel`` process, or the slot was already released). The
-    ``_ACQUIRED`` map makes this idempotent — only the first call for a name releases.
+    The ``_ACQUIRED`` map records how this process claimed the slot (``"local"`` | ``"shared"``)
+    and makes the common path idempotent — only the first call for a name this process claimed
+    releases. When a shared store is configured, a teardown running on a DIFFERENT replica than
+    the one that claimed the slot (e.g. a ``flash cancel`` routed to another control-plane
+    replica) has no ``_ACQUIRED`` entry but must STILL drop the shared row, or the slot leaks
+    until the next reconcile and the queue is throttled even though the endpoint is gone. The
+    callers only invoke this once the remote endpoint is provably gone, and server-side release
+    is idempotent, so the best-effort cross-replica release is safe.
+
+    Returns ``True`` if a slot was (or, on the shared path, may have been) released; ``False`` for
+    a no-op (nothing tracked locally and no shared store to release against).
     """
     with _ACQUIRED_LOCK:
         mode = _ACQUIRED.pop(name, None)
-    if mode is None:
-        return False
     if mode == "local":
         _LOCAL_SLOTS.release()
         return True
     from flash.providers.runpod import slots
 
+    # mode == "shared": this process holds the row. mode is None: either a cross-replica teardown
+    # (release the shared row anyway) or — with no shared store at all — genuinely nothing to do.
+    cross_replica = mode is None
+    if cross_replica and slots.internal_key() is None:
+        return False
+
     try:
-        slots.release(name)
+        released = slots.release(name)
     except slots.SlotStoreError as exc:
         # A transient release failure can't leak the slot permanently: the endpoint is gone, so
         # the next startup reconcile reclaims its row against the live endpoint list.
@@ -165,7 +177,8 @@ def _release_endpoint_slot(name: str) -> bool:
             name,
             exc,
         )
-    return True
+        return not cross_replica
+    return released if cross_replica else True
 
 
 def reconcile_endpoint_slots() -> None:
@@ -696,8 +709,9 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             # as "absent" — releasing on an unverified absence risks oversubscribing the quota.
             logger.debug("REST endpoint lookup failed for %s: %s", target, exc)
 
-    # Release the quota slot for this run's endpoint.  Only releases if this process
-    # previously acquired one (no-op in a fresh ``flash cancel`` process).  Release ONLY when
+    # Release the quota slot for this run's endpoint.  Releases the slot this process acquired,
+    # or — when a shared store is configured — the row a different replica claimed (a ``flash
+    # cancel`` may run on another replica than the one that deployed).  Release ONLY when
     # the remote endpoint is provably gone: (a) at least one undeploy/delete succeeded, or
     # (b) we positively verified no remote endpoint exists (registry returned no uids AND the
     # REST lookup confirmed none — e.g. the endpoint never finished deploying, so its slot
