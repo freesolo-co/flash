@@ -127,7 +127,11 @@ def _load_active_env():
             "(a Freesolo environment id like 'your-name/your-env', returned by "
             "`flash env push --name <name>`)."
         )
-    return load_environment(env_id, JOB_SPEC.environment.params)
+    # Pass the control-plane-pinned commit sha (resolve-once hook) when present so the adapter
+    # skips the GitHub ref->sha resolve; "" (the default) keeps the worker resolving it itself.
+    return load_environment(
+        env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
+    )
 
 
 ACTIVE_ENV = None

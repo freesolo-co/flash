@@ -39,8 +39,14 @@ def worker_pip_for_env(env_id: str) -> list[str]:
     return ["freesolo"]
 
 
-def load_environment(env_id: str, params: dict | None = None) -> Environment:
-    """Load a Freesolo SDK environment and wrap it in Flash's protocol."""
+def load_environment(
+    env_id: str, params: dict | None = None, resolved_sha: str | None = None
+) -> Environment:
+    """Load a Freesolo SDK environment and wrap it in Flash's protocol.
+
+    ``resolved_sha`` is the optional resolve-once hint (the control-plane-pinned commit sha for the
+    env's GitHub ref). None/"" preserves today's behavior — the adapter resolves the ref itself.
+    """
     params = params or {}
     from .adapter import load_freesolo_environment
 
@@ -49,4 +55,7 @@ def load_environment(env_id: str, params: dict | None = None) -> Environment:
             "no environment specified: set [environment] id to the id returned by "
             "`flash env push --name <name>` (for example 'your-name/your-env')"
         )
-    return load_freesolo_environment(env_id, **params)
+    # resolved_sha is our reserved control-plane kwarg; never let an env-supplied param shadow it
+    # (a stray params["resolved_sha"] would otherwise raise "multiple values for keyword argument").
+    _params = {k: v for k, v in params.items() if k != "resolved_sha"}
+    return load_freesolo_environment(env_id, resolved_sha=resolved_sha or None, **_params)

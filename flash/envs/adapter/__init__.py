@@ -17,6 +17,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,6 +43,19 @@ _TAR_METADATA_TYPES = {
 }
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
+
+# Content-addressed, process-local caches so co-located resolves/downloads (the common case:
+# many workers booting on the same node, or a single process resolving the same env twice)
+# reuse instead of re-hitting GitHub. A commit SHA is immutable, so caching by (repo, sha) is
+# always safe. The ref->sha cache is keyed by (repo_full_name, ref); the resolved sha is then
+# stored under (repo_full_name, sha) so an etag-conditional request can return the prior bytes
+# on a 304. All access is guarded by _CACHE_LOCK (many worker threads may resolve at once).
+_CACHE_LOCK = threading.Lock()
+# (repo_full_name, ref) -> resolved 40-char commit sha
+_REF_SHA_CACHE: dict[tuple[str, str], str] = {}
+# (repo_full_name, sha) -> (etag or None, tarball bytes). Bounds memory by entry count, not size:
+# an env tarball is small and the set of distinct envs a node touches is tiny.
+_TARBALL_CACHE: dict[tuple[str, str], tuple[str | None, bytes]] = {}
 
 
 @dataclass(frozen=True)
@@ -200,9 +214,26 @@ def _is_commit_sha(value: str) -> bool:
     return _COMMIT_SHA_RE.fullmatch(value) is not None
 
 
-def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
+def _resolve_ref_sha(parsed: GitHubEnvironmentRef, pinned_sha: str | None = None) -> str:
+    # Resolve-once hook (item 3): the control plane can resolve ref->sha ONCE and pass the pinned
+    # commit sha through, so the worker short-circuits without hitting GitHub at all. Same effect
+    # as the immutable-ref fast path below, but applied to a symbolic ref (e.g. "main") that the
+    # worker would otherwise have to resolve itself. Only a real 40-char sha is trusted; anything
+    # else falls through to the live resolve. See spec.EnvironmentSpec.resolved_sha for the (still
+    # optional, default-off) field that would carry this end-to-end.
+    if pinned_sha and _is_commit_sha(pinned_sha):
+        return pinned_sha
     if _is_commit_sha(parsed.ref):
         return parsed.ref
+    # Content-addressed cache: a co-located resolve of the same (repo, ref) reuses the prior
+    # answer instead of re-hitting the GitHub commits API. Safe because each entry maps to an
+    # immutable commit sha; a ref that later moves resolves to a new (repo, ref) only if the
+    # process is restarted, which is acceptable for a per-boot resolve.
+    cache_key = (parsed.repo_full_name, parsed.ref)
+    with _CACHE_LOCK:
+        cached = _REF_SHA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
     token = _github_token()
     if token:
@@ -219,12 +250,36 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef) -> str:
     sha = payload.get("sha")
     if not isinstance(sha, str) or not _is_commit_sha(sha):
         raise RuntimeError(f"Failed to resolve GitHub environment ref {parsed.canonical()}")
+    with _CACHE_LOCK:
+        _REF_SHA_CACHE[cache_key] = sha
     return sha
 
 
 def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
+    """Fetch bytes for a GitHub request with the #209 jittered 403-retry. Bytes-only contract."""
+    data, _etag = _urlopen_with_etag(req, timeout=timeout)
+    return data
+
+
+def _urlopen_with_etag(
+    req: urllib.request.Request,
+    *,
+    timeout: float = 60.0,
+    cached: tuple[str | None, bytes] | None = None,
+) -> tuple[bytes, str | None]:
+    """Fetch bytes plus the response ETag, supporting an If-None-Match conditional.
+
+    When ``cached`` (etag, bytes) is supplied and has an etag, the request is sent with an
+    ``If-None-Match`` header; a 304 (Not Modified) returns the cached bytes unchanged rather than
+    empty bytes, so the bytes contract is preserved. Keeps #209's jittered 403-retry as the safety
+    net. The returned etag (or None) lets the caller refresh its content-addressed cache.
+    """
     import random
     import time
+
+    cached_etag = cached[0] if cached else None
+    if cached_etag:
+        req.add_header("If-None-Match", cached_etag)
 
     _MAX_RATE_LIMIT_RETRIES = 5
     _RATE_LIMIT_BASE_DELAY = 10.0
@@ -232,8 +287,18 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
     while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
+                # `.headers` is defensive: a real http.client.HTTPResponse has it, but a faked
+                # response (tests) or odd opener may not — a missing etag just disables the
+                # conditional, never breaks the bytes return.
+                headers = getattr(resp, "headers", None)
+                etag = headers.get("ETag") if headers is not None else None
+                return resp.read(), etag
         except urllib.error.HTTPError as exc:
+            # 304 Not Modified: the conditional request matched our cached etag, so reuse the
+            # cached bytes (never empty bytes) and keep the same etag. Only reachable when we
+            # actually sent an If-None-Match, so `cached` is present here.
+            if exc.code == 304 and cached is not None:
+                return cached[1], cached_etag
             body = exc.read().decode("utf-8", "replace")
             if exc.code == 403 and "rate limit" in body.lower() and attempt < _MAX_RATE_LIMIT_RETRIES:
                 # GitHub secondary rate limit: many workers booting simultaneously all
@@ -249,6 +314,18 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
+    # Content-addressed tarball cache keyed by (repo, sha). Callers download the tarball for the
+    # ALREADY-resolved commit sha (see _resolve_github_environment_file), so the bytes are immutable
+    # and a cache hit can serve them without touching GitHub. When the key isn't an immutable sha
+    # (an unresolved ref), the stored etag still lets us send an If-None-Match conditional and reuse
+    # the cached bytes on a 304 instead of re-downloading the whole archive.
+    cache_key = (ref.repo_full_name, ref.ref)
+    immutable = _is_commit_sha(ref.ref)
+    with _CACHE_LOCK:
+        cached = _TARBALL_CACHE.get(cache_key)
+    if cached is not None and immutable:
+        return cached[1]
+
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -257,12 +334,16 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
+    data, etag = _urlopen_with_etag(
+        urllib.request.Request(url, headers=headers), timeout=120.0, cached=cached
+    )
     if len(data) > _MAX_ARCHIVE_BYTES:
         raise RuntimeError(
             f"environment archive is too large ({len(data)} bytes; "
             f"limit {_MAX_ARCHIVE_BYTES} bytes)"
         )
+    with _CACHE_LOCK:
+        _TARBALL_CACHE[cache_key] = (etag, data)
     return data
 
 
@@ -309,11 +390,15 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
     return extracted
 
 
-def _resolve_github_environment_file(env_ref: str) -> Path:
+def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
-    resolved_ref = _resolve_ref_sha(parsed)
+    # Only forward pinned_sha when set, so the unpatched _resolve_ref_sha(parsed) call shape stays
+    # single-arg (a test monkeypatch like ``lambda parsed: ...`` keeps working).
+    resolved_ref = (
+        _resolve_ref_sha(parsed, pinned_sha=pinned_sha) if pinned_sha else _resolve_ref_sha(parsed)
+    )
     cache_key = hashlib.sha256(
         f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
@@ -348,16 +433,21 @@ def _resolve_github_environment_file(env_ref: str) -> Path:
         shutil.rmtree(tmp_parent, ignore_errors=True)
 
 
-def _resolve_environment_reference(env_ref: str) -> str:
+def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) -> str:
+    # pinned_sha (resolve-once hook, item 3): when the control plane already resolved this env's
+    # ref->sha, it threads the commit sha here so the GitHub commits API is skipped entirely. None
+    # (the default and today's behavior) means the worker resolves the ref itself.
     if is_managed_environment_slug(env_ref):
-        return str(_resolve_github_environment_file(managed_slug_to_github_ref(env_ref)))
+        return str(
+            _resolve_github_environment_file(managed_slug_to_github_ref(env_ref), pinned_sha)
+        )
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         path = Path(env_ref)
         if path.exists():
             return str(path)
         return env_ref
-    return str(_resolve_github_environment_file(env_ref))
+    return str(_resolve_github_environment_file(env_ref, pinned_sha))
 
 
 def _resolve_path_arg(value: object, base_dir: Path) -> object:
@@ -711,9 +801,14 @@ class FreesoloEnvironment(BaseEnvironment):
         return float(rewards[0].score)
 
 
-def load_freesolo_environment(env_id: str, **kwargs) -> FreesoloEnvironment:
+def load_freesolo_environment(
+    env_id: str, *, resolved_sha: str | None = None, **kwargs
+) -> FreesoloEnvironment:
+    # resolved_sha is a keyword-only resolve-once hook (item 3): kept OUT of **kwargs because those
+    # are forwarded verbatim to the Freesolo SDK env loader. None (default) preserves today's
+    # behavior — the worker resolves the env ref->sha itself.
     tools = _import_freesolo_environment_tools()
-    reference = _resolve_environment_reference(env_id)
+    reference = _resolve_environment_reference(env_id, resolved_sha)
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 
