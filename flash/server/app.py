@@ -182,8 +182,14 @@ def _worker_artifacts(spec) -> dict[str, str]:
                 repo_type="dataset",
                 filename=f"{prefix}/{name}",
                 token=os.environ.get("HF_TOKEN"),
+                # The worker appends to console/error files across the run, so a cached copy goes
+                # stale; force a fresh pull (matches other HF artifact readers, e.g.
+                # flash/providers/runpod/jobs.py:make_hf_text_reader).
+                force_download=True,
             )
-            with open(path) as f:
+            # errors="replace": worker stdout can carry non-UTF-8 bytes (tracebacks, progress bars);
+            # decode leniently so a single bad byte never drops the whole log on UnicodeDecodeError.
+            with open(path, encoding="utf-8", errors="replace") as f:
                 out[name] = f.read()
         except Exception:
             continue  # file not uploaded yet / not produced for this phase
