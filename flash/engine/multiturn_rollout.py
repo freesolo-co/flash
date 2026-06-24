@@ -528,8 +528,20 @@ def build_rollout_func(
     except Exception:
         _final_only_kind = None
 
+    _render_cache: dict[str, list[int]] = {}
+    _RENDER_CACHE_MAX = 8192
+
     def render(messages: list, add_generation_prompt: bool) -> list[int]:
-        return render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
+        # The initial-prompt render is identical for every rollout in a GRPO group (they share one
+        # prompt), so cache it by content instead of re-rendering num_generations times per step.
+        cache_key = f"{add_generation_prompt}\x00{json.dumps(messages, sort_keys=True, default=str)}"
+        cached = _render_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        ids = render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
+        if len(_render_cache) < _RENDER_CACHE_MAX:
+            _render_cache[cache_key] = ids
+        return ids
 
     _glue_cache: dict[str, list[int]] = {}
     _GLUE_CACHE_MAX = 8192
