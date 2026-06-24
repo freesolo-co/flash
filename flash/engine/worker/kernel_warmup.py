@@ -20,6 +20,7 @@ save whatever did compile. CLI: ``python -m flash.engine.worker.kernel_warmup --
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 
@@ -28,6 +29,7 @@ import time
 # engine.worker._KERNEL_CACHE_DIR / _KERNEL_CACHE_FILE.
 DEFAULT_CACHE_DIR = "/opt/flash/kernelcache"
 MEGA_CACHE_FILENAME = "mega_cache.bin"
+MEGA_CACHE_META_FILENAME = "mega_cache.json"
 
 
 def _log(msg: str) -> None:
@@ -40,8 +42,13 @@ def _point_backends_at(cache_dir: str) -> None:
     under the same tree the worker reads (matches the Dockerfile ENV)."""
     os.makedirs(os.path.join(cache_dir, "triton"), exist_ok=True)
     os.makedirs(os.path.join(cache_dir, "inductor"), exist_ok=True)
-    os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(cache_dir, "triton"))
-    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(cache_dir, "inductor"))
+    os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(cache_dir, "inductor")
+
+
+def _torch_sm(torch) -> str:
+    cap = torch.cuda.get_device_capability(0)
+    return f"sm{cap[0]}{cap[1]}"
 
 
 def _require_gpu():
@@ -56,8 +63,7 @@ def _require_gpu():
         if not torch.cuda.is_available():
             _log("no CUDA device visible — kernel warmup must run on a GPU builder; nothing baked")
             return None
-        cap = torch.cuda.get_device_capability(0)
-        _log(f"GPU: {torch.cuda.get_device_name(0)} (sm{cap[0]}{cap[1]}), torch {torch.__version__}")
+        _log(f"GPU: {torch.cuda.get_device_name(0)} ({_torch_sm(torch)}), torch {torch.__version__}")
         return torch
     except Exception as e:
         _log(f"torch unavailable ({e}); cannot warm kernels")
@@ -84,7 +90,8 @@ def warm_flash_attn(torch) -> bool:
 
 
 def warm_liger_ce(torch) -> bool:
-    """Compile the Liger fused linear cross-entropy (the big large-vocab win)."""
+    """Compile Liger cross-entropy kernels."""
+    warmed = False
     try:
         from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
@@ -94,10 +101,51 @@ def warm_liger_ce(torch) -> bool:
         loss_fn(logits, labels).backward()
         torch.cuda.synchronize()
         _log("liger fused cross-entropy compiled")
-        return True
+        warmed = True
     except Exception as e:
         _log(f"liger CE warm skipped: {e}")
-        return False
+    try:
+        candidates = (
+            ("liger_kernel.ops.fused_linear_cross_entropy", "LigerFusedLinearCrossEntropyLoss"),
+            (
+                "liger_kernel.transformers.fused_linear_cross_entropy",
+                "LigerFusedLinearCrossEntropyLoss",
+            ),
+        )
+        loss_cls = None
+        for module_name, attr in candidates:
+            try:
+                mod = __import__(module_name, fromlist=[attr])
+                loss_cls = getattr(mod, attr)
+                break
+            except Exception:
+                continue
+        if loss_cls is None:
+            raise ImportError("no fused-linear Liger loss class found")
+        hidden = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(4096, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        labels = torch.randint(0, 4096, (64,), device="cuda")
+        loss_fn = loss_cls()
+        attempts = (
+            lambda: loss_fn(hidden, weight, labels),
+            lambda: loss_fn(weight, hidden, labels),
+            lambda: loss_fn(hidden, weight, target=labels),
+        )
+        for call in attempts:
+            try:
+                out = call()
+                if isinstance(out, tuple):
+                    out = out[0]
+                out.backward()
+                torch.cuda.synchronize()
+                _log("liger fused-linear loss compiled")
+                return True
+            except Exception:
+                continue
+        raise RuntimeError("fused-linear Liger calls were not accepted")
+    except Exception as e:
+        _log(f"liger fused-linear warm skipped: {e}")
+    return warmed
 
 
 def warm_fla_gdn(torch) -> bool:
@@ -106,18 +154,35 @@ def warm_fla_gdn(torch) -> bool:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
         b, h, t, d = 1, 4, 256, 64
-        q = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16)
-        g = torch.randn(b, t, h, device="cuda", dtype=torch.float32)
-        beta = torch.rand(b, t, h, device="cuda", dtype=torch.bfloat16)
-        chunk_gated_delta_rule(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
+        q = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        g = torch.randn(b, t, h, device="cuda", dtype=torch.float32, requires_grad=True)
+        beta = torch.rand(b, t, h, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        out = chunk_gated_delta_rule(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
+        if isinstance(out, tuple):
+            out = out[0]
+        out.sum().backward()
         torch.cuda.synchronize()
-        _log("flash-linear-attention GDN compiled")
+        _log("flash-linear-attention GDN fwd/bwd compiled")
         return True
     except Exception as e:
         _log(f"fla GDN warm skipped: {e}")
         return False
+
+
+def warm_chalk_kernels() -> bool:
+    """Compile default chalk self-test kernels when freesolo-chalk is installed."""
+    warmed = False
+    try:
+        from chalk.transformers import install_fused_lora_delta, install_qwen35_rope
+
+        warmed = bool(install_qwen35_rope()) or warmed
+        warmed = bool(install_fused_lora_delta()) or warmed
+        _log(f"chalk default kernel installers ran (warmed={warmed})")
+    except Exception as e:
+        _log(f"chalk warm skipped: {e}")
+    return warmed
 
 
 def warm_torch_compile(torch) -> bool:
@@ -161,6 +226,28 @@ def save_mega_cache(torch, out_dir: str) -> bool:
         return False
 
 
+def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warmed: int) -> bool:
+    try:
+        meta = {
+            "sm": _torch_sm(torch),
+            "requested_arch": requested_arch,
+            "torch": getattr(torch, "__version__", "unknown"),
+            "cuda": getattr(getattr(torch, "version", None), "cuda", None),
+            "device": torch.cuda.get_device_name(0),
+            "warmed_groups": int(warmed),
+            "created_at": int(time.time()),
+        }
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, MEGA_CACHE_META_FILENAME)
+        with open(path, "w") as f:
+            json.dump(meta, f, sort_keys=True)
+        _log(f"cache metadata saved: {path} ({meta['sm']})")
+        return True
+    except Exception as e:
+        _log(f"cache metadata save failed: {e}")
+        return False
+
+
 def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
     """Run every warm step then persist the mega-cache. Returns a process exit code.
 
@@ -181,13 +268,15 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
             warm_flash_attn(torch),
             warm_liger_ce(torch),
             warm_fla_gdn(torch),
+            warm_chalk_kernels(),
             warm_torch_compile(torch),
         ]
     )
-    _log(f"{warmed}/4 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
+    _log(f"{warmed}/5 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
     saved = save_mega_cache(torch, out_dir)
+    meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
     _log(f"done in {time.time() - t0:.1f}s (saved={saved})")
-    return 0 if saved else 1
+    return 0 if saved and meta_saved else 1
 
 
 def main() -> int:

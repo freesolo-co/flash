@@ -122,9 +122,10 @@ RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
 # The COPY is made safe-when-absent with the standard "COPY a path that always exists + a guard"
 # trick. `build/kernel_cache/` is checked into the repo with just a `.keep` placeholder, so the COPY
 # source ALWAYS exists (a bare glob that matches nothing is a hard BuildKit error — this avoids it).
-# kernel_warmup.py drops the real `mega_cache.bin` next to that placeholder on a GPU builder; the
-# guard then bakes the dir into /opt/flash/kernelcache ONLY when BUILD_KERNEL_CACHE=true. With the
-# default the dir holds only `.keep`, so the copy is harmless and nothing meaningful is baked.
+# kernel_warmup.py drops `mega_cache.bin` + `mega_cache.json` next to that placeholder on a GPU
+# builder; the guard then bakes the dir into /opt/flash/kernelcache only when
+# BUILD_KERNEL_CACHE=true. with the default the dir holds only `.keep`, so the copy is harmless and
+# nothing meaningful is baked.
 ARG BUILD_KERNEL_CACHE=false
 COPY build/kernel_cache/ /tmp/kcstage/
 RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /tmp/kcstage/mega_cache.bin ]; then \

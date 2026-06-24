@@ -2264,6 +2264,17 @@ def _finalize(metrics: RunMetrics):
 # names are kept in lockstep with kernel_warmup.DEFAULT_CACHE_DIR / MEGA_CACHE_FILENAME.
 _KERNEL_CACHE_DIR = "/opt/flash/kernelcache"
 _KERNEL_CACHE_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.bin")
+_KERNEL_CACHE_META_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.json")
+
+
+def _current_cuda_sm(torch) -> str | None:
+    try:
+        if not torch.cuda.is_available():
+            return None
+        cap = torch.cuda.get_device_capability(0)
+        return f"sm{cap[0]}{cap[1]}"
+    except Exception:
+        return None
 
 
 def _load_kernel_cache_if_present() -> bool:
@@ -2281,10 +2292,30 @@ def _load_kernel_cache_if_present() -> bool:
     try:
         import torch
 
+        current_sm = _current_cuda_sm(torch)
+        try:
+            with open(_KERNEL_CACHE_META_FILE) as f:
+                meta = json.load(f)
+        except FileNotFoundError:
+            print("[kernel-cache] baked cache has no metadata -> first-run JIT fallback")
+            return False
+        except Exception as e:
+            print(f"[kernel-cache] metadata unreadable ({e}) -> first-run JIT fallback")
+            return False
+        cached_sm = str(meta.get("sm") or "")
+        if current_sm and cached_sm != current_sm:
+            print(
+                f"[kernel-cache] baked cache arch {cached_sm or 'unknown'} does not match "
+                f"worker arch {current_sm} -> first-run JIT fallback"
+            )
+            return False
         with open(_KERNEL_CACHE_FILE, "rb") as f:
             blob = f.read()
         torch.compiler.load_cache_artifacts(blob)
-        print(f"[kernel-cache] loaded baked mega-cache ({len(blob)} bytes) -> skipping first-run JIT")
+        print(
+            f"[kernel-cache] loaded baked mega-cache for {cached_sm or 'unknown'} "
+            f"({len(blob)} bytes) -> skipping first-run JIT"
+        )
         return True
     except Exception as e:
         # never block boot on a bad/absent cache: fall back to the normal JIT path.
