@@ -149,15 +149,19 @@ async def _reap_idle_endpoints_loop() -> None:
     """Background loop: proactively delete idle, orphaned RunPod training endpoints (workers doing
     nothing that still hold worker quota) so they don't linger between quota errors. Run-aware and
     graced (see ``_sweep_idle_flash_endpoints``); the blocking RunPod calls are offloaded to a
-    thread, and failures are swallowed and retried next cycle."""
+    thread, and a failed sweep is logged and retried next cycle."""
     interval = 600.0  # sweep every 10 min
     min_idle_s = 900.0  # only reap an endpoint idle for >= 15 min (well past any cold start)
     while True:
         await asyncio.sleep(interval)
-        with contextlib.suppress(Exception):
+        try:
             deleted = await asyncio.to_thread(_reap_idle_endpoints_once, min_idle_s)
             if deleted:
                 _log.info("reaped %d idle RunPod endpoint(s) doing nothing", deleted)
+        except asyncio.CancelledError:
+            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+        except Exception:
+            _log.debug("idle-endpoint reaper sweep failed; retrying next cycle", exc_info=True)
 
 
 class _RunLock:
