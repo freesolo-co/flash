@@ -168,14 +168,6 @@ class GpuSpec:
     # Auto-resubmit budget for infra-shaped failures (worker loss / stall / timeout);
     # each retry resumes from the latest streamed checkpoint.
     max_retries: int = 2
-    # OPT-IN persistent RunPod network volume mounted at /runpod-volume, used as a
-    # cross-run HF model cache (repeat runs skip the model download). Trade-offs: it
-    # pins the run to the volume's datacenter (smaller GPU pool — usually the bigger
-    # cost) and the volume bills monthly while it exists. Off (None) by default.
-    # RunPod-specific: network_volume/datacenter are read only by the RunPod provider.
-    network_volume: str | None = None
-    network_volume_gb: int = 100
-    datacenter: str | None = None  # e.g. "EU-RO-1"; required pool pin for the volume
 
 
 @dataclass(frozen=True)
@@ -271,9 +263,6 @@ class JobSpec:
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 2)),
-                network_volume=gpu.get("network_volume"),
-                network_volume_gb=int(gpu.get("network_volume_gb", 100)),
-                datacenter=gpu.get("datacenter"),
             ),
             run_id=data.get("run_id", "local"),
             worker_env=_coerce_str_map(data.get("worker_env")),
