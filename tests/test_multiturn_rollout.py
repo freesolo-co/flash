@@ -15,6 +15,7 @@ import pytest
 from flash.engine.multiturn_rollout import (
     build_examples_index,
     index_collisions,
+    rollout_async,
     rollout_batch,
     rollout_one,
 )
@@ -356,28 +357,52 @@ class _OneTurnEnv:
         return 0.5
 
 
+def _mk_logprobs(token_ids, lps):
+    """vLLM's per-position [{token_id: Logprob}] structure (or None when lps is None)."""
+    if lps is None:
+        return None
+    return [{tid: types.SimpleNamespace(logprob=lp)} for tid, lp in zip(token_ids, lps, strict=True)]
+
+
 class _FakeEngine:
-    def __init__(self, vocab=1000):
+    """Step-able fake colocate engine mirroring vLLM's V1 manual loop: ``llm_engine.add_request``
+    enqueues a turn, ``step()`` finishes ALL pending requests at once (one decode round) returning a
+    RequestOutput per finished request, ``has_unfinished_requests`` reports the queue. Records
+    ('wake'|'add'|'step'|'sleep', ...) events in order so the wake/sleep ordering can be asserted."""
+
+    def __init__(self, vocab=1000, gen=None):
         self.events = []
+        self._pending = []  # (req_id, prompt_ids, sampling_params)
+        # default generation: two tokens, no logprobs, text 'ok' (matches the prior fake)
+        self._gen = gen or (lambda ids, sp: ([5, 6], None, "ok"))
         self.llm_engine = types.SimpleNamespace(
-            model_config=types.SimpleNamespace(get_vocab_size=lambda: vocab)
+            model_config=types.SimpleNamespace(get_vocab_size=lambda: vocab),
+            add_request=self._add_request,
+            step=self._step,
+            has_unfinished_requests=lambda: bool(self._pending),
         )
+
+    def _add_request(self, req_id, prompt, sampling_params):
+        self.events.append(("add", req_id))
+        self._pending.append((req_id, list(prompt["prompt_token_ids"]), sampling_params))
+
+    def _step(self):
+        self.events.append(("step", len(self._pending)))
+        batch, self._pending = self._pending, []
+        outs = []
+        for req_id, ids, sp in batch:
+            token_ids, lps, text = self._gen(ids, sp)
+            comp = types.SimpleNamespace(
+                token_ids=token_ids, logprobs=_mk_logprobs(token_ids, lps), text=text
+            )
+            outs.append(types.SimpleNamespace(request_id=req_id, finished=True, outputs=[comp]))
+        return outs
 
     def wake_up(self, tags=None):
         self.events.append(("wake", tuple(tags or [])))
 
     def sleep(self, level=None):
         self.events.append(("sleep", level))
-
-    def generate(self, prompts, sampling_params=None, use_tqdm=False):
-        # Batched decode: record the batch's prompts and return ONE output per prompt (in order).
-        self.events.append(("generate", tuple(tuple(p["prompt_token_ids"]) for p in prompts)))
-        return [
-            types.SimpleNamespace(
-                outputs=[types.SimpleNamespace(token_ids=[5, 6], logprobs=None, text="ok")]
-            )
-            for _ in prompts
-        ]
 
 
 def _fake_trainer(engine, *, sleep_mode):
@@ -453,13 +478,13 @@ def test_env_glue_fails_loud_when_template_drops_probe():
 @pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_wakes_kv_cache_around_generation_when_sleep_mode():
     # The bug (#162): TRL's rollout_func path wakes only the weights, never the KV cache, so the
-    # first engine.generate() faults. The fix wakes tags=["kv_cache"] BEFORE any generate and
-    # re-sleeps AFTER the batch — assert that exact ordering.
+    # first decode faults. The fix wakes tags=["kv_cache"] BEFORE any add_request/step and
+    # re-sleeps AFTER the whole batch — assert that exact ordering around the continuous-batch loop.
     engine = _FakeEngine()
     rf = _build(_FakeTok())
     out = rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=True))
     kinds = [e[0] for e in engine.events]
-    assert kinds == ["wake", "generate", "sleep"]
+    assert kinds == ["wake", "add", "step", "sleep"]
     assert engine.events[0] == ("wake", ("kv_cache",))
     assert engine.events[-1] == ("sleep", 2)
     assert out["reward"] == [0.5]
@@ -523,19 +548,80 @@ def test_batched_makes_far_fewer_engine_calls_than_sequential():
     assert batch_calls < seq_calls
 
 
+def _fake_async_engine(gen, *, one_at_a_time=False, lifo=False):
+    """submit/poll/busy over an in-memory queue, for CPU-testing rollout_async. By default poll()
+    finishes ALL pending requests (one decode round); ``one_at_a_time`` finishes a single request
+    per poll (``lifo`` -> most-recently submitted) to exercise an arbitrary, non-FIFO finish order —
+    the real engine finishes requests in completion-length order, not submission order."""
+    pending = []  # (req_id, prefix_ids, max_tokens)
+
+    def submit(req_id, prefix_ids, max_tokens, initial):
+        pending.append((req_id, list(prefix_ids), max_tokens))
+
+    def poll():
+        if not pending:
+            return []
+        if one_at_a_time:
+            batch = [pending.pop(-1 if lifo else 0)]
+        else:
+            batch = pending[:]
+            pending.clear()
+        return [(rid, *gen(ids, mt)) for rid, ids, mt in batch]
+
+    def busy():
+        return bool(pending)
+
+    return submit, poll, busy
+
+
+def test_rollout_async_equals_rollout_batch_and_one():
+    """rollout_async (continuous-batched, no turn barrier) returns byte-identical rollouts to one
+    rollout_one per example — same token alignment, env_mask, logprobs, per-rollout reward and input
+    order. Only the SCHEDULING differs from the synchronized rollout_batch."""
+    examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
+    ones = [
+        rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
+                    env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+        for e in examples
+    ]
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    out = rollout_async(examples=examples, active_env=_VarTurnEnv(), render=render, submit=submit,
+                        poll=poll, busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    assert out == ones
+    assert [r["reward"] for r in out] == [1.0, 3.0, 2.0]
+
+
+def test_rollout_async_robust_to_arbitrary_finish_order():
+    """Continuous batching finishes requests in completion order, NOT submission order. Even when
+    turns finish one-at-a-time in LIFO order, rollout_async still produces input-order, byte-identical
+    results: each rollout has at most one in-flight turn, so cross-rollout finish order can't perturb
+    any single rollout's transcript — and a finished rollout's slot is free for others' next turns."""
+    examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}, {"max_model": 1}]
+    ones = [
+        rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
+                    env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+        for e in examples
+    ]
+    submit, poll, busy = _fake_async_engine(_det_generate, one_at_a_time=True, lifo=True)
+    out = rollout_async(examples=examples, active_env=_VarTurnEnv(), render=render, submit=submit,
+                        poll=poll, busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    assert out == ones  # input order + byte-identical despite LIFO one-at-a-time finishing
+    assert [r["reward"] for r in out] == [1.0, 3.0, 2.0, 1.0]
+
+
 @pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_no_wakesleep_when_sleep_mode_off():
     engine = _FakeEngine()
     rf = _build(_FakeTok())
     rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
-    assert [e[0] for e in engine.events] == ["generate"]
+    assert [e[0] for e in engine.events] == ["add", "step"]
 
 
 @pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_re_sleeps_even_if_generation_raises():
     # finally: the engine must return to the offloaded state even when a rollout throws, or the
     # next step inherits a half-woken engine.
-    engine = _FakeEngine(vocab=50)  # ord('h')=104 >= 50 -> guard fires inside generate()
+    engine = _FakeEngine(vocab=50)  # ord('h')=104 >= 50 -> guard fires inside submit()
     rf = _build(_FakeTok())
     with pytest.raises(ValueError, match="out-of-range token id"):
         rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=True))

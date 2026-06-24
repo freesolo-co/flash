@@ -281,6 +281,42 @@ def _advance_after_turn(
     r.cur_ids.extend(glue)
 
 
+def _build_rollout_states(
+    examples: list[dict],
+    active_env,
+    render: Callable[[list, bool], list[int]],
+    engine_max_len: int | None,
+) -> list[_RolloutState]:
+    """Initialise one :class:`_RolloutState` per example (initial prompt rendered, engine budget
+    computed). Shared by the synchronized (:func:`rollout_batch`) and async
+    (:func:`rollout_async`) paths so both start from byte-identical state."""
+    rollouts: list[_RolloutState] = []
+    for example in examples:
+        state = active_env.new_rollout_state(example)
+        initial_messages = state.get("prompt") or state.get("messages")
+        if not isinstance(initial_messages, list):
+            raise KeyError("multi-turn rollout state must include prompt or messages")
+        messages = [dict(m) for m in initial_messages]
+        prompt_ids = render(messages, True)
+        budget = (engine_max_len - len(prompt_ids) - 8) if engine_max_len else None
+        rollouts.append(_RolloutState(example, messages, prompt_ids, state, budget))
+    return rollouts
+
+
+def _turn_budget(r: _RolloutState, per_turn_max_tokens: int) -> int | None:
+    """Max new tokens for ``r``'s next assistant turn, bounded by the remaining engine headroom so
+    prompt+completion can't overflow the context. Returns ``None`` and marks ``r.done`` when the
+    headroom is already exhausted. Identical cap for both rollout paths (no drift)."""
+    max_new = per_turn_max_tokens
+    if r.budget is not None:
+        remaining = r.budget - len(r.completion_ids)
+        if remaining <= 0:  # prompt already fills the context -> this rollout is done
+            r.done = True
+            return None
+        max_new = min(max_new, remaining)
+    return max(1, max_new)
+
+
 def rollout_batch(
     *,
     examples: list[dict],
@@ -308,16 +344,7 @@ def rollout_batch(
     ``batched_generate(prefixes, max_tokens_list)`` returns ``(token_ids, logprobs, text)`` per
     prefix, in input order. It is injected so the loop is unit-testable on CPU.
     """
-    rollouts: list[_RolloutState] = []
-    for example in examples:
-        state = active_env.new_rollout_state(example)
-        initial_messages = state.get("prompt") or state.get("messages")
-        if not isinstance(initial_messages, list):
-            raise KeyError("multi-turn rollout state must include prompt or messages")
-        messages = [dict(m) for m in initial_messages]
-        prompt_ids = render(messages, True)
-        budget = (engine_max_len - len(prompt_ids) - 8) if engine_max_len else None
-        rollouts.append(_RolloutState(example, messages, prompt_ids, state, budget))
+    rollouts = _build_rollout_states(examples, active_env, render, engine_max_len)
 
     # Advance all rollouts in lockstep: each iteration samples one assistant turn for every
     # still-active rollout in a single batched call, then runs each rollout's env step.
@@ -327,15 +354,11 @@ def rollout_batch(
         for r in rollouts:
             if r.done:
                 continue
-            max_new = per_turn_max_tokens
-            if r.budget is not None:
-                remaining = r.budget - len(r.completion_ids)
-                if remaining <= 0:  # prompt already fills the context -> this rollout is done
-                    r.done = True
-                    continue
-                max_new = min(max_new, remaining)
+            max_new = _turn_budget(r, per_turn_max_tokens)
+            if max_new is None:  # engine headroom exhausted -> _turn_budget marked r.done
+                continue
             batch.append(r)
-            max_news.append(max(1, max_new))
+            max_news.append(max_new)
         if not batch:
             break
         gen = batched_generate([r.cur_ids for r in batch], max_news)
@@ -346,6 +369,69 @@ def rollout_batch(
             )
 
     # Score with the ACTUAL accumulated rollout state (matches rollout_one).
+    return [r.result(float(active_env.reward("", r.example, r.state))) for r in rollouts]
+
+
+def rollout_async(
+    *,
+    examples: list[dict],
+    active_env,
+    render: Callable[[list, bool], list[int]],
+    submit: Callable[[str, list[int], int, bool], None],
+    poll: Callable[[], list[tuple[str, list[int], list[float], str]]],
+    busy: Callable[[], bool],
+    env_glue: Callable[[list], list[int]],
+    max_turns: int,
+    per_turn_max_tokens: int,
+    engine_max_len: int | None = None,
+) -> list[RolloutResult]:
+    """Run ``len(examples)`` multi-turn rollouts with CONTINUOUS-BATCHED generation (no turn barrier).
+
+    Same result as :func:`rollout_batch` / one :func:`rollout_one` per example — identical token
+    alignment, env_mask, per-rollout reward and input order — but rollouts are NOT advanced in
+    lockstep. Each rollout's assistant turn is an independent engine request; the moment one
+    finishes, its env step runs and its NEXT turn is submitted, so the decode batch stays full
+    instead of stalling at a turn boundary while the slowest rollout's turn (and then every
+    rollout's env reply) completes. For high-variance multi-turn (rollouts of very different
+    depths) this keeps the GPU busy across the many turn boundaries the synchronized path idles at.
+
+    The engine is injected as three callables so the loop is unit-testable on CPU:
+      * ``submit(req_id, prefix_ids, max_tokens, initial)`` — enqueue one assistant-turn request
+        (``initial`` marks a turn-0 prompt, the only externally-rendered ids worth bounds-checking);
+      * ``poll()`` — return ``(req_id, token_ids, logprobs, text)`` for every request that FINISHED
+        since the last call (``[]`` if none finished this step);
+      * ``busy()`` — whether any request is still in flight.
+    """
+    rollouts = _build_rollout_states(examples, active_env, render, engine_max_len)
+    by_id: dict[str, _RolloutState] = {}
+    counter = 0
+
+    def launch(r: _RolloutState) -> None:
+        """Submit r's next assistant turn, or no-op (marking r done) if its budget is exhausted."""
+        nonlocal counter
+        max_new = _turn_budget(r, per_turn_max_tokens)
+        if max_new is None:
+            return  # _turn_budget marked r.done — nothing left to generate
+        req_id = f"r{counter}"
+        counter += 1
+        by_id[req_id] = r
+        submit(req_id, list(r.cur_ids), max_new, r.turns == 0)
+
+    for r in rollouts:
+        launch(r)  # prime turn 0 for every rollout
+    # Drain: each finished turn is folded + its env step run + its next turn enqueued immediately,
+    # so freed decode slots refill with other rollouts' next turns rather than idling at a barrier.
+    while busy():
+        for req_id, asst_ids, asst_lp, text in poll():
+            r = by_id.pop(req_id)
+            _advance_after_turn(
+                r, asst_ids, asst_lp, text,
+                active_env=active_env, env_glue=env_glue, max_turns=max_turns,
+            )
+            if not r.done:
+                launch(r)
+
+    # Score with the ACTUAL accumulated rollout state (matches rollout_one), in input order.
     return [r.result(float(active_env.reward("", r.example, r.state))) for r in rollouts]
 
 
@@ -414,6 +500,17 @@ def build_rollout_func(
     """
     from vllm import SamplingParams  # gpu-only; imported lazily so the module loads on CPU
 
+    try:
+        # FINAL_ONLY makes each manual add_request emit exactly one RequestOutput, at finish, with
+        # the complete turn (matching LLM.generate); without it the engine streams a cumulative
+        # output every step. Optional so the CPU import (stubbed vllm) still works — poll() filters
+        # on `finished` either way.
+        from vllm.sampling_params import RequestOutputKind
+
+        _final_only_kind = RequestOutputKind.FINAL_ONLY
+    except Exception:
+        _final_only_kind = None
+
     def render(messages: list, add_generation_prompt: bool) -> list[int]:
         return render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
 
@@ -449,68 +546,59 @@ def build_rollout_func(
 
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
+        # The colocate engine is a vLLM `LLM`; its V1 `LLMEngine` exposes the public
+        # add_request / step / has_unfinished_requests loop that lets us decode many rollouts'
+        # turns CONTINUOUSLY (a finished turn's slot refills with another rollout's next turn)
+        # instead of one synchronized batched decode per turn.
+        llm_engine = engine.llm_engine
         # Colocate vLLM sleep mode (GRPOConfig.vllm_enable_sleep_mode, ON for large / long-context
         # runs) offloads BOTH the rollout engine's weights and its KV cache between steps. TRL's
         # rollout_func path (GRPOTrainer._generate) calls vllm_generation.sync_weights() — which
         # wakes only tags=["weights"] — and then hands control to this closure, but, UNLIKE TRL's
-        # own single-turn generate() path, it never wakes tags=["kv_cache"]. So engine.generate()
+        # own single-turn generate() path, it never wakes tags=["kv_cache"]. So the first decode
         # below would run against a freed/offloaded KV cache and fault with CUDA "illegal memory
-        # access" on the very first generate of step 0. Wake the KV cache here and re-sleep after
-        # the whole batch, mirroring trl.generation.vllm_generation.generate (and
-        # trl.experimental.openenv). No-op when sleep mode is off (small/short-context runs keep
-        # the engine resident across steps). See flash issue #162.
+        # access" on step 0. Wake the KV cache here and re-sleep after the whole batch, mirroring
+        # trl.generation.vllm_generation.generate (and trl.experimental.openenv). No-op when sleep
+        # mode is off (small/short-context runs keep the engine resident). See flash issue #162.
         sleep_mode = bool(getattr(getattr(trainer, "args", None), "vllm_enable_sleep_mode", False))
         vocab_size = _engine_vocab_size(engine)
-        bounds_checked = False  # the initial prompts (the first batch) are validated once; see below
 
-        def batched_generate(prefixes: list[list[int]], max_tokens_list: list[int]):
-            """Sample ONE assistant turn for every active rollout in a single vLLM decode.
-
-            Replaces the old one-generate-per-prompt-per-turn loop: vLLM batches the sequences and
-            (with prefix caching, on for the colocate engine) reuses each rollout's growing prefix
-            and the shared in-group prompt KV. Returns (token_ids, logprobs, text) per prefix, in
-            input order.
-            """
-            nonlocal bounds_checked
-            for p in prefixes:
+        def submit(req_id: str, prefix_ids: list[int], max_tokens: int, initial: bool) -> None:
+            """Enqueue one assistant-turn request on the colocate engine."""
+            if not prefix_ids:
                 # Fail loudly on a degenerate prompt instead of letting it reach the embedding gather
                 # as an opaque async CUDA illegal-access (the failure mode #162 was first mistaken
                 # for): the prompt_token_ids path does no bounds checking.
-                if not p:
-                    raise ValueError("multi-turn rollout produced an empty prompt for engine.generate()")
-            if not bounds_checked:
-                # The FIRST batch is turn 0 — every prefix is an externally-rendered initial prompt,
-                # the only segment that can carry tokenizer/model-mismatch ids (later turns' prefixes
-                # are vLLM-generated / tokenizer glue, in range). Validate each one; the
-                # prompt_token_ids path does no bounds checking.
-                bounds_checked = True
-                for p in prefixes:
-                    lo, hi = min(p), max(p)
-                    if lo < 0 or (vocab_size is not None and hi >= vocab_size):
-                        raise ValueError(
-                            f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
-                            f"vocab size {vocab_size} (tokenizer/model mismatch)"
-                        )
-            # Per-prompt SamplingParams: each rollout has its own remaining-token budget.
-            sps = [
-                SamplingParams(
-                    max_tokens=max(1, int(mt)),
-                    temperature=temperature,
-                    top_p=top_p,
-                    logprobs=1,  # include the sampled token's logprob at each position
-                    stop=list(stop) if stop else None,
-                )
-                for mt in max_tokens_list
-            ]
-            # vLLM's LLM.generate takes prompts (TokensPrompt-style dicts), not a `prompt_token_ids`
-            # kwarg — pass pre-tokenized ids as {"prompt_token_ids": ...}, ONE per active rollout.
-            outs = engine.generate(
-                [{"prompt_token_ids": list(p)} for p in prefixes],
-                sampling_params=sps,
-                use_tqdm=False,
-            )
-            results: list[tuple[list[int], list[float], str]] = []
-            for out in outs:
+                raise ValueError("multi-turn rollout produced an empty prompt for engine.add_request()")
+            if initial:
+                # Turn-0 prefixes are the only externally-rendered initial prompts (later turns are
+                # vLLM-generated / tokenizer glue, already in range); validate each, since the
+                # prompt_token_ids path does no bounds checking and an out-of-range id would surface
+                # as an opaque CUDA illegal-access.
+                lo, hi = min(prefix_ids), max(prefix_ids)
+                if lo < 0 or (vocab_size is not None and hi >= vocab_size):
+                    raise ValueError(
+                        f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
+                        f"vocab size {vocab_size} (tokenizer/model mismatch)"
+                    )
+            sp_kwargs = {
+                "max_tokens": max(1, int(max_tokens)),
+                "temperature": temperature,
+                "top_p": top_p,
+                "logprobs": 1,  # include the sampled token's logprob at each position
+                "stop": list(stop) if stop else None,
+            }
+            if _final_only_kind is not None:
+                sp_kwargs["output_kind"] = _final_only_kind
+            llm_engine.add_request(req_id, {"prompt_token_ids": list(prefix_ids)}, SamplingParams(**sp_kwargs))
+
+        def poll() -> list[tuple[str, list[int], list[float], str]]:
+            """Advance the engine one step; return (req_id, token_ids, logprobs, text) for every
+            request that finished this step (``[]`` if none did / a dummy batch ran)."""
+            finished: list[tuple[str, list[int], list[float], str]] = []
+            for out in llm_engine.step():
+                if not getattr(out, "finished", False):
+                    continue
                 comp = out.outputs[0]
                 token_ids = list(comp.token_ids)
                 # comp.logprobs is a list (per position) of {token_id: Logprob}; pull the sampled
@@ -520,8 +608,11 @@ def build_rollout_func(
                     entry = (comp.logprobs or [])[pos] if comp.logprobs else None
                     lp = entry.get(tid) if entry else None
                     lps.append(float(getattr(lp, "logprob", 0.0)) if lp is not None else 0.0)
-                results.append((token_ids, lps, comp.text))
-            return results
+                finished.append((out.request_id, token_ids, lps, comp.text))
+            return finished
+
+        def busy() -> bool:
+            return bool(llm_engine.has_unfinished_requests())
 
         # Wake the KV cache for the whole batch (see the note above), then re-sleep so the engine
         # returns to its fully-offloaded state and the optimizer step has the freed memory back.
@@ -537,14 +628,16 @@ def build_rollout_func(
             # num_generations times BEFORE handing the slice to rollout_func (trl 1.6/1.7:
             # `prompts = [x["prompt"] for x in inputs]`, no dedup), and it expects exactly
             # len(prompts) completions back — the GRPO group is the consecutive num_generations rows
-            # of the same prompt. rollout_batch advances every active rollout's turn in a single
-            # batched_generate call and returns results in input order, so the group stays aligned.
+            # of the same prompt. rollout_async returns one result per example in input order, so
+            # the group stays aligned.
             examples = [examples_by_key.get(_prompt_key(p), {"prompt": p}) for p in prompts]
-            rollouts = rollout_batch(
+            rollouts = rollout_async(
                 examples=examples,
                 active_env=active_env,
                 render=render,
-                batched_generate=batched_generate,
+                submit=submit,
+                poll=poll,
+                busy=busy,
                 env_glue=env_glue,
                 max_turns=max_turns,
                 per_turn_max_tokens=max_completion,
