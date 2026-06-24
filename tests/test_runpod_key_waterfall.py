@@ -189,6 +189,39 @@ def test_rest_waterfall_all_keys_exhausted_raises(monkeypatch):
     assert seen == ["rk-a", "rk-b"]  # both accounts attempted
 
 
+def test_rest_waterfall_persistent_429_fails_over(monkeypatch):
+    """A 429 that survives the retry loop (no fast-fail) still fails over to the next key.
+
+    Regression: the exhausted-retries raise must chain the HTTPError as __cause__ so the
+    failover predicate can see the 429 status — otherwise it stops on the first account.
+    """
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
+    keys.reset()
+    seen = _fake_urlopen_by_key(
+        monkeypatch,
+        lambda k: _http_error(429) if k == "rk-a" else b'{"ok": true}',
+    )
+    out = runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/endpoints", retries=1)
+    assert out == {"ok": True}
+    assert "rk-b" in seen  # failed over after rk-a's 429 exhausted its retries
+
+
+def test_rest_waterfall_persistent_5xx_does_not_fail_over(monkeypatch):
+    """A 5xx is a server-side error (same on every account) -> do NOT try the next key."""
+    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
+    keys.reset()
+    seen = _fake_urlopen_by_key(monkeypatch, lambda k: _http_error(500, b"boom"))
+    with pytest.raises(runpod_api.RunpodApiError):
+        runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/endpoints", retries=1)
+    assert "rk-b" not in seen  # never failed over on a server error
+
+
 # NOTE: the deploy_train_endpoint account-failover test lives in test_jobs.py, next to the
 # _patch_deploy_deps / _make_runpod_flash_mocks helpers it shares with the other deploy tests.
 
