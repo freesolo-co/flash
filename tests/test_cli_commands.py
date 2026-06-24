@@ -68,6 +68,9 @@ class _FakeClient:
             "state": "done",
         }
 
+    def get_worker_output(self, run_id: str) -> dict[str, str]:
+        return {"console_sft.txt": "worker stdout line\n"}
+
     def cancel_run(self, run_id: str) -> dict:
         self.calls.append(("cancel", run_id))
         return {"run_id": run_id, "state": "cancelled"}
@@ -208,6 +211,9 @@ def test_status_runs_and_status_logs(fake_client, capsys) -> None:
     assert _run(["status", "flash-1", "--logs"]) == 0
     out = capsys.readouterr().out
     assert "hello from the worker" in out
+    # --logs always appends the real train-subprocess stdout fetched from the run's HF repo.
+    assert "----- console_sft.txt -----" in out
+    assert "worker stdout line" in out
     assert "cost_usd" in out
 
     assert _run(["status", "flash-1", "--follow"]) == 0
@@ -218,6 +224,7 @@ def test_status_runs_and_status_logs(fake_client, capsys) -> None:
 
 def test_status_logs_separates_partial_log_line_from_json(fake_client, capsys) -> None:
     fake_client.log_text = "partial log line"
+    fake_client.get_worker_output = lambda run_id: {}  # isolate: log->status separation only
 
     assert _run(["status", "flash-1", "--logs"]) == 0
     out = capsys.readouterr().out

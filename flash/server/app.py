@@ -156,6 +156,40 @@ def _append_run_log(run_id: str, message: str) -> None:
         f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
 
 
+def _worker_artifacts(spec) -> dict[str, str]:
+    """The run's train-subprocess stdout + traceback, fetched from its HF artifact repo.
+
+    The control-plane ``.log`` only carries orchestrator lines (and, on a terminal failure, a
+    truncated tail of the worker console). The full ``console_<phase>.txt`` / ``error_<phase>.txt``
+    the worker streams to HF are the real train stdout/traceback — but the repo is PRIVATE, so a
+    user's own HF token 404s. We fetch them here with the OPERATOR ``HF_TOKEN`` (the control plane
+    already holds it) so ``flash status --logs`` shows the real worker output regardless of run
+    state and without the user needing repo access. Best-effort: a missing file / no repo yields {}.
+    """
+    repo = getattr(getattr(spec, "train", None), "hf_repo", None)
+    if not repo:
+        return {}
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception:
+        return {}
+    prefix = adapter_prefix(spec)
+    out: dict[str, str] = {}
+    for name in (f"console_{spec.phase}.txt", f"error_{spec.phase}.txt"):
+        try:
+            path = hf_hub_download(
+                repo_id=repo,
+                repo_type="dataset",
+                filename=f"{prefix}/{name}",
+                token=os.environ.get("HF_TOKEN"),
+            )
+            with open(path) as f:
+                out[name] = f.read()
+        except Exception:
+            continue  # file not uploaded yet / not produced for this phase
+    return out
+
+
 def recover_runs() -> None:
     """Recover every in-flight run after a restart so a redeploy never loses a training session:
     re-attach to ``running`` jobs, resume multi-seed runs across the inter-seed gap, and resubmit
@@ -482,6 +516,15 @@ def create_app():
             "last_heartbeat": status.last_heartbeat,
             "gpu_status": status.gpu_status,
         }
+
+    @app.get("/v1/runs/{run_id}/worker")
+    def run_worker_output(run_id: str, key: dict = Depends(require_key)):
+        # The full train-subprocess stdout/traceback, pulled from the run's HF artifact repo with
+        # the operator token — the real worker output the offset-paged .log can't carry. Kept off
+        # the hot /logs poll path (it hits HF) so streaming `--follow` stays fast; `--logs` calls
+        # this once. Best-effort: {} when nothing's been uploaded yet.
+        status = owned_run(run_id, key)
+        return {"run_id": run_id, "worker": _worker_artifacts(JobSpec.from_dict(status.spec))}
 
     @app.post("/v1/runs/{run_id}/cancel")
     def cancel(run_id: str, key: dict = Depends(require_key)):
