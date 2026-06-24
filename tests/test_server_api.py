@@ -564,6 +564,31 @@ def test_logs_offset_paging(api):
     assert page2["logs"] == "line two\n"
 
 
+def test_worker_output_route(api, monkeypatch):
+    # /worker surfaces the train-subprocess stdout/traceback from the run's HF repo (operator
+    # token, server-side). Best-effort: no artifacts -> empty dict; present -> passed through.
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+
+    empty = api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(key)).json()
+    assert empty["run_id"] == run_id
+    assert empty["worker"] == {}
+
+    monkeypatch.setattr(
+        app_mod, "_worker_artifacts", lambda spec: {"console_sft.txt": "real worker stdout\n"}
+    )
+    got = api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(key)).json()
+    assert got["worker"] == {"console_sft.txt": "real worker stdout\n"}
+
+    # Another user can't read it (same ownership gate as /logs).
+    other = _login()
+    assert api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(other)).status_code == 404
+
+
 def test_local_env_path_rejected(api):
     # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()
