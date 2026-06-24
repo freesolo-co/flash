@@ -10,9 +10,15 @@ Torch and other heavy deps are imported lazily inside the functions (CPU-importa
 from __future__ import annotations
 
 import contextlib
+import csv
 import os
 import sys
 import time
+
+# Fused-CE (Liger) gate thresholds live in ONE place — flash.engine.vram — so the worker's run-time
+# gate and the cost estimator's offline mirror (sft_logits_fused) can never drift. vram is a pure
+# leaf (no worker import), so this is cycle-free.
+from flash.engine.vram import _LIGER_LONG_CTX_TOKENS, _LIGER_MIN_PARAMS_B
 
 
 def _attn_impl_for_capability(major: int) -> str | None:
@@ -72,7 +78,9 @@ def optimal_attn_impl() -> str | None:
 # RTX 4090 0.83x, RTX 5090 0.79x) — the per-step Triton overhead isn't repaid because the small
 # model's logits don't dominate memory. Its value appears on LARGE models (lets a bigger batch
 # fit / avoids OOM). So gate by estimated model size.
-_LIGER_MIN_PARAMS = 3e9  # ~3B; 1B-class models measured net-negative -> Liger off below this
+# ~3B in raw param count; the canonical threshold (in billions) lives in flash.engine.vram.
+# 1B-class models measured net-negative -> Liger off below this.
+_LIGER_MIN_PARAMS = _LIGER_MIN_PARAMS_B * 1e9
 
 
 def _estimate_params(cfg) -> float:
@@ -186,7 +194,7 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
 # Long-context runs are memory-bound (activations + vLLM KV cache scale with sequence length), so
 # they need the memory features even on a SMALL model — PR #174 measured a 1B model OOM on GRPO at
 # 4096 ctx in speed mode, but it fits in memory mode. So "memory mode" = large model OR long ctx.
-_LONG_CONTEXT_TOKENS = 2048
+_LONG_CONTEXT_TOKENS = _LIGER_LONG_CTX_TOKENS  # canonical value in flash.engine.vram
 
 
 def _memory_mode(model_id: str, max_length: int = 0) -> bool:
@@ -342,35 +350,175 @@ def _sdpa_cudnn_ctx(attn_impl: str | None):
 
 
 
-def gpu_diagnostics() -> dict:
-    """Collect CUDA/driver diagnostics to pin down GPU init failures on rented nodes."""
-    diag = {}
+def _float_or_none(value) -> float | None:
     try:
-        import torch
+        text = str(value).strip()
+        if not text or text.upper() in {"N/A", "[N/A]", "NOT SUPPORTED", "[NOT SUPPORTED]"}:
+            return None
+        return float(text)
+    except (TypeError, ValueError):
+        return None
 
-        diag["torch"] = torch.__version__
-        diag["torch_cuda"] = torch.version.cuda
-        diag["cuda_available"] = torch.cuda.is_available()
-        try:
-            diag["device_count"] = torch.cuda.device_count()
-            diag["device_name"] = torch.cuda.get_device_name(0)
-        except Exception as e:
-            diag["device_query_err"] = str(e)[:160]
-    except Exception as e:
-        diag["torch_import_err"] = str(e)[:160]
-    try:
-        import subprocess
 
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version,name,memory.total", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=20,
+def _int_or_none(value) -> int | None:
+    num = _float_or_none(value)
+    return int(num) if num is not None else None
+
+
+def _round_gb_from_mib(value) -> float | None:
+    num = _float_or_none(value)
+    if num is None:
+        return None
+    return round(num / 1024.0, 3)
+
+
+def _clean_diag(diag: dict) -> dict:
+    return {k: v for k, v in diag.items() if v is not None and v != ""}
+
+
+def _query_nvidia_gpu() -> dict:
+    import subprocess
+
+    fields = [
+        "index",
+        "uuid",
+        "driver_version",
+        "name",
+        "utilization.gpu",
+        "utilization.memory",
+        "memory.total",
+        "memory.used",
+        "memory.free",
+        "temperature.gpu",
+        "power.draw",
+        "power.limit",
+        "pstate",
+        "clocks.sm",
+        "clocks.mem",
+        "pcie.link.gen.current",
+        "pcie.link.width.current",
+    ]
+    out = subprocess.run(
+        ["nvidia-smi", f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        timeout=float(os.environ.get("FLASH_GPU_DIAG_TIMEOUT_S", "8")),
+    )
+    raw = (out.stdout or out.stderr).strip()
+    if out.returncode != 0:
+        return {"nvidia_smi_err": raw[:300]}
+    rows = list(csv.reader(raw.splitlines()))
+    if not rows:
+        return {}
+    first = [cell.strip() for cell in rows[0]]
+    row = dict(zip(fields, first, strict=False))
+    diag = {
+        "index": _int_or_none(row.get("index")),
+        "uuid": row.get("uuid"),
+        "driver_version": row.get("driver_version"),
+        "device_name": row.get("name"),
+        "gpu_util_pct": _int_or_none(row.get("utilization.gpu")),
+        "mem_util_pct": _int_or_none(row.get("utilization.memory")),
+        "memory_total_gb": _round_gb_from_mib(row.get("memory.total")),
+        "memory_used_gb": _round_gb_from_mib(row.get("memory.used")),
+        "memory_free_gb": _round_gb_from_mib(row.get("memory.free")),
+        "temperature_c": _int_or_none(row.get("temperature.gpu")),
+        "power_w": _float_or_none(row.get("power.draw")),
+        "power_limit_w": _float_or_none(row.get("power.limit")),
+        "pstate": row.get("pstate"),
+        "sm_clock_mhz": _int_or_none(row.get("clocks.sm")),
+        "mem_clock_mhz": _int_or_none(row.get("clocks.mem")),
+        "pcie_gen": _int_or_none(row.get("pcie.link.gen.current")),
+        "pcie_width": _int_or_none(row.get("pcie.link.width.current")),
+    }
+    clean = _clean_diag(diag)
+    clean["nvidia_smi"] = raw[:300]
+    return clean
+
+
+def _query_nvidia_processes() -> list[dict]:
+    import subprocess
+
+    out = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=float(os.environ.get("FLASH_GPU_DIAG_TIMEOUT_S", "8")),
+    )
+    if out.returncode != 0 or not out.stdout.strip():
+        return []
+    rows = []
+    for row in csv.reader(out.stdout.splitlines()):
+        if len(row) < 3:
+            continue
+        rows.append(
+            _clean_diag(
+                {
+                    "pid": _int_or_none(row[0]),
+                    "process_name": row[1].strip(),
+                    "used_memory_gb": _round_gb_from_mib(row[2]),
+                }
+            )
         )
-        diag["nvidia_smi"] = (out.stdout or out.stderr).strip()[:200]
+    return sorted(rows, key=lambda r: float(r.get("used_memory_gb") or 0.0), reverse=True)[:8]
+
+
+def gpu_diagnostics(include_torch: bool = True) -> dict:
+    """Collect live CUDA/GPU telemetry for run logs and status."""
+    diag = {}
+    if include_torch:
+        try:
+            import torch
+
+            diag["torch"] = torch.__version__
+            diag["torch_cuda"] = torch.version.cuda
+            diag["cuda_available"] = torch.cuda.is_available()
+            try:
+                diag["device_count"] = torch.cuda.device_count()
+                if torch.cuda.is_available():
+                    diag["device_name"] = torch.cuda.get_device_name(0)
+                    free, total = torch.cuda.mem_get_info()
+                    diag["torch_memory_free_gb"] = round(free / (1024**3), 3)
+                    diag["torch_memory_total_gb"] = round(total / (1024**3), 3)
+                    diag["torch_memory_allocated_gb"] = round(
+                        torch.cuda.memory_allocated() / (1024**3), 3
+                    )
+                    diag["torch_memory_reserved_gb"] = round(
+                        torch.cuda.memory_reserved() / (1024**3), 3
+                    )
+            except Exception as e:
+                diag["device_query_err"] = str(e)[:160]
+        except Exception as e:
+            diag["torch_import_err"] = str(e)[:160]
+    try:
+        diag.update(_query_nvidia_gpu())
+        processes = _query_nvidia_processes()
+        if processes:
+            diag["processes"] = processes
     except Exception as e:
         diag["nvidia_smi_err"] = str(e)[:160]
-    return diag
+    return _clean_diag(diag)
+
+
+# Human-readable sentinel embedded in the error message (debug tag only — the runner classifies
+# structurally off the worker's heartbeat ``retriable`` flag, not by matching this phrase).
+RETRIABLE_INFRA_MARKER = "RETRIABLE_INFRA_GPU"
+
+
+class RetriableInfraError(RuntimeError):
+    """An infrastructure failure the control plane should RETRY on a fresh worker.
+
+    Raised for a host the run can never train on — e.g. a GPU that never comes up
+    (``wait_for_gpu`` times out) or a required-upload failure. The worker's top-level handler
+    stamps ``retriable=True`` into heartbeat.json so the runner retries on a fresh worker.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(f"{RETRIABLE_INFRA_MARKER}: {reason}")
 
 
 def wait_for_gpu():
@@ -394,7 +542,8 @@ def wait_for_gpu():
             last = str(e)[:160]
         print(f"GPU not ready (try {i + 1}/12): {last}; sleeping 10s")
         _t.sleep(10)
-    raise RuntimeError(f"GPU never became ready after 12 tries: {last}")
+    # Infra-shaped: a host whose GPU never comes up is dead, not a code bug -> retry on a fresh one.
+    raise RetriableInfraError(f"GPU never became ready after 12 tries: {last}")
 
 
 def free_gpu(trainer=None):
@@ -445,8 +594,8 @@ def _ensure_fla_fastpath_on_hopper() -> None:
         ``fla.modules``; reinstall from git if the resident copy is incomplete).
     Validated A/B (H100 SXM, Qwen3.5 hidden-2560 LoRA, controlled fla on/off): seq4096 435->105
     ms/step & 9.9->6.1 GB (4.2x / 1.6x); seq8192 7.1x; seq16384 3106->247 ms & 32->17 GB (12.6x /
-    1.9x). Forward loss matches the torch delta to 1.8e-4 (correct). Runs on BOTH substrates
-    (RunPod + Vast exec this module), after all installs and BEFORE any model import. Non-Hopper:
+    1.9x). Forward loss matches the torch delta to 1.8e-4 (correct). Runs in the worker process,
+    after all installs and BEFORE any model import. Non-Hopper:
     no-op (fla's Triton kernel is correct there). Best-effort + FAIL-CLOSED: a failed install
     (pip rc!=0), a missing module, or the wrong resolved ``apache-tvm-ffi`` version all flip the
     gate off and DISABLE fla, leaving the (correct) pure-PyTorch delta rule in place — a worker

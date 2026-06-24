@@ -49,6 +49,7 @@ def _connect() -> sqlite3.Connection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
     return conn
@@ -72,11 +73,16 @@ def ensure_internal_key(api_key: str) -> dict:
     internal-key runs share this single service identity (no per-user isolation;
     the platform scopes users upstream)."""
     now = time.time()
+    internal_email = "internal@freesolo.co"
     with _connect() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (hash_key(api_key), "internal", "freesolo-internal", now),
+            (hash_key(api_key), "internal", internal_email, now),
+        )
+        conn.execute(
+            "UPDATE api_keys SET email = ? WHERE key_hash = ? AND key_prefix = ?",
+            (internal_email, hash_key(api_key), "internal"),
         )
     row = lookup_key(api_key)
     if row is None:  # pragma: no cover - the row was just inserted
@@ -84,7 +90,9 @@ def ensure_internal_key(api_key: str) -> dict:
     return row
 
 
-def ensure_external_key(api_key: str) -> dict | None:
+def ensure_external_key(
+    api_key: str, *, key_prefix: str | None = None, email: str | None = None
+) -> dict | None:
     """Provision a per-token row for a verified external (freesolo USER) key (idempotent).
 
     Unlike :func:`ensure_internal_key` (one shared service identity), this keys a distinct
@@ -100,7 +108,7 @@ def ensure_external_key(api_key: str) -> dict | None:
         conn.execute(
             "INSERT OR IGNORE INTO api_keys (key_hash, key_prefix, email, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (hash_key(api_key), "freesolo", "freesolo-user", now),
+            (hash_key(api_key), key_prefix or "freesolo", email, now),
         )
     return lookup_key(api_key)
 

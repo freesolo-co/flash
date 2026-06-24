@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 
 from flash._logging import get_logger
+from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.spec import JobSpec
 
 # Literal name (NOT __name__) so the logger stays "flash.providers.runpod.train" after the
@@ -19,10 +20,11 @@ logger = get_logger("flash.providers.runpod.train")
 
 
 # Worker stack: trl 1.6 (colocate default; adds the GRPO `tools=` / `rollout_func`
-# multi-turn hooks used for verifiers ToolEnv / MultiTurnEnv training), vllm 0.19.1
+# multi-turn hooks used for Freesolo EnvironmentMultiTurn training), vllm 0.19.1
 # (Qwen3.5/3.6 archs, native RL APIs, transformers-5
 # compatible metadata), transformers 5.x (qwen3_5/qwen3_5_moe model types),
-# bitsandbytes (4-bit NF4 QLoRA tier). trl 1.6 requires transformers>=4.56,
+# bitsandbytes (the 8-bit paged AdamW optimizer state — LoRA+ coexists with it).
+# trl 1.6 requires transformers>=4.56,
 # satisfied by the 5.6+ pin; GRPOConfig is field-compatible with the 1.5 usage here.
 # Resolver/driver notes: vllm 0.17/0.18 hard-pin transformers<5 (uv refuses the
 # combo), so the first transformers-5-compatible vllm line is 0.19.1. vllm >=0.20
@@ -41,6 +43,7 @@ WORKER_DEPS = [
     "vllm==0.19.1",
     "bitsandbytes>=0.49",
     "datasets>=4.7,<6",
+    "freesolo>=0.2.46",
     "huggingface_hub>=0.25",
     "accelerate>=1.4",
     # NB: the HF `kernels` Hub package is intentionally NOT pinned here — the versions
@@ -78,8 +81,7 @@ WORKER_DEPS = [
     # to the worker's `extra_pip` for EVERY job by default — installed + applied automatically, like
     # Liger. Override the source with FLASH_CHALK_SPEC (an exact version / git URL / wheel), or
     # disable every kernel (FLASH_<K>=0) to skip the install. The worker pip-installs extra_pip for
-    # EVERY job (baked-image RunPod
-    # _train_body + Vast bootstrap). Do NOT rely on
+    # EVERY job through the baked-image RunPod _train_body. Do NOT rely on
     # FLASH_WORKER_EXTRA_DEPS / FLASH_WORKER_DEPS for this: the durable baked-image submit path
     # (jobs.build_function_input) returns the raw payload and never consults resolve_worker_deps, so
     # those vars don't reach a default run; and FLASH_WORKER_DEPS would also REPLACE the whole stack.
@@ -94,7 +96,6 @@ WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
 # The prebuilt worker image (full training stack baked in; built by Dockerfile.worker /
 # .github/workflows/worker-image.yml). PUBLIC under the org namespace, so no registry login is
 # ever needed. Must be published to GHCR + made public before the paths that use it can pull it.
-#   * Vast: ALWAYS used (jobs.builders pins the container to WORKER_IMAGE).
 #   * RunPod baked-image submit (jobs.deploy_train_endpoint / build_function_input): the default —
 #     a self-contained serverless worker whose rp_handler runs _train_body. FLASH_WORKER_IMAGE
 #     overrides the tag (e.g. a hotfix); the boot-install fallback is only reachable if BOTH are
@@ -197,9 +198,9 @@ def chalk_extra_pip(spec=None) -> list[str]:
     """Chalk pip spec(s) to ADD to the worker's ``extra_pip`` when a chalk kernel is selected.
 
     This is the install hook that runs for DEFAULT remote jobs: the baked-image RunPod path
-    (``_train_body`` -> ``pip install *extra_pip``) and the Vast bootstrap both consume the
-    payload's ``extra_pip`` regardless of ``WORKER_IMAGE`` — unlike ``FLASH_WORKER_EXTRA_DEPS``
-    / ``resolve_worker_deps``, which the durable ``build_function_input`` baked-image path skips.
+    (``_train_body`` -> ``pip install *extra_pip``) consumes the payload's ``extra_pip``
+    regardless of ``WORKER_IMAGE`` — unlike ``FLASH_WORKER_EXTRA_DEPS`` /
+    ``resolve_worker_deps``, which the durable ``build_function_input`` baked-image path skips.
 
     Selection (and the ``FLASH_CHALK_SPEC`` lookup) is resolved against the EFFECTIVE worker env —
     the run's ``[worker_env]`` merged over ``os.environ`` — so it matches exactly what the worker
@@ -224,8 +225,20 @@ def chalk_extra_pip(spec=None) -> list[str]:
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
 
 
-def build_worker_env(spec: JobSpec, seed: int) -> dict:
-    """Per-run env passed to the worker (secrets + recipe overrides)."""
+_RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
+
+
+def build_worker_env(
+    spec: JobSpec,
+    seed: int,
+    runtime_secrets: dict[str, str] | None = None,
+) -> dict:
+    """Per-run env passed to the worker (platform creds + recipe overrides).
+
+    Provider and artifact credentials still come from the control-plane process environment.
+    User runtime secrets (W&B plus [environment].secrets) are injected from ``runtime_secrets``
+    below so the control plane never stores user-owned secret values in the spec.
+    """
     # CUDA allocator conf. Colocate (TRL trainer + vLLM on one GPU) fragments over a long run,
     # so expandable_segments (which reclaims fragmentation) is the right default — EXCEPT under
     # GRPO vLLM sleep mode, whose CuMemAllocator memory pool is incompatible with
@@ -262,8 +275,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     _alloc_conf = _alloc_override or _alloc_default
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
-        # Compute substrate, read back by engine.worker for the RunMetrics record. Vast's
-        # on-instance bootstrap overrides this to "vast" (it reuses this same env builder).
+        # Compute substrate, read back by engine.worker for the RunMetrics record.
         "FLASH_ARM": "runpod",
         "BENCH_HF_MODEL": spec.model,
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
@@ -286,9 +298,8 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
             else {}
         ),
     }
-    # HF artifact creds + PRIME_API_KEY (the worker `prime env install`s the run's Hub
-    # env(s), public + private) + optional reward-judge creds: a verifiers env whose rubric
-    # calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
+    # HF artifact creds + managed environment hub creds + optional reward-judge creds: a Freesolo
+    # environment whose reward calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
     # where the reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env
     # reads (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's
     # control-plane override so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
@@ -296,7 +307,7 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # simply not passed (the env then uses its own default model).
     for key in (
         "HF_TOKEN",
-        "PRIME_API_KEY",
+        "GITHUB_TOKEN",
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "FLASH_JUDGE_MODEL",
@@ -328,15 +339,10 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
         # than the host driver's JIT (sm_120 + 12.8 drivers); TRITON_ATTN/FLASHINFER
         # sidestep it without restricting the host pool to CUDA-13 drivers.
         "VLLM_ATTENTION_BACKEND",
-        # W&B credential that enables logging. Project + run name come from the spec's typed
-        # [wandb] config (NOT env vars); the run's entity is the API key's default account/team
-        # (wandb_report_to does not pass entity=).
-        "WANDB_API_KEY",
         # Upload the worker console (which optimizations engaged) on SUCCESS too, not just on crash.
         # run_mode() in _train_body reads this from the `env` dict it builds (os.environ updated with
         # this forwarded input_data["env"] allowlist), NOT from its own process os.environ — so a
         # control-plane `FLASH_UPLOAD_CONSOLE=1` only reaches run_mode if it's forwarded here.
-        # Without this it silently no-ops on success.
         "FLASH_UPLOAD_CONSOLE",
         # FLASH_* chalk kernel-selection flags: chalk is install-on-call (reads NO env vars), so
         # the WORKER decides which kernels to enable from these flags. install_chalk_kernels runs
@@ -365,10 +371,14 @@ def build_worker_env(spec: JobSpec, seed: int) -> dict:
     # deploy, and artifact paths all key off spec.run_id / spec.train.hf_repo, so letting a
     # [worker_env] override RUN_ID/HF_REPO would make the worker upload under a different repo/prefix
     # and orphan the artifacts (the poller would never find DONE/metrics, deploy can't locate the
-    # adapter). FLASH_ARM identifies the substrate (Vast rewrites it in its own bootstrap).
+    # adapter). FLASH_ARM identifies the substrate.
     _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
         if str(k).upper() in _RESERVED_WORKER_ENV:
             continue  # control plane owns run identity; a per-run override would orphan artifacts
         env[str(k)] = str(v)
+    allowed_runtime_secrets = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
+    for k, v in (runtime_secrets or {}).items():
+        if k in allowed_runtime_secrets and v:
+            env[k] = str(v)
     return env

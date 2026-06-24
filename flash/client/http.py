@@ -7,13 +7,20 @@ problems surface as ``ClientError`` with an actionable hint.
 
 from __future__ import annotations
 
+import codecs
+import contextlib
 import json
 import os
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Iterator
 from typing import Any
 
-from .config import load_credentials
+from .config import load_credentials_with_source
+
+# Called as ``progress(bytes_sent, total_bytes)`` as a request body streams to the server, so
+# the CLI can draw an upload bar. ``total_bytes`` is the full Content-Length, fixed up front.
+ProgressCallback = Callable[[int, int], None]
 
 
 class ClientError(RuntimeError):
@@ -29,7 +36,7 @@ class ApiError(ClientError):
 # Login is handled by the freesolo backend (not the flash control plane): `flash login`
 # verifies the user's freesolo API key here. The same key authenticates the flash
 # control plane, which accepts freesolo-issued keys.
-DEFAULT_FREESOLO_BASE_URL = "https://api-dev.freesolo.co"
+DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 FREESOLO_AUTH_VERIFY_PATH = "/api/auth/verify"
 
 
@@ -53,7 +60,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
     """Verify a freesolo API key against the freesolo backend's ``/api/auth/verify``.
 
     Raises :class:`ClientError`/:class:`ApiError` if the key is rejected or the backend is
-    unreachable; returns ``None`` on success. Keys are issued from the freesolo dashboard.
+    unreachable; returns ``None`` on success. Keys are issued from the freesolo sign-in page.
     """
     base = freesolo_base_url(base_url)
     url = f"{base}{FREESOLO_AUTH_VERIFY_PATH}"
@@ -68,8 +75,9 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             raise ClientError(
-                "freesolo rejected this API key — create or copy a valid key from your "
-                "freesolo dashboard and pass it with `flash login --api-key` (or FREESOLO_API_KEY)"
+                "freesolo rejected this API key — create or copy a valid key at "
+                "https://freesolo.co/sign-in and pass it with `flash login --api-key` "
+                "(or FREESOLO_API_KEY)"
             ) from exc
         raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
     except urllib.error.URLError as exc:
@@ -79,11 +87,55 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
         ) from exc
 
 
+class _ProgressReader:
+    """A read()-only file-like over an in-memory payload that reports bytes consumed.
+
+    ``http.client`` sends a body exposing ``read()`` in blocksize chunks; we forward the running
+    total to ``progress(sent, total)`` for each chunk so the CLI can draw an upload bar. The
+    caller sets Content-Length from ``len(payload)``, so the request is NOT chunked-encoded and
+    the server reads it exactly as a plain bytes body."""
+
+    def __init__(self, data: bytes, progress: ProgressCallback):
+        self._data = data
+        self._total = len(data)
+        self._pos = 0
+        self._progress = progress
+
+    def __len__(self) -> int:
+        return self._total
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            chunk = self._data[self._pos :]
+        else:
+            chunk = self._data[self._pos : self._pos + size]
+        self._pos += len(chunk)
+        # a rendering hiccup must never abort an in-flight upload
+        with contextlib.suppress(Exception):
+            self._progress(self._pos, self._total)
+        return chunk
+
+
 class ApiClient:
-    def __init__(self, api_url: str, api_key: str | None = None, timeout: float = 60.0):
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str | None = None,
+        timeout: float = 60.0,
+        key_source: str | None = None,
+    ):
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.key_source = key_source
+
+    def _auth_error_detail(self, status: int, detail: str) -> str:
+        if status not in {401, 403} or self.key_source != "FREESOLO_API_KEY":
+            return detail
+        return (
+            f"{detail}; FREESOLO_API_KEY is set and overrides the key saved by "
+            "`flash login`. Unset FREESOLO_API_KEY or update it to a valid freesolo API key."
+        )
 
     def _request(
         self,
@@ -106,7 +158,43 @@ class ApiClient:
                 raw = resp.read()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:
-            raise ApiError(exc.code, _detail_from_http_error(exc)) from exc
+            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            raise ApiError(exc.code, detail) from exc
+        except urllib.error.URLError as exc:
+            raise ClientError(
+                f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
+                "check your network connection and FLASH_API_URL"
+            ) from exc
+
+    def _post_with_progress(
+        self,
+        path: str,
+        body: dict,
+        *,
+        progress: ProgressCallback,
+        timeout: float,
+    ) -> Any:
+        """POST a JSON body while reporting upload progress (see :class:`_ProgressReader`).
+
+        Same error mapping as :meth:`_request`; kept separate because the body is a streaming
+        reader with an explicit Content-Length rather than a one-shot bytes payload."""
+        payload = json.dumps(body).encode()
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(payload))}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            f"{self.api_url}{path}",
+            method="POST",
+            data=_ProgressReader(payload, progress),
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            raise ApiError(exc.code, detail) from exc
         except urllib.error.URLError as exc:
             raise ClientError(
                 f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
@@ -121,23 +209,29 @@ class ApiClient:
         return self._request("GET", "/v1/health", timeout=10.0)
 
     # -- environments ------------------------------------------------------------------
-    def publish_env(self, *, name: str, is_new: bool, package_b64: str) -> dict:
-        """Upload a packaged verifiers env to the managed Environments Hub (the control plane
-        publishes it under FreeSolo's Prime account); returns ``{"id": "owner/name"}``.
+    def publish_env(
+        self,
+        *,
+        name: str,
+        package_b64: str,
+        progress: ProgressCallback | None = None,
+    ) -> dict:
+        """Upload a packaged Freesolo environment to the managed Environments Hub.
 
-        The server may retry `prime env push` up to its own bound (default 8 attempts x 180s =
-        ~24 min worst case, plus extract/build), so the client timeout must comfortably exceed
-        that — otherwise the client gives up while the publish is still running server-side."""
-        return self._request(
-            "POST",
-            "/v1/envs",
-            body={"name": name, "is_new": is_new, "package_b64": package_b64},
-            timeout=1800.0,
-        )
+        When ``progress`` is given the body streams to the server in chunks and
+        ``progress(bytes_sent, total_bytes)`` fires for each, so the CLI can render an upload
+        bar; otherwise the body is sent in one shot (the default, used off a TTY)."""
+        body = {"name": name, "package_b64": package_b64}
+        if progress is None:
+            return self._request("POST", "/v1/envs", body=body, timeout=1800.0)
+        return self._post_with_progress("/v1/envs", body, progress=progress, timeout=1800.0)
 
     # -- runs --------------------------------------------------------------------------
-    def create_run(self, spec: dict) -> dict:
-        return self._request("POST", "/v1/runs", body={"spec": spec})
+    def create_run(self, spec: dict, runtime_secrets: dict[str, str] | None = None) -> dict:
+        body = {"spec": spec}
+        if runtime_secrets:
+            body["runtime_secrets"] = runtime_secrets
+        return self._request("POST", "/v1/runs", body=body)
 
     def list_runs(self) -> list[dict]:
         return self._request("GET", "/v1/runs")["runs"]
@@ -151,22 +245,27 @@ class ApiClient:
     def cancel_run(self, run_id: str) -> dict:
         return self._request("POST", f"/v1/runs/{run_id}/cancel")
 
+    def checkpoints(self, run_id: str) -> list[dict]:
+        """Deployable per-step RL checkpoints for a run (each `flash deploy --step N`-able)."""
+        return self._request("GET", f"/v1/runs/{run_id}/checkpoints")["checkpoints"]
+
     # -- serving -----------------------------------------------------------------------
     def deploy(
         self,
         run_id: str,
-        mode: str = "dev",
-        idle_timeout_s: int = 300,
         dry_run: bool = False,
+        step: int | None = None,
     ) -> dict:
-        # always-on blocks on the server until the worker has downloaded the
-        # model/adapter and vLLM is healthy (the no-cold-start guarantee), which can
-        # take many minutes — use the serve-scale timeout, not the default 60s.
-        deploy_timeout = 30 * 60 if (mode == "always-on" and not dry_run) else None
+        # Deploy blocks on registration and serving warmup, which can take many minutes.
+        deploy_timeout = 30 * 60 if not dry_run else None
+        body: dict = {"dry_run": dry_run}
+        if step is not None:
+            # Deploy a specific intermediate checkpoint instead of the run's final adapter.
+            body["step"] = int(step)
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/deploy",
-            body={"mode": mode, "idle_timeout_s": idle_timeout_s, "dry_run": dry_run},
+            body=body,
             timeout=deploy_timeout,
         )
 
@@ -183,7 +282,7 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
     ) -> dict:
-        # Cold starts in dev mode can take minutes; give inference a generous timeout.
+        # Serving warmup can take minutes; give inference a generous timeout.
         return self._request(
             "POST",
             f"/v1/runs/{run_id}/chat",
@@ -191,12 +290,61 @@ class ApiClient:
             timeout=30 * 60,
         )
 
+    def chat_stream(
+        self,
+        run_id: str,
+        messages: list[dict],
+        temperature: float = 0.0,
+        max_tokens: int = 512,
+    ) -> Iterator[str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            f"{self.api_url}/v1/runs/{run_id}/chat",
+            method="POST",
+            data=json.dumps(
+                {
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                }
+            ).encode(),
+            headers=headers,
+        )
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        try:
+            with urllib.request.urlopen(req, timeout=30 * 60) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if "application/json" in content_type:
+                    payload = json.loads(resp.read() or b"{}")
+                    content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
+                    if content:
+                        yield str(content)
+                    return
+                while raw := resp.read(1):
+                    chunk = decoder.decode(raw)
+                    if chunk:
+                        yield chunk
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    yield tail
+        except urllib.error.HTTPError as exc:
+            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            raise ApiError(exc.code, detail) from exc
+        except urllib.error.URLError as exc:
+            raise ClientError(
+                f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
+                "check your network connection and FLASH_API_URL"
+            ) from exc
+
 
 def client_from_config(require_key: bool = True) -> ApiClient:
     """Build a client from the stored credentials; fail with a clear hint when logged out."""
-    api_url, api_key = load_credentials()
+    api_url, api_key, key_source = load_credentials_with_source()
     if require_key and not api_key:
         raise ClientError(
             "not logged in — run `flash login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
-    return ApiClient(api_url, api_key)
+    return ApiClient(api_url, api_key, key_source=key_source)

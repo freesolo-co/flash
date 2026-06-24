@@ -9,7 +9,7 @@ the run. This module owns the lifecycle instead:
   build_function_input()   -> the exact FunctionRequest payload Flash workers expect
   submit + poll_job()      -> REST queue API with hardened retries; the job handle
                               {endpoint_id, job_id} is persisted by the runner so
-                              any process can re-attach (`flash attach`).
+                              any process can re-attach (`flash status --follow`).
 """
 
 from __future__ import annotations
@@ -23,7 +23,12 @@ import time
 from dataclasses import dataclass
 
 from flash._logging import get_logger
-from flash.providers._poll import PollErrorTracker, make_say, surface_heartbeat
+from flash.providers._poll import (
+    PollErrorTracker,
+    make_say,
+    surface_forced_heartbeat,
+    surface_heartbeat,
+)
 from flash.providers.base import PollResult, canonical_gpu
 from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.gpus import flash_gpu
@@ -50,6 +55,7 @@ __all__ = [
     "build_function_input",
     "decode_output",
     "deploy_train_endpoint",
+    "make_hf_failure_detail_reader",
     "make_hf_heartbeat_reader",
     "make_hf_text_reader",
     "poll_job",
@@ -58,7 +64,10 @@ __all__ = [
 ]
 
 TERMINAL_OK = {"COMPLETED"}
-TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMED_OUT"}
+# The provider killed the worker (reclaim/preempt/time-cap) -> infra-shaped, retried. A worker
+# "FAILED" is the run dying on its own (real traceback) -> fails fast.
+PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
+TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
 
 # Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
 # training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
@@ -72,9 +81,11 @@ _SETUP_HEARTBEAT_STAGES = frozenset(
 def stall_kwargs() -> dict:
     """``poll_job`` stall-window kwargs, shared by the submit and reattach paths so a recovered
     run uses the same tuning as the original submit. ``stall_after_s`` = post-training-heartbeat
-    window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat.
+    window; ``setup_grace_s`` = the larger cold-start window before the first training heartbeat;
+    ``queue_grace_s`` = how long a job may sit IN_QUEUE (no worker assigned) before we treat the
+    pinned GPU class as out of capacity and walk to the next-best one.
     """
-    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0}
+    return {"stall_after_s": 1500.0, "setup_grace_s": 3000.0, "queue_grace_s": 900.0}
 
 
 def volume_endpoint_kwargs(spec) -> dict:
@@ -143,6 +154,57 @@ class JobHandle:
         return cls(d["endpoint_id"], d.get("endpoint_name", ""), d["job_id"])
 
 
+def _is_workers_quota_error(exc: Exception) -> bool:
+    """True when a RunPod exception signals the account worker quota is exhausted."""
+    msg = str(exc).lower()
+    return "max workers across all endpoints" in msg
+
+
+def _sweep_idle_flash_endpoints(skip_name: str) -> int:
+    """Delete idle flash-* endpoints to reclaim worker quota. Returns count deleted.
+
+    RunPod Flash registers each endpoint as ``live-<endpoint_name>`` in its resource
+    registry, so the actual RunPod endpoint name is ``live-flash-<gpu>-<suffix>``.
+    An endpoint is idle when health reports zero active workers (running/ready/idle/
+    initializing) and no jobs in queue or in progress. These belong to runs that finished
+    or crashed without cleaning up their endpoint. ``skip_name`` is never deleted.
+    """
+    deleted = 0
+    try:
+        endpoints = runpod_api.list_endpoints()
+    except Exception:
+        logger.debug("quota-sweep: failed to list endpoints", exc_info=True)
+        return 0
+    for ep in endpoints:
+        ep_name = ep.get("name") or ""
+        eid = ep.get("id")
+        # Endpoints are registered as "live-<endpoint_name>" by the Flash SDK; both the
+        # bare "flash-" prefix and the "live-flash-" prefix must match.
+        is_flash = ep_name.startswith("flash-") or ep_name.startswith("live-flash-")
+        if not (is_flash and eid and ep_name != skip_name and f"live-{skip_name}" != ep_name):
+            continue
+        try:
+            health = runpod_api.endpoint_health(eid) or {}
+            workers = health.get("workers")
+            jobs_info = health.get("jobs")
+            # Require non-empty dicts: a missing or empty workers section means the health
+            # response is incomplete and we can't confirm the endpoint is idle.
+            if not isinstance(workers, dict) or not workers or not isinstance(jobs_info, dict):
+                continue
+            active_workers = sum(
+                workers.get(k, 0) or 0
+                for k in ("running", "ready", "idle", "initializing")
+            )
+            in_flight = (jobs_info.get("inQueue") or 0) + (jobs_info.get("inProgress") or 0)
+            if active_workers == 0 and in_flight == 0 and runpod_api.delete_endpoint(eid):
+                deleted += 1
+                logger.info("quota-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
+        except Exception:
+            logger.debug("quota-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True)
+            continue
+    return deleted
+
+
 def deploy_train_endpoint(
     friendly_gpu: str,
     execution_timeout_ms: int | None = None,
@@ -150,7 +212,11 @@ def deploy_train_endpoint(
     disk_gb: int | None = None,
     spec=None,
 ) -> tuple[str, str]:
-    """Deploy (or reuse) the run's uniquely-named worker endpoint; return (id, name)."""
+    """Deploy (or reuse) the run's uniquely-named worker endpoint; return (id, name).
+
+    On a worker-quota error, sweeps idle flash-* endpoints (from crashed/completed runs
+    that skipped GC) and retries up to ``_QUOTA_MAX_RETRIES`` times with backoff.
+    """
     os.environ["FLASH_IS_LIVE_PROVISIONING"] = "true"
     from runpod_flash import Endpoint
 
@@ -169,36 +235,54 @@ def deploy_train_endpoint(
     image = os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
     from runpod_flash.core.resources.resource_manager import ResourceManager
 
-    # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
-    # suffix, and ResourceManager + the deploy share the SDK's asyncio singleton. Hold the
-    # lock across the whole critical section so a concurrent run can't swap the registry
-    # scope or race the event loop mid-deploy.
-    with FLASH_SDK_LOCK:
-        isolate_flash_state(name_suffix)
-        kwargs = dict(
-            name=name,
-            gpu=flash_gpu(friendly),
-            gpu_count=1,
-            min_cuda_version=min_cuda_for(friendly),
-            execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-            workers=(0, 1),
-            **volume_endpoint_kwargs(spec),
-        )
-        if image:
-            kwargs["image"] = image
-        else:
-            # Pass the resolved GPU so Hopper (sm90) gets its fla-drop treatment (resolve_worker_deps
-            # is GPU-scoped); a bare call would ship the generic deps and run fla's #640-buggy GDN
-            # Triton kernel on an H100 instead of the correct pure-PyTorch delta rule.
-            kwargs["dependencies"] = resolve_worker_deps(friendly)
-            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-        ep = Endpoint(**kwargs)
-        ep._qb_target = _train_body
-        config = ep._build_resource_config()
-        apply_disk_gb(config, disk_gb)
-        # Worker image is PUBLIC, so no container-registry credential is needed to pull it.
-        rm = ResourceManager()
-        resource = asyncio.run(rm.get_or_deploy_resource(config))
+    _QUOTA_MAX_RETRIES = 3
+    resource = None
+    for quota_attempt in range(_QUOTA_MAX_RETRIES):
+        if quota_attempt > 0:
+            # Sweep idle flash-* endpoints to free quota, then backoff.
+            swept = _sweep_idle_flash_endpoints(skip_name=name)
+            wait_s = 30 * quota_attempt
+            logger.warning(
+                "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
+                "retrying in %ds",
+                quota_attempt + 1, _QUOTA_MAX_RETRIES, swept, wait_s,
+            )
+            time.sleep(wait_s)
+        # isolate_flash_state mutates runpod_flash's process-wide registry globals for this run's
+        # suffix, and ResourceManager + the deploy share the SDK's asyncio singleton. Hold the
+        # lock across the whole critical section so a concurrent run can't swap the registry
+        # scope or race the event loop mid-deploy.
+        with FLASH_SDK_LOCK:
+            isolate_flash_state(name_suffix)
+            kwargs = dict(
+                name=name,
+                gpu=flash_gpu(friendly),
+                gpu_count=1,
+                min_cuda_version=min_cuda_for(friendly),
+                execution_timeout_ms=execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
+                workers=(0, 1),
+                **volume_endpoint_kwargs(spec),
+            )
+            if image:
+                kwargs["image"] = image
+            else:
+                # Pass the resolved GPU so Hopper (sm90) gets its fla-drop treatment
+                # (resolve_worker_deps is GPU-scoped); a bare call would ship the generic deps
+                # and run fla's #640-buggy GDN Triton kernel on an H100.
+                kwargs["dependencies"] = resolve_worker_deps(friendly)
+                kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
+            ep = Endpoint(**kwargs)
+            ep._qb_target = _train_body
+            config = ep._build_resource_config()
+            apply_disk_gb(config, disk_gb)
+            # Worker image is PUBLIC, so no container-registry credential is needed to pull it.
+            rm = ResourceManager()
+            try:
+                resource = asyncio.run(rm.get_or_deploy_resource(config))
+                break  # success
+            except Exception as exc:
+                if not (_is_workers_quota_error(exc) and quota_attempt < _QUOTA_MAX_RETRIES - 1):
+                    raise
     endpoint_id = getattr(resource, "id", None)
     if not endpoint_id:
         raise RuntimeError(f"deploy_train_endpoint: no endpoint id on resource {resource!r}")
@@ -276,15 +360,29 @@ def decode_output(output) -> dict:
     return output
 
 
+def _append_failure_artifacts(detail: str, failure_detail_reader) -> str:
+    """Append worker-uploaded failure artifacts to a RunPod terminal-status detail."""
+    if failure_detail_reader is None:
+        return detail
+    extra = failure_detail_reader(force=True)
+    if not extra:
+        return detail
+    if detail:
+        return f"{detail}\n{extra}"
+    return extra
+
+
 def poll_job(
     handle: JobHandle,
     log=None,
     interval_s: float = 10.0,
     heartbeat_reader=None,
+    failure_detail_reader=None,
     stall_after_s: float = 1200.0,
     setup_grace_s: float = 3000.0,
     unhealthy_grace_s: float = 240.0,
     throttled_grace_s: float = 300.0,
+    queue_grace_s: float = 900.0,
     deadline_s: float | None = None,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
@@ -296,9 +394,20 @@ def poll_job(
     Needs a ``heartbeat_reader`` to tell the phases apart — without one we keep
     ``stall_after_s`` throughout (no regression).
 
+    ``failure_detail_reader`` force-reads worker-uploaded artifacts (``error_<phase>.txt`` and
+    ``console_<phase>.txt``) after a worker terminal failure so a generic RunPod handler wrapper
+    does not hide the real traceback.
+
     ``throttled_grace_s`` bounds how long we wait on a worker stuck THROTTLED (no RunPod
     capacity for the pinned GPU class) before returning a retryable stall so the runner
     walks to the next-best GPU.
+
+    ``queue_grace_s`` is the capacity backstop for that same walk when RunPod *doesn't* surface
+    a THROTTLED/UNHEALTHY worker: a job can sit IN_QUEUE with zero workers assigned (or one stuck
+    INITIALIZING, or while ``endpoint_health`` errors are swallowed below) and the throttled/
+    unhealthy fast-fails never arm — so without this it would burn the full ``setup_grace_s``
+    (~50 min). Keyed off the authoritative job status (robust to a failing health probe), it
+    returns a retryable stall once a job has been IN_QUEUE longer than ``queue_grace_s``.
     """
 
     say = make_say(log)
@@ -312,6 +421,7 @@ def poll_job(
     last_health_probe = 0.0
     unhealthy_since: float | None = None  # first time the worker was seen stuck UNHEALTHY
     throttled_since: float | None = None  # first time the worker was seen stuck THROTTLED
+    queued_since: float | None = None  # first time the job was seen IN_QUEUE with no worker yet
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
@@ -331,7 +441,16 @@ def poll_job(
             try:
                 return PollResult(True, metrics=decode_output(st.get("output")))
             except RuntimeError as e:
-                return PollResult(False, failure="job_failed", detail=str(e))
+                # COMPLETED but the output decodes as an error (a handler exception). Consult the
+                # worker flag too: an infra failure can surface here and must still retry.
+                last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
+                retriable = worker_flagged_retriable(heartbeat_reader)
+                detail = _append_failure_artifacts(str(e), failure_detail_reader)
+                return PollResult(
+                    False,
+                    failure="job_preempted" if retriable else "job_failed",
+                    detail=detail,
+                )
         if status in TERMINAL_FAIL:
             detail = str(st.get("error") or "")[:1500]
             out = st.get("output")
@@ -341,19 +460,53 @@ def poll_job(
                 detail += "\n--- worker stdout tail ---\n" + str(out["stdout"])[-2000:]
             elif not detail:
                 detail = str(out)[:1500]
-            # Prefix the terminal status so the runner's infra-retry markers
-            # (e.g. TIMED_OUT) match even when RunPod sets no error/output text.
-            return PollResult(False, failure="job_failed", detail=f"[{status}] {detail}")
+            # Structural classification only ([{status}] prefix is for human-readable logs).
+            # A platform termination (CANCELLED/TIMED_OUT) is already retryable — skip the worker
+            # heartbeat read entirely (no worker error there, and it may not even exist yet).
+            if status in PLATFORM_TERMINATIONS:
+                return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
+            # A worker FAILED: consult the structured worker flag (one forced heartbeat read).
+            last_hb_key, _ = surface_forced_heartbeat(heartbeat_reader, last_hb_key, say)
+            retriable = worker_flagged_retriable(heartbeat_reader)
+            detail = _append_failure_artifacts(detail, failure_detail_reader)
+            return PollResult(
+                False,
+                failure="job_preempted" if retriable else "job_failed",
+                detail=f"[{status}] {detail}",
+            )
+        # Capacity backstop: bound how long the job may sit IN_QUEUE (no worker has accepted it).
+        # The throttled/unhealthy fast-fails below only arm when endpoint_health succeeds AND RunPod
+        # reports a THROTTLED/UNHEALTHY worker; a queue with zero workers, one stuck INITIALIZING, or
+        # a health probe that keeps erroring (its block is wrapped in `except: pass`) bypasses them and
+        # would otherwise wait the full setup_grace_s (~50 min). Keyed off the authoritative job status
+        # so it holds even when the health probe is blind: once IN_QUEUE exceeds queue_grace_s, return a
+        # retryable stall so the runner's gpu-walk re-provisions on the next-best (in-capacity) class.
+        now = time.time()
+        if status == "IN_QUEUE":
+            if queued_since is None:
+                queued_since = now
+            elif now - queued_since > queue_grace_s:
+                return PollResult(
+                    False,
+                    failure="stalled",
+                    detail=f"job stuck IN_QUEUE for {int(now - queued_since)}s (no RunPod capacity "
+                    f"for the pinned GPU class); retrying on the next-best GPU",
+                )
+        else:
+            queued_since = None
         # While queued, surface worker availability (throttled hosts are the common
         # cause of silent multi-minute waits — make them visible in the run log).
-        if status == "IN_QUEUE" and time.time() - last_health_probe > 90:
-            last_health_probe = time.time()
+        if status == "IN_QUEUE" and now - last_health_probe > 90:
+            last_health_probe = now
             try:
                 h = runpod_api.endpoint_health(handle.endpoint_id)
                 workers = h.get("workers") or {}
                 usable = workers.get("running") or workers.get("ready") or workers.get("idle")
                 recovering = workers.get("initializing")
-                if any(workers.get(k) for k in ("throttled", "unhealthy", "initializing")) or not usable:
+                if (
+                    any(workers.get(k) for k in ("throttled", "unhealthy", "initializing"))
+                    or not usable
+                ):
                     say(f"queued; workers: {workers}")
                 # Fail fast on a worker stuck UNHEALTHY: a dead worker / failed image pull won't
                 # self-recover, so don't burn the full setup_grace_s (~50 min) waiting on it — once
@@ -421,13 +574,20 @@ def poll_job(
         time.sleep(interval_s)
 
 
-def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> PollResult:
+def submit_run(
+    spec,
+    seed: int,
+    log=None,
+    on_handle=None,
+    attempt: int = 0,
+    runtime_secrets: dict[str, str] | None = None,
+) -> PollResult:
     """Durable equivalent of ``submit_train``: deploy, submit, persist handle, poll.
 
     ``on_handle(handle_dict)`` is invoked as soon as the job is queued so the
     runner can persist {endpoint_id, job_id} for cross-process reattach.
     """
-    from flash.envs.registry import worker_hub_env_ids, worker_pip_for_env
+    from flash.envs.registry import worker_pip_for_env
     from flash.providers.runpod.train import _run_suffix, build_worker_env, chalk_extra_pip
 
     timeout_s = max(60, int(spec.gpu.max_wall_seconds))
@@ -437,17 +597,16 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     suffix = _run_suffix(spec.run_id)
     if attempt:
         suffix = f"{suffix}r{attempt}"
-    # Resolve the worker env BEFORE provisioning: an unrecorded Hub env raises here, and
-    # doing it after deploy_train_endpoint() would leak the just-created endpoint (its
-    # rN-suffixed name can't be reconstructed from the run id later) against the account
-    # quota — the runner would also treat the raise as a retryable poll_error.
+    # Resolve worker pip deps BEFORE provisioning, so deterministic dependency issues surface
+    # before the endpoint exists.
     # extra_pip runs for EVERY job here (the durable baked-image path skips resolve_worker_deps /
     # FLASH_WORKER_EXTRA_DEPS in build_function_input, but _train_body always pip-installs
     # extra_pip), so the opt-in chalk spec is appended here to reach default runs.
     extra_pip = (
         list(spec.environment.pip) or worker_pip_for_env(spec.environment.id)
     ) + chalk_extra_pip(spec)
-    worker_env = build_worker_env(spec, seed)
+    worker_env = build_worker_env(spec, seed, runtime_secrets=runtime_secrets)
+    worker_env["ATTEMPT"] = str(int(attempt))
     endpoint_id, name = deploy_train_endpoint(
         spec.gpu.type,
         execution_timeout_ms=timeout_s * 1000,
@@ -462,7 +621,6 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
         "seed": int(seed),
         "env": worker_env,
         "extra_pip": extra_pip,
-        "hub_env_ids": worker_hub_env_ids(spec.environment.id, spec.environment.params),
     }
     try:
         job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload, spec.gpu.type))
@@ -487,14 +645,23 @@ def submit_run(spec, seed: int, log=None, on_handle=None, attempt: int = 0) -> P
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     reader = make_hf_heartbeat_reader(hf_repo, prefix) if hf_repo else None
-    return poll_job(handle, log=log, heartbeat_reader=reader, **stall_kwargs())
+    failure_reader = (
+        make_hf_failure_detail_reader(hf_repo, prefix, spec.phase) if hf_repo else None
+    )
+    return poll_job(
+        handle,
+        log=log,
+        heartbeat_reader=reader,
+        failure_detail_reader=failure_reader,
+        **stall_kwargs(),
+    )
 
 
 def make_hf_text_reader(hf_repo: str, path_in_repo: str, min_interval_s: float = 45.0):
     """Rate-limited reader for one HF artifact's text content (None until it exists).
 
-    Generic helper shared by both providers' pollers (runpod heartbeats + vast's
-    DONE/metrics/error artifacts). ``read(force=False)`` re-downloads at most once per
+    Generic helper for HF-backed worker artifacts and heartbeats. ``read(force=False)``
+    re-downloads at most once per
     ``min_interval_s`` (``force=True`` bypasses the gate); it never raises — any HF error
     (artifact absent, network) returns None.
     """
@@ -531,8 +698,8 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
     """
     text_reader = make_hf_text_reader(hf_repo, f"{prefix}/heartbeat.json", min_interval_s)
 
-    def read() -> dict | None:
-        raw = text_reader()
+    def read(force: bool = False) -> dict | None:
+        raw = text_reader(force=force)
         if raw is None:
             return None
         try:
@@ -541,3 +708,45 @@ def make_hf_heartbeat_reader(hf_repo: str, prefix: str, min_interval_s: float = 
             return None
 
     return read
+
+
+def make_hf_failure_detail_reader(
+    hf_repo: str,
+    prefix: str,
+    phase: str,
+    min_interval_s: float = 45.0,
+):
+    """Reader for worker-uploaded RunPod failure artifacts on HF.
+
+    The RunPod queue often reports only the outer handler error (for example, "produced no
+    /tmp/metrics.json"). The worker writes the actual traceback and console tail to HF; this
+    reader lets ``poll_job`` force-download those files after a terminal worker failure.
+    """
+    error_reader = make_hf_text_reader(hf_repo, f"{prefix}/error_{phase}.txt", min_interval_s)
+    console_reader = make_hf_text_reader(
+        hf_repo, f"{prefix}/console_{phase}.txt", min_interval_s
+    )
+
+    def read(force: bool = False) -> str | None:
+        parts: list[str] = []
+        error_text = error_reader(force=force)
+        if error_text:
+            parts.append(f"--- error_{phase}.txt ---\n{error_text[-4000:]}")
+        console_text = console_reader(force=force)
+        if console_text:
+            parts.append(f"--- console_{phase}.txt ---\n{console_text[-4000:]}")
+        return "\n".join(parts) if parts else None
+
+    return read
+
+
+def worker_flagged_retriable(heartbeat_reader) -> bool:
+    """True if the worker stamped ``retriable`` (a RetriableInfraError) in its last heartbeat — the
+    structured worker<->poller contract that replaces failure-detail parsing: ``retriable`` means
+    retry on a fresh worker. Forces a fresh read past the rate limit."""
+    if heartbeat_reader is None:
+        return False
+    hb = heartbeat_reader(force=True)
+    if not isinstance(hb, dict):
+        return False
+    return bool(hb.get("retriable"))

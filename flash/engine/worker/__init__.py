@@ -1,8 +1,8 @@
-"""On-GPU fine-tuning worker (RunPod or Vast.ai). Modes: sft | rl.
+"""On-GPU fine-tuning worker (RunPod). Modes: sft | rl.
 
-This module runs on the provisioned GPU (RunPod or Vast.ai) launched by the selected
-``flash.providers`` backend. It uses the shared recipe (``flash.engine.recipe``) so
-SFT targets and RL rewards are rendered and scored consistently.
+This module runs on the provisioned RunPod GPU. It uses the shared recipe
+(``flash.engine.recipe``) so SFT targets and RL rewards are rendered and scored
+consistently.
 
 Artifacts (adapter, metrics.json, heartbeat.json, checkpoints) are streamed to a
 Hugging Face dataset repo. HF checkpoints give preemption resilience: if a worker is
@@ -27,6 +27,7 @@ import contextlib
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -45,17 +46,25 @@ from flash.engine.recipe import RECIPE
 # by the retained readers are imported plainly; names re-exported only for API / test access
 # (no retained reader uses them) are marked unused for the linter.
 from flash.engine.worker.lora import (
+    _LM_SYNC_REMAP_ON,
     _VL_EXCLUDE_SEGMENTS,  # noqa: F401
-    _patch_peft_weight_converter_compat,
-    is_vl_checkpoint,  # noqa: F401
+    _patch_peft_weight_converter_compat,  # noqa: F401
+    _remap_vl_sync_weights,  # noqa: F401
+    assert_adapter_delta_nonzero,
+    assert_adapter_load_clean,
+    assert_lora_applied,
+    is_vl_checkpoint,
     lora_exclude_modules,
-    model_quant,
+    model_quant,  # noqa: F401
     patch_vllm_language_model_only,
+    patch_vllm_lm_weight_sync,
+    remap_adapter_keys,  # noqa: F401
+    remap_vl_adapter_dir,
+    strip_language_model_infix,  # noqa: F401
     vllm_language_model_only_kwargs,  # noqa: F401
 )
 from flash.engine.worker.perf import (
-    _LIGER_MIN_PARAMS,  # noqa: F401
-    _LONG_CONTEXT_TOKENS,  # noqa: F401
+    RetriableInfraError,
     _attn_impl_for_capability,  # noqa: F401
     _ensure_fla_fastpath_on_hopper,
     _estimate_params,  # noqa: F401
@@ -85,6 +94,7 @@ HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
 SEED = int(os.environ.get("SEED", "0"))
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
+ATTEMPT = os.environ.get("ATTEMPT", "")
 JOB_SPEC = load_job_spec_from_env()
 # PHASE is the stable artifact namespace (sft|rl) and matches RUN_MODE for a train run.
 PHASE = os.environ.get(
@@ -94,11 +104,11 @@ PHASE = os.environ.get(
 
 
 def _load_active_env():
-    """Load the run's verifiers environment from the JobSpec; require an explicit env.
+    """Load the run's Freesolo environment from the JobSpec; require an explicit env.
 
-    There is no default/builtin environment (verifiers-only): a run MUST name a verifiers/
-    Prime Hub env id. Failing here (instead of falling back to some default) prevents a paid
-    worker from training/evaluating the wrong task.
+    There is no default/builtin environment: a run MUST name a published Freesolo
+    environment id. Failing here prevents a paid worker from training/evaluating the
+    wrong task.
     """
     if JOB_SPEC is None:
         # No JobSpec at all (e.g. the module imported for a non-run path / a unit test). There
@@ -107,17 +117,18 @@ def _load_active_env():
         return None
     env_id = JOB_SPEC.environment.id
     if not env_id:
-        # Every supported algorithm (sft/grpo) trains/evaluates against a verifiers env, so a
+        # Every supported algorithm (sft/grpo) trains/evaluates against a Freesolo env, so a
         # missing env is always a misconfigured spec. Fail loudly rather than fall back to a
         # default and burn a paid worker on the wrong task.
         raise RuntimeError(
-            "JobSpec sets no environment: provide [environment] id (a verifiers/Prime Hub "
-            "slug, e.g. 'owner/name')."
+            "JobSpec sets no environment: provide [environment] id "
+            "(a Freesolo environment id like 'your-name/your-env', returned by "
+            "`flash env push --name <name>`)."
         )
     return load_environment(env_id, JOB_SPEC.environment.params)
 
 
-ACTIVE_ENV = _load_active_env()
+ACTIVE_ENV = None
 
 
 def require_active_env():
@@ -130,12 +141,16 @@ def require_active_env():
     actionable message instead — mirrors the explicit RuntimeError raised when a JobSpec is
     present but names no environment.
     """
+    global ACTIVE_ENV
+    if ACTIVE_ENV is None:
+        ACTIVE_ENV = _load_active_env()
     if ACTIVE_ENV is None:
         raise RuntimeError(
             "no environment is loaded: this worker was started without a JobSpec "
             "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
-            "carry a JobSpec naming [environment] id (a verifiers/Prime Hub slug, e.g. "
-            "'owner/name')."
+            "carry a JobSpec naming [environment] id "
+            "(a Freesolo environment id like 'your-name/your-env', returned by "
+            "`flash env push --name <name>`)."
         )
     return ACTIVE_ENV
 
@@ -185,7 +200,8 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> None
                 time.sleep(5 * (attempt + 1))
                 continue
             if required:
-                raise RuntimeError(f"required upload of {repo_subpath!r} failed: {e}") from e
+                # Already retried 3x -> the host/network is bad, not the run. Infra-shaped.
+                raise RetriableInfraError(f"required upload of {repo_subpath!r} failed: {e}") from e
             print(f"{label} warn:", e)
             return
 
@@ -203,6 +219,32 @@ def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False):
         required,
         "hf_upload_file",
     )
+
+
+_DEBUG_UPLOAD_LOCK = threading.Lock()
+
+
+def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> None:
+    """Append bounded JSONL debug rows and upload them as an optional artifact.
+
+    This is intentionally best-effort: debug visibility must not fail a paid run.
+    """
+    if not rows or not HF_REPO:
+        return
+    repo_name = os.path.basename(name if name.endswith(".jsonl") else f"{name}.jsonl")
+    path = os.path.join("/tmp", repo_name)
+    try:
+        with _DEBUG_UPLOAD_LOCK:
+            existing: list[str] = []
+            with contextlib.suppress(FileNotFoundError), open(path) as f:
+                existing = f.readlines()[-keep_last:]
+            with open(path, "w") as f:
+                f.writelines(existing)
+                for row in rows:
+                    f.write(json.dumps(row, default=str, ensure_ascii=True, sort_keys=True) + "\n")
+            hf_upload_file(path, repo_name)
+    except Exception as e:
+        print(f"debug upload warn ({repo_name}): {e}")
 
 
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False):
@@ -281,8 +323,67 @@ def prefetch_model(model_id: str) -> float:
         model=model_id,
         download_seconds=secs,
         hf_transfer=os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
+        gpu=gpu_diagnostics(),
     )
     return secs
+
+
+# Trainer-state files a serving engine never needs: optimizer/scheduler/rng/loss-curve
+# state. Excluded when publishing the deployable per-step adapter so each step's snapshot is
+# just the LoRA weights + config (a few MB), small enough to KEEP every step (no pruning).
+_CHECKPOINT_TRAINER_STATE = (
+    "optimizer.pt",
+    "optimizer.bin",
+    "scheduler.pt",
+    "scaler.pt",
+    "rng_state*.pth",
+    "trainer_state.json",
+    "training_args.bin",
+    "*.distcp",
+    "global_step*/**",
+    "latest",
+    "zero_to_fp32.py",
+)
+
+# The PEFT adapter weights file a checkpoint must carry to be loadable/servable (safetensors is
+# the default; .bin is the legacy fallback). A step with adapter_config.json but no weights is
+# NOT deployable, so it's never published/listed.
+_ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
+
+
+def publish_deployable_checkpoint(ckpt_dir: str, step: int) -> str | None:
+    """Mirror a trainer checkpoint's LoRA adapter to a stable, NON-pruned per-step path so a
+    run cancelled mid-RL is still one-command-deployable from its last good step.
+
+    The trainer's checkpoint folder already contains the PEFT adapter (``adapter_config.json``
+    + ``adapter_model.safetensors``) that ``deploy_adapter`` serves; we re-upload just those
+    (dropping optimizer/scheduler/rng state) to ``<prefix>/checkpoints/step-<step>/adapter``.
+    Unlike the resume checkpoint (``checkpoint/**``, kept latest-only), these accumulate, so
+    EVERY step stays deployable. Returns the deployable adapter subfolder, or ``None`` when
+    there's no adapter to publish. Best-effort: a failure here never fails a paid run.
+    """
+    if not HF_REPO:
+        return None
+    # Only publish a checkpoint that actually carries a loadable adapter (config AND weights) —
+    # never advertise a non-deployable step.
+    has_config = os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json"))
+    has_weights = any(os.path.isfile(os.path.join(ckpt_dir, w)) for w in _ADAPTER_WEIGHT_FILES)
+    if not (has_config and has_weights):
+        return None
+    subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
+    try:
+        hf_api().upload_folder(
+            folder_path=ckpt_dir,
+            path_in_repo=subfolder,
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+        )
+        heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
+        return subfolder
+    except Exception as e:
+        print(f"[ckpt] deployable publish warn (step {step}):", e)
+        return None
 
 
 def make_checkpoint_upload_callback():
@@ -291,6 +392,9 @@ def make_checkpoint_upload_callback():
     Uploads run in a background thread (the train loop never blocks on the network);
     older checkpoints are deleted in the same commit. If an upload is still in flight
     when the next save fires, the new save is skipped (the following one catches up).
+
+    Each save also publishes a deployable per-step adapter snapshot (``publish_deployable_
+    checkpoint``) so a run cancelled mid-RL can still be deployed from its latest step.
     """
     from transformers import TrainerCallback
 
@@ -318,6 +422,9 @@ def make_checkpoint_upload_callback():
                         delete_patterns=[f"{hf_prefix()}/checkpoint/**"],
                     )
                     heartbeat("checkpoint_uploaded", step=step)
+                    # Mirror this step's adapter to its own kept-forever path so the run
+                    # stays deployable even if it never reaches "done".
+                    publish_deployable_checkpoint(ckpt_dir, step)
                 except Exception as e:
                     print("ckpt upload warn:", e)
                 finally:
@@ -346,7 +453,7 @@ _HB_THROTTLED_STAGES = frozenset({"rl_step"})
 _HB_TERMINAL_STAGES = frozenset({"done", "already_done"})
 _HB_TERMINAL_ONLY = False
 # Even in terminal-only mode, emit a SLOW heartbeat at this cadence so the control plane's stall
-# detector (poll_vast_job stall_after_s, default 1500s) keeps seeing progress through a long
+# detector keeps seeing progress through a long
 # training phase and doesn't false-stall the run. 600s -> ~6 commits/hr, far under the 128/hr cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
 
@@ -371,6 +478,7 @@ def heartbeat(stage: str, **kw):
         "run_id": RUN_ID,
         "mode": RUN_MODE,
         "seed": SEED,
+        "attempt": ATTEMPT,
         **kw,
     }
     os.makedirs("/tmp/hb", exist_ok=True)
@@ -459,12 +567,9 @@ def graded_text(completion: str | None) -> str | None:
     return strip_think(completion) if THINKING else completion
 
 
-
-
 # ---------------------------------------------------------------------------
 # SFT
 # ---------------------------------------------------------------------------
-
 
 
 def force_vllm_backend_for_sm120() -> str | None:
@@ -488,10 +593,11 @@ def force_vllm_backend_for_sm120() -> str | None:
         print("[rl] sm120 vLLM backend probe skipped:", e)
         return None
     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
-    print("[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
-          "on consumer Blackwell hosts -> empty-rollout failures)")
+    print(
+        "[rl] sm120 (RTX 5090): VLLM_ATTENTION_BACKEND=FLASHINFER (flash-attn PTX is unreliable "
+        "on consumer Blackwell hosts -> empty-rollout failures)"
+    )
     return "FLASHINFER"
-
 
 
 def finalize_alloc_conf_for_sleep() -> None:
@@ -529,10 +635,6 @@ def finalize_alloc_conf_for_sleep() -> None:
         print("[alloc] auto-conf skipped:", e)
 
 
-
-
-
-
 def wandb_report_to() -> list[str]:
     """TRL/HF ``report_to`` targets. Restores the W&B logging the legacy freesolo training path had
     but the flash migration dropped: report to W&B whenever WANDB_API_KEY is present. No key -> []
@@ -561,7 +663,9 @@ def wandb_report_to() -> list[str]:
             project = (JOB_SPEC.wandb.project if JOB_SPEC else None) or "flash"
             wandb.init(project=project, name=wandb_run_name())
     except Exception as e:
-        print(f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)")
+        print(
+            f"[wandb] W&B init failed ({e}); skipping W&B logging (metrics.json is still written)"
+        )
         return []
     return ["wandb"]
 
@@ -597,9 +701,6 @@ def wandb_run_info() -> dict:
         return {}
 
 
-
-
-
 def make_lora(model_id: str | None = None):
     """LoRA config. We target 'all-linear' (every nn.Linear) rather than a hardcoded
     q/k/v/o list: it is architecture-agnostic, so the same recipe works for the dense
@@ -621,48 +722,30 @@ def make_lora(model_id: str | None = None):
         "target_modules": targets,
         "task_type": "CAUSAL_LM",
     }
-    # Adapter initialization (convergence lever: measured -35% train loss in A/B (gpu-bench)).
-    # PiSSA inits A/B from the base weight's top singular vectors (fast SVD, ~seconds) so LoRA
-    # converges faster + to higher quality than the default zero-B init (arXiv 2404.02948).
-    # NOTE: PiSSA mutates the effective base, so the saved adapter is a PiSSA-residual unless
-    # converted — fine for our train+eval+serve-same-stack flow.
-    # BUT PiSSA's SVD needs an UNQUANTIZED base: on the 4-bit QLoRA tier peft raises "Please
-    # initialize PiSSA under float32/float16/bfloat16" and the whole run crashes at adapter init.
-    # The catalog's 9B is 4bit-qlora by default, so every 9B run died here. Fall back to the
-    # default LoRA init on the QLoRA tier; PiSSA stays on for the bf16/LoRA tier.
-    if model_id and model_quant(model_id) == "4bit-qlora":
-        print("[lora] 4-bit QLoRA base -> default LoRA init (PiSSA needs an fp base)")
-    else:
-        kwargs["init_lora_weights"] = "pissa_niter_16"
-        print("[lora] init_lora_weights=pissa_niter_16")
-    # rsLoRA scaling (convergence lever, always-on: measured -47% train loss in A/B (gpu-bench)).
-    # Quant-independent (just the alpha/sqrt(r) scale), so on for both tiers.
-    kwargs["use_rslora"] = True
+    # Adapter initialization: standard zero-B init (the LoRA delta starts at zero, so the saved
+    # adapter is a plain residual that loads correctly onto the ORIGINAL base).
+    # PiSSA was removed: it mutates the effective base during training, so its saved adapter only
+    # reconstructs against the PiSSA-residual base. Loading that adapter onto the unmodified base
+    # at SERVING or GRPO WARM-START (which is exactly our flow) corrupts the model -> the served
+    # model emits only whitespace and warm-start GRPO hangs. peft can convert PiSSA->standard on
+    # save, but the simpler, robust choice is the default init (the convergence gain isn't worth
+    # silently breaking serve + warm-start).
+    kwargs["init_lora_weights"] = True
+    print(
+        "[lora] init_lora_weights=True (standard zero-B; PiSSA removed for serve/warm-start safety)"
+    )
+    # Standard LoRA scaling (alpha/r). rsLoRA was removed: it scales by alpha/sqrt(r) (~5.6x larger
+    # for r=32/alpha=64), so with the usual LoRA LR (e.g. 2e-4) the effective update is ~5.6x too
+    # large -> SFT diverges to a degenerate adapter (served model repeats a single token / emits
+    # whitespace) and the adapter is also fragile under vLLM's rsLoRA handling at serve time.
+    # Standard scaling keeps the catalog LRs sane and the saved adapter serve-safe.
+    kwargs["use_rslora"] = False
     if model_id and targets == "all-linear":
         exclude = lora_exclude_modules(model_id)
         if exclude:
             kwargs["exclude_modules"] = exclude
             print(f"[lora] excluding modules for {model_id}: {exclude}")
     return LoraConfig(**kwargs)
-
-
-
-
-def qlora_model_init_kwargs() -> dict:
-    """Model-load kwargs for the 4-bit QLoRA tier: bf16 compute + a bitsandbytes NF4
-    (double-quant) config so the frozen base loads in 4-bit and only the LoRA adapter trains."""
-    import torch
-    from transformers import BitsAndBytesConfig
-
-    return {
-        "dtype": torch.bfloat16,
-        "quantization_config": BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        ),
-    }
 
 
 def require_vllm_for_rollout_func(use_rollout_func: bool, use_vllm: bool, model_id: str) -> None:
@@ -688,15 +771,15 @@ def run_sft():
     from trl import SFTConfig as TRLSFTConfig
     from trl import SFTTrainer
 
-    require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
+    env = require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
-    heartbeat("sft_start")
+    heartbeat("sft_start", gpu=gpu_diagnostics())
     # SFT only fits the single assistant `sft_target` per row; a multi-turn/ToolEnv env's
     # tool/env turns are not represented, so SFT on one would silently mis-train (imitating a
     # collapsed single-turn target). Warn loudly so it is not mistaken for proper multi-turn SFT.
-    if getattr(ACTIVE_ENV, "multi_turn", False):
+    if getattr(env, "multi_turn", False):
         print(
-            "[sft][warn] this is a multi-turn / tool verifiers environment, but SFT only fits "
+            "[sft][warn] this is a multi-turn Freesolo environment, but SFT only fits "
             "the single assistant target per row (tool/env turns are ignored). The model will be "
             "trained on collapsed single-turn targets; multi-turn SFT is not supported. Use a "
             "single-turn environment, or expect a single-turn-only fit."
@@ -710,7 +793,7 @@ def run_sft():
         tok.pad_token = tok.eos_token
 
     # Build SFT text dataset (seeded shuffle for reproducibility)
-    train = ACTIVE_ENV.dataset()
+    train = env.dataset()
     rng = random.Random(SEED)
     rng.shuffle(train)
     max_examples = int(
@@ -723,8 +806,8 @@ def run_sft():
     texts = []
     for ex in train:
         msgs = [
-            *ACTIVE_ENV.prompt_messages(ex),
-            {"role": "assistant", "content": ACTIVE_ENV.sft_target(ex)},
+            *env.prompt_messages(ex),
+            {"role": "assistant", "content": env.sft_target(ex)},
         ]
         texts.append(
             {
@@ -742,7 +825,7 @@ def run_sft():
     ds = Dataset.from_list(texts)
 
     setup_seconds = time.time() - t_start
-    heartbeat("sft_model_load", setup_seconds=setup_seconds)
+    heartbeat("sft_model_load", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
 
     # Epochs come from the run's [train] epochs (already in JOB_SPEC), else the recipe default.
     epochs = int(
@@ -751,21 +834,44 @@ def run_sft():
         else RECIPE.sft.num_epochs
     )
     # SDK [train] knobs override the recipe default.
-    from flash.engine.vram import sft_grad_accum
+    from flash.catalog import vocab_size_for
+    from flash.engine.vram import resolve_params_b, sft_grad_accum, sft_logits_fused
 
     _t = JOB_SPEC.train if JOB_SPEC else None
-    # batch_size is the GLOBAL/effective batch; sft_grad_accum sizes the per-device micro-batch +
-    # grad-accum to realize it (shared with the cost estimator's step count, see engine.vram).
-    effective_batch = (
-        _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
-    )
-    per_device_bs, grad_accum = sft_grad_accum(effective_batch)
     sft_lr = _t.learning_rate if _t and _t.learning_rate is not None else RECIPE.sft.learning_rate
     sft_max_len = (
         _t.max_length
         if _t and _t.max_length is not None
         else (RECIPE.sft.max_seq_len_thinking if THINKING else RECIPE.sft.max_seq_len)
     )
+    # batch_size is the GLOBAL/effective batch; sft_grad_accum sizes the per-device micro-batch +
+    # grad-accum to realize it (shared with the cost estimator's step count, see engine.vram).
+    effective_batch = (
+        _t.batch_size if _t and _t.batch_size is not None else RECIPE.sft.effective_batch
+    )
+    # Large-vocab OOM guard: when the fused CE (Liger) is OFF, the SFTTrainer materializes the full
+    # [per_device, seq, vocab] fp32 logits + grad — at Qwen3.5's ~248k vocab a 0.8B SFT OOM'd a
+    # 24 GB card in backward. Cap the per-device micro-batch by the real model vocab + seq so those
+    # logits stay within the logits budget; grad-accum rises to keep the effective batch unchanged
+    # (the SFT mirror of rl_per_device_comps' GRPO cap). fused mirrors liger_on(_memory_mode(...))
+    # below, so the cap binds exactly when the worker won't fuse the CE.
+    _sft_params_b = resolve_params_b(model_id)  # catalog stat else HF safetensors (open models)
+    _sft_vocab = vocab_size_for(model_id)
+    # Actual fused-CE decision == what `use_liger_kernel` is set from below (line ~879). sft_logits_fused
+    # is the offline size/ctx mirror; liger_on(...) adds the runtime CUDA + liger_kernel-importable
+    # check, so the cap binds exactly when the fused CE is NOT really taken.
+    _sft_fused = sft_logits_fused(_sft_params_b, sft_max_len) and liger_on(
+        _memory_mode(model_id, sft_max_len)
+    )
+    per_device_bs, grad_accum = sft_grad_accum(
+        effective_batch, seq_len=sft_max_len, vocab=_sft_vocab, fused=_sft_fused
+    )
+    if not _sft_fused and per_device_bs < min(effective_batch, 4):
+        print(
+            f"[sft] large-vocab logits cap: per_device={per_device_bs} grad_accum={grad_accum} "
+            f"(seq={sft_max_len}, vocab={_sft_vocab}; realized batch "
+            f"{per_device_bs * grad_accum} >= requested {effective_batch})"
+        )
     sft_save_default = _t.save_every if _t and _t.save_every is not None else 50
     out_dir = f"/tmp/sft_seed{SEED}"
     resume_ckpt = hf_resume_checkpoint()
@@ -782,10 +888,15 @@ def run_sft():
         "logging_steps": 10,
         "save_steps": sft_save_default,
         "save_total_limit": 1,
-        # Memory-light checkpoints: save ONLY the (small LoRA) model, not the optimizer /
-        # scheduler / RNG state — skips the optimizer-state serialization spike at save and
-        # writes just the adapter. (We don't resume mid-run; seeds restart cleanly.)
-        "save_only_model": True,
+        # Resumable checkpoints: save the optimizer / scheduler / RNG state alongside the (small)
+        # LoRA adapter. We DO resume mid-run — make_checkpoint_upload_callback streams each save to
+        # HF and a replacement worker calls resume_from_checkpoint(hf_resume_checkpoint()) after a
+        # preemption — so without this the resumed run would re-initialize the optimizer (Adam
+        # moments) and LR schedule instead of truly continuing. For LoRA the optimizer state is tiny
+        # (it covers only the trainable adapter params), so the save spike is negligible. The
+        # deployable per-step snapshot (publish_deployable_checkpoint) strips this trainer state
+        # separately, so serving still gets adapter-only files.
+        "save_only_model": False,
         "max_length": sft_max_len,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
@@ -814,20 +925,20 @@ def run_sft():
     # FLOPs on padding. TRL's 'bfd' strategy makes padding-free batches whose example boundaries are
     # honored ONLY by an attention impl that reads them — under plain SDPA packed examples
     # cross-contaminate (silent quality loss). The boundary-correct backend is FlashAttention-2
-    # varlen (reads position_ids); but flash-attn has NO prebuilt wheel for torch 2.10 (PyPI
-    # sdist-only; Dao-AILab wheels stop at torch 2.9) so it would build from source on every cold
-    # start (~20 min, fragile) — it is NOT in the worker image. So _fa_ok is False on the current
-    # stack and packing is effectively unavailable until flash-attn is baked into a prebuilt image.
-    # Packing is ON when FA2 is importable (varlen keeps 'bfd' example boundaries correct); else
-    # SKIP — without a boundary-correct attn backend examples would cross-contaminate under SDPA.
+    # varlen (reads position_ids), which the worker image bakes in best-effort: Dockerfile.worker
+    # installs FLASH_ATTN_SPEC (a community cu128/torch2.10/cp312 wheel preferred, source build as a
+    # fallback) and tolerates a build failure -> SDPA. So _fa_ok is True whenever that install landed;
+    # packing is ON then (varlen keeps 'bfd' example boundaries correct). If the best-effort install
+    # failed, _fa_ok is False and we SKIP packing — without a boundary-correct attn backend examples
+    # would cross-contaminate under SDPA.
     _fa_ok = _flash_attn_available()
     if _fa_ok:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
     else:
         print(
-            "[sft] packing SKIPPED: no boundary-correct attn backend (flash-attn absent on torch "
-            "2.10). Bake flash-attn into the worker image to enable FA2 varlen packing."
+            "[sft] packing SKIPPED: flash_attn not importable (best-effort image build failed) "
+            "— no boundary-correct attn backend, falling back to SDPA without packing."
         )
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
@@ -841,18 +952,11 @@ def run_sft():
     if cfg_kwargs.get("packing") and _fa_ok:
         _attn = "flash_attention_2"
         print("[sft] attn_implementation=flash_attention_2 (packing boundary-correct varlen)")
-    quant = model_quant(model_id)
-    if quant == "4bit-qlora":
-        # QLoRA tier: 4-bit NF4 base + bf16 LoRA adapters (e.g. Qwen3.5-9B on a 5090).
-        _patch_peft_weight_converter_compat()  # adapter (re)load, e.g. ckpt resume
-        mik = qlora_model_init_kwargs()
-        print(f"[sft] loading {model_id} in 4-bit (QLoRA tier)")
-    else:
-        # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
-        # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
-        # accelerate-offload large models to meta ("expected device meta but got
-        # cuda:0" in backward on the 9B).
-        mik = {"dtype": "bfloat16", "device_map": None}
+    # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
+    # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
+    # accelerate-offload large models to meta ("expected device meta but got
+    # cuda:0" in backward on the 9B).
+    mik = {"dtype": "bfloat16", "device_map": None}
     if _attn:
         mik["attn_implementation"] = _attn
     cfg_kwargs["model_init_kwargs"] = mik
@@ -940,14 +1044,28 @@ def run_sft():
 
     # Pass model as a string id + tokenizer as processing_class so TRL takes the
     # text/causal-LM path (not the VLM processor path) for this multimodal checkpoint.
-    trainer = _SFT(
-        model=model_id,
-        args=cfg,
-        train_dataset=ds,
-        peft_config=make_lora(model_id),
-        processing_class=tok,
-        callbacks=[make_checkpoint_upload_callback()],
-    )
+    # SFTTrainer.__init__ blocks for 10-15 min on first use (FA2 CUDA kernel JIT compilation);
+    # without a heartbeat the control plane can't distinguish this from a real hang and may
+    # recycle the worker. A daemon thread pings every 30s so the stall detector stays quiet.
+    _sft_init_done = threading.Event()
+
+    def _sft_init_heartbeat() -> None:
+        while not _sft_init_done.wait(30.0):
+            heartbeat("sft_initializing", gpu=gpu_diagnostics())
+
+    _sft_init_hb = threading.Thread(target=_sft_init_heartbeat, daemon=True)
+    _sft_init_hb.start()
+    try:
+        trainer = _SFT(
+            model=model_id,
+            args=cfg,
+            train_dataset=ds,
+            peft_config=make_lora(model_id),
+            processing_class=tok,
+            callbacks=[make_sft_heartbeat_callback(), make_checkpoint_upload_callback()],
+        )
+    finally:
+        _sft_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the materialized
     # SFT trainer.model — chalk's apply patches the LIVE module, so it must run AFTER TRL builds the
     # model (chalk composes on top of TRL's Liger). No-op unless a FLASH_* kernel flag selects it and
@@ -967,7 +1085,7 @@ def run_sft():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     hf_upload_folder(adapter_dir, "adapter", required=True)
-    heartbeat("sft_trained", train_wall=train_wall)
+    heartbeat("sft_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     # count train tokens
     train_tokens = int(sum(len(tok(t["text"])["input_ids"]) for t in texts) * epochs)
@@ -1071,6 +1189,22 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     }
 
 
+def resolve_grpo_prompts_per_step(requested: int, available_prompts: int) -> int:
+    """Cap GRPO's prompt batch to the retained dataset size.
+
+    TRL's GRPO dataloader can yield zero batches when the configured prompt batch is larger
+    than the dataset that remains after prompt-budget filtering. That surfaces late as
+    "There seems not to be a single sample in your epoch_iterator" and then our no-reward guard
+    reports the wrong cause. Small smoke envs should still train; use every retained prompt per
+    step instead of asking TRL for an impossible larger batch.
+    """
+    requested = max(1, int(requested))
+    available_prompts = int(available_prompts)
+    if available_prompts <= 0:
+        raise ValueError("GRPO needs at least one retained training prompt")
+    return min(requested, available_prompts)
+
+
 def rl_per_device_comps(
     completion_len: int = 0,
     vocab: int = 248_320,
@@ -1117,6 +1251,10 @@ def rl_per_device_comps(
     return max(1, base)
 
 
+_STEP_GPU_DIAG_INTERVAL_S = 300.0
+_SFT_HEARTBEAT_INTERVAL_S = 60.0
+
+
 def make_reward_heartbeat_callback():
     """A TRL/transformers callback that streams the per-step mean reward to the HF heartbeat
     channel, giving the worker a live RL signal (no pod log API) and recording a
@@ -1126,6 +1264,7 @@ def make_reward_heartbeat_callback():
     class _RewardHeartbeat(TrainerCallback):
         def __init__(self):
             self.reward_history = []
+            self.last_gpu_diag_at = 0.0
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs:
@@ -1139,9 +1278,55 @@ def make_reward_heartbeat_callback():
                 return
             self.reward_history.append(r)
             step = int(getattr(state, "global_step", len(self.reward_history)))
-            heartbeat("rl_step", step=step, reward=r, reward_last=self.reward_history[-8:])
+            payload = {
+                "step": step,
+                "reward": r,
+                "reward_last": self.reward_history[-8:],
+            }
+            now = time.monotonic()
+            if (
+                self.last_gpu_diag_at == 0.0
+                or now - self.last_gpu_diag_at >= _STEP_GPU_DIAG_INTERVAL_S
+            ):
+                payload["gpu"] = gpu_diagnostics()
+                self.last_gpu_diag_at = now
+            heartbeat("rl_step", **payload)
 
     return _RewardHeartbeat()
+
+
+def make_sft_heartbeat_callback():
+    """Stream SFT trainer logs so a run is not silent between model load and completion."""
+    from transformers import TrainerCallback
+
+    class _SFTHeartbeat(TrainerCallback):
+        def __init__(self):
+            self.last_heartbeat_at = 0.0
+            self.last_gpu_diag_at = 0.0
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return
+            now = time.monotonic()
+            if self.last_heartbeat_at and now - self.last_heartbeat_at < _SFT_HEARTBEAT_INTERVAL_S:
+                return
+            self.last_heartbeat_at = now
+            payload = {
+                "step": int(getattr(state, "global_step", 0) or 0),
+                "epoch": logs.get("epoch"),
+                "loss": logs.get("loss"),
+                "grad_norm": logs.get("grad_norm"),
+                "learning_rate": logs.get("learning_rate"),
+            }
+            if (
+                self.last_gpu_diag_at == 0.0
+                or now - self.last_gpu_diag_at >= _STEP_GPU_DIAG_INTERVAL_S
+            ):
+                payload["gpu"] = gpu_diagnostics()
+                self.last_gpu_diag_at = now
+            heartbeat("sft_step", **{k: v for k, v in payload.items() if v is not None})
+
+    return _SFTHeartbeat()
 
 
 def grpo_overrides() -> dict:
@@ -1151,7 +1336,7 @@ def grpo_overrides() -> dict:
     Knobs: group_size, temperature, max_tokens (completion budget), kl_penalty_coef (the KL
     beta), advantage_clip (centered-advantage clip), and thinking_length_penalty_coef
     (a per-<think>-token reward deduction). These live in ``[train]`` — NOT in
-    ``[environment.params]``, which is forwarded verbatim to the verifiers env loader."""
+    ``[environment.params]``, which is forwarded verbatim to the Freesolo env loader."""
     if not JOB_SPEC:
         return {}
     train = JOB_SPEC.train
@@ -1205,29 +1390,38 @@ def _init_adapter_model(model_id: str):
     from transformers import AutoModelForCausalLM
 
     print(f"[init-adapter] initializing LoRA from {prefix}")
-    # 4-bit-QLoRA tier: load the frozen base in NF4 so a continued-adapter GRPO run fits
-    # the same memory budget as a fresh-LoRA one (and TRL still sees Linear4bit modules ->
-    # bitsandbytes vLLM rollout).
-    if model_quant(model_id) == "4bit-qlora":
-        _patch_peft_weight_converter_compat()
-        _attn = optimal_attn_impl()  # arch-aware attention on the QLoRA path too
-        _mik = qlora_model_init_kwargs()
-        if _attn:  # else leave transformers' default (sdpa)
-            _mik["attn_implementation"] = _attn
-        base = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            **_mik,
-        )
-    else:
-        _attn = optimal_attn_impl()
-        base = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            dtype="bfloat16",
-            trust_remote_code=True,
-            **({"attn_implementation": _attn} if _attn else {}),
-        )
+    # VL checkpoints (Qwen3.5/3.6): the SFT step saved the adapter against the FULL multimodal model
+    # (keys under ``base_model.model.model.language_model.layers.*``), but we load the base here via
+    # AutoModelForCausalLM (text-only tree, ``base_model.model.model.layers.*``). Strip the
+    # ``.language_model.`` infix on disk so PeftModel.from_pretrained matches the SFT keys —
+    # otherwise peft only WARNS about missing keys and silently trains a fresh LoRA, discarding the
+    # SFT. No-op for non-VL checkpoints. See flash/engine/worker/lora.py.
+    remap_vl_adapter_dir(adir, model_id)
+    _attn = optimal_attn_impl()
+    base = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        **({"attn_implementation": _attn} if _attn else {}),
+    )
     model = PeftModel.from_pretrained(base, adir, is_trainable=True)
+    # Fail loudly if the adapter didn't actually apply (a key mismatch would otherwise silently start
+    # GRPO from the base model again). from_pretrained loads with load_state_dict(strict=False) and
+    # only WARNS on a mismatch, discarding the load result — so re-run load_adapter to CAPTURE which
+    # keys matched and assert matched==saved (peft injects the LoRA modules from target_modules BEFORE
+    # loading weights, so the module-count check alone can't see a silent weight discard). The reload
+    # is idempotent: same weights into the same "default" adapter. See flash/engine/worker/lora.py.
+    # Mirror from_pretrained's key_mapping: for transformers models that define a
+    # ``_checkpoint_conversion_mapping`` (renamed-arch checkpoints), from_pretrained remaps the adapter
+    # keys before loading; the reload must apply the SAME mapping or it would reinterpret valid keys as
+    # mismatched and falsely abort. peft reads it off the base model (peft_model.py from_pretrained).
+    key_mapping = getattr(base, "_checkpoint_conversion_mapping", None)
+    load_result = model.load_adapter(
+        adir, adapter_name="default", is_trainable=True, key_mapping=key_mapping
+    )
+    assert_adapter_load_clean(load_result, model_id)
+    assert_lora_applied(model, model_id)
+    assert_adapter_delta_nonzero(model, model_id)
     return model, None
 
 
@@ -1240,9 +1434,7 @@ def _grpo_resume_already_complete(resume_ckpt, target_steps: int, steps_run: int
     return bool(resume_ckpt) and target_steps > 0 and steps_run >= target_steps
 
 
-def _grpo_is_no_op_failure(
-    reward_history, resume_ckpt, target_steps: int, steps_run: int
-) -> bool:
+def _grpo_is_no_op_failure(reward_history, resume_ckpt, target_steps: int, steps_run: int) -> bool:
     """True when a GRPO run trained NOTHING and must fail loudly instead of reporting as done.
 
     An empty ``reward_history`` means the reward callback never fired — the rollout scored nothing
@@ -1260,9 +1452,9 @@ def run_rl():
     from transformers import AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
 
-    require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
+    env = require_active_env()  # fail loudly (not AttributeError: NoneType) on the no-JobSpec path
     t_start = time.time()
-    heartbeat("rl_start")
+    heartbeat("rl_start", gpu=gpu_diagnostics())
     # GRPO rollout strategy by env shape (trl 1.6 adds the hooks these need):
     #   * single-turn          -> TRL single-shot generation + per-completion reward (below);
     #   * tool (ToolEnv & subs:
@@ -1272,14 +1464,12 @@ def run_rl():
     #   * pure multi-turn      -> a custom rollout_func (flash.engine.multiturn_rollout)
     #     drives THIS env's turn loop on the colocate engine and returns the interleaved
     #     token sequence with an env_mask so only the model's tokens are trained.
-    is_tool_env = getattr(ACTIVE_ENV, "is_tool_env", False)
-    is_multi_turn = getattr(ACTIVE_ENV, "multi_turn", False)
+    is_tool_env = getattr(env, "is_tool_env", False)
+    is_multi_turn = getattr(env, "multi_turn", False)
     conversational = is_multi_turn  # message-list prompts (tool + pure multi-turn) vs strings
     wait_for_gpu()
     setup_perf_backends()
     model_id = JOB_SPEC.model if JOB_SPEC else RECIPE.hf_model_id
-    # QLoRA tier loads the base bf16 checkpoint; vLLM/transformers quantize it to 4-bit NF4 at load.
-    quant = model_quant(model_id)
     download_seconds = prefetch_model(model_id)
     rl = RECIPE.rl
     # Steps come from the run's [train] steps (already in JOB_SPEC), else the recipe default.
@@ -1294,7 +1484,9 @@ def run_rl():
     _t = JOB_SPEC.train if JOB_SPEC else None
     # batch_size = prompts per optimizer step for GRPO.
     # prompts per optimizer step = the run config's [train].batch_size (recipe default otherwise).
-    prompts_per_step = int(_t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step)
+    prompts_per_step = int(
+        _t.batch_size if _t and _t.batch_size is not None else rl.prompts_per_step
+    )
     group_size = int(gcfg.get("group_size") or rl.group_size)
     # temperature: explicit None check, NOT `or` — a configured 0.0 (greedy/deterministic
     # rollouts) must be honored, not fall back to the recipe sampling temperature.
@@ -1322,13 +1514,13 @@ def run_rl():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    train = ACTIVE_ENV.dataset()
+    train = env.dataset()
     rng = random.Random(SEED)
     rng.shuffle(train)
     if conversational:
         # Message-list prompts so the chat template applies roles + (for tool envs) the tool
         # schemas; per-turn length is managed by the tool loop / rollout_func, not a flat budget.
-        prompts = [{"prompt": ACTIVE_ENV.prompt_messages(ex), "example": ex} for ex in train]
+        prompts = [{"prompt": env.prompt_messages(ex), "example": ex} for ex in train]
     else:
         prompts = [{"prompt": render_prompt(tok, ex), "example": ex} for ex in train]
     # The colocated vLLM engine's model length is the hard cap on prompt+completion at
@@ -1368,7 +1560,7 @@ def run_rl():
     # Tool schemas TRL injects into the prompt for native tools= GRPO — include them in the
     # budget for a tool env so a prompt isn't undercounted at filter time vs. rollout time.
     _oai_tools = (
-        getattr(getattr(ACTIVE_ENV, "_env", None), "oai_tools", None) if is_tool_env else None
+        getattr(getattr(env, "_env", None), "oai_tools", None) if is_tool_env else None
     )
 
     def _prompt_tokens(p) -> int:
@@ -1409,6 +1601,13 @@ def run_rl():
             "[train].max_tokens, or shorten the environment's prompts"
         )
     prompts = kept
+    resolved_prompts_per_step = resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
+    if resolved_prompts_per_step != prompts_per_step:
+        print(
+            f"[rl] lowering prompts_per_step from {prompts_per_step} to "
+            f"{resolved_prompts_per_step}: only {len(prompts)} prompt(s) fit after filtering"
+        )
+        prompts_per_step = resolved_prompts_per_step
     ds = Dataset.from_list(prompts)
 
     def reward_fn(completions, **kwargs):
@@ -1420,31 +1619,55 @@ def run_rl():
         # the thinking-length penalty computed from the RAW completion's <think> span.
         examples = kwargs.get("example")
         rewards = []
-        for comp, ex in zip(completions, examples, strict=False):
+        debug_rows = []
+        for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
             if isinstance(comp, list):
                 # Tool / conversational transcript (TRL passes a list of messages): score the
-                # whole transcript via the rubric (no <think> stripping — multi-turn content).
-                rewards.append(ACTIVE_ENV.reward_from_messages(comp, ex))
+                # whole transcript via the environment reward (no <think> stripping —
+                # multi-turn content).
+                r = env.reward_from_messages(comp, ex)
+                rewards.append(r)
                 continue
-            r = ACTIVE_ENV.reward(graded_text(comp), ex)
+            graded = graded_text(comp)
+            breakdown = None
+            if hasattr(env, "scores_breakdown"):
+                breakdown = env.scores_breakdown(graded, ex)
+                r = float(breakdown.get("total", 0.0))
+            else:
+                r = env.reward(graded, ex)
             if _think_penalty > 0 and THINKING:
                 r -= _think_penalty * think_token_count(comp, tok)
             rewards.append(r)
+            if idx < 8:
+                debug_rows.append(
+                    {
+                        "ts": time.time(),
+                        "attempt": ATTEMPT,
+                        "run_id": RUN_ID,
+                        "mode": RUN_MODE,
+                        "seed": SEED,
+                        "reward": r,
+                        "breakdown": breakdown,
+                        "completion_prefix": str(comp or "")[:1000],
+                        "graded_prefix": str(graded or "")[:1000],
+                        "example_id": (ex or {}).get("id") if isinstance(ex, dict) else None,
+                        "example_input": (ex or {}).get("input") if isinstance(ex, dict) else None,
+                    }
+                )
+        upload_debug_jsonl("reward_debug.jsonl", debug_rows)
         return rewards
 
     # TRL's per_device_train_batch_size counts COMPLETIONS, not prompts. Size grad-accum so
     # the global completion batch = prompts_per_step * group_size, i.e. each optimizer step
     # actually optimizes `prompts_per_step` prompts. The per-device *completion* micro-batch
     # is the VRAM knob (thinking-aware; see rl_per_device_comps).
-    from flash.engine.vram import fetch_hf_params_b, params_b_from_str
+    from flash.engine.vram import resolve_params_b
 
-    _params_b = params_b_from_str(getattr(_info, "params", None)) if _info else None
-    # Open-model (uncataloged) GRPO: _info carries no param count, so size the colocate
-    # activation cap from the HF safetensors metadata (no download). Without this, a large
-    # open model falls back to the ~2B-width default in rl_per_device_comps and gets too LOOSE
-    # a per-device cap -> colocate OOM. Best-effort: stays None offline, keeping prior behavior.
-    if _params_b is None:
-        _params_b = fetch_hf_params_b(model_id)
+    # Open-model (uncataloged) GRPO: size the colocate activation cap from the catalog stat, else
+    # the HF safetensors metadata (no download). Without a real count a large open model falls back
+    # to the ~2B-width default in rl_per_device_comps and gets too LOOSE a per-device cap ->
+    # colocate OOM. Best-effort: stays None offline, keeping prior behavior.
+    _params_b = resolve_params_b(model_id)
     from flash.catalog import vocab_size_for
 
     per_device_comps = rl_per_device_comps(
@@ -1452,7 +1675,9 @@ def run_rl():
     )
     batching = compute_grpo_batching(prompts_per_step, group_size, per_device_comps)
     if not batching["divisible_by_group"]:
-        print("WARN: generation batch not divisible by group size; check prompts_per_step/group_size")
+        print(
+            "WARN: generation batch not divisible by group size; check prompts_per_step/group_size"
+        )
     print(
         f"[rl] GRPO batching: per_device={batching['per_device_train_batch_size']} "
         f"grad_accum={batching['gradient_accumulation_steps']} "
@@ -1482,9 +1707,12 @@ def run_rl():
         "logging_steps": 1,
         "save_steps": _t.save_every if _t and _t.save_every is not None else 20,
         "save_total_limit": 1,
-        # Memory-light checkpoints: adapter only, no optimizer/scheduler/RNG state -> no
-        # serialization spike at save (the save-step OOM guard).
-        "save_only_model": True,
+        # Resumable checkpoints: keep the optimizer/scheduler/RNG state with the LoRA adapter so a
+        # preempted GRPO run resumed via resume_from_checkpoint(hf_resume_checkpoint()) continues
+        # with intact optimizer state + step instead of a fresh optimizer. For LoRA this state is
+        # small (trainable adapter params only). The deployable per-step snapshot strips it
+        # separately, so serving still gets adapter-only files.
+        "save_only_model": False,
         "bf16": True,
         "report_to": wandb_report_to(),  # W&B when WANDB_API_KEY present (restored post-flash-migration)
         "run_name": wandb_run_name(),
@@ -1525,12 +1753,29 @@ def run_rl():
         force_vllm_backend_for_sm120()
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
-        # the model's FULL context and won't start on a consumer GPU). vllm_gpu_memory_utilization
-        # sizes vLLM's pool; sleep mode offloads its weights between steps.
+        # the model's FULL context and won't start on a consumer GPU).
+        # vllm_gpu_memory_utilization sizes vLLM's KV pool. When sleep_mode is ON (>=3B /
+        # long-ctx), vLLM offloads ALL GPU memory (model + KV) to CPU during the backward
+        # pass, so 0.45 is safe — the peak is max(rollout, train). When sleep_mode is OFF
+        # (small/fast models), the KV cache stays resident during training; on large cards
+        # (A100/H100) 0.45 x 80 GB = 36 GB KV that never frees, leaving too little room
+        # for activations and causing OOM. Cap the KV pool at ~8 GB (the estimator's
+        # _KV_CAP in flash.engine.vram) so the non-sleep training peak stays within budget.
+        if sleep_mode:
+            _vllm_gpu_mem_util = 0.45
+        else:
+            try:
+                import torch as _torch_vram
+
+                _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
+                _kv_target_gb = 8.0  # matches estimator's _KV_CAP (flash.engine.vram)
+                _vllm_gpu_mem_util = min(0.45, _kv_target_gb / max(1.0, _total_vram_gb))
+            except Exception:
+                _vllm_gpu_mem_util = 0.10  # safe fallback: ~8 GB KV on worst-case 80 GB card
         grpo_kwargs.update(
             vllm_mode="colocate",
             vllm_max_model_length=vllm_max_len,
-            vllm_gpu_memory_utilization=0.45,
+            vllm_gpu_memory_utilization=_vllm_gpu_mem_util,
             vllm_enable_sleep_mode=sleep_mode,
         )
         # Rollout-memory + throughput knobs, applied ONLY if this TRL exposes the field (so an
@@ -1546,7 +1791,7 @@ def run_rl():
             return False
 
         # fp8 KV cache only where the silicon has native fp8 (compute capability >= 8.9: Ada /
-        # Hopper / Blackwell) — ~halves the rollout KV pool. Ampere (A100/A5000/3090, sm80) lacks
+        # Hopper / Blackwell) — ~halves the rollout KV pool. Ampere (A100/A6000/3090) lacks
         # fp8, so it stays fp16 there (forcing it on would error / silently emulate).
         try:
             import torch as _torch
@@ -1570,11 +1815,32 @@ def run_rl():
             True,
             "vLLM chunked prefill",
         )
-        _set_vllm_field(
-            ("vllm_compilation_config", "compilation_config"),
-            {"cudagraph_mode": "FULL_AND_PIECEWISE"},
-            "vLLM cudagraph_mode (verl rollout default)",
-        )
+        # vLLM 0.19.1 regressed the Triton _compute_slot_mapping_kernel: it launches
+        # (num_reqs + 1) thread blocks but the block table only has num_reqs rows, so the
+        # extra block causes an illegal memory access (cudaErrorIllegalAddress) on the first
+        # generation step. CUDA graph compilation triggers this path. Skip FULL_AND_PIECEWISE
+        # for vLLM versions outside TRL's supported range (0.12.0-0.19.0) until a fix lands.
+        _cudagraph_safe = True
+        try:
+            import vllm as _vllm_mod
+
+            _ver_base = _vllm_mod.__version__.split("+")[0]  # strip PEP440 local (e.g. +cu121)
+            _vllm_ver = tuple(int(x) for x in _ver_base.split(".")[:3])
+            if _vllm_ver > (0, 19, 0):
+                _cudagraph_safe = False
+                print(
+                    f"[rl][warn] vLLM {_vllm_mod.__version__} > 0.19.0: skipping "
+                    "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
+                    "crash workaround; update vLLM to a TRL-supported version to re-enable)"
+                )
+        except Exception:
+            pass
+        if _cudagraph_safe:
+            _set_vllm_field(
+                ("vllm_compilation_config", "compilation_config"),
+                {"cudagraph_mode": "FULL_AND_PIECEWISE"},
+                "vLLM cudagraph_mode (verl rollout default)",
+            )
     # Adapter init: continue training the SFT adapter (peft_config=None, model is the
     # loaded PeftModel) when train.init_from_adapter is set, else a fresh LoRA on the
     # string model id (model_init_kwargs forces bf16 — TRL string-loading can fall back
@@ -1587,19 +1853,9 @@ def run_rl():
     # authoritative target.
     if init_peft is not None:
         # Fresh LoRA: TRL loads the string model id with these kwargs, then attaches the
-        # adapter. For the 4-bit-QLoRA tier load the base in NF4 — TRL detects the
-        # bnb.Linear4bit modules and brings up its colocated vLLM rollout engine with
-        # quantization="bitsandbytes" (so a 36B MoE fits an 80 GB GPU in 4-bit on both the
-        # trainer and rollout sides). Otherwise force bf16 (TRL string-loading can fall
-        # back to fp32 and double VRAM).
+        # adapter. Force bf16 (TRL string-loading can fall back to fp32 and double VRAM).
         _attn = optimal_attn_impl()  # arch-aware FlashAttention (Kernels Hub) / SDPA
-        if quant == "4bit-qlora":
-            _patch_peft_weight_converter_compat()  # adapter (re)load compatibility
-            grpo_kwargs["model_init_kwargs"] = qlora_model_init_kwargs()
-            _vllm_note = "; vLLM rollout -> bitsandbytes" if use_vllm else ""
-            print(f"[rl] loading {model_id} in 4-bit (QLoRA tier){_vllm_note}")
-        else:
-            grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
+        grpo_kwargs["model_init_kwargs"] = {"dtype": "bfloat16"}
         if _attn:
             grpo_kwargs["model_init_kwargs"]["attn_implementation"] = _attn
     else:
@@ -1631,7 +1887,7 @@ def run_rl():
         print("[rl] rollout amortization: num_iterations=2 (reuse each generation batch)")
     cfg = GRPOConfig(**grpo_kwargs)
     setup_seconds = time.time() - t_start
-    heartbeat("rl_train_start", setup_seconds=setup_seconds)
+    heartbeat("rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics())
 
     # VL checkpoints (Qwen3.5/3.6) train text-only: make TRL's colocated rollout
     # engine skip the vision tower (VRAM + 5090 PTX-compat; see the patch docstring).
@@ -1639,12 +1895,17 @@ def run_rl():
     # model (already text-only via the LoRA target/exclude config).
     if use_vllm:
         patch_vllm_language_model_only(model_id)
+        # Install (but do NOT yet activate) the TRL->vLLM weight-sync name remap for Qwen3.5/3.6:
+        # the trainer pushes ``model.*`` names but the VL engine's LM params live under
+        # ``language_model.*``, so the first sync_weights() would raise without this. Activated
+        # below, after the trainer + its initial checkpoint load are built.
+        patch_vllm_lm_weight_sync(model_id)
     hb_cb = make_reward_heartbeat_callback()
     # Multi-turn / tool wiring (trl 1.6): tool envs hand TRL the tool callables so it runs the
     # tool-call loop natively; pure multi-turn envs hand TRL a rollout_func that drives the
     # env's own turn loop on the colocate engine (env_mask masks the non-model tokens).
     extra_trainer_kwargs: dict = {}
-    tools = ACTIVE_ENV.tools() if is_tool_env else []
+    tools = env.tools() if is_tool_env else []
     # A tool env exposing NO tools would silently degrade to single-shot under tools=[]; drive
     # it through the rollout_func turn loop instead so it isn't mis-trained as single-turn.
     if is_tool_env and not tools:
@@ -1661,19 +1922,19 @@ def run_rl():
             index_collisions,
         )
 
-        examples_by_key = build_examples_index(train, ACTIVE_ENV.prompt_messages)
-        ncol = index_collisions(train, ACTIVE_ENV.prompt_messages)
+        examples_by_key = build_examples_index(train, env.prompt_messages)
+        ncol = index_collisions(train, env.prompt_messages)
         if ncol:
             print(
                 f"[rl][warn] {ncol} duplicate prompt(s) collide in the reward index; the shared "
                 "prompt scores against the last example's answer/info"
             )
         extra_trainer_kwargs["rollout_func"] = build_rollout_func(
-            active_env=ACTIVE_ENV,
+            active_env=env,
             tok=tok,
             examples_by_key=examples_by_key,
             max_completion=_max_completion,
-            max_turns=getattr(ACTIVE_ENV, "max_turns", 10),
+            max_turns=getattr(env, "max_turns", 10),
             temperature=_temperature,
             top_p=rl.sampling_top_p,
             stop=(list(_t.stop_sequences) if _t and _t.stop_sequences else None),
@@ -1681,21 +1942,42 @@ def run_rl():
             engine_max_len=vllm_max_len,
         )
         print("[rl] multi-turn env: driving the turn loop via rollout_func")
-    trainer = GRPOTrainer(
-        model=init_model,
-        args=cfg,
-        train_dataset=ds,
-        reward_funcs=reward_fn,
-        peft_config=init_peft,
-        processing_class=tok,
-        callbacks=[hb_cb, make_checkpoint_upload_callback()],
-        **extra_trainer_kwargs,
-    )
+    # GRPOTrainer.__init__ blocks during model/vLLM init + FA2 kernel compilation (can be
+    # 10-20 min on first use). Background heartbeats keep the stall detector quiet.
+    _rl_init_done = threading.Event()
+
+    def _rl_init_heartbeat() -> None:
+        while not _rl_init_done.wait(30.0):
+            heartbeat("rl_initializing", gpu=gpu_diagnostics())
+
+    _rl_init_hb = threading.Thread(target=_rl_init_heartbeat, daemon=True)
+    _rl_init_hb.start()
+    try:
+        trainer = GRPOTrainer(
+            model=init_model,
+            args=cfg,
+            train_dataset=ds,
+            reward_funcs=reward_fn,
+            peft_config=init_peft,
+            processing_class=tok,
+            callbacks=[hb_cb, make_checkpoint_upload_callback()],
+            **extra_trainer_kwargs,
+        )
+    finally:
+        _rl_init_done.set()
     # Apply chalk's gap-filling kernels (RoPE/LoRA-delta/embedding, like Liger) on the module
     # GRPOTrainer actually optimizes (trainer.model) — the fresh-LoRA path only passes the model-id
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
     # Capture the install report so the engaged kernels land in metrics (active_kernels below).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+    # The trainer (and its colocated vLLM engine + initial checkpoint load) is now built. Activate
+    # the TRL->vLLM weight-sync name remap ONLY now (see patch_vllm_lm_weight_sync) so the initial
+    # checkpoint load stayed untouched while the train-time syncs get remapped. No-op unless the VL
+    # patch above was installed.
+    if use_vllm:
+        _LM_SYNC_REMAP_ON["on"] = True
+        if is_vl_checkpoint(model_id):
+            print("[vllm] LM weight-sync remap activated for training syncs")
     # Mid-run eval is intentionally NOT run during training: held-out evaluation happens on the
     # deploy/serving side (against the trained adapter), keeping training pure (no eval-phase cost
     # or eval-boundary stalls). Training streams only the per-step reward heartbeat.
@@ -1720,6 +2002,14 @@ def run_rl():
     # didn't reach the target steps).
     _resumed_complete = _grpo_resume_already_complete(resume_ckpt, steps, _steps_run)
     if _grpo_is_no_op_failure(reward_history, resume_ckpt, steps, _steps_run):
+        if _steps_run == 0:
+            raise RuntimeError(
+                "GRPO trainer completed zero optimizer steps before any reward was scored. "
+                f"retained_prompts={len(prompts)}, prompts_per_step={prompts_per_step}, "
+                f"generations_per_step={batching['generations_per_step']}. This usually means "
+                "TRL built an empty dataloader; add training examples, lower [train].batch_size, "
+                "or reduce prompt length/max_tokens so more examples fit."
+            )
         raise RuntimeError(
             f"GRPO scored no reward in {train_wall:.1f}s over {_steps_run} step(s) — the rollout "
             "produced no completions, so the policy was never actually trained. Failing loudly "
@@ -1734,7 +2024,7 @@ def run_rl():
     trainer.model.save_pretrained(adapter_dir)
     tok.save_pretrained(adapter_dir)
     hf_upload_folder(adapter_dir, "adapter", required=True)
-    heartbeat("rl_trained", train_wall=train_wall)
+    heartbeat("rl_trained", train_wall=train_wall, gpu=gpu_diagnostics())
 
     # Upper bound on generated tokens: completions actually optimized (the intended
     # prompts_per_step after the batch fix) x the max completion length. Over-counts (most
@@ -1790,6 +2080,7 @@ def run_rl():
 def write_train_meta(
     phase, adapter_dir, model_id, train_wall, setup_seconds, train_tokens, generated_tokens, notes
 ):
+    env = require_active_env()
     meta = {
         "phase": phase,
         "adapter_dir": adapter_dir,
@@ -1806,14 +2097,14 @@ def write_train_meta(
     heartbeat(
         f"{phase}_train_done",
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
+        gpu=gpu_diagnostics(),
     )
     # Finalize directly from the training phase: build the run-metrics record (training
     # metrics only — loss/reward are streamed by the trainer; reward_history is in notes)
     # and write the completion sentinel. There is no separate eval phase.
     m = RunMetrics(
-        # Substrate the worker actually ran on. Each provider's launcher sets FLASH_ARM
-        # in the worker env (runpod -> "runpod", vast -> "vast"); default to "runpod" only
-        # when unset so the persisted metrics correctly attribute the compute backend.
+        # Substrate the worker actually ran on. The RunPod launcher sets FLASH_ARM; default to
+        # "runpod" when unset so persisted metrics correctly attribute the compute backend.
         arm=os.environ.get("FLASH_ARM", "runpod"),
         phase=phase,
         seed=SEED,
@@ -1831,26 +2122,53 @@ def write_train_meta(
             "thinking": THINKING,
             "train_wall": train_wall,
             "model_id": model_id,
-            "environment": ACTIVE_ENV.id,
+            "environment": env.id,
             "job_spec": JOB_SPEC.to_dict() if JOB_SPEC else None,
         },
     )
     _finalize(m)
 
 
-def _download_adapter(adapter_prefix: str | None) -> str | None:
-    if not (adapter_prefix and HF_REPO):
+def _resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
+    """Resolve init_from_adapter into (repo, prefix).
+
+    The only public form is the exact adapter_ref emitted by ``flash status``:
+    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
+    """
+    adapter_ref = adapter_ref.strip()
+    match = re.fullmatch(
+        r"(?P<repo>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*):"
+        r"(?P<phase>sft|rl)/(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})/seed(?P<seed>\d+)",
+        adapter_ref,
+    )
+    if not match:
         return None
+    repo, phase, run_id, seed = match.groups()
+    return repo, f"{phase}/{run_id}/seed{seed}"
+
+
+def _download_adapter(adapter_prefix: str | None) -> str | None:
+    """Download an init_from_adapter LoRA to /tmp/evdl/<prefix>/adapter and return its dir.
+
+    ``adapter_prefix`` must be the full ``adapter_ref`` string emitted by ``flash status``:
+    ``<owner>/<repo>:<phase>/<run_id>/seed<N>``.
+    """
+    if not adapter_prefix:
+        return None
+    resolved = _resolve_adapter_ref(adapter_prefix)
+    if not resolved:
+        return None
+    repo, prefix = resolved
     from huggingface_hub import snapshot_download
 
     snapshot_download(
-        repo_id=HF_REPO,
+        repo_id=repo,
         repo_type="dataset",
-        allow_patterns=[f"{adapter_prefix}/adapter/*"],
+        allow_patterns=[f"{prefix}/adapter/*"],
         local_dir="/tmp/evdl",
         token=os.environ.get("HF_TOKEN"),
     )
-    adir = os.path.join("/tmp/evdl", adapter_prefix, "adapter")
+    adir = os.path.join("/tmp/evdl", prefix, "adapter")
     return adir if os.path.isdir(adir) else None
 
 
@@ -1862,9 +2180,8 @@ def _finalize(metrics: RunMetrics):
     with open("/tmp/DONE", "w") as f:
         f.write(str(time.time()))
     hf_upload_file("/tmp/DONE", "DONE", required=True)
-    heartbeat("done")
+    heartbeat("done", gpu=gpu_diagnostics())
     print("NODE DONE:", metrics.to_json())
-
 
 
 def main():
@@ -1891,7 +2208,7 @@ def main():
                 done = False
             if done:
                 print("Run already complete (DONE present); returning persisted metrics.")
-                heartbeat("already_done")
+                heartbeat("already_done", gpu=gpu_diagnostics(include_torch=False))
                 try:
                     got = hf_hub_download(
                         repo_id=HF_REPO,
@@ -1908,7 +2225,7 @@ def main():
                     raise SystemExit(f"DONE present but metrics.json unavailable: {e}") from e
         # Not a DONE re-delivery -> this worker will train. These must run before any model import:
         _ensure_fla_fastpath_on_hopper()  # Hopper: enable fla+tilelang GDN fast path (see perf.py)
-        heartbeat("boot")
+        heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
@@ -1930,11 +2247,10 @@ def main():
         sys.stderr.flush()
         os._exit(0)
     except Exception as e:
+        # Structured retry signal both pollers read: an infra failure -> retry on a fresh worker.
+        retriable = isinstance(e, RetriableInfraError)
         tb = traceback.format_exc()
         traceback.print_exc()
-        # Upload the FULL traceback under a phase-specific name (error_<phase>.txt) so the
-        # train (sft/rl) root-cause error survives for debugging. heartbeat.json is
-        # single-file/overwritten, so the per-phase error file is the persistent signal.
         try:
             err_name = error_artifact_name(RUN_MODE)
             err_path = f"/tmp/{err_name}"
@@ -1943,10 +2259,11 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
+        hb_flags = {"retriable": retriable}
         try:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], diag=gpu_diagnostics())
+            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:
-            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500])
+            heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags)
         # keep container alive briefly so logs flush, then exit non-zero -> restart
         time.sleep(10)
         raise
@@ -1954,5 +2271,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

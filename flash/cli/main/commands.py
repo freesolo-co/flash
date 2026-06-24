@@ -25,10 +25,13 @@ from flash.client import (
     verify_freesolo_key,
 )
 from flash.client.config import load_credentials
+from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
 from flash.cost.spec import runconfig_from_spec
 from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
+
+from . import render
 
 logger = get_logger("flash.cli.main")
 
@@ -45,228 +48,323 @@ _USER_ERRORS = (
 # Run states after which nothing more will happen (polling can stop).
 _CLI_DONE_STATES = TERMINAL_STATES | {"deployed"}
 _OK_STATES = {"done", "dry_run", "deployed"}
+_SPINNER_FRAMES = "|/-\\"
+_SPINNER_TICK_SECONDS = 0.1
+
+
+class _LogFollowSpinner:
+    def __init__(self, run_id: str):
+        self._run_id = run_id
+        self._frame = 0
+        self._last_len = 0
+        self._active = False
+        self._enabled = sys.stderr.isatty()
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def render(self, state: str) -> None:
+        if not self._enabled:
+            return
+        frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
+        self._frame += 1
+        message = f"{frame} following logs for {self._run_id} ({state})"
+        padding = " " * max(0, self._last_len - len(message))
+        sys.stderr.write(f"\r{message}{padding}")
+        sys.stderr.flush()
+        self._last_len = len(message)
+        self._active = True
+
+    def clear(self) -> None:
+        if not (self._enabled and self._active):
+            return
+        sys.stderr.write(f"\r{' ' * self._last_len}\r")
+        sys.stderr.flush()
+        self._active = False
+
+
+def _sleep_with_spinner(interval: float, spinner: _LogFollowSpinner, state: str) -> None:
+    if interval <= 0:
+        return
+    if not spinner.enabled:
+        time.sleep(interval)
+        return
+    ticks = max(1, int(interval / _SPINNER_TICK_SECONDS))
+    sleep_for = interval / ticks
+    for _ in range(ticks):
+        spinner.render(state)
+        time.sleep(sleep_for)
 
 
 def cmd_version(args) -> int:
-    print(f"flash {__version__}")
+    if render.styled():
+        print(render.version(__version__))
+    else:
+        print(f"flash {__version__}")
     return 0
 
 
 def cmd_login(args) -> int:
     # Login is handled by the freesolo backend (not the flash control plane): the user
-    # supplies the freesolo API key they created in the dashboard, and we verify it against
+    # supplies the freesolo API key they created at freesolo.co/sign-in, and we verify it against
     # freesolo before storing it. The same key authenticates flash's control plane.
-    api_key = args.api_key or os.environ.get("FREESOLO_API_KEY")
-    if not api_key:
-        raise ClientError(
-            "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
-            "Create a key in your freesolo dashboard."
-        )
-    verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
+    try:
+        env_api_key = os.environ.get("FREESOLO_API_KEY")
+        api_key = args.api_key or env_api_key
+        if not api_key:
+            raise ClientError(
+                "no API key provided: pass `--api-key <key>` or set FREESOLO_API_KEY. "
+                "Create or copy a key at https://freesolo.co/sign-in."
+            )
+        verify_freesolo_key(api_key, base_url=getattr(args, "freesolo_url", None))
+    except ClientError as exc:
+        # Login failed (no key, a rejected key, or an unreachable backend): say so plainly
+        # and point the user back at `flash login` to try again. `--debug` still surfaces
+        # the full traceback via the top-level handler.
+        if getattr(args, "debug", False):
+            raise
+        print(render.login_failed(str(exc)), file=sys.stderr)
+        return 1
     api_url = args.api_url or load_credentials()[0]
     # save_credentials clears the stored url when it's the default, so logging into the
     # default plane also drops a stale custom url from a previous custom-URL login.
-    path = save_credentials(api_key, api_url=api_url)
-    # Never echo the key itself; the stored file is the single source of truth.
-    print(f"logged in: freesolo verified your key (saved to {path})")
-    print("you're ready to train — try `flash train <config.toml>`")
+    _ = save_credentials(api_key, api_url=api_url)
+    if args.api_key and env_api_key and env_api_key != args.api_key:
+        print(
+            "warning: FREESOLO_API_KEY is set and will override this saved login for future "
+            "commands; unset FREESOLO_API_KEY to use the saved key.",
+            file=sys.stderr,
+        )
+    # Show who they are right away (the same identity `flash whoami` prints) so they don't
+    # have to run a second command. Never echo the key itself. The identity lookup is
+    # best-effort: the key is already verified and stored, so a momentary control-plane
+    # hiccup must not turn a successful login into a failure.
+    print(render.login_ok(_identity_or_none(api_key, api_url)))
     return 0
 
 
+# A control-plane hiccup must not make a successful login appear to hang while we fetch a
+# nonessential card, so the best-effort identity lookup uses a short timeout.
+_IDENTITY_LOOKUP_TIMEOUT_S = 5.0
+
+
+def _identity_or_none(api_key: str, api_url: str) -> dict | None:
+    # Use the key/url we just verified and stored, not `client_from_config()`: an ambient
+    # FREESOLO_API_KEY would otherwise win over the file and render the wrong identity.
+    try:
+        return ApiClient(api_url, api_key, timeout=_IDENTITY_LOOKUP_TIMEOUT_S).me()
+    except (ClientError, OSError, ValueError):
+        return None
+
+
 def cmd_whoami(args) -> int:
-    print(json.dumps(client_from_config().me(), indent=2))
+    print(render.whoami(client_from_config().me()))
     return 0
 
 
 _STARTER_ENV_PY = '''\
-"""Starter local verifiers environment.
+"""Starter Freesolo environment.
 
-Replace the dataset and rubric with your task, then publish it to the Prime Hub with
-`flash env push environments/starter_env.py`. A managed run references the published env by
-its Hub slug: set [environment] id = "owner/name" in the config.
-See https://github.com/PrimeIntellect-ai/verifiers for the full API.
+Edit datasets/train.jsonl and the reward code, then upload with
+`flash env push --name my-env .`.
+
+A managed run should use the returned [environment] id from
+`flash env push --name my-env .`.
+
+This starter keeps a tiny smoke-test dataset in datasets/train.jsonl. Replace it
+with your real training rows before a real run.
 """
 
-import verifiers as vf
-from datasets import Dataset
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from freesolo.datasets.types import TaskExample
+from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
 
-def load_environment(**kwargs) -> vf.Environment:
-    dataset = Dataset.from_list(
-        [
-            {"prompt": [{"role": "user", "content": "What is 2 + 2?"}], "answer": "4"},
-            {"prompt": [{"role": "user", "content": "What is 3 + 5?"}], "answer": "8"},
-        ]
-    )
+DEFAULT_DATASET_PATH = Path(__file__).parent / "datasets" / "train.jsonl"
 
-    def correct_answer(completion, answer, **_):
-        """Reward 1.0 when the gold answer appears in the model's final message."""
-        text = completion[-1]["content"] if isinstance(completion, list) else str(completion)
-        return 1.0 if str(answer) in text else 0.0
 
-    rubric = vf.Rubric(funcs=[correct_answer], weights=[1.0])
-    return vf.SingleTurnEnv(dataset=dataset, rubric=rubric, **kwargs)
+def load_jsonl(path: str | Path):
+    rows = []
+    with Path(path).open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def exact_match_reward(example: TaskExample, response_text: str) -> RewardResult:
+    expected = str(example.expected_output or "").strip()
+    score = 1.0 if expected and expected in response_text else 0.0
+    return RewardResult(score=score, threshold=1.0)
+
+
+class StarterEnv(EnvironmentSingleTurn):
+    dataset = load_jsonl(DEFAULT_DATASET_PATH)
+
+    def build_prompt_messages(self, example: TaskExample, prompt_text: str):
+        return [{"role": "user", "content": example.task}]
+
+    def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
+        return exact_match_reward(example, response_text)
+
+
+def load_environment(dataset_path: str | None = None, **kwargs) -> StarterEnv:
+    env = StarterEnv()
+    if dataset_path:
+        env.dataset = load_jsonl(dataset_path)
+    return env
 '''
 
+_STARTER_DATASET_JSONL = """\
+{"input":"What is 2 + 2?","output":"4"}
+{"input":"What is 3 + 5?","output":"8"}
+"""
 
-def cmd_lab_setup(args) -> int:
-    Path("environments").mkdir(exist_ok=True)
+
+def cmd_env_setup(args) -> int:
     Path("configs").mkdir(exist_ok=True)
-    Path("configs/endpoints.toml").write_text(
-        "# OpenAI-compatible endpoints returned by `flash deploy` can be stored here.\n"
-    )
-    starter_env = Path("environments/starter_env.py")
+    Path("datasets").mkdir(exist_ok=True)
+    dataset = Path("datasets/train.jsonl")
+    if not dataset.exists():
+        dataset.write_text(_STARTER_DATASET_JSONL)
+    starter_env = Path("environment.py")
     if not starter_env.exists():
         starter_env.write_text(_STARTER_ENV_PY)
-    sample = Path("configs/verifiers_grpo.toml")
-    if not sample.exists():
-        sample.write_text(
+    env_comment = (
+        "# Environment: upload this project folder with\n"
+        "# `flash env push --name my-env .`, then paste the returned id below.\n"
+        "# If the environment reads secrets with os.environ, list only the env var names here.\n"
+        "# Values are read from your shell or .env at submit time and are not stored in the spec.\n"
+        "[environment]\n"
+        'id = ""\n\n'
+        '# secrets = ["SERPAPI_API_KEY"]\n\n'
+    )
+    rl = Path("configs/rl.toml")
+    if not rl.exists():
+        rl.write_text(
             'model = "Qwen/Qwen3.5-4B"\n'
             'algorithm = "grpo"\n\n'
-            "# Environment: a verifiers / Prime Hub env slug. Publish the scaffolded\n"
-            "# environments/starter_env.py with `flash env push environments/starter_env.py`\n"
-            "# (then `flash env install owner/name`) to get the slug, and set it below.\n"
-            "[environment]\n"
-            'id = "owner/name"   # a verifiers / Prime Hub env slug\n\n'
+            f"{env_comment}"
             "[train]\n"
-            'hf_repo = "your-org/your-runs"   # HF dataset repo for adapters/checkpoints\n'
             "steps = 150\n"
             "lora_rank = 32\n"
             "seeds = [0]\n"
-            "# GPU is allocated automatically: the cheapest class that fits, across providers.\n"
+            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
+    sft = Path("configs/sft.toml")
+    if not sft.exists():
+        sft.write_text(
+            'model = "Qwen/Qwen3.5-4B"\n'
+            'algorithm = "sft"\n\n'
+            f"{env_comment}"
+            "[train]\n"
+            "epochs = 1\n"
+            "lora_rank = 32\n"
+            "seeds = [0]\n"
+            "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
+            "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
+        )
+    if render.styled():
+        print(
+            render.env_setup(
+                ["environment.py", "datasets/train.jsonl", "configs/rl.toml", "configs/sft.toml"]
+            )
+        )
+        return 0
     print(
-        "created environments/, environments/starter_env.py, configs/, "
-        "configs/verifiers_grpo.toml, configs/endpoints.toml"
+        "ensured environment.py, datasets/train.jsonl, configs/, configs/rl.toml, configs/sft.toml"
     )
     return 0
 
 
 def cmd_models(args) -> int:
-    for row in public_model_rows():
-        print(
-            f"{row['id']}\t{row['params']}\talgos={','.join(row['algos'])}\t{row['quant']}"
-            f"\tthinking={row.get('thinking', 'none')}"
-        )
+    rows = public_model_rows()
+    if render.styled():
+        print(render.models_table(rows))
+        return 0
+    for row in rows:
+        print(row["id"])
     return 0
 
 
 def cmd_gpus(args) -> int:
-    """List GPU classes, VRAM, and per-provider $/hr."""
-    from flash.providers import available_providers
+    """List RunPod GPU classes, VRAM, and $/hr."""
     from flash.providers.base import GPU_INFO
-    from flash.providers.runpod.pricing import live_rates
+    from flash.providers.runpod.pricing import static_rates as runpod_static_rates
 
-    rates = live_rates()
-    # Cheapest live verified-datacenter offer per class (vast key + network only).
-    vast_rates: dict[str, float] = {}
-    if "vast" in available_providers():
-        try:
-            from flash.providers.vast.jobs import usable_offers
-
-            for offer in usable_offers(0, 0):
-                vast_rates.setdefault(offer.gpu, offer.dph_total)  # offers are price-sorted
-        except Exception as exc:
-            print(f"warning: vast offers unavailable ({exc})", file=sys.stderr)
+    runpod_rates = runpod_static_rates()
+    infos = sorted(
+        (info for info in GPU_INFO.values() if info.enum_member), key=lambda g: g.hourly_usd
+    )
+    tip = (
+        "Tip: GPU class selection is fully automatic — the submit-time allocator always picks the\n"
+        "cheapest validated RunPod class that fits the model, so you don't pin a GPU type."
+    )
+    if render.styled():
+        rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]
+        print(render.gpus_table(rows, tip))
+        return 0
 
     def fmt_rate(v: float | None) -> str:
         return f"{v:>10.2f}" if v else f"{'-':>10}"
 
-    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}{'vast$/hr':>10}")
-    for info in sorted(GPU_INFO.values(), key=lambda g: rates.get(g.name, g.hourly_usd)):
-        runpod_rate = rates.get(info.name, info.hourly_usd) if info.enum_member else None
-        print(
-            f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}"
-            f"{fmt_rate(vast_rates.get(info.name))}"
-        )
-    print(
-        "\nTip: GPU allocation is fully automatic — the submit-time allocator always picks the\n"
-        "cheapest class that fits the model across all providers. There is no GPU pin: a concrete\n"
-        'gpu.type in the config is ignored (same as omitting it or setting "cheapest").'
-    )
-    return 0
-
-
-def cmd_env_init(args) -> int:
-    mod = args.name.replace("-", "_")
-    root = Path("environments") / mod
-    root.mkdir(parents=True, exist_ok=True)
-    # Verifiers-only: scaffold a real verifiers env whose load_environment returns a
-    # vf.Environment (here a SingleTurnEnv + Rubric over a datasets.Dataset). This is what
-    # a Hub push expects, so a freshly scaffolded env actually loads.
-    (root / f"{mod}.py").write_text(
-        f'"""Custom verifiers environment ({args.name}).\n\n'
-        "Replace the dataset and rubric with your task, then publish it to the Prime Hub\n"
-        f"with `flash env push environments/{mod}/{mod}.py` and reference it by id\n"
-        '([environment] id = "owner/name") in your config.\n'
-        "See https://github.com/PrimeIntellect-ai/verifiers for the full API.\n"
-        '"""\n\n'
-        "import verifiers as vf\n"
-        "from datasets import Dataset\n\n\n"
-        "def load_environment(**kwargs) -> vf.Environment:\n"
-        "    dataset = Dataset.from_list(\n"
-        "        [\n"
-        '            {"prompt": [{"role": "user", "content": "What is 2 + 2?"}], "answer": "4"},\n'
-        '            {"prompt": [{"role": "user", "content": "What is 3 + 5?"}], "answer": "8"},\n'
-        "        ]\n"
-        "    )\n\n"
-        "    def correct_answer(completion, answer, **_):\n"
-        '        """Reward 1.0 when the gold answer appears in the model\'s final message."""\n'
-        "        text = (\n"
-        '            completion[-1]["content"] if isinstance(completion, list) else str(completion)\n'
-        "        )\n"
-        "        return 1.0 if str(answer) in text else 0.0\n\n"
-        "    rubric = vf.Rubric(funcs=[correct_answer], weights=[1.0])\n"
-        "    return vf.SingleTurnEnv(dataset=dataset, rubric=rubric, **kwargs)\n"
-    )
-    (root / "README.md").write_text(f"# {args.name}\n\nCustom verifiers environment for Flash.\n")
-    print(f"created {root}")
-    print(
-        f"publish it to the Prime Hub with `flash env push environments/{mod}/{mod}.py`, "
-        'then reference it by id ([environment] id = "owner/name") in your config.'
-    )
+    print(f"{'gpu':<16}{'vram':>6}{'runpod$/hr':>11}")
+    for info in infos:
+        runpod_rate = runpod_rates.get(info.name)
+        print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}")
+    print(f"\n{tip}")
     return 0
 
 
 def cmd_env_list(args) -> int:
-    from flash.envs.registry import list_installed_verifiers_envs
+    from flash.envs.registry import list_installed_environments
 
-    installed = list_installed_verifiers_envs()
-    if installed:
-        print("installed (verifiers / Prime Hub):")
-        for env_id in installed:
-            print(f"  {env_id}")
+    installed = list_installed_environments()
+    paths: list[str] = []
+    if Path("environment.py").is_file():
+        paths.append(".")
     local = Path("environments")
     if local.is_dir():
-        # Both directory envs (environments/<name>/<name>.py) and top-level single-file
-        # modules (environments/<name>.py, e.g. the `flash lab` starter env). These are local
-        # env SOURCES — publish one with `flash env push <path>` to run it on the managed
-        # service by its Hub id.
-        paths: list[str] = []
+        # Prefer publishing folders. Single-file modules remain supported for small smoke tests.
         for p in local.iterdir():
             if p.name.startswith("__"):
                 continue
             if p.is_dir():
-                # `flash env init` maps a hyphenated dir to an underscored inner module file
-                # (my-env/ -> my-env/my_env.py). List that exact path, and only when it
-                # actually exists (an empty/incomplete folder isn't a publishable source).
                 stem = p.name.replace("-", "_")
                 module = p / f"{stem}.py"
-                if module.is_file():
-                    paths.append(f"environments/{p.name}/{stem}.py")
+                canonical = p / "environment.py"
+                if canonical.is_file() or module.is_file():
+                    paths.append(f"environments/{p.name}")
             elif p.suffix == ".py":
                 paths.append(f"environments/{p.name}")
-        if paths:
-            print("local env sources (publish with `flash env push <path>`):")
-            for path in sorted(paths):
-                print(f"  {path}")
+    # Decide the rendering up front so the themed panel and the legacy lines never both print.
+    if render.styled():
+        print(render.env_list(list(installed), sorted(paths)))
+        return 0
+    if installed:
+        print("installed environments:")
+        for env_id in installed:
+            print(f"  {env_id}")
+    if paths:
+        print("local env sources (publish with `flash env push --name <name> <path>`):")
+        for path in sorted(paths):
+            print(f"  {path}")
     return 0
 
 
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    Catalog-only and deterministic; an uncapped SFT run loads the env to count its train split."""
+    Catalog-only and deterministic; an uncapped SFT run tries to count the env's train split, and
+    falls back to a default example count (with a warning) when the environment isn't
+    importable here."""
     from flash.cost import estimate_cost
 
     spec = spec_from_file(
@@ -275,7 +373,11 @@ def _cmd_train_cost(args) -> int:
         overrides=args.overrides,
         extra_configs=args.extra_configs,
     )
-    print(estimate_cost(runconfig_from_spec(spec)).breakdown())
+    estimate = estimate_cost(runconfig_from_spec(spec))
+    if render.styled():
+        print(render.cost_panel(estimate))
+    else:
+        print(estimate.breakdown())
     return 0
 
 
@@ -290,14 +392,19 @@ def cmd_train(args) -> int:
     )
     if args.dry_run:
         # Fully local: validate the id-based config without credentials, a server, or a GPU.
-        print(
-            json.dumps(
-                {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}, indent=2
+        payload = {"run_id": spec.run_id, "state": "dry_run", "spec": spec.to_dict()}
+        if render.styled():
+            print(
+                render.object_panel("train", payload, "dry run — validated locally, not submitted")
             )
-        )
+        else:
+            print(json.dumps(payload, indent=2))
         return 0
     client = client_from_config()
-    status = client.create_run(spec_payload(spec))
+    status = client.create_run(
+        spec_payload(spec),
+        runtime_secrets=runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets),
+    )
     run_id = status["run_id"]
     logger.info(
         "submitted run %s: model=%s algorithm=%s gpu=%s seeds=%s",
@@ -308,54 +415,86 @@ def cmd_train(args) -> int:
         list(spec.train.seeds),
     )
     if args.background:
-        print(json.dumps(status, indent=2))
+        if render.styled():
+            print(render.object_panel("train", status, "submitted (running in background)"))
+        else:
+            print(json.dumps(status, indent=2))
         return 0
-    print(
-        f"run {run_id} submitted; following logs (Ctrl-C detaches, `flash attach {run_id}` resumes)",
-        file=sys.stderr,
-    )
+    if render.styled():
+        print(render.submitted(run_id), file=sys.stderr)
+    else:
+        print(
+            f"run {run_id} submitted; following logs "
+            f"(Ctrl-C detaches, `flash status {run_id} --follow` resumes)",
+            file=sys.stderr,
+        )
     return _follow_run(client, run_id)
 
 
 def _poll_logs(client: ApiClient, run_id: str, interval: float) -> str:
     """Stream offset-paged logs until the run reaches a terminal state; return that state."""
     offset = 0
-    while True:
-        page = client.get_logs(run_id, offset=offset)
-        if page["logs"]:
-            print(page["logs"], end="", flush=True)
-        offset = page["offset"]
-        if page["state"] in _CLI_DONE_STATES:
-            return page["state"]
-        time.sleep(interval)
+    spinner = _LogFollowSpinner(run_id)
+    try:
+        while True:
+            page = client.get_logs(run_id, offset=offset)
+            if page["logs"]:
+                spinner.clear()
+                print(page["logs"], end="", flush=True)
+            offset = page["offset"]
+            if page["state"] in _CLI_DONE_STATES:
+                spinner.clear()
+                return page["state"]
+            _sleep_with_spinner(interval, spinner, page["state"])
+    finally:
+        spinner.clear()
 
 
 def _follow_run(client: ApiClient, run_id: str) -> int:
     """Poll logs until the run reaches a terminal state, then print the final status."""
     state = _poll_logs(client, run_id, interval=2.0)
-    print(json.dumps(client.get_run(run_id), indent=2))
+    status = client.get_run(run_id)
+    if render.styled():
+        print(render.run_status(status))
+    else:
+        print(json.dumps(status, indent=2))
     return 0 if state in _OK_STATES else 1
 
 
 def cmd_status(args) -> int:
-    print(json.dumps(client_from_config().get_run(args.run_id), indent=2))
+    client = client_from_config()
+    if getattr(args, "follow", False):
+        return _follow_run(client, args.run_id)
+    if getattr(args, "logs", False):
+        logs = client.get_logs(args.run_id)["logs"]
+        if logs:
+            print(logs, end="")
+            if not logs.endswith("\n"):
+                print()
+    status = client.get_run(args.run_id)
+    if render.styled():
+        print(render.run_status(status))
+    else:
+        print(json.dumps(status, indent=2))
     return 0
 
 
-def cmd_attach(args) -> int:
-    client = client_from_config()
-    return _follow_run(client, args.run_id)
-
-
-def cmd_ps(args) -> int:
+def cmd_runs(args) -> int:
     runs = client_from_config().list_runs()
     if not runs:
-        print("no runs yet")
+        if render.styled():
+            print(render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"))
+        else:
+            print("no runs yet")
         return 0
-    print(f"{'RUN_ID':<32}  {'STATE':<11}  {'COST($)':>8}  {'GPU':<22}  MODEL")
+    if render.styled():
+        print(render.runs_table(runs))
+        return 0
+    print(f"{'RUN_ID':<32}  {'STATE':<11}  {'ALGO':<5}  {'COST($)':>8}  {'GPU':<22}  MODEL")
     for r in sorted(runs, key=lambda r: r.get("updated_at", 0), reverse=True):
         spec = r.get("spec") or {}
         model = spec.get("model", "")
+        algorithm = str(spec.get("algorithm") or "-").upper()
         remote = r.get("remote") or {}
         # the remote handle knows what actually ran; the spec is the parse-time pick
         provider = remote.get("provider") or (
@@ -364,84 +503,110 @@ def cmd_ps(args) -> int:
         gpu = remote.get("gpu") or (spec.get("gpu") or {}).get("type", "")
         where = f"{gpu}@{provider}" if provider else gpu
         print(
-            f"{r['run_id']:<32}  {r['state']:<11}  {r.get('cost_usd', 0.0):>8.4f}  "
-            f"{where:<22}  {model}"
+            f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  "
+            f"{r.get('cost_usd', 0.0):>8.4f}  {where:<22}  {model}"
         )
-    return 0
-
-
-def cmd_cost(args) -> int:
-    status = client_from_config().get_run(args.run_id)
-    print(
-        json.dumps(
-            {
-                "run_id": args.run_id,
-                "state": status["state"],
-                "cost_usd": status.get("cost_usd", 0.0),
-            },
-            indent=2,
-        )
-    )
     return 0
 
 
 def cmd_cancel(args) -> int:
     status = client_from_config().cancel_run(args.run_id)
-    print(json.dumps({"run_id": args.run_id, "state": status["state"]}, indent=2))
+    payload = {"run_id": args.run_id, "state": status["state"]}
+    if render.styled():
+        print(render.object_panel("cancel", payload))
+    else:
+        print(json.dumps(payload, indent=2))
     return 0
 
 
-def cmd_logs(args) -> int:
-    client = client_from_config()
-    if not args.follow:
-        print(client.get_logs(args.run_id)["logs"], end="")
+def cmd_checkpoints(args) -> int:
+    checkpoints = client_from_config().checkpoints(args.run_id)
+    if not checkpoints:
+        print(
+            f"no deployable checkpoints for {args.run_id} yet "
+            "(RL streams one per save interval; SFT-only runs have none).",
+            file=sys.stderr,
+        )
         return 0
-    _poll_logs(client, args.run_id, interval=1.0)
+    for c in checkpoints:
+        print(f"step {c['step']:>6}  {c['repo_id']}:{c['subfolder']}")
+    print(
+        f"\ndeploy one with `flash deploy {args.run_id} --step <STEP>`.",
+        file=sys.stderr,
+    )
     return 0
 
 
 def cmd_deploy(args) -> int:
     dep = client_from_config().deploy(
         args.run_id,
-        mode=args.mode,
-        idle_timeout_s=args.idle_timeout,
         dry_run=args.dry_run,
+        step=getattr(args, "step", None),
     )
-    print(json.dumps(dep, indent=2))
-    if dep.get("mode") == "always-on":
-        print(
-            f"note: always-on keeps a {dep.get('gpu')} warm 24/7 "
-            f"(~${dep.get('est_idle_cost_usd_per_day')}/day). Use `flash undeploy {args.run_id}` "
-            "to stop billing.",
-            file=sys.stderr,
-        )
+    if render.styled():
+        print(render.object_panel("deploy", dep))
+    else:
+        print(json.dumps(dep, indent=2))
+    print(
+        "note: serving is billed per token only; use "
+        f"`flash undeploy {args.run_id}` to deregister the adapter.",
+        file=sys.stderr,
+    )
     return 0
 
 
 def cmd_undeploy(args) -> int:
-    print(json.dumps(client_from_config().undeploy(args.run_id), indent=2))
+    result = client_from_config().undeploy(args.run_id)
+    if render.styled():
+        print(render.object_panel("undeploy", result))
+    else:
+        print(json.dumps(result, indent=2))
     return 0
 
 
 def cmd_deployments(args) -> int:
     rows = client_from_config().deployments()
     if not rows:
-        print("no active deployments")
+        if render.styled():
+            print(render.empty("deployments", "0 active", "no active deployments"))
+        else:
+            print("no active deployments")
         return 0
-    print(f"{'RUN_ID':<32}  {'MODE':<10}  {'GPU':<9}  {'$/DAY':>7}  ENDPOINT")
+    if render.styled():
+        print(render.deployments_table(rows))
+        return 0
+    print(f"{'RUN_ID':<32}  {'GPU':<9}  ENDPOINT")
     for r in rows:
         d = r.get("deployment") or {}
-        print(
-            f"{r['run_id']:<32}  {d.get('mode', '?'):<10}  {d.get('gpu', '?'):<9}  "
-            f"{d.get('est_idle_cost_usd_per_day', 0):>7}  {d.get('endpoint_name', '')}"
-        )
+        print(f"{r['run_id']:<32}  {d.get('gpu', '?'):<9}  {d.get('endpoint_name', '')}")
     return 0
 
 
 def cmd_chat(args) -> int:
-    resp = client_from_config().chat(
+    client = client_from_config()
+    messages = [{"role": "user", "content": args.message}]
+    # A faint speaker label on a TTY; the reply text itself stays plain so a piped transcript
+    # is byte-for-byte the model's words.
+    if render.styled():
+        print(render.chat_label())
+    stream = getattr(client, "chat_stream", None)
+    if stream is not None:
+        wrote = False
+        for chunk in stream(
+            args.run_id,
+            messages=messages,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        ):
+            print(chunk, end="", flush=True)
+            wrote = True
+        if wrote:
+            print()
+        return 0
+
+    resp = client.chat(
         args.run_id,
-        messages=[{"role": "user", "content": args.message}],
+        messages=messages,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
     )

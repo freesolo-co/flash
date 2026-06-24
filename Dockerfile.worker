@@ -1,11 +1,9 @@
-# Flash prebuilt WORKER image — the full training stack baked in so Vast/RunPod cold-start
-# skips the per-host dep install (the dominant cold-start cost; measured 7-86s on fresh Vast).
+# Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
 # The worker still fetches the flash `code/**` from HF at runtime, so only DEPS live here.
 #
-# This image is the default worker image — Vast always uses it; on RunPod, FLASH_WORKER_IMAGE
-# overrides it and the Flash live-endpoint path boot-installs deps instead. It is referenced by name
-# in flash/providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be published to GHCR and the package set PUBLIC
-# (no registry login is configured) — otherwise Vast/RunPod can't pull it. Normally built by
+# This image is referenced by name in flash/providers/runpod/train/deps.py:WORKER_IMAGE. It MUST be
+# published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
+# pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
 #
 #   docker build -f Dockerfile.worker -t ghcr.io/freesolo-co/flash-worker:cu128 .
@@ -42,8 +40,7 @@ RUN pip install --no-cache-dir \
     "tilelang==0.1.11" \
     "apache-tvm-ffi==0.1.11" \
     "hf_transfer" \
-    "verifiers>=0.1.10" \
-    "prime" \
+    "freesolo>=0.2.46" \
     "runpod"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
@@ -79,15 +76,12 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" MAX_JOBS=4 \
 # (liger, flash-linear-attention=fla, flash_attn, bitsandbytes, triton), and the HF/env libs. A
 # missing or ABI-broken package fails the build HERE instead of silently shipping (the FA wheel in
 # particular can install yet fail to import against this torch). cuDNN comes from the base image.
-# `prime` is a CLI dist (no importable top-level module) and the worker never imports it, so we
-# verify its PRESENCE via metadata rather than importing it. Everything else the worker imports at
-# runtime is imported strictly here.
 # flash_attn is BEST-EFFORT (the install above tolerates a build failure -> SDPA fallback), so it
 # is imported optionally here: a missing FA must NOT abort the build, or the SDPA-fallback image
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
 import torch, transformers, trl, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
-liger_kernel, fla, bitsandbytes, hf_transfer, triton, verifiers, runpod; \
+liger_kernel, fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
 import importlib; \
 fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
@@ -96,14 +90,12 @@ ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)'); \
 [print('  ', d, ver(d)) for d in ['transformers','trl','peft','vllm','datasets','huggingface-hub', \
 'accelerate','wandb','liger-kernel','flash-linear-attention','bitsandbytes', \
-'hf-transfer','verifiers','prime','runpod']]"
+'hf-transfer','freesolo','runpod']]"
 
 # RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
 # from the real _train_body source in providers/runpod/train/endpoints.py (single source of truth;
 # _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
-# image is a self-contained RunPod Serverless worker. On Vast the image is launched in args-mode
-# (`bash -c <onstart>`), which OVERRIDES this CMD — so ONE image serves both providers (Vast bash
-# bootstrap vs RunPod serverless handler reading job["input"]). Build context is the repo root.
+# image is a self-contained RunPod Serverless worker. Build context is the repo root.
 COPY flash/providers/runpod/train/endpoints.py docker/make_rp_handler.py /tmp/rpgen/
 RUN python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /rp_handler.py \
     && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"

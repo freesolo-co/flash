@@ -3,7 +3,7 @@
 The SDK ships the GRPO recipe knobs (group_size/temperature/advantage_clip/
 kl_penalty_coef/thinking_length_penalty_coef) plus the optimizer/batching knobs
 (learning_rate/batch_size/max_length/save_every) in the job spec's ``[train]`` table
-(TrainSpec) — NOT ``[environment.params]``, which is forwarded verbatim to the verifiers
+(TrainSpec) — NOT ``[environment.params]``, which is forwarded verbatim to the Freesolo
 env's ``load_environment`` — and an optional ``train.init_from_adapter``; these tests
 cover the pure plumbing the worker uses to honor them (the GPU trainer wiring itself is
 exercised by the live smokes).
@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from flash.schema import spec_from_dict
+from flash.schema import ConfigError, spec_from_dict
 from flash.spec import JobSpec
 
 
@@ -54,7 +54,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "environment": {"id": "owner/env"},
+            "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"seeds": [0], **knobs},
         }
     )
@@ -65,7 +65,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         {
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "grpo",
-            "environment": {"id": "owner/env", "params": {"grpo_config": knobs}},
+            "environment": {"id": "github:owner/repo@main:env/environment.py", "params": {"grpo_config": knobs}},
             "train": {"seeds": [0]},
         }
     )
@@ -79,7 +79,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             {
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "environment": {"id": "owner/env"},
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"seeds": [0], "group_size": 2},
             }
         ),
@@ -103,7 +103,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "owner/env"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
@@ -158,48 +158,59 @@ def test_opt_int_float_reject_bools() -> None:
             {
                 "model": "Qwen/Qwen3.5-0.8B",
                 "algorithm": "grpo",
-                "environment": {"id": "owner/env"},
+                "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"steps": 10, "group_size": True},
             }
         )
 
 
-def test_verifiers_adapter_forwards_only_env_kwargs(monkeypatch) -> None:
-    # environment.params is forwarded to vf.load_environment WITHOUT flash-reserved
-    # keys (a stray grpo_config/mode/records/eval_* must be dropped, not passed through).
+def test_freesolo_adapter_forwards_env_kwargs(monkeypatch, tmp_path) -> None:
+    # environment.params is forwarded to freesolo.environments.load_environment, while
+    # Flash-consumed dataset/contract source helpers are handled by the adapter.
     import types
 
     captured = {}
 
-    def fake_load_environment(env_id, **kwargs):
-        captured["env_id"] = env_id
+    def fake_load_environment(reference, **kwargs):
+        captured["reference"] = reference
         captured["kwargs"] = kwargs
         return object()
 
-    fake_vf = types.SimpleNamespace(
+    fake_records = types.SimpleNamespace(
+        load_task_examples=lambda source: [],
+        task_example_from_record=lambda record: record,
+    )
+    fake_envs = types.SimpleNamespace(
         load_environment=fake_load_environment,
-        ToolEnv=type("ToolEnv", (), {}),
-        MultiTurnEnv=type("MultiTurnEnv", (), {}),
-        SingleTurnEnv=type("SingleTurnEnv", (), {}),
-        JudgeRubric=type("JudgeRubric", (), {}),
+        EnvironmentEpisode=type("EnvironmentEpisode", (), {}),
+        EnvironmentMultiTurn=type("EnvironmentMultiTurn", (), {}),
+        EnvironmentSingleTurn=type("EnvironmentSingleTurn", (), {}),
+        EnvironmentTurn=type("EnvironmentTurn", (), {}),
     )
-    monkeypatch.setitem(sys.modules, "verifiers", fake_vf)
+    monkeypatch.setitem(sys.modules, "freesolo", types.ModuleType("freesolo"))
+    monkeypatch.setitem(sys.modules, "freesolo.datasets", types.ModuleType("freesolo.datasets"))
+    monkeypatch.setitem(sys.modules, "freesolo.datasets.records", fake_records)
+    monkeypatch.setitem(sys.modules, "freesolo.environments", fake_envs)
 
-    from flash.envs import registry
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("def load_environment(**kwargs): pass\n")
 
-    registry.load_environment(
-        "owner/env",
-        params={
-            "difficulty": "hard",  # a real verifiers-env kwarg -> forwarded
-            "grpo_config": {"group_size": 4},  # reserved -> dropped
-            "mode": "train",  # reserved -> dropped
-            "records": [1, 2],  # reserved -> dropped
-            "eval_seed": 99,  # adapter-consumed -> not forwarded
-        },
+    from flash.envs.adapter import load_freesolo_environment
+
+    load_freesolo_environment(
+        str(env_file),
+        difficulty="hard",
+        mode="train",
+        records=[{"task": "x"}],
+        contract_text="contract",
     )
-    assert captured["env_id"] == "env"
-    assert captured["kwargs"] == {"difficulty": "hard"}
-    for forbidden in ("grpo_config", "mode", "records", "eval_seed"):
+    assert captured["reference"] == str(env_file)
+    assert captured["kwargs"] == {
+        "contract_path": str(tmp_path / "TRAINING_CONTRACT.md"),
+        "difficulty": "hard",
+        "mode": "train",
+    }
+    for forbidden in ("records", "contract_text"):
         assert forbidden not in captured["kwargs"]
 
 
@@ -208,52 +219,106 @@ def test_init_from_adapter_parses_and_roundtrips() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "owner/env"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
             "steps": 10,
             "hf_repo": "owner/runs",
-            "init_from_adapter": "sft/run-x/seed0",
+            "init_from_adapter": "Freesolo-Co/flashrun-run-x:sft/run-x/seed0",
         },
     }
     spec = spec_from_dict(raw, run_id="grpo-x")
-    assert spec.train.init_from_adapter == "sft/run-x/seed0"
+    assert spec.train.init_from_adapter == "Freesolo-Co/flashrun-run-x:sft/run-x/seed0"
     # survives the JSON round-trip the worker reconstructs from
-    assert JobSpec.from_dict(spec.to_dict()).train.init_from_adapter == "sft/run-x/seed0"
+    assert (
+        JobSpec.from_dict(spec.to_dict()).train.init_from_adapter
+        == "Freesolo-Co/flashrun-run-x:sft/run-x/seed0"
+    )
     # absent -> empty string (train fresh from base)
     raw["train"].pop("init_from_adapter")
     assert spec_from_dict(raw, run_id="grpo-y").train.init_from_adapter == ""
 
 
-def test_hf_repo_per_run_parses_and_validates() -> None:
-    # [train] hf_repo is the REQUIRED per-run HF artifact repo (no operator HF_REPO default);
-    # it must parse through schema (server) AND JobSpec.from_dict (worker), an absent value
-    # must be rejected as required, and a malformed value must 400 at parse time.
-    from flash.schema import ConfigError
-
+def test_init_from_adapter_rejects_repo_without_status_prefix() -> None:
     raw = {
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
-        "model_policy": "allow",
-        "environment": {"id": "owner/env"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
-        "train": {"seeds": [0], "steps": 10, "hf_repo": "myorg/runs"},
+        "train": {
+            "seeds": [0],
+            "steps": 10,
+            "init_from_adapter": "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff",
+        },
     }
+    with pytest.raises(ConfigError, match="full adapter_ref emitted by `flash status`"):
+        spec_from_dict(raw, run_id="grpo-x")
+
+
+@pytest.mark.parametrize(
+    "bad_adapter_ref",
+    [
+        "owner:evil/flashrun-run:sft/seed0",
+        "Freesolo-Co/flashrun-sftX:sft/../seed0",
+    ],
+)
+def test_init_from_adapter_rejects_invalid_shape_or_path_traversal_ref(bad_adapter_ref: str) -> None:
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "gpu": {"type": "cheapest"},
+        "train": {"seeds": [0], "steps": 10, "init_from_adapter": bad_adapter_ref},
+    }
+    with pytest.raises(ConfigError, match="full adapter_ref emitted by `flash status`"):
+        spec_from_dict(raw, run_id="grpo-x")
+
+
+@pytest.mark.parametrize(
+    "bad_ref",
+    [
+        123,
+        False,
+        ["owner/repo:sft/run/seed0"],
+    ],
+)
+def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "gpu": {"type": "cheapest"},
+        "train": {
+            "seeds": [0],
+            "steps": 10,
+            "init_from_adapter": bad_ref,
+        },
+    }
+    with pytest.raises(ConfigError, match=r"train\.init_from_adapter must be a string"):
+        spec_from_dict(raw, run_id="grpo-x")
+
+
+def test_hf_repo_is_managed_not_user_set() -> None:
+    # [train] hf_repo is the platform-managed per-run HF artifact repo: the control plane assigns
+    # it server-side at submit (see runner.submit_job). It is NOT required and a user-supplied
+    # value is IGNORED — verified through both schema (server) and JobSpec.from_dict (worker).
+    raw = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "algorithm": "grpo",
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "train": {"seeds": [0], "steps": 10},
+    }
+    # absent -> fine (no longer required); left blank for the control plane to assign
     spec = spec_from_dict(raw, run_id="hf-x")
-    assert spec.train.hf_repo == "myorg/runs"
-    # survives the JSON round-trip the worker reconstructs from
-    assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == "myorg/runs"
-    # absent -> rejected (it is required; there is no operator HF_REPO fallback)
-    with pytest.raises(ConfigError, match=r"train\.hf_repo is required"):
-        spec_from_dict({**raw, "train": {"seeds": [0], "steps": 10}}, run_id="hf-y")
-    # malformed values are rejected at parse time (server 400), not passed to the worker
-    for bad in ("noslash", "/name", "owner/", "a/b/c", "owner//name"):
-        with pytest.raises(ConfigError):
-            spec_from_dict(
-                {**raw, "train": {"seeds": [0], "steps": 10, "hf_repo": bad}},
-                run_id="hf-bad",
-            )
+    assert spec.train.hf_repo == ""
+    assert JobSpec.from_dict(spec.to_dict()).train.hf_repo == ""
+    # user-supplied -> ignored (the control plane overrides it at submit)
+    spec2 = spec_from_dict(
+        {**raw, "train": {"seeds": [0], "steps": 10, "hf_repo": "someone-else/their-repo"}},
+        run_id="hf-y",
+    )
+    assert spec2.train.hf_repo == ""
 
 
 def test_optimizer_and_batching_knobs_roundtrip() -> None:
@@ -264,7 +329,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "owner/env"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
         "train": {
             "seeds": [0],
@@ -334,7 +399,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "owner/env"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
     }
     bad_cases = [
@@ -373,7 +438,7 @@ def test_steps_and_epochs_reject_non_integer_at_parse() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "model_policy": "allow",
-        "environment": {"id": "owner/env"},
+        "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "cheapest"},
     }
     for bad in ({"steps": 1.5}, {"epochs": 2.5}, {"steps": 0}, {"epochs": -1}):

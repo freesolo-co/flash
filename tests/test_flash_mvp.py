@@ -17,7 +17,7 @@ def test_catalog_validation():
 
     info = get_model("Qwen/Qwen3.5-4B")
     assert "grpo" in info.algos
-    # 9B is the QLoRA GRPO tier (4-bit NF4 base on a ~24-32 GB card).
+    # 9B is the bf16 GRPO tier (needs an 80 GB-class card; QLoRA was dropped).
     assert validate_model_for_algorithm("Qwen/Qwen3.5-9B", "grpo").id == "Qwen/Qwen3.5-9B"
     # An sft-only model still rejects grpo (inject one — no catalog entry is sft-only now).
     from flash.catalog import MODELS, ModelInfo
@@ -42,7 +42,7 @@ def test_config_to_job_spec():
                 'model = "Qwen/Qwen3.5-4B"\n'
                 'algorithm = "grpo"\n'
                 "[environment]\n"
-                'id = "primeintellect/gsm8k"\n'
+                'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
                 "[train]\n"
                 "steps = 10\n"
                 "seeds = [0, 1]\n"
@@ -96,7 +96,7 @@ def test_mcp_handler_dry_run(monkeypatch):
                     "run_id": "mcp-dry",
                     "model": "Qwen/Qwen3.5-4B",
                     "algorithm": "grpo",
-                    "environment": {"id": "primeintellect/gsm8k"},
+                    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
                     "train": {"steps": 1, "seeds": [0], "hf_repo": "owner/runs"},
                     "gpu": {"type": "RTX 5090"},
                     "dry_run": True,
@@ -114,7 +114,7 @@ def test_cli_train_dry_run():
                 'model = "Qwen/Qwen3.5-4B"\n'
                 'algorithm = "grpo"\n'
                 "[environment]\n"
-                'id = "primeintellect/gsm8k"\n'
+                'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
                 "[train]\n"
                 "steps = 1\n"
                 "seeds = [0]\n"

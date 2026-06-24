@@ -91,6 +91,26 @@ def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
     assert setup_seconds(RunConfig(BIG, "sft", 1)) > setup_seconds(RunConfig(SMALL, "sft", 1))
 
 
+def test_cold_start_calibrated_to_real_short_sft_run():
+    # Calibration anchor: a real fresh-worker run (0.8B SFT, 391 examples -> 26 priced steps at
+    # the recipe batch) was cold-start-dominated (a fresh worker spent ~12.5 min in model load).
+    # Static pricing now picks the cheapest fitting class, but the estimate must stay in the same
+    # short-run range. 26 = ceil(391 / 32) * 2 epochs.
+    e = estimate_cost(RunConfig(SMALL, "sft", 26))
+    assert e.gpu == "RTX 2000 Ada"
+    assert e.gpu_hourly_usd == pytest.approx(0.24, abs=1e-3)
+    assert e.total_usd == pytest.approx(0.044, rel=0.10)
+    # Model load (not boot/deps) is the dominant cold-start term for a short job.
+    assert e.setup_seconds > e.train_seconds  # cold start dominates this short run
+
+
+def test_cold_start_negligible_for_long_runs():
+    # The bigger cold start must NOT regress long runs: when training wall dominates, setup is a
+    # small single-digit fraction of the bill.
+    e = estimate_cost(RunConfig(SMALL, "sft", 5000))
+    assert e.setup_seconds / e.wall_clock_seconds < 0.05
+
+
 def test_wall_clock_cap_bounds_runaway_runs():
     e = estimate_cost(RunConfig(BIG, "grpo", 100_000))
     assert e.wall_capped is True
@@ -144,25 +164,25 @@ def test_nonpositive_max_wall_seconds_is_accepted_and_floored():
 
 def test_select_gpu_picks_cheapest_including_unvalidated():
     # No validation gate: select_gpu picks the cheapest fitting class (validated or not) at the
-    # REALIZED (billed) rate, and nothing fitting is cheaper.
-    from flash.cost.facts import pick_gpu, realized_hourly_usd
+    # static rate, and nothing fitting is cheaper.
+    from flash.cost.facts import gpu_hourly_usd, pick_gpu
     from flash.providers.base import GPU_INFO
 
     gpu, need = select_gpu(RunConfig(MID, "sft", 100))
     assert gpu == pick_gpu(need)
     cheaper = [
         g for g in GPU_INFO.values()
-        if g.vram_gb >= need and realized_hourly_usd(g.name) < realized_hourly_usd(gpu)
+        if g.vram_gb >= need and gpu_hourly_usd(g.name) < gpu_hourly_usd(gpu)
     ]
     assert not cheaper, f"{cheaper} cheaper than {gpu} for {need} GB"
 
 
-def test_qlora_model_fits_a_smaller_card_than_bf16_would():
-    # Qwen3.5-9B is QLoRA: its GRPO requirement fits a 32 GB card (the chosen class may be bigger
-    # if cheaper -- it's the requirement that shrinks).
+def test_9b_bf16_grpo_needs_an_80gb_class():
+    # Qwen3.5-9B is bf16 (QLoRA was dropped: the 4-bit vLLM-rollout merge collapsed the GRPO
+    # importance-sampling ratio -> no learning). Colocated bf16 GRPO needs an 80 GB-class card.
     e = estimate_cost(RunConfig(BIG, "grpo", 100))
-    assert e.required_vram_gb <= 32
-    assert any("qlora" in n.lower() for n in e.notes)
+    assert e.required_vram_gb >= 80
+    assert e.gpu_vram_gb >= 80
 
 
 def test_invalid_config_rejected():

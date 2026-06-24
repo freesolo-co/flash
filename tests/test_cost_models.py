@@ -19,12 +19,12 @@ def test_total_params_is_the_catalog_stat(model_id):
 
 
 def test_quant_lookup():
-    assert model_quant("Qwen/Qwen3.5-9B") == "4bit-qlora"
+    assert model_quant("Qwen/Qwen3.5-9B") == "bf16"
     assert model_quant("Qwen/Qwen3.5-4B") == "bf16"
 
 
 def test_download_weight_gb_is_total_params_bf16():
-    # Download is always the full bf16 checkpoint (2 bytes/param), even for QLoRA.
+    # Download is always the full bf16 checkpoint (2 bytes/param).
     nine = "Qwen/Qwen3.5-9B"
     assert download_weight_gb(nine) == pytest.approx(total_params_b(nine) * 2.0)
 

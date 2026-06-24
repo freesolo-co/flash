@@ -20,7 +20,7 @@ def _base(**extra: object) -> dict:
     cfg = {
         "model": "openbmb/MiniCPM5-1B",
         "algorithm": "sft",
-        "environment": {"id": "owner/some-env"},
+        "environment": {"id": "github:owner/repo@main:some-env/environment.py"},
         "train": {"seeds": [0], "hf_repo": "me/repo"},
     }
     cfg.update(extra)
@@ -103,7 +103,7 @@ def _toml(tmp_path) -> str:
         'model = "openbmb/MiniCPM5-1B"\n'
         'algorithm = "sft"\n'
         "[environment]\n"
-        'id = "owner/some-env"\n'
+        'id = "github:owner/repo@main:some-env/environment.py"\n'
         "[train]\n"
         "seeds = [0]\n"
         'hf_repo = "me/repo"\n'
@@ -211,3 +211,32 @@ def test_report_to_is_best_effort_when_wandb_init_fails(monkeypatch):
     monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(project="p", run_name="r")))
 
     assert worker.wandb_report_to() == []  # degrades to no W&B logging, no crash
+
+
+def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, monkeypatch):
+    from flash.client.runtime_secrets import runtime_secrets_from_local_env
+
+    cfg = tmp_path / "run.toml"
+    cfg.write_text('model = "openbmb/MiniCPM5-1B"\n')
+    (tmp_path / ".env").write_text(
+        "WANDB_API_KEY=wb-from-user-file\n"
+        "SERPAPI_API_KEY=serp-from-user-file\n"
+        "RUNPOD_API_KEY=must-not-be-client-supplied\n"
+    )
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+
+    assert runtime_secrets_from_local_env(cfg) == {"WANDB_API_KEY": "wb-from-user-file"}
+    assert runtime_secrets_from_local_env(cfg, keys=("SERPAPI_API_KEY",)) == {
+        "SERPAPI_API_KEY": "serp-from-user-file",
+        "WANDB_API_KEY": "wb-from-user-file",
+    }
+    monkeypatch.setenv("SERPAPI_API_KEY", "serp-from-process")
+    assert runtime_secrets_from_local_env(cfg, keys=("SERPAPI_API_KEY",))[
+        "SERPAPI_API_KEY"
+    ] == "serp-from-process"
+    monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
+    (tmp_path / ".env").write_text("WANDB_API_KEY=wb-from-user-file\n")
+    with pytest.raises(ValueError, match="missing declared environment secret"):
+        runtime_secrets_from_local_env(cfg, keys=("SERPAPI_API_KEY",))
