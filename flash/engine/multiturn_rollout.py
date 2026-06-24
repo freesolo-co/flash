@@ -30,7 +30,6 @@ the real tokenizer + the colocate vLLM engine into it at runtime.
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Callable
 from typing import TypedDict
 
@@ -238,44 +237,31 @@ class _RolloutState:
         }
 
 
-def _env_max_workers(n: int) -> int:
-    try:
-        cap = int(os.environ.get("FLASH_MT_ENV_WORKERS", "16"))
-    except ValueError:
-        cap = 16
-    return max(1, min(n, cap))
+# Cap concurrent env-side threads. Once GPU generation is batched, the per-rollout env_reply / reward
+# are the serial tail; for LLM-in-the-loop envs (simulated-user model / LLM judge / tool API) those
+# are I/O-bound network calls, so running them across a small thread pool is a strict win and free
+# for cheap/deterministic envs. Each rollout's state is independent (a Freesolo env operates on the
+# passed ``state``, not shared object state), so the parallel result equals sequential — proven by
+# the ``rollout_batch`` == per-example ``rollout_one`` test.
+_ENV_THREAD_CAP = 16
+
+
+def _env_map(rollouts: list[_RolloutState], fn) -> list:
+    """``fn(rollout)`` for each rollout, in order — across a thread pool for >1 (inline for 0/1)."""
+    if len(rollouts) <= 1:
+        return [fn(r) for r in rollouts]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(len(rollouts), _ENV_THREAD_CAP)) as ex:
+        return list(ex.map(fn, rollouts))
 
 
 def _run_env_replies(rollouts: list[_RolloutState], active_env) -> list:
-    """``env_reply`` for each rollout (independent per-rollout state), in order. Run across a thread
-    pool whenever there's more than one rollout — once GPU generation is batched, the per-rollout env
-    turns are the serial tail, and overlapping them is a strict win for LLM-in-the-loop envs
-    (simulated-user model / LLM judge / tool API) and free for cheap/deterministic ones. Always on:
-    each rollout's state is independent (a Freesolo env's ``env_reply`` operates on the passed
-    ``state``, not shared object state), so the parallel result is identical to sequential (tested:
-    ``rollout_batch`` == per-example ``rollout_one``)."""
-    if not rollouts:
-        return []
-    if len(rollouts) == 1:
-        return [active_env.env_reply(rollouts[0].messages, rollouts[0].state)]
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=_env_max_workers(len(rollouts))) as ex:
-        return list(ex.map(lambda r: active_env.env_reply(r.messages, r.state), rollouts))
+    return _env_map(rollouts, lambda r: active_env.env_reply(r.messages, r.state))
 
 
 def _score_rewards(rollouts: list[_RolloutState], active_env) -> list[float]:
-    """Per-rollout reward scoring, in order — across a thread pool for >1 rollout (overlaps an
-    LLM-judge reward across the whole batch; free for cheap rewards). ``reward("", ex, state)``
-    matches :func:`rollout_one` (score against the accumulated rollout state)."""
-    if not rollouts:
-        return []
-    if len(rollouts) == 1:
-        return [float(active_env.reward("", rollouts[0].example, rollouts[0].state))]
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=_env_max_workers(len(rollouts))) as ex:
-        return [float(x) for x in ex.map(lambda r: active_env.reward("", r.example, r.state), rollouts)]
+    return [float(x) for x in _env_map(rollouts, lambda r: active_env.reward("", r.example, r.state))]
 
 
 def _advance_model_turn(
@@ -320,25 +306,6 @@ def _advance_env_reply(
     r.logprobs.extend([0.0] * len(glue))
     r.env_mask.extend([0] * len(glue))
     r.cur_ids.extend(glue)
-
-
-def _advance_after_turn(
-    r: _RolloutState,
-    asst_ids: list[int],
-    asst_lp: list[float],
-    text: str,
-    *,
-    active_env,
-    env_glue: Callable[[list], list[int]],
-    max_turns: int,
-) -> None:
-    """Fold one freshly-sampled assistant turn into rollout ``r`` and run its env step (phase 1 +
-    a sequential env_reply + phase 2), mirroring the body of :func:`rollout_one`'s loop EXACTLY.
-    Sets ``r.done`` when the rollout should stop. Shared by :func:`rollout_one` so the single-rollout
-    path and the batched path (which splits the phases) can never drift."""
-    if _advance_model_turn(r, asst_ids, asst_lp, text, active_env=active_env, max_turns=max_turns):
-        env_msgs = active_env.env_reply(r.messages, r.state)
-        _advance_env_reply(r, env_msgs, active_env=active_env, env_glue=env_glue, max_turns=max_turns)
 
 
 def rollout_batch(
@@ -527,28 +494,7 @@ def build_rollout_func(
         # the engine resident across steps). See flash issue #162.
         sleep_mode = bool(getattr(getattr(trainer, "args", None), "vllm_enable_sleep_mode", False))
         vocab_size = _engine_vocab_size(engine)
-        # Bounds-check each rollout's INITIAL prompt exactly once, keyed on the identity of its token
-        # list. A rollout's ``cur_ids`` is one object grown in place across turns and is FRESH per
-        # rollout, so the first time we see a given list it is that rollout's externally-rendered
-        # initial prompt — the only segment that can carry tokenizer/model-mismatch ids; its later
-        # (grown) appearances are vLLM-generated / tokenizer glue, both in range. Tracking identity
-        # (not a turn-0 flag) validates EVERY prompt in BOTH the batched and the sequential A/B path
-        # without re-scanning the growing prefix each turn. ``checked_refs`` holds the validated lists
-        # alive so a freed id can't be reused and wrongly skipped.
-        checked_ids: set[int] = set()
-        checked_refs: list[list[int]] = []
-
-        def _bounds_check(p: list[int]) -> None:
-            if id(p) in checked_ids:
-                return
-            checked_ids.add(id(p))
-            checked_refs.append(p)
-            lo, hi = min(p), max(p)
-            if lo < 0 or (vocab_size is not None and hi >= vocab_size):
-                raise ValueError(
-                    f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
-                    f"vocab size {vocab_size} (tokenizer/model mismatch)"
-                )
+        bounds_checked = False  # the initial prompts (the first batch) are validated once; see below
 
         def batched_generate(prefixes: list[list[int]], max_tokens_list: list[int]):
             """Sample ONE assistant turn for every active rollout in a single vLLM decode.
@@ -558,13 +504,26 @@ def build_rollout_func(
             and the shared in-group prompt KV. Returns (token_ids, logprobs, text) per prefix, in
             input order.
             """
+            nonlocal bounds_checked
             for p in prefixes:
                 # Fail loudly on a degenerate prompt instead of letting it reach the embedding gather
                 # as an opaque async CUDA illegal-access (the failure mode #162 was first mistaken
                 # for): the prompt_token_ids path does no bounds checking.
                 if not p:
                     raise ValueError("multi-turn rollout produced an empty prompt for engine.generate()")
-                _bounds_check(p)  # validates each initial prompt once (id-keyed); later turns skip
+            if not bounds_checked:
+                # The FIRST batch is turn 0 — every prefix is an externally-rendered initial prompt,
+                # the only segment that can carry tokenizer/model-mismatch ids (later turns' prefixes
+                # are vLLM-generated / tokenizer glue, in range). Validate each one; the
+                # prompt_token_ids path does no bounds checking.
+                bounds_checked = True
+                for p in prefixes:
+                    lo, hi = min(p), max(p)
+                    if lo < 0 or (vocab_size is not None and hi >= vocab_size):
+                        raise ValueError(
+                            f"multi-turn rollout prompt has out-of-range token id(s) [{lo}, {hi}] for "
+                            f"vocab size {vocab_size} (tokenizer/model mismatch)"
+                        )
             # Per-prompt SamplingParams: each rollout has its own remaining-token budget.
             sps = [
                 SamplingParams(
