@@ -150,7 +150,12 @@ def main(argv: list[str] | None = None) -> int:
 
     status = sub.add_parser("status", help="show a run's status, logs, or follow logs")
     status.add_argument("run_id")
-    status.add_argument("--logs", action="store_true", help="print current logs before status")
+    status.add_argument(
+        "--logs",
+        action="store_true",
+        help="print current logs before status — the orchestrator log plus the train-subprocess "
+        "stdout + traceback (console_/error_<phase>.txt) fetched from the run's HF artifact repo",
+    )
     status.add_argument(
         "-f",
         "--follow",
