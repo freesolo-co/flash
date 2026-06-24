@@ -703,6 +703,32 @@ def test_rollout_func_aborts_inflight_requests_on_error():
     assert engine.aborted  # leftover in-flight requests were aborted, not leaked
 
 
+class _CountingTok(_FakeTok):
+    """_FakeTok that counts how many times env_glue rendered (apply_chat_template with the probe)."""
+
+    def __init__(self):
+        super().__init__()
+        self.glue_renders = 0
+
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize, enable_thinking):
+        if any("flash-env-glue-probe" in str(m.get("content", "")) for m in messages):
+            self.glue_renders += 1
+        return super().apply_chat_template(messages, add_generation_prompt, tokenize, enable_thinking)
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_env_glue_render_is_cached_across_repeated_env_messages():
+    # Every rollout in the group gets the SAME env reply ("result") each turn, so the inter-turn
+    # glue is byte-identical — apply_chat_template must render it ONCE (cached), not once per rollout.
+    tok = _CountingTok()
+    engine = _FakeEngine()
+    rf = _build(tok, active_env=_TwoTurnEnv())
+    prompts = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}],
+               [{"role": "user", "content": "c"}]]
+    rf(prompts, _fake_trainer(engine, sleep_mode=False))
+    assert tok.glue_renders == 1  # 3 rollouts' identical env-glue rendered once, not 3x
+
+
 @pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_guards_empty_prompt():
     engine = _FakeEngine()

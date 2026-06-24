@@ -531,7 +531,20 @@ def build_rollout_func(
     def render(messages: list, add_generation_prompt: bool) -> list[int]:
         return render_message_ids(tok, messages, add_generation_prompt, thinking=thinking)
 
+    _glue_cache: dict[str, list[int]] = {}
+    _GLUE_CACHE_MAX = 8192
+
     def env_glue(env_messages: list) -> list[int]:
+        # The inter-turn glue is a pure function of env_messages (+ this closure's tokenizer /
+        # thinking). Within a GRPO group every rollout gets the SAME env reply each turn, and many
+        # turns repeat env messages across rollouts and steps, so apply_chat_template would
+        # otherwise re-render byte-identical glue dozens-to-hundreds of times — the dominant per-turn
+        # CPU cost in the (otherwise overhead-bound) multi-turn rollout. Cache by env-message
+        # content; bounded so an env whose every reply is unique can't grow it without limit.
+        cache_key = json.dumps(env_messages, sort_keys=True, default=str)
+        cached = _glue_cache.get(cache_key)
+        if cached is not None:
+            return cached
         # Tokens between two assistant turns: close the previous assistant turn, render the env
         # reply message(s), and open the next generation prompt. Derived by rendering a probe
         # assistant turn followed by the env messages (+ generation prompt) and taking everything
@@ -559,7 +572,10 @@ def build_rollout_func(
                 "env or a different model)."
             )
         glue_text = text[first + len(probe) :]
-        return [int(t) for t in tok(glue_text, add_special_tokens=False).input_ids]
+        glue = [int(t) for t in tok(glue_text, add_special_tokens=False).input_ids]
+        if len(_glue_cache) < _GLUE_CACHE_MAX:
+            _glue_cache[cache_key] = glue
+        return glue
 
     def rollout_func(prompts, trainer):
         engine = trainer.vllm_generation.llm
