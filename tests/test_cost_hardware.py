@@ -49,8 +49,10 @@ def test_unknown_gpu_lookup_raises():
 
 
 def test_pick_gpu_cheapest_fit_no_validation_gate():
-    # No validation gate: every fitting class is eligible, ranked by static rate.
-    assert pick_gpu(12) == "RTX 2000 Ada"
+    # No validation gate: every fitting class is eligible, ranked by static rate. 24 GB is the
+    # floor (sub-24 GB classes dropped), so anything that fits <=24 GB lands on the cheapest 24 GB
+    # card, L4 ($0.39).
+    assert pick_gpu(12) == "L4"
     assert pick_gpu(24) == "L4"
     # > 24 GB needs the big-VRAM tier -> cheapest static >= 40 is the A40 ($0.44, 48 GB).
     assert pick_gpu(40) == "A40"
@@ -70,8 +72,9 @@ def test_pick_gpu_result_actually_fits_and_is_cheapest():
 
 
 def test_pick_gpu_includes_unvalidated_classes():
-    # No validation gate: the cheapest static-rate class wins regardless of validation status.
-    assert pick_gpu(12) == "RTX 2000 Ada"
+    # No validation gate: the cheapest static-rate class wins regardless of validation status
+    # (L4 is unvalidated yet is the cheapest fitting class).
+    assert pick_gpu(12) == "L4"
 
 
 def test_pick_gpu_impossible_raises():
@@ -81,4 +84,4 @@ def test_pick_gpu_impossible_raises():
 
 def test_pick_gpu_auto_matches_default():
     assert pick_gpu(24, provider="auto") == pick_gpu(24)
-    assert pick_gpu(12) == "RTX 2000 Ada"
+    assert pick_gpu(12) == "L4"

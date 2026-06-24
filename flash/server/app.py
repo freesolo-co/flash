@@ -24,6 +24,7 @@ from flash.catalog import public_model_rows
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.runner import (
     adapter_prefix,
+    attach_checkpoint_deployment,
     cancel_run,
     get_status,
     mark_deployed,
@@ -32,6 +33,7 @@ from flash.runner import (
     runs_file_path,
     submit_job,
 )
+from flash.runner.checkpoints import checkpoint_adapter_prefix, list_checkpoints
 from flash.schema import ConfigError, spec_from_dict
 from flash.serve.deploy import ServingError, deploy_adapter, undeploy_adapter
 from flash.serve.deploy import chat as serve_chat
@@ -44,9 +46,46 @@ _RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 _RECOVERABLE = {"queued", "provisioning", "running"}
 # Run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
+# A specific intermediate checkpoint can also be deployed from a run that stopped mid-RL
+# (cancelled/failed): the per-step adapter was already streamed to HF, so it serves even though
+# the run never sealed a final adapter. `dry_run` is excluded — it never trained.
+_CHECKPOINT_DEPLOYABLE_STATES = _DEPLOYABLE_STATES | {"cancelled", "failed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 _log = logging.getLogger("flash.server")
+
+
+def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
+    """Validate an optional deploy ``step`` against the run's published checkpoints.
+
+    Returns the integer step to deploy, or ``None`` when no step was requested (deploy the
+    final adapter). Raises ``HTTPException(400)`` for a malformed step and ``HTTPException(404)``
+    — listing the available steps — when the run has no deployable checkpoint at that step."""
+    if raw_step is None:
+        return None
+    from fastapi import HTTPException
+
+    # Accept only an actual integer step — NOT a bool (True would coerce to step 1) and not a
+    # non-integer float/string (40.9 / "40.9" must not silently round to a different checkpoint).
+    want: int | None = None
+    if isinstance(raw_step, bool):
+        want = None
+    elif isinstance(raw_step, int):
+        want = raw_step
+    elif isinstance(raw_step, float):
+        want = int(raw_step) if raw_step.is_integer() else None
+    elif isinstance(raw_step, str) and raw_step.strip().lstrip("-").isdigit():
+        want = int(raw_step.strip())
+    if want is None:
+        raise HTTPException(status_code=400, detail=f"invalid checkpoint step: {raw_step!r}")
+    checkpoints = list_checkpoints(spec)
+    if any(c["step"] == want for c in checkpoints):
+        return want
+    available = ", ".join(str(c["step"]) for c in checkpoints) or "none"
+    raise HTTPException(
+        status_code=404,
+        detail=f"run {run_id} has no deployable checkpoint at step {want} (available: {available})",
+    )
 
 
 async def _reconcile_cost_loop() -> None:
@@ -294,6 +333,9 @@ def create_app():
             )
         except envs.EnvPublishError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        from flash.server.environment_registry import record_published_environment
+
+        record_published_environment(slug=slug, name=str(_name), key=key)
         return {"id": slug}
 
     def _parse_spec(payload: dict, run_id: str) -> JobSpec:
@@ -380,7 +422,26 @@ def create_app():
                 submit_kwargs["runtime_secrets"] = runtime_secrets
             if billing_context:
                 submit_kwargs["billing_context"] = billing_context
+            platform_context = {
+                field: value
+                for field, value in {
+                    "org_id": key.get("org_id"),
+                    "user_id": key.get("user_id"),
+                    "api_key_id": key.get("api_key_id"),
+                }.items()
+                if value
+            }
+            if platform_context:
+                submit_kwargs["platform_context"] = platform_context
             status = submit_job(spec, **submit_kwargs)
+            from flash.server.run_registry import record_training_run
+
+            record_training_run(status=status, key=key)
+            from flash.envs.adapter import is_managed_environment_slug
+            from flash.server.environment_registry import record_environment_use
+
+            if is_managed_environment_slug(spec.environment.id):
+                record_environment_use(slug=spec.environment.id, run_id=spec.run_id, key=key)
         except Exception as exc:
             db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
             if isinstance(exc, HTTPException):
@@ -437,14 +498,23 @@ def create_app():
             status = owned_run(run_id, key)
             spec = JobSpec.from_dict(status.spec)
             dry_run = bool(payload.get("dry_run", False))
-            if not dry_run and status.state not in _DEPLOYABLE_STATES:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"run {run_id} is {status.state!r}; only finished runs with "
-                        "trained adapter artifacts can be deployed"
-                    ),
+            # Optional `step`: deploy a specific intermediate checkpoint instead of the run's
+            # final adapter. We resolve it against what's actually on HF (the source of truth),
+            # so a missing step 404s with the available list rather than 500ing at serve time.
+            checkpoint_step = _resolve_deploy_step(run_id, spec, payload.get("step"))
+            is_checkpoint = checkpoint_step is not None
+            allowed_states = (
+                _CHECKPOINT_DEPLOYABLE_STATES if is_checkpoint else _DEPLOYABLE_STATES
+            )
+            if not dry_run and status.state not in allowed_states:
+                detail = (
+                    f"run {run_id} is {status.state!r}; deploy a checkpoint only once the run "
+                    "has finished or been cancelled"
+                    if is_checkpoint
+                    else f"run {run_id} is {status.state!r}; only finished runs with "
+                    "trained adapter artifacts can be deployed"
                 )
+                raise HTTPException(status_code=409, detail=detail)
             # Legacy runs persisted before [train].hf_repo was mandatory rehydrate with an
             # empty hf_repo; without this guard freesolo serving cannot locate the adapter
             # artifacts (the per-run HF dataset repo). Reject early with a clear 409.
@@ -456,6 +526,12 @@ def create_app():
                         "cannot be located, so it cannot be deployed"
                     ),
                 )
+            # A checkpoint deploy serves the per-step adapter; otherwise the run's final adapter.
+            deploy_prefix = (
+                checkpoint_adapter_prefix(spec, checkpoint_step)
+                if is_checkpoint
+                else adapter_prefix(spec)
+            )
             # The state the run must still be in for this deploy to finalize — a CAS guard so
             # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't be
             # silently overwritten by the deployment record.
@@ -465,7 +541,7 @@ def create_app():
                     run_id=run_id,
                     model=spec.model,
                     hf_repo=spec.train.hf_repo,
-                    adapter_prefix=adapter_prefix(spec),
+                    adapter_prefix=deploy_prefix,
                     gpu_name=spec.gpu.type,
                     dry_run=dry_run,
                     # a run trained with thinking serves with thinking (per-run parity)
@@ -480,19 +556,44 @@ def create_app():
                 if isinstance(exc, ValueError):
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 raise
+            dep_dict = dep.to_dict()
+            if is_checkpoint:
+                dep_dict["checkpoint_step"] = checkpoint_step
             if not dry_run:
-                # Record the deployment. The CAS no-ops only if a /cancel raced finalization
-                # — then the adapter we just registered is orphaned, so deregister it and
-                # report the conflict instead of a bogus 200.
-                marked = mark_deployed(run_id, dep.to_dict(), expect_state=prev_state)
-                if marked.state != "deployed":
-                    with contextlib.suppress(Exception):
-                        undeploy_adapter(run_id)
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
-                    )
-            return dep.to_dict()
+                if is_checkpoint and status.state not in _DEPLOYABLE_STATES:
+                    # Deploying a checkpoint of a run that stopped mid-RL (cancelled/failed):
+                    # attach the serving deployment but KEEP the run's terminal training state
+                    # — flipping it to `deployed` would erase the outcome and make undeploy
+                    # wrongly restore it to `done`.
+                    attach_checkpoint_deployment(run_id, dep_dict)
+                else:
+                    # Record the deployment. The CAS no-ops only if a /cancel raced finalization
+                    # — then the adapter we just registered is orphaned, so deregister it and
+                    # report the conflict instead of a bogus 200.
+                    marked = mark_deployed(run_id, dep_dict, expect_state=prev_state)
+                    if marked.state != "deployed":
+                        with contextlib.suppress(Exception):
+                            undeploy_adapter(run_id)
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
+                        )
+            return dep_dict
+
+    @app.get("/v1/runs/{run_id}/checkpoints")
+    def run_checkpoints(run_id: str, key: dict = Depends(require_key)):
+        """List a run's deployable per-step RL checkpoints (each `flash deploy --step N`-able).
+
+        Reads the snapshots the worker streamed to HF, and best-effort mirrors them to the
+        backend store so a listing also persists them."""
+        status = owned_run(run_id, key)
+        spec = JobSpec.from_dict(status.spec)
+        checkpoints = list_checkpoints(spec)
+        with contextlib.suppress(Exception):
+            from flash.server.checkpoints import register_checkpoints_best_effort
+
+            register_checkpoints_best_effort(status)
+        return {"run_id": run_id, "checkpoints": checkpoints}
 
     @app.delete("/v1/runs/{run_id}/deploy")
     def undeploy(run_id: str, key: dict = Depends(require_key)):

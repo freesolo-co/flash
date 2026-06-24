@@ -1,0 +1,709 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash CLI - output style</title>
+<style>
+:root{--navy:#1b1b4b;--bg:#0a0a16;--ink:#cdd2e6;--mut:#8a93a8;--line:#23244a;--accent:#5f72ff;--accent2:#97a3ff;--green:#57ff8f}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 600px at 50% -10%,#5f72ff22,transparent),var(--bg);
+  color:var(--ink);font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Inter,sans-serif}
+.wrap{max-width:1320px;margin:0 auto;padding:56px 24px 80px}
+.brand{display:inline-flex;align-items:center;gap:10px;font-weight:700}
+.brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px var(--accent)}
+.brand b{color:var(--accent)}
+h1{font-size:30px;margin:18px 0 8px;letter-spacing:-.4px}
+.lede{color:var(--mut);max-width:760px}
+.legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:22px;color:var(--mut);font-size:13px}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+.card{border:1px solid var(--line);border-radius:14px;margin:22px 0;overflow:hidden;
+  box-shadow:0 1px 0 #ffffff0a inset,0 18px 40px -28px #000}
+.card>.head{display:flex;align-items:baseline;gap:12px;padding:15px 18px;border-bottom:1px solid var(--line)}
+.card>.head code{font:600 14px/1 ui-monospace,SFMono-Regular,Menlo,monospace}
+.card>.head .sub{color:var(--mut);font-size:13px}
+.cols{display:grid;grid-template-columns:1fr 1fr 1fr}
+.col+.col{border-left:1px solid var(--line)}
+.col .tag{display:flex;align-items:center;gap:8px;padding:9px 16px;color:var(--mut);font-size:11px;
+  letter-spacing:.14em;text-transform:uppercase;border-bottom:1px solid var(--line);background:#0d0d22}
+.col .tag .pill{width:7px;height:7px;border-radius:50%}
+.before .pill{background:#3a3c63}
+.after .pill{background:var(--green);box-shadow:0 0 10px #57ff8f88}
+pre{margin:0;padding:18px;overflow-x:auto;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,"Cascadia Code",monospace;
+  color:#aeb6cf;background:#0d0d22}
+.after pre{background:#09091a}
+.before pre{color:#868eaa}
+/* the light column previews how the theme looks on a light terminal */
+.light .tag{background:#eef0f7;color:#5b6472;border-bottom-color:#e2e5f0}
+.light pre{background:#ffffff;color:#1b1b4b}
+@media(max-width:900px){.cols{grid-template-columns:1fr}.col+.col{border-left:0;border-top:1px solid var(--line)}}
+footer{color:var(--mut);font-size:13px;margin-top:48px;border-top:1px solid var(--line);padding-top:20px}
+footer code{color:var(--accent2)}
+</style></head><body><div class="wrap">
+<header>
+  <div class="brand"><span class="dot"></span><span><b>flash</b> cli</span></div>
+  <h1>A standardized output theme for every command</h1>
+  <p class="lede">One visual language across the whole CLI, in the Freesolo website palette
+  (navy <code>#1b1b4b</code>, periwinkle <code>#5f72ff</code>, green <code>#57ff8f</code>): a brand
+  header, colored status badges, aligned tables, key/value panels, and syntax-highlighted JSON. Like
+  the website, it ships <b>light and dark</b> variants (auto-detected from the terminal background,
+  or forced with <code>FLASH_THEME</code>) &mdash; each command below shows both. The themed view
+  renders on an interactive terminal; piped or scripted output stays byte-for-byte plain, so
+  <code>jq</code>, scripts, and the agent contract are untouched.</p>
+  <div class="legend">
+    <span><i class="sw" style="background:#5f72ff"></i>periwinkle &mdash; accent / links</span>
+    <span><i class="sw" style="background:#57ff8f"></i>green &mdash; success / done</span>
+    <span><i class="sw" style="background:#24c2a8"></i>teal &mdash; amounts</span>
+    <span><i class="sw" style="background:#9a8cff"></i>indigo &mdash; literals</span>
+    <span><i class="sw" style="background:#ff6b6b"></i>red &mdash; failure</span>
+    <span><i class="sw" style="background:#4d5470"></i>structure</span>
+  </div>
+</header>
+<section class="card"><div class="head"><code>flash version</code><span class="sub">package version</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>flash 0.2.19</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="opacity:.62">v0.2.19</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="opacity:.62">v0.2.19</span></pre></div></div></section><section class="card"><div class="head"><code>flash login</code><span class="sub">verify + store your freesolo key</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>✓ logged in to flash
+
+  account  ml-team@acme.ai
+  org      org_acme
+  user     usr_4192
+  key      fs_live_8Kd2… (freesolo key)</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#57ff8f;font-weight:700">✓</span> <span style="font-weight:700">logged in to flash</span>
+
+  <span style="opacity:.62">account</span>  ml-team@acme.ai
+  <span style="opacity:.62">org    </span>  org_acme
+  <span style="opacity:.62">user   </span>  usr_4192
+  <span style="opacity:.62">key    </span>  fs_live_8Kd2… <span style="opacity:.62">(freesolo key)</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#00695c;font-weight:700">✓</span> <span style="font-weight:700">logged in to flash</span>
+
+  <span style="opacity:.62">account</span>  ml-team@acme.ai
+  <span style="opacity:.62">org    </span>  org_acme
+  <span style="opacity:.62">user   </span>  usr_4192
+  <span style="opacity:.62">key    </span>  fs_live_8Kd2… <span style="opacity:.62">(freesolo key)</span></pre></div></div></section><section class="card"><div class="head"><code>flash whoami</code><span class="sub">identity behind the stored key</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>logged in to flash
+
+  account  ml-team@acme.ai
+  org      org_acme
+  user     usr_4192
+  key      fs_live_8Kd2… (freesolo key)</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="font-weight:700">logged in to flash</span>
+
+  <span style="opacity:.62">account</span>  ml-team@acme.ai
+  <span style="opacity:.62">org    </span>  org_acme
+  <span style="opacity:.62">user   </span>  usr_4192
+  <span style="opacity:.62">key    </span>  fs_live_8Kd2… <span style="opacity:.62">(freesolo key)</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="font-weight:700">logged in to flash</span>
+
+  <span style="opacity:.62">account</span>  ml-team@acme.ai
+  <span style="opacity:.62">org    </span>  org_acme
+  <span style="opacity:.62">user   </span>  usr_4192
+  <span style="opacity:.62">key    </span>  fs_live_8Kd2… <span style="opacity:.62">(freesolo key)</span></pre></div></div></section><section class="card"><div class="head"><code>flash models</code><span class="sub">supported base models</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>Qwen/Qwen3.5-0.8B
+openbmb/MiniCPM5-1B
+Qwen/Qwen3.5-2B
+Qwen/Qwen3.5-4B
+Qwen/Qwen3.5-9B</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">models</span>  <span style="color:#8a93a8">supported base models</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#4d5470">•</span> <span style="color:#97a3ff">Qwen/Qwen3.5-0.8B</span>
+  <span style="color:#4d5470">•</span> <span style="color:#97a3ff">openbmb/MiniCPM5-1B</span>
+  <span style="color:#4d5470">•</span> <span style="color:#97a3ff">Qwen/Qwen3.5-2B</span>
+  <span style="color:#4d5470">•</span> <span style="color:#97a3ff">Qwen/Qwen3.5-4B</span>
+  <span style="color:#4d5470">•</span> <span style="color:#97a3ff">Qwen/Qwen3.5-9B</span>
+
+<span style="color:#97a3ff">→</span> <span style="opacity:.62">train one with: flash train configs/rl.toml</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">models</span>  <span style="color:#5b6472">supported base models</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#9aa1b5">•</span> <span style="color:#3a46c8">Qwen/Qwen3.5-0.8B</span>
+  <span style="color:#9aa1b5">•</span> <span style="color:#3a46c8">openbmb/MiniCPM5-1B</span>
+  <span style="color:#9aa1b5">•</span> <span style="color:#3a46c8">Qwen/Qwen3.5-2B</span>
+  <span style="color:#9aa1b5">•</span> <span style="color:#3a46c8">Qwen/Qwen3.5-4B</span>
+  <span style="color:#9aa1b5">•</span> <span style="color:#3a46c8">Qwen/Qwen3.5-9B</span>
+
+<span style="color:#3a46c8">→</span> <span style="opacity:.62">train one with: flash train configs/rl.toml</span></pre></div></div></section><section class="card"><div class="head"><code>flash gpus</code><span class="sub">managed GPU classes + $/hr</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>gpu               vram runpod$/hr
+L4                 24G       0.39
+A40                48G       0.44
+RTX 3090           24G       0.46
+RTX A6000          48G       0.49
+RTX 4090           24G       0.69
+RTX 6000 Ada       48G       0.77
+RTX 5090           32G       0.99
+A100 PCIe          80G       1.39
+A100 SXM           80G       1.49
+RTX Pro 6000       96G       2.09
+H100               80G       3.29
+
+Tip: GPU class selection is fully automatic — the submit-time allocator always picks the
+cheapest validated RunPod class that fits the model, so you don&#x27;t pin a GPU type.</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">gpus</span>  <span style="color:#8a93a8">managed GPU classes</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#8a93a8;font-weight:700">GPU         </span>  <span style="color:#8a93a8;font-weight:700"> VRAM</span>  <span style="color:#8a93a8;font-weight:700"> $/HR</span>
+<span style="color:#4d5470">────────────  ─────  ─────</span>
+<span style="color:#97a3ff">L4          </span>  <span style="color:#8a93a8">24 GB</span>  <span style="color:#24c2a8">$0.39</span>
+<span style="color:#97a3ff">A40         </span>  <span style="color:#8a93a8">48 GB</span>  <span style="color:#24c2a8">$0.44</span>
+<span style="color:#97a3ff">RTX 3090    </span>  <span style="color:#8a93a8">24 GB</span>  <span style="color:#24c2a8">$0.46</span>
+<span style="color:#97a3ff">RTX A6000   </span>  <span style="color:#8a93a8">48 GB</span>  <span style="color:#24c2a8">$0.49</span>
+<span style="color:#97a3ff">RTX 4090    </span>  <span style="color:#8a93a8">24 GB</span>  <span style="color:#24c2a8">$0.69</span>
+<span style="color:#97a3ff">RTX 6000 Ada</span>  <span style="color:#8a93a8">48 GB</span>  <span style="color:#24c2a8">$0.77</span>
+<span style="color:#97a3ff">RTX 5090    </span>  <span style="color:#8a93a8">32 GB</span>  <span style="color:#24c2a8">$0.99</span>
+<span style="color:#97a3ff">A100 PCIe   </span>  <span style="color:#8a93a8">80 GB</span>  <span style="color:#24c2a8">$1.39</span>
+<span style="color:#97a3ff">A100 SXM    </span>  <span style="color:#8a93a8">80 GB</span>  <span style="color:#24c2a8">$1.49</span>
+<span style="color:#97a3ff">RTX Pro 6000</span>  <span style="color:#8a93a8">96 GB</span>  <span style="color:#24c2a8">$2.09</span>
+<span style="color:#97a3ff">H100        </span>  <span style="color:#8a93a8">80 GB</span>  <span style="color:#24c2a8">$3.29</span>
+
+<span style="opacity:.62">Tip: GPU class selection is fully automatic — the submit-time allocator always picks the
+cheapest validated RunPod class that fits the model, so you don&#x27;t pin a GPU type.</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">gpus</span>  <span style="color:#5b6472">managed GPU classes</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#5b6472;font-weight:700">GPU         </span>  <span style="color:#5b6472;font-weight:700"> VRAM</span>  <span style="color:#5b6472;font-weight:700"> $/HR</span>
+<span style="color:#9aa1b5">────────────  ─────  ─────</span>
+<span style="color:#3a46c8">L4          </span>  <span style="color:#5b6472">24 GB</span>  <span style="color:#0e7490">$0.39</span>
+<span style="color:#3a46c8">A40         </span>  <span style="color:#5b6472">48 GB</span>  <span style="color:#0e7490">$0.44</span>
+<span style="color:#3a46c8">RTX 3090    </span>  <span style="color:#5b6472">24 GB</span>  <span style="color:#0e7490">$0.46</span>
+<span style="color:#3a46c8">RTX A6000   </span>  <span style="color:#5b6472">48 GB</span>  <span style="color:#0e7490">$0.49</span>
+<span style="color:#3a46c8">RTX 4090    </span>  <span style="color:#5b6472">24 GB</span>  <span style="color:#0e7490">$0.69</span>
+<span style="color:#3a46c8">RTX 6000 Ada</span>  <span style="color:#5b6472">48 GB</span>  <span style="color:#0e7490">$0.77</span>
+<span style="color:#3a46c8">RTX 5090    </span>  <span style="color:#5b6472">32 GB</span>  <span style="color:#0e7490">$0.99</span>
+<span style="color:#3a46c8">A100 PCIe   </span>  <span style="color:#5b6472">80 GB</span>  <span style="color:#0e7490">$1.39</span>
+<span style="color:#3a46c8">A100 SXM    </span>  <span style="color:#5b6472">80 GB</span>  <span style="color:#0e7490">$1.49</span>
+<span style="color:#3a46c8">RTX Pro 6000</span>  <span style="color:#5b6472">96 GB</span>  <span style="color:#0e7490">$2.09</span>
+<span style="color:#3a46c8">H100        </span>  <span style="color:#5b6472">80 GB</span>  <span style="color:#0e7490">$3.29</span>
+
+<span style="opacity:.62">Tip: GPU class selection is fully automatic — the submit-time allocator always picks the
+cheapest validated RunPod class that fits the model, so you don&#x27;t pin a GPU type.</span></pre></div></div></section><section class="card"><div class="head"><code>flash env setup</code><span class="sub">scaffold a starter environment</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>ensured environment.py, datasets/train.jsonl, configs/, configs/rl.toml, configs/sft.toml</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">env setup</span>  <span style="color:#8a93a8">starter Freesolo environment</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#57ff8f;font-weight:700">✓</span> scaffold ready
+
+  <span style="color:#97a3ff">environment.py      </span>  <span style="opacity:.62">env entrypoint — edit the reward + prompt</span>
+  <span style="color:#97a3ff">datasets/train.jsonl</span>  <span style="opacity:.62">starter training rows</span>
+  <span style="color:#97a3ff">configs/rl.toml     </span>  <span style="opacity:.62">GRPO run config</span>
+  <span style="color:#97a3ff">configs/sft.toml    </span>  <span style="opacity:.62">SFT run config</span>
+
+<span style="color:#97a3ff">→</span> <span style="opacity:.62">publish it: flash env push --name my-env .</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">env setup</span>  <span style="color:#5b6472">starter Freesolo environment</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#00695c;font-weight:700">✓</span> scaffold ready
+
+  <span style="color:#3a46c8">environment.py      </span>  <span style="opacity:.62">env entrypoint — edit the reward + prompt</span>
+  <span style="color:#3a46c8">datasets/train.jsonl</span>  <span style="opacity:.62">starter training rows</span>
+  <span style="color:#3a46c8">configs/rl.toml     </span>  <span style="opacity:.62">GRPO run config</span>
+  <span style="color:#3a46c8">configs/sft.toml    </span>  <span style="opacity:.62">SFT run config</span>
+
+<span style="color:#3a46c8">→</span> <span style="opacity:.62">publish it: flash env push --name my-env .</span></pre></div></div></section><section class="card"><div class="head"><code>flash env list</code><span class="sub">installed + local environments</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>local env sources (publish with `flash env push --name &lt;name&gt; &lt;path&gt;`):
+  .
+  environments/math-grader</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">env list</span>  <span style="color:#8a93a8">installed + local environments</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#8a93a8;font-weight:700">local sources</span><span style="opacity:.62">  (publish with flash env push --name &lt;name&gt; &lt;path&gt;)</span>
+  <span style="color:#4d5470">·</span> <span style="color:#97a3ff">.</span>
+  <span style="color:#4d5470">·</span> <span style="color:#97a3ff">environments/math-grader</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">env list</span>  <span style="color:#5b6472">installed + local environments</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#5b6472;font-weight:700">local sources</span><span style="opacity:.62">  (publish with flash env push --name &lt;name&gt; &lt;path&gt;)</span>
+  <span style="color:#9aa1b5">·</span> <span style="color:#3a46c8">.</span>
+  <span style="color:#9aa1b5">·</span> <span style="color:#3a46c8">environments/math-grader</span></pre></div></div></section><section class="card"><div class="head"><code>flash env install acme/math-grader</code><span class="sub">record a published environment</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>installed acme/math-grader; recorded in /Users/you/.flash/environments.json
+use it via:  [environment]\nid = &quot;acme/math-grader&quot;</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#57ff8f;font-weight:700">✓</span> recorded <span style="font-weight:700">acme/math-grader</span>
+<span style="opacity:.62">  manifest: /Users/you/.flash/environments.json</span>
+
+<span style="opacity:.62">use it in your config:</span>
+  <span style="color:#97a3ff">[environment]</span>
+  <span style="color:#97a3ff">id = &quot;acme/math-grader&quot;</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#00695c;font-weight:700">✓</span> recorded <span style="font-weight:700">acme/math-grader</span>
+<span style="opacity:.62">  manifest: /Users/you/.flash/environments.json</span>
+
+<span style="opacity:.62">use it in your config:</span>
+  <span style="color:#3a46c8">[environment]</span>
+  <span style="color:#3a46c8">id = &quot;acme/math-grader&quot;</span></pre></div></div></section><section class="card"><div class="head"><code>flash env push --name math-grader .</code><span class="sub">package + upload a local environment</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>published acme/math-grader
+reference it in your config:
+
+  [environment]
+  id = &quot;acme/math-grader&quot;</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#57ff8f;font-weight:700">✓</span> published <span style="font-weight:700">acme/math-grader</span>
+
+<span style="opacity:.62">reference it in your config:</span>
+  <span style="color:#97a3ff">[environment]</span>
+  <span style="color:#97a3ff">id = &quot;acme/math-grader&quot;</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#00695c;font-weight:700">✓</span> published <span style="font-weight:700">acme/math-grader</span>
+
+<span style="opacity:.62">reference it in your config:</span>
+  <span style="color:#3a46c8">[environment]</span>
+  <span style="color:#3a46c8">id = &quot;acme/math-grader&quot;</span></pre></div></div></section><section class="card"><div class="head"><code>flash train rl.toml</code><span class="sub">submit a run and follow its logs</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>run flash-1718900000-a1b2c3d4 submitted; following logs (Ctrl-C detaches, `flash status flash-1718900000-a1b2c3d4 --follow` resumes)
+worker: provisioning RTX 5090 on runpod ...
+worker: loading Qwen/Qwen3.5-4B (bf16, LoRA r=32) ...
+step  10/150  loss=1.842  reward=0.41  lr=1.0e-4
+step 150/150  loss=0.213  reward=0.88  lr=2.0e-6
+worker: pushing adapter -&gt; acme/qwen3.5-4b-grpo-runs
+{
+  &quot;run_id&quot;: &quot;flash-1718900000-a1b2c3d4&quot;,
+  &quot;state&quot;: &quot;done&quot;,
+  &quot;spec&quot;: {
+    &quot;model&quot;: &quot;Qwen/Qwen3.5-4B&quot;,
+    &quot;algorithm&quot;: &quot;grpo&quot;,
+    &quot;gpu&quot;: {
+      &quot;type&quot;: &quot;RTX 5090&quot;
+    }
+  },
+  &quot;remote&quot;: {
+    &quot;provider&quot;: &quot;runpod&quot;,
+    &quot;gpu&quot;: &quot;RTX 5090&quot;
+  },
+  &quot;cost_usd&quot;: 1.8421,
+  &quot;realized_cost_usd&quot;: 1.774,
+  &quot;created_at&quot;: 1718896400.0,
+  &quot;updated_at&quot;: 1718900000.0,
+  &quot;error&quot;: null,
+  &quot;artifacts_dir&quot;: &quot;acme/qwen3.5-4b-grpo-runs&quot;
+}</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#57ff8f;font-weight:700">✓</span> run <span style="color:#97a3ff">flash-1718900000-a1b2c3d4</span> submitted
+<span style="opacity:.62">following logs — Ctrl-C detaches; resume with `flash status flash-1718900000-a1b2c3d4 --follow`</span>
+worker: provisioning RTX 5090 on runpod ...
+worker: loading Qwen/Qwen3.5-4B (bf16, LoRA r=32) ...
+step  10/150  loss=1.842  reward=0.41  lr=1.0e-4
+step 150/150  loss=0.213  reward=0.88  lr=2.0e-6
+worker: pushing adapter -&gt; acme/qwen3.5-4b-grpo-runs
+<span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">status</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#57ff8f">● done</span>
+
+  <span style="color:#8a93a8">run id   </span> <span style="color:#4d5470">·</span> <span style="color:#97a3ff">flash-1718900000-a1b2c3d4</span>
+  <span style="color:#8a93a8">model    </span> <span style="color:#4d5470">·</span> Qwen/Qwen3.5-4B
+  <span style="color:#8a93a8">algorithm</span> <span style="color:#4d5470">·</span> GRPO
+  <span style="color:#8a93a8">gpu      </span> <span style="color:#4d5470">·</span> RTX 5090 @ runpod
+  <span style="color:#8a93a8">cost     </span> <span style="color:#4d5470">·</span> <span style="color:#24c2a8">$1.8421</span>
+  <span style="color:#8a93a8">realized </span> <span style="color:#4d5470">·</span> <span style="color:#24c2a8">$1.7740</span>
+  <span style="color:#8a93a8">created  </span> <span style="color:#4d5470">·</span> 2024-06-20 15:13 UTC
+  <span style="color:#8a93a8">updated  </span> <span style="color:#4d5470">·</span> 2024-06-20 16:13 UTC
+  <span style="color:#8a93a8">artifacts</span> <span style="color:#4d5470">·</span> acme/qwen3.5-4b-grpo-runs
+
+<span style="opacity:.62">details</span>
+{
+  <span style="color:#97a3ff">&quot;run_id&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#97a3ff">&quot;state&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;done&quot;</span>,
+  <span style="color:#97a3ff">&quot;spec&quot;</span><span style="color:#4d5470">:</span> {
+    <span style="color:#97a3ff">&quot;model&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;Qwen/Qwen3.5-4B&quot;</span>,
+    <span style="color:#97a3ff">&quot;algorithm&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;grpo&quot;</span>,
+    <span style="color:#97a3ff">&quot;gpu&quot;</span><span style="color:#4d5470">:</span> {
+      <span style="color:#97a3ff">&quot;type&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;RTX 5090&quot;</span>
+    }
+  },
+  <span style="color:#97a3ff">&quot;remote&quot;</span><span style="color:#4d5470">:</span> {
+    <span style="color:#97a3ff">&quot;provider&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;runpod&quot;</span>,
+    <span style="color:#97a3ff">&quot;gpu&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;RTX 5090&quot;</span>
+  },
+  <span style="color:#97a3ff">&quot;cost_usd&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">1.8421</span>,
+  <span style="color:#97a3ff">&quot;realized_cost_usd&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">1.774</span>,
+  <span style="color:#97a3ff">&quot;created_at&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">1718896400.0</span>,
+  <span style="color:#97a3ff">&quot;updated_at&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">1718900000.0</span>,
+  <span style="color:#97a3ff">&quot;error&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+  <span style="color:#97a3ff">&quot;artifacts_dir&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;acme/qwen3.5-4b-grpo-runs&quot;</span>
+}</pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#00695c;font-weight:700">✓</span> run <span style="color:#3a46c8">flash-1718900000-a1b2c3d4</span> submitted
+<span style="opacity:.62">following logs — Ctrl-C detaches; resume with `flash status flash-1718900000-a1b2c3d4 --follow`</span>
+worker: provisioning RTX 5090 on runpod ...
+worker: loading Qwen/Qwen3.5-4B (bf16, LoRA r=32) ...
+step  10/150  loss=1.842  reward=0.41  lr=1.0e-4
+step 150/150  loss=0.213  reward=0.88  lr=2.0e-6
+worker: pushing adapter -&gt; acme/qwen3.5-4b-grpo-runs
+<span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">status</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#00695c">● done</span>
+
+  <span style="color:#5b6472">run id   </span> <span style="color:#9aa1b5">·</span> <span style="color:#3a46c8">flash-1718900000-a1b2c3d4</span>
+  <span style="color:#5b6472">model    </span> <span style="color:#9aa1b5">·</span> Qwen/Qwen3.5-4B
+  <span style="color:#5b6472">algorithm</span> <span style="color:#9aa1b5">·</span> GRPO
+  <span style="color:#5b6472">gpu      </span> <span style="color:#9aa1b5">·</span> RTX 5090 @ runpod
+  <span style="color:#5b6472">cost     </span> <span style="color:#9aa1b5">·</span> <span style="color:#0e7490">$1.8421</span>
+  <span style="color:#5b6472">realized </span> <span style="color:#9aa1b5">·</span> <span style="color:#0e7490">$1.7740</span>
+  <span style="color:#5b6472">created  </span> <span style="color:#9aa1b5">·</span> 2024-06-20 15:13 UTC
+  <span style="color:#5b6472">updated  </span> <span style="color:#9aa1b5">·</span> 2024-06-20 16:13 UTC
+  <span style="color:#5b6472">artifacts</span> <span style="color:#9aa1b5">·</span> acme/qwen3.5-4b-grpo-runs
+
+<span style="opacity:.62">details</span>
+{
+  <span style="color:#3a46c8">&quot;run_id&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#3a46c8">&quot;state&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;done&quot;</span>,
+  <span style="color:#3a46c8">&quot;spec&quot;</span><span style="color:#9aa1b5">:</span> {
+    <span style="color:#3a46c8">&quot;model&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;Qwen/Qwen3.5-4B&quot;</span>,
+    <span style="color:#3a46c8">&quot;algorithm&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;grpo&quot;</span>,
+    <span style="color:#3a46c8">&quot;gpu&quot;</span><span style="color:#9aa1b5">:</span> {
+      <span style="color:#3a46c8">&quot;type&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;RTX 5090&quot;</span>
+    }
+  },
+  <span style="color:#3a46c8">&quot;remote&quot;</span><span style="color:#9aa1b5">:</span> {
+    <span style="color:#3a46c8">&quot;provider&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;runpod&quot;</span>,
+    <span style="color:#3a46c8">&quot;gpu&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;RTX 5090&quot;</span>
+  },
+  <span style="color:#3a46c8">&quot;cost_usd&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">1.8421</span>,
+  <span style="color:#3a46c8">&quot;realized_cost_usd&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">1.774</span>,
+  <span style="color:#3a46c8">&quot;created_at&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">1718896400.0</span>,
+  <span style="color:#3a46c8">&quot;updated_at&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">1718900000.0</span>,
+  <span style="color:#3a46c8">&quot;error&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+  <span style="color:#3a46c8">&quot;artifacts_dir&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;acme/qwen3.5-4b-grpo-runs&quot;</span>
+}</pre></div></div></section><section class="card"><div class="head"><code>flash train --cost rl.toml</code><span class="sub">pre-flight cost estimate</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>Run        : Qwen/Qwen3.5-4B  [GRPO, 150 steps]
+GPU        : A40 on auto (48 GB; run needs &gt;= 35 GB) @ $0.44/hr
+Setup      : 9.8 min (cold start: boot + deps + model load + vLLM init)
+Per step   : 234.90 s
+Train      : 587.3 min
+Wall clock : 9.95 h
+TOTAL      : $4.38
+Notes      :
+  - GRPO step = vLLM rollout of 64x8=512 completions @ 320 tok + reward (1.00s/completion, env acme/math-grader) + policy+reference update
+  - GPU sized with 10% VRAM headroom; static GPU $/hr</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">train</span>  <span style="color:#8a93a8">pre-flight cost estimate</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#8a93a8">run       </span> <span style="color:#4d5470">·</span> <span style="color:#97a3ff">Qwen/Qwen3.5-4B</span>  <span style="opacity:.62">[GRPO, 150 steps]</span>
+  <span style="color:#8a93a8">gpu       </span> <span style="color:#4d5470">·</span> A40 on auto  <span style="opacity:.62">(48 GB; needs &gt;= 35 GB)</span>  @ <span style="color:#24c2a8">$0.44</span>/hr
+  <span style="color:#8a93a8">setup     </span> <span style="color:#4d5470">·</span> 9.8 min  <span style="opacity:.62">(cold start: boot + deps + model load + vLLM init)</span>
+  <span style="color:#8a93a8">per step  </span> <span style="color:#4d5470">·</span> 234.90 s
+  <span style="color:#8a93a8">train     </span> <span style="color:#4d5470">·</span> 587.3 min
+  <span style="color:#8a93a8">wall clock</span> <span style="color:#4d5470">·</span> 9.95 h
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#8a93a8;font-weight:700">TOTAL     </span> <span style="color:#4d5470">·</span> <span style="color:#24c2a8;font-weight:700">$4.38</span>
+
+<span style="opacity:.62">notes</span>
+  <span style="color:#4d5470">·</span> <span style="opacity:.62">GRPO step = vLLM rollout of 64x8=512 completions @ 320 tok + reward (1.00s/completion, env acme/math-grader) + policy+reference update</span>
+  <span style="color:#4d5470">·</span> <span style="opacity:.62">GPU sized with 10% VRAM headroom; static GPU $/hr</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">train</span>  <span style="color:#5b6472">pre-flight cost estimate</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#5b6472">run       </span> <span style="color:#9aa1b5">·</span> <span style="color:#3a46c8">Qwen/Qwen3.5-4B</span>  <span style="opacity:.62">[GRPO, 150 steps]</span>
+  <span style="color:#5b6472">gpu       </span> <span style="color:#9aa1b5">·</span> A40 on auto  <span style="opacity:.62">(48 GB; needs &gt;= 35 GB)</span>  @ <span style="color:#0e7490">$0.44</span>/hr
+  <span style="color:#5b6472">setup     </span> <span style="color:#9aa1b5">·</span> 9.8 min  <span style="opacity:.62">(cold start: boot + deps + model load + vLLM init)</span>
+  <span style="color:#5b6472">per step  </span> <span style="color:#9aa1b5">·</span> 234.90 s
+  <span style="color:#5b6472">train     </span> <span style="color:#9aa1b5">·</span> 587.3 min
+  <span style="color:#5b6472">wall clock</span> <span style="color:#9aa1b5">·</span> 9.95 h
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#5b6472;font-weight:700">TOTAL     </span> <span style="color:#9aa1b5">·</span> <span style="color:#0e7490;font-weight:700">$4.38</span>
+
+<span style="opacity:.62">notes</span>
+  <span style="color:#9aa1b5">·</span> <span style="opacity:.62">GRPO step = vLLM rollout of 64x8=512 completions @ 320 tok + reward (1.00s/completion, env acme/math-grader) + policy+reference update</span>
+  <span style="color:#9aa1b5">·</span> <span style="opacity:.62">GPU sized with 10% VRAM headroom; static GPU $/hr</span></pre></div></div></section><section class="card"><div class="head"><code>flash train --dry-run sft.toml</code><span class="sub">validate a config locally</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>{
+  &quot;run_id&quot;: &quot;flash-1718900000-d0cf00ed&quot;,
+  &quot;state&quot;: &quot;dry_run&quot;,
+  &quot;spec&quot;: {
+    &quot;model&quot;: &quot;Qwen/Qwen3.5-4B&quot;,
+    &quot;algorithm&quot;: &quot;sft&quot;,
+    &quot;environment&quot;: {
+      &quot;id&quot;: &quot;acme/math-grader&quot;,
+      &quot;params&quot;: {},
+      &quot;pip&quot;: [],
+      &quot;secrets&quot;: []
+    },
+    &quot;train&quot;: {
+      &quot;steps&quot;: null,
+      &quot;epochs&quot;: 1,
+      &quot;lora_rank&quot;: 32,
+      &quot;lora_alpha&quot;: 64,
+      &quot;seeds&quot;: [
+        0
+      ],
+      &quot;init_from_adapter&quot;: &quot;&quot;,
+      &quot;hf_repo&quot;: &quot;&quot;,
+      &quot;learning_rate&quot;: null,
+      &quot;batch_size&quot;: null,
+      &quot;max_length&quot;: null,
+      &quot;save_every&quot;: null,
+      &quot;max_steps&quot;: null,
+      &quot;max_examples&quot;: null,
+      &quot;group_size&quot;: null,
+      &quot;temperature&quot;: null,
+      &quot;max_tokens&quot;: null,
+      &quot;kl_penalty_coef&quot;: null,
+      &quot;advantage_clip&quot;: null,
+      &quot;thinking_length_penalty_coef&quot;: null,
+      &quot;stop_sequences&quot;: []
+    },
+    &quot;gpu&quot;: {
+      &quot;type&quot;: &quot;RTX 3090&quot;,
+      &quot;disk_gb&quot;: 60,
+      &quot;max_wall_seconds&quot;: 86400,
+      &quot;max_retries&quot;: 2,
+      &quot;network_volume&quot;: null,
+      &quot;network_volume_gb&quot;: 100,
+      &quot;datacenter&quot;: null
+    },
+    &quot;run_id&quot;: &quot;flash-1718900000-d0cf00ed&quot;,
+    &quot;worker_env&quot;: {},
+    &quot;model_policy&quot;: &quot;catalog&quot;,
+    &quot;thinking&quot;: false,
+    &quot;wandb&quot;: {
+      &quot;project&quot;: null,
+      &quot;run_name&quot;: null
+    }
+  }
+}</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">train</span>  <span style="color:#8a93a8">dry run — validated locally, not submitted</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#97a3ff">○ dry_run</span>   <span style="color:#97a3ff">flash-1718900000-d0cf00ed</span>
+
+{
+  <span style="color:#97a3ff">&quot;run_id&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;flash-1718900000-d0cf00ed&quot;</span>,
+  <span style="color:#97a3ff">&quot;state&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;dry_run&quot;</span>,
+  <span style="color:#97a3ff">&quot;spec&quot;</span><span style="color:#4d5470">:</span> {
+    <span style="color:#97a3ff">&quot;model&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;Qwen/Qwen3.5-4B&quot;</span>,
+    <span style="color:#97a3ff">&quot;algorithm&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;sft&quot;</span>,
+    <span style="color:#97a3ff">&quot;environment&quot;</span><span style="color:#4d5470">:</span> {
+      <span style="color:#97a3ff">&quot;id&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;acme/math-grader&quot;</span>,
+      <span style="color:#97a3ff">&quot;params&quot;</span><span style="color:#4d5470">:</span> {},
+      <span style="color:#97a3ff">&quot;pip&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">[]</span>,
+      <span style="color:#97a3ff">&quot;secrets&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">[]</span>
+    },
+    <span style="color:#97a3ff">&quot;train&quot;</span><span style="color:#4d5470">:</span> {
+      <span style="color:#97a3ff">&quot;steps&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;epochs&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">1</span>,
+      <span style="color:#97a3ff">&quot;lora_rank&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">32</span>,
+      <span style="color:#97a3ff">&quot;lora_alpha&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">64</span>,
+      <span style="color:#97a3ff">&quot;seeds&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">[0]</span>,
+      <span style="color:#97a3ff">&quot;init_from_adapter&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;&quot;</span>,
+      <span style="color:#97a3ff">&quot;hf_repo&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;&quot;</span>,
+      <span style="color:#97a3ff">&quot;learning_rate&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;batch_size&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;max_length&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;save_every&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;max_steps&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;max_examples&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;group_size&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;temperature&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;max_tokens&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;kl_penalty_coef&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;advantage_clip&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;thinking_length_penalty_coef&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;stop_sequences&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">[]</span>
+    },
+    <span style="color:#97a3ff">&quot;gpu&quot;</span><span style="color:#4d5470">:</span> {
+      <span style="color:#97a3ff">&quot;type&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;RTX 3090&quot;</span>,
+      <span style="color:#97a3ff">&quot;disk_gb&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">60</span>,
+      <span style="color:#97a3ff">&quot;max_wall_seconds&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">86400</span>,
+      <span style="color:#97a3ff">&quot;max_retries&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">2</span>,
+      <span style="color:#97a3ff">&quot;network_volume&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;network_volume_gb&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">100</span>,
+      <span style="color:#97a3ff">&quot;datacenter&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>
+    },
+    <span style="color:#97a3ff">&quot;run_id&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;flash-1718900000-d0cf00ed&quot;</span>,
+    <span style="color:#97a3ff">&quot;worker_env&quot;</span><span style="color:#4d5470">:</span> {},
+    <span style="color:#97a3ff">&quot;model_policy&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;catalog&quot;</span>,
+    <span style="color:#97a3ff">&quot;thinking&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">false</span>,
+    <span style="color:#97a3ff">&quot;wandb&quot;</span><span style="color:#4d5470">:</span> {
+      <span style="color:#97a3ff">&quot;project&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+      <span style="color:#97a3ff">&quot;run_name&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>
+    }
+  }
+}</pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">train</span>  <span style="color:#5b6472">dry run — validated locally, not submitted</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#3a46c8">○ dry_run</span>   <span style="color:#3a46c8">flash-1718900000-d0cf00ed</span>
+
+{
+  <span style="color:#3a46c8">&quot;run_id&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;flash-1718900000-d0cf00ed&quot;</span>,
+  <span style="color:#3a46c8">&quot;state&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;dry_run&quot;</span>,
+  <span style="color:#3a46c8">&quot;spec&quot;</span><span style="color:#9aa1b5">:</span> {
+    <span style="color:#3a46c8">&quot;model&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;Qwen/Qwen3.5-4B&quot;</span>,
+    <span style="color:#3a46c8">&quot;algorithm&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;sft&quot;</span>,
+    <span style="color:#3a46c8">&quot;environment&quot;</span><span style="color:#9aa1b5">:</span> {
+      <span style="color:#3a46c8">&quot;id&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;acme/math-grader&quot;</span>,
+      <span style="color:#3a46c8">&quot;params&quot;</span><span style="color:#9aa1b5">:</span> {},
+      <span style="color:#3a46c8">&quot;pip&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">[]</span>,
+      <span style="color:#3a46c8">&quot;secrets&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">[]</span>
+    },
+    <span style="color:#3a46c8">&quot;train&quot;</span><span style="color:#9aa1b5">:</span> {
+      <span style="color:#3a46c8">&quot;steps&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;epochs&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">1</span>,
+      <span style="color:#3a46c8">&quot;lora_rank&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">32</span>,
+      <span style="color:#3a46c8">&quot;lora_alpha&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">64</span>,
+      <span style="color:#3a46c8">&quot;seeds&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">[0]</span>,
+      <span style="color:#3a46c8">&quot;init_from_adapter&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;&quot;</span>,
+      <span style="color:#3a46c8">&quot;hf_repo&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;&quot;</span>,
+      <span style="color:#3a46c8">&quot;learning_rate&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;batch_size&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;max_length&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;save_every&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;max_steps&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;max_examples&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;group_size&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;temperature&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;max_tokens&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;kl_penalty_coef&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;advantage_clip&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;thinking_length_penalty_coef&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;stop_sequences&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">[]</span>
+    },
+    <span style="color:#3a46c8">&quot;gpu&quot;</span><span style="color:#9aa1b5">:</span> {
+      <span style="color:#3a46c8">&quot;type&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;RTX 3090&quot;</span>,
+      <span style="color:#3a46c8">&quot;disk_gb&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">60</span>,
+      <span style="color:#3a46c8">&quot;max_wall_seconds&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">86400</span>,
+      <span style="color:#3a46c8">&quot;max_retries&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">2</span>,
+      <span style="color:#3a46c8">&quot;network_volume&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;network_volume_gb&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">100</span>,
+      <span style="color:#3a46c8">&quot;datacenter&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>
+    },
+    <span style="color:#3a46c8">&quot;run_id&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;flash-1718900000-d0cf00ed&quot;</span>,
+    <span style="color:#3a46c8">&quot;worker_env&quot;</span><span style="color:#9aa1b5">:</span> {},
+    <span style="color:#3a46c8">&quot;model_policy&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;catalog&quot;</span>,
+    <span style="color:#3a46c8">&quot;thinking&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">false</span>,
+    <span style="color:#3a46c8">&quot;wandb&quot;</span><span style="color:#9aa1b5">:</span> {
+      <span style="color:#3a46c8">&quot;project&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+      <span style="color:#3a46c8">&quot;run_name&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>
+    }
+  }
+}</pre></div></div></section><section class="card"><div class="head"><code>flash status &lt;run&gt;</code><span class="sub">a run&#x27;s full status</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>{
+  &quot;run_id&quot;: &quot;flash-1718900000-a1b2c3d4&quot;,
+  &quot;state&quot;: &quot;done&quot;,
+  &quot;spec&quot;: {
+    &quot;model&quot;: &quot;Qwen/Qwen3.5-4B&quot;,
+    &quot;algorithm&quot;: &quot;grpo&quot;,
+    &quot;gpu&quot;: {
+      &quot;type&quot;: &quot;RTX 5090&quot;
+    }
+  },
+  &quot;remote&quot;: {
+    &quot;provider&quot;: &quot;runpod&quot;,
+    &quot;gpu&quot;: &quot;RTX 5090&quot;
+  },
+  &quot;cost_usd&quot;: 1.8421,
+  &quot;realized_cost_usd&quot;: 1.774,
+  &quot;created_at&quot;: 1718896400.0,
+  &quot;updated_at&quot;: 1718900000.0,
+  &quot;error&quot;: null,
+  &quot;artifacts_dir&quot;: &quot;acme/qwen3.5-4b-grpo-runs&quot;
+}</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">status</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#57ff8f">● done</span>
+
+  <span style="color:#8a93a8">run id   </span> <span style="color:#4d5470">·</span> <span style="color:#97a3ff">flash-1718900000-a1b2c3d4</span>
+  <span style="color:#8a93a8">model    </span> <span style="color:#4d5470">·</span> Qwen/Qwen3.5-4B
+  <span style="color:#8a93a8">algorithm</span> <span style="color:#4d5470">·</span> GRPO
+  <span style="color:#8a93a8">gpu      </span> <span style="color:#4d5470">·</span> RTX 5090 @ runpod
+  <span style="color:#8a93a8">cost     </span> <span style="color:#4d5470">·</span> <span style="color:#24c2a8">$1.8421</span>
+  <span style="color:#8a93a8">realized </span> <span style="color:#4d5470">·</span> <span style="color:#24c2a8">$1.7740</span>
+  <span style="color:#8a93a8">created  </span> <span style="color:#4d5470">·</span> 2024-06-20 15:13 UTC
+  <span style="color:#8a93a8">updated  </span> <span style="color:#4d5470">·</span> 2024-06-20 16:13 UTC
+  <span style="color:#8a93a8">artifacts</span> <span style="color:#4d5470">·</span> acme/qwen3.5-4b-grpo-runs
+
+<span style="opacity:.62">details</span>
+{
+  <span style="color:#97a3ff">&quot;run_id&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#97a3ff">&quot;state&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;done&quot;</span>,
+  <span style="color:#97a3ff">&quot;spec&quot;</span><span style="color:#4d5470">:</span> {
+    <span style="color:#97a3ff">&quot;model&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;Qwen/Qwen3.5-4B&quot;</span>,
+    <span style="color:#97a3ff">&quot;algorithm&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;grpo&quot;</span>,
+    <span style="color:#97a3ff">&quot;gpu&quot;</span><span style="color:#4d5470">:</span> {
+      <span style="color:#97a3ff">&quot;type&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;RTX 5090&quot;</span>
+    }
+  },
+  <span style="color:#97a3ff">&quot;remote&quot;</span><span style="color:#4d5470">:</span> {
+    <span style="color:#97a3ff">&quot;provider&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;runpod&quot;</span>,
+    <span style="color:#97a3ff">&quot;gpu&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;RTX 5090&quot;</span>
+  },
+  <span style="color:#97a3ff">&quot;cost_usd&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">1.8421</span>,
+  <span style="color:#97a3ff">&quot;realized_cost_usd&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">1.774</span>,
+  <span style="color:#97a3ff">&quot;created_at&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">1718896400.0</span>,
+  <span style="color:#97a3ff">&quot;updated_at&quot;</span><span style="color:#4d5470">:</span> <span style="color:#24c2a8">1718900000.0</span>,
+  <span style="color:#97a3ff">&quot;error&quot;</span><span style="color:#4d5470">:</span> <span style="color:#9a8cff">null</span>,
+  <span style="color:#97a3ff">&quot;artifacts_dir&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;acme/qwen3.5-4b-grpo-runs&quot;</span>
+}</pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">status</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#00695c">● done</span>
+
+  <span style="color:#5b6472">run id   </span> <span style="color:#9aa1b5">·</span> <span style="color:#3a46c8">flash-1718900000-a1b2c3d4</span>
+  <span style="color:#5b6472">model    </span> <span style="color:#9aa1b5">·</span> Qwen/Qwen3.5-4B
+  <span style="color:#5b6472">algorithm</span> <span style="color:#9aa1b5">·</span> GRPO
+  <span style="color:#5b6472">gpu      </span> <span style="color:#9aa1b5">·</span> RTX 5090 @ runpod
+  <span style="color:#5b6472">cost     </span> <span style="color:#9aa1b5">·</span> <span style="color:#0e7490">$1.8421</span>
+  <span style="color:#5b6472">realized </span> <span style="color:#9aa1b5">·</span> <span style="color:#0e7490">$1.7740</span>
+  <span style="color:#5b6472">created  </span> <span style="color:#9aa1b5">·</span> 2024-06-20 15:13 UTC
+  <span style="color:#5b6472">updated  </span> <span style="color:#9aa1b5">·</span> 2024-06-20 16:13 UTC
+  <span style="color:#5b6472">artifacts</span> <span style="color:#9aa1b5">·</span> acme/qwen3.5-4b-grpo-runs
+
+<span style="opacity:.62">details</span>
+{
+  <span style="color:#3a46c8">&quot;run_id&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#3a46c8">&quot;state&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;done&quot;</span>,
+  <span style="color:#3a46c8">&quot;spec&quot;</span><span style="color:#9aa1b5">:</span> {
+    <span style="color:#3a46c8">&quot;model&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;Qwen/Qwen3.5-4B&quot;</span>,
+    <span style="color:#3a46c8">&quot;algorithm&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;grpo&quot;</span>,
+    <span style="color:#3a46c8">&quot;gpu&quot;</span><span style="color:#9aa1b5">:</span> {
+      <span style="color:#3a46c8">&quot;type&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;RTX 5090&quot;</span>
+    }
+  },
+  <span style="color:#3a46c8">&quot;remote&quot;</span><span style="color:#9aa1b5">:</span> {
+    <span style="color:#3a46c8">&quot;provider&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;runpod&quot;</span>,
+    <span style="color:#3a46c8">&quot;gpu&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;RTX 5090&quot;</span>
+  },
+  <span style="color:#3a46c8">&quot;cost_usd&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">1.8421</span>,
+  <span style="color:#3a46c8">&quot;realized_cost_usd&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">1.774</span>,
+  <span style="color:#3a46c8">&quot;created_at&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">1718896400.0</span>,
+  <span style="color:#3a46c8">&quot;updated_at&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#0e7490">1718900000.0</span>,
+  <span style="color:#3a46c8">&quot;error&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#6d28d9">null</span>,
+  <span style="color:#3a46c8">&quot;artifacts_dir&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;acme/qwen3.5-4b-grpo-runs&quot;</span>
+}</pre></div></div></section><section class="card"><div class="head"><code>flash runs</code><span class="sub">all runs and their state/cost</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>RUN_ID                            STATE        ALGO    COST($)  GPU                     MODEL
+flash-1718903000-e5f6a7b8         running      SFT      0.4210  L40S@vast               Qwen/Qwen3.5-9B
+flash-1718900000-a1b2c3d4         done         GRPO     1.8421  RTX 5090@runpod         Qwen/Qwen3.5-4B
+flash-1718800000-99887766         failed       GRPO     0.0712                          Qwen/Qwen3.5-2B
+flash-1718700000-12ab34cd         queued       SFT      0.0000                          openbmb/MiniCPM5-1B</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">runs</span>  <span style="color:#8a93a8">4 run(s)</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#8a93a8;font-weight:700">RUN ID                   </span>  <span style="color:#8a93a8;font-weight:700">STATE    </span>  <span style="color:#8a93a8;font-weight:700">ALGO</span>  <span style="color:#8a93a8;font-weight:700">   COST</span>  <span style="color:#8a93a8;font-weight:700">GPU            </span>  <span style="color:#8a93a8;font-weight:700">MODEL              </span>
+<span style="color:#4d5470">─────────────────────────  ─────────  ────  ───────  ───────────────  ───────────────────</span>
+<span style="color:#97a3ff">flash-1718903000-e5f6a7b8</span>  <span style="color:#5f72ff">● running</span>  <span style="color:#8a93a8">SFT </span>  <span style="color:#24c2a8">$0.4210</span>  <span style="color:#8a93a8">L40S@vast      </span>  Qwen/Qwen3.5-9B
+<span style="color:#97a3ff">flash-1718900000-a1b2c3d4</span>  <span style="color:#57ff8f">● done   </span>  <span style="color:#8a93a8">GRPO</span>  <span style="color:#24c2a8">$1.8421</span>  <span style="color:#8a93a8">RTX 5090@runpod</span>  Qwen/Qwen3.5-4B
+<span style="color:#97a3ff">flash-1718800000-99887766</span>  <span style="color:#ff6b6b">● failed </span>  <span style="color:#8a93a8">GRPO</span>  <span style="color:#24c2a8">$0.0712</span>  <span style="color:#8a93a8">               </span>  Qwen/Qwen3.5-2B
+<span style="color:#97a3ff">flash-1718700000-12ab34cd</span>  <span style="color:#8a93a8">○ queued </span>  <span style="color:#8a93a8">SFT </span>  <span style="color:#24c2a8">$0.0000</span>  <span style="color:#8a93a8">               </span>  openbmb/MiniCPM5-1B</pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">runs</span>  <span style="color:#5b6472">4 run(s)</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#5b6472;font-weight:700">RUN ID                   </span>  <span style="color:#5b6472;font-weight:700">STATE    </span>  <span style="color:#5b6472;font-weight:700">ALGO</span>  <span style="color:#5b6472;font-weight:700">   COST</span>  <span style="color:#5b6472;font-weight:700">GPU            </span>  <span style="color:#5b6472;font-weight:700">MODEL              </span>
+<span style="color:#9aa1b5">─────────────────────────  ─────────  ────  ───────  ───────────────  ───────────────────</span>
+<span style="color:#3a46c8">flash-1718903000-e5f6a7b8</span>  <span style="color:#5f72ff">● running</span>  <span style="color:#5b6472">SFT </span>  <span style="color:#0e7490">$0.4210</span>  <span style="color:#5b6472">L40S@vast      </span>  Qwen/Qwen3.5-9B
+<span style="color:#3a46c8">flash-1718900000-a1b2c3d4</span>  <span style="color:#00695c">● done   </span>  <span style="color:#5b6472">GRPO</span>  <span style="color:#0e7490">$1.8421</span>  <span style="color:#5b6472">RTX 5090@runpod</span>  Qwen/Qwen3.5-4B
+<span style="color:#3a46c8">flash-1718800000-99887766</span>  <span style="color:#cc3b3b">● failed </span>  <span style="color:#5b6472">GRPO</span>  <span style="color:#0e7490">$0.0712</span>  <span style="color:#5b6472">               </span>  Qwen/Qwen3.5-2B
+<span style="color:#3a46c8">flash-1718700000-12ab34cd</span>  <span style="color:#5b6472">○ queued </span>  <span style="color:#5b6472">SFT </span>  <span style="color:#0e7490">$0.0000</span>  <span style="color:#5b6472">               </span>  openbmb/MiniCPM5-1B</pre></div></div></section><section class="card"><div class="head"><code>flash cancel &lt;run&gt;</code><span class="sub">cancel a run</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>{
+  &quot;run_id&quot;: &quot;flash-1718903000-e5f6a7b8&quot;,
+  &quot;state&quot;: &quot;cancelled&quot;
+}</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">cancel</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#8a93a8">● cancelled</span>   <span style="color:#97a3ff">flash-1718903000-e5f6a7b8</span>
+
+{
+  <span style="color:#97a3ff">&quot;run_id&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;flash-1718903000-e5f6a7b8&quot;</span>,
+  <span style="color:#97a3ff">&quot;state&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;cancelled&quot;</span>
+}</pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">cancel</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#5b6472">● cancelled</span>   <span style="color:#3a46c8">flash-1718903000-e5f6a7b8</span>
+
+{
+  <span style="color:#3a46c8">&quot;run_id&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;flash-1718903000-e5f6a7b8&quot;</span>,
+  <span style="color:#3a46c8">&quot;state&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;cancelled&quot;</span>
+}</pre></div></div></section><section class="card"><div class="head"><code>flash deploy &lt;run&gt;</code><span class="sub">serve a trained adapter</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>{
+  &quot;run_id&quot;: &quot;flash-1718900000-a1b2c3d4&quot;,
+  &quot;state&quot;: &quot;deployed&quot;,
+  &quot;mode&quot;: &quot;dev&quot;,
+  &quot;openai_model&quot;: &quot;flash-1718900000-a1b2c3d4&quot;,
+  &quot;endpoint_name&quot;: &quot;https://api.freesolo.co/v1&quot;,
+  &quot;gpu&quot;: &quot;RTX 4090&quot;
+}</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">deploy</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#9a8cff">● deployed</span>   <span style="color:#97a3ff">flash-1718900000-a1b2c3d4</span>
+
+{
+  <span style="color:#97a3ff">&quot;run_id&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#97a3ff">&quot;state&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;deployed&quot;</span>,
+  <span style="color:#97a3ff">&quot;mode&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;dev&quot;</span>,
+  <span style="color:#97a3ff">&quot;openai_model&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#97a3ff">&quot;endpoint_name&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;https://api.freesolo.co/v1&quot;</span>,
+  <span style="color:#97a3ff">&quot;gpu&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;RTX 4090&quot;</span>
+}</pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">deploy</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+  <span style="color:#6d28d9">● deployed</span>   <span style="color:#3a46c8">flash-1718900000-a1b2c3d4</span>
+
+{
+  <span style="color:#3a46c8">&quot;run_id&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#3a46c8">&quot;state&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;deployed&quot;</span>,
+  <span style="color:#3a46c8">&quot;mode&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;dev&quot;</span>,
+  <span style="color:#3a46c8">&quot;openai_model&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#3a46c8">&quot;endpoint_name&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;https://api.freesolo.co/v1&quot;</span>,
+  <span style="color:#3a46c8">&quot;gpu&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;RTX 4090&quot;</span>
+}</pre></div></div></section><section class="card"><div class="head"><code>flash undeploy &lt;run&gt;</code><span class="sub">tear down a serving endpoint</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>{
+  &quot;run_id&quot;: &quot;flash-1718900000-a1b2c3d4&quot;,
+  &quot;deleted_endpoints&quot;: [
+    &quot;flash-a1b2c3d4-serve&quot;
+  ]
+}</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">undeploy</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+{
+  <span style="color:#97a3ff">&quot;run_id&quot;</span><span style="color:#4d5470">:</span> <span style="color:#57ff8f">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#97a3ff">&quot;deleted_endpoints&quot;</span><span style="color:#4d5470">:</span> [
+    <span style="color:#57ff8f">&quot;flash-a1b2c3d4-serve&quot;</span>
+  ]
+}</pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">undeploy</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+{
+  <span style="color:#3a46c8">&quot;run_id&quot;</span><span style="color:#9aa1b5">:</span> <span style="color:#00695c">&quot;flash-1718900000-a1b2c3d4&quot;</span>,
+  <span style="color:#3a46c8">&quot;deleted_endpoints&quot;</span><span style="color:#9aa1b5">:</span> [
+    <span style="color:#00695c">&quot;flash-a1b2c3d4-serve&quot;</span>
+  ]
+}</pre></div></div></section><section class="card"><div class="head"><code>flash deployments</code><span class="sub">active serving deployments</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>RUN_ID                            GPU        ENDPOINT
+flash-1718900000-a1b2c3d4         RTX 4090   https://api.freesolo.co/v1</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#4d5470">›</span> <span style="font-weight:700">deployments</span>  <span style="color:#8a93a8">1 active</span>
+<span style="color:#4d5470">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#8a93a8;font-weight:700">RUN ID                   </span>  <span style="color:#8a93a8;font-weight:700">GPU     </span>  <span style="color:#8a93a8;font-weight:700">ENDPOINT                  </span>
+<span style="color:#4d5470">─────────────────────────  ────────  ──────────────────────────</span>
+<span style="color:#97a3ff">flash-1718900000-a1b2c3d4</span>  <span style="color:#8a93a8">RTX 4090</span>  <span style="color:#57ff8f">https://api.freesolo.co/v1</span></pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#5f72ff;font-weight:700">flash</span> <span style="color:#9aa1b5">›</span> <span style="font-weight:700">deployments</span>  <span style="color:#5b6472">1 active</span>
+<span style="color:#9aa1b5">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#5b6472;font-weight:700">RUN ID                   </span>  <span style="color:#5b6472;font-weight:700">GPU     </span>  <span style="color:#5b6472;font-weight:700">ENDPOINT                  </span>
+<span style="color:#9aa1b5">─────────────────────────  ────────  ──────────────────────────</span>
+<span style="color:#3a46c8">flash-1718900000-a1b2c3d4</span>  <span style="color:#5b6472">RTX 4090</span>  <span style="color:#00695c">https://api.freesolo.co/v1</span></pre></div></div></section><section class="card"><div class="head"><code>flash chat &lt;run&gt; -m ...</code><span class="sub">chat with a deployed adapter</span></div><div class="cols"><div class="col before"><div class="tag"><span class="pill"></span>before</div><pre>The capital of France is Paris. It has been the country&#x27;s political and cultural center since the 12th century.</pre></div><div class="col after"><div class="tag"><span class="pill"></span>after · dark</div><pre><span style="color:#97a3ff;font-weight:700">assistant</span>
+The capital of France is Paris. It has been the country&#x27;s political and cultural center since the 12th century.</pre></div><div class="col after light"><div class="tag"><span class="pill"></span>after · light</div><pre><span style="color:#3a46c8;font-weight:700">assistant</span>
+The capital of France is Paris. It has been the country&#x27;s political and cultural center since the 12th century.</pre></div></div></section>
+<footer>Rendered from the real <code>flash</code> handlers via <code>FLASH_STYLE=1</code>. The
+plain column is the exact machine output (<code>FLASH_STYLE=0</code> / non-TTY). Pure standard
+library, no new dependencies. Regenerate with <code>uv run python docs/cli-style/generate.py</code>.</footer>
+</div></body></html>
