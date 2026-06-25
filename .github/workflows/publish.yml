@@ -34,6 +34,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Pin Python >= 3.11 BEFORE any step that imports tomllib (stdlib only since 3.11).
+      # The metadata + version-bump steps below run `python3 -c "import tomllib"`, which would
+      # fail on a runner whose default python3 predates 3.11 — so set it up here, not later
+      # (the uv step that follows brings its own interpreter, but only after those tomllib steps).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Read package metadata
         id: metadata
         run: |
@@ -155,7 +164,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
         run: |
           if [ -z "$UV_PUBLISH_TOKEN" ]; then
-            echo "::error::PYPI_API_TOKEN is not configured; refusing to skip publish."
+            echo "::error::UV_PUBLISH_TOKEN is empty (sourced from the PYPI_API_TOKEN repo secret); refusing to publish without credentials. Set the PYPI_API_TOKEN secret on this repository."
             exit 1
           fi
           uv publish

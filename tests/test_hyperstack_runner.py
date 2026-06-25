@@ -143,6 +143,38 @@ def test_launch_raises_when_no_stock(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=[], attempt=0)
 
 
+def test_regions_excludes_canada1_by_default(monkeypatch):
+    """CANADA-1 (known broken-driver on-demand fleet) is dropped from the region list by default, so
+    the allocator + launcher never offer or boot there. The API still returns it; flash filters it."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.setattr(
+        hs_api,
+        "request_with_retries",
+        lambda *a, **k: {"regions": [{"name": "NORWAY-1"}, {"name": "CANADA-1"}, {"name": "US-1"}]},
+    )
+    monkeypatch.delenv("HYPERSTACK_BLOCKED_REGIONS", raising=False)
+    regions = hs_api._regions()
+    assert "CANADA-1" not in regions
+    assert regions == ["NORWAY-1", "US-1"]
+
+
+def test_regions_blocklist_is_env_overridable(monkeypatch):
+    """HYPERSTACK_BLOCKED_REGIONS overrides the default: set to "" re-enables CANADA-1 (operator
+    opt-in once the fleet recovers); set to another region blocks that instead."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.setattr(
+        hs_api,
+        "request_with_retries",
+        lambda *a, **k: {"regions": [{"name": "NORWAY-1"}, {"name": "CANADA-1"}, {"name": "US-1"}]},
+    )
+    monkeypatch.setenv("HYPERSTACK_BLOCKED_REGIONS", "")  # explicit empty -> nothing blocked
+    assert "CANADA-1" in hs_api._regions()
+    monkeypatch.setenv("HYPERSTACK_BLOCKED_REGIONS", "norway-1, us-1")  # case-insensitive
+    assert hs_api._regions() == ["CANADA-1"]
+
+
 def test_throwaway_keypair_missing_ssh_keygen_is_clear_error(monkeypatch):
     """A slim control plane without ssh-keygen must raise an actionable HyperstackApiError (install
     openssh-client / pin HYPERSTACK_KEYPAIR_NAME), not a bare FileNotFoundError that reads like an
@@ -572,3 +604,188 @@ def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=insts, attempt=0)
     assert attempts == ["default-CANADA-1"]  # no second launch
     assert reaped == ["flash-1700000000-abcd1234"]
+
+
+# ---------------------------------------------------------------------------
+# API: VM listing must paginate (orphan sweep reads it; a missed page = a leaked, billing VM)
+# ---------------------------------------------------------------------------
+def test_list_vms_paginates_all_pages(monkeypatch):
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    # Two full pages + a short third: list_vms must walk all three and concatenate.
+    pages = {
+        1: [{"id": i, "name": f"flash-r-s0-a0-{i}"} for i in range(page_size)],
+        2: [{"id": page_size + i, "name": f"flash-r-s0-a0-{page_size + i}"} for i in range(page_size)],
+        3: [{"id": 2 * page_size, "name": "flash-r-s0-a0-last"}],
+    }
+    seen_pages = []
+
+    def fake_req(path, **k):
+        # path like /core/virtual-machines?page=N&per_page=M
+        page = int(path.split("page=")[1].split("&")[0])
+        seen_pages.append(page)
+        return {"instances": pages.get(page, [])}
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    vms = hs_api.list_vms()
+    assert len(vms) == 2 * page_size + 1  # nothing dropped
+    assert seen_pages == [1, 2, 3]  # walked every page, stopped at the short one
+
+
+def test_list_vms_stops_when_server_ignores_pagination(monkeypatch):
+    """An older API that echoes page 1 regardless of ?page must not loop forever / double-count:
+    a full page that adds no NEW ids terminates the walk."""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    same_page = [{"id": i, "name": f"flash-r-s0-a0-{i}"} for i in range(page_size)]
+    calls = {"n": 0}
+
+    def fake_req(path, **k):
+        calls["n"] += 1
+        return {"instances": same_page}  # always page 1
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    vms = hs_api.list_vms()
+    assert len(vms) == page_size  # de-duped, not page_size * many
+    assert calls["n"] == 2  # one full page, then one more that added nothing -> stop
+
+
+def test_list_vms_raises_on_malformed_response(monkeypatch):
+    """An unexpected response schema (not a dict / no 'instances' list) must RAISE, not silently
+    return a partial fleet — orphan sweeping a partial list could miss still-billing VMs."""
+    from flash.providers.hyperstack import api as hs_api
+
+    # First page malformed (not a dict).
+    monkeypatch.setattr(hs_api, "request_with_retries", lambda path, **k: ["not", "a", "dict"])
+    with pytest.raises(hs_api.HyperstackApiError, match="unexpected /core/virtual-machines"):
+        hs_api.list_vms()
+
+    # 'instances' present but not a list.
+    monkeypatch.setattr(hs_api, "request_with_retries", lambda path, **k: {"instances": "oops"})
+    with pytest.raises(hs_api.HyperstackApiError, match="no 'instances' list"):
+        hs_api.list_vms()
+
+
+def test_list_vms_malformed_mid_walk_raises_not_partial(monkeypatch):
+    """A malformed LATER page (after valid pages) also raises rather than returning the partial list
+    gathered so far — that partial list would look authoritative to the orphan sweep."""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    full = [{"id": i, "name": f"flash-r-s0-a0-{i}"} for i in range(page_size)]
+
+    def fake_req(path, **k):
+        page = int(path.split("page=")[1].split("&")[0])
+        return {"instances": full} if page == 1 else {"unexpected": True}  # page 2 malformed
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    with pytest.raises(hs_api.HyperstackApiError, match="page 2"):
+        hs_api.list_vms()
+
+
+def test_list_vms_empty_page_one_is_valid_not_an_error(monkeypatch):
+    """A valid empty fleet (page 1 returns an empty 'instances' list) is NOT an error -> []."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.setattr(hs_api, "request_with_retries", lambda path, **k: {"instances": []})
+    assert hs_api.list_vms() == []
+
+
+def test_list_vms_raises_when_page_cap_hit_with_full_last_page(monkeypatch):
+    """A GENUINELY-truncated fleet (every page full of NEW ids, AND the page past the cap is STILL
+    full) must RAISE rather than return a truncated fleet — an orphan sweep keying off a partial
+    list would miss still-billing VMs past the cap."""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    # Lower the cap so the test is cheap; every page (incl. the cap+1 probe) is full AND adds
+    # brand-new ids, so none of the natural-termination conditions ever fire and the probe confirms
+    # the fleet is genuinely over-cap.
+    monkeypatch.setattr(hs_api, "_VM_MAX_PAGES", 3)
+
+    def fake_req(path, **k):
+        page = int(path.split("page=")[1].split("&")[0])
+        base = (page - 1) * page_size
+        return {"instances": [{"id": base + i, "name": f"flash-r-s0-a0-{base + i}"} for i in range(page_size)]}
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    with pytest.raises(hs_api.HyperstackApiError, match="did not terminate"):
+        hs_api.list_vms()
+
+
+def test_list_vms_exact_multiple_of_page_size_at_cap_does_not_raise(monkeypatch):
+    """A COMPLETE fleet whose size is an exact multiple of _VM_PAGE_SIZE and exactly fills
+    _VM_MAX_PAGES must NOT be mistaken for a truncated one: the last in-cap page is full, but the
+    probe page (_VM_MAX_PAGES + 1) comes back EMPTY -> the fleet is complete, return it WITHOUT
+    raising. (Regression for the exact-multiple edge case in the page-cap guard.)"""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    cap = 2
+    monkeypatch.setattr(hs_api, "_VM_MAX_PAGES", cap)
+    seen_pages = []
+    total = cap * page_size  # exactly fills `cap` full pages, then page cap+1 is empty
+
+    def fake_req(path, **k):
+        page = int(path.split("page=")[1].split("&")[0])
+        seen_pages.append(page)
+        base = (page - 1) * page_size
+        # Pages 1..cap are full of distinct ids; the cap+1 probe page is genuinely empty.
+        items = [
+            {"id": base + i, "name": f"flash-r-s0-a0-{base + i}"}
+            for i in range(page_size)
+            if base + i < total
+        ]
+        return {"instances": items}
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    vms = hs_api.list_vms()  # must NOT raise
+    assert len(vms) == total  # whole fleet returned, nothing dropped
+    # Walked the cap pages plus exactly ONE probe page (cap+1) that confirmed completeness.
+    assert seen_pages == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# API: managed-keypair create is race-tolerant (two concurrent launches into one env)
+# ---------------------------------------------------------------------------
+def test_resolve_key_name_tolerates_create_race(monkeypatch):
+    """Two concurrent launches into the same env both see no managed key and both POST; the loser
+    gets an 'already exists' rejection — that is SUCCESS (the env-scoped key now exists), so
+    resolve_key_name returns the name instead of crashing the launch."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.delenv("HYPERSTACK_KEYPAIR_NAME", raising=False)
+    env = "default-CANADA-1"
+    name = f"{hs_api._MANAGED_KEYPAIR}-{env}"
+    monkeypatch.setattr(hs_api, "_generate_throwaway_public_key", lambda: "ssh-ed25519 AAAA")
+    # First list: empty (race condition: both launches saw no key). Second list (post-conflict
+    # re-check): the winner's key is now present.
+    lists = iter([[], [{"name": name, "environment": {"name": env}}]])
+    monkeypatch.setattr(hs_api, "list_keypairs", lambda: next(lists))
+
+    def fake_req(path, method="GET", body=None, **k):
+        raise hs_api.HyperstackApiError(
+            "POST /core/keypairs -> HTTP 409: keypair name already exists"
+        )
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    assert hs_api.resolve_key_name(env) == name  # race tolerated
+
+
+def test_resolve_key_name_reraises_unrelated_create_error(monkeypatch):
+    """An UNRELATED keypair-create failure (e.g. bad public key / perms) must still surface, not be
+    swallowed as a benign duplicate."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.delenv("HYPERSTACK_KEYPAIR_NAME", raising=False)
+    monkeypatch.setattr(hs_api, "_generate_throwaway_public_key", lambda: "ssh-ed25519 AAAA")
+    monkeypatch.setattr(hs_api, "list_keypairs", lambda: [])
+
+    def fake_req(path, method="GET", body=None, **k):
+        raise hs_api.HyperstackApiError("POST /core/keypairs -> HTTP 400: invalid public_key")
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    with pytest.raises(hs_api.HyperstackApiError, match="invalid public_key"):
+        hs_api.resolve_key_name("default-CANADA-1")

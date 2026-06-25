@@ -197,6 +197,10 @@ def test_reconcile_filters_flash_endpoints_and_calls_store(monkeypatch):
         lambda: [
             {"name": "flash-5090-abc"},
             {"name": "other-thing"},
+            # RunPod Flash registers live-provisioned endpoints as "live-flash-...". These MUST
+            # reconcile too (matching the sweep predicate) — they were previously omitted, so
+            # their slot rows never got reclaimed after a crash.
+            {"name": "live-flash-a100-def"},
             {"name": "flash-4090-xyz"},
             {"name": None},
         ],
@@ -205,11 +209,11 @@ def test_reconcile_filters_flash_endpoints_and_calls_store(monkeypatch):
 
     def _reconcile(live):
         got["live"] = live
-        return {"inUse": 2, "reclaimed": 1}
+        return {"inUse": 3, "reclaimed": 1}
 
     monkeypatch.setattr(slots, "reconcile", _reconcile)
     ep.reconcile_endpoint_slots()
-    assert got["live"] == ["flash-5090-abc", "flash-4090-xyz"]
+    assert got["live"] == ["flash-5090-abc", "live-flash-a100-def", "flash-4090-xyz"]
 
 
 def test_reconcile_noop_without_internal_key(monkeypatch):
