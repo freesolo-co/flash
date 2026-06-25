@@ -258,6 +258,28 @@ def test_poll_client_deadline(monkeypatch):
     assert "deadline" in res.detail
 
 
+def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
+    """Reattach must pass the FULL launch-relative budget: poll_hs_job already anchors its deadline
+    to handle.started_ts (= launch), so pre-subtracting elapsed too double-counts and deletes a
+    still-valid VM once a recovered run is past half its window."""
+    from flash.providers.base import JobHandle, PollResult
+    from flash.providers.hyperstack import HyperstackProvider
+    from flash.providers.hyperstack.jobs import PROVISION_GRACE_S
+
+    captured = {}
+
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None):
+        captured["deadline_s"] = deadline_s
+        return PollResult(True)
+
+    monkeypatch.setattr("flash.providers.hyperstack.jobs.poll_hs_job", fake_poll)
+    monkeypatch.setattr("flash.providers.hyperstack.api.delete_vm", lambda vid: None)
+    spec = _spec()  # max_wall_seconds=3600
+    handle = JobHandle.from_dict({"provider": "hyperstack", **_handle(started_ts=1.0).to_dict()})
+    HyperstackProvider().poll(handle, spec, seed=0)
+    assert captured["deadline_s"] == max(60.0, 3600 + PROVISION_GRACE_S)
+
+
 def test_poll_surfaces_worker_progress(monkeypatch):
     done_seq = iter([None, "10500.0", "10500.0", "10500.0"])
     jobs = _wire_poll(

@@ -337,10 +337,10 @@ def poll_lambda_job(
     # start: on a delayed reattach after a control-plane restart the box has been billing since
     # launch, so a still-booting instance that already blew LOAD_TIMEOUT_S must fail over NOW
     # instead of getting another full window. On a fresh launch started_ts ~= now (no-op).
-    start = handle.started_ts or time.time()
+    start = handle.started_ts if handle.started_ts is not None else time.time()
     last_status = None
     last_hb_key = None
-    last_progress = handle.started_ts or time.time()
+    last_progress = start
     became_active = False
     seen_training_hb = False
     missing_streak = 0
@@ -417,10 +417,15 @@ def poll_lambda_job(
             # already stale before a control-plane restart must not reset the stall clock to now
             # on the first reattach read (last_hb_key starts None, so even an old heartbeat looks
             # "new"). Clamped to [launch, now]. Healthy workers heartbeat well inside the stall
-            # window, so their ts ~= now (no behavior change on the normal path).
-            last_progress = heartbeat_progress_ts(new_key, handle.started_ts)
-            if stage not in _SETUP_HEARTBEAT_STAGES:
-                seen_training_hb = True
+            # window, so their ts ~= now (no behavior change on the normal path). ``fresh`` is False
+            # for a LEFTOVER heartbeat from a prior attempt (ts < launch); we then neither advance
+            # last_progress nor mark training seen, so a stale training heartbeat can't arm the
+            # tighter training stall window before this attempt overwrites the file.
+            hb_ts, fresh = heartbeat_progress_ts(new_key, handle.started_ts)
+            if fresh:
+                last_progress = hb_ts
+                if stage not in _SETUP_HEARTBEAT_STAGES:
+                    seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +
         # pip + model download), so use the larger setup grace; tighten only once training begins.
         if became_active:

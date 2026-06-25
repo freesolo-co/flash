@@ -80,8 +80,9 @@ def _terminal_ts(status: runner.RunStatus) -> float:
     DELAY the settle gate (it counts from the bump, not the finish) and let a long-finished run
     that was merely bumped look "recent" and slip back inside ``_WINDOW_SECONDS``. ``finished_at``
     is stamped once at the terminal transition and never moved; falls back to ``updated_at`` for
-    pre-feature runs."""
-    return float(status.finished_at or status.updated_at)
+    pre-feature runs. ``is not None`` (not truthiness) so a legitimate ``finished_at == 0.0`` is
+    honored rather than silently falling back to ``updated_at``."""
+    return float(status.finished_at if status.finished_at is not None else status.updated_at)
 
 
 def _due(status: runner.RunStatus, now: float) -> bool:
@@ -104,7 +105,10 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     later cycle (within the window) retries once the provider invoice settles."""
     now = time.time() if now is None else now
     remote = status.remote or {}
-    start = float(remote.get("started_ts") or status.created_at)
+    # ``is not None`` (not truthiness) so a launch at the epoch (started_ts == 0.0) is honored
+    # rather than falling back to created_at.
+    started_ts = remote.get("started_ts")
+    start = float(started_ts if started_ts is not None else status.created_at)
     # The run's true terminal time (~teardown / billing stop); see _terminal_ts for why this is
     # the frozen finished_at rather than the mutable updated_at (which deploy/heartbeat move past
     # teardown and would make the instance providers' flat $/hr bill until that later event).

@@ -410,12 +410,69 @@ def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
     assert int(m.group(1)) >= 1000, res.detail
 
 
+def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
+    """A LEFTOVER heartbeat from a PRIOR attempt (ts < this attempt's launch; retries reuse the same
+    seed heartbeat path) must not be treated as current progress. Clamping its ts up to launch made
+    a stale training-stage heartbeat arm the tighter training stall window and fail a healthy new
+    attempt mid-setup before it overwrote the file. With the freshness gate, a pre-launch heartbeat
+    neither advances last_progress nor sets seen_training_hb, so the run gets the longer SETUP grace
+    measured from launch. (Clock starts 10_000; launch 9000; old heartbeat ts 8000 < launch.)"""
+    import re
+
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    stale = {"stage": "rl", "step": 2, "ts": 8000.0}  # training stage, but predates this launch
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: stale,
+        setup_grace_s=3000.0,
+        stall_after_s=500.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    # Stalls on SETUP grace (3000s from launch), not the tighter 500s training window the stale
+    # heartbeat would have armed -> the reported idle time exceeds the training budget.
+    assert "setup (pre-training)" in res.detail
+    m = re.search(r"for (\d+)s", res.detail)
+    assert m is not None, res.detail
+    assert int(m.group(1)) >= 3000, res.detail
+
+
 def test_poll_client_deadline(monkeypatch):
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
     res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, deadline_s=250.0)
     assert not res.ok
     assert res.failure == "stalled"
     assert "deadline" in res.detail
+
+
+def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
+    """The reattach path must NOT pre-subtract elapsed-since-launch from the deadline: the poll loop
+    already anchors its deadline check to handle.started_ts (= launch), so subtracting elapsed here
+    too double-counts and tears down a still-valid instance once a recovered run is past half its
+    window. LambdaProvider.poll must pass the FULL launch-relative budget regardless of how old
+    started_ts is."""
+    from flash.providers.base import JobHandle
+    from flash.providers.lambdalabs import LambdaProvider
+    from flash.providers.lambdalabs.jobs import PROVISION_GRACE_S
+
+    captured = {}
+
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None):
+        captured["deadline_s"] = deadline_s
+        from flash.providers.base import PollResult
+
+        return PollResult(True)
+
+    monkeypatch.setattr("flash.providers.lambdalabs.jobs.poll_lambda_job", fake_poll)
+    monkeypatch.setattr("flash.providers.lambdalabs.api.terminate_instances", lambda ids: ids)
+    spec = _spec()  # max_wall_seconds=3600
+    # started_ts long in the past (recovered well past half its window).
+    handle = JobHandle.from_dict({"provider": "lambda", **_handle(started_ts=1.0).to_dict()})
+    LambdaProvider().poll(handle, spec, seed=0)
+    assert captured["deadline_s"] == max(60.0, 3600 + PROVISION_GRACE_S)
 
 
 def test_poll_surfaces_worker_progress_in_log(monkeypatch):
