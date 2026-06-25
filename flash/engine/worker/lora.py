@@ -228,6 +228,93 @@ def patch_vllm_lm_weight_sync(model_id: str) -> bool:
     return patched_any
 
 
+def patch_grpo_mask_aware_lm_head(trainer) -> bool:
+    """Skip the 248k-vocab ``lm_head`` projection at MASKED completion positions in the GRPO loss.
+
+    Targets MULTI-TURN GRPO, where the masked set is the env/tool text (~half-to-most of the
+    transcript: the rollout's ``env_mask`` -> TRL's ``tool_mask``) that EVERY row carries, so the
+    micro-batch has maskable headroom in all rows. TRL 1.6's ``compute_liger_loss`` hands the
+    FULL-length hidden states to ``liger_grpo_loss``, and the Liger kernel runs the lm_head matmul +
+    log-softmax for EVERY position (in the forward AND the backward recompute). Masked positions
+    contribute zero loss and zero gradient but still pay the full FLOPs of the single most expensive
+    GRPO op (the 248k-vocab projection Liger exists to tame). The saving scales with the env-masked
+    fraction. (SINGLE-TURN is effectively a no-op: its only mask is right-padding, and TRL pads
+    completions to the LONGEST in the micro-batch, so the deepest row has ``keep.sum() == full_t`` and
+    the across-batch no-op below triggers — there is no shared headroom to gather. It would engage
+    only if ``pad_to_multiple_of`` padded every row past the longest completion.)
+
+    Wrap ``trainer.liger_grpo_loss`` to GATHER the unmasked positions — ONE shared index applied
+    identically to every per-token tensor (``_input``, ``selected_token_ids``, ``attention_mask``,
+    ``old_per_token_logps``, ``ref_per_token_logps``, and a 2-D ``vllm_is_ratio``) — before the call,
+    so the kernel only projects the kept positions. Per-sequence ``advantages`` ``(B,)`` and the loss
+    object's ``max_completion_length`` are left untouched. This is EXACTLY loss-preserving: dr_grpo's
+    numerator only ever summed unmasked positions, and its normalizer is ``B * max_completion_length``
+    (a config constant on the loss object, independent of the gathered length); the gathered
+    sequence is re-padded with masked positions whose new mask is 0, so loss + credit assignment are
+    unchanged while the gathered length T' < T cuts the projection FLOPs by ~the masked fraction.
+    No-op when the deepest row is full-length (``max(unmasked) == T`` — e.g. single-turn padded to the
+    batch max), when nothing is masked at all, or when the loss object isn't present. Returns True if
+    wrapped."""
+    orig = getattr(trainer, "liger_grpo_loss", None)
+    if orig is None:
+        return False
+    if getattr(orig, "_flash_mask_aware", False):
+        return True  # already wrapped — idempotent (mirrors the other patch helpers' sentinels)
+    import torch
+
+    def _gather(x, idx, tprime):
+        if x is None:
+            return None
+        if x.dim() == 2:  # (B, T) per-token tensor
+            return torch.gather(x, 1, idx)
+        return torch.gather(x, 1, idx.unsqueeze(-1).expand(idx.size(0), tprime, x.size(-1)))
+
+    def masked_liger_loss(*args, **kwargs):
+        mask = kwargs.get("attention_mask")  # loss mask = completion_mask * tool_mask, shape (B, T)
+        if args or mask is None or mask.dim() != 2:
+            return orig(*args, **kwargs)  # unexpected call shape -> never alter the loss
+        keep = mask != 0
+        full_t = mask.size(1)
+        tprime = int(keep.sum(dim=1).max().item())
+        if tprime == 0 or tprime == full_t:
+            # Nothing maskable to skip across the batch: the DEEPEST row is full-length (max unmasked
+            # == T). Standard single-turn vLLM GRPO pads completions to the longest in the micro-batch,
+            # so this is its common case — the patch only engages where every row has masked headroom.
+            return orig(**kwargs)
+        # Defensive: we gather a KNOWN set of per-token tensors below. If TRL/Liger starts passing any
+        # OTHER per-token tensor shaped (B, T[, *]), it would stay full-length while the rest are
+        # gathered to T' -> a shape mismatch or misaligned credit. Bail to the unmodified loss instead.
+        # (Per-sequence ``advantages`` is (B,) and 2-D ``vllm_is_ratio`` is handled explicitly below.)
+        _known = {"attention_mask", "_input", "selected_token_ids", "old_per_token_logps",
+                  "ref_per_token_logps", "vllm_is_ratio"}
+        for _k, _v in kwargs.items():
+            if (_k not in _known and isinstance(_v, torch.Tensor) and _v.dim() >= 2
+                    and _v.size(0) == mask.size(0) and _v.size(1) == full_t):
+                return orig(**kwargs)  # unknown per-token tensor -> don't risk a misaligned gather
+        # One shared gather index: the unmasked positions first (stable argsort -> their original
+        # order preserved), then the remaining masked positions in original order. Keep only the
+        # first tprime columns; a sequence with fewer than tprime unmasked positions has its filler
+        # entries taken from its masked positions, whose gathered mask is 0 — so they add zero
+        # loss/grad and can't perturb the per-token ratio/KL alignment.
+        order = torch.argsort((~keep).to(torch.int8), dim=1, stable=True)
+        idx = order[:, :tprime].contiguous()
+        gk = dict(kwargs)
+        gk["attention_mask"] = torch.gather(mask, 1, idx)
+        gk["_input"] = _gather(kwargs.get("_input"), idx, tprime)
+        gk["selected_token_ids"] = _gather(kwargs.get("selected_token_ids"), idx, tprime)
+        for key in ("old_per_token_logps", "ref_per_token_logps"):
+            if kwargs.get(key) is not None:
+                gk[key] = _gather(kwargs[key], idx, tprime)
+        ratio = kwargs.get("vllm_is_ratio")
+        if ratio is not None and ratio.dim() == 2 and ratio.size(1) == full_t:
+            gk["vllm_is_ratio"] = _gather(ratio, idx, tprime)
+        return orig(**gk)
+
+    masked_liger_loss._flash_mask_aware = True  # sentinel for the idempotency check above
+    trainer.liger_grpo_loss = masked_liger_loss
+    return True
+
+
 # --------------------------------------------------------------------------------------------
 # Warm-start (init_from_adapter) SFT-adapter key remap for VL checkpoints.
 #
