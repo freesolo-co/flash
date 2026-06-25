@@ -80,6 +80,18 @@ GPU to `ghcr.io/freesolo-co/flash-worker:cu128-sm89`. for a custom tag layout, s
 FLASH_WORKER_IMAGE_TEMPLATE='ghcr.io/freesolo-co/flash-worker:mybuild-{sm}'
 ```
 
+## automated (CI)
+
+`.github/workflows/bake-kernel-cache.yml` does all of the above per arch on a manual dispatch.
+For each sm it offloads the warmup to a RunPod GPU of that arch (GitHub runners have none) via
+`docker/bake_kernel_cache.py` — which uploads the flash code to a temp HF dataset, runs a pod from
+the base `cu128` image that warms the kernels and ships `build/kernel_cache` back — then
+`docker build --build-arg BUILD_KERNEL_CACHE=true` and pushes
+`ghcr.io/freesolo-co/flash-worker:cu128-<sm>`. It needs the `RUNPOD_API_KEY` repo secret (the warmup
+pod), plus the default `GITHUB_TOKEN` (GHCR push) and `HF_TOKEN` (the ferry dataset). The base
+`cu128` image must already be published — the warmup runs INSIDE it so the cache matches its pinned
+toolchain. After the tags publish, set `FLASH_WORKER_IMAGE_PER_SM=1` to activate them.
+
 ## fallback (the default)
 
 with `BUILD_KERNEL_CACHE=false` (the default) nothing is baked and the build needs no GPU. the
