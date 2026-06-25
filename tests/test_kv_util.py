@@ -37,10 +37,22 @@ def test_preserves_kv_for_long_contexts():
     assert u_long > u_short
 
 
-def test_non_sleep_path_unchanged():
-    # Non-sleep keeps the existing resident-KV target (_KV_CAP), now via the named constant.
-    assert colocate_kv_util(0.8, 2048, 80.0, sleep_mode=False) == min(0.45, _KV_CAP / 80.0)
-    assert colocate_kv_util(2.0, 4096, 24.0, sleep_mode=False) == min(0.45, _KV_CAP / 24.0)
+def test_non_sleep_path_budgets_weights_plus_kv():
+    # gpu_memory_utilization is the WHOLE executor budget, so the non-sleep path budgets the bf16
+    # weight copy + the resident-KV target (_KV_CAP). The old _KV_CAP/total budgeted KV ALONE, which
+    # starved the weights -- vLLM raised "No available memory for the cache blocks" on >=3B models
+    # whose weights already exceed an 8 GB total budget (hit once the 4B resident path skips sleep).
+    for params_b, card in [(0.8, 80.0), (2.0, 48.0), (4.0, 80.0), (4.7, 48.0)]:
+        u = colocate_kv_util(params_b, 2048, card, sleep_mode=False)
+        assert u * card >= params_b * 2.0  # the engine can actually load its weight copy (the fix)
+        assert u == max(0.10, min(0.45, (params_b * 2.0 + _KV_CAP) / card))
+
+
+def test_non_sleep_bigger_model_gets_a_bigger_budget():
+    # the weight copy lives in the non-sleep budget too, so a bigger model gets more headroom.
+    big = colocate_kv_util(4.0, 2048, 80.0, sleep_mode=False)
+    small = colocate_kv_util(0.8, 2048, 80.0, sleep_mode=False)
+    assert big > small
 
 
 def test_caps_at_045_on_small_or_weight_heavy_configs():

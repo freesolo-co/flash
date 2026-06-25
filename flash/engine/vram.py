@@ -114,13 +114,18 @@ def colocate_kv_util(
     ``_KV_COEF x seq x sqrt(params) x group/8`` with a 1.5x margin and an 8 GB floor — NOT capped, so
     long-context / large-group runs keep a big pool (the 0.45 utilization cap bounds it like the old
     blanket did). The old blanket sleep-path 0.45 reserved ~36 GB on an 80 GB A100 — MEASURED as the
-    dominant resident allocation that set the GRPO step peak (~46 GB). The non-sleep path is unchanged
-    (its resident-KV target). MEASURED at 4B/group8/2k ctx: 0.25 util -> peak 46 -> 26 GB, reward
-    byte-identical, train_wall neutral; a tighter 12 GB budget preempts, confirming this as the floor."""
-    if not sleep_mode:
-        return min(0.45, _KV_CAP / max(1.0, total_vram_gb))  # unchanged: resident-KV target (_KV_CAP)
-    width = math.sqrt(max(float(params_b), 0.1)) if params_b else math.sqrt(2.0)
+    dominant resident allocation that set the GRPO step peak (~46 GB). BOTH paths budget the weight
+    copy + KV; the non-sleep path uses the leaner resident-KV target (_KV_CAP). MEASURED at
+    4B/group8/2k ctx: 0.25 util -> peak 46 -> 26 GB, reward byte-identical, train_wall neutral; a
+    tighter 12 GB budget preempts, confirming this as the floor."""
     weights_gb = max(0.5, float(params_b or 1.0)) * 2.0  # vLLM's bf16 weight copy lives in the budget
+    if not sleep_mode:
+        # Resident-KV target (_KV_CAP) ON TOP of the weight copy: gpu_memory_utilization is the WHOLE
+        # executor budget, so budgeting KV alone (the old _KV_CAP/total) starved the weights and vLLM
+        # raised "No available memory for the cache blocks" on >=3B models whose weights already exceed
+        # an 8 GB total budget -- surfaced when the 4B resident path skips sleep mode (grpo_sleep_mode).
+        return max(0.10, min(0.45, (weights_gb + _KV_CAP) / max(1.0, total_vram_gb)))
+    width = math.sqrt(max(float(params_b), 0.1)) if params_b else math.sqrt(2.0)
     kv_pool_gb = max(
         8.0,
         1.5 * _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width * (max(1, num_generations) / 8.0),
