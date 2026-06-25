@@ -585,7 +585,9 @@ def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
     )
     res = jobs.poll_hs_job(
         _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"stage": "sft_train", "step": 7, "ts": 10_000.0},
+        # sft_step is the worker's real training-step stage -> is_training_stage() True only because
+        # it is a genuine step (not just any non-setup string), so this actually guards the classification.
+        heartbeat_reader=lambda force=False: {"stage": "sft_step", "step": 7, "ts": 10_000.0},
     )
     assert not res.ok
     assert res.failure == "job_preempted"

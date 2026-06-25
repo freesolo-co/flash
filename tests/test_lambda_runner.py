@@ -676,7 +676,9 @@ def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
     )
     res = jobs.poll_lambda_job(
         _handle(), _spec(), seed=0, interval_s=0,
-        heartbeat_reader=lambda force=False: {"stage": "sft_train", "step": 7, "ts": 10_000.0},
+        # sft_step is the worker's real training-step stage -> is_training_stage() True only because
+        # it is a genuine step (not just any non-setup string), so this actually guards the classification.
+        heartbeat_reader=lambda force=False: {"stage": "sft_step", "step": 7, "ts": 10_000.0},
     )
     assert not res.ok
     assert res.failure == "job_preempted"
@@ -860,7 +862,7 @@ def test_poll_heartbeat_stall(monkeypatch):
     # A FRESH training heartbeat (ts >= launch 10_000) that then FROZE: it proves liveness (so the
     # fast first-liveness failover is satisfied) AND arms the tight training stall window, so the
     # subsequent no-progress gap past stall_after_s is the stall actually under test here.
-    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0}
+    frozen = {"stage": "rl_step", "step": 3, "ts": 10_000.0}  # real training-step stage
     res = jobs.poll_lambda_job(
         _handle(),
         _spec(),
@@ -1204,7 +1206,7 @@ def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
     import re
 
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
-    hb = {"stage": "rl", "step": 7, "ts": 8500.0}
+    hb = {"stage": "rl_step", "step": 7, "ts": 8500.0}  # real training-step stage
     res = jobs.poll_lambda_job(
         _handle(started_ts=8_000.0),
         _spec(),
@@ -1238,7 +1240,7 @@ def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
     jobs = _wire_poll(
         monkeypatch, instances=[{"status": "active"}], step=10.0, boot="+ cloud-init\n+ docker pull"
     )
-    stale = {"stage": "rl", "step": 2, "ts": 8000.0}  # training stage, but predates this launch
+    stale = {"stage": "rl_step", "step": 2, "ts": 8000.0}  # real training stage, but predates this launch
     res = jobs.poll_lambda_job(
         _handle(started_ts=9_000.0),
         _spec(),
