@@ -78,15 +78,16 @@ def test_thinking_budget_selection(monkeypatch):
     try:
         importlib.reload(ne)
         assert ne.THINKING is True
-        # GRPO micro-batch shrinks (logits VRAM scales with seq len); effective batch
-        # is preserved through grad-accum
-        assert ne.rl_per_device_comps() == 2
-        b = ne.compute_grpo_batching(64, 8, ne.rl_per_device_comps())
+        # Thinking default micro-batch is 2 (vs 8); effective batch is preserved through grad-accum.
+        # use_vllm=False asserts the offline default deterministically (no dependence on a host GPU,
+        # which would engage the colocate VRAM-growth path).
+        assert ne.rl_per_device_comps(use_vllm=False) == 2
+        b = ne.compute_grpo_batching(64, 8, ne.rl_per_device_comps(use_vllm=False))
         assert b["unique_prompts_per_step"] == 64
         assert b["divisible_by_group"]
         # RL_PER_DEVICE_PROMPTS is no longer an override — the default + auto-caps stand.
         os.environ["RL_PER_DEVICE_PROMPTS"] = "4"
-        assert ne.rl_per_device_comps() == 2
+        assert ne.rl_per_device_comps(use_vllm=False) == 2
     finally:
         _restore_env(saved)
     # thinking off: a JobSpec with thinking=false -> original (larger) micro-batch
@@ -101,7 +102,7 @@ def test_thinking_budget_selection(monkeypatch):
     try:
         importlib.reload(ne)
         assert ne.THINKING is False
-        assert ne.rl_per_device_comps() == 8
+        assert ne.rl_per_device_comps(use_vllm=False) == 8
     finally:
         os.environ.pop("FLASH_JOB_SPEC_JSON", None)
         importlib.reload(ne)
