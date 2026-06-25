@@ -52,7 +52,7 @@ def test_legacy_datacenter_key_tolerated():
 def test_network_volume_gb_tolerant_of_bad_values():
     # Platform-managed field: null/empty/"0"/0/negative/non-numeric/missing -> default 100 (never
     # crash int(), never round-trip a nonsensical size). Valid positive sizes pass through.
-    for raw in (None, "", 0, "0", -5, "-5", "abc"):
+    for raw in (None, "", 0, "0", -5, "-5", "abc", True, False):
         spec = JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}})
         assert spec.gpu.network_volume_gb == 100, f"{raw!r} should default to 100"
     assert JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v"}}).gpu.network_volume_gb == 100

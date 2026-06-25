@@ -76,6 +76,10 @@ def _volume_gb(value: Any, default: int = 100) -> int:
     missing / null / empty / non-numeric value, or a non-positive size (incl. the string "0" or a
     negative), all fall back to ``default`` rather than crashing or round-tripping a nonsensical size.
     """
+    if isinstance(value, bool):
+        # bool is an int subclass (int(True) == 1), so a stray boolean would become a 1 GB volume;
+        # treat it as invalid and default (mirrors the bool rejection in _opt_int).
+        return default
     try:
         gb = int(value)
     except (TypeError, ValueError):
