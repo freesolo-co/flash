@@ -34,19 +34,19 @@ def test_allocation_restricted_to_validated_pool(monkeypatch):
     # The deployed control plane rejects a submit for any non-validated class, so client-side
     # allocation must only ever pick a class in the validated pool — across ALL candidates,
     # not just the chosen one. Offline only RunPod is available; 0.8B GRPO needs the 24 GB tier
-    # whose cheapest VALIDATED RunPod class is RTX 3090 @ $0.46 (cheaper unvalidated 24 GB classes
+    # whose cheapest VALIDATED RunPod class is RTX A6000 @ $0.49 (cheaper unvalidated 24 GB classes
     # like L4 are excluded). 24 GB is the floor — sub-24 GB classes were dropped.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a.provider == "runpod"
     assert all(c.gpu in VALIDATED for c in a.candidates), [
         c.gpu for c in a.candidates if c.gpu not in VALIDATED
     ]
-    assert a.gpu == "RTX 3090"  # the cheapest VALIDATED 24 GB RunPod class
+    assert a.gpu == "RTX A6000"  # the cheapest VALIDATED RunPod class that fits 24 GB
 
 
 def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
     """A small SFT down-routes below 24 GB; the absolute-cheapest fitting class (L4 @ $0.39, 24 GB)
-    is UNVALIDATED and must be skipped for the cheapest VALIDATED one (RTX 3090 @ $0.46), so the
+    is UNVALIDATED and must be skipped for the cheapest VALIDATED one (RTX A6000 @ $0.49), so the
     run actually submits (the live `flash train` default-submit failure this fixes)."""
     from flash.providers import allocator
     from flash.providers.base import GPU_INFO, VALIDATED
@@ -65,13 +65,13 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
 
 
 def test_runpod_allocation_lands_on_full_validated_cards(monkeypatch):
-    """The 0.8B GRPO (24 GB) lands on the cheapest validated 24 GB RunPod card (RTX 3090) and the
-    9B GRPO (80 GB) on the cheapest validated 80 GB RunPod card (A100 PCIe)."""
+    """The 0.8B GRPO (24 GB) lands on the cheapest validated RunPod card that fits (RTX A6000) and
+    the 9B GRPO (80 GB) on the cheapest validated 80 GB RunPod card (A100 PCIe)."""
     from flash.providers import allocator
 
     a08 = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
     assert a08.provider == "runpod"
-    assert a08.gpu == "RTX 3090"  # cheapest validated 24 GB RunPod card
+    assert a08.gpu == "RTX A6000"  # cheapest validated RunPod card that fits 24 GB
     a9 = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a9.provider == "runpod"
     assert a9.gpu == "A100 PCIe"  # cheapest validated 80 GB RunPod card
@@ -94,7 +94,7 @@ def test_cheapest_gpu_picks_cheapest_validated_runpod_class(monkeypatch):
     RunPod-provisionable class that fits, matching what the RunPod allocator path provisions."""
     from flash.providers.base import cheapest_gpu
 
-    assert cheapest_gpu(24) == "RTX 3090"  # cheapest validated 24 GB RunPod class
+    assert cheapest_gpu(24) == "RTX A6000"  # cheapest validated RunPod class that fits 24 GB
     assert cheapest_gpu(80) == "A100 PCIe"  # cheapest validated 80 GB RunPod class
 
 

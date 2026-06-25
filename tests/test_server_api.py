@@ -656,6 +656,82 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
+    """The adapter is registered under the RUN's owning org (its persisted billing_context) so
+    serving can authorize external chat by org — not merely whatever key initiated the deploy."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.billing_context = {"org_id": "run-owner-org"}
+    runner._save_status(status)
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return Deployment(
+            run_id=run_id,
+            model=kwargs["model"],
+            adapter_hf_prefix="x/adapter",
+            gpu="RTX 5090",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            state="ready",
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", capture)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 200, resp.text
+    # The run's owning org (billing_context) is what's attributed, not the bare caller key.
+    assert seen["org_id"] == "run-owner-org"
+
+
+def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
+    """An internal/operator deploy has no billing_context but persists the org in
+    platform_context; the adapter must still be attributed to that run-owning org."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.billing_context = None
+    status.platform_context = {"org_id": "platform-org"}
+    runner._save_status(status)
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return Deployment(
+            run_id=run_id,
+            model=kwargs["model"],
+            adapter_hf_prefix="x/adapter",
+            gpu="RTX 5090",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            state="ready",
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", capture)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 200, resp.text
+    assert seen["org_id"] == "platform-org"
+
+
 def test_chat_streams_deployed_run(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -768,6 +844,73 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     out = runner.mark_deployed("dep-3", {"endpoint_name": "e2"}, expect_state="deployed")
     assert out.state == "done"
     assert out.deployment["state"] == "undeployed"  # not re-advertised
+
+
+def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monkeypatch, tmp_path):
+    # The legacy finished_at backfill (for runs that went `done` before finished_at existed) must
+    # run ONLY on the done->deployed transition, where updated_at == training teardown. On an
+    # already-`deployed` run (the CAS finalization with expect_state="deployed"), updated_at is the
+    # DEPLOY time, so stamping finished_at from it would reintroduce the instance over-billing this
+    # whole change fixes.
+    import flash.runner as runner
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+
+    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-leg"}
+
+    # (1) done -> deployed: legacy run, finished_at=None, updated_at == teardown -> backfilled.
+    teardown = 1_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id="dep-leg",
+            state="done",
+            spec=spec,
+            remote=None,
+            updated_at=teardown,
+            finished_at=None,
+        )
+    )
+    out = runner.mark_deployed("dep-leg", {"endpoint_name": "e"})
+    assert out.state == "deployed"
+    assert out.finished_at == teardown  # frozen to the real teardown time
+    assert out.updated_at > teardown  # the deploy bumped updated_at past teardown
+
+    # (2) already-`deployed` legacy run whose finished_at was never backfilled: a CAS-finalization
+    # re-call must NOT turn the deploy-time updated_at into finished_at.
+    deploy_time = 5_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id="dep-leg2",
+            state="deployed",
+            spec={**spec, "run_id": "dep-leg2"},
+            remote=None,
+            updated_at=deploy_time,
+            finished_at=None,
+            deployment={"endpoint_name": "e"},
+        )
+    )
+    out2 = runner.mark_deployed("dep-leg2", {"endpoint_name": "e2"}, expect_state="deployed")
+    assert out2.state == "deployed"
+    assert out2.finished_at is None  # NOT stamped from the deploy-time updated_at
+
+    # (3) reconciled-then-deployed legacy `done` run: record_realized_cost bumped updated_at to the
+    # reconcile time, so the backfill must NOT freeze that (later) stamp as teardown.
+    runner._save_status(
+        runner.RunStatus(
+            run_id="dep-leg3",
+            state="done",
+            spec={**spec, "run_id": "dep-leg3"},
+            remote=None,
+            updated_at=9_000.0,  # reconcile-time bump, well after teardown
+            finished_at=None,
+            reconciled_at=8_500.0,
+        )
+    )
+    out3 = runner.mark_deployed("dep-leg3", {"endpoint_name": "e3"})
+    assert out3.state == "deployed"
+    assert out3.finished_at is None  # not frozen from the reconcile-bumped updated_at
 
 
 def test_deploy_lock_is_usable_and_weakly_cleaned():
