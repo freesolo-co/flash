@@ -192,6 +192,12 @@ def deploy_adapter(
         # warmup fails, the adapter is silently disabled, and the first chat 404s.
         "repoType": "dataset",
         "status": "ready",
+        # Per-adapter thinking default: the value this run was trained with. Serving applies it as
+        # the chat template's ``enable_thinking`` whenever a chat caller omits chat_template_kwargs
+        # (e.g. a raw OpenAI client). Without it, serving falls back to Qwen3.5's template default
+        # (thinking ON), so a run trained thinking=false emits a reasoning preamble ("…</think>{json}")
+        # for any caller that doesn't pass the flag — diverging from how the adapter was trained.
+        "thinking": bool(thinking),
     }
     # Attribute the adapter to the deploying org so serving can authorize external chat by org:
     # the backend maps adapterId -> org via hosted_lora_adapters.org_id, which serving persists
