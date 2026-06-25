@@ -13,6 +13,7 @@ interchangeably.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from flash.providers.base import GpuClass, JobHandle, PollResult, Provider
@@ -123,7 +124,9 @@ class LambdaProvider:
 
         terminate_run_instances(spec.run_id)
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[str]:
+    def sweep_orphans(
+        self, active_labels: set[str] | Callable[[], set[str]] | None = None
+    ) -> list[str]:
         """Lambda crash-recovery sweep (called via the provider object at startup).
 
         Lambda instance ids are opaque hex STRINGS (the ``base.Provider`` protocol widens the return
