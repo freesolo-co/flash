@@ -90,15 +90,18 @@ FIRST_LIVENESS_OBSERVED_GRACE_S = 120.0
 # proves the worker is alive but NOT that the slow setup (model download + trainer/vLLM init) finished,
 # so they must keep the larger setup grace (not flip stall detection to the tight training window) AND
 # must NOT count as "training reached" for the region-quarantine decision -- an infra/GPU fault during
-# init is exactly a sick-region signal. Includes the ``*_initializing`` stages the worker emits during
-# trainer/vLLM init (worker emits sft_start -> sft_model_load -> sft_initializing -> sft_step, and
-# rl_start -> rl_train_start -> rl_initializing -> rl_step). SHARED single source of truth so the three
-# pollers (RunPod / Lambda / Hyperstack) can't drift out of sync.
+# init is exactly a sick-region signal. Includes ``model_prefetched`` (prefetch_model() emits it right
+# after sft_start/rl_start while pulling weights into the HF cache) and the ``*_initializing`` stages
+# the worker emits during trainer/vLLM init. Full cold-start order:
+#   sft_start -> model_prefetched -> sft_model_load -> sft_initializing -> sft_step
+#   rl_start  -> model_prefetched -> rl_train_start  -> rl_initializing  -> rl_step
+# SHARED single source of truth so the three pollers (RunPod / Lambda / Hyperstack) can't drift apart.
 SETUP_HEARTBEAT_STAGES = frozenset(
     {
         "boot",
         "sft_start",
         "rl_start",
+        "model_prefetched",
         "sft_model_load",
         "rl_train_start",
         "sft_initializing",

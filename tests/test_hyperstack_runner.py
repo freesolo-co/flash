@@ -555,6 +555,25 @@ def test_poll_init_stage_heartbeat_quarantines_on_retriable(monkeypatch):
     assert res.host_fault  # init-time infra fault is pre-training -> region quarantined
 
 
+def test_poll_model_prefetched_heartbeat_quarantines_on_retriable(monkeypatch):
+    """``model_prefetched`` is emitted by prefetch_model() right after sft_start/rl_start while pulling
+    weights -- pre-training cold start, NOT a training step. A retriable infra/GPU fault after prefetch
+    but before the first step must STILL quarantine the region: reached_training_now() must treat it as
+    setup. Regression: model_prefetched was missing from SETUP_HEARTBEAT_STAGES, so is_training_stage()
+    returned True and host_fault was wrongly suppressed. Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}],
+        marker=json.dumps({"ok": False, "attempt": 0, "error": "RetriableInfraError: cuda init failed", "retriable": True}),
+    )
+    res = jobs.poll_hs_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {"stage": "model_prefetched", "step": 0, "ts": 10_000.0},
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"
+    assert res.host_fault  # prefetch is pre-training -> region quarantined
+
+
 def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
     """A retriable failure marker can land in the SAME poll iteration the worker first reaches training
     -- the marker branch decides host_fault BEFORE surface_heartbeat() advances seen_training_hb.

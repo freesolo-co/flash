@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from flash.providers._poll import heartbeat_progress_ts
+from flash.providers._poll import SETUP_HEARTBEAT_STAGES, heartbeat_progress_ts, is_training_stage
 
 
 def test_heartbeat_progress_credits_post_launch_ts_and_is_fresh():
@@ -50,3 +50,22 @@ def test_heartbeat_progress_no_ts_is_not_fresh():
         ts, fresh = heartbeat_progress_ts(bad, launch)
         assert fresh is False
         assert abs(ts - now) < 2
+
+
+def test_is_training_stage_excludes_setup_init_and_error_stages():
+    """Only a real training-STEP heartbeat counts as training. Every cold-start/setup stage the worker
+    emits before the first step (incl. model_prefetched and the *_initializing stages) must be excluded,
+    or reached_training_now() would suppress the region quarantine for a pre-training infra fault. The
+    error_* crash stages (stamped on any raise, incl. a pre-training RetriableInfraError) are excluded by
+    prefix. This is the taxonomy guard: a new pre-training worker stage missing from SETUP_HEARTBEAT_STAGES
+    would regress quarantine, so it must also be added here."""
+    # Real training steps -> training.
+    for stage in ("sft_step", "rl_step"):
+        assert is_training_stage(stage) is True
+    # Cold-start / setup stages -> NOT training (every member of the shared set, plus model_prefetched).
+    assert "model_prefetched" in SETUP_HEARTBEAT_STAGES  # prefetch_model() emits it pre-training
+    for stage in SETUP_HEARTBEAT_STAGES:
+        assert is_training_stage(stage) is False
+    # error_* crash stages and empty/None -> NOT training.
+    for stage in ("error_sft", "error_rl", "", None):
+        assert is_training_stage(stage) is False
