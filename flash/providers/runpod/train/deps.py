@@ -78,6 +78,11 @@ WORKER_DEPS = [
     # version in lockstep with Dockerfile.worker + perf.py's runtime reinstall.
     "tilelang==0.1.11",
     "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
+    # NB: ``causal_conv1d`` (the conv kernel that, with fla's cu_seqlens, lets GatedDeltaNet hybrids
+    # PACK boundary-correctly — engine.worker.packing) is NOT pip-listed here: it's a CUDA-extension
+    # build, so Dockerfile.worker compiles it best-effort with TORCH_CUDA_ARCH_LIST set (a plain pip
+    # entry would try to compile at the no-GPU image-build step for the wrong/native arch). If it's
+    # absent the GDN packing path stays off (gdn_packing_available) and Qwen3.5/3.6 train unpacked.
     # NB: freesolo-chalk (custom Triton/CUDA kernels that complement Liger) is NOT in this base dep
     # list, but its gap-fillers are default-on (flash/engine/chalk_kernels.py), so the submit path
     # (chalk_extra_pip) appends the version-pinned ``freesolo-chalk`` (DEFAULT_CHALK_SPEC) from PyPI
