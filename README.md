@@ -58,6 +58,22 @@ The artifact repo is platform-managed and per-run (each run gets its own
 knob and not an operator-wide env var. Clients authenticate with their freesolo API key
 (`flash login`).
 
+## Release channels
+
+Two channels are published to PyPI from the *same source*, distinguished by one line in
+`flash/_channel.py` (`CHANNEL`):
+
+| Channel | PyPI package | CLI | Default plane | Published from |
+| --- | --- | --- | --- | --- |
+| prod | `freesolo-flash` | `flash` | `flash.freesolo.co` | push to `main` that bumps `[project].version` (`.github/workflows/publish.yml`) |
+| dev | `freesolo-flash-dev` | `flash-dev` | `flash-dev.freesolo.co` | push to `dev` whose `[tool.flash-dev].version` isn't on PyPI yet (`.github/workflows/publish-dev.yml`) |
+
+The two install side by side (distinct package + CLI names). The dev build is produced by
+`scripts/build_dev_dist.py`, which renames the package/CLI and flips `CHANNEL` to `dev` before
+`uv build`. To cut a dev release, bump `[tool.flash-dev].version` and merge to `dev`. Either CLI
+still honours an explicit `FLASH_API_URL` / `flash login --api-url`; the channel only sets the
+default.
+
 ## Serving From an API
 
 `flash chat` is a CLI wrapper around the Flash control-plane chat endpoint. To call a

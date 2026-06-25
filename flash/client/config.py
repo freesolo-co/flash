@@ -10,9 +10,23 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .._channel import CHANNEL
 from .._fileio import read_json_or_empty, secure_json_write
 
-DEFAULT_API_URL = "https://flash.freesolo.co"
+# The default control plane follows the installed channel (see flash/_channel.py): the prod
+# package (freesolo-flash / `flash`) targets the production plane, the dev-channel package
+# (freesolo-flash-dev / `flash-dev`) targets the staging plane. Either is overridable via
+# FLASH_API_URL or `flash login --api-url`.
+PROD_API_URL = "https://flash.freesolo.co"
+DEV_API_URL = "https://flash-dev.freesolo.co"
+
+
+def default_api_url(channel: str = CHANNEL) -> str:
+    """Default control-plane URL for the given release channel."""
+    return DEV_API_URL if channel == "dev" else PROD_API_URL
+
+
+DEFAULT_API_URL = default_api_url()
 
 CONFIG_DIR = Path.home() / ".flash"
 CONFIG_PATH = CONFIG_DIR / "config.json"

@@ -1,0 +1,107 @@
+name: Publish flash dev-channel package
+
+# Auto-publish the dev-channel package `freesolo-flash-dev` (the `flash-dev` CLI, which defaults
+# to the staging plane flash-dev.freesolo.co) to PyPI from the `dev` branch.
+#
+# Trigger: a push to `dev` that touches package files. We publish iff the dev-channel version
+# ([tool.flash-dev].version in pyproject.toml) is NOT already on PyPI. So bumping that version and
+# merging to `dev` cuts a release; ordinary dev pushes (version unchanged -> already published)
+# no-op. This mirrors freesolo-flash's publish.yml, but keyed on the dev version and on `dev`
+# instead of `main`, and a no-op is a clean success (not a failure) since most dev pushes don't
+# bump it. Manual runs via workflow_dispatch force a publish attempt of the current dev version.
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "flash/**"
+      - "scripts/build_dev_dist.py"
+      - ".github/workflows/publish-dev.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-flash-dev-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-pypi-dev:
+    name: Publish freesolo-flash-dev to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # tomllib is stdlib only since 3.11; pin the interpreter before the metadata step below.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read dev-channel version
+        id: meta
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+          print(f"version={data['tool']['flash-dev']['version']}")
+          PY
+
+      - name: Decide whether to publish
+        id: decide
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import urllib.error
+          import urllib.request
+
+          version = os.environ["VERSION"]
+          url = f"https://pypi.org/pypi/freesolo-flash-dev/{version}/json"
+          published = False
+          try:
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  published = response.status == 200
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          # Publish only when the dev version isn't on PyPI yet (i.e. it was just bumped).
+          print(f"publish={'false' if published else 'true'}")
+          PY
+
+      - name: Already published (nothing to do)
+        if: steps.decide.outputs.publish == 'false'
+        run: echo "freesolo-flash-dev ${{ steps.meta.outputs.version }} is already on PyPI; nothing to publish."
+
+      - name: Install uv
+        if: steps.decide.outputs.publish == 'true'
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+
+      - name: Build dev-channel distribution
+        if: steps.decide.outputs.publish == 'true'
+        run: |
+          rm -rf dist
+          # build_dev_dist.py renames the package to freesolo-flash-dev, retargets the CLI to
+          # flash-dev, flips the channel to the staging plane, then runs `uv build`.
+          python3 scripts/build_dev_dist.py
+
+      - name: Publish to PyPI
+        if: steps.decide.outputs.publish == 'true'
+        run: |
+          if [ -z "$UV_PUBLISH_TOKEN" ]; then
+            echo "::error::UV_PUBLISH_TOKEN is empty (sourced from the PYPI_API_TOKEN repo secret); refusing to publish without credentials. Set the PYPI_API_TOKEN secret on this repository."
+            exit 1
+          fi
+          uv publish
