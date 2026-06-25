@@ -32,6 +32,10 @@ on:
       - .github/workflows/worker-image.yml
       - flash/**
       - pyproject.toml
+      # The baked rp_handler is generated from _train_body at build time (docker/make_rp_handler.py),
+      # so handler changes (e.g. the weight-cache preload branch) MUST rebuild the image. flash/**
+      # covers the handler source (endpoints.py); the generator lives outside flash/, so watch it too.
+      - docker/make_rp_handler.py
 
 permissions:
   contents: read
