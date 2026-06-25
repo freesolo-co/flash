@@ -203,6 +203,17 @@ def run_preload(payload: dict) -> dict:
     if not hf_home or not mount or not os.path.isdir(mount):
         return {"preloaded": [], "already_cached": [], "failed": {},
                 "error": f"weight-cache not mounted (HF_HOME={hf_home!r}); refusing to warm ephemeral disk"}
+    # Block-volume providers (Hyperstack) carry ``cache_block_device``: the cloud-init preamble drops a
+    # sentinel ONTO the mounted volume, so it's only visible here when the REAL volume is mounted. If the
+    # attach failed, Docker binds an EMPTY host dir -> the mount exists (isdir passes) but the sentinel
+    # is absent, which would otherwise warm ephemeral disk yet report success. Require it. (NFS/Lambda
+    # has no block device and no preamble; the platform genuinely auto-mounts, so isdir alone is sound.)
+    if payload.get("cache_block_device"):
+        marker = os.path.join(mount, ".flash-cache-mounted")  # mirrors _instance.CACHE_MOUNT_MARKER
+        if not os.path.exists(marker):
+            return {"preloaded": [], "already_cached": [], "failed": {},
+                    "error": (f"weight-cache block volume not mounted (no sentinel at {marker}); "
+                              "refusing to warm ephemeral disk")}
     from huggingface_hub import snapshot_download
 
     cache_dir = os.path.join(hf_home, "hub")

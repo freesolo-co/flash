@@ -1149,6 +1149,59 @@ def test_instance_preload_downloads_into_cache(tmp_path, monkeypatch):
     assert calls[0]["token"] == "t"
 
 
+def test_instance_preload_block_device_requires_mount_sentinel(tmp_path, monkeypatch):
+    """A block-volume (Hyperstack) preload with the mount dir present but NO sentinel must refuse.
+
+    Regression: a failed/absent volume attach lets Docker bind an EMPTY host dir, so isdir(mount)
+    passes; without requiring the on-device sentinel the worker would warm EPHEMERAL disk and report
+    success. The cloud-init preamble writes .flash-cache-mounted only onto a real mount.
+    """
+    import sys
+
+    from flash.providers import _instance_bootstrap as b
+
+    def _boom(**k):
+        raise AssertionError("must not download when the block volume isn't really mounted")
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = _boom
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    hf_home = str(tmp_path / "hf-cache")  # parent (the mount) exists but has no sentinel
+    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"], "cache_block_device": True})
+    assert r["preloaded"] == []
+    assert "not mounted" in r["error"]
+
+
+def test_instance_preload_block_device_warms_when_sentinel_present(tmp_path, monkeypatch):
+    """With the on-device sentinel present, a block-volume preload proceeds to download."""
+    import sys
+
+    from flash.providers import _instance_bootstrap as b
+
+    calls = []
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = lambda **k: calls.append(k)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    mount = tmp_path
+    (mount / ".flash-cache-mounted").write_text("")  # preamble's real-mount sentinel
+    hf_home = str(mount / "hf-cache")
+    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"], "cache_block_device": True})
+    assert r["preloaded"] == ["a/b"]
+    assert not r["failed"]
+
+
+def test_block_device_preamble_writes_mount_sentinel():
+    """The Hyperstack block-device preamble drops the sentinel only on a SUCCESSFUL mount."""
+    from flash.providers import _instance
+
+    pre = _instance._cache_block_device_setup(
+        {"cache_block_device": True, "cache_host_mount": "/mnt/cache", "cache_size_gb": 100}
+    )
+    # sentinel is written inside the mount-success branch (after `mount ... &&`), not unconditionally
+    assert "touch '/mnt/cache/.flash-cache-mounted'" in pre
+    assert _instance.CACHE_MOUNT_MARKER == ".flash-cache-mounted"
+
+
 def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     """launch_and_submit(mode='preload', models=...) embeds a preload payload in the cache user_data."""
     import base64

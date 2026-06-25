@@ -307,6 +307,34 @@ def test_cache_falls_back_to_cold_when_filesystem_unavailable(monkeypatch):
     assert "/weight-cache" not in calls[0]["user_data"]  # cold user_data, no bind
 
 
+def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
+    """In preload mode a cache-ensure failure SKIPS the region — never a cold full-training launch.
+
+    Regression: the cold user_data carries no mode/models, so falling back to it for a preload would
+    boot a full training run (GPU billing, timeout) and warm nothing. The walk must try the next
+    region, and fail if none can host the cache.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem",
+        lambda n, r: (_ for _ in ()).throw(lambda_api.LambdaApiError("no FS capacity")),
+    )
+
+    launched = []
+    monkeypatch.setattr(lambda_api, "launch_instance", lambda **kw: launched.append(kw) or "i-x")
+
+    insts = [_inst(region="us-east-1"), _inst(region="us-west-2")]
+    with pytest.raises(lambda_api.LambdaApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=insts, attempt=0,
+            mode="preload", models=["a/b"],
+        )
+    assert launched == []  # no region ever launched a cold (training) instance
+
+
 def test_no_cache_never_touches_filesystems(monkeypatch):
     jobs, lambda_api, calls = _wire_launch(monkeypatch)
 

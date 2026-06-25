@@ -55,6 +55,10 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
 # but the CONTAINER path is fixed, so HF_HOME is uniform regardless of substrate.
 CACHE_CONTAINER_MOUNT = "/weight-cache"
 CACHE_HF_HOME = f"{CACHE_CONTAINER_MOUNT}/hf-cache"
+# Sentinel file written onto a SUCCESSFULLY-mounted block-volume cache (by the cloud-init preamble),
+# so the in-container preload mount-check can tell a real mount from an empty Docker bind (a failed
+# attach). Lives on the device itself -> absent when the volume isn't actually mounted.
+CACHE_MOUNT_MARKER = ".flash-cache-mounted"
 
 
 def _cache_block_device_setup(payload: dict) -> str:
@@ -72,6 +76,7 @@ def _cache_block_device_setup(payload: dict) -> str:
     # never mkfs the wrong device. A warm cache disk (already ext4, unmounted) still matches, and the
     # blkid guard keeps its data. If nothing matches, run cold (format nothing).
     expect_bytes = int(payload.get("cache_size_gb") or 0) * 1000 * 1000 * 1000
+    marker = CACHE_MOUNT_MARKER
     return f"""
 # --- weight-cache block volume: wait-for-device (size-matched, unmounted), format-if-new, mount ---
 echo "FLASH: waiting for the attached cache block device (~{payload.get('cache_size_gb')}GB)..."
@@ -91,7 +96,15 @@ if [ -n "$CACHE_DEV" ]; then
   echo "FLASH: cache device $CACHE_DEV"
   blkid "$CACHE_DEV" >/dev/null 2>&1 || mkfs.ext4 -q "$CACHE_DEV" || true   # format ONCE; never reformat a populated cache
   mkdir -p '{mount}'
-  mount "$CACHE_DEV" '{mount}' 2>/dev/null || echo "FLASH: cache mount failed; running cold"
+  if mount "$CACHE_DEV" '{mount}' 2>/dev/null; then
+    # Sentinel written ONTO the mounted block device (not the underlying empty dir): it is only
+    # visible at the bind path inside the container when the REAL volume is mounted. The preload
+    # mount-check requires it, so a failed/absent attach (Docker binding an empty host dir) can't
+    # masquerade as a warm cache and silently warm ephemeral disk.
+    touch '{mount}/{marker}' 2>/dev/null || true
+  else
+    echo "FLASH: cache mount failed; running cold"
+  fi
 else
   echo "FLASH: no matching cache block device appeared; running cold"
 fi

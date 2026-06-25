@@ -198,6 +198,14 @@ def launch_and_submit(
                 )
                 user_data, fs_names = region_user_data, [cache_name]
             except Exception as e:
+                # A preload run's WHOLE purpose is to warm the cache; the cold user_data carries no
+                # mode/models, so a cold fallback would run a full training bootstrap (GPU billing,
+                # timeout) and warm nothing. SKIP this region instead — try the next one, and fail the
+                # walk if no region can host the cache. Normal runs still degrade to a cold run.
+                if mode == "preload":
+                    say(f"weight cache unavailable in {inst.region} ({e}); skipping (preload needs it)")
+                    last_err = e
+                    continue
                 say(f"weight cache unavailable in {inst.region} ({e}); launching cold")
         try:
             instance_id = lambda_api.launch_instance(
