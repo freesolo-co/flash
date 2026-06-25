@@ -55,7 +55,11 @@ def load_environment(
             "no environment specified: set [environment] id to the id returned by "
             "`flash env push --name <name>` (for example 'your-name/your-env')"
         )
-    # resolved_sha is our reserved control-plane kwarg; never let an env-supplied param shadow it
-    # (a stray params["resolved_sha"] would otherwise raise "multiple values for keyword argument").
-    _params = {k: v for k, v in params.items() if k != "resolved_sha"}
-    return load_freesolo_environment(env_id, resolved_sha=resolved_sha or None, **_params)
+    # User [environment.params] are freeform and forwarded verbatim to the SDK loader. The
+    # control-plane resolve-once pin travels under the adapter's RESERVED `pinned_sha` kwarg (a
+    # distinct internal name), so it never shadows or strips a user param — including one literally
+    # named "resolved_sha". The `not in params` guard keeps even a user `pinned_sha` collision-free.
+    extra = {}
+    if resolved_sha and "pinned_sha" not in params:
+        extra["pinned_sha"] = resolved_sha
+    return load_freesolo_environment(env_id, **extra, **params)

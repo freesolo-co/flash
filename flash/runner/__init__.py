@@ -189,6 +189,45 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
+    """Resolve the environment's GitHub ref->SHA ONCE here so every worker in the fan-out boots from
+    an immutable pinned sha instead of each re-resolving the symbolic ref (e.g. "main") against the
+    GitHub commits API. A cold spawn wave of N workers otherwise fires N concurrent commit-API calls
+    and trips GitHub's secondary rate limit; a worker-side in-process cache cannot help, because
+    each worker is a separate process. Best-effort: any failure (no network/token, transient limit,
+    or a non-GitHub env) leaves resolved_sha empty and the worker resolves the ref itself via the
+    in-worker jittered retry + retriable-reschedule path, so submission never blocks on GitHub.
+    """
+    env_id = spec.environment.id
+    if not env_id or spec.environment.resolved_sha:
+        return spec
+    try:
+        from flash.envs.adapter import (
+            _parse_github_environment_ref,
+            _resolve_ref_sha,
+            is_managed_environment_slug,
+            managed_slug_to_github_ref,
+        )
+
+        ref_str = (
+            managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
+        )
+        parsed = _parse_github_environment_ref(ref_str)
+        if parsed is None:
+            return spec  # local/path or non-GitHub env: nothing to pin
+        sha = _resolve_ref_sha(parsed)
+    except Exception as e:
+        # Never block submission on a control-plane resolve; the worker falls back to resolving the
+        # ref itself. Log for visibility.
+        print(f"resolve-once: could not pin env ref->sha for {env_id!r} ({e}); worker will resolve")
+        return spec
+    if not sha:
+        return spec
+    d = spec.to_dict()
+    d["environment"] = {**d["environment"], "resolved_sha": sha}
+    return JobSpec.from_dict(d)
+
+
 def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     """Daemon-thread entrypoint for background runs.
 
@@ -241,6 +280,11 @@ def submit_job(
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
     spec = _assign_managed_hf_repo(spec)
+    if not dry_run:
+        # Resolve the env ref->sha ONCE before fan-out so workers boot from the pin and skip the
+        # GitHub commits API (defuses the cold-spawn rate-limit wave). Skipped on dry-run: no
+        # workers fan out, and it avoids a network call on a preview/test submission.
+        spec = _assign_resolved_env_sha(spec)
     status = RunStatus(
         run_id=spec.run_id,
         state="queued",

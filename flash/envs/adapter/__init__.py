@@ -17,7 +17,6 @@ import re
 import shutil
 import tarfile
 import tempfile
-import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,18 +43,16 @@ _TAR_METADATA_TYPES = {
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
 
-# Content-addressed, process-local caches so co-located resolves/downloads (the common case:
-# many workers booting on the same node, or a single process resolving the same env twice)
-# reuse instead of re-hitting GitHub. A commit SHA is immutable, so caching by (repo, sha) is
-# always safe. The ref->sha cache is keyed by (repo_full_name, ref); the resolved sha is then
-# stored under (repo_full_name, sha) so an etag-conditional request can return the prior bytes
-# on a 304. All access is guarded by _CACHE_LOCK (many worker threads may resolve at once).
-_CACHE_LOCK = threading.Lock()
-# (repo_full_name, ref) -> resolved 40-char commit sha
-_REF_SHA_CACHE: dict[tuple[str, str], str] = {}
-# (repo_full_name, sha) -> (etag or None, tarball bytes). Bounds memory by entry count, not size:
-# an env tarball is small and the set of distinct envs a node touches is tiny.
-_TARBALL_CACHE: dict[tuple[str, str], tuple[str | None, bytes]] = {}
+
+class GitHubRateLimitError(RuntimeError):
+    """Raised when the GitHub API rate-limits us (HTTP 429, or a 403 whose body says "rate limit").
+
+    Raised by ``_urlopen`` only after the in-process jittered retry is exhausted, so it signals a
+    *persistent* limit. The worker's top-level handler catches it and stamps ``retriable=True`` so
+    the control plane reschedules the job on a fresh worker once the limit window resets, instead of
+    permanently failing the run. The real spawn-wave mitigation is the control-plane resolve-once
+    pin (EnvironmentSpec.resolved_sha) that lets workers skip the GitHub resolve entirely.
+    """
 
 
 @dataclass(frozen=True)
@@ -215,25 +212,20 @@ def _is_commit_sha(value: str) -> bool:
 
 
 def _resolve_ref_sha(parsed: GitHubEnvironmentRef, pinned_sha: str | None = None) -> str:
-    # Resolve-once hook (item 3): the control plane can resolve ref->sha ONCE and pass the pinned
-    # commit sha through, so the worker short-circuits without hitting GitHub at all. Same effect
-    # as the immutable-ref fast path below, but applied to a symbolic ref (e.g. "main") that the
-    # worker would otherwise have to resolve itself. Only a real 40-char sha is trusted; anything
-    # else falls through to the live resolve. See spec.EnvironmentSpec.resolved_sha for the (still
-    # optional, default-off) field that would carry this end-to-end.
+    # Resolve-once hook: the control plane resolves ref->sha ONCE (runner._assign_resolved_env_sha)
+    # and threads the pinned commit sha through, so every worker in a fan-out short-circuits here
+    # without hitting GitHub at all — this is what actually defuses a cold spawn wave (the prior
+    # in-process cache could not, since each worker is a separate process). Same effect as the
+    # immutable-ref fast path below, but applied to a symbolic ref (e.g. "main"). Only a real
+    # 40-char sha is trusted; anything else falls through to a live resolve.
     if pinned_sha and _is_commit_sha(pinned_sha):
         return pinned_sha
     if _is_commit_sha(parsed.ref):
         return parsed.ref
-    # Content-addressed cache: a co-located resolve of the same (repo, ref) reuses the prior
-    # answer instead of re-hitting the GitHub commits API. Safe because each entry maps to an
-    # immutable commit sha; a ref that later moves resolves to a new (repo, ref) only if the
-    # process is restarted, which is acceptable for a per-boot resolve.
-    cache_key = (parsed.repo_full_name, parsed.ref)
-    with _CACHE_LOCK:
-        cached = _REF_SHA_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    # No pin (legacy spec / non-managed ref / control-plane resolve failed): resolve the symbolic
+    # ref live every time. We deliberately do NOT cache symbolic refs in-process — a long-lived
+    # process must see a moved branch (managed slugs point at environment-hub@main, which moves on
+    # `flash env push`), and the immutable-sha cases above already skip the network.
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
     token = _github_token()
     if token:
@@ -250,36 +242,21 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef, pinned_sha: str | None = None
     sha = payload.get("sha")
     if not isinstance(sha, str) or not _is_commit_sha(sha):
         raise RuntimeError(f"Failed to resolve GitHub environment ref {parsed.canonical()}")
-    with _CACHE_LOCK:
-        _REF_SHA_CACHE[cache_key] = sha
     return sha
 
 
 def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
-    """Fetch bytes for a GitHub request with the #209 jittered 403-retry. Bytes-only contract."""
-    data, _etag = _urlopen_with_etag(req, timeout=timeout)
-    return data
+    """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
 
-
-def _urlopen_with_etag(
-    req: urllib.request.Request,
-    *,
-    timeout: float = 60.0,
-    cached: tuple[str | None, bytes] | None = None,
-) -> tuple[bytes, str | None]:
-    """Fetch bytes plus the response ETag, supporting an If-None-Match conditional.
-
-    When ``cached`` (etag, bytes) is supplied and has an etag, the request is sent with an
-    ``If-None-Match`` header; a 304 (Not Modified) returns the cached bytes unchanged rather than
-    empty bytes, so the bytes contract is preserved. Keeps #209's jittered 403-retry as the safety
-    net. The returned etag (or None) lets the caller refresh its content-addressed cache.
+    On a 429 or a 403 whose body says "rate limit" (a cold spawn wave of workers all hitting the
+    commits/tarball endpoint trips GitHub's abuse detection), retry a few times with jitter so
+    concurrent workers don't all retry in lockstep. If the limit persists past the retries, raise
+    ``GitHubRateLimitError`` so the worker's top-level handler stamps ``retriable=True`` and the run
+    reschedules on a fresh worker, instead of hard-failing on a transient limit. Any other HTTP /
+    URL error raises a plain ``RuntimeError`` (non-retriable).
     """
     import random
     import time
-
-    cached_etag = cached[0] if cached else None
-    if cached_etag:
-        req.add_header("If-None-Match", cached_etag)
 
     _MAX_RATE_LIMIT_RETRIES = 5
     _RATE_LIMIT_BASE_DELAY = 10.0
@@ -287,45 +264,31 @@ def _urlopen_with_etag(
     while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                # `.headers` is defensive: a real http.client.HTTPResponse has it, but a faked
-                # response (tests) or odd opener may not — a missing etag just disables the
-                # conditional, never breaks the bytes return.
-                headers = getattr(resp, "headers", None)
-                etag = headers.get("ETag") if headers is not None else None
-                return resp.read(), etag
+                return resp.read()
         except urllib.error.HTTPError as exc:
-            # 304 Not Modified: the conditional request matched our cached etag, so reuse the
-            # cached bytes (never empty bytes) and keep the same etag. Only reachable when we
-            # actually sent an If-None-Match, so `cached` is present here.
-            if exc.code == 304 and cached is not None:
-                return cached[1], cached_etag
             body = exc.read().decode("utf-8", "replace")
-            if exc.code == 403 and "rate limit" in body.lower() and attempt < _MAX_RATE_LIMIT_RETRIES:
-                # GitHub secondary rate limit: many workers booting simultaneously all
-                # hit the same commits/tarball endpoint, triggering abuse detection.
-                # Retry with jitter so concurrent workers don't all retry at once.
+            is_rate_limit = exc.code == 429 or (exc.code == 403 and "rate limit" in body.lower())
+            if is_rate_limit and attempt < _MAX_RATE_LIMIT_RETRIES:
                 delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
                 time.sleep(delay)
                 attempt += 1
                 continue
+            if is_rate_limit:
+                # Persistent limit: signal retriable so the control plane reschedules (#209).
+                raise GitHubRateLimitError(
+                    f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
+                ) from exc
             raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
 
 
 def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
-    # Content-addressed tarball cache keyed by (repo, sha). Callers download the tarball for the
-    # ALREADY-resolved commit sha (see _resolve_github_environment_file), so the bytes are immutable
-    # and a cache hit can serve them without touching GitHub. When the key isn't an immutable sha
-    # (an unresolved ref), the stored etag still lets us send an If-None-Match conditional and reuse
-    # the cached bytes on a 304 instead of re-downloading the whole archive.
-    cache_key = (ref.repo_full_name, ref.ref)
-    immutable = _is_commit_sha(ref.ref)
-    with _CACHE_LOCK:
-        cached = _TARBALL_CACHE.get(cache_key)
-    if cached is not None and immutable:
-        return cached[1]
-
+    # Callers download the tarball for the ALREADY-resolved commit sha (see
+    # _resolve_github_environment_file), which extracts it into the content-addressed disk cache
+    # under _CACHE_ROOT/<hash(repo@sha:path)> and never re-downloads on a hit. So reuse is handled
+    # on disk; we deliberately do NOT also retain the (up to _MAX_ARCHIVE_BYTES) archive bytes in a
+    # module-level cache for the worker's lifetime — that wasted hundreds of MiB of RAM per process.
     url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -334,16 +297,12 @@ def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
     token = _github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    data, etag = _urlopen_with_etag(
-        urllib.request.Request(url, headers=headers), timeout=120.0, cached=cached
-    )
+    data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
     if len(data) > _MAX_ARCHIVE_BYTES:
         raise RuntimeError(
             f"environment archive is too large ({len(data)} bytes; "
             f"limit {_MAX_ARCHIVE_BYTES} bytes)"
         )
-    with _CACHE_LOCK:
-        _TARBALL_CACHE[cache_key] = (etag, data)
     return data
 
 
@@ -802,13 +761,15 @@ class FreesoloEnvironment(BaseEnvironment):
 
 
 def load_freesolo_environment(
-    env_id: str, *, resolved_sha: str | None = None, **kwargs
+    env_id: str, *, pinned_sha: str | None = None, **kwargs
 ) -> FreesoloEnvironment:
-    # resolved_sha is a keyword-only resolve-once hook (item 3): kept OUT of **kwargs because those
-    # are forwarded verbatim to the Freesolo SDK env loader. None (default) preserves today's
-    # behavior — the worker resolves the env ref->sha itself.
+    # pinned_sha is a keyword-only resolve-once hook (the control-plane-pinned commit sha). It is a
+    # RESERVED internal name kept OUT of **kwargs because those are user [environment.params]
+    # forwarded verbatim to the Freesolo SDK env loader — using a distinct name means a user param
+    # (even one literally named "resolved_sha") is never shadowed or stripped. None (default)
+    # preserves today's behavior — the worker resolves the env ref->sha itself.
     tools = _import_freesolo_environment_tools()
-    reference = _resolve_environment_reference(env_id, resolved_sha)
+    reference = _resolve_environment_reference(env_id, pinned_sha)
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 
