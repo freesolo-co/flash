@@ -16,7 +16,7 @@ from .._fileio import read_json_or_empty, secure_json_write
 # The default control plane follows the installed channel (see flash/_channel.py): the prod
 # package (freesolo-flash / `flash`) targets the production plane, the dev-channel package
 # (freesolo-flash-dev / `flash-dev`) targets the staging plane. Either is overridable via
-# FLASH_API_URL or `flash login --api-url`.
+# FLASH_API_URL or the `login --api-url` flag (the CLI is `flash` or `flash-dev` per channel).
 PROD_API_URL = "https://flash.freesolo.co"
 DEV_API_URL = "https://flash-dev.freesolo.co"
 

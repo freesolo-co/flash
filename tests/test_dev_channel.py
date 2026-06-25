@@ -16,6 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def _load_build_module():
     path = REPO_ROOT / "scripts" / "build_dev_dist.py"
     spec = importlib.util.spec_from_file_location("build_dev_dist", path)
+    assert spec is not None, f"could not load a spec for {path}"
+    assert spec.loader is not None, f"spec for {path} has no loader"
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
