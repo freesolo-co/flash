@@ -1,4 +1,8 @@
-"""RunPod provider registry + ``base.Provider`` interface coverage (CPU-only, offline)."""
+"""Provider registry + ``base.Provider`` interface coverage (CPU-only, offline).
+
+RunPod (always on) and Lambda (instance-based complement, opt-in via LAMBDA_API_KEY) both
+implement the SAME ``base.Provider`` interface behind the SAME module layout, so the
+orchestrator/allocator treat them interchangeably."""
 
 from __future__ import annotations
 
@@ -21,13 +25,48 @@ PROVIDER_METHODS = (
 )
 
 
-def test_registry_lists_runpod_only():
+def test_registry_lists_runpod_and_lambda():
     from flash.providers import PROVIDER_NAMES, get_provider
 
-    assert PROVIDER_NAMES == ("runpod",)
+    assert PROVIDER_NAMES == ("runpod", "lambda")
     assert get_provider("RunPod ").name == "runpod"
+    assert get_provider(" Lambda ").name == "lambda"  # case/space-insensitive
     with pytest.raises(KeyError):
-        get_provider("lambda")
+        get_provider("vast")  # removed; not registered
+
+
+@pytest.mark.parametrize("provider", ["runpod", "lambda"])
+def test_provider_implements_the_interface(provider):
+    from flash.providers import get_provider
+    from flash.providers.base import Provider
+
+    prov = get_provider(provider)
+    assert isinstance(prov, Provider)
+    for meth in PROVIDER_METHODS:
+        assert callable(getattr(prov, meth)), f"{provider} missing {meth}"
+
+
+@pytest.mark.parametrize("provider", ["runpod", "lambda"])
+def test_module_layout(provider):
+    """Both subpackages expose the SAME public module set (the symmetry contract)."""
+    pkg_name = {"runpod": "runpod", "lambda": "lambdalabs"}[provider]
+    for mod in PROVIDER_MODULES:
+        importlib.import_module(f"flash.providers.{pkg_name}.{mod}")
+    pkg = importlib.import_module(f"flash.providers.{pkg_name}")
+    assert hasattr(pkg, "PROVIDER")
+
+
+def test_method_signatures_match_across_providers():
+    """The interface methods take the same parameters on both providers (swappable)."""
+    import inspect
+
+    from flash.providers import get_provider
+
+    rp, la = get_provider("runpod"), get_provider("lambda")
+    for meth in PROVIDER_METHODS:
+        rs = list(inspect.signature(getattr(rp, meth)).parameters)
+        ls = list(inspect.signature(getattr(la, meth)).parameters)
+        assert rs == ls, f"{meth} param mismatch: runpod={rs} lambda={ls}"
 
 
 def test_runpod_provider_implements_the_interface():

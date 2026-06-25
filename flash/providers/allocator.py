@@ -1,27 +1,35 @@
-"""GPU allocation: the cheapest validated RunPod class that fits the run.
+"""GPU allocation: the cheapest fitting class across the active providers.
 
 Given a base model (+ algorithm), compute the VRAM the FULL run needs — sized for the
-heavier phase, GRPO, since the typical pipeline is SFT followed by GRPO — then rank
-every validated RunPod candidate by static $/hr and pick the cheapest:
+heavier phase, GRPO, since the typical pipeline is SFT followed by GRPO — then rank every
+fitting candidate by $/hr and pick the cheapest:
 
-  runpod  every Flash-provisionable class
+  runpod  every validated Flash-provisionable class (static $/hr)
+  lambda  every fitting class that currently has LIVE regional capacity (live $/hr); opt-in,
+          available only when LAMBDA_API_KEY is set on the control plane
+
+RunPod's cheaper static rates almost always win on price, so Lambda joins the ranked list as a
+capacity COMPLEMENT: when RunPod's cheapest fitting class is out of capacity (THROTTLED / queue
+backstop), the runner's gpu-walk steps down the ranked list and reaches the in-capacity Lambda
+class. Lambda candidates are capacity-filtered up front (``_lambda_candidates`` only offers a
+class with a region advertising capacity), so the walk never lands on a class that would just
+fail to launch.
 
 Allocation happens at SUBMIT time in the runner. The parse-time resolution in schema is a
-RunPod-static provisional for validation/dry-run display, and both use the same static GPU
-rate table (see ``flash.providers.base`` / ``flash.providers.runpod.pricing``).
-
-RunPod is the only active provider; the provider registry remains the narrow interface
-for pricing/provisionability.
+RunPod-static provisional for validation/dry-run display.
 """
 
 from __future__ import annotations
 
+from flash._logging import get_logger
 from flash.providers import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.base import (
     Allocation,
     Candidate,
     UnsupportedGpuError,
 )
+
+logger = get_logger(__name__)
 
 # "Comfortably" = the open-model VRAM estimate plus headroom, so a full SFT+GRPO run
 # never lands in check_fit's "tight" band by construction. Curated catalog entries
@@ -75,6 +83,32 @@ def _runpod_candidates(need: int) -> list[Candidate]:
     ]
 
 
+def _lambda_candidates(need: int) -> list[Candidate]:
+    """Lambda's fitting classes that currently have LIVE capacity, priced live.
+
+    Capacity-aware by design: a Lambda class with no region advertising capacity is EXCLUDED, so
+    the allocator never hands the runner a Lambda class that would immediately fail to launch (and
+    burn a retry) — directly the "GPU allocation is good, doesn't randomly die" property. A Lambda
+    capacity-lookup failure (no key / network blip) degrades to the other providers: it is
+    non-fatal as long as another provider can supply a fitting class.
+    """
+    from flash.providers.lambdalabs.jobs import usable_instances
+
+    provider = get_provider("lambda")
+    out: list[Candidate] = []
+    try:
+        for g in provider.gpu_classes():
+            if g.vram_gb < need:
+                continue
+            # usable_instances reads the cached /instance-types, so only the first call hits the API.
+            if usable_instances(g.name):
+                out.append(Candidate("lambda", g.name, provider.hourly_rate(g.name), g.vram_gb))
+    except Exception as exc:
+        logger.warning("lambda capacity lookup failed (%s); allocating without lambda", exc)
+        return []
+    return out
+
+
 def allocate(
     model_id: str,
     algorithm: str,
@@ -82,21 +116,23 @@ def allocate(
     train=None,
     thinking: bool = False,
 ) -> Allocation:
-    """Pick the cheapest active RunPod GPU class able to run the job.
+    """Pick the cheapest fitting (provider, GPU class) able to run the job.
 
-    There is no GPU pin — every fitting, validated RunPod class is eligible, and the cheapest wins.
-
-    Allocation is restricted to the validated pool
-    (``GpuClass.validated``) because the deployed control plane rejects a submit for any
-    non-validated class, so picking the absolute-cheapest fitting class (e.g. an unvalidated "RTX
-    2000 Ada") would just make the server refuse the run. ``train``/``thinking`` size the
-    requirement to the run's actual knobs (context, group, rank, batch) via the matrix.
+    There is no GPU pin — every fitting class on every available provider is eligible, and the
+    cheapest wins. RunPod is restricted to its validated pool (``GpuClass.validated``) because the
+    deployed control plane rejects a submit for any non-validated class; Lambda (opt-in via
+    LAMBDA_API_KEY) contributes its fitting classes that have live regional capacity. RunPod's
+    cheaper static rates usually win, with Lambda joining as a capacity complement lower in the
+    ranked list. ``train``/``thinking`` size the requirement to the run's actual knobs (context,
+    group, rank, batch) via the matrix.
     """
     need = required_vram_gb(model_id, algorithm, train=train, thinking=thinking)
     available = available_providers()
     candidates: list[Candidate] = []
     if "runpod" in available:
         candidates += _runpod_candidates(need)
+    if "lambda" in available:
+        candidates += _lambda_candidates(need)
     if not candidates:
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "

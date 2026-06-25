@@ -43,6 +43,11 @@ class GpuClass:
     # server then refuses, and the run never submits. Exactly the smoke-validated members below
     # are marked True.
     validated: bool = False
+    # Lambda Cloud instance-type name for this class (e.g. "gpu_1x_a10"); None -> not on Lambda.
+    # Lambda is the instance-based complement to RunPod's serverless substrate: a class with a
+    # ``lambda_name`` is provisionable on Lambda (capacity permitting), priced from Lambda's own
+    # live ``/instance-types`` rate (NOT the RunPod ``hourly_usd`` snapshot above).
+    lambda_name: str | None = None
 
 
 # Static hourly rates are RunPod secure-cloud on-demand snapshots.
@@ -79,11 +84,16 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         validated=True,
     ),
     GpuClass("L4", "NVIDIA_L4", 24, "l4", "sm89", 0.39),
+    # Lambda-only 24 GB Ampere datacenter card (RunPod has no A10). Instance-based capacity
+    # complement: chosen by the allocator only when the cheaper RunPod 24 GB classes are out of
+    # capacity, so it never undercuts RunPod on price.
+    GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10"),
     # Live-validated 2026-06-22: Qwen3.5-0.8B/9B SFT+GRPO train smokes (RunPod). The 48 GB tier that
     # fills the 32->80 GB gap (e.g. 4B GRPO @ 35 GB) ~55% cheaper than the A100.
     GpuClass(
         "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
         validated=True,
+        lambda_name="gpu_1x_a6000",
     ),
     GpuClass("A40", "NVIDIA_A40", 48, "a40", "sm86", 0.44),
     GpuClass(
@@ -93,6 +103,11 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "6000ada",
         "sm89",
         0.77,
+    ),
+    # Lambda-only 40 GB A100 (SXM4) — RunPod's A100s are all 80 GB, so this fills the 32->80 GB gap
+    # on Lambda (e.g. a 4B GRPO at ~35 GB) as an instance-based capacity complement.
+    GpuClass(
+        "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99, lambda_name="gpu_1x_a100_sxm4"
     ),
     # ---- big-VRAM tier (9B bf16 GRPO, future >9B bf16) ----
     # Validated 2026-06-11: 0.6B SFT smoke (phase6).
@@ -114,6 +129,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     GpuClass(
         "H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29,
         validated=True,
+        lambda_name="gpu_1x_h100_pcie",
     ),
     # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod, sm120/CUDA-13).
     GpuClass(
@@ -202,7 +218,12 @@ def get_gpu_info(name: str) -> GpuClass:
 def providers_for(name: str) -> tuple[str, ...]:
     """Providers that can provision this GPU class."""
     info = get_gpu_info(name)
-    return ("runpod",) if info.enum_member else ()
+    out: list[str] = []
+    if info.enum_member:
+        out.append("runpod")
+    if info.lambda_name:
+        out.append("lambda")
+    return tuple(out)
 
 
 def gpu_short(name: str) -> str:

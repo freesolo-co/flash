@@ -29,6 +29,13 @@ def _offline(monkeypatch):
 
     monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [], raising=False)
 
+    # Lambda is OPT-IN via LAMBDA_API_KEY (instance-based complement to RunPod). On an operator
+    # box whose shell sources a .env, that key is present in the process env — which would make the
+    # lambda provider "available" and pull live Lambda capacity/pricing into offline tests
+    # (allocation candidates, registry). Delete it by default so the suite stays hermetic and
+    # RunPod-only; a lambda test opts back in with ``monkeypatch.setenv("LAMBDA_API_KEY", ...)``.
+    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
+
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
     # it to a single active key never loses the rest of the pool). Reset it around every
     # test so a key set/collapsed by one test can't leak into the next.

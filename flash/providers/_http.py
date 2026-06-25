@@ -42,6 +42,7 @@ class RestClient:
         missing_key_message: str | None = None,
         keys_provider: Callable[[], list[str]] | None = None,
         failover_predicate: Callable[[Exception], bool] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.env_var = env_var
         self.error_cls = error_cls
@@ -51,6 +52,11 @@ class RestClient:
         )
         self.keys_provider = keys_provider
         self.failover_predicate = failover_predicate
+        # Static headers added to EVERY request (e.g. a custom User-Agent). Lambda Cloud sits
+        # behind Cloudflare, which 403s the stdlib default ``Python-urllib/<v>`` UA — so the
+        # Lambda client passes a real UA here. ``Authorization``/``Content-Type`` are always set
+        # by ``request`` and win on a key collision.
+        self.extra_headers = dict(extra_headers or {})
 
     def api_key(self) -> str:
         key = os.environ.get(self.env_var)
@@ -80,6 +86,7 @@ class RestClient:
             method=method,
             data=json.dumps(body).encode() if body is not None else None,
             headers={
+                **self.extra_headers,
                 "Authorization": f"Bearer {key or self.api_key()}",
                 "Content-Type": "application/json",
             },
