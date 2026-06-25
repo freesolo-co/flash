@@ -49,7 +49,7 @@ RUN pip install --no-cache-dir \
     "tilelang==0.1.11" \
     "apache-tvm-ffi==0.1.11" \
     "hf_transfer" \
-    "freesolo>=0.2.46" \
+    "freesolo>=0.2.49" \
     "runpod"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
@@ -126,6 +126,14 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE M
     || { echo "causal_conv1d: build/import failed -> removing + GDN packing stays off (Qwen3.5/3.6 train unpacked)"; \
          pip uninstall -y causal-conv1d 2>/dev/null || true; }
 
+# Weight cache (this PR, RUNTIME not baked): when the shared weight-cache network volume is attached
+# (flash runner._assign_weight_cache_volume), the control plane points HF_HOME at the persistent mount
+# per-run (providers/.../deps.weight_cache_env), so the MODEL DOWNLOAD is reused across runs landing in
+# the same region. ONLY HF_HOME (inert model blobs) is redirected — the executable kernel-JIT caches
+# below are deliberately NOT shared (the volume is multi-tenant; a poisoned compiled artifact could
+# affect another tenant). The redirect can't be a static image ENV: the volume mounts at a fixed path
+# only at runtime and only when attached, so a baked ENV would break cache-less (no-volume) cold runs.
+#
 # Compiled-kernel cache: OPT-IN bake, JIT fallback. The fused Triton (Liger/fla/chalk),
 # TorchInductor, and Hopper tilelang kernels the trainer builds on first use are content-addressed
 # by GPU ARCH + toolchain version, so they can only be compiled on a real GPU of each catalog arch

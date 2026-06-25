@@ -135,7 +135,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
     from flash.providers import _instance_bootstrap as lb
 
     calls: list[str] = []
-    markers: list[tuple[bool, str]] = []
+    markers: list[tuple[bool, str, bool]] = []
     monkeypatch.setattr(
         lb,
         "load_payload",
@@ -154,7 +154,11 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
     )
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)
     monkeypatch.setattr(lb, "run_mode", lambda p, e, m, d: (calls.append(m), rc)[1])
-    monkeypatch.setattr(lb, "write_attempt_marker", lambda p, ok, error="": markers.append((ok, error)))
+    monkeypatch.setattr(
+        lb,
+        "write_attempt_marker",
+        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
+    )
     monkeypatch.setattr(lb.os.path, "exists", lambda p: metrics if "metrics.json" in p else False)
     return lb, calls, markers
 
@@ -163,15 +167,18 @@ def test_bootstrap_train_success(monkeypatch):
     lb, calls, markers = _bootstrap_env(monkeypatch)
     assert lb.main() == 0
     assert calls == ["sft"]  # one fresh worker process
-    assert markers == [(True, "")]
+    assert markers == [(True, "", False)]  # success marker, not retriable
 
 
 def test_bootstrap_fails_without_metrics(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
     assert lb.main() == 1
-    ok, error = markers[0]
+    ok, error, retriable = markers[0]
     assert not ok
     assert "metrics.json" in error
+    # A genuine no-metrics crash (the worker never produced metrics) is a REAL failure, not infra:
+    # it must NOT be flagged retriable (that would loop a deterministically-broken run).
+    assert retriable is False
 
 
 def test_bootstrap_sets_lambda_arm():
@@ -196,7 +203,7 @@ def test_launch_walks_regions_on_capacity_rejection(monkeypatch):
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     attempts = []
 
-    def fake_launch(*, region_name, instance_type_name, ssh_key_names, name, user_data):
+    def fake_launch(*, region_name, instance_type_name, ssh_key_names, name, user_data, file_system_names=None):
         attempts.append(region_name)
         if len(attempts) < 3:
             raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
@@ -264,9 +271,228 @@ def test_resolve_ssh_key_names(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# launch_and_submit: per-region weight cache (Lambda persistent filesystem)
+# ---------------------------------------------------------------------------
+def _wire_launch(monkeypatch):
+    """Common launch wiring: ssh key + a launch that records (region, user_data, file_system_names)."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    calls = []
+
+    def fake_launch(*, region_name, instance_type_name, ssh_key_names, name, user_data, file_system_names=None):
+        calls.append({"region": region_name, "user_data": user_data, "fs": file_system_names})
+        return "i-cache"
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    return jobs, lambda_api, calls
+
+
+def test_cache_ensures_filesystem_and_attaches_at_launch(monkeypatch):
+    jobs, lambda_api, calls = _wire_launch(monkeypatch)
+    ensured = []
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: ensured.append((n, r)) or f"/lambda/nfs/{n}")
+
+    spec = _spec(network_volume="flash-weights")
+    jobs.launch_and_submit(spec, seed=0, instances=[_inst(region="us-east-1")], attempt=0)
+
+    assert ensured == [("flash-weights", "us-east-1")]  # create-if-absent in THIS region
+    assert calls[0]["fs"] == ["flash-weights"]  # attached at launch (Lambda can't attach later)
+    # The cloud-init binds the auto-mounted NFS path into the worker at the fixed cache mount.
+    assert "-v '/lambda/nfs/flash-weights':/weight-cache" in calls[0]["user_data"]  # quoted host path
+
+
+def test_cache_bind_uses_returned_mount_point(monkeypatch):
+    """The bind-mount targets the FS's ACTUAL mount_point, not the hard-coded /lambda/nfs/<name>.
+
+    Regression: ensure_filesystem's returned mount_point was ignored, so a region where Lambda mounts
+    the FS at a non-default host path would bind the wrong path -> silently cold / failed preload mount.
+    """
+    jobs, lambda_api, calls = _wire_launch(monkeypatch)
+    # Lambda reports a NON-default host mount for this region's filesystem.
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: "/mnt/lambda-fs/flash-weights")
+
+    jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+
+    assert calls[0]["fs"] == ["flash-weights"]
+    # the bind uses the REAL mount_point, and never the stale default
+    assert "-v '/mnt/lambda-fs/flash-weights':/weight-cache" in calls[0]["user_data"]
+    assert "/lambda/nfs/flash-weights" not in calls[0]["user_data"]
+
+
+def test_cache_payload_points_hf_home_at_the_bind(monkeypatch):
+    """The base64 payload's worker env redirects HF_HOME onto the bind (so the model download persists)."""
+    from flash.providers.lambdalabs.jobs import build_payload
+
+    payload = build_payload(_spec(network_volume="flash-weights"), 0, 0, cache_host_mount="/lambda/nfs/flash-weights")
+    assert payload["env"]["HF_HOME"] == "/weight-cache/hf-cache"
+    assert payload["cache_host_mount"] == "/lambda/nfs/flash-weights"
+    assert "cache_block_device" not in payload  # NFS: no format/mount preamble
+
+
+def test_cache_falls_back_to_cold_when_filesystem_unavailable(monkeypatch):
+    jobs, lambda_api, calls = _wire_launch(monkeypatch)
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem",
+        lambda n, r: (_ for _ in ()).throw(lambda_api.LambdaApiError("filesystem quota exceeded")),
+    )
+    jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+    assert calls[0]["fs"] is None  # no filesystem attached
+    assert "/weight-cache" not in calls[0]["user_data"]  # cold user_data, no bind
+
+
+def test_filesystem_attach_reject_retries_same_region_cold(monkeypatch):
+    """A clean reject whose error mentions the FILESYSTEM retries THIS region cache-less before
+    walking — so a best-effort attach can't make a region the cold path would have served fail."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: f"/lambda/nfs/{n}")  # FS ensured
+    calls = []
+
+    def fake_launch(*, region_name, file_system_names=None, user_data=None, **kw):
+        calls.append({"region": region_name, "fs": file_system_names})
+        if file_system_names:  # the CACHED launch is rejected for a filesystem-attach reason
+            raise lambda_api.LambdaApiError(
+                "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
+            )
+        return "i-cold"  # the cold retry (no fs) succeeds in the SAME region
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    h = jobs.launch_and_submit(_spec(network_volume="flash-weights"),
+                               seed=0, instances=[_inst(region="us-east-1")], attempt=0)
+    assert h.region == "us-east-1"  # served by the SAME region, not lost to the walk
+    assert [c["fs"] for c in calls] == [["flash-weights"], None]  # cached attempt, then cold retry
+    assert all(c["region"] == "us-east-1" for c in calls)
+
+
+def test_capacity_reject_does_not_trigger_cold_fs_retry(monkeypatch):
+    """A plain CAPACITY reject (no filesystem in the error) walks normally — no extra cold retry."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: f"/lambda/nfs/{n}")
+    calls = []
+
+    def fake_launch(*, region_name, file_system_names=None, **kw):
+        calls.append({"region": region_name, "fs": file_system_names})
+        if region_name == "us-east-1":
+            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
+        return "i-2"
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    h = jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0,
+                               instances=[_inst(region="us-east-1"), _inst(region="us-west-2")], attempt=0)
+    assert h.region == "us-west-2"  # walked to the next region
+    # us-east-1 tried ONCE (with fs), then walked — no extra cold retry in us-east-1
+    assert [c["region"] for c in calls] == ["us-east-1", "us-west-2"]
+
+
+def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
+    """In preload mode a cache-ensure failure SKIPS the region — never a cold full-training launch.
+
+    Regression: the cold user_data carries no mode/models, so falling back to it for a preload would
+    boot a full training run (GPU billing, timeout) and warm nothing. The walk must try the next
+    region, and fail if none can host the cache.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem",
+        lambda n, r: (_ for _ in ()).throw(lambda_api.LambdaApiError("no FS capacity")),
+    )
+
+    launched = []
+    monkeypatch.setattr(lambda_api, "launch_instance", lambda **kw: launched.append(kw) or "i-x")
+
+    insts = [_inst(region="us-east-1"), _inst(region="us-west-2")]
+    with pytest.raises(lambda_api.LambdaApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=insts, attempt=0,
+            mode="preload", models=["a/b"],
+        )
+    assert launched == []  # no region ever launched a cold (training) instance
+
+
+def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
+    """In preload mode a capacity rejection must NOT refresh to a NEW region and launch there.
+
+    Regression: warm_instances pins each preload launch to one TARGET region and reports that exact
+    region as warmed. If the launch is rejected and the walk refreshed (usable_instances) to a
+    different region and launched there, the caller would report the cold target region as warmed.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: f"/lambda/nfs/{n}")  # cache OK
+    launched = []
+
+    def reject(**kw):
+        launched.append(kw)
+        raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")  # clean reject
+
+    monkeypatch.setattr(lambda_api, "launch_instance", reject)
+    refresh_calls = []
+    monkeypatch.setattr(
+        jobs, "usable_instances",
+        lambda gpu, force=False: refresh_calls.append(force) or [_inst(region="us-fresh-9")],
+    )
+
+    with pytest.raises(lambda_api.LambdaApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=[_inst(region="us-east-1")],
+            attempt=0, mode="preload", models=["a/b"],
+        )
+    assert [c["region_name"] for c in launched] == ["us-east-1"]  # only the TARGET region attempted
+    assert refresh_calls == []  # the stale-stock refresh was NOT consulted in preload mode
+
+
+def test_no_cache_never_touches_filesystems(monkeypatch):
+    jobs, lambda_api, calls = _wire_launch(monkeypatch)
+
+    def boom(*a, **k):
+        raise AssertionError("ensure_filesystem must not be called without a requested cache")
+
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", boom)
+    jobs.launch_and_submit(_spec(), seed=0, instances=[_inst()], attempt=0)  # spec has no network_volume
+    assert calls[0]["fs"] is None
+    assert "/weight-cache" not in calls[0]["user_data"]
+
+
+def test_cache_ensured_per_region_in_the_walk(monkeypatch):
+    """Lazy per-region: the FS is ensured ONLY in the region the run actually lands in (walk skips on
+    capacity, ensuring then launching cold/cache per region)."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    ensured, attempts = [], []
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: ensured.append(r) or f"/lambda/nfs/{n}")
+
+    def fake_launch(*, region_name, file_system_names=None, **kw):
+        attempts.append(region_name)
+        if len(attempts) < 2:
+            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
+        return "i-2"
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    insts = [_inst(region="us-east-1"), _inst(region="us-west-2")]
+    jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=insts, attempt=0)
+    # Ensured in every region we actually attempted (east failed capacity, west succeeded) — never a
+    # whole-fleet pre-create.
+    assert ensured == ["us-east-1", "us-west-2"]
+
+
+# ---------------------------------------------------------------------------
 # poll_lambda_job state machine
 # ---------------------------------------------------------------------------
-def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boot=None, step=10.0):
+def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
 
@@ -292,6 +518,8 @@ def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boo
                 return metrics() if callable(metrics) else metrics
             if path.endswith("lambda_boot.log"):
                 return boot() if callable(boot) else boot
+            if "/error_" in path:
+                return error() if callable(error) else error
             return None
 
         return read
@@ -367,6 +595,40 @@ def test_poll_dead_host_without_marker_is_preempted(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"
     assert "gpu never became ready" in res.detail  # the host boot log is the only console window
+
+
+def test_poll_dead_host_with_error_file_is_job_failed(monkeypatch):
+    """A worker that RAN and crashed early (left error_<phase>.txt) but died before writing the
+    attempt marker is a DETERMINISTIC worker error -> fail fast (job_failed), not burn fresh GPUs
+    retrying a crash that will repeat. Surfaces the traceback in the detail."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminating"}],
+        error="Traceback (most recent call last):\nFileNotFoundError: environment archive did not contain ...",
+    )
+    res = jobs.poll_lambda_job(
+        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {}
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"
+    assert "environment archive" in res.detail
+
+
+def test_poll_dead_host_with_retriable_error_still_preempted(monkeypatch):
+    """Even WITH an error_<phase>.txt, a crash the worker flagged retriable (RetriableInfraError,
+    stamped in the heartbeat) retries on a fresh host (job_preempted) -- same contract as
+    fail_from_marker. This is also what keeps a stale prior-attempt error file from flipping a
+    genuine preemption to job_failed."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminating"}],
+        error="Traceback ...\nRetriableInfraError: cuda device not ready",
+    )
+    res = jobs.poll_lambda_job(
+        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {"retriable": True}
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"
 
 
 def test_poll_loading_timeout(monkeypatch):
@@ -758,6 +1020,64 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
     assert out == ["i-2"]
 
 
+def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
+    """Warm/preload boxes (``flash-preload-...``) are driver-owned: launched by
+    preload.warm_instances, never persisted in the run DB (so never in the active set), and
+    self-terminated by the warm driver. The periodic sweep must NOT reap an IN-DEADLINE preload box by
+    the bare ``flash-`` prefix — a catalog warm can outlast the ~10-min sweep and would be killed
+    mid-download. A box with no embedded deadline (legacy launch) is likewise exempt.
+    """
+    import time
+
+    from flash.providers._instance import instance_label
+    from flash.providers._poll import preload_instance_run_id
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    # Build the name the way a launch does (instance_label bounds it to the provider name budget) so the
+    # reap parser is tested against the REAL, possibly-truncated VM name, not the raw run id.
+    fresh = preload_instance_run_id("lambda", "us-east-1", int(time.time()) + 1800, "abcdef")
+    instances = [
+        {"id": "i-1", "name": instance_label(fresh, 0, 0)},  # in-deadline warm box -> KEEP
+        {"id": "i-legacy", "name": "flash-preload-lambda-us-east-1-abcdef-s0-a0"},  # no deadline -> KEEP
+        {"id": "i-2", "name": "flash-1700-cccc-s0-a0"},  # genuine orphan -> terminate
+    ]
+    terminated = []
+    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+    )
+    out = jobs.sweep_orphans(active_labels=set())  # none is a tracked active run
+    assert out == ["i-2"]
+    assert terminated == ["i-2"]
+
+
+def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
+    """A preload box still alive past its embedded wall deadline + grace has lost its driver (the only
+    thing that terminates an instance provider — nothing on the box self-terminates the VM). The sweep
+    must reap it to bound the billing leak rather than exempt it forever."""
+    import time
+
+    from flash.providers._instance import instance_label
+    from flash.providers._poll import PRELOAD_REAP_GRACE_S, preload_instance_run_id
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    # Deadline well past now + the reap grace -> driver provably gone. Name built via instance_label so
+    # the front-loaded deadline token must survive the provider name-budget truncation to be reaped.
+    stale_deadline = int(time.time()) - int(PRELOAD_REAP_GRACE_S) - 600
+    stale = preload_instance_run_id("lambda", "us-west-1", stale_deadline, "deadbe")
+    instances = [{"id": "i-9", "name": instance_label(stale, 0, 0)}]
+    terminated = []
+    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+    )
+    out = jobs.sweep_orphans(active_labels=set())
+    assert out == ["i-9"]
+    assert terminated == ["i-9"]
+
+
 # ---------------------------------------------------------------------------
 # provider object dispatch + capacity-aware allocation
 # ---------------------------------------------------------------------------
@@ -857,13 +1177,18 @@ def test_bootstrap_honors_nonzero_exit_without_remote_artifacts(monkeypatch):
     """Bug: a worker that exits non-zero AFTER writing /tmp/metrics.json locally but BEFORE its
     required DONE/metrics.json upload (e.g. a transient RetriableInfraError uploading them) must
     NOT be reported as success. The local file exists, so the old code wrote ok=true; now we only
-    tolerate a non-zero exit when the REMOTE completion artifacts are confirmed on HF."""
+    tolerate a non-zero exit when the REMOTE completion artifacts are confirmed on HF.
+
+    The failure is infra-shaped (a failed required upload), so the marker carries retriable=True:
+    during an HF outage the worker's own retriable heartbeat may also be missing, so the marker's
+    flag is what makes the poller retry on a fresh host (job_preempted) instead of failing fast."""
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
     assert lb.main() == 1
-    ok, error = markers[0]
+    ok, error, retriable = markers[0]
     assert not ok
     assert "non-zero" in error  # propagated as a real (retriable) failure, not a false ok=true
+    assert retriable is True  # infra/upload failure -> retried, not job_failed
 
 
 def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
@@ -873,7 +1198,7 @@ def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
     assert lb.main() == 0
-    assert markers[0] == (True, "")
+    assert markers[0] == (True, "", False)
 
 
 def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
@@ -910,6 +1235,62 @@ def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
     assert "FLASH_JOB_SPEC_JSON" not in env
     with open("/tmp/job_spec.json") as f:
         assert f.read() == big
+
+
+def test_build_worker_env_raises_clearly_without_a_spec():
+    """A malformed payload carrying NEITHER an inline job_spec_json NOR the job_spec_in_hf sentinel
+    must raise a clear RuntimeError naming the cause — not crash on len(None) with an opaque
+    TypeError that buries the real (control-plane payload) bug."""
+    from flash.providers import _instance_bootstrap as lb
+
+    with pytest.raises(RuntimeError, match="no job spec"):
+        lb.build_worker_env(
+            {"phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"}  # no job_spec_* at all
+        )
+
+
+def test_build_worker_env_spilled_spec_fetch_failure_is_retriable(monkeypatch):
+    """The pre-worker HF fetch of a spilled spec is infra-shaped: a transient failure must surface
+    as RetriableBootstrapError (not a bare error) so main() marks the attempt retriable and the
+    poller retries on a fresh host instead of failing the run fast."""
+    from flash.providers import _instance_bootstrap as lb
+
+    monkeypatch.setattr(
+        lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503"))
+    )
+    with pytest.raises(lb.RetriableBootstrapError, match="spilled job spec"):
+        lb.build_worker_env(
+            {"job_spec_json": "", "job_spec_in_hf": True, "phase": "sft", "seed": 0,
+             "env": {}, "flash_arm": "lambda"}
+        )
+
+
+def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
+    """End-to-end: a payload whose spilled-spec HF fetch fails -> main() exits non-zero AND the
+    written attempt marker carries retriable=True (so the poller -> job_preempted, not job_failed)."""
+    from flash.providers import _instance_bootstrap as lb
+
+    markers: list[tuple[bool, str, bool]] = []
+    monkeypatch.setattr(
+        lb,
+        "load_payload",
+        lambda path=lb.PAYLOAD_PATH: {
+            "hf_repo": "org/repo", "job_spec_json": "", "job_spec_in_hf": True,
+            "phase": "sft", "seed": 0, "flash_arm": "lambda", "env": {}, "extra_pip": [],
+            "hf_prefix": "sft/x/seed0", "max_wall_s": 60, "attempt": 0,
+        },
+    )
+    monkeypatch.setattr(lb, "fetch_code", lambda p: None)
+    monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503")))
+    monkeypatch.setattr(
+        lb, "write_attempt_marker",
+        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
+    )
+    assert lb.main() == 1
+    ok, error, retriable = markers[0]
+    assert not ok
+    assert "spilled job spec" in error
+    assert retriable is True
 
 
 def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
@@ -952,8 +1333,15 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     # bytes is a valid path type and huggingface_hub could misread it as a (huge) filesystem path.
     assert isinstance(uploaded["fileobj"], io.BytesIO)
     assert uploaded["fileobj"].getvalue() == big.encode()
-    # user_data is tiny despite a 100KB spec, and the caller's payload is untouched.
-    assert len(ud) < 25_000
+    # The 100KB spec content is genuinely OUT of user_data (the whole point of the spill): not even
+    # a fragment of it rides inline. (A brittle exact byte-size threshold would break as the bootstrap
+    # script legitimately grows; assert the semantic invariant instead.)
+    assert "v" * 1000 not in ud
+    # And user_data stays under a generous, provider-aligned cap: cloud-init user_data limits run
+    # ~16KB (AWS) to 64KB; the base64+heredoc framing inflates it, so 64KB is the ceiling the spill
+    # threshold is chosen to keep us under. A 100KB inline spec alone would already blow this.
+    assert len(ud) < 64_000
+    # The caller's payload is untouched (the spill works on a copy).
     assert payload["job_spec_json"] == big
     assert "job_spec_in_hf" not in payload
 

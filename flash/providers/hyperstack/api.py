@@ -18,6 +18,7 @@ retries, nothing persisted locally. Hyperstack specifics:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import tempfile
@@ -65,11 +66,48 @@ _FLAVORS_TTL_S = 45.0
 _flavors_cache: dict[str, Any] = {"ts": 0.0, "by_region": None}
 
 
+# Regions excluded from allocation + launch. CANADA-1's on-demand stock is a known-broken-driver
+# fleet: instances reach ACTIVE then die without a DONE sentinel (NVML init failure / cuda
+# unavailable), so launching there burns GPU budget on guaranteed-failed retries. Skip it by default
+# rather than waterfall through it. Override with HYPERSTACK_BLOCKED_REGIONS (comma-separated): unset
+# -> the default below; set (even to "") -> exactly that list, so operators can re-enable CANADA-1
+# (HYPERSTACK_BLOCKED_REGIONS="") or block others once capacity/driver health changes.
+_DEFAULT_BLOCKED_REGIONS = frozenset({"CANADA-1"})
+
+
+def _blocked_regions() -> set[str]:
+    env = os.environ.get("HYPERSTACK_BLOCKED_REGIONS")
+    if env is None:
+        return set(_DEFAULT_BLOCKED_REGIONS)
+    return {r.strip().upper() for r in env.split(",") if r.strip()}
+
+
 def _regions() -> list[str]:
     out = request_with_retries("/core/regions")
     regs = out.get("regions", []) if isinstance(out, dict) else []
     names = [r.get("name") for r in regs if r.get("name")]
-    return names or ["NORWAY-1", "CANADA-1", "US-1", "CANADA-2"]
+    names = names or ["NORWAY-1", "CANADA-1", "US-1", "CANADA-2"]
+    blocked = _blocked_regions()
+    return [n for n in names if n.upper() not in blocked]
+
+
+# Hyperstack regions that DON'T support block-volume operations. LIVE-FOUND: CANADA-2 returns HTTP 400
+# "Volume operations are not supported in this region" on create — the region is launchable for COMPUTE
+# but has no volume backend, so the cache can't live there. Mirrors RunPod's _VOLUME_INCAPABLE_DATACENTERS.
+# These regions stay in `_regions()` (still usable for GPU launches), but the cache provisioner and the
+# launch-time attach skip them rather than burning a guaranteed-failing API call (the launch path already
+# degrades to a cold run there, so a stale list is graceful — but list a region here to silence the noise).
+_VOLUME_INCAPABLE_REGIONS = frozenset({"CANADA-2"})
+
+
+def region_supports_cache(region: str) -> bool:
+    """Whether the weight cache can be stored in ``region`` (False for known volume-incapable regions)."""
+    return region not in _VOLUME_INCAPABLE_REGIONS
+
+
+def cache_regions() -> list[str]:
+    """The subset of ``_regions()`` that supports block volumes — where the cache is provisioned."""
+    return [r for r in _regions() if region_supports_cache(r)]
 
 
 def flavors_by_region(force: bool = False) -> dict[str, list[dict]]:
@@ -178,17 +216,38 @@ def resolve_key_name(environment_name: str) -> str:
     name = f"{_MANAGED_KEYPAIR}-{environment_name}"
     if any(k.get("name") == name for k in existing):
         return name
-    request_with_retries(
-        "/core/keypairs",
-        method="POST",
-        body={
-            "name": name,
-            "environment_name": environment_name,
-            "public_key": _generate_throwaway_public_key(),
-        },
-        retries=0,
-    )
+    try:
+        request_with_retries(
+            "/core/keypairs",
+            method="POST",
+            body={
+                "name": name,
+                "environment_name": environment_name,
+                "public_key": _generate_throwaway_public_key(),
+            },
+            retries=0,
+        )
+    except HyperstackApiError as e:
+        # Create race: two concurrent launches into the same env both see no managed key and both
+        # POST. The loser gets an "already exists" rejection — that is SUCCESS, the env-scoped key now
+        # exists (the winner created it), so return the name. Re-list to confirm the key is really
+        # present before swallowing the error, so an UNRELATED 4xx (e.g. a bad public key / perms)
+        # still surfaces rather than being silently treated as a benign duplicate.
+        if _keypair_create_conflict(e) and any(
+            k.get("name") == name for k in list_keypairs()
+        ):
+            return name
+        raise
     return name
+
+
+def _keypair_create_conflict(err: Exception) -> bool:
+    """True when a keypair POST failed because the name already exists (a benign create race), not
+    for some other reason. Hyperstack returns 409/400 with an 'already exists'/'duplicate' body."""
+    s = str(err).lower()
+    if "-> http 409" in s:
+        return True
+    return ("-> http 4" in s) and ("already exist" in s or "duplicate" in s or "in use" in s)
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +343,81 @@ def get_vm(vm_id: str) -> dict | None:
     return inst if isinstance(inst, dict) else None
 
 
+# Hyperstack paginates ``/core/virtual-machines``: a single GET returns only the FIRST page, so an
+# account with more VMs than one page silently hides the rest. ``sweep_orphans`` lists every VM to
+# reap orphans, so a missed page = a leaked, still-billing box. Walk every page (bounded so a buggy
+# server that never shrinks the page can't loop forever) and concatenate.
+_VM_PAGE_SIZE = 100
+_VM_MAX_PAGES = 1000
+
+
 def list_vms() -> list[dict]:
-    out = request_with_retries("/core/virtual-machines")
-    insts = out.get("instances") if isinstance(out, dict) else None
-    return insts if isinstance(insts, list) else []
+    """Every Flash-listable VM across ALL pages (orphan-sweep + run-terminate read this).
+
+    Paginates ``/core/virtual-machines`` via ``page``/``per_page`` until a short/empty page is
+    reached. A page fetch that errors propagates AND a malformed page schema raises
+    ``HyperstackApiError`` — so a partial/incomplete list never masquerades as the authoritative
+    fleet and lets a sweep miss still-billing VMs (or reap survivors)."""
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    terminated = False
+    # Walk one page PAST the cap so a fleet that's an exact multiple of _VM_PAGE_SIZE can be CONFIRMED
+    # complete: its last in-cap page is full, so the only way to tell "complete (next page empty)"
+    # from "truncated (next page still has VMs)" is to fetch that extra probe page. The probe is
+    # gated below to fire ONLY at the cap boundary, so the normal walk still stops at _VM_MAX_PAGES.
+    for page in range(1, _VM_MAX_PAGES + 2):
+        resp = request_with_retries(
+            f"/core/virtual-machines?page={page}&per_page={_VM_PAGE_SIZE}"
+        )
+        # Distinguish a malformed response from a valid empty page. An unexpected schema (resp not a
+        # dict, or "instances" not a list) means we CANNOT trust this as the authoritative fleet —
+        # returning the partial list gathered so far would let an orphan sweep miss still-billing VMs
+        # past this point, so RAISE instead. A valid empty list is the legitimate end-of-pagination.
+        if not isinstance(resp, dict) or not isinstance(resp.get("instances"), list):
+            raise HyperstackApiError(
+                f"unexpected /core/virtual-machines response on page {page} "
+                f"(no 'instances' list): {resp!r}"
+            )
+        insts = resp["instances"]
+        if not insts:
+            terminated = True
+            break  # valid empty page -> done paginating (incl. the boundary probe confirming complete)
+        added = 0
+        for v in insts:
+            # De-dupe across pages: an older API that ignores the ``page`` param would echo page 1
+            # forever, so we count only NEW ids and stop below when a full page adds none.
+            # Use ``is not None`` (not truthiness) so a legitimately falsy id like 0 still de-dupes.
+            vid = str(v["id"]) if isinstance(v, dict) and v.get("id") is not None else None
+            if vid is not None and vid in seen_ids:
+                continue
+            if vid is not None:
+                seen_ids.add(vid)
+            out.append(v)
+            added += 1
+        # Last page (short) OR a full page that added nothing new (server ignoring pagination): done.
+        if len(insts) < _VM_PAGE_SIZE or added == 0:
+            terminated = True
+            break
+        # A FULL page that added new VMs and we've now consumed the cap (page == _VM_MAX_PAGES): the
+        # fleet might be exactly a multiple of the page size (complete) OR genuinely larger
+        # (truncated). DON'T raise yet — let the loop fetch ONE more page (_VM_MAX_PAGES + 1) as a
+        # probe: if it comes back empty, the break above marks ``terminated`` and we return the full
+        # fleet; if it still has VMs, the fleet is genuinely over-cap and we raise below.
+    if not terminated:
+        # The boundary probe page (_VM_MAX_PAGES + 1) ALSO came back full — pagination did not
+        # terminate within the cap and there are genuinely more VMs past it. Returning ``out`` here
+        # would hand back a truncated fleet as if authoritative, and an orphan sweep / run-terminate
+        # keying off it would miss (or fail to reap) still-billing VMs. Surface it as a
+        # HyperstackApiError — same as the malformed-page guard above — so the incomplete list never
+        # masquerades as the complete one. (An exact-multiple fleet whose probe page was empty
+        # already returned normally above and does NOT reach here.)
+        raise HyperstackApiError(
+            f"/core/virtual-machines pagination did not terminate within {_VM_MAX_PAGES} pages "
+            f"(the page past the cap was still full at {_VM_PAGE_SIZE}/page, {len(out)} VMs "
+            f"collected) — refusing to return a truncated fleet that an orphan sweep could read as "
+            f"authoritative"
+        )
+    return out
 
 
 def delete_vm(vm_id: str) -> bool:
@@ -307,6 +437,82 @@ def delete_vm(vm_id: str) -> bool:
             return True
         logger.warning("hyperstack delete_vm(%s) failed: %s", vm_id, exc)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Volumes (the weight cache). Region/environment-scoped block storage; created via the API, attached
+# to a VM AFTER launch, then formatted+mounted in the VM by the cloud-init preamble. Block volumes
+# are single-attach (one VM at a time) — concurrent same-region runs fall back to cold.
+# ---------------------------------------------------------------------------
+_CACHE_VOLUME_TYPE = "Cloud-SSD"
+
+
+def list_volumes() -> list[dict]:
+    """All volumes: ``[{id, name, environment:{name,region}, status, attachments}, ...]``."""
+    out = request_with_retries("/core/volumes")
+    vols = out.get("volumes") if isinstance(out, dict) else None
+    return vols if isinstance(vols, list) else []
+
+
+def create_volume(name: str, environment_name: str, size_gb: int) -> dict:
+    """Create a ``Cloud-SSD`` volume in ``environment_name`` -> its object (incl. integer ``id``)."""
+    body = {
+        "name": name,
+        "environment_name": environment_name,
+        "volume_type": _CACHE_VOLUME_TYPE,
+        "size": int(size_gb),
+    }
+    out = request_with_retries("/core/volumes", method="POST", body=body, retries=2)
+    return (out.get("volume") if isinstance(out, dict) else None) or {}
+
+
+def delete_volume(volume_id) -> bool:
+    """Delete a volume by id (best-effort)."""
+    try:
+        request_with_retries(f"/core/volumes/{volume_id}", method="DELETE", retries=2)
+        return True
+    except Exception as exc:
+        logger.warning("hyperstack delete_volume(%s) failed: %s", volume_id, exc)
+        return False
+
+
+def attach_volume(vm_id: str, volume_id) -> bool:
+    """Attach a volume to a VM (best-effort). The cloud-init preamble then formats+mounts the device;
+    if this fails the run still proceeds COLD (the preamble degrades when no device appears)."""
+    try:
+        request_with_retries(
+            f"/core/virtual-machines/{vm_id}/attach-volumes",
+            method="POST",
+            body={"volume_ids": [volume_id]},
+            retries=2,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("hyperstack attach_volume(vm=%s, vol=%s) failed: %s", vm_id, volume_id, exc)
+        return False
+
+
+def cache_volume_name(base: str, region: str) -> str:
+    """Physical cache-volume name for ``base`` in ``region`` — DISTINCT per region.
+
+    Hyperstack enforces GLOBAL volume-name uniqueness (a plain ``flash-weights`` can exist in only ONE
+    environment account-wide; a 2nd create elsewhere returns HTTP 400 "This name is not available").
+    The cache is one logical volume (``base`` == ``spec.gpu.network_volume``, e.g. ``flash-weights``)
+    realized as one physical volume per region, so the region MUST be in the name. Mirrors RunPod's
+    per-DC ``weight_cache_volume_name``. The cloud-init preamble mounts by device size, not name, so
+    the worker is unaffected — every cache volume mounts at the same ``/mnt/flash-weights``.
+    """
+    return f"{base}-{region}".lower()
+
+
+def ensure_volume(name: str, environment_name: str, size_gb: int) -> object:
+    """Create-if-absent the cache volume ``name`` in ``environment_name``; return its id. Idempotent:
+    reuses an existing same-name volume in that environment. ``name`` MUST be globally unique — use
+    ``cache_volume_name(base, region)`` (Hyperstack rejects a duplicate name across environments)."""
+    for v in list_volumes():
+        if v.get("name") == name and (v.get("environment") or {}).get("name") == environment_name:
+            return v.get("id")
+    return create_volume(name, environment_name, size_gb).get("id")
 
 
 def delete_vms(vm_ids: list[str]) -> list[str]:

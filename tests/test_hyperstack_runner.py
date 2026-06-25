@@ -143,6 +143,38 @@ def test_launch_raises_when_no_stock(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=[], attempt=0)
 
 
+def test_regions_excludes_canada1_by_default(monkeypatch):
+    """CANADA-1 (known broken-driver on-demand fleet) is dropped from the region list by default, so
+    the allocator + launcher never offer or boot there. The API still returns it; flash filters it."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.setattr(
+        hs_api,
+        "request_with_retries",
+        lambda *a, **k: {"regions": [{"name": "NORWAY-1"}, {"name": "CANADA-1"}, {"name": "US-1"}]},
+    )
+    monkeypatch.delenv("HYPERSTACK_BLOCKED_REGIONS", raising=False)
+    regions = hs_api._regions()
+    assert "CANADA-1" not in regions
+    assert regions == ["NORWAY-1", "US-1"]
+
+
+def test_regions_blocklist_is_env_overridable(monkeypatch):
+    """HYPERSTACK_BLOCKED_REGIONS overrides the default: set to "" re-enables CANADA-1 (operator
+    opt-in once the fleet recovers); set to another region blocks that instead."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.setattr(
+        hs_api,
+        "request_with_retries",
+        lambda *a, **k: {"regions": [{"name": "NORWAY-1"}, {"name": "CANADA-1"}, {"name": "US-1"}]},
+    )
+    monkeypatch.setenv("HYPERSTACK_BLOCKED_REGIONS", "")  # explicit empty -> nothing blocked
+    assert "CANADA-1" in hs_api._regions()
+    monkeypatch.setenv("HYPERSTACK_BLOCKED_REGIONS", "norway-1, us-1")  # case-insensitive
+    assert hs_api._regions() == ["CANADA-1"]
+
+
 def test_throwaway_keypair_missing_ssh_keygen_is_clear_error(monkeypatch):
     """A slim control plane without ssh-keygen must raise an actionable HyperstackApiError (install
     openssh-client / pin HYPERSTACK_KEYPAIR_NAME), not a bare FileNotFoundError that reads like an
@@ -183,6 +215,198 @@ def test_launch_skips_region_with_no_boot_image_without_reconciling(monkeypatch)
     assert h.vm_id == "vm-img"  # walked PAST CANADA-1's missing image to US-1
     assert h.region == "US-1"
     assert reconciled == []  # NEVER reconciled: a pre-launch failure leaves no phantom VM
+
+
+# ---------------------------------------------------------------------------
+# launch_and_submit: per-region weight cache (Hyperstack block volume)
+# ---------------------------------------------------------------------------
+def _wire_cache_launch(monkeypatch):
+    """Common wiring: image+key resolve, launch records user_data, returns the api module + recorders."""
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
+    launched = []
+
+    def fake_launch(*, name, environment_name, image_name, flavor_name, key_name, user_data):
+        launched.append({"env": environment_name, "user_data": user_data})
+        return "vm-cache"
+
+    monkeypatch.setattr(hs_api, "launch_vm", fake_launch)
+    return hs_api, jobs, launched
+
+
+def test_cache_ensures_volume_and_attaches_after_launch(monkeypatch):
+    hs_api, jobs, launched = _wire_cache_launch(monkeypatch)
+    ensured, attached = [], []
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: ensured.append((n, env, gb)) or "vol-7")
+    monkeypatch.setattr(hs_api, "attach_volume", lambda vm, vol: attached.append((vm, vol)))
+
+    jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+
+    # per-region physical name (Hyperstack volume names are globally unique), created in the env
+    assert ensured == [("flash-weights-canada-1", "default-CANADA-1", 100)]
+    assert attached == [("vm-cache", "vol-7")]  # attached AFTER launch (block volume can't attach at create)
+    ud = launched[0]["user_data"]
+    assert "-v '/mnt/flash-weights':/weight-cache" in ud  # bind into the worker (quoted host path)
+    assert "blkid" in ud  # format-if-new preamble (guard)
+    assert "mkfs.ext4" in ud  # format-if-new preamble (format)
+
+
+def test_cache_preamble_never_reformats_a_populated_volume(monkeypatch):
+    """The block-device preamble guards mkfs behind blkid so a populated cache is never wiped."""
+    from flash.providers.hyperstack.jobs import build_payload, build_user_data
+
+    ud = build_user_data(
+        build_payload(_spec(network_volume="flash-weights"), 0, 0,
+                      cache_host_mount="/mnt/flash-weights", cache_block_device=True)
+    )
+    # mkfs runs ONLY when blkid finds no filesystem (the `||` short-circuit) — never unconditionally.
+    assert 'blkid "$CACHE_DEV" >/dev/null 2>&1 || mkfs.ext4' in ud
+    assert "mount \"$CACHE_DEV\" '/mnt/flash-weights'" in ud  # quoted host mount
+    # Device is size-matched (never blindly the first unmounted disk) and skips disks with a mounted
+    # partition, so the boot disk is never reformatted.
+    assert "EXPECT_BYTES=" in ud
+    assert "lsblk -pnr -o MOUNTPOINT" in ud
+
+
+def test_cache_falls_back_cold_when_ensure_fails(monkeypatch):
+    hs_api, jobs, launched = _wire_cache_launch(monkeypatch)
+    attached = []
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: (_ for _ in ()).throw(RuntimeError("quota")))
+    monkeypatch.setattr(hs_api, "attach_volume", lambda vm, vol: attached.append((vm, vol)))
+
+    jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+    assert attached == []  # nothing attached
+    assert "/weight-cache" not in launched[0]["user_data"]  # cold user_data, no bind
+
+
+def test_cache_falls_back_cold_when_volume_has_no_id(monkeypatch):
+    """ensure_volume returning a falsy id (creation returned no id) must launch cold, not a cache
+    user_data that waits forever for a device that never attaches."""
+    hs_api, jobs, launched = _wire_cache_launch(monkeypatch)
+    attached = []
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: None)
+    monkeypatch.setattr(hs_api, "attach_volume", lambda vm, vol: attached.append((vm, vol)))
+
+    jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+    assert attached == []
+    assert "/weight-cache" not in launched[0]["user_data"]
+
+
+def test_no_cache_never_touches_volumes(monkeypatch):
+    hs_api, jobs, launched = _wire_cache_launch(monkeypatch)
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no ensure")))
+    monkeypatch.setattr(hs_api, "attach_volume", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no attach")))
+    jobs.launch_and_submit(_spec(), seed=0, instances=[_inst()], attempt=0)  # no network_volume
+    assert "/weight-cache" not in launched[0]["user_data"]
+
+
+def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
+    """In preload mode a cache-ensure failure SKIPS the region — never a cold full-training launch.
+
+    Regression: the cold user_data carries no mode/models, so cold-fallback for a preload would boot
+    a full training run (GPU billing, timeout) and warm nothing. The walk must skip and fail if no
+    region can host the cache.
+    """
+    import pytest
+
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: (_ for _ in ()).throw(RuntimeError("quota")))
+    launched = []
+    monkeypatch.setattr(hs_api, "launch_vm", lambda **kw: launched.append(kw) or "vm")
+
+    insts = [_inst(region="CANADA-1"), _inst(region="NORWAY-1")]
+    with pytest.raises(hs_api.HyperstackApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=insts, attempt=0,
+            mode="preload", models=["a/b"],
+        )
+    assert launched == []  # no region ever launched a cold (training) VM
+
+
+def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
+    """In preload mode the walk must NOT refresh to a NEW region on a target-region miss.
+
+    Regression: warm_instances pins each preload launch to one TARGET region and reports that exact
+    region as warmed. If the walk refreshed (usable_instances) to a different region and launched
+    there, the caller would report the cold target region as warmed. The walk must stay confined to
+    the given candidate(s) and FAIL when none can host the cache.
+    """
+    import pytest
+
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
+    # target region's cache is unavailable
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: (_ for _ in ()).throw(RuntimeError("quota")))
+    launched = []
+    monkeypatch.setattr(hs_api, "launch_vm", lambda **kw: launched.append(kw) or "vm")
+    # the refresh source offers a DIFFERENT region with a working cache — it must NOT be consulted
+    refresh_calls = []
+    monkeypatch.setattr(
+        jobs, "usable_instances",
+        lambda gpu, force=False: refresh_calls.append(force) or [_inst(region="ELSEWHERE-9")],
+    )
+
+    with pytest.raises(hs_api.HyperstackApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=[_inst(region="CANADA-1")],
+            attempt=0, mode="preload", models=["a/b"],
+        )
+    assert launched == []  # never launched anywhere (not in the refreshed region)
+    assert refresh_calls == []  # the stale-stock refresh was NOT consulted in preload mode
+
+
+def test_preload_mode_tears_down_when_attach_fails(monkeypatch):
+    """In preload mode a FAILED volume attach (vol busy on another VM / API error) must tear the just-
+    launched box down and walk on — not leave it billing while it waits for an absent device.
+
+    Regression: attach_volume() returns False on failure and the call ignored it, so a preload box
+    launched, couldn't warm (the sentinel check refuses ephemeral disk), and burned GPU to the wall cap.
+    A training run still tolerates a failed attach (degrades cold); only preload hard-fails the region.
+    """
+    import pytest
+
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: "vol-busy")
+    launched, terminated = [], []
+    monkeypatch.setattr(hs_api, "launch_vm", lambda **kw: launched.append(kw) or "vm-x")
+    monkeypatch.setattr(hs_api, "attach_volume", lambda vm, vol: False)  # attach FAILS
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda rid: terminated.append(rid))
+
+    with pytest.raises(hs_api.HyperstackApiError):
+        jobs.launch_and_submit(
+            _spec(network_volume="flash-weights"), seed=0, instances=[_inst(region="CANADA-1")],
+            attempt=0, mode="preload", models=["a/b"],
+        )
+    assert len(launched) == 1  # the box DID launch (attach is post-launch)...
+    assert terminated  # ...and was torn down when the attach failed (not left billing)
+
+
+def test_training_mode_tolerates_failed_attach(monkeypatch):
+    """A TRAINING run survives a failed attach: the cloud-init preamble degrades to a cold run, so the
+    box keeps running (no teardown) — only preload is strict about the cache."""
+    hs_api, jobs, _launched = _wire_cache_launch(monkeypatch)
+    terminated = []
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda n, env, gb: "vol-7")
+    monkeypatch.setattr(hs_api, "attach_volume", lambda vm, vol: False)  # attach fails
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda rid: terminated.append(rid))
+    # mode defaults to None (training) -> returns a handle, no teardown
+    h = jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+    assert h is not None
+    assert terminated == []
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +719,60 @@ def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):
     assert jobs.sweep_orphans(active_labels={"flash-100"}) == ["vm-2"]
 
 
+def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
+    """Warm/preload boxes (``flash-preload-...``) are driver-owned: launched by
+    preload.warm_instances, never persisted in the run DB (so never in the active set), and
+    self-terminated by the warm driver. The periodic sweep must NOT reap an IN-DEADLINE preload box by
+    the bare ``flash-`` prefix — a catalog warm can outlast the ~10-min sweep and would be killed
+    mid-download. A box with no embedded deadline (legacy launch) is likewise exempt.
+    """
+    import time
+
+    from flash.providers._instance import instance_label
+    from flash.providers._poll import preload_instance_run_id
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    # Build the name the way a launch does (instance_label bounds it to the provider name budget) so the
+    # reap parser is tested against the REAL, possibly-truncated VM name, not the raw run id.
+    fresh = preload_instance_run_id("hyperstack", "canada-1", int(time.time()) + 1800, "abcdef")
+    vms = [
+        {"id": "vm-1", "name": instance_label(fresh, 0, 0)},  # in-deadline warm box -> KEEP
+        {"id": "vm-legacy", "name": "flash-preload-hyperstack-canada-1-abcdef-s0-a0"},  # no deadline -> KEEP
+        {"id": "vm-2", "name": "flash-1700-cccc-s0-a0"},  # genuine orphan -> delete
+    ]
+    deleted = []
+    monkeypatch.setattr(hs_api, "list_vms", lambda: vms)
+    monkeypatch.setattr(hs_api, "delete_vms", lambda ids: deleted.extend(ids) or list(ids))
+    out = jobs.sweep_orphans(active_labels=set())  # none is a tracked active run
+    assert out == ["vm-2"]
+    assert deleted == ["vm-2"]
+
+
+def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
+    """A preload VM still alive past its embedded wall deadline + grace has lost its driver (the only
+    thing that deletes a Hyperstack VM — nothing on the box self-terminates it). The sweep must reap it
+    to bound the billing leak rather than exempt it forever."""
+    import time
+
+    from flash.providers._instance import instance_label
+    from flash.providers._poll import PRELOAD_REAP_GRACE_S, preload_instance_run_id
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    # Name built via instance_label (longest provider, "hyperstack") so the front-loaded deadline token
+    # must survive the provider name-budget truncation to be reaped.
+    stale_deadline = int(time.time()) - int(PRELOAD_REAP_GRACE_S) - 600
+    stale = preload_instance_run_id("hyperstack", "norway-1", stale_deadline, "deadbe")
+    vms = [{"id": "vm-9", "name": instance_label(stale, 0, 0)}]
+    deleted = []
+    monkeypatch.setattr(hs_api, "list_vms", lambda: vms)
+    monkeypatch.setattr(hs_api, "delete_vms", lambda ids: deleted.extend(ids) or list(ids))
+    out = jobs.sweep_orphans(active_labels=set())
+    assert out == ["vm-9"]
+    assert deleted == ["vm-9"]
+
+
 def test_provider_cancel_destroy_deletes_vm(monkeypatch):
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
@@ -572,3 +850,188 @@ def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=insts, attempt=0)
     assert attempts == ["default-CANADA-1"]  # no second launch
     assert reaped == ["flash-1700000000-abcd1234"]
+
+
+# ---------------------------------------------------------------------------
+# API: VM listing must paginate (orphan sweep reads it; a missed page = a leaked, billing VM)
+# ---------------------------------------------------------------------------
+def test_list_vms_paginates_all_pages(monkeypatch):
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    # Two full pages + a short third: list_vms must walk all three and concatenate.
+    pages = {
+        1: [{"id": i, "name": f"flash-r-s0-a0-{i}"} for i in range(page_size)],
+        2: [{"id": page_size + i, "name": f"flash-r-s0-a0-{page_size + i}"} for i in range(page_size)],
+        3: [{"id": 2 * page_size, "name": "flash-r-s0-a0-last"}],
+    }
+    seen_pages = []
+
+    def fake_req(path, **k):
+        # path like /core/virtual-machines?page=N&per_page=M
+        page = int(path.split("page=")[1].split("&")[0])
+        seen_pages.append(page)
+        return {"instances": pages.get(page, [])}
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    vms = hs_api.list_vms()
+    assert len(vms) == 2 * page_size + 1  # nothing dropped
+    assert seen_pages == [1, 2, 3]  # walked every page, stopped at the short one
+
+
+def test_list_vms_stops_when_server_ignores_pagination(monkeypatch):
+    """An older API that echoes page 1 regardless of ?page must not loop forever / double-count:
+    a full page that adds no NEW ids terminates the walk."""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    same_page = [{"id": i, "name": f"flash-r-s0-a0-{i}"} for i in range(page_size)]
+    calls = {"n": 0}
+
+    def fake_req(path, **k):
+        calls["n"] += 1
+        return {"instances": same_page}  # always page 1
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    vms = hs_api.list_vms()
+    assert len(vms) == page_size  # de-duped, not page_size * many
+    assert calls["n"] == 2  # one full page, then one more that added nothing -> stop
+
+
+def test_list_vms_raises_on_malformed_response(monkeypatch):
+    """An unexpected response schema (not a dict / no 'instances' list) must RAISE, not silently
+    return a partial fleet — orphan sweeping a partial list could miss still-billing VMs."""
+    from flash.providers.hyperstack import api as hs_api
+
+    # First page malformed (not a dict).
+    monkeypatch.setattr(hs_api, "request_with_retries", lambda path, **k: ["not", "a", "dict"])
+    with pytest.raises(hs_api.HyperstackApiError, match="unexpected /core/virtual-machines"):
+        hs_api.list_vms()
+
+    # 'instances' present but not a list.
+    monkeypatch.setattr(hs_api, "request_with_retries", lambda path, **k: {"instances": "oops"})
+    with pytest.raises(hs_api.HyperstackApiError, match="no 'instances' list"):
+        hs_api.list_vms()
+
+
+def test_list_vms_malformed_mid_walk_raises_not_partial(monkeypatch):
+    """A malformed LATER page (after valid pages) also raises rather than returning the partial list
+    gathered so far — that partial list would look authoritative to the orphan sweep."""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    full = [{"id": i, "name": f"flash-r-s0-a0-{i}"} for i in range(page_size)]
+
+    def fake_req(path, **k):
+        page = int(path.split("page=")[1].split("&")[0])
+        return {"instances": full} if page == 1 else {"unexpected": True}  # page 2 malformed
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    with pytest.raises(hs_api.HyperstackApiError, match="page 2"):
+        hs_api.list_vms()
+
+
+def test_list_vms_empty_page_one_is_valid_not_an_error(monkeypatch):
+    """A valid empty fleet (page 1 returns an empty 'instances' list) is NOT an error -> []."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.setattr(hs_api, "request_with_retries", lambda path, **k: {"instances": []})
+    assert hs_api.list_vms() == []
+
+
+def test_list_vms_raises_when_page_cap_hit_with_full_last_page(monkeypatch):
+    """A GENUINELY-truncated fleet (every page full of NEW ids, AND the page past the cap is STILL
+    full) must RAISE rather than return a truncated fleet — an orphan sweep keying off a partial
+    list would miss still-billing VMs past the cap."""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    # Lower the cap so the test is cheap; every page (incl. the cap+1 probe) is full AND adds
+    # brand-new ids, so none of the natural-termination conditions ever fire and the probe confirms
+    # the fleet is genuinely over-cap.
+    monkeypatch.setattr(hs_api, "_VM_MAX_PAGES", 3)
+
+    def fake_req(path, **k):
+        page = int(path.split("page=")[1].split("&")[0])
+        base = (page - 1) * page_size
+        return {"instances": [{"id": base + i, "name": f"flash-r-s0-a0-{base + i}"} for i in range(page_size)]}
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    with pytest.raises(hs_api.HyperstackApiError, match="did not terminate"):
+        hs_api.list_vms()
+
+
+def test_list_vms_exact_multiple_of_page_size_at_cap_does_not_raise(monkeypatch):
+    """A COMPLETE fleet whose size is an exact multiple of _VM_PAGE_SIZE and exactly fills
+    _VM_MAX_PAGES must NOT be mistaken for a truncated one: the last in-cap page is full, but the
+    probe page (_VM_MAX_PAGES + 1) comes back EMPTY -> the fleet is complete, return it WITHOUT
+    raising. (Regression for the exact-multiple edge case in the page-cap guard.)"""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    cap = 2
+    monkeypatch.setattr(hs_api, "_VM_MAX_PAGES", cap)
+    seen_pages = []
+    total = cap * page_size  # exactly fills `cap` full pages, then page cap+1 is empty
+
+    def fake_req(path, **k):
+        page = int(path.split("page=")[1].split("&")[0])
+        seen_pages.append(page)
+        base = (page - 1) * page_size
+        # Pages 1..cap are full of distinct ids; the cap+1 probe page is genuinely empty.
+        items = [
+            {"id": base + i, "name": f"flash-r-s0-a0-{base + i}"}
+            for i in range(page_size)
+            if base + i < total
+        ]
+        return {"instances": items}
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    vms = hs_api.list_vms()  # must NOT raise
+    assert len(vms) == total  # whole fleet returned, nothing dropped
+    # Walked the cap pages plus exactly ONE probe page (cap+1) that confirmed completeness.
+    assert seen_pages == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# API: managed-keypair create is race-tolerant (two concurrent launches into one env)
+# ---------------------------------------------------------------------------
+def test_resolve_key_name_tolerates_create_race(monkeypatch):
+    """Two concurrent launches into the same env both see no managed key and both POST; the loser
+    gets an 'already exists' rejection — that is SUCCESS (the env-scoped key now exists), so
+    resolve_key_name returns the name instead of crashing the launch."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.delenv("HYPERSTACK_KEYPAIR_NAME", raising=False)
+    env = "default-CANADA-1"
+    name = f"{hs_api._MANAGED_KEYPAIR}-{env}"
+    monkeypatch.setattr(hs_api, "_generate_throwaway_public_key", lambda: "ssh-ed25519 AAAA")
+    # First list: empty (race condition: both launches saw no key). Second list (post-conflict
+    # re-check): the winner's key is now present.
+    lists = iter([[], [{"name": name, "environment": {"name": env}}]])
+    monkeypatch.setattr(hs_api, "list_keypairs", lambda: next(lists))
+
+    def fake_req(path, method="GET", body=None, **k):
+        raise hs_api.HyperstackApiError(
+            "POST /core/keypairs -> HTTP 409: keypair name already exists"
+        )
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    assert hs_api.resolve_key_name(env) == name  # race tolerated
+
+
+def test_resolve_key_name_reraises_unrelated_create_error(monkeypatch):
+    """An UNRELATED keypair-create failure (e.g. bad public key / perms) must still surface, not be
+    swallowed as a benign duplicate."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.delenv("HYPERSTACK_KEYPAIR_NAME", raising=False)
+    monkeypatch.setattr(hs_api, "_generate_throwaway_public_key", lambda: "ssh-ed25519 AAAA")
+    monkeypatch.setattr(hs_api, "list_keypairs", lambda: [])
+
+    def fake_req(path, method="GET", body=None, **k):
+        raise hs_api.HyperstackApiError("POST /core/keypairs -> HTTP 400: invalid public_key")
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    with pytest.raises(hs_api.HyperstackApiError, match="invalid public_key"):
+        hs_api.resolve_key_name("default-CANADA-1")

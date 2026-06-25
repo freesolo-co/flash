@@ -9,9 +9,47 @@ keeps its own status/terminal handling inline.
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections.abc import Callable
 from typing import Any
+
+# Grace past a preload box's embedded wall deadline before an orphan sweep reaps it. A healthy warm
+# self-bounds at its wall cap (the in-box timer ``os._exit``s) and the driver's ``finally`` terminates
+# the instance; a box still alive THIS long past its deadline has lost its driver (the only thing that
+# tears instance providers down), so it is provably orphaned and safe to reap. Generous so clock skew /
+# a slow teardown / a near-deadline box mid-download is never reaped early.
+PRELOAD_REAP_GRACE_S = 1800.0
+
+
+def preload_instance_run_id(provider: str, region: str, reap_deadline_epoch: int, suffix: str) -> str:
+    """Build a ``flash-preload-*`` run id that embeds its wall-clock reap deadline (``-d<epoch>-``).
+
+    The epoch lets an orphan sweep reap a driver-lost warm box by NAME alone (no provider creation-time
+    field needed). ``reap_deadline_epoch`` is the box's wall-cap deadline in epoch seconds. Kept in sync
+    with ``preload_box_reap_due``'s parser — change both together.
+
+    The epoch is placed RIGHT AFTER ``flash-preload-`` (before provider/region) on purpose: the launched
+    instance NAME is bounded to the provider name budget by ``run_label_prefix``, which truncates the
+    TAIL and appends a hash. A long provider+region (e.g. hyperstack + a long region) would otherwise
+    push the deadline token past the cut and the reap parser would never see it — front-loading keeps
+    ``-d<epoch>-`` inside the surviving prefix."""
+    return f"flash-preload-d{int(reap_deadline_epoch)}-{provider}-{region.lower()}-{suffix}"
+
+
+def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GRACE_S) -> bool:
+    """True when a ``flash-preload-*`` instance name carries an embedded reap deadline (``-d<epoch>-``,
+    written by ``preload_instance_run_id``) that elapsed more than ``grace_s`` ago.
+
+    Used by the Lambda/Hyperstack orphan sweeps: warm boxes are normally driver-owned and exempt, but a
+    driver that died before its ``terminate_run_instances`` finally would leave one billing forever.
+    Reaping past deadline+grace bounds that leak. Names WITHOUT a parseable deadline (legacy launches)
+    return False — the unconditional driver-owned exemption still applies to them. The 10+ digit guard
+    keeps a region segment like ``us-east-1`` from being mistaken for the ``-d<epoch>-`` token."""
+    m = re.search(r"-d(\d{10,})-", name)
+    if not m:
+        return False
+    return float(m.group(1)) + grace_s < now
 
 
 def make_say(log) -> Callable[[str], None]:

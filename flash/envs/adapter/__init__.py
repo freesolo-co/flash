@@ -280,7 +280,13 @@ def _urlopen(
                 return resp.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
-            is_rate_limit = exc.code == 429 or (exc.code == 403 and "rate limit" in body.lower())
+            # GitHub signals an exhausted primary limit with a 403 + `X-RateLimit-Remaining: 0`
+            # header; the body may be empty or omit the phrase "rate limit", so check the header too
+            # rather than relying on substring matching alone. Secondary (abuse) limits come back 429.
+            remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
+            is_rate_limit = exc.code == 429 or (
+                exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
+            )
             if is_rate_limit and attempt < max_rate_limit_retries:
                 delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
                 time.sleep(delay)
@@ -652,13 +658,52 @@ class FreesoloEnvironment(BaseEnvironment):
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return float(self.scores_breakdown(completion, example, state)["total"])
 
+    def reward_many(self, items: list[tuple[dict, dict]]) -> list[float]:
+        """Reward for many ``(example, state)`` rollouts at once, in input order.
+
+        For multi-turn, episodes that share a task go through ONE ``score_episodes`` call, which the
+        env scores concurrently (``Environment.max_score_concurrency``) — replacing one blocking
+        scoring call per rollout. For a judge / network-reward env (where scoring dominates) this is
+        the multi-turn analogue of batched generation. Equals one :meth:`reward` per item:
+        ``score_episodes`` scores each episode independently, so batching changes only concurrency,
+        not values. Single-turn falls back to per-item :meth:`reward`."""
+        if not self.multi_turn:
+            # Single-turn scoring ignores state and grades the completion, so pass the rollout's
+            # actual response (stored on the state) — not "" (which would score every item empty).
+            return [self.reward(str(st.get("response_text") or ""), ex, st) for ex, st in items]
+        groups: dict[str, dict] = {}
+        order: list[str] = []
+        for i, (ex, st) in enumerate(items):
+            # Group rollouts of the same example (a GRPO group shares one prompt) so their episodes
+            # are scored together; the example dict is the stable grouping key.
+            key = json.dumps(ex, sort_keys=True, default=str)
+            grp = groups.get(key)
+            if grp is None:
+                grp = groups[key] = {
+                    "task": st.get("task") or self._task_example(ex),
+                    "idxs": [],
+                    "episodes": [],
+                }
+                order.append(key)
+            grp["idxs"].append(i)
+            grp["episodes"].append(self._episode_from_state(st))
+        out: list[float] = [0.0] * len(items)
+        for key in order:
+            grp = groups[key]
+            rewards = self._env.score_episodes(grp["task"], grp["episodes"])
+            if len(rewards) != len(grp["episodes"]):
+                raise RuntimeError("Freesolo environment score_episodes returned the wrong length")
+            for idx, rw in zip(grp["idxs"], rewards, strict=True):
+                out[idx] = float(rw.score)
+        return out
+
     @property
     def reward_thread_safe(self) -> bool:
-        """Whether ``reward`` may be called concurrently across rollouts (multiturn_rollout scores a
-        batch in a thread pool). The verifiers reward contract is a pure scorer — ``score_responses``
-        reads the per-call inputs + immutable env config — so the default is True. An underlying env
-        whose scorer keeps mutable state or a thread-bound client opts out with
-        ``reward_thread_safe = False`` and is scored serially."""
+        """Whether ``reward`` may be called concurrently across rollouts (multiturn_rollout's
+        ``_score_rollouts`` thread-pool fallback, used when the env has no ``reward_many``). The
+        verifiers reward contract is a pure scorer — ``score_responses`` reads the per-call inputs +
+        immutable env config — so the default is True. An underlying env whose scorer keeps mutable
+        state or a thread-bound client opts out with ``reward_thread_safe = False`` (scored serially)."""
         return bool(getattr(self._env, "reward_thread_safe", True))
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:

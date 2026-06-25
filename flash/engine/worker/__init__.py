@@ -56,6 +56,7 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
+    disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
     lora_exclude_modules,
     model_quant,  # noqa: F401
@@ -520,6 +521,13 @@ def heartbeat(stage: str, **kw):
         "attempt": ATTEMPT,
         **kw,
     }
+    # The datacenter the worker actually landed in (RunPod serverless sets RUNPOD_DC_ID) — a
+    # diagnostic so the control plane / logs show which region a run hit (the eager weight-cache fleet
+    # already has a volume in every storage DC). Empty/absent on non-RunPod (instance) workers and
+    # harmless; only emitted when present.
+    _dc = os.environ.get("RUNPOD_DC_ID") or ""
+    if _dc:
+        payload.setdefault("dc", _dc)
     os.makedirs("/tmp/hb", exist_ok=True)
     p = "/tmp/hb/heartbeat.json"
     # _HB_LOCK guards ONLY the fast local work (atomic write + _HB_LAST_UPLOAD + snapshot capture);
@@ -1087,8 +1095,6 @@ def run_sft():
         _dk["skip_prepare_dataset"] = True
         cfg_kwargs["dataset_kwargs"] = _dk
         cfg_kwargs["remove_unused_columns"] = False
-        from flash.catalog import vocab_size_for
-
         # Tokenize EXACTLY like TRL's non-packed prep (EOS-append parity so the model still learns to
         # stop; batched; truncate to max_length) then bin-pack into <= max_length blocks.
         _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
@@ -1985,24 +1991,59 @@ def run_rl():
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
         # The dataset carries example_idx (not the record); map each back to its original object.
-        examples = [rollout_examples[int(i)] for i in kwargs.get("example_idx", [])]
+        # Fail LOUD if TRL stops forwarding example_idx (column pruning / a TRL change): defaulting to
+        # [] would zip to ZERO examples -> empty rewards -> silent no-op / broken training (issues
+        # #206 / #210). A reward over the wrong/empty examples is far worse than crashing the run.
+        example_idx = kwargs.get("example_idx")
+        if example_idx is None:
+            raise RuntimeError(
+                "GRPO reward_fn received no 'example_idx' column from TRL — the reward cannot be "
+                "mapped back to its training example, so every reward would be empty/misaligned "
+                f"(got kwargs keys {sorted(kwargs)}). This usually means TRL dropped the dataset "
+                "column (remove_unused_columns / a TRL version change); the run is aborted rather "
+                "than silently training on no signal."
+            )
+        if len(example_idx) != len(completions):
+            raise RuntimeError(
+                f"GRPO reward_fn example_idx/completions length mismatch "
+                f"({len(example_idx)} vs {len(completions)}) — rewards would be misaligned with "
+                "the sampled completions; aborting rather than training on a shifted reward signal."
+            )
+        examples = [rollout_examples[int(i)] for i in example_idx]
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
-            if isinstance(comp, list):
-                # Tool / conversational transcript (TRL passes a list of messages): score the
-                # whole transcript via the environment reward (no <think> stripping —
-                # multi-turn content).
-                r = env.reward_from_messages(comp, ex)
-                rewards.append(r)
+            try:
+                if isinstance(comp, list):
+                    # Tool / conversational transcript (TRL passes a list of messages): score the
+                    # whole transcript via the environment reward (no <think> stripping —
+                    # multi-turn content).
+                    r = env.reward_from_messages(comp, ex)
+                    rewards.append(r)
+                    continue
+                graded = graded_text(comp)
+                breakdown = None
+                if hasattr(env, "scores_breakdown"):
+                    breakdown = env.scores_breakdown(graded, ex)
+                    r = float(breakdown.get("total", 0.0))
+                else:
+                    r = env.reward(graded, ex)
+            except Exception as _reward_exc:
+                # The user's environment raised during scoring (e.g. a transient network error
+                # calling an LLM judge). Treat this sample as 0 reward rather than crashing the
+                # entire RL run — a single bad score call should not kill the worker. Scoped
+                # deliberately to the env calls above: flash's own logic (the think penalty below)
+                # stays outside so a tokenizer/config bug fails loud instead of hiding as a 0.0.
+                print(
+                    f"[reward_fn] env scoring raised for completion {idx} "
+                    f"({type(_reward_exc).__name__}: {_reward_exc}); scoring as 0.0",
+                    flush=True,
+                )
+                rewards.append(0.0)
                 continue
-            graded = graded_text(comp)
-            breakdown = None
-            if hasattr(env, "scores_breakdown"):
-                breakdown = env.scores_breakdown(graded, ex)
-                r = float(breakdown.get("total", 0.0))
-            else:
-                r = env.reward(graded, ex)
+            # Thinking-length penalty is computed from flash's own tokenizer (not the user env), so it
+            # lives outside the try/except above — an internal failure here should crash the run, not
+            # be silently swallowed into a 0.0 reward.
             if _think_penalty > 0 and THINKING:
                 r -= _think_penalty * think_token_count(comp, tok)
             rewards.append(r)
@@ -2219,6 +2260,18 @@ def run_rl():
                     "FULL_AND_PIECEWISE CUDA graph compilation (Triton slot-mapping "
                     "crash workaround; update vLLM to a TRL-supported version to re-enable)"
                 )
+                # vLLM 0.19.1 ALSO hits `RuntimeError: aot_compile is not supported by the
+                # current configuration` through its DEFAULT torch.compile path on some GPU
+                # arches (Ampere sm_86: A6000, A100) — it fires from vllm/compilation/wrapper.py
+                # when torch._dynamo.is_compiling() is False inside the CUDA-graph capture path.
+                # Skipping FULL_AND_PIECEWISE above is not enough (the vllm_compilation_config
+                # GRPOConfig field doesn't exist in this TRL, so that _set_vllm_field is a no-op).
+                # VLLM_TORCH_COMPILE_LEVEL=0 (NO_COMPILATION) forces vLLM to execute the model
+                # eagerly, preventing the AOT path entirely. Official vLLM env var (vllm/envs.py);
+                # a no-op on a vLLM that doesn't define it. Don't override an operator-set value.
+                if "VLLM_TORCH_COMPILE_LEVEL" not in os.environ:
+                    os.environ["VLLM_TORCH_COMPILE_LEVEL"] = "0"
+                    print("[rl][warn] VLLM_TORCH_COMPILE_LEVEL=0 (prevent aot_compile on vLLM 0.19.1)")
         except Exception:
             pass
         if _cudagraph_safe:
@@ -2394,6 +2447,15 @@ def run_rl():
         if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
             _liger_loss.chunk_size = _cs
             print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
+    # Run liger's fused GRPO loss EAGER: drop ONLY its torch.compile (BROKEN on torch 2.10 — its
+    # dynamo guard-gen trips a symbol_to_source IndexError that crashes the first GRPO step on every
+    # path), keep the chunked memory path that prevents the 248k-vocab fp32-logit OOM. Must run BEFORE
+    # the mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure. See the helper.
+    if disable_liger_grpo_torch_compile(trainer):
+        print(
+            "[rl] liger GRPO loss: torch.compile DISABLED (eager loss math; chunked memory path "
+            "retained) — dodges the torch 2.10 dynamo guard-gen crash (symbol_to_source IndexError)"
+        )
     # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
     # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
     # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is
@@ -2627,6 +2689,13 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
+# How long to wait for wandb.finish() to flush. On SUCCESS the full run must sync (a slow network /
+# large run can exceed the old 5s and leave the run "crashed"), so give it a generous-but-bounded
+# window; on FAILURE abort fast (the run is failing regardless and the worker is hard-exiting).
+_WANDB_FINISH_WAIT_S = 120.0
+_WANDB_FINISH_FAIL_WAIT_S = 5.0
+
+
 # Baked compiled-kernel cache (opt-in; see Dockerfile.worker + flash/engine/worker/kernel_warmup.py).
 # The Dockerfile points TRITON_CACHE_DIR/TORCHINDUCTOR_CACHE_DIR here and, when built with
 # --build-arg BUILD_KERNEL_CACHE=true, bakes a portable mega-cache produced on a real GPU. These
@@ -2718,8 +2787,16 @@ def wandb_finish(exit_code: int = 0) -> None:
         return
     import importlib.util
 
-    if importlib.util.find_spec("wandb") is None:
-        return
+    # find_spec can RAISE (not just return None) when wandb is already in sys.modules with an
+    # absent/partial __spec__ (e.g. a namespace-package or a partially-initialized import) — that
+    # would propagate out of the shutdown path and skip the hard exit. Keep it best-effort: treat any
+    # probe failure as "wandb present enough to try", and let the import + finish below (already
+    # wrapped) decide. Only a definitive None (probe succeeded, module truly absent) returns early.
+    try:
+        if importlib.util.find_spec("wandb") is None:
+            return
+    except Exception:
+        pass  # ambiguous probe -> fall through and try to finish (still fully guarded below)
     try:
         import wandb
 
@@ -2736,9 +2813,14 @@ def wandb_finish(exit_code: int = 0) -> None:
 
         t = threading.Thread(target=_finish, daemon=True)
         t.start()
-        t.join(timeout=5)
+        # On SUCCESS (exit_code == 0) wandb.finish() must flush the full run; a slow network / large
+        # run can take well over 5s, and cutting it off there is what leaves the run dangling ->
+        # "crashed". Allow a longer, still-bounded wait on success; keep the short cut-off on the
+        # FAILURE path (exit_code != 0) where we want to abort fast and the run is failing anyway.
+        wait_s = _WANDB_FINISH_WAIT_S if exit_code == 0 else _WANDB_FINISH_FAIL_WAIT_S
+        t.join(timeout=wait_s)
         if t.is_alive():
-            print("[wandb] finish() timed out; continuing with hard exit")
+            print(f"[wandb] finish() did not complete within {wait_s}s; continuing with hard exit")
         elif errs:
             print(f"[wandb] finish() warning: {errs[0]}")
     except Exception as e:  # pragma: no cover - logging-only path

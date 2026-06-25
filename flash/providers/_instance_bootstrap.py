@@ -33,6 +33,17 @@ CODE_ROOT = "/runcode"
 CODE_DIR = "/runcode/code"
 
 
+class RetriableBootstrapError(RuntimeError):
+    """An infra-shaped bootstrap failure that should RETRY on a fresh host, not fail the run.
+
+    The control-plane pollers classify an attempt marker carrying ``retriable=True`` as
+    ``job_preempted`` (retried within the HF infra-retry budget) rather than ``job_failed`` (fails
+    fast). The bootstrap is self-contained (can't import the worker's ``RetriableInfraError``), so
+    this local sentinel marks the same shape: an HF-side failure (the spilled-spec fetch, or a
+    required-artifact upload that never landed) that a retry on a healthy host would clear. ``main``
+    keys the marker's ``retriable`` flag off whether the raised error is an instance of this."""
+
+
 def load_payload() -> dict:
     with open(PAYLOAD_PATH) as f:
         return json.load(f)
@@ -117,7 +128,26 @@ def build_worker_env(payload: dict) -> dict:
     # provider's cloud-init user_data cap); fetch it here when only the sentinel rode in the payload.
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
-        spec_json = fetch_spec_from_hf(payload)
+        # This fetch is the FIRST HF round-trip in the bootstrap and runs pre-worker (so the worker
+        # never starts and can't stamp a retriable heartbeat). Any failure here is infra-shaped, so
+        # surface it as RetriableBootstrapError — otherwise main() would mark ok=false with no
+        # retriable flag and the poller would fail the run fast (job_failed) instead of retrying it
+        # on a fresh host (job_preempted). A permanently missing/unreadable spec (a control-plane bug
+        # on the rare spilled-spec path) just burns the bounded infra-retry budget, then fails.
+        try:
+            spec_json = fetch_spec_from_hf(payload)
+        except Exception as e:
+            raise RetriableBootstrapError(
+                f"failed to fetch the spilled job spec from HF: {e}"
+            ) from e
+    if not spec_json:
+        # Neither an inline spec NOR the spilled-to-HF sentinel rode in the payload: a malformed
+        # payload (the control plane always sets exactly one). Fail loudly with the cause instead of
+        # crashing on the len(None) below with an opaque TypeError that buries the real problem.
+        raise RuntimeError(
+            "bootstrap payload carries no job spec: both job_spec_json and the job_spec_in_hf "
+            "sentinel are absent/empty — the control plane built an invalid worker payload"
+        )
     # Pass a large spec via a file, not the environment: a job spec with large inline params can
     # reach hundreds of KB, which trips execve's "Argument list too long". Mirrors
     # runpod/train.py:_train_body.
@@ -210,7 +240,12 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             uploader = threading.Thread(target=upload_loop, daemon=True)
             uploader.start()
         try:
-            proc.wait(timeout=max(10.0, deadline_ts - time.time()))
+            # Honor the wall-clock deadline: wait only up to the time left (floored to a small
+            # positive so the call never blocks forever on a 0/negative timeout). A prior ``max(10.0,
+            # …)`` floor could overshoot the deadline by ~10s when little/no time remained — that
+            # leftover 10s is paid GPU time past the run's wall cap, so we clamp to the remaining
+            # budget instead.
+            proc.wait(timeout=max(1.0, deadline_ts - time.time()))
         except subprocess.TimeoutExpired:
             timed_out = True
             proc.kill()
@@ -232,19 +267,138 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     return proc.returncode
 
 
-def write_attempt_marker(payload: dict, ok: bool, error: str = "") -> None:
+def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bool = False) -> None:
     """Attempt-scoped terminal marker (``<arm>_attempt<N>.json``): how the control plane
-    distinguishes THIS attempt's failure from a prior attempt's leftovers under the same prefix."""
+    distinguishes THIS attempt's failure from a prior attempt's leftovers under the same prefix.
+
+    ``retriable`` stamps the same flag the host failmark and the worker heartbeat use: the pollers
+    read ``marker.get("retriable")`` and classify a flagged failure as ``job_preempted`` (retried on
+    a fresh host within the HF infra budget) instead of ``job_failed`` (fails fast). Set it for
+    infra-shaped bootstrap failures (HF fetch/upload) so an HF outage doesn't burn the run."""
     marker = {
         "ok": bool(ok),
         "ts": time.time(),
         "attempt": int(payload.get("attempt") or 0),
+        "retriable": bool(retriable),
         "error": error[:2000],
     }
     p = "/tmp/attempt_marker.json"
     with open(p, "w") as f:
         json.dump(marker, f)
     hf_upload(payload, p, f"{_arm(payload)}_attempt{marker['attempt']}.json")
+
+
+def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Event] | None:
+    """Arm the preload path's wall-clock cap. The training path enforces ``max_wall_s`` by
+    ``run_mode`` killing the worker SUBPROCESS on its deadline, but ``run_preload`` runs
+    ``snapshot_download`` IN-PROCESS — a hung Hub download (or a stalled NIC) has no subprocess to
+    time out, so without this the paid Lambda/Hyperstack box can keep running long past ``timeout_s``
+    (the control-plane driver's ``terminate_run_instances`` only fires if that driver process is
+    still alive, and nothing on the box self-terminates). Mirror the deadline here: a daemon timer
+    writes a terminal failure marker (so the warm driver stops polling and the box can be reaped) and
+    HARD-exits the process — ``os._exit`` because a blocked C-level socket read in ``snapshot_download``
+    can't be unwound by a Python exception/signal. Returns ``(timer, done)``: the caller cancels the
+    timer AND sets ``done`` on a clean finish, so a wall expiry racing that finish no-ops in _fire."""
+    wall_s = float(payload.get("max_wall_s") or 0)
+    if wall_s <= 0:
+        return None
+    # Set by the caller the instant ``run_preload`` returns cleanly. ``Timer.cancel()`` cannot stop an
+    # _fire that is ALREADY RUNNING, so without this guard a wall expiry racing a successful finish
+    # would still upload an ok=false marker + ``os._exit(1)`` over a warmed cache (the warm driver then
+    # reports failure). _fire checks it first and no-ops when the preload already completed.
+    done = threading.Event()
+
+    def _fire() -> None:
+        if done.is_set():
+            return
+        msg = f"preload exceeded the wall-clock cap ({int(wall_s)}s); self-terminating box"
+        print(f"FLASH: {msg}", flush=True)
+        # Best-effort terminal marker so the driver/sweeper sees a terminal failure instead of polling
+        # to its own timeout. The wall cap often fires BECAUSE the Hub/NIC is hung (the main thread is
+        # stuck in snapshot_download), and write_attempt_marker does a blocking HF upload — running it
+        # inline here would wedge the timer thread on that same hung network and the paid VM would
+        # NEVER self-terminate, defeating the wall cap. So attempt the marker on a SEPARATE daemon
+        # thread, join it only briefly, then HARD-exit regardless of whether the upload finished. The
+        # marker is best-effort; the driver's own poll-timeout still frees the box if it's lost.
+        def _mark() -> None:
+            with contextlib.suppress(Exception):
+                write_attempt_marker(payload, ok=False, error=msg)
+
+        marker_thread = threading.Thread(target=_mark, daemon=True)
+        marker_thread.start()
+        marker_thread.join(timeout=8.0)
+        os._exit(1)
+
+    timer = threading.Timer(wall_s, _fire)
+    timer.daemon = True
+    timer.start()
+    return timer, done
+
+
+def run_preload(payload: dict) -> dict:
+    """Download-only warm: pull the requested models into the bind-mounted cache (HF_HOME) and exit.
+
+    The instance-provider mirror of runpod/train/endpoints._train_body's ``preload`` branch. NO
+    training, NO env code, NO worker subprocess — just ``snapshot_download`` straight into the cache so
+    the very first real run in this region is warm. HF_HOME (from the payload env) is rooted at the
+    per-region bind-mounted cache mount; we pass ``cache_dir`` EXPLICITLY (huggingface_hub freezes
+    HF_HUB_CACHE at import, so setting the env var here would be too late) and FAIL if the cache isn't
+    mounted (otherwise we'd warm ephemeral local disk that vanishes with the box).
+    """
+    env = payload.get("env") or {}
+    hf_home = env.get("HF_HOME") or ""
+    token = env.get("HF_TOKEN")
+    # The cache bind-mount must be present; HF_HOME is <mount>/hf-cache, so its parent is the mount.
+    # Checked BEFORE importing huggingface_hub so a missing mount fails fast (and stays testable).
+    mount = os.path.dirname(hf_home.rstrip("/")) if hf_home else ""
+    if not hf_home or not mount or not os.path.isdir(mount):
+        return {"preloaded": [], "already_cached": [], "failed": {},
+                "error": f"weight-cache not mounted (HF_HOME={hf_home!r}); refusing to warm ephemeral disk"}
+    # Require the mount sentinel for BOTH substrates. The cloud-init preamble drops it ONLY onto a
+    # verified-real mount: block-volume (Hyperstack) writes it after the device mounts; NFS (Lambda)
+    # writes it after confirming ``mountpoint`` (the platform auto-mount actually took). It is therefore
+    # visible here only when the REAL cache is mounted. Without it, Docker's ``-v`` bind silently
+    # auto-creates an EMPTY host dir -> the mount exists (isdir passes) but the sentinel is absent, which
+    # would otherwise warm EPHEMERAL disk (discarded at teardown) yet report a successful warm. The
+    # marker filename flows in via the payload from _instance.CACHE_MOUNT_MARKER (ONE source of truth);
+    # the literal is only a defensive fallback for an older payload that predates the field. A
+    # cache-attached preload payload always carries cache_mount_marker, so absence of the field is
+    # treated as "no sentinel expected" only when no cache mount was requested at all.
+    if payload.get("cache_mount_marker"):
+        marker = os.path.join(mount, payload["cache_mount_marker"])
+        if not os.path.exists(marker):
+            kind = "block volume" if payload.get("cache_block_device") else "NFS filesystem"
+            return {"preloaded": [], "already_cached": [], "failed": {},
+                    "error": (f"weight-cache {kind} not mounted (no sentinel at {marker}); "
+                              "refusing to warm ephemeral disk")}
+    from huggingface_hub import snapshot_download
+
+    cache_dir = os.path.join(hf_home, "hub")
+    # weights + tokenizer/config only (same exclusions as prefetch_model / the image bake / the RunPod
+    # preload branch) so the warmed cache matches exactly what workers later fetch.
+    ignore_patterns = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
+    done, already, failed = [], [], {}
+    for repo_id in payload.get("models") or []:
+        try:
+            # Idempotent: probe with local_files_only (HF's own resolution, NOT a dir-name guess) — if
+            # the snapshot is already on the volume, skip the network download. Mirrors the RunPod
+            # preload branch; accurate (no repo_id.replace heuristic) and avoids re-downloading.
+            try:
+                snapshot_download(repo_id=repo_id, token=token, cache_dir=cache_dir,
+                                  ignore_patterns=ignore_patterns, local_files_only=True)
+                already.append(repo_id)
+                print(f"preload: {repo_id} -> {cache_dir} (cached)", flush=True)
+                continue
+            except Exception:
+                pass
+            snapshot_download(repo_id=repo_id, token=token, cache_dir=cache_dir,
+                              ignore_patterns=ignore_patterns)
+            done.append(repo_id)
+            print(f"preload: {repo_id} -> {cache_dir} (downloaded)", flush=True)
+        except Exception as exc:
+            failed[repo_id] = str(exc)
+            print(f"preload FAILED {repo_id}: {exc}", flush=True)
+    return {"preloaded": done, "already_cached": already, "failed": failed}
 
 
 def main() -> int:
@@ -254,6 +408,7 @@ def main() -> int:
     payload = load_payload()
     ok = False
     error = ""
+    retriable = False
     try:
         # hf_transfer is baked into the worker image; enable it so model pulls saturate the NIC.
         try:
@@ -263,6 +418,47 @@ def main() -> int:
                 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         except Exception as _e:
             print("hf_transfer setup skipped:", _e)
+        # Preload (warm) mode: download-only into the mounted cache, then exit. No code fetch, no
+        # extra_pip, no worker subprocess — the warm driver (warm_instances) detects completion by
+        # polling the `<prefix>/preload_result.json` we upload just below (the attempt marker is still
+        # written in the finally, but it is NOT the preload completion signal).
+        if payload.get("mode") == "preload":
+            # Enforce the wall cap on the in-process download (the training path enforces it on the
+            # worker subprocess via run_mode; preload has no subprocess, so arm a watchdog here).
+            wall_cap = _arm_preload_wall_cap(payload)
+            try:
+                result = run_preload(payload)
+            finally:
+                if wall_cap is not None:
+                    wall_timer, wall_done = wall_cap
+                    # Mark done FIRST so a wall expiry racing this clean finish no-ops in _fire, THEN
+                    # cancel the timer (cancel can't stop an _fire that is already in flight).
+                    wall_done.set()
+                    wall_timer.cancel()
+            with open("/tmp/preload_result.json", "w") as f:
+                json.dump(result, f)
+            # preload_result.json is the AUTHORITATIVE completion signal the warm driver polls — a
+            # single transient Hub blip on this one upload (hf_upload swallows it) would silently drop
+            # it, leaving the driver to poll to its full timeout then terminate an already-warmed box
+            # and report it timed out. Best-effort RETRY a few times (bounded — never block forever) so
+            # a transient blip doesn't lose the completion file. Still NON-FATAL: the box exits success
+            # after the retries even if every one fails (the driver's terminal attempt-marker handling
+            # is the backstop), but log loudly so a persistent failure is observable.
+            for attempt in range(3):
+                hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
+                try:
+                    if hf_file_exists(payload, "preload_result.json"):
+                        break
+                except Exception as exc:
+                    print(f"preload_result.json upload confirm warn: {exc}", flush=True)
+                if attempt < 2:
+                    time.sleep(2.0 * (attempt + 1))
+            else:
+                print("preload_result.json upload FAILED after 3 attempts (completion file may be "
+                      "missing; driver falls back to the attempt marker)", flush=True)
+            ok = not result.get("error") and not result.get("failed")
+            error = result.get("error") or (f"models failed: {sorted(result.get('failed') or {})}" if result.get("failed") else "")
+            return 0 if ok else 1
         # The base training stack is baked into WORKER_IMAGE; only the per-run extras install here
         # (the verifiers/Freesolo env wheel + the chalk kernels) — exactly the payload's extra_pip.
         extra_pip = payload.get("extra_pip") or []
@@ -289,7 +485,12 @@ def main() -> int:
                 f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF dataset repo"
             )
         if rc != 0 and not remote_completion_confirmed(payload):
-            raise RuntimeError(
+            # The local metrics.json exists but the REQUIRED uploads (DONE/metrics.json) never landed
+            # on HF — an upload/HF-infra failure, not a code error. Surface it as retriable so the
+            # poller retries on a fresh host (job_preempted) within the HF infra budget instead of
+            # failing the run fast. During a full HF outage the worker's own retriable heartbeat may
+            # also be missing, so the marker's retriable flag is what carries the classification.
+            raise RetriableBootstrapError(
                 f"train phase '{phase}' exited non-zero ({rc}) and its required completion "
                 f"artifacts (DONE/metrics.json) are not on HF — the run did not finish (e.g. a "
                 f"failed upload after the local metrics.json was written); see error_{phase}.txt "
@@ -302,9 +503,13 @@ def main() -> int:
         # cause from reattach/debugging. BaseException records a useful error and still re-exits
         # nonzero (return 1) with the marker written in `finally`.
         error = f"{type(exc).__name__}: {exc}"
+        # An infra-shaped bootstrap failure (the pre-worker spilled-spec HF fetch, or a required
+        # artifact that never uploaded) is raised as RetriableBootstrapError so the marker carries
+        # retriable=True and the poller retries on a fresh host instead of failing the run fast.
+        retriable = isinstance(exc, RetriableBootstrapError)
         print(f"bootstrap failed: {error}", flush=True)
     finally:
-        write_attempt_marker(payload, ok, error)
+        write_attempt_marker(payload, ok, error, retriable=retriable)
     return 0 if ok else 1
 
 

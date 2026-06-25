@@ -1,0 +1,49 @@
+name: Version parity
+
+# Keep the two release channels pinned to the same version: the prod package `freesolo-flash`
+# (pyproject `[project].version`) and the dev-channel package `freesolo-flash-dev`
+# (`[tool.flash-dev].version`). They publish from `main` and `dev` respectively, so a divergence
+# would ship two channels claiming different versions. Bump both together.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  versions-match:
+    name: dev and main at the same version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # tomllib is stdlib only since 3.11; the runner's default python3 may predate that.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compare channel versions
+        run: |
+          python3 - <<'PY'
+          import sys
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+
+          prod = data["project"]["version"]
+          dev = data["tool"]["flash-dev"]["version"]
+          if prod != dev:
+              print(
+                  "::error::Channel version mismatch: "
+                  f"[project].version={prod} (freesolo-flash) != "
+                  f"[tool.flash-dev].version={dev} (freesolo-flash-dev). "
+                  "Bump both to the same version."
+              )
+              sys.exit(1)
+          print(f"OK: freesolo-flash and freesolo-flash-dev are both at {prod}.")
+          PY

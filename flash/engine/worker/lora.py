@@ -308,10 +308,51 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
         ratio = kwargs.get("vllm_is_ratio")
         if ratio is not None and ratio.dim() == 2 and ratio.size(1) == full_t:
             gk["vllm_is_ratio"] = _gather(ratio, idx, tprime)
-        return orig(**gk)
+        # The gathered tensors have shape (B, tprime) where tprime varies per micro-batch
+        # (it is the max unmasked-position count across the batch). torch.compile inside
+        # liger_kernel's compiled_compute_loss builds SHAPE_ENV guards keyed on static tensor
+        # dimensions; when tprime changes between calls, guard recompilation hits a
+        # symbol_to_source IndexError (InternalTorchDynamoError). Running the gathered call
+        # without torch.compile is still faster than the unmasked path: the gather already
+        # eliminated the masked FLOPs; eager overhead is negligible at 0.8B scale.
+        import torch._dynamo as _dynamo
+
+        _disabled_orig = getattr(masked_liger_loss, "_flash_disabled_orig", None)
+        if _disabled_orig is None:
+            _disabled_orig = _dynamo.disable(orig)
+            masked_liger_loss._flash_disabled_orig = _disabled_orig
+        return _disabled_orig(**gk)
 
     masked_liger_loss._flash_mask_aware = True  # sentinel for the idempotency check above
     trainer.liger_grpo_loss = masked_liger_loss
+    return True
+
+
+def disable_liger_grpo_torch_compile(trainer) -> bool:
+    """Run liger's fused GRPO loss EAGER — drop only its ``torch.compile``, keep the memory path.
+
+    ``LigerFusedLinearGRPOLoss`` wraps ONLY the loss math
+    (``fused_linear_ppo._compute_loss_from_logps``) in ``torch.compile`` (gated by its ``compiled``
+    flag, default True); the memory-efficient part — the chunked custom-autograd ``chunk_forward``
+    that never materializes the fp32 ``[batch, seq, ~248k vocab]`` logits — ALWAYS runs eager. On
+    torch 2.10 that ``torch.compile`` is BROKEN: its SHAPE_ENV guards are keyed on the per-call tensor
+    dims and guard generation trips a torch bug (``symbol_to_source`` IndexError surfaced as
+    ``InternalTorchDynamoError`` — "list index out of range" at ``symbolic_shapes.issue_guard``) that
+    crashes the FIRST GRPO step on EVERY path (single-turn, multi-turn, tool). It fires during
+    guard-build (after tracing), so neither the multi-turn ``suppress_errors=True`` nor the mask-aware
+    path's ``_dynamo.disable`` catches it.
+
+    Setting ``compiled=False`` makes liger skip the ``torch.compile`` wrapper entirely while KEEPING
+    the chunked memory path — so the 248k-vocab fp32-logit OOM fix (the whole reason
+    ``use_liger_kernel`` stays on for GRPO) is fully retained; only the loss-math JIT is dropped, and
+    its eager overhead is negligible at these tiny per-token GEMMs. Call this BEFORE
+    ``patch_grpo_mask_aware_lm_head`` (which replaces ``liger_grpo_loss`` with a closure) so it lands
+    on the live ``LigerFusedLinearGRPOLoss`` instance. No-op (returns False) when the loss isn't
+    present, predates the ``compiled`` flag, or already has it off. Returns True if it flipped it."""
+    loss = getattr(trainer, "liger_grpo_loss", None)
+    if loss is None or not getattr(loss, "compiled", False):
+        return False
+    loss.compiled = False
     return True
 
 
@@ -391,7 +432,16 @@ def _rewrite_safetensors_header_keys(path: str, rename) -> int:
         header_bytes = f.read(hdr_len)
         if len(header_bytes) < hdr_len:
             raise ValueError(f"{path}: truncated safetensors header")
-        header = json.loads(header_bytes)
+        try:
+            header = json.loads(header_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # Re-raise with the file path so a corrupt adapter being rewritten is diagnosable
+            # (a bare JSONDecodeError/UnicodeDecodeError names no file). Non-UTF8 header bytes
+            # raise UnicodeDecodeError, not JSONDecodeError, so catch both to keep the context.
+            raise ValueError(
+                f"{path}: safetensors header is not valid JSON "
+                f"(corrupt or not a safetensors file): {exc}"
+            ) from exc
     data_start = 8 + hdr_len
 
     new_header = {}
@@ -509,14 +559,23 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
             header_bytes = f.read(hdr_len)
             if len(header_bytes) < hdr_len:
                 raise ValueError(f"{st_path}: truncated safetensors header")
-            header = json.loads(header_bytes)
+            try:
+                header = json.loads(header_bytes)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                # A bare JSONDecodeError ("Expecting value: line 1 column 1") — or a
+                # UnicodeDecodeError from non-UTF8 header bytes — gives no clue WHICH adapter is
+                # corrupt. Re-raise with the file path so a bad download is diagnosable.
+                raise ValueError(
+                    f"{st_path}: safetensors header is not valid JSON "
+                    f"(corrupt or not a safetensors file): {exc}"
+                ) from exc
         # The safetensors header MUST be a JSON object keyed by tensor name. A corrupt/hostile file
-        # could decode to a list/int/str or carry non-string keys, which would later blow up with a
-        # confusing TypeError in _is_lora_key (substring search on a non-str). Validate the shape here
-        # (this reader is the "reject hostile headers early" hardening) and fail with a clear message.
-        if not isinstance(header, dict) or not all(isinstance(k, str) for k in header):
+        # could decode to a list/int/str, which would later blow up with a confusing TypeError in
+        # _is_lora_key (substring search on a non-str). (JSON object keys are always str, so only the
+        # container type needs checking.) Reject a non-object header early with a clear message.
+        if not isinstance(header, dict):
             raise ValueError(
-                f"{st_path}: safetensors header is not a JSON object with string keys "
+                f"{st_path}: safetensors header is not a JSON object "
                 "(corrupt or not a safetensors file)"
             )
         return [k for k in header if k != "__metadata__"]

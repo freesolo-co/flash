@@ -29,12 +29,16 @@ def _alloc(gpu="RTX A6000", rate=0.49, candidates=None):
     if candidates is None:
         candidates = (Candidate("runpod", gpu, rate, 48),)
     return Allocation(
-        provider="runpod",
+        provider=candidates[0].provider,
         gpu=candidates[0].gpu,
         hourly_usd=candidates[0].hourly_usd,
         min_vram_gb=12,
         candidates=tuple(candidates),
     )
+
+
+def _hs_handle(vm_id="vm1"):
+    return {"provider": "hyperstack", "vm_id": vm_id, "region": "CANADA-1", "name": "n"}
 
 
 def _runpod_handle(endpoint_id="ep", job_id="j"):
@@ -145,6 +149,225 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     assert cancelled == [("ep1", "j1")]
     assert "ep1" in deleted
     assert "walking past the cheapest class" in log.getvalue()
+
+
+def test_select_candidate_escapes_failed_provider_then_walks_classes():
+    """The retry picker prefers cheapest first, escapes a failed provider cross-provider on retry,
+    and only walks classes within a provider once every provider has been burned."""
+    from flash.providers.base import Candidate
+    from flash.runner.lifecycle import _select_candidate
+
+    cands = (
+        Candidate("runpod", "RTX A6000", 0.49, 48),
+        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),
+        Candidate("hyperstack", "RTX A6000", 0.50, 48),
+    )
+    # Attempt 0 (nothing failed): cheapest overall.
+    assert _select_candidate(cands, set(), set()) is cands[0]
+    # RunPod burned an infra attempt -> escape to the OTHER provider, not the next RunPod class.
+    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "RTX A6000")})
+    assert (chosen.provider, chosen.gpu) == ("hyperstack", "RTX A6000")
+    # Both providers burned -> fall back to the cheapest class NOT yet tried (within-provider walk).
+    chosen = _select_candidate(
+        cands,
+        {"runpod", "hyperstack"},
+        {("runpod", "RTX A6000"), ("hyperstack", "RTX A6000")},
+    )
+    assert (chosen.provider, chosen.gpu) == ("runpod", "RTX 6000 Ada")
+
+
+def test_select_candidate_single_provider_walks_classes():
+    """With only one provider configured, the picker degrades to the cheapest untried class."""
+    from flash.providers.base import Candidate
+    from flash.runner.lifecycle import _select_candidate
+
+    cands = (Candidate("runpod", "L4", 0.39, 24), Candidate("runpod", "RTX A6000", 0.49, 48))
+    assert _select_candidate(cands, {"runpod"}, {("runpod", "L4")}).gpu == "RTX A6000"
+
+
+def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
+    """Issue 7: a RunPod queue / no-capacity failure must retry on a DIFFERENT provider
+    (Hyperstack) rather than walking to the next RunPod class while Hyperstack sits available."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.hyperstack import jobs as hs_jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("runpod", "RTX A6000", 0.49, 48),  # cheapest -> attempt 0
+        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # next RunPod class (the WRONG retry target)
+        Candidate("hyperstack", "RTX A6000", 0.50, 48),  # the right cross-provider escape
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    rp_gpus, hs_gpus = [], []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        rp_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle("ep1", "j1"))
+        return PollResult(
+            False, failure="no_capacity", detail="job stuck IN_QUEUE (no RunPod capacity)"
+        )
+
+    def fake_hs(spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        hs_gpus.append(spec.gpu.type)
+        if on_handle:
+            on_handle(_hs_handle())
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    monkeypatch.setattr(hs_jobs, "submit_run_hyperstack", fake_hs)
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+    assert metrics["train_tokens"] == 4096
+    assert rp_gpus == ["RTX A6000"]  # RunPod tried exactly once...
+    assert hs_gpus == ["RTX A6000"]  # ...then the retry escaped cross-provider to Hyperstack
+    assert orch.get_status(spec.run_id).remote["provider"] == "hyperstack"
+    assert "walking past the cheapest class" in log.getvalue()
+
+
+def test_auto_cache_run_gets_cacheless_fallback_at_zero_retries(orch, monkeypatch):
+    """The platform auto-attaches the SHARED weight cache, so its endpoint-pinning DC-set
+    restriction must not cost the user a GPU-walk retry: a no_capacity on the cached spec earns ONE
+    extra, cache-less cross-region attempt even at max_retries=0 (else the auto-cache could fail a
+    run a cache-less launch would have won). Regression for the cache-fallback-vs-retry-budget gap.
+    """
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: _alloc(candidates=(Candidate("runpod", "RTX A6000", 0.49, 48),)),
+    )
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    volumes_seen = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        vol = getattr(run_spec.gpu, "network_volume", None)
+        volumes_seen.append(vol)
+        if on_handle:
+            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        # Cache-attached attempt -> no_capacity (the cache's DC set is starved); the cache-less
+        # fallback attempt -> success.
+        if vol == WEIGHT_CACHE_VOLUME_NAME:
+            return PollResult(False, failure="no_capacity", detail="IN_QUEUE (cache DC set starved)")
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=0, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
+    _seed_status(orch, spec)
+    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    assert metrics["train_tokens"] == 4096
+    # Exactly two attempts: the cache-attached one (no_capacity) then the bonus cache-less retry.
+    assert volumes_seen == [WEIGHT_CACHE_VOLUME_NAME, None]
+
+
+def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
+    """The cache-drop fallback is a FREE attempt — it must not spend the user's GPU-walk retry budget.
+    With max_retries=1 and both the cache attempt AND the cache-less same-class fallback hitting
+    no_capacity, the run must still walk to a DIFFERENT class (its one real retry), not stop after the
+    cache drop. Regression for the cache-fallback-steals-the-only-retry gap (the stop check counted the
+    cache-drop attempt against max_retries)."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    candidates = (
+        Candidate("runpod", "RTX A6000", 0.49, 48),  # cheapest -> cache attempt, then cache-less same class
+        Candidate("runpod", "RTX 6000 Ada", 0.50, 48),  # the GPU-walk target the real retry must reach
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    monkeypatch.setattr(runpod_api, "cancel_job", lambda e, j: None)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    seen = []
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        vol = getattr(run_spec.gpu, "network_volume", None)
+        seen.append((run_spec.gpu.type, vol))
+        if on_handle:
+            on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}"))
+        # Cache attempt AND its cache-less same-class fallback both starve; only the walk to the OTHER
+        # class (the genuine retry that must survive the cache drop) succeeds.
+        if run_spec.gpu.type == "RTX 6000 Ada":
+            return PollResult(True, metrics={"train_tokens": 4096})
+        return PollResult(False, failure="no_capacity", detail="IN_QUEUE (no capacity)")
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME, network_volume_gb=100)
+    _seed_status(orch, spec)
+    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
+    assert metrics["train_tokens"] == 4096
+    # cache attempt -> cache-less SAME class (free fallback) -> GPU-walk to the OTHER class (real retry).
+    assert seen == [
+        ("RTX A6000", WEIGHT_CACHE_VOLUME_NAME),
+        ("RTX A6000", None),
+        ("RTX 6000 Ada", None),
+    ]
+
+
+def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
+    """Issue 5: a Hyperstack VM whose CUDA never inits fails job_preempted; the retry must move to
+    a DIFFERENT provider (RunPod) instead of re-rolling another broken Hyperstack VM, and the sick
+    VM is torn down before the retry."""
+    from flash.providers import allocator
+    from flash.providers.base import Candidate, PollResult
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs as hs_jobs
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import jobs as rp_jobs
+
+    candidates = (
+        Candidate("hyperstack", "L40", 0.40, 48),  # cheapest -> attempt 0 (lands on broken VM)
+        Candidate("hyperstack", "RTX A6000", 0.45, 48),  # next class on the SAME (sick) provider
+        Candidate("runpod", "RTX A6000", 0.49, 48),  # the right cross-provider escape
+    )
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
+    deleted_vms = []
+    monkeypatch.setattr(hs_api, "delete_vm", lambda vid: deleted_vms.append(vid) or True)
+    monkeypatch.setattr(runpod_api, "delete_endpoint", lambda e: True)
+
+    hs_gpus, rp_gpus = [], []
+
+    def fake_hs(spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        hs_gpus.append(spec.gpu.type)
+        if on_handle:
+            on_handle(_hs_handle("vm-broken"))
+        return PollResult(
+            False,
+            failure="job_preempted",
+            detail="GPU never became ready after 12 tries: cuda not available",
+        )
+
+    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
+        rp_gpus.append(run_spec.gpu.type)
+        on_handle(_runpod_handle("ep2", "j2"))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(hs_jobs, "submit_run_hyperstack", fake_hs)
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
+    spec = _spec()
+    _seed_status(orch, spec)
+    log = io.StringIO()
+    metrics = orch._submit_seed_supervised(spec, 0, log)
+    assert metrics["train_tokens"] == 4096
+    assert hs_gpus == ["L40"]  # broken Hyperstack VM tried once...
+    assert rp_gpus == ["RTX A6000"]  # ...then escaped cross-provider to RunPod
+    assert "vm-broken" in deleted_vms  # sick VM torn down before the retry
+    assert orch.get_status(spec.run_id).remote["provider"] == "runpod"
 
 
 def test_genuine_worker_error_does_not_retry(orch, monkeypatch):

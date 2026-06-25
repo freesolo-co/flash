@@ -1047,3 +1047,39 @@ def test_find_real_libcudart_handles_bare_soname_without_crashing(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _no_nvidia)
     # On a host without a real libcudart the bare soname won't load -> None (no exception, no skip).
     assert perf._find_real_libcudart() is None
+
+
+def test_find_real_libcudart_finds_cu13_wheel_layout(tmp_path, monkeypatch):
+    """Regression: the resolver must be CUDA-major-agnostic. The cu13 nvidia wheel ships the runtime
+    at ``nvidia/cu13/lib/libcudart.so.13`` (NOT ``nvidia/cuda_runtime/lib/libcudart.so.12``, and it
+    has no ``nvidia.cuda_runtime`` module), so the original ``.so.12``-only probe returns None on a
+    cu13 stack -> the stub shadow stays in place. Build a real .so exporting cudaDeviceReset at the
+    cu13 wheel path and assert the resolver finds it (this FAILS against the .so.12-only version)."""
+    import ctypes.util
+    import glob
+    import os
+    import types
+
+    cu13lib = tmp_path / "nvidia" / "cu13" / "lib"
+    cu13lib.mkdir(parents=True)
+    real = str(cu13lib / "libcudart.so.13")
+    if not _compile_so(str(tmp_path / "real.c"), real, "void cudaDeviceReset(void){}"):
+        import pytest
+
+        pytest.skip("no C toolchain to build a real libcudart.so")
+
+    from flash.engine.worker import perf
+
+    # Fake the `nvidia` namespace package so its __path__ is our tmp tree (the cu13 wheel layout).
+    fake_nvidia = types.ModuleType("nvidia")
+    fake_nvidia.__path__ = [str(tmp_path / "nvidia")]
+    monkeypatch.setitem(sys.modules, "nvidia", fake_nvidia)
+    # Neutralize the toolkit + ldconfig fallbacks so ONLY the wheel-layout path can match — keeps the
+    # assertion deterministic on any CI box, with or without a system CUDA install.
+    monkeypatch.setattr(ctypes.util, "find_library", lambda _n: None)
+    _real_glob = glob.glob
+    monkeypatch.setattr(
+        glob, "glob", lambda p, *a, **k: ([] if p.startswith("/usr") else _real_glob(p, *a, **k))
+    )
+
+    assert perf._find_real_libcudart() == os.path.realpath(real)

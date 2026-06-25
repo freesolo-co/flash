@@ -57,6 +57,62 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
+def _drop_weight_cache(spec: JobSpec) -> JobSpec:
+    """Spec with the SHARED weight-cache volume removed (run cold + fully cross-region).
+
+    Used after a no-capacity attempt: attaching the cache restricts the endpoint to the cache's
+    datacenter set, so if that whole set is momentarily starved the next attempt should fall back to
+    the unrestricted all-DC pool. Dropping ``network_volume`` makes weight_cache_endpoint_kwargs
+    return ``{}`` (no volume, no datacenter list) and turns off the worker's HF_HOME redirect — i.e.
+    exactly today's cold cross-region behavior. Worst case for the cache is one capacity-grace wait,
+    never a permanent IN_QUEUE block.
+
+    ONLY the platform-managed SHARED cache (``WEIGHT_CACHE_VOLUME_NAME``) is dropped. A non-shared
+    per-org/custom ``network_volume`` is a deliberate escape-hatch isolation (see
+    runner._assign_weight_cache_volume) the user opted into — it is PRESERVED across retries rather
+    than silently stripped.
+    """
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
+        return spec
+    d = spec.to_dict()
+    d["gpu"] = {**d["gpu"], "network_volume": None}
+    return JobSpec.from_dict(d)
+
+
+def _select_candidate(candidates, failed_providers: set[str], tried_classes: set[tuple[str, str]]):
+    """Pick the next (provider, class) to try from the cross-provider ranked candidate list.
+
+    ``candidates`` is already price-sorted (cheapest first). On the FIRST attempt — nothing failed
+    yet — this returns the cheapest overall, unchanged. On an infra-shaped RETRY it ESCAPES the
+    failed substrate *cross-provider* before walking classes within it:
+
+      * a congested provider (RunPod queue timeout / no warm workers) is left for a DIFFERENT
+        provider (Hyperstack / Lambda) on retry instead of hopping to its next-cheapest class —
+        which, when the whole provider is busy, is just as likely to time out (issue: A6000 queue
+        timeout retried onto another RunPod class while Hyperstack A6000 sat available); and
+      * a provider handing out a broken GPU (a Hyperstack VM whose CUDA never comes up ->
+        ``job_preempted``) is likewise escaped to another provider rather than re-rolling the same
+        broken region.
+
+    When every provider has already burned a retry (or only one provider is configured) it falls
+    back to the cheapest class NOT yet tried, preserving the within-provider class walk.
+
+    Keyed on (provider, gpu) IDENTITY, never a list index, so it stays correct even though each
+    attempt re-allocates and the live-capacity ordering can shift between attempts.
+    """
+    return min(
+        candidates,
+        key=lambda c: (
+            c.provider in failed_providers,  # 1) escape providers that already failed this run
+            (c.provider, c.gpu) in tried_classes,  # 2) then prefer a class not yet tried
+            c.hourly_usd,  # 3) then cheapest
+            c.vram_gb,  # 4) then the smaller card (don't burn a big GPU on a small job)
+        ),
+    )
+
+
 def _submit_seed_supervised(
     spec: JobSpec,
     seed: int,
@@ -65,13 +121,16 @@ def _submit_seed_supervised(
 ) -> dict:
     """Run one seed with the job submit/poll path + bounded auto-retry.
 
-    Each attempt first ALLOCATES the GPU: the cheapest active RunPod class that fits the model,
-    priced from the static GPU table. There is no GPU pin — the cheapest fitting class in the
-    validated pool always wins.
+    Each attempt first ALLOCATES the GPU: the cheapest fitting class across every active provider
+    (RunPod's validated pool + any Lambda/Hyperstack class with live capacity), price-ranked. There
+    is no GPU pin — the cheapest fitting class wins the first attempt.
 
     Retries (fresh job on a fresh host; worker resumes from the latest HF checkpoint) when the
-    failure looks infra-shaped: a stall (heartbeat frozen), a client polling breakdown, or a
-    platform TIMED_OUT/worker-loss.
+    failure looks infra-shaped: a stall (heartbeat frozen), no capacity, a client polling breakdown,
+    or a platform TIMED_OUT/preemption/worker-loss. Each infra retry ESCAPES the provider that just
+    failed cross-provider before walking classes within it (see ``_select_candidate``), so a
+    congested provider (RunPod queue timeout) or one handing out a broken GPU (a Hyperstack VM whose
+    CUDA never inits) is left for a healthy substrate rather than re-rolling the same failure.
     Genuine worker errors (the run's code crashed; traceback persisted to HF) fail
     immediately.
     """
@@ -85,6 +144,11 @@ def _submit_seed_supervised(
     # so on_handle persists it into the run handle and a recovery via attach_run costs the
     # class actually used rather than the parse-time provisional spec.gpu.type.
     current_gpu: dict = {}
+    # Whether the CURRENT attempt's class is the last gpu-walk candidate (set right before each
+    # submit). Persisted into the run handle so a recovery via attach_run polls with the SAME
+    # no-capacity stall tuning the original submit used (see jobs.stall_kwargs / RunpodProvider.poll)
+    # — otherwise a reattached last-candidate run would be judged on the shorter non-last grace.
+    current_on_last_gpu: dict = {"value": False}
     # Every RunPod endpoint id this run registered across attempts. Retries run on
     # rN-suffixed endpoints whose names _gc_run_endpoints cannot reconstruct, and a
     # failed delete during the next attempt's teardown would otherwise lose the id;
@@ -99,7 +163,12 @@ def _submit_seed_supervised(
         _update(
             spec.run_id,
             "running",
-            remote={**handle, "seed": int(seed), "allocated_gpu": current_gpu.get("name")},
+            remote={
+                **handle,
+                "seed": int(seed),
+                "allocated_gpu": current_gpu.get("name"),
+                "on_last_gpu": bool(current_on_last_gpu["value"]),
+            },
         )
 
     def _gc_seen_endpoints() -> None:
@@ -113,11 +182,37 @@ def _submit_seed_supervised(
 
     max_retries = int(spec.gpu.max_retries)
     last_detail = None
-    # Index into the ranked candidate list. It advances only after an attempt that
-    # actually provisioned a class lost it to an infra failure (see the retry tail), so a
-    # failed allocation — which never tried a card — can't skip past the cheapest class.
-    gpu_walk_offset = 0
-    for attempt in range(max_retries + 1):
+    # Sticky: once a no-capacity failure shows the weight-cache datacenter set is starved, drop the
+    # cache (volume) for every remaining attempt so they run on the unrestricted all-DC pool.
+    drop_weight_cache = False
+    # The platform auto-attaches the SHARED weight cache (runner._assign_weight_cache_volume), so its
+    # endpoint-pinning DC-set restriction must not cost the USER a GPU-walk retry. Grant ONE extra,
+    # cache-less fallback attempt — consumed ONLY by the cache-drop transition below (the stop check
+    # gates the bonus on ``first_cache_drop``, never on a plain GPU walk) — so a no_capacity/poll_error
+    # the cache's datacenter set could have caused always earns one unrestricted cross-region retry,
+    # even at ``max_retries == 0`` (where the auto-cache would otherwise fail a run a cache-less launch
+    # could have won). A non-shared per-org/custom volume is the user's own choice and earns no bonus.
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    started_with_shared_cache = getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
+    cache_fallback_attempts = 1 if started_with_shared_cache else 0
+    # Cross-provider retry memory. ``failed_providers`` are the providers that consumed an
+    # infra-shaped attempt; ``tried_classes`` the exact (provider, gpu) pairs already attempted.
+    # Both grow only when an attempt that ACTUALLY provisioned a class lost it to an infra failure
+    # (see the retry tail) — a failed allocation never tried a card, so it can't poison the next
+    # pick. ``_select_candidate`` reads them to escape a sick/congested provider cross-provider on
+    # retry before walking classes within it.
+    failed_providers: set[str] = set()
+    tried_classes: set[tuple[str, str]] = set()
+    # Attempts spent on the cache-drop fallback, EXCLUDED from the GPU-walk budget. The bonus slot
+    # ``cache_fallback_attempts`` widens the loop range, but the budget checks below use the raw attempt
+    # counter; without this offset the cache-drop attempt would still tick the budget, so a run that
+    # spends its bonus on the cache drop could never reach its real ``max_retries`` GPU-walk retries
+    # (the fallback would silently steal the only user retry). ``walk_attempt`` = attempt index with the
+    # cache-drop attempt(s) removed, so the GPU walk gets its full budget AFTER a cache drop.
+    cache_drop_consumed = 0
+    for attempt in range(max_retries + 1 + cache_fallback_attempts):
+        walk_attempt = attempt - cache_drop_consumed
         if attempt > 0 and last_handle:
             # A stalled/timed-out attempt often means the worker is pinned to a
             # throttled/sick host; tear it down so the fresh deploy lands elsewhere.
@@ -194,27 +289,53 @@ def _submit_seed_supervised(
             with contextlib.suppress(FileNotFoundError):
                 if get_status(spec.run_id).state == "cancelled":
                     raise _RunCancelled(f"run {spec.run_id} was cancelled")
-            # Walk down the ranked candidates by the walk offset (clamped to the last): the
-            # first attempt takes the cheapest; each retry that provisioned a class and lost
-            # it to an infra failure steps to the next-cheapest, so a capacity-starved class
-            # can't burn the whole budget.
-            last_idx = len(alloc.candidates) - 1
-            walk_idx = min(gpu_walk_offset, last_idx)
-            chosen = alloc.candidates[walk_idx]
-            # Once the walk lands on (or clamps to) the last candidate there is no next-best class
-            # left to fall to — tell the provider so its no-capacity backstops wait longer before
-            # giving up rather than burning a retry on a class with no fallback. A pinned/single-
-            # candidate run is "last" from attempt 0, which is what we want.
-            on_last_gpu = walk_idx == last_idx
+            # Pick this attempt's (provider, class) from the cross-provider ranked list: the first
+            # attempt takes the cheapest; each retry that provisioned a class and lost it to an infra
+            # failure ESCAPES that provider before walking classes within it (see _select_candidate),
+            # so a congested/sick provider can't burn the whole budget.
+            chosen = _select_candidate(alloc.candidates, failed_providers, tried_classes)
+            # ``on_last_gpu`` == NO further GPU attempt will be made after this one — either the
+            # candidate list is exhausted (``len(untried) <= 1``) OR the retry budget is exhausted
+            # (``attempt >= max_retries``, including the single-attempt ``max_retries == 0`` case).
+            # Any remaining alternates are only ever reached on a RETRY, so on the final iteration
+            # there is no next-best GPU to fall back to regardless of how many candidates remain.
+            # Tell the provider so its no-capacity backstops wait longer before giving up rather than
+            # failing fast into a retry that will never happen. A pinned/single-candidate run is
+            # "last" from attempt 0, which is what we want.
+            untried = [c for c in alloc.candidates if (c.provider, c.gpu) not in tried_classes]
+            # The cache-drop fallback (cache_fallback_attempts) is a reserved attempt PAST the retry
+            # budget, so when it's still available a cache-attached RunPod attempt is not "last" by
+            # BUDGET — don't let ``attempt >= max_retries`` mark it last-GPU (long no-capacity grace),
+            # so a no_capacity fails fast into that fallback (notably at max_retries == 0). This only
+            # gates the BUDGET clause: genuine class exhaustion (``len(untried) <= 1``) still marks
+            # last-GPU (the fallback re-uses the same class cache-less — there's no OTHER class to walk
+            # to), preserving the walk semantics for non-cache-caused failures (e.g. a stalled walk).
+            cache_fallback_available = (
+                started_with_shared_cache
+                and not drop_weight_cache
+                and chosen is not None
+                and chosen.provider == "runpod"
+            )
+            on_last_gpu = len(untried) <= 1 or (
+                walk_attempt >= max_retries and not cache_fallback_available
+            )
+            # Mirror into the closure cell so on_handle persists THIS attempt's value (see
+            # current_on_last_gpu) for a recovery to reproduce the same stall tuning.
+            current_on_last_gpu["value"] = on_last_gpu
             print(allocation_summary(alloc), file=log, flush=True)
-            if chosen.gpu != alloc.gpu:
+            if (chosen.provider, chosen.gpu) != (alloc.provider, alloc.gpu):
                 print(
                     f"retry {attempt}: walking past the cheapest class to {chosen.gpu} "
-                    f"@ ${chosen.hourly_usd:.2f}/hr",
+                    f"@ {chosen.provider} ${chosen.hourly_usd:.2f}/hr",
                     file=log,
                     flush=True,
                 )
             run_spec = _spec_with_gpu(spec, chosen.gpu)
+            # After a no-capacity attempt, fall back to a cache-less cross-region run (see
+            # drop_weight_cache below): the attached cache pins the endpoint to its DC set, so the
+            # fallback must run on the unrestricted pool.
+            if drop_weight_cache:
+                run_spec = _drop_weight_cache(run_spec)
             current_gpu["name"] = chosen.gpu
             provider = get_provider(chosen.provider)
             try:
@@ -265,20 +386,59 @@ def _submit_seed_supervised(
         except FileNotFoundError:
             # Status file not yet written (early race): treat as not-cancelled and proceed.
             pass
+        # Best-effort cache-drop fallback — computed BEFORE the log + budget stop so both reflect it.
+        # If a VOLUME-BACKED RunPod attempt failed in a way the cache could have caused — no_capacity
+        # (the cache restricts the endpoint to its DC set) or a deploy/submit poll_error (e.g. the SDK
+        # failing to create/attach a volume) — drop the cache so the run degrades to a cold, unrestricted
+        # cross-region attempt instead of looping on the same volume-backed spec (the IN_QUEUE-forever /
+        # persistent-volume-failure block). Sticky: once dropped it stays dropped. A non-volume flake
+        # (stall/preempt) keeps the cache so the warm-weights benefit survives ordinary retries.
+        # Gate to RunPod: instance providers (Lambda/Hyperstack) already fall back to a cold run
+        # per-region INSIDE the launch walk, so their no_capacity isn't cache-caused. Only the SHARED
+        # platform cache triggers it (gate on the exact name); a non-shared per-org/custom volume is the
+        # intended escape-hatch isolation (runner._assign_weight_cache_volume) and must NOT be stripped.
+        run_had_cache = bool(
+            chosen is not None
+            and chosen.provider == "runpod"
+            and getattr(run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
+        )
+        first_cache_drop = (
+            run_had_cache
+            and not drop_weight_cache
+            and res.failure in ("no_capacity", "poll_error")
+        )
+        # "retrying" is true when the GPU-walk budget remains OR a cache-drop fallback will retry this
+        # even past it (first_cache_drop) — else the log would say "not retrying" while the loop actually
+        # continues with the reserved cache-less fallback attempt.
         print(
             f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and attempt < max_retries else 'not retrying'}"
+            f"{'retrying (resume from last checkpoint)' if infra_shaped and (walk_attempt < max_retries or first_cache_drop) else 'not retrying'}"
             f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
             file=log,
             flush=True,
         )
-        if not infra_shaped or attempt >= max_retries:
+        if not infra_shaped:
             break
-        # Step to the next-cheapest class only when THIS attempt actually provisioned one
-        # and it failed infra-shaped. An allocation/pricing failure (chosen is None) never
-        # tried a card, so the next attempt must retry from the cheapest, not walk past it.
-        if chosen is not None:
-            gpu_walk_offset += 1
+        # Stop when the GPU-walk retry budget is exhausted — UNLESS a cache-drop fallback is still
+        # available. The bonus attempt granted above is reserved for exactly this transition; once the
+        # cache is dropped (sticky), ``first_cache_drop`` is False so the budget check applies normally
+        # and the loop cannot spin past its one extra cache-less attempt.
+        if walk_attempt >= max_retries and not first_cache_drop:
+            break
+        if first_cache_drop:
+            drop_weight_cache = True
+            # This attempt was the FREE cache-drop fallback, not a GPU-walk retry — exclude it from the
+            # budget so the subsequent ``walk_attempt`` still counts ``max_retries`` real retries.
+            cache_drop_consumed += 1
+            # Do NOT advance the GPU walk on this transition: the next attempt should retry the SAME
+            # cheapest GPU without the volume on the wider all-DC pool first — the miss may have been
+            # the cache's datacenter set, not the GPU class globally. Only walk if THAT also fails.
+        elif chosen is not None:
+            # Record what THIS attempt burned so the next pick escapes it cross-provider — only when
+            # an attempt actually provisioned a class and lost it infra-shaped. An allocation/pricing
+            # failure (chosen is None) never tried a card, so it must not poison the next pick.
+            failed_providers.add(chosen.provider)
+            tried_classes.add((chosen.provider, chosen.gpu))
     # Retry budget exhausted: GC every endpoint this seed registered (the final
     # attempt's is in status.remote for _gc_run_endpoints, but intermediate rN ones
     # are only known here).
