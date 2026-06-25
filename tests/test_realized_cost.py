@@ -336,3 +336,65 @@ def test_reconcile_once_sweeps_due_runs(monkeypatch):
     monkeypatch.setattr(reconcile, "reconcile_run", fake_reconcile_run)
     assert reconcile.reconcile_once(now=now) == 1
     assert seen == ["due"]
+
+
+# ----------------------------------------------------------- _reconcile_cost_loop cancel/error
+# The background loop must (a) re-raise asyncio.CancelledError so the lifespan's task.cancel()
+# can stop it at shutdown (no stall), and (b) swallow a real Exception from a sweep and continue
+# to the next cycle — the same contract the sibling reaper/sweep loops uphold. #191 follow-up.
+class _StopLoop(Exception):
+    """Sentinel raised from the patched asyncio.sleep to terminate the otherwise-infinite loop."""
+
+
+def _run_reconcile_loop_once(monkeypatch, reconcile_once_impl):
+    """Drive _reconcile_cost_loop through exactly ONE sweep, then break out via the next sleep.
+
+    The loop awaits asyncio.sleep BEFORE the sweep, so the first sleep returns and the second
+    raises _StopLoop to end the loop deterministically without a 3600s wait. reconcile_once is a
+    SYNC callable run via asyncio.to_thread(...), so the stub is a plain sync function."""
+    import asyncio
+
+    from flash.server import app as server_app
+
+    # reconcile_once is imported function-locally inside the loop
+    # (`from flash.server.reconcile import reconcile_once`), so patch it at the source module.
+    monkeypatch.setattr(reconcile, "reconcile_once", reconcile_once_impl)
+
+    calls = {"sleep": 0}
+
+    async def fake_sleep(_interval):
+        calls["sleep"] += 1
+        if calls["sleep"] >= 2:  # 1st sleep: enter the loop body; 2nd: break out post-sweep
+            raise _StopLoop
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return asyncio.run(server_app._reconcile_cost_loop()), calls
+
+
+def test_reconcile_cost_loop_swallows_sweep_error_and_continues(monkeypatch):
+    import pytest
+
+    swept = {"n": 0}
+
+    def boom_once(*a, **k):
+        swept["n"] += 1
+        raise RuntimeError("provider billing API blip")
+
+    # The RuntimeError must NOT escape; the loop reaches the next sleep, which breaks it (_StopLoop).
+    with pytest.raises(_StopLoop):
+        _run_reconcile_loop_once(monkeypatch, boom_once)
+    assert swept["n"] == 1  # the sweep ran once and its failure was swallowed (loop kept going)
+
+
+def test_reconcile_cost_loop_reraises_cancelled(monkeypatch):
+    import asyncio
+
+    import pytest
+
+    def cancel_once(*a, **k):
+        raise asyncio.CancelledError
+
+    # A cancel surfacing during the sweep must propagate (re-raised), NOT be swallowed as a
+    # generic Exception — otherwise shutdown would stall until the next cancellation point.
+    with pytest.raises(asyncio.CancelledError):
+        _run_reconcile_loop_once(monkeypatch, cancel_once)

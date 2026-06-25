@@ -135,7 +135,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
     from flash.providers import _instance_bootstrap as lb
 
     calls: list[str] = []
-    markers: list[tuple[bool, str]] = []
+    markers: list[tuple[bool, str, bool]] = []
     monkeypatch.setattr(
         lb,
         "load_payload",
@@ -154,7 +154,11 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
     )
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)
     monkeypatch.setattr(lb, "run_mode", lambda p, e, m, d: (calls.append(m), rc)[1])
-    monkeypatch.setattr(lb, "write_attempt_marker", lambda p, ok, error="": markers.append((ok, error)))
+    monkeypatch.setattr(
+        lb,
+        "write_attempt_marker",
+        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
+    )
     monkeypatch.setattr(lb.os.path, "exists", lambda p: metrics if "metrics.json" in p else False)
     return lb, calls, markers
 
@@ -163,15 +167,18 @@ def test_bootstrap_train_success(monkeypatch):
     lb, calls, markers = _bootstrap_env(monkeypatch)
     assert lb.main() == 0
     assert calls == ["sft"]  # one fresh worker process
-    assert markers == [(True, "")]
+    assert markers == [(True, "", False)]  # success marker, not retriable
 
 
 def test_bootstrap_fails_without_metrics(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
     assert lb.main() == 1
-    ok, error = markers[0]
+    ok, error, retriable = markers[0]
     assert not ok
     assert "metrics.json" in error
+    # A genuine no-metrics crash (the worker never produced metrics) is a REAL failure, not infra:
+    # it must NOT be flagged retriable (that would loop a deterministically-broken run).
+    assert retriable is False
 
 
 def test_bootstrap_sets_lambda_arm():
@@ -677,6 +684,41 @@ def test_instance_label_always_sweepable():
     assert instance_label("fail-fast", 0, 0) == "flash-fail-fast-s0-a0"  # prefix forced
 
 
+def test_instance_label_bounds_seed_and_attempt():
+    """The seed/attempt suffix is the only caller-supplied text appended after the (already-bounded)
+    run prefix: an absurd seed OR attempt (or a non-int) must NOT push the name past the 60-char
+    provider cap, which would get the name silently truncated and desync it from the sweep-matched
+    prefix. BOTH numeric fields are bounded so the WHOLE suffix stays <= _SUFFIX_BUDGET."""
+    from flash.providers._instance import _MAX_NAME, _SUFFIX_BUDGET, run_label_prefix
+    from flash.providers.lambdalabs.jobs.builders import instance_label
+
+    def suffix_of(rid, label):
+        return label[len(run_label_prefix(rid)) :]
+
+    # Normal small ids: unchanged.
+    assert instance_label("flash-1700000000-abcd1234", 0, 0) == "flash-1700000000-abcd1234-s0-a0"
+    # Absurdly large seed: name stays within the cap (and keeps the -a boundary).
+    rid = "flash-1700000000-abcd1234"
+    huge = instance_label(rid, 123456789012345, 0)
+    assert len(huge) <= _MAX_NAME
+    assert len(suffix_of(rid, huge)) <= _SUFFIX_BUDGET
+    assert "-a0" in huge
+    # Absurdly large ATTEMPT (corrupt) alone: still bounded (the earlier fix only trimmed seed).
+    huge_att = instance_label(rid, 0, 999999999999)
+    assert len(huge_att) <= _MAX_NAME
+    assert len(suffix_of(rid, huge_att)) <= _SUFFIX_BUDGET
+    assert huge_att.startswith(rid + "-s")  # framing + prefix intact for sweep matching
+    # BOTH seed and attempt huge together: whole suffix bounded.
+    both_huge = instance_label(rid, 123456789, 987654321)
+    assert len(both_huge) <= _MAX_NAME
+    assert len(suffix_of(rid, both_huge)) <= _SUFFIX_BUDGET
+    # A long run id AND both fields huge together still fit.
+    both = instance_label("flash-" + "x" * 80, 99999999999, 7777777)
+    assert len(both) <= _MAX_NAME
+    # A non-int seed/attempt degrades to 0 instead of crashing / overflowing.
+    assert instance_label(rid, "weird", "bad").startswith(rid + "-s0-a0")
+
+
 def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
@@ -857,13 +899,18 @@ def test_bootstrap_honors_nonzero_exit_without_remote_artifacts(monkeypatch):
     """Bug: a worker that exits non-zero AFTER writing /tmp/metrics.json locally but BEFORE its
     required DONE/metrics.json upload (e.g. a transient RetriableInfraError uploading them) must
     NOT be reported as success. The local file exists, so the old code wrote ok=true; now we only
-    tolerate a non-zero exit when the REMOTE completion artifacts are confirmed on HF."""
+    tolerate a non-zero exit when the REMOTE completion artifacts are confirmed on HF.
+
+    The failure is infra-shaped (a failed required upload), so the marker carries retriable=True:
+    during an HF outage the worker's own retriable heartbeat may also be missing, so the marker's
+    flag is what makes the poller retry on a fresh host (job_preempted) instead of failing fast."""
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
     assert lb.main() == 1
-    ok, error = markers[0]
+    ok, error, retriable = markers[0]
     assert not ok
     assert "non-zero" in error  # propagated as a real (retriable) failure, not a false ok=true
+    assert retriable is True  # infra/upload failure -> retried, not job_failed
 
 
 def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
@@ -873,7 +920,7 @@ def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
     assert lb.main() == 0
-    assert markers[0] == (True, "")
+    assert markers[0] == (True, "", False)
 
 
 def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
@@ -910,6 +957,62 @@ def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
     assert "FLASH_JOB_SPEC_JSON" not in env
     with open("/tmp/job_spec.json") as f:
         assert f.read() == big
+
+
+def test_build_worker_env_raises_clearly_without_a_spec():
+    """A malformed payload carrying NEITHER an inline job_spec_json NOR the job_spec_in_hf sentinel
+    must raise a clear RuntimeError naming the cause — not crash on len(None) with an opaque
+    TypeError that buries the real (control-plane payload) bug."""
+    from flash.providers import _instance_bootstrap as lb
+
+    with pytest.raises(RuntimeError, match="no job spec"):
+        lb.build_worker_env(
+            {"phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"}  # no job_spec_* at all
+        )
+
+
+def test_build_worker_env_spilled_spec_fetch_failure_is_retriable(monkeypatch):
+    """The pre-worker HF fetch of a spilled spec is infra-shaped: a transient failure must surface
+    as RetriableBootstrapError (not a bare error) so main() marks the attempt retriable and the
+    poller retries on a fresh host instead of failing the run fast."""
+    from flash.providers import _instance_bootstrap as lb
+
+    monkeypatch.setattr(
+        lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503"))
+    )
+    with pytest.raises(lb.RetriableBootstrapError, match="spilled job spec"):
+        lb.build_worker_env(
+            {"job_spec_json": "", "job_spec_in_hf": True, "phase": "sft", "seed": 0,
+             "env": {}, "flash_arm": "lambda"}
+        )
+
+
+def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
+    """End-to-end: a payload whose spilled-spec HF fetch fails -> main() exits non-zero AND the
+    written attempt marker carries retriable=True (so the poller -> job_preempted, not job_failed)."""
+    from flash.providers import _instance_bootstrap as lb
+
+    markers: list[tuple[bool, str, bool]] = []
+    monkeypatch.setattr(
+        lb,
+        "load_payload",
+        lambda path=lb.PAYLOAD_PATH: {
+            "hf_repo": "org/repo", "job_spec_json": "", "job_spec_in_hf": True,
+            "phase": "sft", "seed": 0, "flash_arm": "lambda", "env": {}, "extra_pip": [],
+            "hf_prefix": "sft/x/seed0", "max_wall_s": 60, "attempt": 0,
+        },
+    )
+    monkeypatch.setattr(lb, "fetch_code", lambda p: None)
+    monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503")))
+    monkeypatch.setattr(
+        lb, "write_attempt_marker",
+        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
+    )
+    assert lb.main() == 1
+    ok, error, retriable = markers[0]
+    assert not ok
+    assert "spilled job spec" in error
+    assert retriable is True
 
 
 def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
@@ -952,8 +1055,15 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     # bytes is a valid path type and huggingface_hub could misread it as a (huge) filesystem path.
     assert isinstance(uploaded["fileobj"], io.BytesIO)
     assert uploaded["fileobj"].getvalue() == big.encode()
-    # user_data is tiny despite a 100KB spec, and the caller's payload is untouched.
-    assert len(ud) < 25_000
+    # The 100KB spec content is genuinely OUT of user_data (the whole point of the spill): not even
+    # a fragment of it rides inline. (A brittle exact byte-size threshold would break as the bootstrap
+    # script legitimately grows; assert the semantic invariant instead.)
+    assert "v" * 1000 not in ud
+    # And user_data stays under a generous, provider-aligned cap: cloud-init user_data limits run
+    # ~16KB (AWS) to 64KB; the base64+heredoc framing inflates it, so 64KB is the ceiling the spill
+    # threshold is chosen to keep us under. A 100KB inline spec alone would already blow this.
+    assert len(ud) < 64_000
+    # The caller's payload is untouched (the spill works on a copy).
     assert payload["job_spec_json"] == big
     assert "job_spec_in_hf" not in payload
 
@@ -970,7 +1080,11 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
     """Bug: a container that fast-fails on a real user/config error uploads its own ok=false marker,
     then the host's ~5s liveness check fires fail() and would CLOBBER it with a retriable host
     marker (relabeling the user error as job_preempted). The host failmark must SKIP the write when
-    a worker attempt marker already exists at the path (and stay conservative on a read error)."""
+    a worker attempt marker already exists at the path (and stay conservative on a read error).
+
+    Also covers the TOCTOU race: the worker can write its marker in the window BETWEEN the initial
+    existence check and the host upload, so the failmark RE-checks immediately before uploading and
+    still skips if the worker's marker has appeared."""
     import sys
     import types
 
@@ -978,9 +1092,14 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
 
     payload = {"flash_arm": "lambda", "attempt": 0, "hf_prefix": "sft/x/seed0", "hf_repo": "o/r", "env": {}}
 
-    def run_failmark(worker_marker_exists, read_raises=False):
-        """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads."""
+    def run_failmark(exists_seq=(False,), read_raises=False):
+        """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads.
+
+        ``exists_seq`` is the sequence of file_exists() return values across the (up to two) checks
+        the script makes; the last value repeats once exhausted."""
         uploaded = []
+        seq = list(exists_seq)
+        calls = {"n": 0}
 
         class FakeApi:
             def __init__(self, token=None):
@@ -989,7 +1108,9 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
             def file_exists(self, *, repo_id, filename, repo_type):
                 if read_raises:
                     raise RuntimeError("hf down")
-                return worker_marker_exists
+                i = min(calls["n"], len(seq) - 1)
+                calls["n"] += 1
+                return seq[i]
 
             def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
                 uploaded.append(path_in_repo)
@@ -1004,8 +1125,10 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
         return uploaded
 
     # Worker already wrote its marker -> host must NOT clobber it.
-    assert run_failmark(worker_marker_exists=True) == []
-    # No worker marker (never-started container) -> host failmark IS written.
-    assert run_failmark(worker_marker_exists=False) == ["sft/x/seed0/lambda_attempt0.json"]
+    assert run_failmark(exists_seq=(True,)) == []
+    # No worker marker at all (never-started container) -> host failmark IS written.
+    assert run_failmark(exists_seq=(False,)) == ["sft/x/seed0/lambda_attempt0.json"]
     # HF read error -> conservative: skip the write (never risk clobbering).
-    assert run_failmark(worker_marker_exists=False, read_raises=True) == []
+    assert run_failmark(exists_seq=(False,), read_raises=True) == []
+    # RACE: absent on the first check, present on the re-check (worker uploaded in the gap) -> SKIP.
+    assert run_failmark(exists_seq=(False, True)) == []
