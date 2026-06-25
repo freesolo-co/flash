@@ -86,6 +86,26 @@ BOOT_LOG_ABSENT_POLLS = 3
 # silent since before the restart is still caught by that setup grace.
 FIRST_LIVENESS_OBSERVED_GRACE_S = 120.0
 
+# Heartbeat stages the worker emits DURING cold start, BEFORE the first training step. Receiving one
+# proves the worker is alive but NOT that the slow setup (model download + trainer/vLLM init) finished,
+# so they must keep the larger setup grace (not flip stall detection to the tight training window) AND
+# must NOT count as "training reached" for the region-quarantine decision -- an infra/GPU fault during
+# init is exactly a sick-region signal. Includes the ``*_initializing`` stages the worker emits during
+# trainer/vLLM init (worker emits sft_start -> sft_model_load -> sft_initializing -> sft_step, and
+# rl_start -> rl_train_start -> rl_initializing -> rl_step). SHARED single source of truth so the three
+# pollers (RunPod / Lambda / Hyperstack) can't drift out of sync.
+SETUP_HEARTBEAT_STAGES = frozenset(
+    {
+        "boot",
+        "sft_start",
+        "rl_start",
+        "sft_model_load",
+        "rl_train_start",
+        "sft_initializing",
+        "rl_initializing",
+    }
+)
+
 
 def make_say(log) -> Callable[[str], None]:
     """A timestamped line logger that no-ops when ``log`` is None."""

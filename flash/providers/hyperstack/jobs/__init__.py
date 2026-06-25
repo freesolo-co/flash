@@ -23,6 +23,7 @@ from flash.providers._poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_GRACE_S,
     FIRST_LIVENESS_S,
+    SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
     heartbeat_progress_ts,
     make_say,
@@ -51,9 +52,9 @@ SETUP_GRACE_S = 3000.0
 STALL_AFTER_S = 1500.0
 PROVISION_GRACE_S = 3000.0
 
-_SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
-)
+# Cold-start (pre-first-training-step) heartbeat stages, incl. the *_initializing stages. SHARED
+# single source of truth (flash.providers._poll) so RunPod / Lambda / Hyperstack can't drift apart.
+_SETUP_HEARTBEAT_STAGES = SETUP_HEARTBEAT_STAGES
 
 # Hyperstack VM statuses that mean "the box is gone / will not progress".
 _DEAD_STATES = {"ERROR", "FAILED", "DELETING", "DELETED", "TERMINATED"}

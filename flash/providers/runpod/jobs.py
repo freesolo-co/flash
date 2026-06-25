@@ -29,6 +29,7 @@ from flash._logging import get_logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 from flash.providers._poll import (
+    SETUP_HEARTBEAT_STAGES,
     PollErrorTracker,
     make_say,
     surface_forced_heartbeat,
@@ -78,13 +79,11 @@ TERMINAL_OK = {"COMPLETED"}
 PLATFORM_TERMINATIONS = {"CANCELLED", "TIMED_OUT"}
 TERMINAL_FAIL = {"FAILED"} | PLATFORM_TERMINATIONS
 
-# Heartbeat stages the worker emits DURING cold start, BEFORE the model is loaded and the
-# training loop begins (boot -> sft_start/rl_start, then later sft_model_load/rl_train_start).
-# Receiving one proves the worker is alive but NOT that the slow setup (model download +
-# vLLM init) finished, so they must not flip stall detection to the tight training window.
-_SETUP_HEARTBEAT_STAGES = frozenset(
-    {"boot", "sft_start", "rl_start", "sft_model_load", "rl_train_start"}
-)
+# Cold-start (pre-first-training-step) heartbeat stages, incl. the *_initializing stages the worker
+# emits during model download + trainer/vLLM init; receiving one proves the worker is alive but NOT
+# that setup finished, so they must not flip stall detection to the tight training window. SHARED
+# single source of truth (flash.providers._poll) so RunPod / Lambda / Hyperstack can't drift apart.
+_SETUP_HEARTBEAT_STAGES = SETUP_HEARTBEAT_STAGES
 
 
 def stall_kwargs(on_last_gpu: bool = False) -> dict:

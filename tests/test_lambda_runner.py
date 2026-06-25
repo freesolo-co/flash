@@ -626,6 +626,25 @@ def test_poll_dead_host_cancelled_run_not_quarantined(monkeypatch):
     assert not res.host_fault  # cancelled -> region NOT quarantined
 
 
+def test_poll_init_stage_heartbeat_quarantines_on_retriable(monkeypatch):
+    """sft_initializing/rl_initializing are PRE-training (trainer/vLLM init), so a retriable infra
+    fault during init must STILL quarantine the region: reached_training_now() must treat the init
+    heartbeat as setup, not training. Regression: the *_initializing stages were missing from
+    _SETUP_HEARTBEAT_STAGES, so an init heartbeat looked like training and suppressed host_fault for
+    exactly the init-time GPU/host faults the quarantine targets."""
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}],
+        marker=json.dumps({"ok": False, "attempt": 0, "error": "RetriableInfraError: vLLM init OOM", "retriable": True}),
+    )
+    res = jobs.poll_lambda_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {"stage": "sft_initializing", "step": 0, "ts": 10_000.0},
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"
+    assert res.host_fault  # init-time infra fault is pre-training -> region quarantined
+
+
 def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
     """A retriable failure marker can land in the SAME poll iteration the worker first reaches training
     -- the marker branch decides host_fault BEFORE surface_heartbeat() advances seen_training_hb.
