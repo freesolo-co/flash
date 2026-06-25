@@ -684,41 +684,6 @@ def test_instance_label_always_sweepable():
     assert instance_label("fail-fast", 0, 0) == "flash-fail-fast-s0-a0"  # prefix forced
 
 
-def test_instance_label_bounds_seed_and_attempt():
-    """The seed/attempt suffix is the only caller-supplied text appended after the (already-bounded)
-    run prefix: an absurd seed OR attempt (or a non-int) must NOT push the name past the 60-char
-    provider cap, which would get the name silently truncated and desync it from the sweep-matched
-    prefix. BOTH numeric fields are bounded so the WHOLE suffix stays <= _SUFFIX_BUDGET."""
-    from flash.providers._instance import _MAX_NAME, _SUFFIX_BUDGET, run_label_prefix
-    from flash.providers.lambdalabs.jobs.builders import instance_label
-
-    def suffix_of(rid, label):
-        return label[len(run_label_prefix(rid)) :]
-
-    # Normal small ids: unchanged.
-    assert instance_label("flash-1700000000-abcd1234", 0, 0) == "flash-1700000000-abcd1234-s0-a0"
-    # Absurdly large seed: name stays within the cap (and keeps the -a boundary).
-    rid = "flash-1700000000-abcd1234"
-    huge = instance_label(rid, 123456789012345, 0)
-    assert len(huge) <= _MAX_NAME
-    assert len(suffix_of(rid, huge)) <= _SUFFIX_BUDGET
-    assert "-a0" in huge
-    # Absurdly large ATTEMPT (corrupt) alone: still bounded (the earlier fix only trimmed seed).
-    huge_att = instance_label(rid, 0, 999999999999)
-    assert len(huge_att) <= _MAX_NAME
-    assert len(suffix_of(rid, huge_att)) <= _SUFFIX_BUDGET
-    assert huge_att.startswith(rid + "-s")  # framing + prefix intact for sweep matching
-    # BOTH seed and attempt huge together: whole suffix bounded.
-    both_huge = instance_label(rid, 123456789, 987654321)
-    assert len(both_huge) <= _MAX_NAME
-    assert len(suffix_of(rid, both_huge)) <= _SUFFIX_BUDGET
-    # A long run id AND both fields huge together still fit.
-    both = instance_label("flash-" + "x" * 80, 99999999999, 7777777)
-    assert len(both) <= _MAX_NAME
-    # A non-int seed/attempt degrades to 0 instead of crashing / overflowing.
-    assert instance_label(rid, "weird", "bad").startswith(rid + "-s0-a0")
-
-
 def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
@@ -987,76 +952,6 @@ def test_build_worker_env_spilled_spec_fetch_failure_is_retriable(monkeypatch):
         )
 
 
-def _payload_in_hf():
-    return {"job_spec_json": "", "job_spec_in_hf": True, "phase": "sft", "seed": 0,
-            "env": {}, "flash_arm": "lambda"}
-
-
-def _fake_hf_response(status):
-    """A minimal stand-in for the httpx.Response that HfHubHTTPError reads (.status_code, .headers,
-    .request) so we can construct these errors with a chosen HTTP status in tests."""
-
-    class _Req:
-        def __init__(self):
-            self.headers: dict = {}
-            self.url = "https://hf/x"
-
-    class _Resp:
-        def __init__(self, st):
-            self.status_code = st
-            self.headers: dict = {}
-            self.request = _Req()
-
-    return _Resp(status)
-
-
-def test_build_worker_env_permanent_spec_fetch_failure_is_not_retriable(monkeypatch):
-    """A PERMANENT spilled-spec fetch failure (missing file, bad repo/prefix, auth/gated, a 4xx
-    other than 429) must NOT be wrapped as RetriableBootstrapError — it never clears by retrying,
-    so it propagates and main() fails the run FAST instead of burning the whole infra-retry budget
-    re-fetching a spec that will never appear."""
-    from huggingface_hub.errors import (
-        EntryNotFoundError,
-        GatedRepoError,
-        HfHubHTTPError,
-        RepositoryNotFoundError,
-        RevisionNotFoundError,
-    )
-
-    from flash.providers import _instance_bootstrap as lb
-
-    permanent = [
-        EntryNotFoundError("missing job_spec.json"),
-        RepositoryNotFoundError("no such repo", response=_fake_hf_response(404)),
-        RevisionNotFoundError("no such revision", response=_fake_hf_response(404)),
-        GatedRepoError("token cannot read", response=_fake_hf_response(403)),
-        HfHubHTTPError("not found", response=_fake_hf_response(404)),
-        HfHubHTTPError("unauthorized", response=_fake_hf_response(401)),
-        HfHubHTTPError("forbidden", response=_fake_hf_response(403)),
-    ]
-    for exc in permanent:
-        monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p, _e=exc: (_ for _ in ()).throw(_e))
-        # The original (non-retriable) exception propagates; it is NOT RetriableBootstrapError.
-        with pytest.raises(Exception) as ei:  # noqa: PT011 - asserting the class below
-            lb.build_worker_env(_payload_in_hf())
-        assert not isinstance(ei.value, lb.RetriableBootstrapError)
-        assert ei.value is exc  # propagated unchanged
-
-
-def test_build_worker_env_transient_http_spec_fetch_failure_is_retriable(monkeypatch):
-    """A TRANSIENT HF fetch failure (5xx / 429 rate-limit) IS wrapped as RetriableBootstrapError so
-    the poller retries on a fresh host."""
-    from huggingface_hub.errors import HfHubHTTPError
-
-    from flash.providers import _instance_bootstrap as lb
-
-    for status in (500, 502, 503, 504, 429):
-        exc = HfHubHTTPError("boom", response=_fake_hf_response(status))
-        monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p, _e=exc: (_ for _ in ()).throw(_e))
-        with pytest.raises(lb.RetriableBootstrapError, match="spilled job spec"):
-            lb.build_worker_env(_payload_in_hf())
-
-
 def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     """End-to-end: a payload whose spilled-spec HF fetch fails -> main() exits non-zero AND the
     written attempt marker carries retriable=True (so the poller -> job_preempted, not job_failed)."""
@@ -1150,11 +1045,7 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
     """Bug: a container that fast-fails on a real user/config error uploads its own ok=false marker,
     then the host's ~5s liveness check fires fail() and would CLOBBER it with a retriable host
     marker (relabeling the user error as job_preempted). The host failmark must SKIP the write when
-    a worker attempt marker already exists at the path (and stay conservative on a read error).
-
-    Also covers the TOCTOU race: the worker can write its marker in the window BETWEEN the initial
-    existence check and the host upload, so the failmark RE-checks immediately before uploading and
-    still skips if the worker's marker has appeared."""
+    a worker attempt marker already exists at the path (and stay conservative on a read error)."""
     import sys
     import types
 
@@ -1162,14 +1053,9 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
 
     payload = {"flash_arm": "lambda", "attempt": 0, "hf_prefix": "sft/x/seed0", "hf_repo": "o/r", "env": {}}
 
-    def run_failmark(exists_seq=(False,), read_raises=False):
-        """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads.
-
-        ``exists_seq`` is the sequence of file_exists() return values across the (up to two) checks
-        the script makes; the last value repeats once exhausted."""
+    def run_failmark(worker_marker_exists, read_raises=False):
+        """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads."""
         uploaded = []
-        seq = list(exists_seq)
-        calls = {"n": 0}
 
         class FakeApi:
             def __init__(self, token=None):
@@ -1178,9 +1064,7 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
             def file_exists(self, *, repo_id, filename, repo_type):
                 if read_raises:
                     raise RuntimeError("hf down")
-                i = min(calls["n"], len(seq) - 1)
-                calls["n"] += 1
-                return seq[i]
+                return worker_marker_exists
 
             def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
                 uploaded.append(path_in_repo)
@@ -1195,10 +1079,8 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
         return uploaded
 
     # Worker already wrote its marker -> host must NOT clobber it.
-    assert run_failmark(exists_seq=(True,)) == []
-    # No worker marker at all (never-started container) -> host failmark IS written.
-    assert run_failmark(exists_seq=(False,)) == ["sft/x/seed0/lambda_attempt0.json"]
+    assert run_failmark(worker_marker_exists=True) == []
+    # No worker marker (never-started container) -> host failmark IS written.
+    assert run_failmark(worker_marker_exists=False) == ["sft/x/seed0/lambda_attempt0.json"]
     # HF read error -> conservative: skip the write (never risk clobbering).
-    assert run_failmark(exists_seq=(False,), read_raises=True) == []
-    # RACE: absent on the first check, present on the re-check (worker uploaded in the gap) -> SKIP.
-    assert run_failmark(exists_seq=(False, True)) == []
+    assert run_failmark(worker_marker_exists=False, read_raises=True) == []

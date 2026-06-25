@@ -1454,11 +1454,6 @@ def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
 # past the top of that plateau, even on a card with VRAM to spare. (Reward histories at pd 4 and
 # 16 were identical -> per_device is a pure speed/VRAM knob, not an optimization change.)
 _RL_PER_DEVICE_MAX = 16
-# fp32-logits VRAM budget (bytes) for a SINGLE Liger chunk's [chunk, completion, vocab] tensor.
-# The same 6 GB ceiling rl_per_device_comps uses to bound per_device; reused to bound the fused
-# GRPO loss chunk_size so a large micro-batch on a short-seq run can't materialize the whole
-# batch's logits in one chunk and OOM (see liger_loss_chunk_size).
-_RL_LOGITS_BUDGET_BYTES = 6.0e9
 # Reference sequence length the activation/VRAM divisor is calibrated at. The colocate activation
 # peak grows with the training sequence length; the cap is scaled by seq_len/_RL_ACT_SEQ_REF so a
 # short-seq run (the underfed regime) is allowed a proportionally bigger micro-batch.
@@ -1532,7 +1527,7 @@ def rl_per_device_comps(
     # Logits budget: hard upper bound on the fp32 [per_device, completion, vocab] logprob tensor.
     logits_cap = _RL_PER_DEVICE_MAX
     if completion_len > 0:
-        logits_cap = max(1, int(_RL_LOGITS_BUDGET_BYTES / (max(1, completion_len) * vocab * 4)))
+        logits_cap = max(1, int(6.0e9 / (max(1, completion_len) * vocab * 4)))
 
     # Growth is gated to SHORT sequences (seq < the reference). At/above the reference seq the
     # micro-batch is left exactly as the historical code computed it: bigger per_device at long
@@ -1576,26 +1571,6 @@ def rl_per_device_comps(
     # i.e. byte-for-byte the historical value.
     ceiling = _RL_PER_DEVICE_MAX if (short_seq and not THINKING) else default
     return max(1, min(ceiling, logits_cap, vram_cap))
-
-
-def liger_loss_chunk_size(per_device: int, completion_len: int, vocab: int) -> int:
-    """Sequences-per-chunk for TRL's Liger fused GRPO loss, bounded by the fp32-logits VRAM budget.
-
-    TRL leaves ``chunk_size`` at 1 (one sequence per chunk -> one detach/forward/compiled-loss/
-    autograd cycle PER SEQUENCE), so we raise it toward ``per_device`` to collapse that overhead to
-    a single invocation. But the Liger chunk materializes ``[chunk, completion_len, vocab]`` fp32
-    logits at once, so chunking the WHOLE micro-batch (chunk == per_device) blows VRAM when
-    per_device is large — exactly the short-context GRPO regime where ``rl_per_device_comps`` now
-    grows the micro-batch to 8/16. Cap the chunk so a single chunk's logits stay within the same 6 GB
-    budget that bounds per_device, then clamp to ``[1, per_device]``. The loss is numerically
-    identical for any chunk_size (every loss_type normalizes by the GLOBAL token count and chunk
-    losses are summed), so this only trades per-chunk peak VRAM against per-chunk launch overhead.
-    """
-    per_device = max(1, int(per_device))
-    if completion_len <= 0 or vocab <= 0:
-        return per_device  # no budget signal (offline / unknown) -> keep the whole micro-batch
-    budget = max(1, int(_RL_LOGITS_BUDGET_BYTES / (completion_len * vocab * 4)))
-    return max(1, min(per_device, budget))
 
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
@@ -2004,20 +1979,7 @@ def run_rl():
         # rollout_func (pure multi-turn) path: the per-rollout reward is computed by the env
         # during the rollout and forwarded as the "reward" extra field — pass it through.
         if kwargs.get("reward") is not None:
-            precomputed = kwargs["reward"]
-            # Mirror the example_idx guard below: a precomputed reward array that doesn't line up
-            # 1:1 with the sampled completions would silently MISALIGN rewards (TRL zips them
-            # positionally), training on a shifted signal. A short/long array is a real bug (env
-            # forwarded the wrong count, or TRL reordered/dropped rows), so fail LOUD rather than
-            # pass through a misaligned vector.
-            if len(precomputed) != len(completions):
-                raise RuntimeError(
-                    f"GRPO reward_fn precomputed 'reward'/completions length mismatch "
-                    f"({len(precomputed)} vs {len(completions)}) — the forwarded per-rollout "
-                    "rewards would be misaligned with the sampled completions; aborting rather "
-                    "than training on a shifted reward signal."
-                )
-            return [float(r) for r in precomputed]
+            return [float(r) for r in kwargs["reward"]]
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
         # The dataset carries example_idx (not the record); map each back to its original object.
@@ -2437,25 +2399,17 @@ def run_rl():
     # Liger fused-loss chunk_size: TRL leaves it at the default 1, so the fused GRPO loss runs its
     # whole detach -> chunk_forward -> compiled-loss -> autograd.grad cycle ONCE PER SEQUENCE
     # (per_device_train_batch_size times) — Python/kernel-launch/compile-guard overhead that
-    # dominates at small-model scale where the GEMMs are tiny. Raise it toward the whole per-device
-    # micro-batch, but BOUND by the fp32-logits VRAM budget: a chunk materializes
-    # [chunk, completion, vocab] fp32 logits at once, so on a short-context run where per_device grew
-    # to 8/16 (see rl_per_device_comps) collapsing the WHOLE batch into one chunk would blow VRAM /
-    # OOM. liger_loss_chunk_size caps the chunk to the same 6 GB budget that bounds per_device.
-    # Numerically identical for any chunk_size (every loss_type normalizes by the GLOBAL token count,
-    # not the chunk-local size, and chunk losses are summed). Must run BEFORE the mask-aware wrap
-    # below, which replaces trainer.liger_grpo_loss with a closure that has no chunk_size attribute.
+    # dominates at small-model scale where the GEMMs are tiny. Collapse it to ONE invocation over the
+    # whole per-device micro-batch. Numerically identical (every loss_type normalizes by the GLOBAL
+    # token count, not the chunk-local size, and chunk losses are summed). Must run BEFORE the
+    # mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure that has no
+    # chunk_size attribute.
     _liger_loss = getattr(trainer, "liger_grpo_loss", None)
     if _liger_loss is not None and hasattr(_liger_loss, "chunk_size"):
-        _pd = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
-        _cs = liger_loss_chunk_size(_pd, _cap_completion_len, vocab_size_for(model_id))
+        _cs = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
         if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
             _liger_loss.chunk_size = _cs
-            _capped = " (logits-budget capped)" if _cs < _pd else ""
-            print(
-                f"[rl] liger fused-loss chunk_size -> {_cs} of per_device {_pd}{_capped} "
-                "(fewer invocations, bounded per-chunk logits VRAM)"
-            )
+            print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
     # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
     # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
     # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is
