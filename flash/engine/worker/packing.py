@@ -135,7 +135,23 @@ def gdn_packing_available() -> bool:
         from transformers.models.qwen3_5 import modeling_qwen3_5 as _m  # (b) version/API gate
 
         fwd = inspect.getsource(_m.Qwen3_5GatedDeltaNet.forward)
-        return ("cu_seq_lens_q" in fwd) and ("seq_idx" in fwd)
+        if not (("cu_seq_lens_q" in fwd) and ("seq_idx" in fwd)):
+            return False
+        # (c) RUN the conv kernel on the LIVE GPU: a causal_conv1d wheel compiled WITHOUT this device's
+        # arch imports fine but raises "CUDA error: no kernel image is available for execution on the
+        # device" at the FIRST forward — which would crash the run mid-train. A tiny conv here surfaces
+        # that now so packing stays off and the model trains unpacked instead. (fla's kernels are
+        # Triton-JIT — always compiled for the present arch — so they need no such smoke.)
+        import torch
+
+        if torch.cuda.is_available():
+            from causal_conv1d import causal_conv1d_fn
+
+            _x = torch.zeros(1, 4, 8, device="cuda", dtype=torch.bfloat16)
+            _w = torch.zeros(4, 3, device="cuda", dtype=torch.bfloat16)
+            causal_conv1d_fn(_x, _w)
+            torch.cuda.synchronize()
+        return True
     except Exception:
         return False
 
@@ -178,19 +194,22 @@ def packing_efficiency(rows: list[dict], max_length: int) -> float:
 
 
 def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[list[int]]:
-    """Tokenize chat-templated ``text`` rows for packing, MATCHING TRL's non-packed SFT prep so a
-    packed run trains on the SAME token sequences as the unpacked/FA2 path (no quality drift):
+    """Tokenize chat-templated ``text`` rows for packing, MATCHING TRL's non-packed SFT prep EXACTLY
+    so a packed run trains on the SAME token sequences as the unpacked/FA2 path (no quality drift):
       * append the EOS token to any row that doesn't already end with it — TRL's add_eos step does
         this for the language-modeling ``text`` case, and skipping it would stop teaching the model
         the final stop token (it'd never learn to halt);
-      * tokenize in ONE batched call (faster than a per-row Python loop, and the worker's chat
-        template already added every other special token, so add_special_tokens=False);
-      * truncate to ``max_length`` in the tokenizer so a pathological long row never materializes a
-        huge id list only to be sliced by pack_token_ids.
+      * tokenize with the tokenizer's DEFAULT add_special_tokens — TRL's ``_tokenize`` for a non-
+        conversational ``text`` field calls ``processing_class(text=input)`` with no override, so for
+        Llama-family tokenizers (e.g. the MiniCPM pure-attention tier) it prepends BOS. Forcing
+        add_special_tokens=False here would drop that BOS and diverge from the unpacked path. (Qwen
+        tokenizers have no BOS, so the Qwen3.x / GDN tier is unaffected either way.)
+      * truncate to ``max_length`` (same cap pack_token_ids would apply) so a pathological long row
+        never materializes a huge id list; batched (one call) for speed.
     """
     eos = tokenizer.eos_token or ""
     rows = [t if (eos and t.endswith(eos)) else t + eos for t in texts]
-    enc = tokenizer(rows, add_special_tokens=False, truncation=True, max_length=max_length)
+    enc = tokenizer(rows, truncation=True, max_length=max_length)  # default add_special_tokens (TRL parity)
     return enc["input_ids"]
 
 

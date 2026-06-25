@@ -30,25 +30,28 @@ class _FakeTok:
     def __init__(self, eos="<e>"):
         self.eos_token = eos
 
-    def __call__(self, rows, add_special_tokens, truncation, max_length):
-        assert add_special_tokens is False
+    def __call__(self, rows, truncation, max_length, add_special_tokens=True):
+        # mirror TRL: default add_special_tokens (no override); prepend a BOS marker (id 1) when on,
+        # so the test can assert parity with TRL's text-field tokenization. Truncate the TOTAL.
         assert truncation is True
-        return {"input_ids": [[ord(c) for c in r][:max_length] for r in rows]}
+        bos = [1] if add_special_tokens else []
+        return {"input_ids": [(bos + [ord(c) for c in r])[:max_length] for r in rows]}
 
 
-def test_tokenize_for_packing_appends_eos_for_parity():
+def test_tokenize_for_packing_eos_and_bos_parity():
     tok = _FakeTok(eos="!")
-    # row WITHOUT eos -> eos appended (so the model learns to stop, matching TRL's add_eos);
-    # row WITH eos -> not doubled.
+    # row WITHOUT eos -> eos appended (model learns to stop, matching TRL add_eos); WITH eos -> not
+    # doubled; default add_special_tokens prepends BOS (id 1), matching TRL's text-field _tokenize.
     ids = tokenize_for_packing(["ab", "cd!"], tok, max_length=100)
-    assert ids[0] == [ord("a"), ord("b"), ord("!")]
-    assert ids[1] == [ord("c"), ord("d"), ord("!")]
+    assert ids[0] == [1, ord("a"), ord("b"), ord("!")]
+    assert ids[1] == [1, ord("c"), ord("d"), ord("!")]
 
 
 def test_tokenize_for_packing_truncates_and_handles_no_eos():
-    assert tokenize_for_packing(["abcdef"], _FakeTok("!"), max_length=3) == [[ord("a"), ord("b"), ord("c")]]
-    # eos_token None -> no append, no crash
-    assert tokenize_for_packing(["ab"], _FakeTok(eos=None), max_length=100) == [[ord("a"), ord("b")]]
+    # BOS-inclusive truncation to max_length
+    assert tokenize_for_packing(["abcdef"], _FakeTok("!"), max_length=3) == [[1, ord("a"), ord("b")]]
+    # eos_token None -> no append, no crash (BOS still added)
+    assert tokenize_for_packing(["ab"], _FakeTok(eos=None), max_length=100) == [[1, ord("a"), ord("b")]]
 
 
 def _split_by_lengths(ids: list[int], lengths: list[int]) -> list[list[int]]:
