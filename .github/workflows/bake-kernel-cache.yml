@@ -32,11 +32,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { sm: sm80, arch: "8.0", gpu_type_id: "NVIDIA A100 80GB PCIe" }
-          - { sm: sm86, arch: "8.6", gpu_type_id: "NVIDIA RTX A6000" }
-          - { sm: sm89, arch: "8.9", gpu_type_id: "NVIDIA GeForce RTX 4090" }
-          - { sm: sm90, arch: "9.0", gpu_type_id: "NVIDIA H100 80GB HBM3" }
-          - { sm: sm120, arch: "12.0", gpu_type_id: "NVIDIA GeForce RTX 5090" }
+          - {
+              sm: sm80,
+              arch: "8.0",
+              gpu_type_id: "NVIDIA A100 80GB PCIe",
+              allowed_cuda: "",
+            }
+          - {
+              sm: sm86,
+              arch: "8.6",
+              gpu_type_id: "NVIDIA RTX A6000",
+              allowed_cuda: "",
+            }
+          - {
+              sm: sm89,
+              arch: "8.9",
+              gpu_type_id: "NVIDIA GeForce RTX 4090",
+              allowed_cuda: "",
+            }
+          - {
+              sm: sm90,
+              arch: "9.0",
+              gpu_type_id: "NVIDIA H100 80GB HBM3",
+              allowed_cuda: "",
+            }
+          # Blackwell needs CUDA-13 hosts to JIT its PTX (matches min_cuda_for in the provider).
+          - {
+              sm: sm120,
+              arch: "12.0",
+              gpu_type_id: "NVIDIA GeForce RTX 5090",
+              allowed_cuda: "13.0",
+            }
     steps:
       - uses: actions/checkout@v6
 
@@ -44,7 +70,9 @@ jobs:
       - name: Should bake ${{ matrix.sm }}?
         id: gate
         run: |
-          case ",${{ github.event.inputs.sms || 'sm80,sm86,sm89,sm90,sm120' }}," in
+          req="${{ github.event.inputs.sms || 'sm80,sm86,sm89,sm90,sm120' }}"
+          req="${req// /}"   # tolerate spaces, e.g. "sm80, sm86"
+          case ",$req," in
             *,${{ matrix.sm }},*) echo "run=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "run=false" >> "$GITHUB_OUTPUT"; echo "skipping ${{ matrix.sm }}" ;;
           esac
@@ -66,6 +94,7 @@ jobs:
           uv run python docker/bake_kernel_cache.py \
             --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
             --gpu-type-id "${{ matrix.gpu_type_id }}" \
+            --allowed-cuda "${{ matrix.allowed_cuda }}" \
             --image ghcr.io/freesolo-co/flash-worker:cu128 \
             --out build/kernel_cache
 

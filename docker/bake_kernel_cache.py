@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import time
+import uuid
 
 ARTIFACT_NAMESPACE = "Freesolo-Co"
 
@@ -37,6 +38,9 @@ def _upload_flash_code(api, repo: str, token: str) -> None:
 
     pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     api.create_repo(repo_id=repo, repo_type="dataset", private=True, exist_ok=True)
+    # mirror upload_code: force private even if the id pre-existed as a public repo, before any
+    # flash source is uploaded.
+    api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True)
     api.upload_folder(
         folder_path=pkg_dir,
         path_in_repo="code/flash",
@@ -67,7 +71,12 @@ def main() -> int:
     ap.add_argument("--out", default="build/kernel_cache")
     ap.add_argument("--container-disk-gb", type=int, default=80)
     ap.add_argument("--deadline-min", type=int, default=45)
-    ap.add_argument("--run-id", default="", help="unique suffix for the temp repo (default: time-based)")
+    ap.add_argument("--run-id", default="", help="unique suffix for the temp repo (default: time+uuid)")
+    ap.add_argument(
+        "--allowed-cuda",
+        default="",
+        help="comma-separated host CUDA versions to allow (e.g. 13.0 for Blackwell); empty = any",
+    )
     args = ap.parse_args()
 
     token = os.environ["HF_TOKEN"]
@@ -77,9 +86,12 @@ def main() -> int:
     runpod.api_key = os.environ["RUNPOD_API_KEY"]
     api = HfApi(token=token)
 
-    suffix = args.run_id or str(int(time.time()))
+    # time + uuid so two concurrent bakes of the SAME sm never share a dataset (a second-granularity
+    # timestamp alone collides under the matrix / re-runs -> corrupt/shared cache).
+    suffix = args.run_id or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
     repo = f"{ARTIFACT_NAMESPACE}/kernel-bake-{args.sm}-{suffix}"
     entry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bake_pod_entry.py")
+    allowed_cuda = [v.strip() for v in args.allowed_cuda.split(",") if v.strip()] or None
 
     # the chalk install spec the production worker uses (so the bake warms chalk's kernels too);
     # FLASH_CHALK_SPEC overrides, else the source-of-truth DEFAULT_CHALK_SPEC, else a safe literal.
@@ -94,83 +106,91 @@ def main() -> int:
 
     _upload_flash_code(api, repo, token)
 
-    pod = runpod.create_pod(
-        name=f"kernel-bake-{args.sm}-{suffix}",
-        image_name=args.image,
-        gpu_type_id=args.gpu_type_id,
-        cloud_type="ALL",
-        container_disk_in_gb=args.container_disk_gb,
-        docker_args=_docker_args(entry_path),
-        env={
-            "BAKE_HF_REPO": repo,
-            "BAKE_ARCH": args.arch,
-            "HF_TOKEN": token,
-            "BAKE_CHALK_SPEC": chalk_spec,
-        },
-    )
-    pod_id = pod["id"]
-    log(f"created pod {pod_id} ({args.gpu_type_id}, {args.sm}); polling for out/STATUS")
-
-    deadline = time.time() + args.deadline_min * 60
-    outcome = "timeout"
-    dead = 0
-    while time.time() < deadline:
-        try:
-            p = runpod.get_pod(pod_id)
-            ds = (p or {}).get("desiredStatus")
-            up = bool((p or {}).get("runtime"))
-            log(f"pod desired={ds} runtime={'up' if up else 'none'}")
-            dead = dead + 1 if ds in ("TERMINATED", "EXITED") else 0
-        except Exception as e:
-            log(f"pod status err: {str(e)[:120]}")
-        try:
-            files = api.list_repo_files(repo, repo_type="dataset")
-            if "out/STATUS" in files:
-                outcome = "done"
-                log("out/STATUS present -> warmup complete")
-                break
-        except Exception as e:
-            log(f"hf list err: {str(e)[:120]}")
-        if dead >= 2:
-            outcome = "pod_died"
-            log("pod terminated/exited before STATUS")
-            break
-        time.sleep(45)
-
-    # always tear the pod down
-    try:
-        runpod.terminate_pod(pod_id)
-        log(f"terminated pod {pod_id}")
-    except Exception as e:
-        log(f"terminate fail: {str(e)[:120]}")
-
+    # create -> poll -> download inside try/finally so the GPU pod + temp dataset are ALWAYS released,
+    # even if create_pod / polling / the download raises midway.
+    pod_id = None
+    outcome = "error"
     rc = 1
-    if outcome == "done":
-        tmp = os.path.join(args.out, ".dl")
-        snapshot_download(
-            repo_id=repo,
-            repo_type="dataset",
-            allow_patterns=["out/**"],
-            local_dir=tmp,
-            token=token,
-        )
-        src = os.path.join(tmp, "out")
-        os.makedirs(args.out, exist_ok=True)
-        for name in os.listdir(src):
-            if name == "STATUS":
-                continue
-            s, d = os.path.join(src, name), os.path.join(args.out, name)
-            shutil.rmtree(d, ignore_errors=True) if os.path.isdir(d) else None
-            shutil.move(s, d)
-        shutil.rmtree(tmp, ignore_errors=True)
-        rc = _verify(args.out, args.sm)
-
-    # best-effort cleanup of the temp dataset
     try:
-        api.delete_repo(repo_id=repo, repo_type="dataset")
-        log(f"deleted temp dataset {repo}")
-    except Exception as e:
-        log(f"temp dataset delete fail (ignore): {str(e)[:120]}")
+        pod = runpod.create_pod(
+            name=f"kernel-bake-{args.sm}-{suffix}",
+            image_name=args.image,
+            gpu_type_id=args.gpu_type_id,
+            # token-bearing pod (carries HF_TOKEN + private code/cache) -> Secure Cloud only, never a
+            # community/peer-provider host.
+            cloud_type="SECURE",
+            container_disk_in_gb=args.container_disk_gb,
+            docker_args=_docker_args(entry_path),
+            # Blackwell (sm120) PTX needs CUDA-13 drivers to JIT; the matrix pins it (empty = any host).
+            allowed_cuda_versions=allowed_cuda,
+            env={
+                "BAKE_HF_REPO": repo,
+                "BAKE_ARCH": args.arch,
+                "HF_TOKEN": token,
+                "BAKE_CHALK_SPEC": chalk_spec,
+            },
+        )
+        pod_id = pod["id"]
+        log(f"created pod {pod_id} ({args.gpu_type_id}, {args.sm}); polling for out/STATUS")
+
+        deadline = time.time() + args.deadline_min * 60
+        outcome = "timeout"
+        dead = 0
+        while time.time() < deadline:
+            try:
+                p = runpod.get_pod(pod_id)
+                ds = (p or {}).get("desiredStatus")
+                up = bool((p or {}).get("runtime"))
+                log(f"pod desired={ds} runtime={'up' if up else 'none'}")
+                dead = dead + 1 if ds in ("TERMINATED", "EXITED") else 0
+            except Exception as e:
+                log(f"pod status err: {str(e)[:120]}")
+            try:
+                files = api.list_repo_files(repo, repo_type="dataset")
+                if "out/STATUS" in files:
+                    outcome = "done"
+                    log("out/STATUS present -> warmup complete")
+                    break
+            except Exception as e:
+                log(f"hf list err: {str(e)[:120]}")
+            if dead >= 2:
+                outcome = "pod_died"
+                log("pod terminated/exited before STATUS")
+                break
+            time.sleep(45)
+
+        if outcome == "done":
+            tmp = os.path.join(args.out, ".dl")
+            snapshot_download(
+                repo_id=repo,
+                repo_type="dataset",
+                allow_patterns=["out/**"],
+                local_dir=tmp,
+                token=token,
+            )
+            src = os.path.join(tmp, "out")
+            os.makedirs(args.out, exist_ok=True)
+            for name in os.listdir(src):
+                if name == "STATUS":
+                    continue
+                s, d = os.path.join(src, name), os.path.join(args.out, name)
+                if os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
+                shutil.move(s, d)
+            shutil.rmtree(tmp, ignore_errors=True)
+            rc = _verify(args.out, args.sm)
+    finally:
+        if pod_id:
+            try:
+                runpod.terminate_pod(pod_id)
+                log(f"terminated pod {pod_id}")
+            except Exception as e:
+                log(f"terminate fail: {str(e)[:120]}")
+        try:
+            api.delete_repo(repo_id=repo, repo_type="dataset")
+            log(f"deleted temp dataset {repo}")
+        except Exception as e:
+            log(f"temp dataset delete fail (ignore): {str(e)[:120]}")
 
     log(f"DONE outcome={outcome} rc={rc}")
     return rc
