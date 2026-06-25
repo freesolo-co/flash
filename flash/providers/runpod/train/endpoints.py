@@ -252,17 +252,27 @@ def _train_body(input_data: dict) -> dict:
         # instead of the worker's ephemeral default cache. (The training path is immune: it spawns a
         # subprocess that imports huggingface_hub fresh with HF_HOME already in its env.)
         hf_home = overrides.get("HF_HOME")
-        # The whole point of preload is to write onto the per-region network volume. If it isn't
-        # actually mounted (e.g. the endpoint was deployed without the volume / RunPod didn't mount
-        # it), downloading would silently warm the worker's EPHEMERAL disk and report success while
-        # warming nothing. Fail loudly instead so the driver records this region as failed.
-        if hf_home and hf_home.startswith("/runpod-volume") and not os.path.isdir("/runpod-volume"):
+        # The whole point of preload is to write onto the per-region network volume mounted at
+        # /runpod-volume. If HF_HOME is MISSING or not rooted there, cache_dir would fall back to the
+        # worker's EPHEMERAL default cache: snapshot_download would "succeed" and report repos
+        # preloaded while persisting NOTHING to the volume — a phantom warm the driver would count as a
+        # warmed region. Refuse a misconfigured preload instead (the flash driver always passes a
+        # volume-rooted HF_HOME, so this only fires on a handler-shape/env bug).
+        if not hf_home or not hf_home.startswith("/runpod-volume"):
+            return {
+                "preloaded": [], "already_cached": [], "failed": {},
+                "error": f"preload requires HF_HOME rooted at /runpod-volume (got HF_HOME={hf_home!r})",
+                "hf_home": hf_home,
+            }
+        # Rooted at the volume but the mount is absent (endpoint deployed without the volume / RunPod
+        # didn't mount it) — same phantom-warm risk; fail loudly so the driver records this region failed.
+        if not os.path.isdir("/runpod-volume"):
             return {
                 "preloaded": [], "already_cached": [], "failed": {},
                 "error": f"weight-cache volume not mounted at /runpod-volume (HF_HOME={hf_home})",
                 "hf_home": hf_home,
             }
-        cache_dir = os.path.join(hf_home, "hub") if hf_home else None
+        cache_dir = os.path.join(hf_home, "hub")  # hf_home is now guaranteed non-empty + volume-rooted
         # Same exclusions as the worker prefetch (engine/worker.prefetch_model), the image bake, and
         # the instance-provider preload (_instance_bootstrap.run_preload): weights + tokenizer/config
         # only, never the large unused artifacts. Inlined (this handler is baked self-contained, so it

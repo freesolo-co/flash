@@ -594,6 +594,35 @@ def test_preload_branch_passes_explicit_cache_dir(monkeypatch):
     assert all(c["ignore"] == expected_ignore for c in calls)
 
 
+def test_preload_rejects_non_volume_hf_home(monkeypatch):
+    """Phantom-warm guard: preload's whole purpose is to populate the on-volume HF cache. A missing or
+    non-/runpod-volume HF_HOME would make cache_dir fall back to the worker's EPHEMERAL default cache,
+    so snapshot_download would report repos preloaded while persisting nothing. The handler must refuse
+    such a misconfigured preload (no download) instead of reporting a phantom warm."""
+    import os as _os
+
+    import huggingface_hub
+
+    from flash.providers.runpod.train import endpoints
+
+    monkeypatch.setattr(_os, "environ", dict(_os.environ))
+    monkeypatch.setattr(_os.path, "isdir", lambda p: True)  # even with the mount present...
+    calls = []
+    monkeypatch.setattr(
+        huggingface_hub, "snapshot_download",
+        lambda *a, **k: calls.append(k) or "/x",
+    )
+    for bad in (None, "", "/root/.cache/huggingface", "/tmp/hf"):
+        env = {"HF_TOKEN": "t"}
+        if bad is not None:
+            env["HF_HOME"] = bad
+        out = endpoints._train_body({"mode": "preload", "models": ["Qwen/Qwen3.5-0.8B"], "env": env})
+        assert out["preloaded"] == []
+        assert out["already_cached"] == []
+        assert "HF_HOME rooted at /runpod-volume" in out["error"]
+    assert not calls  # ...nothing is ever downloaded for a non-volume HF_HOME
+
+
 def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):
     from flash.providers.runpod import preload
 
