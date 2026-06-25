@@ -1,11 +1,12 @@
 """Shared, fully-managed, best-effort, multi-region model-weight cache on RunPod network volumes.
 
-The runner attaches ONE platform-wide cache volume name (``flash-weights``) to EVERY run; the RunPod
-provider then attaches a same-named volume in every storage datacenter and allows the endpoint across
-all of them. This gives a cross-run weight cache with NO single-datacenter pin — whichever region the
-run lands in, that region's volume mounts at ``/runpod-volume`` and the worker's ``HF_HOME`` points
-there. On a no-capacity failure the lifecycle drops the volume so a run can never wedge IN_QUEUE on
-one full region.
+The runner attaches ONE platform-wide logical cache name (``flash-weights``) to EVERY run; the RunPod
+provider realizes it as a DISTINCT per-DC physical volume (``flash-weights-<dc>``) in every storage
+datacenter (distinct names avoid the runpod_flash resource-key collision) and allows the endpoint
+across all of them. This gives a cross-run weight cache with NO single-datacenter pin — whichever
+region the run lands in, that region's volume mounts at ``/runpod-volume`` and the worker's
+``HF_HOME`` points there. On a no-capacity failure the lifecycle drops the volume so a run can never
+wedge IN_QUEUE on one full region.
 
 Fully managed: there are NO env knobs (fixed name/size/datacenter set) and NO per-model gating —
 these tests pin that down. Everything is offline (the autouse ``_offline`` conftest stubs the RunPod
@@ -476,6 +477,9 @@ def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):
     deleted = []
 
     class FakeRest:
+        def __init__(self, api_key=None):  # teardown passes api_key per pool account
+            self.api_key = api_key
+
         async def list_network_volumes(self):
             return {"networkVolumes": [
                 {"name": "flash-weights-us-ca-2", "id": "v1"},
@@ -490,15 +494,42 @@ def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):
 
     import runpod_flash.core.api.runpod as rp_api
 
-    from flash.providers.runpod import auth
+    from flash.providers.runpod import keys as rp_keys
 
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
+    monkeypatch.setattr(rp_keys, "keys", lambda: ["k1"])  # single-account pool
     monkeypatch.setattr(rp_api, "RunpodRestClient", FakeRest)
     out = preload.teardown_weight_cache(["US-CA-2", "EU-RO-1"])
     assert sorted(out) == ["flash-weights-eu-ro-1", "flash-weights-us-ca-2"]
     assert len(deleted) == 2
     assert all(m == "DELETE" for m, _ in deleted)
     assert all(("v1" in u or "v2" in u) for _, u in deleted)  # only the two fleet volumes
+
+
+def test_teardown_weight_cache_sweeps_all_pool_accounts(monkeypatch):
+    from flash.providers.runpod import preload
+
+    seen_keys = []
+
+    class FakeRest:
+        def __init__(self, api_key=None):
+            seen_keys.append(api_key)
+
+        async def list_network_volumes(self):
+            return {"networkVolumes": [{"name": "flash-weights-us-ca-2", "id": "v1"}]}
+
+        async def _execute_rest(self, method, url):
+            return {}
+
+    import runpod_flash.core.api.runpod as rp_api
+
+    from flash.providers.runpod import keys as rp_keys
+
+    monkeypatch.setattr(rp_keys, "keys", lambda: ["k1", "k2"])  # two-account pool
+    monkeypatch.setattr(rp_api, "RunpodRestClient", FakeRest)
+    out = preload.teardown_weight_cache(["US-CA-2"])
+    # swept BOTH accounts; results are account-prefixed when the pool is multi-account
+    assert seen_keys == ["k1", "k2"]
+    assert sorted(out) == ["acct0:flash-weights-us-ca-2", "acct1:flash-weights-us-ca-2"]
 
 
 def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):

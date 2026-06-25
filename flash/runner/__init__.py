@@ -239,7 +239,7 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # weights — a run's trained adapters/checkpoints upload to the per-run managed HF repo
 # (_assign_managed_hf_repo), never here — so one global volume reused by every run is both safe and
 # the highest-hit-rate option: a popular base model (e.g. the 4B) is downloaded once per region,
-# ever, instead of once per run. The RunPod provider attaches a same-named volume in EVERY cache
+# ever, instead of once per run. The RunPod provider attaches a per-DC volume in EVERY cache
 # datacenter and allows the endpoint across all of them, so there is NO single-DC pin (the failure
 # mode that sank the earlier per-org EU-RO-1 attempt — runs wedged IN_QUEUE on one full region).
 # Fully managed: a fixed name + size, no env knobs. 100 GB holds the whole curated catalog (the
@@ -248,6 +248,18 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # (see jobs.weight_cache_volumes), so the first run (or a full preload) provisions the whole fleet —
 # ~11 x 100 GB ~= 1.1 TB of PERMANENT billed storage (~$77/mo). RunPod never auto-deletes network
 # volumes; reclaim the fleet with ``python -m flash.providers.runpod.preload --teardown``.
+#
+# TRUST MODEL (shared multi-tenant cache): the mount is read-WRITE on every run, and a run executes
+# its Freesolo environment code on the worker, so a hostile/buggy environment COULD overwrite a
+# cached model's content-addressed blobs and poison a later run that loads that model in the same
+# region (a cross-tenant integrity risk). This is the accepted flip side of "one shared cache for
+# everything": the cache holds only PUBLIC base weights (no secret/data exfiltration — the poison
+# risk is integrity, not confidentiality), and flash environments are published/reviewed Hub
+# artifacts, not anonymous code. The clean isolation — mounting the volume READ-ONLY for the run and
+# writing only via the trusted preload — is NOT yet expressible through the runpod_flash SDK
+# (NetworkVolume has no mount-mode field; ``extra="forbid"``). When the SDK gains a read-only mount,
+# switch runs to RO + populate exclusively via preload. Until then this is a documented tradeoff;
+# flip to per-org volumes (keyed off platform_context.org_id) if strict tenant isolation is required.
 WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
 WEIGHT_CACHE_VOLUME_GB = 100
 
@@ -259,6 +271,9 @@ def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
     surfaced in the config schema. The only no-op is when the spec already carries a volume (an
     explicit/test assignment is never overridden). The provider builds the per-region volume fleet
     + the cross-DC endpoint at deploy time (jobs.weight_cache_endpoint_kwargs) off this name.
+
+    See the module-level TRUST MODEL note above for the shared-cache integrity tradeoff (a run's env
+    code has write access to the shared mount; RO mount isn't SDK-expressible yet).
     """
     if getattr(spec.gpu, "network_volume", None):
         return spec

@@ -109,35 +109,18 @@ def stall_kwargs(on_last_gpu: bool = False) -> dict:
     }
 
 
-# Weight-cache datacenter fleet: every RunPod DC with network-volume (storage) support. A
-# same-named volume lives in each, and the endpoint is allowed across ALL of them, so a run lands
-# wherever there is GPU capacity — there is no single-DC pin. Fully managed: the set is fixed (no
-# env knob). Kept as canonical strings (parsed to DataCenter enums lazily) so this module imports
-# without the SDK present (control-plane / unit tests).
-WEIGHT_CACHE_DATACENTER_IDS = (
-    "US-CA-2", "US-IL-1", "US-KS-2", "US-MO-1", "US-MO-2", "US-NC-2", "US-NE-1", "US-WA-1",
-    "EU-CZ-1", "EU-RO-1", "EUR-NO-1",
-)
-
-
 def weight_cache_datacenters() -> list:
-    """The DataCenter set the weight-cache fleet spans (all storage-capable DCs).
+    """The DataCenter set the weight-cache fleet spans — EVERY storage-capable RunPod DC.
 
-    Returns ``runpod_flash`` ``DataCenter`` enums. An id the installed SDK doesn't know is skipped
-    (defensive against an SDK that drops a DC) rather than crashing a deploy.
+    Derived from ``DataCenter.all()`` (the SDK enum is documented as exactly the datacenters with
+    network-volume / S3 support), NOT a hardcoded subset — so a SDK upgrade that adds a storage
+    region is picked up automatically (no drift, no missed DCs). One ``flash-weights-<dc>`` volume
+    per entry; the endpoint is allowed across all of them, so a run lands wherever there is GPU
+    capacity — there is no single-DC pin. Fully managed: no env knob.
     """
     from runpod_flash.core.resources.datacenter import DataCenter
 
-    out: list = []
-    for tok in WEIGHT_CACHE_DATACENTER_IDS:
-        try:
-            dc = DataCenter.from_string(tok)
-        except ValueError:
-            logger.warning("weight cache: SDK does not know datacenter %r; skipping", tok)
-            continue
-        if dc not in out:
-            out.append(dc)
-    return out
+    return list(DataCenter.all())
 
 
 def weight_cache_volume_name(base: str, dc) -> str:

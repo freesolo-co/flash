@@ -166,8 +166,13 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     """Delete the per-DC ``flash-weights-<dc>`` cache volumes to reclaim the standing storage.
 
     RunPod network volumes are never auto-GC'd, so this is the only way to stop the monthly bill
-    short of the console. Returns the names deleted. Targets ONLY this fleet's per-DC names (built
-    from ``WEIGHT_CACHE_VOLUME_NAME``), never other volumes on the account.
+    short of the console. Returns the names deleted (``account:name`` when a multi-account pool is
+    configured). Targets ONLY this fleet's per-DC names (built from ``WEIGHT_CACHE_VOLUME_NAME``),
+    never other volumes.
+
+    Sweeps EVERY account in the ``RUNPOD_API_KEY`` pool: ``deploy_train_endpoint`` fails over to
+    another account on a quota error, so a cache volume may have been created under any pool key —
+    a single-account teardown would leak the volumes the failover created elsewhere.
     """
     import asyncio
 
@@ -175,17 +180,17 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     from runpod_flash.core.resources.datacenter import DataCenter
     from runpod_flash.core.urls import RUNPOD_REST_API_URL
 
-    from flash.providers.runpod.auth import ensure_auth
+    from flash.providers.runpod import keys as rp_keys
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
-    ensure_auth()
     dc_ids = datacenters or [dc.value for dc in weight_cache_datacenters()]
     targets = {
         weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, DataCenter.from_string(d)) for d in dc_ids
     }
+    pool = rp_keys.keys() or [None]  # [None] -> RunpodRestClient() resolves the key from the env
 
-    async def _go() -> list[str]:
-        client = RunpodRestClient()
+    async def _go_one(api_key) -> list[str]:
+        client = RunpodRestClient(api_key=api_key) if api_key else RunpodRestClient()
         res = await client.list_network_volumes()
         vols = res if isinstance(res, list) else res.get("networkVolumes", [])
         deleted: list[str] = []
@@ -197,7 +202,12 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
                 deleted.append(v["name"])
         return deleted
 
-    return asyncio.run(_go())
+    multi = len(pool) > 1
+    deleted: list[str] = []
+    for i, key in enumerate(pool):
+        names = asyncio.run(_go_one(key))
+        deleted.extend((f"acct{i}:{n}" if multi else n) for n in names)
+    return deleted
 
 
 def main(argv: list[str] | None = None) -> int:

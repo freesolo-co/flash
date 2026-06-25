@@ -193,6 +193,12 @@ def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
     across tenants on one volume would let a buggy/hostile run's environment code poison a later
     unrelated run in the same region. JIT caches stay per-worker/ephemeral (the ~10-15 min first-use
     compile is paid per cold worker, as before).
+
+    Concurrent writes: two cold runs landing in the same region before it is warm both
+    snapshot_download the model onto this shared mount. huggingface_hub guards this with a per-blob
+    file lock + atomic rename (content-addressed blobs), so the worst case is duplicated download
+    work, not a corrupt snapshot. The preload step (flash/providers/runpod/preload.py) pre-warms each
+    region precisely so real runs hit a populated cache and the cold-concurrent case is rare.
     """
     return {"HF_HOME": f"{mount}/hf-cache"}
 
@@ -267,10 +273,12 @@ def build_worker_env(
     # code storage + heartbeats). The worker reads HF_REPO from its own process env; that env
     # is now sourced from the spec, not the operator's HF_REPO.
     env["HF_REPO"] = spec.train.hf_repo
-    # When the shared weight-cache volume is attached, redirect HF_HOME (+ kernel caches) onto the
-    # mount so model weights persist across runs. Gated on a volume being assigned: without one the
-    # mount doesn't exist, so pointing caches there would just break the worker. A per-run
-    # [worker_env] override still wins (merged last, below).
+    # When the shared weight-cache volume is attached, redirect HF_HOME onto the mount so model
+    # weights persist across runs (HF blobs only — NOT the executable kernel-JIT caches; see
+    # weight_cache_env). Gated on a volume being assigned: without one the mount doesn't exist, so
+    # pointing HF_HOME there would just break the worker (the worker also self-corrects at runtime
+    # if /runpod-volume isn't mounted — see _train_body). A per-run [worker_env] override still wins
+    # (merged last, below).
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
     if spec.train.steps is not None:
