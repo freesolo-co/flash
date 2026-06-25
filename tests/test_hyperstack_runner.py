@@ -589,6 +589,24 @@ def test_poll_dead_vm_with_retriable_error_still_preempted(monkeypatch):
     assert res.host_fault  # infra crash before any training heartbeat -> quarantine the region
 
 
+def test_poll_dead_vm_stale_error_with_fresh_boot_heartbeat_is_preempted(monkeypatch):
+    """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. A
+    fresh retry that posts a boot heartbeat (THIS attempt is still booting) then loses the VM must NOT
+    be classified terminal job_failed off the stale file: in_early_setup_now() sees the fresh boot-stage
+    heartbeat and keeps the loss retriable (job_preempted). Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
+        error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a retriable prior attempt
+    )
+    res = jobs.poll_hs_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # stale error file did not flip a host loss to terminal
+
+
 def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
     """Hyperstack CANADA-1 (or any HS region) equivalent of the Lambda sick-region case: a VM that
     reaches ACTIVE but never starts a worker (no boot.log/heartbeat/marker) fails over fast as a

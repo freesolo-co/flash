@@ -677,6 +677,26 @@ def test_poll_dead_host_with_retriable_error_still_preempted(monkeypatch):
     assert res.failure == "job_preempted"
 
 
+def test_poll_dead_host_stale_error_with_fresh_boot_heartbeat_is_preempted(monkeypatch):
+    """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. A
+    fresh retry that posts a boot heartbeat (THIS attempt overwrote the prior retriable one and is
+    still booting) then loses the host must NOT be classified terminal job_failed off the stale file:
+    in_early_setup_now() sees the fresh boot-stage heartbeat and keeps the loss retriable
+    (job_preempted). (The prior code, keyed only on the seed-scoped file + heartbeat retriable bit,
+    returned job_failed here.)"""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminating"}],
+        error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a retriable prior attempt
+    )
+    res = jobs.poll_lambda_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # stale error file did not flip a host loss to terminal
+
+
 def test_poll_loading_timeout(monkeypatch):
     jobs = _wire_poll(monkeypatch, instances=[{"status": "booting"}], step=100.0)
     monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", 300.0)

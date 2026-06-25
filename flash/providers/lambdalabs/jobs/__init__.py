@@ -470,6 +470,29 @@ def poll_lambda_job(
         _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
         return fresh
 
+    def in_early_setup_now() -> bool:
+        """True if THIS attempt's worker is (per a FRESH heartbeat) still in an early boot/setup stage.
+        ``error_<phase>.txt`` is SEED-scoped (shared across attempts), so a stale traceback from a
+        retriable PRIOR attempt could otherwise flip a fresh attempt's host loss to a terminal
+        job_failed. A worker that actually crashed THIS attempt stamps a fresh ``error_<phase>``
+        heartbeat as its LAST signal, so a current heartbeat still in boot/setup means this attempt has
+        not crashed and the error file is stale -> the loss is retriable. Same launch-freshness gate as
+        the loop; an absent/empty heartbeat (the worker died before any heartbeat) is NOT early-setup,
+        so a genuine early crash that left only the file is still classified terminal."""
+        if heartbeat_reader is None:
+            return False
+        try:
+            hb = heartbeat_reader(force=True)
+        except Exception:
+            return False
+        if not isinstance(hb, dict):
+            return False
+        stage = hb.get("stage")
+        if stage not in _SETUP_HEARTBEAT_STAGES:
+            return False
+        _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
+        return fresh
+
     def fail_from_marker(marker: dict | None) -> PollResult:
         # A real worker error fails fast UNLESS it is flagged retriable — the host failure marker
         # (docker/GPU never ready) sets retriable=True, and the worker stamps it in heartbeat for a
@@ -593,14 +616,19 @@ def poll_lambda_job(
             # (a bad env id, a config/code error, an OOM). That is a DETERMINISTIC worker error, so
             # fail FAST: classifying it job_preempted burns fresh GPUs re-running a crash that will
             # repeat. A crash the worker flagged retriable (RetriableInfraError, stamped in the
-            # heartbeat) still retries, exactly like fail_from_marker. error_{phase}.txt is not
-            # attempt-scoped, but this can't flip a genuine preemption to job_failed: a prior
-            # attempt's NON-retriable crash already ended the run via this same branch, and a prior
-            # retriable crash leaves a retriable heartbeat that keeps this path on job_preempted.
+            # heartbeat) still retries, exactly like fail_from_marker. error_{phase}.txt is SEED-scoped
+            # (NOT attempt-scoped), so a retriable PRIOR attempt's traceback can linger; a fresh retry
+            # that posts a boot heartbeat then loses the box would be mis-failed terminal. Guard with
+            # in_early_setup_now(): if THIS attempt's fresh heartbeat is still boot/setup, the worker
+            # has not crashed yet and the error file is stale -> the loss stays retriable.
             from flash.providers.runpod.jobs import worker_flagged_retriable
 
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
-            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
+            worker_crashed = (
+                bool(err and err.strip())
+                and not worker_flagged_retriable(heartbeat_reader)
+                and not in_early_setup_now()
+            )
             return PollResult(
                 False,
                 failure="job_failed" if worker_crashed else "job_preempted",

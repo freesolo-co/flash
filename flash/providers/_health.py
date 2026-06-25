@@ -29,7 +29,9 @@ import time
 
 # How long a region stays quarantined after a host-fault failure. Long enough to ride out a regional
 # outage / a bad fleet image, short enough that a recovered region returns on its own within an hour.
-# Override with FLASH_REGION_SICK_TTL_S (seconds); 0/invalid disables the dynamic quarantine entirely.
+# Override with FLASH_REGION_SICK_TTL_S (seconds); 0 disables the dynamic quarantine entirely (a
+# non-positive TTL makes mark_region_sick a no-op). An UNPARSEABLE value is ignored and falls back to
+# this default (quarantine stays ENABLED) rather than silently disabling it on a typo.
 _DEFAULT_SICK_TTL_S = 1800.0
 
 

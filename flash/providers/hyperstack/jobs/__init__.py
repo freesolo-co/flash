@@ -414,6 +414,29 @@ def poll_hs_job(
         _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
         return fresh
 
+    def in_early_setup_now() -> bool:
+        """True if THIS attempt's worker is (per a FRESH heartbeat) still in an early boot/setup stage.
+        ``error_<phase>.txt`` is SEED-scoped (shared across attempts), so a stale traceback from a
+        retriable PRIOR attempt could otherwise flip a fresh attempt's host loss to a terminal
+        job_failed. A worker that actually crashed THIS attempt stamps a fresh ``error_<phase>``
+        heartbeat as its LAST signal, so a current heartbeat still in boot/setup means this attempt has
+        not crashed and the error file is stale -> the loss is retriable. Same launch-freshness gate as
+        the loop; an absent/empty heartbeat (the worker died before any heartbeat) is NOT early-setup,
+        so a genuine early crash that left only the file is still classified terminal."""
+        if heartbeat_reader is None:
+            return False
+        try:
+            hb = heartbeat_reader(force=True)
+        except Exception:
+            return False
+        if not isinstance(hb, dict):
+            return False
+        stage = hb.get("stage")
+        if stage not in _SETUP_HEARTBEAT_STAGES:
+            return False
+        _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
+        return fresh
+
     def fail_from_marker(marker: dict | None) -> PollResult:
         from flash.providers.runpod.jobs import worker_flagged_retriable
 
@@ -531,12 +554,18 @@ def poll_hs_job(
             # a config/code error, an OOM). That is a DETERMINISTIC worker error: fail FAST (job_failed
             # burns no fresh GPUs re-running a crash that will just repeat) and do NOT quarantine the
             # region, which is healthy. A crash the worker flagged retriable (RetriableInfraError,
-            # stamped in the heartbeat) still retries. Mirrors the Lambda dead-host path exactly so the
-            # two instance substrates classify pre-training deaths identically.
+            # stamped in the heartbeat) still retries. error_{phase}.txt is SEED-scoped, so guard with
+            # in_early_setup_now() against a stale prior-attempt traceback flipping a fresh retry's host
+            # loss to terminal. Mirrors the Lambda dead-host path exactly so the two instance substrates
+            # classify pre-training deaths identically.
             from flash.providers.runpod.jobs import worker_flagged_retriable
 
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
-            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
+            worker_crashed = (
+                bool(err and err.strip())
+                and not worker_flagged_retriable(heartbeat_reader)
+                and not in_early_setup_now()
+            )
             return PollResult(
                 False,
                 failure="job_failed" if worker_crashed else "job_preempted",
