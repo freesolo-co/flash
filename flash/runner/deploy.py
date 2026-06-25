@@ -214,6 +214,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         artifacts_dir,
         get_status,
     )
+    from flash.runner.lifecycle import _is_cancel_intent
 
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
@@ -248,7 +249,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # A best-effort cancel deletes the job/instance, which the poller reports as a
         # failure (or a late worker may still succeed) — either way, re-read the state
         # first so a recovery thread can't overwrite the user's terminal `cancelled`.
-        if get_status(run_id).state == "cancelled":
+        # Honor the cancel INTENT too (cancel_requested set, terminal `cancelled` not yet
+        # persisted): a cancel landing during the long poll above must NOT let the not-ok
+        # resume branch relaunch paid work for a run the user already cancelled (mirrors
+        # lifecycle._is_cancel_intent — the entry guard above only catches a pre-poll cancel).
+        if _is_cancel_intent(get_status(run_id)):
             return get_status(run_id)
         if not res.ok:
             # Job ended not-ok — usually because it was abandoned during the redeploy. Resume the
@@ -294,9 +299,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # A cancel can land while this thread persists the recovered seed's metrics
         # (after the late-cancel check above). Re-read before the post-seed writes so
         # the "running" update and the terminal "done" below can't resurrect a
-        # user-cancelled run (mirrors the fresh seed loop). _RunCancelled is caught
-        # below, leaving the cancellation intact.
-        if get_status(run_id).state == "cancelled":
+        # user-cancelled run (mirrors the fresh seed loop). Honor the cancel INTENT
+        # (cancel_requested), not just the persisted terminal state, so an in-progress
+        # cancel whose `cancelled` write hasn't landed still wins. _RunCancelled is
+        # caught below, leaving the cancellation intact.
+        if _is_cancel_intent(get_status(run_id)):
             raise _RunCancelled(f"run {run_id} was cancelled")
         # The remote handle only identifies the seed that was in flight. For a
         # multi-seed run, resume the remaining seeds instead of terminally
@@ -341,7 +348,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         # Intentional: cancel_run already wrote the terminal `cancelled` state; leave it.
         pass
     except Exception as exc:
-        if get_status(run_id).state != "cancelled":
+        # Don't stamp `failed` over an in-progress cancel: a concurrent cancel_run sets the
+        # intent then tears the box down (which is often what raised here), and a terminal
+        # `failed` write would be sticky and reject cancel_run's later `cancelled` — losing the
+        # user's intent. Skip on cancel_requested too, not just the already-persisted state.
+        if not _is_cancel_intent(get_status(run_id)):
             _update(run_id, "failed", error=str(exc))
     finally:
         _gc_run_endpoints(spec)
@@ -369,6 +380,7 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
         _update,
         get_status,
     )
+    from flash.runner.lifecycle import _is_cancel_intent
 
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
@@ -400,7 +412,10 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
     except _RunCancelled:
         pass  # cancel_run already set the terminal state
     except Exception as exc:
-        if get_status(run_id).state != "cancelled":
+        # Same as attach_run: don't let a `failed` write clobber an in-progress cancel
+        # (cancel_requested set, `cancelled` not yet persisted) — its sticky CAS would
+        # then reject cancel_run's terminal write and lose the user's intent.
+        if not _is_cancel_intent(get_status(run_id)):
             _update(run_id, "failed", error=str(exc))
     finally:
         # Mirror _run_job: GC any endpoint a transient destroy left behind rather than

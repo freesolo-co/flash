@@ -498,6 +498,88 @@ def test_attach_run_recovery_resumes_seed_loop_when_still_active(tmp_path, monke
     assert out.state == "running"
 
 
+def test_attach_run_recovery_bails_on_cancel_intent_mid_poll(tmp_path, monkeypatch):
+    """A cancel can land DURING attach_run's long poll: cancel_run records the INTENT
+    (cancel_requested=True) and tears the box down, but the terminal `cancelled` write may not
+    have landed yet (state still "running"). The not-ok recovery branch must honor the intent --
+    not just the persisted state -- and skip _run_seed_loop, else it relaunches PAID GPU work for
+    a run the user already cancelled. The entry guard only catches a PRE-poll cancel; this covers
+    the cancel that arrives mid-poll. Mirrors lifecycle._is_cancel_intent."""
+    import flash.runner as orch
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-intent-midpoll"})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote={"provider": "runpod", "endpoint_id": "ep-1", "job_id": "job-1", "seed": 0},
+        )
+    )
+
+    seed_loop_calls = {"n": 0}
+    monkeypatch.setattr(
+        orch,
+        "_run_seed_loop",
+        lambda *a, **k: seed_loop_calls.__setitem__("n", seed_loop_calls["n"] + 1),
+    )
+
+    from flash.providers.base import PollResult
+
+    def cancel_intent_poll(handle, spec, seed):
+        # cancel_run records the intent BEFORE the terminal `cancelled` write; its teardown deletes
+        # the box, which the poller then reports as a failure -- all while state is still "running".
+        orch.mark_cancel_requested(spec.run_id)
+        assert orch.get_status(spec.run_id).state == "running"  # terminal NOT yet persisted
+        assert orch.get_status(spec.run_id).cancel_requested is True
+        return PollResult(False, failure="stalled", detail="box deleted by cancel")
+
+    _make_poll_provider(monkeypatch, on_poll=cancel_intent_poll)
+
+    out = orch.attach_run(spec.run_id)
+    assert seed_loop_calls["n"] == 0, "must NOT resume paid work for a cancel-in-progress run"
+    assert out.cancel_requested is True  # intent preserved (cancel_run finishes the terminal flip)
+
+
+def test_attach_run_ok_poll_honors_cancel_intent_before_done(tmp_path, monkeypatch):
+    """The success branch persists metrics then writes terminal `done`. If a cancel lands while
+    metrics persist (intent recorded, `cancelled` not yet written), attach_run must raise
+    _RunCancelled and NOT mark the run `done` -- which would resurrect a user-cancelled run. The
+    guard honors the INTENT (cancel_requested), not just the persisted terminal state."""
+    import flash.runner as orch
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-intent-done"})
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote={"provider": "runpod", "endpoint_id": "ep-1", "job_id": "job-1", "seed": 0},
+        )
+    )
+
+    # The cancel lands while this seed's metrics persist (intent set, state still "running").
+    def fake_persist(spec_, seed_, metrics_):
+        orch.mark_cancel_requested(spec_.run_id)
+        return 1.0
+
+    monkeypatch.setattr(orch, "_persist_metrics", fake_persist)
+
+    from flash.providers.base import PollResult
+
+    _make_poll_provider(monkeypatch, on_poll=lambda h, s, seed: PollResult(True, metrics={"a": 1}))
+
+    out = orch.attach_run(spec.run_id)
+    assert out.state != "done", "a cancel-in-progress run must NOT be marked done"
+    assert orch.get_status(spec.run_id).state != "done"
+
+
 def test_run_seed_loop_bails_on_terminal_before_paid_work(tmp_path, monkeypatch):
     """Defense in depth: _run_seed_loop's own pre-submit guard now bails on ANY terminal state
     (not just `cancelled`). If the run is terminal when the loop is entered — e.g. a concurrent
