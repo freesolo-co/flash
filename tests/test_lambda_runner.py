@@ -1059,6 +1059,23 @@ def test_poll_active_done_marker_wins_over_first_liveness_stall(monkeypatch):
     assert res.failure is None
 
 
+def test_poll_first_liveness_stall_cancelled_run_not_quarantined(monkeypatch):
+    """A user cancel can land while the box is still active-but-silent (no boot.log/heartbeat), and the
+    first-liveness threshold can fire before the runner observes the cancellation. run_cancelled()
+    suppresses host_fault so a deliberate teardown does NOT quarantine a healthy region -- mirrors the
+    dead-host branch's cancel guard, which this liveness-stall path previously lacked."""
+    import flash.runner
+
+    monkeypatch.setattr(
+        flash.runner, "get_status", lambda run_id: type("S", (), {"state": "cancelled"})()
+    )
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], boot=None, step=100.0)
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+    assert not res.host_fault  # cancelled -> region NOT quarantined despite the liveness stall
+
+
 def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
     """Any FRESH heartbeat (even the early 'boot' stage) proves the worker started, so the
     first-liveness deadline is satisfied and must not fire."""
@@ -1643,7 +1660,7 @@ def test_allocator_capacity_aware(monkeypatch):
 
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")  # make lambda "available"
 
-    def fake_usable(gpu):
+    def fake_usable(gpu, force=False, ignore_sick=False):
         # A10 has capacity; A100 SXM 40GB does not (excluded from candidates).
         if gpu == "A10":
             return [LambdaInstance("A10", "gpu_1x_a10", "us-east-1", 24, 1.29)]

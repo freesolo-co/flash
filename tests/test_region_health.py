@@ -38,6 +38,18 @@ def test_healthy_regions_filters_in_order():
     assert health.healthy_regions("hyperstack", regions, now=10.0) == ["NORWAY-1", "US-1"]
 
 
+def test_healthy_regions_ignore_sick_keeps_quarantined():
+    """ignore_sick=True is the allocator's last-resort pass: it returns every region unfiltered (order
+    preserved) even when quarantined, so the quarantine can only DEMOTE a region, never zero out the
+    last candidate and hard-fail a run (the module's bounded-demotion contract)."""
+    health.clear()
+    health.mark_region_sick("hyperstack", "CANADA-1", ttl_s=100.0, now=0.0)
+    regions = ["NORWAY-1", "CANADA-1", "US-1"]
+    # normal filtering drops the sick region; the last-resort pass keeps it (all regions, in order).
+    assert health.healthy_regions("hyperstack", regions, now=10.0) == ["NORWAY-1", "US-1"]
+    assert health.healthy_regions("hyperstack", regions, now=10.0, ignore_sick=True) == regions
+
+
 def test_ttl_zero_disables_quarantine(monkeypatch):
     health.clear()
     monkeypatch.setenv("FLASH_REGION_SICK_TTL_S", "0")

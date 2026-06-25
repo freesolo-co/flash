@@ -85,8 +85,17 @@ def region_is_sick(provider: str, region: str | None, now: float | None = None) 
         return True
 
 
-def healthy_regions(provider: str, regions: list[str], now: float | None = None) -> list[str]:
-    """``regions`` minus those currently quarantined for ``provider`` (order preserved)."""
+def healthy_regions(
+    provider: str, regions: list[str], now: float | None = None, ignore_sick: bool = False
+) -> list[str]:
+    """``regions`` minus those currently quarantined for ``provider`` (order preserved).
+
+    ``ignore_sick=True`` returns ``regions`` unfiltered — the allocator's LAST-RESORT pass when
+    every fitting region is quarantined, so the quarantine can only DEMOTE a region (rank it behind
+    healthy options), never make a run hard-fail for lack of any candidate (its bounded-demotion
+    contract; see the module docstring)."""
+    if ignore_sick:
+        return list(regions)
     return [r for r in regions if not region_is_sick(provider, r, now=now)]
 
 

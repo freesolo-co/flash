@@ -94,7 +94,7 @@ def resolve_ssh_key_names() -> list[str]:
     return [names[0]]
 
 
-def usable_instances(gpu_class: str, force: bool = False) -> list[LambdaInstance]:
+def usable_instances(gpu_class: str, force: bool = False, ignore_sick: bool = False) -> list[LambdaInstance]:
     """Launchable (region) candidates for a managed GPU class, only where capacity exists now.
 
     Lambda prices per instance type (not per region), so every candidate for a class carries the
@@ -102,7 +102,8 @@ def usable_instances(gpu_class: str, force: bool = False) -> list[LambdaInstance
     has no Lambda capacity right now (the allocator skips it; a mid-run vanish is handled by the
     region walk + the runner's retry). ``force`` bypasses the ``/instance-types`` cache — used by the
     in-launch refresh so it can actually discover newly-freed regions rather than re-reading the
-    just-populated allocation cache.
+    just-populated allocation cache. ``ignore_sick`` keeps quarantined regions in (the allocator's
+    last-resort pass) so a region quarantine can never zero out the only capacity and hard-fail a run.
     """
     from flash.providers._health import healthy_regions
     from flash.providers.lambdalabs.gpus import instance_type_for
@@ -114,7 +115,9 @@ def usable_instances(gpu_class: str, force: bool = False) -> list[LambdaInstance
     # Drop regions under a dynamic health quarantine (a region that recently failed a worker before
     # training — see flash.providers._health). Both the allocator's capacity view and the launch
     # region walk read this, so a sick region is avoided everywhere until its TTL self-heals.
-    regions = healthy_regions("lambda", lambda_api.regions_with_capacity(itype, force=force))
+    regions = healthy_regions(
+        "lambda", lambda_api.regions_with_capacity(itype, force=force), ignore_sick=ignore_sick
+    )
     return [
         LambdaInstance(
             gpu=gpu_class,
@@ -773,7 +776,13 @@ def poll_lambda_job(
                             f"{int(time.time() - active_since)}s since the active/launch anchor "
                             f"(active_since is launch-anchored on a reattach that first saw it active; "
                             f"cloud-init/worker never started; limit {int(first_liveness_s)}s)",
-                            host_fault=True,  # the region never got the worker to boot -> quarantine it
+                            # A box that reached active but produced NO liveness means the region never
+                            # got a worker to boot -> quarantine it. EXCEPT when WE tore it down: a user
+                            # cancel during this active-but-silent window deletes the box, and this
+                            # threshold can fire before the runner observes the cancellation, so
+                            # run_cancelled() suppresses the quarantine (mirrors the dead-host branch) --
+                            # a deliberate teardown must not make a healthy region sick.
+                            host_fault=not run_cancelled(),
                         )
                 else:
                     boot_log_seen = True

@@ -898,6 +898,23 @@ def test_poll_active_done_marker_wins_over_first_liveness_stall(monkeypatch):
     assert res.failure is None
 
 
+def test_poll_first_liveness_stall_cancelled_run_not_quarantined(monkeypatch):
+    """A user cancel can land while the VM is still ACTIVE-but-silent (no boot.log/heartbeat), and the
+    first-liveness threshold can fire before the runner observes the cancellation. run_cancelled()
+    suppresses host_fault so a deliberate teardown does NOT quarantine a healthy region -- mirrors the
+    dead-VM branch's cancel guard, which this liveness-stall path previously lacked. Mirrors Lambda."""
+    import flash.runner
+
+    monkeypatch.setattr(
+        flash.runner, "get_status", lambda run_id: type("S", (), {"state": "cancelled"})()
+    )
+    jobs = _wire_poll(monkeypatch, vms=[{"status": "ACTIVE"}], boot=None, step=100.0)
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "stalled"
+    assert "no worker liveness" in res.detail
+    assert not res.host_fault  # cancelled -> region NOT quarantined despite the liveness stall
+
+
 def test_poll_loading_timeout(monkeypatch):
     jobs = _wire_poll(monkeypatch, vms=[{"status": "BUILD"}], step=100.0)
     monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", 300.0)
@@ -1229,7 +1246,7 @@ def test_allocator_capacity_aware(monkeypatch):
 
     monkeypatch.setenv("HYPERSTACK_API_KEY", "hk")
 
-    def fake_usable(gpu):
+    def fake_usable(gpu, force=False, ignore_sick=False):
         if gpu == "RTX A6000":
             return [
                 HyperstackInstance("RTX A6000", "n3-RTX-A6000x1", "NORWAY-1", "default-NORWAY-1", 48, 0.49)

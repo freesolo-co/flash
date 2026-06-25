@@ -61,13 +61,15 @@ _SETUP_HEARTBEAT_STAGES = SETUP_HEARTBEAT_STAGES
 _DEAD_STATES = {"ERROR", "FAILED", "DELETING", "DELETED", "TERMINATED"}
 
 
-def usable_instances(gpu_class: str, force: bool = False) -> list[HyperstackInstance]:
+def usable_instances(gpu_class: str, force: bool = False, ignore_sick: bool = False) -> list[HyperstackInstance]:
     """Launchable (region) candidates for a managed GPU class, only where the flavor has stock now.
     ``force`` bypasses the ``/core/flavors`` cache (used by the in-launch refresh so it can discover
     newly-restocked regions instead of re-reading the just-populated allocation cache).
 
     Hyperstack prices per flavor (not per region), so every candidate carries the same $/hr; the
     list is the regions whose flavor currently advertises stock. Empty == no Hyperstack capacity now.
+    ``ignore_sick`` keeps quarantined regions in (the allocator's last-resort pass) so a region
+    quarantine can never zero out the only capacity and hard-fail a run.
     """
     from flash.providers._health import healthy_regions
     from flash.providers.hyperstack.gpus import flavor_for
@@ -79,7 +81,9 @@ def usable_instances(gpu_class: str, force: bool = False) -> list[HyperstackInst
     # Drop regions under a dynamic health quarantine (a region that recently failed a worker before
     # training — see flash.providers._health), on top of the static HYPERSTACK_BLOCKED_REGIONS denylist
     # already applied in regions_with_stock. Both the allocator and the launch walk read this.
-    regions = healthy_regions("hyperstack", hs_api.regions_with_stock(flavor, force=force))
+    regions = healthy_regions(
+        "hyperstack", hs_api.regions_with_stock(flavor, force=force), ignore_sick=ignore_sick
+    )
     return [
         HyperstackInstance(
             gpu=gpu_class,
@@ -709,7 +713,13 @@ def poll_hs_job(
                             f"{int(time.time() - active_since)}s since the active/launch anchor "
                             f"(active_since is launch-anchored on a reattach that first saw it active; "
                             f"cloud-init/worker never started; limit {int(first_liveness_s)}s)",
-                            host_fault=True,  # the region never got the worker to boot -> quarantine it
+                            # A box that reached ACTIVE but produced NO liveness means the region never
+                            # got a worker to boot -> quarantine it. EXCEPT when WE tore it down: a user
+                            # cancel during this active-but-silent window deletes the VM, and this
+                            # threshold can fire before the runner observes the cancellation, so
+                            # run_cancelled() suppresses the quarantine (mirrors the dead-VM branch) --
+                            # a deliberate teardown must not make a healthy region sick.
+                            host_fault=not run_cancelled(),
                         )
                 else:
                     boot_log_seen = True

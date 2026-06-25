@@ -93,14 +93,16 @@ def _runpod_candidates(need: int) -> list[Candidate]:
     ]
 
 
-def _lambda_candidates(need: int) -> list[Candidate]:
+def _lambda_candidates(need: int, ignore_sick: bool = False) -> list[Candidate]:
     """Lambda's fitting classes that currently have LIVE capacity, priced live.
 
     Capacity-aware by design: a Lambda class with no region advertising capacity is EXCLUDED, so
     the allocator never hands the runner a Lambda class that would immediately fail to launch (and
     burn a retry) — directly the "GPU allocation is good, doesn't randomly die" property. A Lambda
     capacity-lookup failure (no key / network blip) degrades to the other providers: it is
-    non-fatal as long as another provider can supply a fitting class.
+    non-fatal as long as another provider can supply a fitting class. ``ignore_sick`` is the
+    last-resort pass: it keeps quarantined regions in so a region quarantine never zeroes out the
+    only capacity (see ``allocate``).
     """
     from flash.providers.lambdalabs.jobs import usable_instances
 
@@ -111,7 +113,7 @@ def _lambda_candidates(need: int) -> list[Candidate]:
             if g.vram_gb < need or g.name in _POOL_EXCLUDED:
                 continue
             # usable_instances reads the cached /instance-types, so only the first call hits the API.
-            if usable_instances(g.name):
+            if usable_instances(g.name, ignore_sick=ignore_sick):
                 out.append(Candidate("lambda", g.name, provider.hourly_rate(g.name), g.vram_gb))
     except Exception as exc:
         logger.warning("lambda capacity lookup failed (%s); allocating without lambda", exc)
@@ -119,12 +121,13 @@ def _lambda_candidates(need: int) -> list[Candidate]:
     return out
 
 
-def _hyperstack_candidates(need: int) -> list[Candidate]:
+def _hyperstack_candidates(need: int, ignore_sick: bool = False) -> list[Candidate]:
     """Hyperstack's fitting classes that currently have flavor STOCK, priced statically.
 
     Capacity-aware, exactly like Lambda: a class with no in-stock flavor is excluded so the runner
     never walks onto a class that would immediately fail to launch. A capacity-lookup failure
-    degrades to the other providers.
+    degrades to the other providers. ``ignore_sick`` is the last-resort pass: it keeps quarantined
+    regions in so a region quarantine never zeroes out the only capacity (see ``allocate``).
     """
     from flash.providers.hyperstack.jobs import usable_instances
 
@@ -135,7 +138,7 @@ def _hyperstack_candidates(need: int) -> list[Candidate]:
             if g.vram_gb < need or g.name in _POOL_EXCLUDED:
                 continue
             # usable_instances reads the cached /core/flavors, so only the first call hits the API.
-            if usable_instances(g.name):
+            if usable_instances(g.name, ignore_sick=ignore_sick):
                 out.append(Candidate("hyperstack", g.name, provider.hourly_rate(g.name), g.vram_gb))
     except Exception as exc:
         logger.warning("hyperstack capacity lookup failed (%s); allocating without hyperstack", exc)
@@ -170,6 +173,25 @@ def allocate(
         candidates += _lambda_candidates(need)
     if "hyperstack" in available:
         candidates += _hyperstack_candidates(need)
+    if not candidates:
+        # The instance providers contribute nothing when a fitting class has no live capacity OR all
+        # its capacity-having regions are quarantined (flash.providers._health). Quarantine's contract
+        # is bounded DEMOTION, never a hard-fail: if every fitting region is merely quarantined, a
+        # last-resort pass that ignores the quarantine recovers those candidates so the run launches
+        # (into a possibly-sick region) instead of raising the config-shaped UnsupportedGpuError that
+        # _run_seed_loop treats as terminal. A still-sick region just host_faults again (re-quarantine
+        # + cross-provider escape) -- the run is never killed at submit purely by our own quarantine.
+        relaxed: list[Candidate] = []
+        if "lambda" in available:
+            relaxed += _lambda_candidates(need, ignore_sick=True)
+        if "hyperstack" in available:
+            relaxed += _hyperstack_candidates(need, ignore_sick=True)
+        if relaxed:
+            logger.warning(
+                "every fitting instance-provider region is quarantined (sick); allocating into a "
+                "quarantined region rather than hard-failing the run (quarantine is bounded-demotion)"
+            )
+            candidates = relaxed
     if not candidates:
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "

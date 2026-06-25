@@ -129,6 +129,57 @@ def test_nothing_fits_names_constraint(monkeypatch):
         allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
 
 
+def test_quarantine_hiding_last_capacity_falls_back_not_hard_fail(monkeypatch):
+    """Region quarantine is bounded DEMOTION, never a hard-fail. When the only available provider's
+    fitting class has all its capacity-having regions quarantined, the normal (healthy) view is empty
+    -- but allocate() must NOT raise the config-shaped UnsupportedGpuError that _run_seed_loop treats
+    as terminal. Its last-resort pass relaxes the quarantine (ignore_sick) and still returns a
+    candidate, so the run launches into a possibly-sick region (which just host_faults + escapes if
+    still broken) instead of being killed at submit by our own quarantine."""
+    from flash.providers import allocator
+    from flash.providers.lambdalabs import jobs as lambda_jobs
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ["lambda"])
+
+    seen = {"healthy": 0, "relaxed": 0}
+
+    def fake_usable(gpu_class, force=False, ignore_sick=False):
+        # Healthy view: every fitting region is quarantined -> empty. Last-resort view: recovered.
+        if ignore_sick:
+            seen["relaxed"] += 1
+            return [object()]
+        seen["healthy"] += 1
+        return []
+
+    monkeypatch.setattr(lambda_jobs, "usable_instances", fake_usable)
+    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    assert a.provider == "lambda"  # recovered via the ignore_sick last-resort pass, not hard-failed
+    assert seen["healthy"] > 0  # the healthy pass ran first (and came back empty)
+    assert seen["relaxed"] > 0  # then the last-resort fallback recovered the quarantined candidate
+
+
+def test_quarantine_fallback_not_used_when_a_healthy_candidate_exists(monkeypatch):
+    """The fallback is LAST-RESORT only: when a healthy (non-quarantined) candidate exists, allocate()
+    must never relax the quarantine, so a sick region is genuinely demoted rather than resurrected and
+    ranked ahead of a healthy option."""
+    from flash.providers import allocator
+    from flash.providers.lambdalabs import jobs as lambda_jobs
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ["lambda"])
+
+    used_relaxed = {"v": False}
+
+    def fake_usable(gpu_class, force=False, ignore_sick=False):
+        if ignore_sick:
+            used_relaxed["v"] = True  # would only be called by the last-resort pass
+        return [object()]  # healthy view already non-empty
+
+    monkeypatch.setattr(lambda_jobs, "usable_instances", fake_usable)
+    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    assert a.provider == "lambda"
+    assert used_relaxed["v"] is False  # healthy candidates existed -> no quarantine relaxation
+
+
 def test_estimator_matches_measured_seq_boundaries():
     """The raw VRAM physics reproduces the MEASURED RunPod capacity sweep: each anchor
     is a real train/OOM boundary observed on a pinned card (the calibration ground truth).
