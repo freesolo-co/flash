@@ -57,6 +57,7 @@ from flash.engine.worker.lora import (
     is_vl_checkpoint,
     lora_exclude_modules,
     model_quant,  # noqa: F401
+    patch_grpo_mask_aware_lm_head,
     patch_vllm_language_model_only,
     patch_vllm_lm_weight_sync,
     remap_adapter_keys,  # noqa: F401
@@ -2061,24 +2062,24 @@ def run_rl():
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
         # the model's FULL context and won't start on a consumer GPU).
-        # vllm_gpu_memory_utilization sizes vLLM's KV pool. When sleep_mode is ON (>=3B /
-        # long-ctx), vLLM offloads ALL GPU memory (model + KV) to CPU during the backward
-        # pass, so 0.45 is safe — the peak is max(rollout, train). When sleep_mode is OFF
-        # (small/fast models), the KV cache stays resident during training; on large cards
-        # (A100/H100) 0.45 x 80 GB = 36 GB KV that never frees, leaving too little room
-        # for activations and causing OOM. Cap the KV pool at ~8 GB (the estimator's
-        # _KV_CAP in flash.engine.vram) so the non-sleep training peak stays within budget.
-        if sleep_mode:
-            _vllm_gpu_mem_util = 0.45
-        else:
-            try:
-                import torch as _torch_vram
+        # vllm_gpu_memory_utilization sizes vLLM's KV pool. The blanket sleep-path 0.45 was a
+        # misjudgement: on an 80 GB A100 it reserves 0.45 x 80 = 36 GB of KV, but a GRPO rollout only
+        # holds ~num_generations x context tokens. MEASURED (Qwen3.5-4B colocate): that 36 GB
+        # reservation is the dominant resident allocation and sets the step peak (~46 GB) — exactly why
+        # trainer-side optimisations (mask-aware lm_head, fused layers) moved nothing. colocate_kv_util
+        # sizes both paths from flash's per-model KV estimate instead (vram.py); MEASURED 4B/80 GB peak
+        # 46 -> 26 GB, reward byte-identical, train_wall neutral.
+        try:
+            import torch as _torch_vram
 
-                _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
-                _kv_target_gb = 8.0  # matches estimator's _KV_CAP (flash.engine.vram)
-                _vllm_gpu_mem_util = min(0.45, _kv_target_gb / max(1.0, _total_vram_gb))
-            except Exception:
-                _vllm_gpu_mem_util = 0.10  # safe fallback: ~8 GB KV on worst-case 80 GB card
+            from flash.engine.vram import colocate_kv_util
+
+            _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
+            _vllm_gpu_mem_util = colocate_kv_util(
+                _params_b, vllm_max_len, _total_vram_gb, sleep_mode, num_generations=group_size
+            )
+        except Exception:
+            _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10  # safe fallback to the old constants
         grpo_kwargs.update(
             vllm_mode="colocate",
             vllm_max_model_length=vllm_max_len,
@@ -2301,6 +2302,29 @@ def run_rl():
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
     # Capture the install report so the engaged kernels land in metrics (active_kernels below).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+    # Liger fused-loss chunk_size: TRL leaves it at the default 1, so the fused GRPO loss runs its
+    # whole detach -> chunk_forward -> compiled-loss -> autograd.grad cycle ONCE PER SEQUENCE
+    # (per_device_train_batch_size times) — Python/kernel-launch/compile-guard overhead that
+    # dominates at small-model scale where the GEMMs are tiny. Collapse it to ONE invocation over the
+    # whole per-device micro-batch. Numerically identical (every loss_type normalizes by the GLOBAL
+    # token count, not the chunk-local size, and chunk losses are summed). Must run BEFORE the
+    # mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure that has no
+    # chunk_size attribute.
+    _liger_loss = getattr(trainer, "liger_grpo_loss", None)
+    if _liger_loss is not None and hasattr(_liger_loss, "chunk_size"):
+        _cs = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
+        if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
+            _liger_loss.chunk_size = _cs
+            print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
+    # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
+    # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
+    # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is
+    # the right-PADDING (GRPO samples variable-length completions, padded to the batch max). Either
+    # way those positions add zero loss/gradient but pay full FLOPs. Loss-preserving; applies to ALL
+    # GRPO with the Liger fused loss; no-op when nothing is masked (uniform-length single-turn).
+    if grpo_kwargs.get("use_liger_kernel") and patch_grpo_mask_aware_lm_head(trainer):
+        _masked_kind = "env + padding" if use_rollout_func else "padding"
+        print(f"[rl] mask-aware lm_head: skipping masked ({_masked_kind}) positions in the GRPO loss")
     # The trainer (and its colocated vLLM engine + initial checkpoint load) is now built. Activate
     # the TRL->vLLM weight-sync name remap ONLY now (see patch_vllm_lm_weight_sync) so the initial
     # checkpoint load stayed untouched while the train-time syncs get remapped. No-op unless the VL
