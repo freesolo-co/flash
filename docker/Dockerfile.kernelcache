@@ -1,0 +1,18 @@
+# Thin per-arch kernel-cache layer.
+#
+# Bakes a warmup-produced mega-cache ON TOP of the EXACT base image the warmup ran inside, so the
+# cache's toolchain (torch/triton/fla/liger) is guaranteed to match the image it ships in. Rebuilding
+# the full Dockerfile.worker from the checkout instead could drift from the published base and bake a
+# cache that silently won't load (cold-JIT fallback) -- this avoids that by construction.
+#
+# BASE must be the same image tag bake_kernel_cache.py warmed in. build/kernel_cache holds the
+# downloaded mega_cache.bin + mega_cache.json + triton/inductor trees from that warmup.
+ARG BASE=ghcr.io/freesolo-co/flash-worker:cu128
+FROM ${BASE}
+
+# The base already points these at /opt/flash/kernelcache; set again so this layer is self-contained
+# even if it's ever built on an older base.
+ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
+    TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor
+
+COPY build/kernel_cache/ /opt/flash/kernelcache/
