@@ -93,17 +93,22 @@ def select_active() -> str | None:
 
 
 def advance_key() -> bool:
-    """Cycle to the next account for new provisioning. False only for a single-key pool.
+    """Cycle to the next account for new provisioning, signalling exhaustion on a full cycle.
 
     Wraps around after the last key so quota recovered on earlier accounts is reused
-    (e.g. key1 → key2 → key1 → ...). With a single key there is nowhere to advance —
-    the caller's quota-sweep retry loop handles the wait in that case.
+    (e.g. key1 → key2 → key1 → ...). The active pointer ALWAYS advances; the return value is
+    the "more untried accounts remain this cycle?" signal:
 
-    Contract caveat: because it WRAPS, a multi-key pool ALWAYS returns True — a True return
-    does NOT mean "a fresh, untried account is now active". A `True` never means "more accounts
-    remain", so callers must NOT loop on ``while advance_key(): ...`` to drain the pool (that
-    spins forever when every account is exhausted); bound the number of failovers by
-    ``key_count()`` instead (see ``deploy_train_endpoint``).
+    * ``True``  — moved to a fresh account that hasn't been the active key yet this cycle.
+    * ``False`` — either a single-key pool (nowhere to advance) OR the pointer just WRAPPED
+      back to the starting account (index 0), i.e. every account has now been the active key
+      once. The pointer still moved (so subsequent provisioning reuses key #0's possibly-
+      recovered quota), but the False tells a ``while advance_key(): ...`` failover loop to
+      stop after exactly one pass instead of spinning forever on an all-exhausted pool.
+
+    Because False also fires on the wrap, callers may safely loop on ``while advance_key()`` to
+    drain the pool once; ``deploy_train_endpoint`` additionally bounds the failovers by
+    ``key_count()`` (belt-and-suspenders — both stop after one cycle).
 
     Also collapses ``RUNPOD_API_KEY`` to the newly-active key so the SDK and the
     preferred-first REST ordering both follow the failover.
@@ -115,7 +120,9 @@ def advance_key() -> bool:
             return False
         _idx = (_idx + 1) % len(pool)
         os.environ[_ENV_VAR] = pool[_idx]
-        return True
+        # Wrapped back to the starting account (index 0) => every account has been tried this
+        # cycle. Advance still happened, but report exhaustion so failover loops terminate.
+        return _idx != 0
 
 
 def reset() -> None:

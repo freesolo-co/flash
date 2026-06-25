@@ -400,6 +400,47 @@ def test_capacity_grace_scales_with_gpu_walk_position():
     assert sig.parameters["setup_grace_s"].default >= 1800.0
 
 
+def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
+    # A recovery (RunpodProvider.poll on a persisted handle) must reproduce the ORIGINAL submit's
+    # on_last_gpu stall tuning — the runner persists it into the handle, so a last-candidate run
+    # keeps its longer no-capacity grace after a control-plane restart instead of being judged on
+    # the shorter non-last window.
+    from flash.providers.base import JobHandle
+    from flash.providers.runpod import PROVIDER
+    from flash.providers.runpod import jobs as jobs
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    captured: dict = {}
+
+    def fake_poll_job(handle, **kw):
+        captured.update(kw)
+        return jobs.PollResult(True, metrics={})
+
+    monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
+
+    spec = JobSpec(
+        run_id="reattach",
+        model="Qwen/Qwen3.5-0.8B",
+        algorithm="grpo",
+        train=TrainSpec(seeds=(0,), steps=1, hf_repo=""),
+        gpu=GpuSpec(type="A100"),
+    )
+    base = {"provider": "runpod", "endpoint_id": "ep", "endpoint_name": "n", "job_id": "j"}
+
+    # on_last_gpu=True persisted -> the longer (~15 min) capacity grace is reproduced.
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True}), spec, 0)
+    assert captured["queue_grace_s"] == 900.0
+    assert captured["throttled_grace_s"] == 900.0
+
+    # on_last_gpu=False (and a legacy handle with the key ABSENT) -> the default non-last grace.
+    captured.clear()
+    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False}), spec, 0)
+    assert captured["queue_grace_s"] == 300.0
+    captured.clear()
+    PROVIDER.poll(JobHandle.from_dict(base), spec, 0)  # pre-persist handle: defaults to False
+    assert captured["queue_grace_s"] == 300.0
+
+
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     # A job that leaves IN_QUEUE (a worker picks it up) must clear the queue timer: the later
     # IN_PROGRESS/COMPLETED path is governed by the heartbeat/setup windows, never by queue_grace_s.
@@ -1000,6 +1041,9 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         # attempt 0: cheaper class, a next-best still exists -> False; attempts 1 & 2: on the last
         # candidate (and clamped onto it) -> True.
         assert last_flags == [False, True, True]
+        # The winning (last) attempt persisted on_last_gpu into the handle so a reattach reproduces
+        # its stall tuning (see test_reattach_poll_reproduces_persisted_on_last_gpu).
+        assert orch.get_status("lastgpu").remote.get("on_last_gpu") is True
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -1445,8 +1489,9 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
 
 def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
     """When EVERY account is quota-exhausted, deploy fails over once per account and then RAISES —
-    it must NOT loop forever. advance_key() wraps (always True for a multi-key pool), so the deploy
-    bounds its own failovers by key_count(); a regression would spin here indefinitely."""
+    it must NOT loop forever. advance_key() returns False once it wraps back to the starting
+    account, AND the deploy bounds its own failovers by key_count() (belt-and-suspenders); a
+    regression in either would spin here indefinitely."""
     import flash.providers.runpod.jobs as jobs
     import flash.providers.runpod.keys as keys
 

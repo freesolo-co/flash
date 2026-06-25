@@ -69,10 +69,33 @@ def test_advance_collapses_env_and_reorders(monkeypatch):
     # advance collapses RUNPOD_API_KEY to the active key for the runpod_flash SDK.
     assert os.environ["RUNPOD_API_KEY"] == "rk-b"
 
-    # Pool cycles: after the last key wraps back to key #0, not exhausted.
-    assert keys.advance_key() is True
+    # Pool cycles: the pointer still wraps back to key #0 (so recovered quota there is reused),
+    # but the return value now reports exhaustion — every account was the active key once this
+    # cycle — so a `while advance_key()` failover loop stops after one full pass instead of
+    # spinning forever on an all-exhausted pool.
+    assert keys.advance_key() is False
     assert keys.active_key() == "rk-a"
     assert os.environ["RUNPOD_API_KEY"] == "rk-a"
+
+
+def test_advance_key_drain_loop_terminates(monkeypatch):
+    """`while advance_key()` drains the pool exactly once and stops — the False-on-wrap contract
+    that protects any caller relying on the return value (vs. spinning on an all-exhausted pool)."""
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b,rk-c")
+    keys.reset()
+    seen = [keys.active_key()]
+    iterations = 0
+    while keys.advance_key():
+        iterations += 1
+        seen.append(keys.active_key())
+        assert iterations < 10  # safety net: must terminate, never spin
+    # One full cycle: advanced to each of the other 2 accounts (True), then wrapped to rk-a (False).
+    assert iterations == 2
+    assert seen == ["rk-a", "rk-b", "rk-c"]
+    # The pointer DID still wrap back to the preferred account so recovered quota is reused.
+    assert keys.active_key() == "rk-a"
 
 
 def test_select_active_collapses_env(monkeypatch):

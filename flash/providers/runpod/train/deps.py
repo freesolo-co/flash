@@ -180,6 +180,44 @@ DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h RunPod worker execution cap
 
 _RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 
+# Optimization-toggle env knobs REMOVED in PR #175 (deterministic behavior). flash is fully
+# managed: these used to let a run override alloc conf / attention backend / torch.compile / the
+# FlashAttention selection / chalk-kernel selection / the whole worker dep stack. They were dropped
+# from forwarding to make every run behave identically — but the per-run ``spec.worker_env`` block
+# is still merged into the worker env below, so without filtering, a recipe could RE-INJECT any of
+# them and silently re-enable the non-deterministic (and sometimes crash-prone) behavior:
+#   * PYTORCH_(CUDA_)ALLOC_CONF — overrides the sleep-SAFE alloc conf build_worker_env computes for
+#     RL; expandable_segments:True crashes GRPO vLLM sleep mode (CuMemAllocator assert at init).
+#   * RL_VLLM_SLEEP / FLASH_ALLOC_AUTO — the worker resolves sleep + alloc-conf deterministically.
+#   * VLLM_ATTENTION_BACKEND / VLLM_FLASH_ATTN_VERSION / FLASH_DISABLE_FA2 / FLASH_DISABLE_FA3 /
+#     TORCHDYNAMO_DISABLE — attention / compile escape hatches; FA is used whenever importable.
+#   * FLASH_*_KERNEL / FLASH_FP8_BASE / FLASH_TRITON_LORA — chalk kernel SELECTION is now fixed in
+#     engine.chalk_kernels._KERNELS (reads no env); a per-run flag is dead but still stripped.
+#   * FLASH_WORKER_DEPS / FLASH_WORKER_EXTRA_DEPS — the pinned WORKER_DEPS stack is authoritative.
+# Matched case-INSENSITIVELY (env keys are upper-cased on merge); FLASH_CHALK_SPEC is deliberately
+# NOT here — it is a still-supported install-SOURCE override (see build_worker_env's forward list).
+_REMOVED_OPTIMIZATION_ENV = frozenset(
+    {
+        "PYTORCH_ALLOC_CONF",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "RL_VLLM_SLEEP",
+        "FLASH_ALLOC_AUTO",
+        "TORCHDYNAMO_DISABLE",
+        "VLLM_ATTENTION_BACKEND",
+        "VLLM_FLASH_ATTN_VERSION",
+        "FLASH_DISABLE_FA2",
+        "FLASH_DISABLE_FA3",
+        "FLASH_ROPE_KERNEL",
+        "FLASH_QKV_KERNEL",
+        "FLASH_MLP_KERNEL",
+        "FLASH_EMBED_KERNEL",
+        "FLASH_FP8_BASE",
+        "FLASH_TRITON_LORA",
+        "FLASH_WORKER_DEPS",
+        "FLASH_WORKER_EXTRA_DEPS",
+    }
+)
+
 
 def build_worker_env(
     spec: JobSpec,
@@ -267,8 +305,19 @@ def build_worker_env(
     # adapter). FLASH_ARM identifies the substrate.
     _RESERVED_WORKER_ENV = {"RUN_ID", "HF_REPO", "FLASH_ARM"}
     for k, v in (getattr(spec, "worker_env", None) or {}).items():
-        if str(k).upper() in _RESERVED_WORKER_ENV:
+        ku = str(k).upper()
+        if ku in _RESERVED_WORKER_ENV:
             continue  # control plane owns run identity; a per-run override would orphan artifacts
+        if ku in _REMOVED_OPTIMIZATION_ENV:
+            # A removed optimization toggle (PR #175). flash is deterministic + fully managed: drop
+            # it so a recipe can't re-inject e.g. an unsafe PYTORCH_ALLOC_CONF that crashes GRPO
+            # sleep mode, or a stale chalk/FA selection flag. See _REMOVED_OPTIMIZATION_ENV.
+            logger.warning(
+                "ignoring removed optimization toggle %s in [worker_env] (flash is fully "
+                "managed; behavior is deterministic)",
+                k,
+            )
+            continue
         env[str(k)] = str(v)
     allowed_runtime_secrets = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)
     for k, v in (runtime_secrets or {}).items():
