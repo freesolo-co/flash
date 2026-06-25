@@ -310,7 +310,7 @@ def _find_real_libcudart() -> str | None:
     try:
         import nvidia  # type: ignore  # namespace package; subpkg import may fail, this won't
 
-        for base in list(getattr(nvidia, "__path__", []) or []):
+        for base in sorted(map(str, getattr(nvidia, "__path__", []) or [])):
             candidates += sorted(glob.glob(os.path.join(base, "*", "lib", "libcudart.so.*")))
     except Exception:
         pass
