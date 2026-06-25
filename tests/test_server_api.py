@@ -846,6 +846,56 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     assert out.deployment["state"] == "undeployed"  # not re-advertised
 
 
+def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monkeypatch, tmp_path):
+    # The legacy finished_at backfill (for runs that went `done` before finished_at existed) must
+    # run ONLY on the done->deployed transition, where updated_at == training teardown. On an
+    # already-`deployed` run (the CAS finalization with expect_state="deployed"), updated_at is the
+    # DEPLOY time, so stamping finished_at from it would reintroduce the instance over-billing this
+    # whole change fixes.
+    import flash.runner as runner
+
+    importlib.reload(runner)
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+
+    spec = {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "run_id": "dep-leg"}
+
+    # (1) done -> deployed: legacy run, finished_at=None, updated_at == teardown -> backfilled.
+    teardown = 1_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id="dep-leg",
+            state="done",
+            spec=spec,
+            remote=None,
+            updated_at=teardown,
+            finished_at=None,
+        )
+    )
+    out = runner.mark_deployed("dep-leg", {"endpoint_name": "e"})
+    assert out.state == "deployed"
+    assert out.finished_at == teardown  # frozen to the real teardown time
+    assert out.updated_at > teardown  # the deploy bumped updated_at past teardown
+
+    # (2) already-`deployed` legacy run whose finished_at was never backfilled: a CAS-finalization
+    # re-call must NOT turn the deploy-time updated_at into finished_at.
+    deploy_time = 5_000.0
+    runner._save_status(
+        runner.RunStatus(
+            run_id="dep-leg2",
+            state="deployed",
+            spec={**spec, "run_id": "dep-leg2"},
+            remote=None,
+            updated_at=deploy_time,
+            finished_at=None,
+            deployment={"endpoint_name": "e"},
+        )
+    )
+    out2 = runner.mark_deployed("dep-leg2", {"endpoint_name": "e2"}, expect_state="deployed")
+    assert out2.state == "deployed"
+    assert out2.finished_at is None  # NOT stamped from the deploy-time updated_at
+
+
 def test_deploy_lock_is_usable_and_weakly_cleaned():
     # threading.Lock() isn't weak-referenceable, so the per-run lock must be a wrapper that
     # both works as a context manager AND can live in the WeakValueDictionary (the raw lock

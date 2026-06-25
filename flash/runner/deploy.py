@@ -336,10 +336,11 @@ def mark_deployed(run_id: str, deployment: dict, expect_state: str | None = None
         # Freeze the training-teardown time before the deploy bumps updated_at. New terminal runs
         # already stamp finished_at on their first terminal transition, but a LEGACY run that went
         # `done` before that field existed has finished_at=None while its current updated_at still
-        # holds the real teardown time. Capture it here (mark_deployed is only reachable from `done`,
-        # so updated_at == teardown) so reconcile's finished_at-or-updated_at fallback bills the
-        # instance providers' flat $/hr to teardown, not through to the later deploy/serving time.
-        if status.finished_at is None:
+        # holds the real teardown time. Capture it ONLY on the `done` -> `deployed` transition, where
+        # updated_at == teardown. mark_deployed is also called on an already-`deployed` run (the CAS
+        # finalization with expect_state="deployed"), where updated_at is the DEPLOY time — stamping
+        # finished_at from that would reintroduce the very over-billing this fixes for legacy runs.
+        if status.state == "done" and status.finished_at is None:
             status.finished_at = status.updated_at
         status.deployment = deployment
         status.state = "deployed"
