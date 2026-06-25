@@ -210,6 +210,58 @@ def test_rollout_batch_scores_rewards_concurrently():
     assert elapsed < 1.0, f"reward scoring did not run concurrently ({elapsed:.2f}s for 8x0.2s)"
 
 
+def test_rollout_batch_serial_when_reward_not_thread_safe():
+    """An env that declares ``reward_thread_safe = False`` is scored SERIALLY — a scorer with mutable
+    state or a thread-bound client is never raced (it worked serially and must keep working)."""
+    import time
+
+    class _UnsafeSlowEnv(_VarTurnEnv):
+        reward_thread_safe = False  # opt out of concurrent scoring
+
+        def reward(self, completion, example, state=None):
+            time.sleep(0.15)
+            return float(example["rid"])
+
+    def batched(prefixes, max_tokens_list):
+        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
+
+    examples = [{"max_model": 1, "rid": i} for i in range(6)]
+    t0 = time.perf_counter()
+    out = rollout_batch(
+        examples=examples, active_env=_UnsafeSlowEnv(), render=render,
+        batched_generate=batched, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+    )
+    elapsed = time.perf_counter() - t0
+    assert [r["reward"] for r in out] == [float(i) for i in range(6)]  # correct + in order
+    # 6 x 0.15s = 0.9s serial vs ~0.15s concurrent -> a >=0.6s floor proves it did NOT parallelize.
+    assert elapsed >= 0.6, f"reward_thread_safe=False env was parallelized ({elapsed:.2f}s)"
+
+
+def test_rollout_batch_reward_fails_fast():
+    """A reward failure surfaces IMMEDIATELY — pending scorers are cancelled and the slow in-flight
+    judge calls are not awaited — so one rate-limit/API error can't keep a paid rollout stuck."""
+    import time
+
+    class _FailFastEnv(_VarTurnEnv):
+        def reward(self, completion, example, state=None):
+            if example["rid"] == 0:
+                raise RuntimeError("judge 500")  # fails right away
+            time.sleep(0.5)  # the others are slow
+            return 1.0
+
+    def batched(prefixes, max_tokens_list):
+        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
+
+    examples = [{"max_model": 1, "rid": i} for i in range(8)]
+    t0 = time.perf_counter()
+    with pytest.raises(RuntimeError, match="judge 500"):
+        rollout_batch(
+            examples=examples, active_env=_FailFastEnv(), render=render,
+            batched_generate=batched, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+        )
+    assert time.perf_counter() - t0 < 0.3, "reward failure did not surface fast (blocked on slow calls)"
+
+
 def test_rollout_one_interleaves_and_masks_env_tokens():
     out = rollout_one(
         example={"answer": "GOOD"},

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypedDict
 
 
@@ -349,17 +349,28 @@ def rollout_batch(
     # Score with the ACTUAL accumulated rollout state (matches rollout_one). The per-rollout reward is
     # frequently an IO-bound call (an LLM-judge or tool round-trip), so score the batch CONCURRENTLY:
     # the calls release the GIL on network/subprocess I/O and overlap, collapsing N serial GPU-idle
-    # round-trips into ~one. ``pool.map`` reassembles results in INPUT ORDER, so for any pure reward
-    # fn (the verifiers convention — ``reward`` reads only its own example+state) this is identical to
-    # the serial scoring; only the wall time differs. Compute-bound rewards see no change. A single
-    # rollout skips the pool.
+    # round-trips into ~one. Results are reassembled in INPUT ORDER, so for a thread-safe reward (the
+    # verifiers convention — ``reward`` reads only its own example+state + immutable config) this is
+    # identical to the serial scoring; only wall time differs. Compute-bound rewards see no change.
     def _score(r: _RolloutState) -> float:
         return float(active_env.reward("", r.example, r.state))
 
-    if len(rollouts) <= 1:
+    # Serial for a single rollout, or when the env declares its reward NOT thread-safe (a scorer that
+    # keeps mutable state or a thread-bound client/connection — it worked serially and must not be
+    # raced). Envs opt out with ``reward_thread_safe = False``.
+    if len(rollouts) <= 1 or not getattr(active_env, "reward_thread_safe", True):
         return [r.result(_score(r)) for r in rollouts]
-    with ThreadPoolExecutor(max_workers=min(16, len(rollouts))) as pool:
-        scores = list(pool.map(_score, rollouts))
+    # Concurrent + fail-FAST: surface the first reward error immediately and cancel pending scorers
+    # (and don't block on in-flight ones), so one rate-limit / API failure can't keep a paid rollout
+    # stuck behind unrelated long-timeout judge calls — matching the serial path's stop-on-first-error.
+    pool = ThreadPoolExecutor(max_workers=min(16, len(rollouts)))
+    try:
+        futures = {pool.submit(_score, r): i for i, r in enumerate(rollouts)}
+        scores: list[float] = [0.0] * len(rollouts)
+        for fut in as_completed(futures):
+            scores[futures[fut]] = fut.result()  # re-raises the first failed scorer
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return [r.result(s) for r, s in zip(rollouts, scores, strict=True)]
 
 
