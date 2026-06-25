@@ -469,13 +469,6 @@ def submit_run_lambda(
         lambda_api.terminate_instances([handle.instance_id])
 
 
-def cancel(remote: dict) -> None:
-    """Cross-process cancel: terminate the persisted instance (stops billing)."""
-    instance_id = remote.get("instance_id")
-    if instance_id:
-        lambda_api.terminate_instances([str(instance_id)])
-
-
 def terminate_run_instances(run_id: str) -> list[str]:
     """Terminate every instance belonging to ONE run (names start with its run prefix).
 

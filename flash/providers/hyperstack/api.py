@@ -50,10 +50,6 @@ _CLIENT = RestClient(
 )
 
 
-def _api_key() -> str:
-    return _CLIENT.api_key()
-
-
 def request_with_retries(
     path: str, method: str = "GET", body: dict | None = None, retries: int = 4, base_delay: float = 2.0
 ) -> Any:

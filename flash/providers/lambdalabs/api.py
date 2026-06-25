@@ -43,10 +43,6 @@ _CLIENT = RestClient(
 )
 
 
-def _api_key() -> str:
-    return _CLIENT.api_key()
-
-
 def request_with_retries(
     path: str,
     method: str = "GET",

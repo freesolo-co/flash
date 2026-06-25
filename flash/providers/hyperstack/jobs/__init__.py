@@ -403,13 +403,6 @@ def submit_run_hyperstack(
         hs_api.delete_vm(handle.vm_id)
 
 
-def cancel(remote: dict) -> None:
-    """Cross-process cancel: delete the persisted VM (stops billing)."""
-    vm_id = remote.get("vm_id")
-    if vm_id:
-        hs_api.delete_vm(str(vm_id))
-
-
 def terminate_run_instances(run_id: str) -> list[str]:
     """Delete every VM belonging to ONE run (names start with its run prefix). Best-effort."""
     if not run_id:
