@@ -122,6 +122,7 @@ def test_gdn_hybrid_false_for_pure_and_sliding(monkeypatch):
 
 
 def test_gdn_packing_available_requires_both_kernels(monkeypatch):
+    pytest.importorskip("transformers")
     import transformers.utils.import_utils as iu
 
     def setk(fla, conv):
