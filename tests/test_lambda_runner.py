@@ -1870,11 +1870,13 @@ def test_submit_falls_back_to_quarantined_region_when_healthy_empty(monkeypatch)
 
     monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: True)
 
-    seen_ignore_sick = []
+    seen_calls = []  # (force, ignore_sick) per usable_instances() call
 
     def fake_usable(gpu, force=False, ignore_sick=False):
-        seen_ignore_sick.append(ignore_sick)
-        return [_inst()] if ignore_sick else []  # healthy view empty; relaxed recovers the region
+        seen_calls.append((force, ignore_sick))
+        # healthy view empty; the relaxed fallback recovers the region ONLY when it bypasses the cache
+        # (force=True) -- a non-forced relaxed re-fetch would return the same stale-empty view.
+        return [_inst()] if (ignore_sick and force) else []
 
     captured = {}
 
@@ -1889,7 +1891,8 @@ def test_submit_falls_back_to_quarantined_region_when_healthy_empty(monkeypatch)
 
     res = jobs.submit_run_lambda(_spec(), seed=0)
     assert res.ok
-    assert seen_ignore_sick == [False, True]  # healthy pass first (empty), then the relaxed fallback
+    assert [c[1] for c in seen_calls] == [False, True]  # healthy pass first (empty), then relaxed fallback
+    assert seen_calls[1][0] is True  # relaxed fallback bypasses the cache (force=True) to find live capacity
     assert captured["instances"]  # launch got the recovered quarantined candidate, not an empty list
     assert captured["ignore_sick"] is True  # propagated so the in-launch walk relaxes too
 

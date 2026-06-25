@@ -969,7 +969,12 @@ def submit_run_lambda(
     # host_faults + the run retries/escapes) and keep the in-launch region walk consistent (ignore_sick).
     relaxed = not instances
     if relaxed:
-        instances = usable_instances(spec.gpu.type, ignore_sick=True)
+        # force=True on this last-resort fetch: the in-launch region walk's force=True refresh only runs
+        # once there is >=1 instance to iterate, so if launch_and_submit receives an empty list it raises
+        # WITHOUT ever refreshing -- a stale (cached) capacity view showing no regions would then hard-fail
+        # the attempt even though capacity actually exists now. Bypass the cache here so the relaxed pass
+        # discovers any currently-available region (healthy or quarantined) before we give up.
+        instances = usable_instances(spec.gpu.type, force=True, ignore_sick=True)
     handle = launch_and_submit(
         spec, seed, instances, attempt=attempt, log=log,
         runtime_secrets=runtime_secrets, ignore_sick=relaxed,
