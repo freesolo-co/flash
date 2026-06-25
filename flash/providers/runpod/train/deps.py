@@ -136,7 +136,10 @@ def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True
     override = os.environ.get("FLASH_WORKER_IMAGE", "").strip()
     if override:
         return override
-    if friendly_gpu:
+    # per-sm / template images are durable RunPod queue-worker images (CMD runs rp_handler.py), NOT
+    # RunPod Flash live-function images, so they must never leak into the live path. only the
+    # absolute FLASH_WORKER_IMAGE override (handled above) is treated as live-compatible.
+    if friendly_gpu and allow_default:
         info = get_gpu_info(friendly_gpu)
         template = os.environ.get(WORKER_IMAGE_TEMPLATE_ENV, "").strip()
         if template:

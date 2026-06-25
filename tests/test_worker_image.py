@@ -46,3 +46,22 @@ def test_worker_image_template_can_define_arch_tags(monkeypatch):
     )
 
     assert worker_image_for_gpu("H100") == "ghcr.io/freesolo-co/flash-worker:cu128-sm90-h100"
+
+
+def test_per_sm_and_template_never_leak_into_live_endpoints(monkeypatch):
+    # per-SM / template images are durable RunPod queue-worker images (CMD runs rp_handler.py); they
+    # must NOT route into the live-endpoint path (allow_default=False), which expects None unless the
+    # absolute FLASH_WORKER_IMAGE override names a live-compatible image.
+    _clear_image_env(monkeypatch)
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_PER_SM", "1")
+    monkeypatch.setenv(
+        "FLASH_WORKER_IMAGE_TEMPLATE",
+        "ghcr.io/freesolo-co/flash-worker:cu128-{sm}",
+    )
+
+    assert worker_image_for_gpu("RTX 4090", allow_default=False) is None
+    # the absolute override is still honored on the live path
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/freesolo-co/flash-worker:live")
+    assert worker_image_for_gpu("RTX 4090", allow_default=False) == (
+        "ghcr.io/freesolo-co/flash-worker:live"
+    )
