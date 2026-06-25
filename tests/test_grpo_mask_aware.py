@@ -27,11 +27,14 @@ def _make_fake_loss(record):
     def fake_loss(*, _input, lin_weight, selected_token_ids, attention_mask, advantages,
                   old_per_token_logps=None, ref_per_token_logps=None, vllm_is_ratio=None, **_):
         record["T"] = int(selected_token_ids.size(1))
+        record["ratio_T"] = None if vllm_is_ratio is None else int(vllm_is_ratio.size(1))
         per_token = (
             selected_token_ids.float() * _input.sum(-1)
             + old_per_token_logps
             - ref_per_token_logps
         )
+        if vllm_is_ratio is not None:  # 2-D ratio is per-token -> must be gathered with the same index
+            per_token = per_token * vllm_is_ratio
         loss = (per_token * attention_mask).sum() / NORM
         return loss, {"reward": advantages.mean()}
 
@@ -50,6 +53,7 @@ def _inputs():
         "advantages": torch.randn(b),
         "old_per_token_logps": torch.randn(b, t),
         "ref_per_token_logps": torch.randn(b, t),
+        "vllm_is_ratio": torch.rand(b, t) + 0.5,  # 2-D per-token -> exercises the ratio gather path
     }
 
 
@@ -67,6 +71,7 @@ def test_mask_aware_lm_head_is_loss_preserving_and_aligned():
 
     assert rec_full["T"] == 6  # the fake saw full length without the patch
     assert rec_masked["T"] == 4  # ...and GATHERED length (max unmasked = 4) with it
+    assert rec_masked["ratio_T"] == 4  # the 2-D vllm_is_ratio was gathered with the SAME index
     # exactly loss-preserving — and since the numerator uses sel/_input/old/ref, this only holds if
     # every per-token tensor was gathered with the SAME index (a misaligned gather would diverge).
     assert torch.allclose(loss_full, loss_masked)
@@ -103,3 +108,13 @@ def test_mask_aware_lm_head_single_turn_padding():
 
 def test_mask_aware_lm_head_returns_false_without_loss_object():
     assert patch_grpo_mask_aware_lm_head(_FakeTrainer()) is False
+
+
+def test_mask_aware_lm_head_is_idempotent():
+    # A second install must NOT double-wrap (it would gather twice); it returns True as a no-op.
+    trainer = _FakeTrainer()
+    trainer.liger_grpo_loss = _make_fake_loss({})
+    assert patch_grpo_mask_aware_lm_head(trainer) is True
+    wrapped = trainer.liger_grpo_loss
+    assert patch_grpo_mask_aware_lm_head(trainer) is True
+    assert trainer.liger_grpo_loss is wrapped  # unchanged — not wrapped again

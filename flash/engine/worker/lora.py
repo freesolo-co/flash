@@ -255,6 +255,8 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
     orig = getattr(trainer, "liger_grpo_loss", None)
     if orig is None:
         return False
+    if getattr(orig, "_flash_mask_aware", False):
+        return True  # already wrapped — idempotent (mirrors the other patch helpers' sentinels)
     import torch
 
     def _gather(x, idx, tprime):
@@ -273,9 +275,11 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
         tprime = int(keep.sum(dim=1).max().item())
         if tprime == 0 or tprime == full_t:
             return orig(**kwargs)  # nothing maskable to skip
-        # One shared gather index: unmasked positions first (stable -> original order preserved),
-        # the remainder filled from the trailing masked positions whose gathered mask is 0 (so they
-        # add zero loss/grad and can't perturb the per-token ratio/KL alignment).
+        # One shared gather index: the unmasked positions first (stable argsort -> their original
+        # order preserved), then the remaining masked positions in original order. Keep only the
+        # first tprime columns; a sequence with fewer than tprime unmasked positions has its filler
+        # entries taken from its masked positions, whose gathered mask is 0 — so they add zero
+        # loss/grad and can't perturb the per-token ratio/KL alignment.
         order = torch.argsort((~keep).to(torch.int8), dim=1, stable=True)
         idx = order[:, :tprime].contiguous()
         gk = dict(kwargs)
@@ -290,6 +294,7 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
             gk["vllm_is_ratio"] = _gather(ratio, idx, tprime)
         return orig(**gk)
 
+    masked_liger_loss._flash_mask_aware = True  # sentinel for the idempotency check above
     trainer.liger_grpo_loss = masked_liger_loss
     return True
 
