@@ -214,6 +214,11 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     Sweeps EVERY account in the ``RUNPOD_API_KEY`` pool: ``deploy_train_endpoint`` fails over to
     another account on a quota error, so a cache volume may have been created under any pool key —
     a single-account teardown would leak the volumes the failover created elsewhere.
+
+    ``datacenters`` semantics: ``None`` (the default) = the WHOLE storage-DC fleet; a non-empty list =
+    just those DCs; an EXPLICIT empty list ``[]`` = nothing (returns ``[]``). The empty-list case must
+    NOT widen to the full fleet — a caller that resolved a scope down to zero DCs intends a no-op, and
+    silently nuking every cache there would be a destructive footgun.
     """
 
     from runpod_flash.core.api.runpod import RunpodRestClient
@@ -223,6 +228,10 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     from flash.providers.runpod import keys as rp_keys
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
+    # An EXPLICIT empty scope ([]) is a no-op, NOT "all" — never widen zero DCs to the whole fleet.
+    if datacenters is not None and not datacenters:
+        logger.info("teardown: empty datacenter scope — nothing to reclaim (refusing to widen to all)")
+        return []
     pool = rp_keys.keys()
     if not pool:
         # No RunPod key configured (e.g. an instance-only control plane): this is a best-effort
@@ -231,7 +240,7 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
         # missing-key behavior: log and return nothing reclaimed.
         logger.info("teardown: RUNPOD_API_KEY not configured — skipping RunPod cache teardown")
         return []
-    dc_ids = datacenters or [dc.value for dc in weight_cache_datacenters()]
+    dc_ids = datacenters if datacenters else [dc.value for dc in weight_cache_datacenters()]
     targets = {
         weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, DataCenter.from_string(d)) for d in dc_ids
     }
@@ -557,12 +566,25 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else catalog_model_ids()
-    scoped_dcs = bool(args.datacenters)  # operator narrowed to a RunPod-DC subset (RunPod-only scope)
-    dcs = (
-        [d.strip() for d in args.datacenters.split(",") if d.strip()]
-        if args.datacenters
-        else [dc.value for dc in weight_cache_datacenters()]
+    # Parse --datacenters ONCE. `scoped` means the operator actually narrowed to >=1 real DC id — NOT
+    # merely that the flag was present. A flag that parses to NOTHING (e.g. `--datacenters ""`, all
+    # whitespace/commas, or an all-invalid list) must be an ERROR, never a silent full teardown: it
+    # would otherwise (a) hit teardown_weight_cache's `datacenters or <all>` fallback and delete EVERY
+    # RunPod cache, while (b) the present-but-empty flag skipped the instance-provider cleanup.
+    # argparse default is None when --datacenters is OMITTED; an empty/whitespace/all-comma STRING is
+    # still "provided" (`is not None`) but parses to zero ids. Use `is not None` — NOT truthiness — so
+    # `--datacenters ""` is caught too (bool("") is False).
+    dcs_given = args.datacenters is not None
+    parsed_dcs = (
+        [d.strip() for d in args.datacenters.split(",") if d.strip()] if dcs_given else []
     )
+    if dcs_given and not parsed_dcs:
+        print("--datacenters was given but parsed to no datacenter ids — refusing to run "
+              "(an empty scope would delete the WHOLE RunPod fleet); drop --datacenters for a full "
+              "teardown, or pass real DC ids.")
+        return 2
+    scoped = bool(parsed_dcs)  # a real RunPod-DC subset -> RunPod-only scope
+    dcs = parsed_dcs or [dc.value for dc in weight_cache_datacenters()]
     if args.provision:
         # Eagerly create the instance-provider cache storage in every region/env (GPU-free). RunPod's
         # per-DC fleet materializes on the next eager endpoint deploy / warm, so it's not created here.
@@ -600,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
         # regions / Hyperstack envs are a different namespace), so a SCOPED teardown stays RunPod-only
         # rather than unexpectedly deleting every Lambda/Hyperstack `flash-weights` cache too. Only a
         # FULL teardown (no --datacenters) reclaims the instance-provider caches.
-        if not scoped_dcs:
+        if not scoped:
             try:
                 deleted += teardown_lambda_filesystems()
             except Exception as exc:

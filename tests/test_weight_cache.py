@@ -112,6 +112,20 @@ def test_weight_cache_volumes_distinct_name_per_dc():
     assert {v.size for v in vols} == {100}
 
 
+def test_weight_cache_volumes_size_tolerant_of_bad_values():
+    # weight_cache_volumes builds NetworkVolumes from spec.gpu.network_volume_gb directly (a GpuSpec
+    # can carry a raw value that bypassed JobSpec.from_dict's parse). A non-numeric/"0"/negative size
+    # must default to 100 via _volume_gb — never raise (best-effort would silently drop the cache) or
+    # create a 0-GB volume.
+    from flash.providers.runpod import jobs
+
+    for raw in ("0", 0, -5, "abc", None, True):
+        vols = jobs.weight_cache_volumes(_vol_spec(gb=raw))
+        assert {v.size for v in vols} == {100}, f"{raw!r} should default to 100 GB"
+    # a valid positive size still passes through
+    assert {v.size for v in jobs.weight_cache_volumes(_vol_spec(gb=250))} == {250}
+
+
 def test_weight_cache_volume_name_includes_datacenter():
     from runpod_flash.core.resources.datacenter import DataCenter
 
@@ -758,6 +772,40 @@ def test_scoped_teardown_is_runpod_only(monkeypatch):
     assert seen["dcs"] == ["US-CA-2"]  # the RunPod scope was honored
     assert "lambda" not in seen  # instance providers were NOT touched
     assert "hyperstack" not in seen
+
+
+def test_teardown_empty_datacenters_scope_is_refused(monkeypatch):
+    """`--teardown --datacenters <empty/whitespace>` must ERROR, never silently full-teardown RunPod.
+
+    Regression for the footgun where a present-but-empty scope (a) widened teardown_weight_cache to
+    the WHOLE RunPod fleet via its `datacenters or <all>` fallback while (b) skipping the instance
+    providers because the flag was present. It must abort (rc != 0) and touch NOTHING.
+    """
+    from flash.providers.runpod import preload
+
+    called = {}
+    monkeypatch.setattr(preload, "teardown_weight_cache", lambda dcs: called.setdefault("runpod", dcs) or [])
+    monkeypatch.setattr(preload, "teardown_lambda_filesystems", lambda: called.setdefault("lambda", True) or [])
+    monkeypatch.setattr(preload, "teardown_hyperstack_volumes", lambda: called.setdefault("hyperstack", True) or [])
+    for scope in ("", " , , ", "   "):  # empty, all-commas, all-whitespace -> parse to zero ids
+        called.clear()
+        assert preload.main(["--teardown", "--datacenters", scope]) == 2
+        assert called == {}  # no provider teardown ran — not RunPod, not the instance providers
+
+
+def test_teardown_weight_cache_empty_list_is_noop_not_all(monkeypatch):
+    """teardown_weight_cache([]) is a no-op; an EXPLICIT empty scope must not widen to the full fleet."""
+    import runpod_flash.core.api.runpod as rp_api
+
+    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import preload
+
+    def _boom(*a, **k):
+        raise AssertionError("an empty scope must not list/delete any volumes")
+
+    monkeypatch.setattr(rp_keys, "keys", lambda: ["k1"])
+    monkeypatch.setattr(rp_api, "RunpodRestClient", _boom)
+    assert preload.teardown_weight_cache([]) == []  # nothing reclaimed, no client constructed
 
 
 # ---------------------------------------------------------------------------

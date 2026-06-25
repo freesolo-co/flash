@@ -22,8 +22,12 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from flash._logging import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 from flash.providers._poll import (
     PollErrorTracker,
     make_say,
@@ -157,7 +161,12 @@ def weight_cache_volumes(spec) -> list:
         return []
     from runpod_flash import NetworkVolume
 
-    size = int(getattr(spec.gpu, "network_volume_gb", 100) or 100)
+    from flash.spec import _volume_gb
+
+    # Reuse the spec's tolerant parser: a stale/hand-edited spec with a non-numeric, "0", or negative
+    # network_volume_gb defaults to 100 GB rather than raising (which best-effort would swallow into a
+    # no-cache deploy) or creating a nonsensical 0-GB volume — matches _volume_gb's contract/tests.
+    size = _volume_gb(getattr(spec.gpu, "network_volume_gb", 100))
     return [
         NetworkVolume(name=weight_cache_volume_name(str(base), dc), size=size, datacenter=dc)
         for dc in dcs
@@ -338,7 +347,7 @@ def deploy_train_endpoint(
     name_suffix: str | None = None,
     disk_gb: int | None = None,
     spec=None,
-    endpoint_kwargs: dict | None = None,
+    endpoint_kwargs: dict | Callable[[], dict] | None = None,
 ) -> tuple[str, str]:
     """Deploy (or reuse) the run's uniquely-named worker endpoint; return (id, name).
 
