@@ -31,7 +31,7 @@ def test_compute_table_only_lists_real_classes():
 
 def test_gpu_tflops_known_and_default():
     assert gpu_tflops("RTX 5090") == GPU_COMPUTE_TFLOPS["RTX 5090"]
-    assert gpu_tflops("RTX 5090") > gpu_tflops("RTX 3090")  # newer/faster
+    assert gpu_tflops("RTX 5090") > gpu_tflops("RTX 4090")  # newer/faster
     assert gpu_tflops("totally-unknown-gpu") == 100.0  # documented default
 
 

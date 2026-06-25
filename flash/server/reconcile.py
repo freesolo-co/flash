@@ -94,8 +94,10 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     now = time.time() if now is None else now
     remote = status.remote or {}
     start = float(remote.get("started_ts") or status.created_at)
-    end = float(status.updated_at) + _SETTLE_SECONDS
-    realized = realized_cost_for_remote(remote, start=start, end=end)
+    run_end = float(status.updated_at)  # the run's true terminal time (~teardown / billing stop)
+    # RunPod's billing query pads past run end so the settled invoice is in range; the instance
+    # providers bill flat $/hr to teardown, so they get the UN-padded run_end (no extra settle hour).
+    realized = realized_cost_for_remote(remote, start=start, end=run_end + _SETTLE_SECONDS, run_end=run_end)
     if realized is None or realized.realized_usd <= 0:
         return False
 
