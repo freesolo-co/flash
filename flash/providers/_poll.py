@@ -246,15 +246,18 @@ def heartbeat_progress_ts(hb_key: tuple | None, launch_ts: float | None) -> tupl
     launch: that is a LEFTOVER heartbeat from a prior attempt (retries reuse the same seed
     heartbeat path), so the caller must NOT treat it as current progress — otherwise a stale
     training-stage heartbeat would arm the tighter training stall window and fail a healthy new
-    attempt mid-setup before it has overwritten the old file. (``launch`` uses ``is not None`` so a
-    legitimate ``launch_ts == 0.0`` is honored, not silently replaced by ``now``.)"""
+    attempt mid-setup before it has overwritten the old file. ``launch_ts`` uses truthiness (not
+    ``is not None``): the instance handles store started_ts as a non-Optional float coerced to 0.0
+    when missing, so 0.0 means "unknown launch" (a real launch is a large epoch ts) and we fall
+    back to ``now`` for the clamp floor — when launch is unknown every heartbeat counts as fresh
+    (the safe default: don't discard progress we can't date)."""
     now = time.time()
     ts = hb_key[2] if (isinstance(hb_key, tuple) and len(hb_key) >= 3) else None
     try:
         ts = float(ts)
     except (TypeError, ValueError):
         return now, False
-    lo = float(launch_ts) if launch_ts is not None else now
+    lo = float(launch_ts) if launch_ts else now
     fresh = ts >= lo
     return min(now, max(lo, ts)), fresh
 

@@ -287,7 +287,12 @@ def poll_hs_job(
     # on a delayed reattach after a control-plane restart the box has been billing since launch,
     # so a still-booting VM that already blew LOAD_TIMEOUT_S must fail over NOW instead of getting
     # another full window. On a fresh launch started_ts ~= now (no-op).
-    start = handle.started_ts if handle.started_ts is not None else time.time()
+    # Truthiness (`or time.time()`), NOT `is not None`: started_ts is a non-Optional float and
+    # HyperstackJobHandle.from_dict coerces a MISSING started_ts to 0.0, so 0.0 here means "unknown
+    # launch" (a real launch is a large epoch ts, never 0.0). Treat 0.0 as missing and anchor to
+    # now, else an old/corrupt handle would peg the deadline + stall clocks to the epoch and
+    # instantly trip "deadline exceeded".
+    start = handle.started_ts or time.time()
     last_status = None
     last_hb_key = None
     last_progress = start

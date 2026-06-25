@@ -384,6 +384,22 @@ def test_poll_recovery_seeds_load_clock_from_launch(monkeypatch):
     assert int(m.group(1)) >= 2000, res.detail
 
 
+def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
+    """started_ts is a non-Optional float coerced to 0.0 when MISSING (old/corrupt handle), so 0.0
+    means 'unknown launch' (a real launch is a large epoch ts). The clocks must anchor to now, NOT
+    the epoch — otherwise a booting box would be 'past' a ~57-year-old load window and stall on the
+    first tick. DONE then completes the run normally."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        done="10500.0",
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+        step=10.0,
+    )
+    res = jobs.poll_lambda_job(_handle(started_ts=0.0), _spec(), seed=0, interval_s=0)
+    assert res.ok, res  # not instantly stalled by an epoch-anchored deadline/load clock
+
+
 def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
     """A heartbeat that was already stale before a restart must not reset the stall clock to the
     reattach time: its OWN ts is credited as last-progress, so an active worker frozen long ago
