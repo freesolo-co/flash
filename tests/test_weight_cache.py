@@ -1701,24 +1701,50 @@ def test_warm_instances_explicit_gpu_overrides_all_providers(monkeypatch):
     assert seen == {"lambda": "H100", "hyperstack": "H100"}
 
 
-def test_warm_instances_fails_fast_without_status_repo(monkeypatch):
-    """If the status repo can't be created (bad/missing HF_TOKEN), warm must NOT launch paid GPUs."""
+def test_warm_instances_requires_status_repo_before_launch(monkeypatch):
+    """With targets available, warm must validate the status repo BEFORE launching any paid box.
+    Capacity enumeration is cheap/read-only, so it runs first (to decide if there's anything to do);
+    the status-repo guard gates the actual LAUNCH, which is what costs money."""
+    import types
+
     import pytest
 
     from flash.providers.hyperstack import jobs as hj
     from flash.providers.lambdalabs import jobs as lj
     from flash.providers.runpod import preload
 
-    monkeypatch.setattr(preload, "_ensure_status_repo",
-                        lambda token: (_ for _ in ()).throw(RuntimeError("401 unauthorized")))
-
-    def _boom(gpu):
-        raise AssertionError("must not query capacity / launch before the status repo is ready")
-
-    monkeypatch.setattr(lj, "usable_instances", _boom)
-    monkeypatch.setattr(hj, "usable_instances", _boom)
+    # Lambda (an unfiltered provider) has capacity -> a real launch target exists.
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [types.SimpleNamespace(region="us-east-1")])
+    monkeypatch.setattr(hj, "usable_instances", lambda gpu: [])
+    monkeypatch.setattr(
+        lj,
+        "launch_and_submit",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not launch before status repo")),
+    )
+    monkeypatch.setattr(
+        preload,
+        "_ensure_status_repo",
+        lambda token: (_ for _ in ()).throw(RuntimeError("401 unauthorized")),
+    )
     with pytest.raises(RuntimeError, match="status repo"):
         preload.warm_instances(models=["a/b"])
+
+
+def test_warm_instances_no_targets_is_noop_without_status_repo(monkeypatch):
+    """No provider capacity -> documented no-op: warm returns [] and must NOT require the status repo
+    (else an empty warm on an unconfigured / at-capacity host would hard-fail on a missing HF_TOKEN)."""
+    from flash.providers.hyperstack import jobs as hj
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [])
+    monkeypatch.setattr(hj, "usable_instances", lambda gpu: [])
+    monkeypatch.setattr(
+        preload,
+        "_ensure_status_repo",
+        lambda token: (_ for _ in ()).throw(AssertionError("status repo must not be required with no targets")),
+    )
+    assert preload.warm_instances(models=["a/b"]) == []
 
 
 def test_warm_instances_cli_dry_run(monkeypatch):

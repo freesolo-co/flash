@@ -345,6 +345,12 @@ def build_worker_env(
     # pointing HF_HOME there would just break the worker (the worker also self-corrects at runtime
     # if /runpod-volume isn't mounted — see _train_body). A per-run [worker_env] override still wins
     # (merged last, below).
+    # CONFIDENTIALITY: HF_HOME here is process-global, so the run's environment/reward code's runtime
+    # HF downloads ALSO land on this SHARED mount — the catalog gate (runner._assign_weight_cache_volume)
+    # scopes only the spec model, not assets fetched at execution time with the forwarded HF_TOKEN. See
+    # the TRUST MODEL note in flash/runner/__init__.py; proper base-model-only scoping (explicit
+    # cache_dir for prefetch + ephemeral HF cache for env code, or a read-only mount) is a worker-side
+    # follow-up.
     if getattr(spec.gpu, "network_volume", None):
         env.update(weight_cache_env())
     if spec.train.steps is not None:

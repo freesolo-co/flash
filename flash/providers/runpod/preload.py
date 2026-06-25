@@ -193,8 +193,18 @@ def warm_weight_cache(
     default 5) — the default of 4 leaves a buffer so extra deploys don't fail on quota. A region that
     errors is reported in its result dict and does not abort the others.
     """
+    from runpod_flash.core.resources.datacenter import DataCenter
+
     models = models or catalog_model_ids()
     dc_ids = datacenters or [dc.value for dc in weight_cache_datacenters()]
+    # Validate the WHOLE --datacenters scope to concrete DataCenter values BEFORE submitting any
+    # futures: the per-DC parse otherwise runs inside _preload_one_dc on a worker thread, so a single
+    # bad id would raise through fut.result() only AFTER the valid DCs already deployed paid preload
+    # endpoints — aborting the command with money already spent. Parse up front so an invalid id fails
+    # the whole command (naming the bad id + listing valid ones via DataCenter.from_string) before any
+    # endpoint launches.
+    for d in dc_ids:
+        DataCenter.from_string(d)
     token = token or os.environ.get("HF_TOKEN")
     logger.info("warming %d datacenter(s) with %d model(s)", len(dc_ids), len(models))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -462,14 +472,25 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
             text = reader(force=True)
             if text:
                 break
-            # No completion file yet — a terminal failure marker means the box already died; stop
-            # polling and free it now instead of waiting out the full budget.
+            # No completion file yet — the terminal attempt marker is the backstop: ok=false means the
+            # box already died (stop polling, free it now), ok=true means the download SUCCEEDED but
+            # only the preload_result.json upload had a transient Hub blip (the worker still wrote a
+            # terminal ok=true marker), so the box is ALREADY warmed — short-circuit the wait instead
+            # of polling to the full budget then terminating a warmed box and reporting it timed out.
             fail_text = fail_reader(force=True)
             if fail_text:
                 try:
                     fail = json.loads(fail_text)
                 except Exception:
                     fail = {}
+                if fail.get("ok") is True:
+                    # Terminal SUCCESS marker, completion file lost to a transient upload failure. Treat
+                    # the marker itself as the result (the completion file is still authoritative when
+                    # present, but it never landed here). "partial" if the marker carries an
+                    # error/failed field, else "ok".
+                    bad = fail.get("error") or fail.get("failed")
+                    return {"provider": provider, "region": region,
+                            "status": "partial" if bad else "ok", "result": fail}
                 if not fail.get("ok", True):
                     # The completion file (preload_result.json) is authoritative when present: a
                     # partial/failed-download run uploads it AND THEN writes the ok=false fail marker,
@@ -513,16 +534,6 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
     models = models or catalog_model_ids()
     providers = providers or ["lambda", "hyperstack"]
     token = os.environ.get("HF_TOKEN")
-    # Fail fast BEFORE launching any paid GPU: the status repo is the only completion signal, so if it
-    # can't be created/accessed (missing/invalid HF_TOKEN) every box would just run to timeout warming
-    # nothing observable. Surface a clear error instead of silently burning instances.
-    try:
-        _ensure_status_repo(token)
-    except Exception as exc:
-        raise RuntimeError(
-            f"preload status repo {_PRELOAD_STATUS_REPO!r} unavailable ({exc}); set a valid HF_TOKEN "
-            "with write access before warming (refusing to launch paid GPUs that can't report)."
-        ) from exc
 
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs as hs_jobs
@@ -565,6 +576,18 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
     if not targets:
         logger.warning("warm: no Lambda/Hyperstack capacity right now (nothing to warm)")
         return []
+    # Fail fast BEFORE launching any paid GPU: the status repo is the only completion signal, so if it
+    # can't be created/accessed (missing/invalid HF_TOKEN) every box would just run to timeout warming
+    # nothing observable. Surface a clear error instead of silently burning instances. Done only AFTER
+    # the target list is built and the no-targets early-return above, so an empty warm (no capacity /
+    # provider not configured) stays a harmless no-op and doesn't hard-fail on a missing HF_TOKEN.
+    try:
+        _ensure_status_repo(token)
+    except Exception as exc:
+        raise RuntimeError(
+            f"preload status repo {_PRELOAD_STATUS_REPO!r} unavailable ({exc}); set a valid HF_TOKEN "
+            "with write access before warming (refusing to launch paid GPUs that can't report)."
+        ) from exc
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [
             ex.submit(_warm_one_instance, provider, jobs_mod, c, models, provider_gpu, token, timeout_s, poll_interval_s)
@@ -698,6 +721,23 @@ def main(argv: list[str] | None = None) -> int:
              "are left intact, since DC ids don't map to their region/env namespace).",
     )
     args = ap.parse_args(argv)
+
+    # The mode flags are MUTUALLY EXCLUSIVE: each selects a different exit-early branch below, and the
+    # branch order (provision -> warm-instances -> teardown -> default RunPod warm) silently picks ONE
+    # when several are set — e.g. `--teardown --warm-instances` would launch paid warm jobs (the warm
+    # branch runs first) instead of deleting caches, AND bypass the off-catalog --models check (the
+    # teardown exemption short-circuits it). Reject the conflict up front so the off-catalog gate always
+    # applies to whichever warm branch actually executes. The default RunPod warm has no flag, so it's
+    # only reachable when NONE of these are set — it can't conflict.
+    selected_modes = [
+        name for name, on in (
+            ("--provision", args.provision),
+            ("--warm-instances", args.warm_instances),
+            ("--teardown", args.teardown),
+        ) if on
+    ]
+    if len(selected_modes) > 1:
+        ap.error(f"{', '.join(selected_modes)} are mutually exclusive — pass exactly one mode")
 
     catalog = catalog_model_ids()
     models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else catalog

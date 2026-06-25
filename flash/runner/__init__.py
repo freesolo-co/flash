@@ -260,14 +260,20 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
 # Lambda/Hyperstack caches). Lambda filesystems + Hyperstack volumes are likewise pre-created in every
 # region/environment by ``preload --provision`` (pure control-plane API, no GPU).
 #
-# TRUST MODEL (shared multi-tenant cache): the cache holds ONLY PUBLIC catalog base weights. This is
-# ENFORCED, not assumed — ``_assign_weight_cache_volume`` attaches the cache only for
-# ``model_policy == "catalog"`` runs (always public; resolve_model validates catalog membership), and
-# leaves open-model ("allow") runs cache-less so a possibly PRIVATE/GATED HF repo (downloaded with the
-# forwarded platform HF_TOKEN) NEVER persists onto the shared mount where another tenant in the region
-# could read it. So there is NO cross-tenant CONFIDENTIALITY exposure: only inert public weights ever
-# land here.
-# The remaining residual is INTEGRITY only: the mount is read-WRITE on every run and a run executes
+# TRUST MODEL (shared multi-tenant cache). The catalog gate makes the run's SPEC model public:
+# ``_assign_weight_cache_volume`` attaches the cache only for ``model_policy == "catalog"`` runs
+# (always public; resolve_model validates catalog membership) and leaves open-model ("allow") runs
+# cache-less, so a spec that NAMES a private/gated model never persists it onto the shared mount.
+# CONFIDENTIALITY CAVEAT (not fully closed): the redirect is process-global (``weight_cache_env`` sets
+# ``HF_HOME`` onto the mount), so it scopes the SPEC model but NOT additional HF repos the run's
+# environment/reward code may fetch at execution time with the forwarded platform HF_TOKEN — those
+# would also land on the shared mount and be readable by a later tenant in the region. The residual is
+# bounded by (a) the catalog gate on the base model, (b) the scope of the platform HF_TOKEN, and (c)
+# flash environments being published/reviewed Hub/GitHub artifacts (not anonymous code) — but it is a
+# real limitation. The proper hardening (scope the mount to the trusted base-model prefetch via an
+# explicit ``cache_dir`` while env/reward code uses an ephemeral HF cache, or a READ-ONLY mount
+# populated only by preload) is worker-side and tracked as a follow-up.
+# A second residual is INTEGRITY: the mount is read-WRITE on every run and a run executes
 # its Freesolo environment code on the worker, so a hostile/buggy environment COULD overwrite a cached
 # public model's content-addressed blobs and poison a later run loading that same model in the region.
 # That is the accepted flip side of "one shared cache for everything" — flash environments are

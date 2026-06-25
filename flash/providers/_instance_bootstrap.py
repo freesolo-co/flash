@@ -307,9 +307,19 @@ def _arm_preload_wall_cap(payload: dict) -> threading.Timer | None:
         msg = f"preload exceeded the wall-clock cap ({int(wall_s)}s); self-terminating box"
         print(f"FLASH: {msg}", flush=True)
         # Best-effort terminal marker so the driver/sweeper sees a terminal failure instead of polling
-        # to its own timeout. Never block the hard exit on it.
-        with contextlib.suppress(Exception):
-            write_attempt_marker(payload, ok=False, error=msg)
+        # to its own timeout. The wall cap often fires BECAUSE the Hub/NIC is hung (the main thread is
+        # stuck in snapshot_download), and write_attempt_marker does a blocking HF upload — running it
+        # inline here would wedge the timer thread on that same hung network and the paid VM would
+        # NEVER self-terminate, defeating the wall cap. So attempt the marker on a SEPARATE daemon
+        # thread, join it only briefly, then HARD-exit regardless of whether the upload finished. The
+        # marker is best-effort; the driver's own poll-timeout still frees the box if it's lost.
+        def _mark() -> None:
+            with contextlib.suppress(Exception):
+                write_attempt_marker(payload, ok=False, error=msg)
+
+        marker_thread = threading.Thread(target=_mark, daemon=True)
+        marker_thread.start()
+        marker_thread.join(timeout=8.0)
         os._exit(1)
 
     timer = threading.Timer(wall_s, _fire)
@@ -416,7 +426,25 @@ def main() -> int:
                     wall_timer.cancel()
             with open("/tmp/preload_result.json", "w") as f:
                 json.dump(result, f)
-            hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
+            # preload_result.json is the AUTHORITATIVE completion signal the warm driver polls — a
+            # single transient Hub blip on this one upload (hf_upload swallows it) would silently drop
+            # it, leaving the driver to poll to its full timeout then terminate an already-warmed box
+            # and report it timed out. Best-effort RETRY a few times (bounded — never block forever) so
+            # a transient blip doesn't lose the completion file. Still NON-FATAL: the box exits success
+            # after the retries even if every one fails (the driver's terminal attempt-marker handling
+            # is the backstop), but log loudly so a persistent failure is observable.
+            for attempt in range(3):
+                hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
+                try:
+                    if hf_file_exists(payload, "preload_result.json"):
+                        break
+                except Exception as exc:
+                    print(f"preload_result.json upload confirm warn: {exc}", flush=True)
+                if attempt < 2:
+                    time.sleep(2.0 * (attempt + 1))
+            else:
+                print("preload_result.json upload FAILED after 3 attempts (completion file may be "
+                      "missing; driver falls back to the attempt marker)", flush=True)
             ok = not result.get("error") and not result.get("failed")
             error = result.get("error") or (f"models failed: {sorted(result.get('failed') or {})}" if result.get("failed") else "")
             return 0 if ok else 1
