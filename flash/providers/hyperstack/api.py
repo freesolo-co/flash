@@ -130,12 +130,24 @@ def _generate_throwaway_public_key() -> str:
 
     Hyperstack requires a key_name at launch even though the box is bootstrapped via cloud-init and
     we never SSH. The private key is thrown away here and no inbound-SSH security rule is opened, so
-    the key is inert."""
+    the key is inert.
+
+    Shells out to ``ssh-keygen``; a slim control-plane image may not ship it. A missing/failed
+    ``ssh-keygen`` raises a clear, actionable ``HyperstackApiError`` (install ``openssh-client`` or
+    pin ``HYPERSTACK_KEYPAIR_NAME``) instead of a bare ``FileNotFoundError`` that looks like an
+    API/stock failure."""
     with tempfile.TemporaryDirectory() as d:
         kp = f"{d}/k"
-        subprocess.run(
-            ["ssh-keygen", "-t", "ed25519", "-f", kp, "-N", "", "-q"], check=True, timeout=30
-        )
+        try:
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-f", kp, "-N", "", "-q"], check=True, timeout=30
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            raise HyperstackApiError(
+                "could not generate a throwaway Hyperstack keypair: ssh-keygen is unavailable or "
+                f"failed ({e}). Install openssh-client on the control plane (to provide ssh-keygen), "
+                "or set HYPERSTACK_KEYPAIR_NAME to an existing keypair to skip generation."
+            ) from e
         with open(kp + ".pub") as f:
             return f.read().strip()
 

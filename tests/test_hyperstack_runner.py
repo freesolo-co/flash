@@ -116,6 +116,22 @@ def test_launch_raises_when_no_stock(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=[], attempt=0)
 
 
+def test_throwaway_keypair_missing_ssh_keygen_is_clear_error(monkeypatch):
+    """A slim control plane without ssh-keygen must raise an actionable HyperstackApiError (install
+    openssh-client / pin HYPERSTACK_KEYPAIR_NAME), not a bare FileNotFoundError that reads like an
+    API/stock failure."""
+    import subprocess
+
+    from flash.providers.hyperstack import api as hs_api
+
+    def _no_keygen(*a, **k):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'ssh-keygen'")
+
+    monkeypatch.setattr(subprocess, "run", _no_keygen)
+    with pytest.raises(hs_api.HyperstackApiError, match=r"openssh-client|HYPERSTACK_KEYPAIR_NAME"):
+        hs_api._generate_throwaway_public_key()
+
+
 def test_launch_skips_region_with_no_boot_image_without_reconciling(monkeypatch):
     """A pre-launch resolution failure (region has stock but no qualifying CUDA image / key) created
     NO VM, so it's a CLEAN region SKIP — walk to the next region, never an ambiguous-phantom abort
