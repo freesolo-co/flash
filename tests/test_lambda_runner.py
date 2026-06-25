@@ -989,6 +989,27 @@ def test_poll_reattach_setup_stall_no_liveness_quarantines(monkeypatch):
     assert res.host_fault  # active but never any liveness past setup grace on reattach -> quarantine
 
 
+def test_poll_reattach_setup_stall_boot_log_present_not_quarantined(monkeypatch):
+    """SAME reattach window as above, but the box DID publish a boot.log (cloud-init ran, worker booting
+    slowly). The first-liveness branch -- which normally latches boot_log_seen -- is deferred by the
+    observed-grace floor, so the setup-stall fires first with boot_log_seen still False. It must FORCE-read
+    the boot.log before the no-liveness predicate: a boot-log-only stall is ambiguous (the worker ran), so
+    it stays a (retriable) stall but must NOT host_fault/quarantine a healthy region."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}] * 3,
+        boot="+ docker pull ...\n",  # boot.log present -> cloud-init ran -> NOT a no-liveness region
+        step=0.1,  # observed-grace floor (120s) NOT reached -> first-liveness latch stays deferred
+    )
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
+        first_liveness_s=10.0, setup_grace_s=10.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert not res.host_fault  # boot.log present (force-read latch) -> ambiguous stall, region NOT sick
+
+
 def test_poll_setup_stall_done_marker_wins_over_quarantine(monkeypatch):
     """The pre-training setup-stall path force-reads terminal artifacts before returning, exactly as the
     first-liveness branch does. A worker can finish right at the stall boundary and have its DONE delayed

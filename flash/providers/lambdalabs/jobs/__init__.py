@@ -905,6 +905,20 @@ def poll_lambda_job(
                 terminal = terminal_artifact_result()
                 if terminal is not None:
                     return terminal
+                # boot_log_seen is latched ONLY inside the first-liveness block above -- which is
+                # DEFERRED on a reattach until the observed-grace floor (active_obs_since only just
+                # started), so this setup-stall can fire FIRST with boot_log_seen still False even
+                # though the box already published a boot.log (cloud-init ran, worker just booting
+                # slowly). Force-read the boot.log here before the no-liveness predicate so a healthy
+                # boot-log-only box is NOT quarantined -- matching the normal (non-deferred) path where
+                # the latch suppresses host_fault. ``is not None`` keeps an empty "" boot.log counting
+                # as liveness (the file existing proves cloud-init ran); both the attempt-scoped and the
+                # legacy path are consulted (a mixed-version pre-upgrade box wrote only the legacy one).
+                if not boot_log_seen and (
+                    boot_log_reader(force=True) is not None
+                    or legacy_boot_log_reader(force=True) is not None
+                ):
+                    boot_log_seen = True
                 # A box that reached active but produced NO liveness at all (no boot.log, no heartbeat)
                 # and then stalled out the full pre-training setup grace means the region never got a
                 # worker to boot -> host fault (quarantine), same as the first-liveness branch above.
