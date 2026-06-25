@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from flash import __version__
+from flash._channel import CLI_NAME
 from flash._logging import get_logger
 from flash.catalog import public_model_rows
 from flash.client import (
@@ -102,7 +103,7 @@ def cmd_version(args) -> int:
     if render.styled():
         print(render.version(__version__))
     else:
-        print(f"flash {__version__}")
+        print(f"{CLI_NAME} {__version__}")
     return 0
 
 
