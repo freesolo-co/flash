@@ -108,11 +108,6 @@ def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
 # past the top of that plateau, even on a card with VRAM to spare. (Reward histories at pd 4 and
 # 16 were identical -> per_device is a pure speed/VRAM knob, not an optimization change.)
 _RL_PER_DEVICE_MAX = 16
-# fp32-logits VRAM budget (bytes) for a SINGLE Liger chunk's [chunk, completion, vocab] tensor.
-# The same 6 GB ceiling rl_per_device_comps uses to bound per_device; reused to bound the fused
-# GRPO loss chunk_size so a large micro-batch on a short-seq run can't materialize the whole
-# batch's logits in one chunk and OOM (see liger_loss_chunk_size).
-_RL_LOGITS_BUDGET_BYTES = 6.0e9
 # Reference sequence length the activation/VRAM divisor is calibrated at. The colocate activation
 # peak grows with the training sequence length; the cap is scaled by seq_len/_RL_ACT_SEQ_REF so a
 # short-seq run (the underfed regime) is allowed a proportionally bigger micro-batch.
@@ -189,10 +184,11 @@ def rl_per_device_comps(
     """
     default = 2 if _w.THINKING else 8
 
-    # Logits budget: hard upper bound on the fp32 [per_device, completion, vocab] logprob tensor.
+    # Logits budget: hard upper bound on the fp32 [per_device, completion, vocab] logprob tensor —
+    # a single forward's logits must fit a ~6 GB ceiling.
     logits_cap = _RL_PER_DEVICE_MAX
     if completion_len > 0:
-        logits_cap = max(1, int(_RL_LOGITS_BUDGET_BYTES / (max(1, completion_len) * vocab * 4)))
+        logits_cap = max(1, int(6.0e9 / (max(1, completion_len) * vocab * 4)))
 
     # Growth is gated to SHORT sequences (seq < the reference). At/above the reference seq the
     # micro-batch is left exactly as the historical code computed it: bigger per_device at long
@@ -239,26 +235,6 @@ def rl_per_device_comps(
     # i.e. byte-for-byte the historical value.
     ceiling = _RL_PER_DEVICE_MAX if (short_seq and not _w.THINKING) else default
     return max(1, min(ceiling, logits_cap, vram_cap))
-
-
-def liger_loss_chunk_size(per_device: int, completion_len: int, vocab: int) -> int:
-    """Sequences-per-chunk for TRL's Liger fused GRPO loss, bounded by the fp32-logits VRAM budget.
-
-    TRL leaves ``chunk_size`` at 1 (one sequence per chunk -> one detach/forward/compiled-loss/
-    autograd cycle PER SEQUENCE), so we raise it toward ``per_device`` to collapse that overhead to
-    a single invocation. But the Liger chunk materializes ``[chunk, completion_len, vocab]`` fp32
-    logits at once, so chunking the WHOLE micro-batch (chunk == per_device) blows VRAM when
-    per_device is large — exactly the short-context GRPO regime where ``rl_per_device_comps`` now
-    grows the micro-batch to 8/16. Cap the chunk so a single chunk's logits stay within the same 6 GB
-    budget that bounds per_device, then clamp to ``[1, per_device]``. The loss is numerically
-    identical for any chunk_size (every loss_type normalizes by the GLOBAL token count and chunk
-    losses are summed), so this only trades per-chunk peak VRAM against per-chunk launch overhead.
-    """
-    per_device = max(1, int(per_device))
-    if completion_len <= 0 or vocab <= 0:
-        return per_device  # no budget signal (offline / unknown) -> keep the whole micro-batch
-    budget = max(1, int(_RL_LOGITS_BUDGET_BYTES / (completion_len * vocab * 4)))
-    return max(1, min(per_device, budget))
 
 
 def grpo_overrides() -> dict:

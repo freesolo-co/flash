@@ -68,13 +68,11 @@ from flash.engine.worker.gpu_setup import (
     force_vllm_backend_for_sm120,
 )
 from flash.engine.worker.grpo import (
-    _RL_LOGITS_BUDGET_BYTES,
     _grpo_is_no_op_failure,
     _grpo_resume_already_complete,
     build_grpo_prompt_dataset,
     compute_grpo_batching,
     grpo_overrides,
-    liger_loss_chunk_size,
     resolve_grpo_prompts_per_step,
     rl_per_device_comps,
 )
@@ -478,7 +476,6 @@ __all__ = [
     "_HB_UPLOAD_LOCK",
     # leaf lora re-exports
     "_LM_SYNC_REMAP_ON",
-    "_RL_LOGITS_BUDGET_BYTES",
     "_SFT_HEARTBEAT_INTERVAL_S",
     "_STEP_GPU_DIAG_INTERVAL_S",
     "_VL_EXCLUDE_SEGMENTS",
@@ -536,7 +533,6 @@ __all__ = [
     "hf_upload_file",
     "hf_upload_folder",
     "is_vl_checkpoint",
-    "liger_loss_chunk_size",
     "liger_on",
     "lora_exclude_modules",
     "loraplus_optimizer_cls",

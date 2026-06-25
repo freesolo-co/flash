@@ -133,11 +133,18 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
 
 
 def _find_real_libcudart() -> str | None:
-    """Path to a REAL ``libcudart.so.12`` that exports ``cudaDeviceReset`` (the symbol tilelang's
-    stub lacks), or None if none can be found. Prefers the nvidia-cuda-runtime wheel, then the CUDA
-    toolkit baked into the worker's -devel base image, then the system loader's own resolver — and
-    VERIFIES the symbol is actually present (a path is only returned if ``CDLL(path)`` exposes
-    ``cudaDeviceReset``). Never raises."""
+    """Path to a REAL ``libcudart.so.<major>`` that exports ``cudaDeviceReset`` (the symbol
+    tilelang's stub lacks), or None if none can be found. Prefers the nvidia-cuda-runtime wheel, then
+    the CUDA toolkit baked into the worker's -devel base image, then the system loader's own resolver
+    — and VERIFIES the symbol is actually present (a path is only returned if ``CDLL(path)`` exposes
+    ``cudaDeviceReset``). Never raises.
+
+    CUDA-major-agnostic: the worker image pins cu12 today, but the runtime wheel's import path and
+    soname differ across CUDA majors — the cu12 wheel ships ``nvidia/cuda_runtime/lib/libcudart.so.12``
+    while the cu13 wheel ships ``nvidia/cu13/lib/libcudart.so.13`` (and has NO ``nvidia.cuda_runtime``
+    module at all). A ``.so.12``-only probe silently returns None on cu13, leaving the stub shadow in
+    place. So we probe every ``nvidia/*/lib`` subdir and any ``libcudart.so.*`` major; the symlink
+    repoint that consumes this works for any real libcudart (``_verify`` still gates on the symbol)."""
     import ctypes
     import ctypes.util
     import glob
@@ -168,22 +175,25 @@ def _find_real_libcudart() -> str | None:
         return None
 
     candidates: list[str] = []
-    # 1. nvidia-cuda-runtime PyPI wheel (a torch/vLLM dep on many images).
+    # 1. nvidia cuda-runtime PyPI wheel (a torch/vLLM dep on many images), any CUDA major. Import the
+    #    ``nvidia`` namespace package (it resolves even when a specific ``nvidia.cuda_runtime`` subpkg
+    #    is absent — e.g. the cu13 wheel has none) and glob every ``nvidia/*/lib`` for any libcudart
+    #    soname, so both the cu12 layout (nvidia/cuda_runtime/lib/libcudart.so.12) and the cu13 layout
+    #    (nvidia/cu13/lib/libcudart.so.13) are found. ``sorted`` keeps candidate order deterministic.
     try:
-        import nvidia.cuda_runtime as _cr  # type: ignore
+        import nvidia  # type: ignore  # namespace package; subpkg import may fail, this won't
 
-        candidates += glob.glob(
-            os.path.join(os.path.dirname(_cr.__file__), "lib", "libcudart.so.12*")
-        )
+        for base in sorted(map(str, getattr(nvidia, "__path__", []) or [])):
+            candidates += sorted(glob.glob(os.path.join(base, "*", "lib", "libcudart.so.*")))
     except Exception:
         pass
-    # 2. CUDA toolkit in the -devel base image (Dockerfile.worker: cuda12.8-cudnn9-devel).
+    # 2. CUDA toolkit in a -devel base image (Dockerfile.worker today: cuda12.8-cudnn9-devel), any major.
     for pat in (
-        "/usr/local/cuda*/lib64/libcudart.so.12*",
-        "/usr/local/cuda*/targets/*/lib/libcudart.so.12*",
-        "/usr/lib/x86_64-linux-gnu/libcudart.so.12*",
+        "/usr/local/cuda*/lib64/libcudart.so.*",
+        "/usr/local/cuda*/targets/*/lib/libcudart.so.*",
+        "/usr/lib/x86_64-linux-gnu/libcudart.so.*",
     ):
-        candidates += glob.glob(pat)
+        candidates += sorted(glob.glob(pat))
     # 3. The loader's own resolver (LD_LIBRARY_PATH / ldconfig) — returns a bare soname, handled above.
     found = ctypes.util.find_library("cudart")
     if found:

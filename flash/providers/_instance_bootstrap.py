@@ -129,15 +129,16 @@ def build_worker_env(payload: dict) -> dict:
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
         # This fetch is the FIRST HF round-trip in the bootstrap and runs pre-worker (so the worker
-        # never starts and can't stamp a retriable heartbeat). A transient HF outage here is exactly
-        # the infra shape the retry budget exists for, so surface it as RetriableBootstrapError —
-        # otherwise main() would mark ok=false with no retriable flag and the poller would fail the
-        # run fast (job_failed) instead of retrying it on a fresh host (job_preempted).
+        # never starts and can't stamp a retriable heartbeat). Any failure here is infra-shaped, so
+        # surface it as RetriableBootstrapError — otherwise main() would mark ok=false with no
+        # retriable flag and the poller would fail the run fast (job_failed) instead of retrying it
+        # on a fresh host (job_preempted). A permanently missing/unreadable spec (a control-plane bug
+        # on the rare spilled-spec path) just burns the bounded infra-retry budget, then fails.
         try:
             spec_json = fetch_spec_from_hf(payload)
         except Exception as e:
             raise RetriableBootstrapError(
-                f"failed to fetch the spilled job spec from HF (infra/transient): {e}"
+                f"failed to fetch the spilled job spec from HF: {e}"
             ) from e
     if not spec_json:
         # Neither an inline spec NOR the spilled-to-HF sentinel rode in the payload: a malformed
@@ -239,13 +240,12 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             uploader = threading.Thread(target=upload_loop, daemon=True)
             uploader.start()
         try:
-            # Honor the wall-clock deadline: wait only up to the time left, floored to 0.0 so an
-            # already-expired (or sub-second) deadline kills the worker NOW instead of buying it
-            # more paid GPU time past the wall cap. A prior ``max(10.0, …)``/``max(1.0, …)`` floor
-            # overshot the deadline by that floor when little/no time remained. ``proc.wait(timeout=0.0)``
-            # on a still-running process returns immediately by raising ``TimeoutExpired`` (handled
-            # below: kill + reap), which is exactly the expired-deadline behavior we want.
-            proc.wait(timeout=max(0.0, deadline_ts - time.time()))
+            # Honor the wall-clock deadline: wait only up to the time left (floored to a small
+            # positive so the call never blocks forever on a 0/negative timeout). A prior ``max(10.0,
+            # …)`` floor could overshoot the deadline by ~10s when little/no time remained — that
+            # leftover 10s is paid GPU time past the run's wall cap, so we clamp to the remaining
+            # budget instead.
+            proc.wait(timeout=max(1.0, deadline_ts - time.time()))
         except subprocess.TimeoutExpired:
             timed_out = True
             proc.kill()

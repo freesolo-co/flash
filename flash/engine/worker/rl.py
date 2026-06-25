@@ -259,7 +259,25 @@ def run_rl():
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
         # The dataset carries example_idx (not the record); map each back to its original object.
-        examples = [rollout_examples[int(i)] for i in kwargs.get("example_idx", [])]
+        # Fail LOUD if TRL stops forwarding example_idx (column pruning / a TRL change): defaulting to
+        # [] would zip to ZERO examples -> empty rewards -> silent no-op / broken training (issues
+        # #206 / #210). A reward over the wrong/empty examples is far worse than crashing the run.
+        example_idx = kwargs.get("example_idx")
+        if example_idx is None:
+            raise RuntimeError(
+                "GRPO reward_fn received no 'example_idx' column from TRL — the reward cannot be "
+                "mapped back to its training example, so every reward would be empty/misaligned "
+                f"(got kwargs keys {sorted(kwargs)}). This usually means TRL dropped the dataset "
+                "column (remove_unused_columns / a TRL version change); the run is aborted rather "
+                "than silently training on no signal."
+            )
+        if len(example_idx) != len(completions):
+            raise RuntimeError(
+                f"GRPO reward_fn example_idx/completions length mismatch "
+                f"({len(example_idx)} vs {len(completions)}) — rewards would be misaligned with "
+                "the sampled completions; aborting rather than training on a shifted reward signal."
+            )
+        examples = [rollout_examples[int(i)] for i in example_idx]
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
@@ -657,25 +675,17 @@ def run_rl():
     # Liger fused-loss chunk_size: TRL leaves it at the default 1, so the fused GRPO loss runs its
     # whole detach -> chunk_forward -> compiled-loss -> autograd.grad cycle ONCE PER SEQUENCE
     # (per_device_train_batch_size times) — Python/kernel-launch/compile-guard overhead that
-    # dominates at small-model scale where the GEMMs are tiny. Raise it toward the whole per-device
-    # micro-batch, but BOUND by the fp32-logits VRAM budget: a chunk materializes
-    # [chunk, completion, vocab] fp32 logits at once, so on a short-context run where per_device grew
-    # to 8/16 (see rl_per_device_comps) collapsing the WHOLE batch into one chunk would blow VRAM /
-    # OOM. liger_loss_chunk_size caps the chunk to the same 6 GB budget that bounds per_device.
-    # Numerically identical for any chunk_size (every loss_type normalizes by the GLOBAL token count,
-    # not the chunk-local size, and chunk losses are summed). Must run BEFORE the mask-aware wrap
-    # below, which replaces trainer.liger_grpo_loss with a closure that has no chunk_size attribute.
+    # dominates at small-model scale where the GEMMs are tiny. Collapse it to ONE invocation over the
+    # whole per-device micro-batch. Numerically identical (every loss_type normalizes by the GLOBAL
+    # token count, not the chunk-local size, and chunk losses are summed). Must run BEFORE the
+    # mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure that has no
+    # chunk_size attribute.
     _liger_loss = getattr(trainer, "liger_grpo_loss", None)
     if _liger_loss is not None and hasattr(_liger_loss, "chunk_size"):
-        _pd = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
-        _cs = _w.liger_loss_chunk_size(_pd, _cap_completion_len, vocab_size_for(model_id))
+        _cs = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
         if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
             _liger_loss.chunk_size = _cs
-            _capped = " (logits-budget capped)" if _cs < _pd else ""
-            print(
-                f"[rl] liger fused-loss chunk_size -> {_cs} of per_device {_pd}{_capped} "
-                "(fewer invocations, bounded per-chunk logits VRAM)"
-            )
+            print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
     # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
     # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
     # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is
