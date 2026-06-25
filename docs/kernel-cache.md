@@ -30,13 +30,19 @@ representative `torch.compile` (torchinductor).
 ## producing one architecture cache
 
 kernels are content-addressed by GPU arch + toolchain version, so the cache MUST be compiled on a
-real GPU of the target arch (the CI image builder normally has none). on a GPU runner:
+real GPU of the target arch (the CI image builder normally has none). the warmup MUST also run
+INSIDE the worker image's pinned stack: the cache is keyed to the exact torch/triton/fla/liger
+toolchain the image ships, so a cache produced by some other python on the runner's PATH won't
+match at boot (`load_cache_artifacts` silently won't load it). build the base image first, then
+warm inside it on a GPU runner:
 
 ```sh
-# 1. warm the kernels and write the portable mega-cache
-python -m flash.engine.worker.kernel_warmup --arch 9.0 --out build/kernel_cache
+# 1. warm the kernels INSIDE the worker image; write the mega-cache into the build context
+docker run --rm --gpus all -v "$PWD/build/kernel_cache:/out" \
+  ghcr.io/freesolo-co/flash-worker:cu128 \
+  python -m flash.engine.worker.kernel_warmup --arch 9.0 --out /out
 
-# 2. build the image with the bake enabled
+# 2. rebuild the image with the bake enabled (build/kernel_cache now holds the mega-cache)
 docker build -f Dockerfile.worker --build-arg BUILD_KERNEL_CACHE=true \
   -t ghcr.io/freesolo-co/flash-worker:cu128-sm90 .
 ```
