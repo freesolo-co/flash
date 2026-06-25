@@ -265,7 +265,7 @@ def test_cache_ensures_filesystem_and_attaches_at_launch(monkeypatch):
     assert ensured == [("flash-weights", "us-east-1")]  # create-if-absent in THIS region
     assert calls[0]["fs"] == ["flash-weights"]  # attached at launch (Lambda can't attach later)
     # The cloud-init binds the auto-mounted NFS path into the worker at the fixed cache mount.
-    assert "-v /lambda/nfs/flash-weights:/weight-cache" in calls[0]["user_data"]
+    assert "-v '/lambda/nfs/flash-weights':/weight-cache" in calls[0]["user_data"]  # quoted host path
 
 
 def test_cache_payload_points_hf_home_at_the_bind(monkeypatch):

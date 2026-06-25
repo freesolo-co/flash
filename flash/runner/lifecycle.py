@@ -306,7 +306,16 @@ def _submit_seed_supervised(
         # volume-backed spec (the IN_QUEUE-forever / persistent-volume-failure block). Sticky: once
         # dropped it stays dropped. A non-volume flake (stall/preempt) keeps the cache so the
         # warm-weights benefit survives ordinary retries.
-        run_had_cache = bool(chosen is not None and getattr(run_spec.gpu, "network_volume", None))
+        # Gate to RunPod: the cache-drop rationale (the attached volume pins the endpoint to its DC
+        # set, so a no_capacity / volume poll_error wants a cache-less cross-region retry) is
+        # RunPod-specific. Instance providers (Lambda/Hyperstack) already fall back to a cold run
+        # per-region INSIDE the launch walk, so their no_capacity isn't cache-caused — dropping the
+        # cache there would needlessly forfeit the warm-weights benefit on retry.
+        run_had_cache = bool(
+            chosen is not None
+            and chosen.provider == "runpod"
+            and getattr(run_spec.gpu, "network_volume", None)
+        )
         first_cache_drop = (
             run_had_cache
             and not drop_weight_cache

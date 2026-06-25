@@ -112,7 +112,8 @@ def launch_and_submit(
     if cache_name:
         from flash.runner import WEIGHT_CACHE_VOLUME_GB
 
-        cache_gb = WEIGHT_CACHE_VOLUME_GB
+        # Honor the runner-assigned size (mirrors RunPod), defaulting to the standard cache size.
+        cache_gb = int(getattr(spec.gpu, "network_volume_gb", 0) or WEIGHT_CACHE_VOLUME_GB)
         cache_user_data = build_user_data(
             build_payload(
                 spec, seed, attempt, runtime_secrets=runtime_secrets,

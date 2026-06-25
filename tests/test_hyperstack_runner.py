@@ -189,7 +189,7 @@ def test_cache_ensures_volume_and_attaches_after_launch(monkeypatch):
     assert ensured == [("flash-weights", "default-CANADA-1", 100)]  # create-if-absent in the env
     assert attached == [("vm-cache", "vol-7")]  # attached AFTER launch (block volume can't attach at create)
     ud = launched[0]["user_data"]
-    assert "-v /mnt/flash-weights:/weight-cache" in ud  # bind into the worker
+    assert "-v '/mnt/flash-weights':/weight-cache" in ud  # bind into the worker (quoted host path)
     assert "blkid" in ud  # format-if-new preamble (guard)
     assert "mkfs.ext4" in ud  # format-if-new preamble (format)
 
@@ -204,7 +204,11 @@ def test_cache_preamble_never_reformats_a_populated_volume(monkeypatch):
     )
     # mkfs runs ONLY when blkid finds no filesystem (the `||` short-circuit) — never unconditionally.
     assert 'blkid "$CACHE_DEV" >/dev/null 2>&1 || mkfs.ext4' in ud
-    assert "mount \"$CACHE_DEV\" /mnt/flash-weights" in ud
+    assert "mount \"$CACHE_DEV\" '/mnt/flash-weights'" in ud  # quoted host mount
+    # Device is size-matched (never blindly the first unmounted disk) and skips disks with a mounted
+    # partition, so the boot disk is never reformatted.
+    assert "EXPECT_BYTES=" in ud
+    assert "lsblk -pnr -o MOUNTPOINT" in ud
 
 
 def test_cache_falls_back_cold_when_ensure_fails(monkeypatch):

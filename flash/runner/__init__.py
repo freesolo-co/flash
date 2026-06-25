@@ -294,17 +294,35 @@ def record_weight_cache_dc(dc: str) -> None:
     if not dc:
         return
     try:
-        used = weight_cache_used_dcs()
-        if dc in used:
-            return
-        used.add(dc)
         os.makedirs(_STATE_DIR, exist_ok=True)
-        tmp = _WEIGHT_CACHE_DC_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(sorted(used), f)
-        os.replace(tmp, _WEIGHT_CACHE_DC_FILE)
+        # Serialize the read-modify-write across concurrent pollers (multiple run heartbeats can land
+        # the same instant): an exclusive flock on a sidecar lock file means a DC reported by one
+        # poller is never clobbered by another's stale read. Best-effort — if flock is unavailable
+        # (non-POSIX) we fall back to the unlocked path; a lost DC just keeps the cache lazier.
+        import fcntl
+
+        with open(_WEIGHT_CACHE_DC_FILE + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            used = weight_cache_used_dcs()  # re-read UNDER the lock
+            if dc in used:
+                return
+            used.add(dc)
+            tmp = _WEIGHT_CACHE_DC_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(sorted(used), f)
+            os.replace(tmp, _WEIGHT_CACHE_DC_FILE)
     except OSError:
         pass
+    except ImportError:  # no fcntl (non-POSIX): degrade to an unlocked best-effort write
+        with contextlib.suppress(OSError):
+            used = weight_cache_used_dcs()
+            if dc in used:
+                return
+            used.add(dc)
+            tmp = _WEIGHT_CACHE_DC_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(sorted(used), f)
+            os.replace(tmp, _WEIGHT_CACHE_DC_FILE)
 
 
 def _assign_weight_cache_volume(spec: JobSpec) -> JobSpec:
