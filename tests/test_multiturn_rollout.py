@@ -13,9 +13,10 @@ import types
 import pytest
 
 from flash.engine.multiturn_rollout import (
+    _LRUCache,
     build_examples_index,
     index_collisions,
-    rollout_batch,
+    rollout_async,
     rollout_one,
 )
 
@@ -90,7 +91,7 @@ def _generator(turn_texts):
 
 class _VarTurnEnv:
     """Multi-turn env that stops after a PER-EXAMPLE number of model turns, so a batch contains
-    rollouts of different lengths (exercises rollout_batch's lockstep drop-out)."""
+    rollouts of different depths (exercises rollouts finishing at different turns)."""
 
     multi_turn = True
 
@@ -120,156 +121,8 @@ class _VarTurnEnv:
 
 def _det_generate(prefix_ids, max_tokens):
     """Deterministic single-turn generation: a pure function of nothing but the call, so running
-    rollout_one per example and rollout_batch over all examples see byte-identical turns."""
+    rollout_one per example and rollout_async over all examples see byte-identical turns."""
     return [CONTENT["a1"], END], [-0.1, -0.2], "a1"
-
-
-def test_rollout_batch_equals_rollout_one_per_example():
-    """rollout_batch is exactly N independent rollout_one() calls — same token alignment, env_mask,
-    logprobs and per-rollout reward, in input order — only the generation is batched. Different
-    per-example turn counts force the batch to shrink as rollouts finish at different turns."""
-    examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
-
-    ones = [
-        rollout_one(
-            example=e,
-            active_env=_VarTurnEnv(),
-            render=render,
-            generate=_det_generate,
-            env_glue=env_glue,
-            max_turns=8,
-            per_turn_max_tokens=8,
-        )
-        for e in examples
-    ]
-
-    def batched(prefixes, max_tokens_list):
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
-
-    batch = rollout_batch(
-        examples=examples,
-        active_env=_VarTurnEnv(),
-        render=render,
-        batched_generate=batched,
-        env_glue=env_glue,
-        max_turns=8,
-        per_turn_max_tokens=8,
-    )
-    assert batch == ones
-    # rewards differ per rollout (per-rollout scoring survived batching)
-    assert [r["reward"] for r in batch] == [1.0, 3.0, 2.0]
-    # the multi-turn rollouts carry masked (0) env-glue tokens; the single-turn one does not
-    assert set(batch[0]["env_mask"]) == {1}  # max_model=1: one turn, no env tokens
-    three_turn = batch[1]  # max_model=3: env replies -> masked glue tokens present
-    assert 0 in three_turn["env_mask"]  # masked env-glue tokens
-    assert 1 in three_turn["env_mask"]  # trained model tokens
-
-
-def test_rollout_batch_preserves_input_order_and_count():
-    """One result per example, in input order (so TRL's GRPO group stays aligned)."""
-
-    def batched(prefixes, max_tokens_list):
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
-
-    examples = [{"max_model": 2}, {"max_model": 1}, {"max_model": 1}, {"max_model": 3}]
-    out = rollout_batch(
-        examples=examples,
-        active_env=_VarTurnEnv(),
-        render=render,
-        batched_generate=batched,
-        env_glue=env_glue,
-        max_turns=8,
-        per_turn_max_tokens=8,
-    )
-    assert len(out) == 4
-    assert [r["reward"] for r in out] == [2.0, 1.0, 1.0, 3.0]
-
-
-def test_rollout_batch_scores_rewards_concurrently():
-    """The per-rollout reward (often an IO-bound judge/tool round-trip) is scored CONCURRENTLY:
-    results stay correct + in INPUT ORDER, and N slow rewards take ~1x (not Nx) the per-call latency."""
-    import time
-
-    class _SlowRewardEnv(_VarTurnEnv):
-        def reward(self, completion, example, state=None):
-            time.sleep(0.2)  # stand in for an IO-bound judge/tool round-trip (releases the GIL)
-            return float(example["rid"])  # per-rollout id -> proves order survives the pool
-
-    def batched(prefixes, max_tokens_list):
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
-
-    examples = [{"max_model": 1, "rid": i} for i in range(8)]
-    t0 = time.perf_counter()
-    out = rollout_batch(
-        examples=examples, active_env=_SlowRewardEnv(), render=render,
-        batched_generate=batched, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
-    )
-    elapsed = time.perf_counter() - t0
-    assert [r["reward"] for r in out] == [float(i) for i in range(8)]  # correct + in input order
-    # 8 x 0.2s = 1.6s if serial; concurrent (<=16 workers) is ~0.2s. Generous bound for CI jitter.
-    assert elapsed < 1.0, f"reward scoring did not run concurrently ({elapsed:.2f}s for 8x0.2s)"
-
-
-def test_rollout_batch_serial_when_reward_not_thread_safe():
-    """An env that declares ``reward_thread_safe = False`` is scored SERIALLY — a scorer with mutable
-    state or a thread-bound client is never raced (it worked serially and must keep working)."""
-    import time
-
-    class _UnsafeSlowEnv(_VarTurnEnv):
-        reward_thread_safe = False  # opt out of concurrent scoring
-
-        def reward(self, completion, example, state=None):
-            time.sleep(0.15)
-            return float(example["rid"])
-
-    def batched(prefixes, max_tokens_list):
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
-
-    examples = [{"max_model": 1, "rid": i} for i in range(6)]
-    t0 = time.perf_counter()
-    out = rollout_batch(
-        examples=examples, active_env=_UnsafeSlowEnv(), render=render,
-        batched_generate=batched, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
-    )
-    elapsed = time.perf_counter() - t0
-    assert [r["reward"] for r in out] == [float(i) for i in range(6)]  # correct + in order
-    # 6 x 0.15s = 0.9s serial vs ~0.15s concurrent -> a >=0.6s floor proves it did NOT parallelize.
-    assert elapsed >= 0.6, f"reward_thread_safe=False env was parallelized ({elapsed:.2f}s)"
-
-
-def test_rollout_batch_reward_failure_drains_not_backgrounds():
-    """On a reward failure: scorers that haven't started are cancelled (no new calls launched) and the
-    few already in flight are DRAINED before we raise — none keep scoring in the background after
-    rollout_batch returns (no spent calls / mutated scorer state bleeding into the next step)."""
-    import threading
-    import time
-
-    started, finished = [], []
-    lock = threading.Lock()
-
-    class _FailEnv(_VarTurnEnv):
-        def reward(self, completion, example, state=None):
-            with lock:
-                started.append(example["rid"])
-            if example["rid"] == 0:
-                raise RuntimeError("judge 500")  # fails right away
-            time.sleep(0.25)  # the in-flight peers are slow
-            with lock:
-                finished.append(example["rid"])  # records ONLY if the call ran to completion
-            return 1.0
-
-    def batched(prefixes, max_tokens_list):
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
-
-    examples = [{"max_model": 1, "rid": i} for i in range(8)]  # 8 <= max_workers(=8): all start at once
-    with pytest.raises(RuntimeError, match="judge 500"):
-        rollout_batch(
-            examples=examples, active_env=_FailEnv(), render=render,
-            batched_generate=batched, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
-        )
-    # Every scorer that STARTED has also FINISHED by the time we get here (drained, not backgrounded);
-    # nothing is still running. With wait=False the slow peers would still be sleeping -> finished < started.
-    assert sorted(finished) == sorted(s for s in started if s != 0), "in-flight rewards were not drained"
 
 
 def test_rollout_one_interleaves_and_masks_env_tokens():
@@ -443,28 +296,63 @@ class _OneTurnEnv:
         return 0.5
 
 
+def _mk_logprobs(token_ids, lps):
+    """vLLM's per-position [{token_id: Logprob}] structure (or None when lps is None)."""
+    if lps is None:
+        return None
+    return [{tid: types.SimpleNamespace(logprob=lp)} for tid, lp in zip(token_ids, lps, strict=True)]
+
+
 class _FakeEngine:
-    def __init__(self, vocab=1000):
+    """Step-able fake colocate engine mirroring vLLM's V1 manual loop: ``llm_engine.add_request``
+    enqueues a turn, ``step()`` finishes ALL pending requests at once (one decode round) returning a
+    RequestOutput per finished request, ``has_unfinished_requests`` reports the queue. Records
+    ('wake'|'add'|'step'|'sleep', ...) events in order so the wake/sleep ordering can be asserted."""
+
+    def __init__(self, vocab=1000, gen=None, finish="all"):
         self.events = []
+        self._pending = []  # (req_id, prompt_ids, sampling_params)
+        self._finish = finish  # "all" -> finish every pending request per step; "one" -> one per step
+        self.aborted = []
+        # default generation: two tokens, no logprobs, text 'ok' (matches the prior fake)
+        self._gen = gen or (lambda ids, sp: ([5, 6], None, "ok"))
         self.llm_engine = types.SimpleNamespace(
-            model_config=types.SimpleNamespace(get_vocab_size=lambda: vocab)
+            model_config=types.SimpleNamespace(get_vocab_size=lambda: vocab),
+            add_request=self._add_request,
+            step=self._step,
+            has_unfinished_requests=lambda: bool(self._pending),
+            abort_request=self._abort_request,
         )
+
+    def _add_request(self, req_id, prompt, sampling_params):
+        self.events.append(("add", req_id))
+        self._pending.append((req_id, list(prompt["prompt_token_ids"]), sampling_params))
+
+    def _abort_request(self, ids):
+        self.aborted.extend(ids)
+        drop = set(ids)
+        self._pending = [p for p in self._pending if p[0] not in drop]
+
+    def _step(self):
+        self.events.append(("step", len(self._pending)))
+        if self._finish == "one":
+            batch, self._pending = self._pending[:1], self._pending[1:]
+        else:
+            batch, self._pending = self._pending, []
+        outs = []
+        for req_id, ids, sp in batch:
+            token_ids, lps, text = self._gen(ids, sp)
+            comp = types.SimpleNamespace(
+                token_ids=token_ids, logprobs=_mk_logprobs(token_ids, lps), text=text
+            )
+            outs.append(types.SimpleNamespace(request_id=req_id, finished=True, outputs=[comp]))
+        return outs
 
     def wake_up(self, tags=None):
         self.events.append(("wake", tuple(tags or [])))
 
     def sleep(self, level=None):
         self.events.append(("sleep", level))
-
-    def generate(self, prompts, sampling_params=None, use_tqdm=False):
-        # Batched decode: record the batch's prompts and return ONE output per prompt (in order).
-        self.events.append(("generate", tuple(tuple(p["prompt_token_ids"]) for p in prompts)))
-        return [
-            types.SimpleNamespace(
-                outputs=[types.SimpleNamespace(token_ids=[5, 6], logprobs=None, text="ok")]
-            )
-            for _ in prompts
-        ]
 
 
 def _fake_trainer(engine, *, sleep_mode):
@@ -540,13 +428,13 @@ def test_env_glue_fails_loud_when_template_drops_probe():
 @pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_wakes_kv_cache_around_generation_when_sleep_mode():
     # The bug (#162): TRL's rollout_func path wakes only the weights, never the KV cache, so the
-    # first engine.generate() faults. The fix wakes tags=["kv_cache"] BEFORE any generate and
-    # re-sleeps AFTER the batch — assert that exact ordering.
+    # first decode faults. The fix wakes tags=["kv_cache"] BEFORE any add_request/step and
+    # re-sleeps AFTER the whole batch — assert that exact ordering around the continuous-batch loop.
     engine = _FakeEngine()
     rf = _build(_FakeTok())
     out = rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=True))
     kinds = [e[0] for e in engine.events]
-    assert kinds == ["wake", "generate", "sleep"]
+    assert kinds == ["wake", "add", "step", "sleep"]
     assert engine.events[0] == ("wake", ("kv_cache",))
     assert engine.events[-1] == ("sleep", 2)
     assert out["reward"] == [0.5]
@@ -569,45 +457,182 @@ def test_rollout_func_returns_one_completion_per_prompt():
     assert len(out["prompt_ids"]) == 3
 
 
-def test_batched_makes_far_fewer_engine_calls_than_sequential():
-    # The CPU-measurable heart of the optimization: rollout_batch issues ONE batched generate per
-    # TURN (every active rollout together) vs one generate per prompt per turn for per-example
-    # rollout_one. For P prompts over T model turns the batched path makes ~T dispatches, the
-    # sequential path ~P*T — far fewer, far larger GPU calls (vLLM batches the decode), at identical
-    # results. Measured at the core-function level (no env toggle — batching is always on).
-    examples = [{"max_model": 2} for _ in range(6)]  # 6 prompts, _VarTurnEnv -> 2 model turns each
+def _fake_async_engine(gen, *, one_at_a_time=False, lifo=False):
+    """submit/poll/busy over an in-memory queue, for CPU-testing rollout_async. By default poll()
+    finishes ALL pending requests (one decode round); ``one_at_a_time`` finishes a single request
+    per poll (``lifo`` -> most-recently submitted) to exercise an arbitrary, non-FIFO finish order —
+    the real engine finishes requests in completion-length order, not submission order."""
+    pending = []  # (req_id, prefix_ids, max_tokens)
 
-    seq_calls = 0
+    def submit(req_id, prefix_ids, max_tokens, initial):
+        pending.append((req_id, list(prefix_ids), max_tokens))
 
-    def counting_gen(prefix, mt):
-        nonlocal seq_calls
-        seq_calls += 1
-        return _det_generate(prefix, mt)
+    def poll():
+        if not pending:
+            return []
+        if one_at_a_time:
+            batch = [pending.pop(-1 if lifo else 0)]
+        else:
+            batch = pending[:]
+            pending.clear()
+        return [(rid, *gen(ids, mt)) for rid, ids, mt in batch]
 
-    seq = [
-        rollout_one(
-            example=e, active_env=_VarTurnEnv(), render=render, generate=counting_gen,
-            env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
-        )
+    def busy():
+        return bool(pending)
+
+    return submit, poll, busy
+
+
+def test_rollout_async_equals_rollout_one():
+    """rollout_async (continuous-batched, no turn barrier) returns byte-identical rollouts to one
+    rollout_one per example — same token alignment, env_mask, logprobs, per-rollout reward and input
+    order. Only the SCHEDULING differs from the pure single-rollout reference."""
+    examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
+    ones = [
+        rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
+                    env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
         for e in examples
     ]
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    out = rollout_async(examples=examples, active_env=_VarTurnEnv(), render=render, submit=submit,
+                        poll=poll, busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    assert out == ones
+    assert [r["reward"] for r in out] == [1.0, 3.0, 2.0]
 
-    batch_calls = 0
 
-    def counting_batched(prefixes, max_tokens_list):
-        nonlocal batch_calls
-        batch_calls += 1
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
+def test_rollout_async_robust_to_arbitrary_finish_order():
+    """Continuous batching finishes requests in completion order, NOT submission order. Even when
+    turns finish one-at-a-time in LIFO order, rollout_async still produces input-order, byte-identical
+    results: each rollout has at most one in-flight turn, so cross-rollout finish order can't perturb
+    any single rollout's transcript — and a finished rollout's slot is free for others' next turns."""
+    examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}, {"max_model": 1}]
+    ones = [
+        rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
+                    env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+        for e in examples
+    ]
+    submit, poll, busy = _fake_async_engine(_det_generate, one_at_a_time=True, lifo=True)
+    out = rollout_async(examples=examples, active_env=_VarTurnEnv(), render=render, submit=submit,
+                        poll=poll, busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    assert out == ones  # input order + byte-identical despite LIFO one-at-a-time finishing
+    assert [r["reward"] for r in out] == [1.0, 3.0, 2.0, 1.0]
 
-    batch = rollout_batch(
-        examples=examples, active_env=_VarTurnEnv(), render=render, batched_generate=counting_batched,
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+
+class _BatchRewardEnv(_VarTurnEnv):
+    """_VarTurnEnv that also exposes reward_many (scores every rollout in ONE batched call) and
+    counts which scoring path the rollout took."""
+
+    def __init__(self):
+        self.reward_many_calls = 0
+        self.per_rollout_reward_calls = 0
+
+    def reward(self, completion, example, state=None):
+        self.per_rollout_reward_calls += 1
+        return super().reward(completion, example, state)
+
+    def reward_many(self, items):
+        self.reward_many_calls += 1
+        return [super(_BatchRewardEnv, self).reward("", ex, st) for ex, st in items]
+
+
+def test_reward_many_batches_scoring():
+    """When the env exposes reward_many, rollout_async scores every rollout in ONE batched call
+    (env scores them concurrently) instead of a blocking reward() per rollout — the judge/expensive-
+    reward win — at the same per-rollout values + input order as one rollout_one per example."""
+    examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
+    ones = [
+        rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
+                    env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+        for e in examples
+    ]
+    env = _BatchRewardEnv()
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    out = rollout_async(examples=examples, active_env=env, render=render, submit=submit, poll=poll,
+                        busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    assert env.reward_many_calls == 1  # ONE batched scoring call...
+    assert env.per_rollout_reward_calls == 0  # ...not one reward() per rollout
+    assert out == ones  # byte-identical to the single-rollout reference (reward_many only batches)
+    assert [r["reward"] for r in out] == [1.0, 3.0, 2.0]
+
+
+def _run_async(examples, active_env):
+    submit, poll, busy = _fake_async_engine(_det_generate)
+    return rollout_async(
+        examples=examples, active_env=active_env, render=render, submit=submit, poll=poll,
+        busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
     )
 
-    assert batch == seq  # byte-identical rollouts
-    assert seq_calls == 6 * 2  # sequential: one engine call per prompt per turn
-    assert batch_calls == 2  # batched: one engine call per turn (all 6 rollouts in each)
-    assert batch_calls < seq_calls
+
+# _score_rollouts thread-pool fallback (PR #224): when the env has NO reward_many, the per-rollout
+# reward — often an IO-bound judge/tool round-trip — is scored concurrently, in input order, with a
+# reward_thread_safe opt-out. Exercised via rollout_async (the one shipped path through _score_rollouts).
+def test_async_scores_rewards_concurrently():
+    """No reward_many -> the fallback scores the batch CONCURRENTLY: correct + in INPUT ORDER, and N
+    slow rewards take ~1x (not Nx) the per-call latency."""
+    import time
+
+    class _SlowRewardEnv(_VarTurnEnv):
+        def reward(self, completion, example, state=None):
+            time.sleep(0.2)  # stand in for an IO-bound judge/tool round-trip (releases the GIL)
+            return float(example["rid"])  # per-rollout id -> proves order survives the pool
+
+    examples = [{"max_model": 1, "rid": i} for i in range(8)]
+    t0 = time.perf_counter()
+    out = _run_async(examples, _SlowRewardEnv())
+    elapsed = time.perf_counter() - t0
+    assert [r["reward"] for r in out] == [float(i) for i in range(8)]  # correct + in input order
+    # 8 x 0.2s = 1.6s if serial; concurrent (<=16 workers) is ~0.2s. Generous bound for CI jitter.
+    assert elapsed < 1.0, f"reward scoring did not run concurrently ({elapsed:.2f}s for 8x0.2s)"
+
+
+def test_async_serial_when_reward_not_thread_safe():
+    """An env that declares ``reward_thread_safe = False`` is scored SERIALLY — a scorer with mutable
+    state or a thread-bound client is never raced (it worked serially and must keep working)."""
+    import time
+
+    class _UnsafeSlowEnv(_VarTurnEnv):
+        reward_thread_safe = False  # opt out of concurrent scoring
+
+        def reward(self, completion, example, state=None):
+            time.sleep(0.15)
+            return float(example["rid"])
+
+    examples = [{"max_model": 1, "rid": i} for i in range(6)]
+    t0 = time.perf_counter()
+    out = _run_async(examples, _UnsafeSlowEnv())
+    elapsed = time.perf_counter() - t0
+    assert [r["reward"] for r in out] == [float(i) for i in range(6)]  # correct + in order
+    # 6 x 0.15s = 0.9s serial vs ~0.15s concurrent -> a >=0.6s floor proves it did NOT parallelize.
+    assert elapsed >= 0.6, f"reward_thread_safe=False env was parallelized ({elapsed:.2f}s)"
+
+
+def test_async_reward_failure_drains_not_backgrounds():
+    """On a reward failure: scorers that haven't started are cancelled (no new calls launched) and the
+    few already in flight are DRAINED before we raise — none keep scoring in the background after
+    rollout_async returns (no spent calls / mutated scorer state bleeding into the next step)."""
+    import threading
+    import time
+
+    started, finished = [], []
+    lock = threading.Lock()
+
+    class _FailEnv(_VarTurnEnv):
+        def reward(self, completion, example, state=None):
+            with lock:
+                started.append(example["rid"])
+            if example["rid"] == 0:
+                raise RuntimeError("judge 500")  # fails right away
+            time.sleep(0.25)  # the in-flight peers are slow
+            with lock:
+                finished.append(example["rid"])  # records ONLY if the call ran to completion
+            return 1.0
+
+    examples = [{"max_model": 1, "rid": i} for i in range(8)]  # 8 <= max_workers(=8): all start at once
+    with pytest.raises(RuntimeError, match="judge 500"):
+        _run_async(examples, _FailEnv())
+    # Every scorer that STARTED has also FINISHED by the time we get here (drained, not backgrounded);
+    # nothing is still running. With wait=False the slow peers would still be sleeping -> finished < started.
+    assert sorted(finished) == sorted(s for s in started if s != 0), "in-flight rewards were not drained"
 
 
 @pytest.mark.usefixtures("_stub_vllm")
@@ -615,19 +640,104 @@ def test_rollout_func_no_wakesleep_when_sleep_mode_off():
     engine = _FakeEngine()
     rf = _build(_FakeTok())
     rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=False))
-    assert [e[0] for e in engine.events] == ["generate"]
+    assert [e[0] for e in engine.events] == ["add", "step"]
 
 
 @pytest.mark.usefixtures("_stub_vllm")
 def test_rollout_func_re_sleeps_even_if_generation_raises():
     # finally: the engine must return to the offloaded state even when a rollout throws, or the
     # next step inherits a half-woken engine.
-    engine = _FakeEngine(vocab=50)  # ord('h')=104 >= 50 -> guard fires inside generate()
+    engine = _FakeEngine(vocab=50)  # ord('h')=104 >= 50 -> guard fires inside submit()
     rf = _build(_FakeTok())
     with pytest.raises(ValueError, match="out-of-range token id"):
         rf([[{"role": "user", "content": "hi"}]], _fake_trainer(engine, sleep_mode=True))
     assert engine.events[0] == ("wake", ("kv_cache",))
     assert engine.events[-1] == ("sleep", 2)
+
+
+class _RaiseEnvReplyEnv(_TwoTurnEnv):
+    """Raises during the env reply (after the first model turn), to exercise a mid-rollout failure
+    while OTHER rollouts still have in-flight engine requests."""
+
+    def env_reply(self, messages, state):
+        raise RuntimeError("boom in env_reply")
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_rollout_func_no_inflight_leak_on_error():
+    # A rollout whose env reply raises mid-flight must propagate the error from the worker thread
+    # (not hang) and leave NO in-flight engine request behind for the next GRPO step — whether the
+    # leftover requests were aborted in the finally or had already finished.
+    engine = _FakeEngine(finish="one")
+    rf = _build(_FakeTok(), active_env=_RaiseEnvReplyEnv())
+    prompts = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}],
+               [{"role": "user", "content": "c"}]]
+    with pytest.raises(RuntimeError, match="boom in env_reply"):
+        rf(prompts, _fake_trainer(engine, sleep_mode=False))
+    assert not engine.llm_engine.has_unfinished_requests()  # nothing leaked into the engine
+
+
+class _CountingTok(_FakeTok):
+    """_FakeTok that counts how many times env_glue rendered (apply_chat_template with the probe)."""
+
+    def __init__(self):
+        super().__init__()
+        self.glue_renders = 0
+
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize, enable_thinking):
+        if any("flash-env-glue-probe" in str(m.get("content", "")) for m in messages):
+            self.glue_renders += 1
+        return super().apply_chat_template(messages, add_generation_prompt, tokenize, enable_thinking)
+
+
+@pytest.mark.usefixtures("_stub_vllm")
+def test_env_glue_render_is_cached_across_repeated_env_messages():
+    # Every rollout in the group gets the SAME env reply ("result") each turn, so the inter-turn
+    # glue is byte-identical — apply_chat_template must render it ONCE (cached), not once per rollout.
+    tok = _CountingTok()
+    engine = _FakeEngine()
+    rf = _build(tok, active_env=_TwoTurnEnv())
+    prompts = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}],
+               [{"role": "user", "content": "c"}]]
+    rf(prompts, _fake_trainer(engine, sleep_mode=False))
+    assert tok.glue_renders == 1  # 3 rollouts' identical env-glue rendered once, not 3x
+
+
+def test_lru_cache_evicts_oldest_when_full_and_still_caches_new():
+    # Regression: the render/glue caches used to FREEZE when full (no new key admitted past the cap),
+    # so later-repeated diverse prompts never cached -> perf regressed over a long run. The LRU cache
+    # must instead EVICT the least-recently-used entry and keep admitting new keys.
+    c = _LRUCache(2)
+    c.put("a", [1])
+    c.put("b", [2])
+    assert c.get("a") == [1]  # both fit at capacity
+    assert c.get("b") == [2]
+    c.put("c", [3])  # over capacity -> evict the least-recently-used ("a")
+    assert len(c) == 2
+    assert c.get("a") is None  # oldest evicted, NOT frozen-out of the cache
+    assert c.get("b") == [2]  # survivor kept
+    assert c.get("c") == [3]  # new entry cached
+
+
+def test_lru_cache_hit_refreshes_recency():
+    # A get() must mark its key most-recently-used so an actively-reused key isn't evicted while a
+    # stale one lingers (the whole point of LRU over a freeze/FIFO cache).
+    c = _LRUCache(2)
+    c.put("a", [1])
+    c.put("b", [2])
+    assert c.get("a") == [1]  # touch "a" -> "b" is now the least-recently-used
+    c.put("c", [3])  # evicts "b", keeps the recently-used "a"
+    assert c.get("b") is None
+    assert c.get("a") == [1]  # recently-used survivor kept
+    assert c.get("c") == [3]
+
+
+def test_lru_cache_put_existing_key_updates_value_without_growing():
+    c = _LRUCache(2)
+    c.put("a", [1])
+    c.put("a", [9])  # refresh same key -> overwrite, no size growth
+    assert len(c) == 1
+    assert c.get("a") == [9]
 
 
 @pytest.mark.usefixtures("_stub_vllm")
