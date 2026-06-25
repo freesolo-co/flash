@@ -25,7 +25,7 @@ import time
 from typing import Any
 
 from flash._logging import get_logger
-from flash.providers._http import RestClient, is_not_found
+from flash.providers._http import RestClient, is_conflict, is_not_found
 
 logger = get_logger(__name__)
 
@@ -298,6 +298,13 @@ def delete_vm(vm_id: str) -> bool:
         request_with_retries(f"/core/virtual-machines/{vm_id}", method="DELETE", retries=2)
         return True
     except Exception as exc:
+        # Hyperstack returns 409 when a prior delete request is still being processed: the VM is
+        # already queued for teardown so billing will stop — treat as success. Key off the chained
+        # HTTPError status (``is_conflict``), NOT a bare "409"/"conflict" substring — a non-409
+        # failure whose text merely contains "409" (e.g. a "4090" GPU name) must still surface, or a
+        # real delete failure would be silently dropped and the VM left billing.
+        if is_conflict(exc):
+            return True
         logger.warning("hyperstack delete_vm(%s) failed: %s", vm_id, exc)
         return False
 
