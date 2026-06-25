@@ -982,6 +982,25 @@ def run_sft():
     if _attn:
         mik["attn_implementation"] = _attn
     cfg_kwargs["model_init_kwargs"] = mik
+    # torch.compile (opt-in via FLASH_SFT_COMPILE=1): Inductor fuses the LoRA train step's pointwise
+    # ops and trims Python/launch overhead (~1.1-1.4x). The win needs STABLE shapes, so we only honor
+    # it when packing is on (fixed max_length blocks); on unpacked variable-length batches dynamo
+    # recompiles per shape and loses more than it saves. Liger's custom kernels + non-reentrant
+    # grad-checkpointing graph-break, so suppress_errors lets those subgraphs fall back to eager
+    # instead of crashing the run (mirrors the GRPO dynamo path).
+    if os.environ.get("FLASH_SFT_COMPILE") == "1":
+        if cfg_kwargs.get("packing"):
+            cfg_kwargs["torch_compile"] = True
+            cfg_kwargs["torch_compile_backend"] = "inductor"
+            try:
+                import torch._dynamo
+
+                torch._dynamo.config.suppress_errors = True
+            except Exception as exc:  # best-effort; compile still runs without it
+                print(f"[sft] torch._dynamo.suppress_errors unavailable: {exc!r}")
+            print("[sft] torch.compile ENABLED (inductor, suppress_errors=True; stable packed shapes)")
+        else:
+            print("[sft] torch.compile SKIPPED: packing off -> variable shapes would recompile-thrash")
     cfg = TRLSFTConfig(**cfg_kwargs)
 
     # LoRA+ (convergence lever, arXiv 2402.12354; always-on: measured -52% train loss in A/B
