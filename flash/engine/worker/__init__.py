@@ -1534,22 +1534,34 @@ def run_rl():
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
-            if isinstance(comp, list):
-                # Tool / conversational transcript (TRL passes a list of messages): score the
-                # whole transcript via the environment reward (no <think> stripping —
-                # multi-turn content).
-                r = ACTIVE_ENV.reward_from_messages(comp, ex)
-                rewards.append(r)
+            try:
+                if isinstance(comp, list):
+                    # Tool / conversational transcript (TRL passes a list of messages): score the
+                    # whole transcript via the environment reward (no <think> stripping —
+                    # multi-turn content).
+                    r = ACTIVE_ENV.reward_from_messages(comp, ex)
+                    rewards.append(r)
+                    continue
+                graded = graded_text(comp)
+                breakdown = None
+                if hasattr(ACTIVE_ENV, "scores_breakdown"):
+                    breakdown = ACTIVE_ENV.scores_breakdown(graded, ex)
+                    r = float(breakdown.get("total", 0.0))
+                else:
+                    r = ACTIVE_ENV.reward(graded, ex)
+                if _think_penalty > 0 and THINKING:
+                    r -= _think_penalty * think_token_count(comp, tok)
+            except Exception as _reward_exc:
+                # The user's environment raised during scoring (e.g. a transient network error
+                # calling an LLM judge). Treat this sample as 0 reward rather than crashing the
+                # entire RL run — a single bad score call should not kill the worker.
+                print(
+                    f"[reward_fn] env scoring raised for completion {idx} "
+                    f"({type(_reward_exc).__name__}: {_reward_exc}); scoring as 0.0",
+                    flush=True,
+                )
+                rewards.append(0.0)
                 continue
-            graded = graded_text(comp)
-            breakdown = None
-            if hasattr(ACTIVE_ENV, "scores_breakdown"):
-                breakdown = ACTIVE_ENV.scores_breakdown(graded, ex)
-                r = float(breakdown.get("total", 0.0))
-            else:
-                r = ACTIVE_ENV.reward(graded, ex)
-            if _think_penalty > 0 and THINKING:
-                r -= _think_penalty * think_token_count(comp, tok)
             rewards.append(r)
             if idx < 8:
                 debug_rows.append(
