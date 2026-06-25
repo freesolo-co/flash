@@ -10,7 +10,7 @@ import urllib.request
 
 import pytest
 
-from flash.envs.adapter import _urlopen
+from flash.envs.adapter import GitHubRateLimitError, _urlopen
 
 
 def _http_error(code: int, body: str) -> urllib.error.HTTPError:
@@ -49,15 +49,23 @@ def test_urlopen_retries_on_rate_limit_then_succeeds(monkeypatch):
 
 
 def test_urlopen_raises_after_max_retries(monkeypatch):
+    # A PERSISTENT rate limit (every attempt 403s) is reclassified as the typed, retriable
+    # GitHubRateLimitError after the in-process retries are exhausted (#209) — so the worker
+    # reschedules on a fresh worker instead of hard-failing. It is still a RuntimeError subclass.
+    calls = []
+
     def fake_urlopen(req, timeout):
+        calls.append(1)
         raise _http_error(403, _RATE_LIMIT_BODY)
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(time, "sleep", lambda _: None)
     monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)
 
-    with pytest.raises(RuntimeError, match="GitHub environment request failed \\(403\\)"):
+    with pytest.raises(GitHubRateLimitError, match="rate limit exceeded"):
         _urlopen(urllib.request.Request("https://api.github.com/test"))
+    # Initial attempt + 5 retries before giving up.
+    assert len(calls) == 6
 
 
 def test_urlopen_does_not_retry_non_rate_limit_403(monkeypatch):
