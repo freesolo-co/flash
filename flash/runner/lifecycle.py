@@ -295,7 +295,22 @@ def _submit_seed_supervised(
             # failing fast into a retry that will never happen. A pinned/single-candidate run is
             # "last" from attempt 0, which is what we want.
             untried = [c for c in alloc.candidates if (c.provider, c.gpu) not in tried_classes]
-            on_last_gpu = len(untried) <= 1 or attempt >= max_retries
+            # The cache-drop fallback (cache_fallback_attempts) is a reserved attempt PAST the retry
+            # budget, so when it's still available a cache-attached RunPod attempt is not "last" by
+            # BUDGET — don't let ``attempt >= max_retries`` mark it last-GPU (long no-capacity grace),
+            # so a no_capacity fails fast into that fallback (notably at max_retries == 0). This only
+            # gates the BUDGET clause: genuine class exhaustion (``len(untried) <= 1``) still marks
+            # last-GPU (the fallback re-uses the same class cache-less — there's no OTHER class to walk
+            # to), preserving the walk semantics for non-cache-caused failures (e.g. a stalled walk).
+            cache_fallback_available = (
+                started_with_shared_cache
+                and not drop_weight_cache
+                and chosen is not None
+                and chosen.provider == "runpod"
+            )
+            on_last_gpu = len(untried) <= 1 or (
+                attempt >= max_retries and not cache_fallback_available
+            )
             # Mirror into the closure cell so on_handle persists THIS attempt's value (see
             # current_on_last_gpu) for a recovery to reproduce the same stall tuning.
             current_on_last_gpu["value"] = on_last_gpu
@@ -363,30 +378,17 @@ def _submit_seed_supervised(
         except FileNotFoundError:
             # Status file not yet written (early race): treat as not-cancelled and proceed.
             pass
-        print(
-            f"seed={seed} attempt={attempt} failed ({res.failure}); "
-            f"{'retrying (resume from last checkpoint)' if infra_shaped and attempt < max_retries else 'not retrying'}"
-            f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
-            file=log,
-            flush=True,
-        )
-        # Best-effort cache: if a VOLUME-BACKED attempt failed in a way the cache could have caused
-        # — no_capacity (the cache restricts the endpoint to its DC set) or a deploy/submit
-        # poll_error (e.g. the SDK failing to create/attach a volume) — drop the cache so the run
-        # degrades to a cold, unrestricted cross-region attempt instead of looping on the same
-        # volume-backed spec (the IN_QUEUE-forever / persistent-volume-failure block). Sticky: once
-        # dropped it stays dropped. A non-volume flake (stall/preempt) keeps the cache so the
-        # warm-weights benefit survives ordinary retries.
-        # Gate to RunPod: the cache-drop rationale (the attached volume pins the endpoint to its DC
-        # set, so a no_capacity / volume poll_error wants a cache-less cross-region retry) is
-        # RunPod-specific. Instance providers (Lambda/Hyperstack) already fall back to a cold run
-        # per-region INSIDE the launch walk, so their no_capacity isn't cache-caused — dropping the
-        # cache there would needlessly forfeit the warm-weights benefit on retry.
-        # Only the SHARED platform cache triggers the cache-drop retry; a non-shared per-org/custom
-        # volume is the intended escape-hatch isolation (runner._assign_weight_cache_volume) and must
-        # NOT be stripped on no_capacity — gate on the exact shared name, not any truthy volume.
-        # Computed BEFORE the budget stop below so the cache-drop fallback can claim its reserved
-        # bonus attempt even when ``attempt >= max_retries`` (see cache_fallback_attempts above).
+        # Best-effort cache-drop fallback — computed BEFORE the log + budget stop so both reflect it.
+        # If a VOLUME-BACKED RunPod attempt failed in a way the cache could have caused — no_capacity
+        # (the cache restricts the endpoint to its DC set) or a deploy/submit poll_error (e.g. the SDK
+        # failing to create/attach a volume) — drop the cache so the run degrades to a cold, unrestricted
+        # cross-region attempt instead of looping on the same volume-backed spec (the IN_QUEUE-forever /
+        # persistent-volume-failure block). Sticky: once dropped it stays dropped. A non-volume flake
+        # (stall/preempt) keeps the cache so the warm-weights benefit survives ordinary retries.
+        # Gate to RunPod: instance providers (Lambda/Hyperstack) already fall back to a cold run
+        # per-region INSIDE the launch walk, so their no_capacity isn't cache-caused. Only the SHARED
+        # platform cache triggers it (gate on the exact name); a non-shared per-org/custom volume is the
+        # intended escape-hatch isolation (runner._assign_weight_cache_volume) and must NOT be stripped.
         run_had_cache = bool(
             chosen is not None
             and chosen.provider == "runpod"
@@ -396,6 +398,16 @@ def _submit_seed_supervised(
             run_had_cache
             and not drop_weight_cache
             and res.failure in ("no_capacity", "poll_error")
+        )
+        # "retrying" is true when the GPU-walk budget remains OR a cache-drop fallback will retry this
+        # even past it (first_cache_drop) — else the log would say "not retrying" while the loop actually
+        # continues with the reserved cache-less fallback attempt.
+        print(
+            f"seed={seed} attempt={attempt} failed ({res.failure}); "
+            f"{'retrying (resume from last checkpoint)' if infra_shaped and (attempt < max_retries or first_cache_drop) else 'not retrying'}"
+            f"\n--- failure detail ---\n{(res.detail or '')[:2000]}\n---",
+            file=log,
+            flush=True,
         )
         if not infra_shaped:
             break

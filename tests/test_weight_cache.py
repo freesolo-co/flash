@@ -1447,10 +1447,14 @@ def test_preload_wall_cap_timer_armed_and_cancellable(monkeypatch):
     hard-exits the box if a download hangs past max_wall_s. The timer is cancellable on a clean finish."""
     from flash.providers import _instance_bootstrap as b
 
-    t = b._arm_preload_wall_cap({"max_wall_s": 999})
-    assert t is not None
-    assert t.is_alive()
-    t.cancel()
+    cap = b._arm_preload_wall_cap({"max_wall_s": 999})
+    assert cap is not None
+    timer, done = cap  # (timer, done-event): the caller sets `done` then cancels on a clean finish
+    assert timer.is_alive()
+    assert not done.is_set()
+    # A clean finish sets `done` so a wall expiry racing it no-ops in _fire, then cancels the timer.
+    done.set()
+    timer.cancel()
     # No cap requested -> no timer (e.g. a 0/absent wall).
     assert b._arm_preload_wall_cap({"max_wall_s": 0}) is None
     assert b._arm_preload_wall_cap({}) is None

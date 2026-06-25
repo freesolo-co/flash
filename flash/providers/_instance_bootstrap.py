@@ -288,7 +288,7 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
     hf_upload(payload, p, f"{_arm(payload)}_attempt{marker['attempt']}.json")
 
 
-def _arm_preload_wall_cap(payload: dict) -> threading.Timer | None:
+def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Event] | None:
     """Arm the preload path's wall-clock cap. The training path enforces ``max_wall_s`` by
     ``run_mode`` killing the worker SUBPROCESS on its deadline, but ``run_preload`` runs
     ``snapshot_download`` IN-PROCESS — a hung Hub download (or a stalled NIC) has no subprocess to
@@ -297,13 +297,20 @@ def _arm_preload_wall_cap(payload: dict) -> threading.Timer | None:
     still alive, and nothing on the box self-terminates). Mirror the deadline here: a daemon timer
     writes a terminal failure marker (so the warm driver stops polling and the box can be reaped) and
     HARD-exits the process — ``os._exit`` because a blocked C-level socket read in ``snapshot_download``
-    can't be unwound by a Python exception/signal. Returns the Timer so the caller can cancel it on a
-    clean finish (the ``finally`` marker upload then runs normally)."""
+    can't be unwound by a Python exception/signal. Returns ``(timer, done)``: the caller cancels the
+    timer AND sets ``done`` on a clean finish, so a wall expiry racing that finish no-ops in _fire."""
     wall_s = float(payload.get("max_wall_s") or 0)
     if wall_s <= 0:
         return None
+    # Set by the caller the instant ``run_preload`` returns cleanly. ``Timer.cancel()`` cannot stop an
+    # _fire that is ALREADY RUNNING, so without this guard a wall expiry racing a successful finish
+    # would still upload an ok=false marker + ``os._exit(1)`` over a warmed cache (the warm driver then
+    # reports failure). _fire checks it first and no-ops when the preload already completed.
+    done = threading.Event()
 
     def _fire() -> None:
+        if done.is_set():
+            return
         msg = f"preload exceeded the wall-clock cap ({int(wall_s)}s); self-terminating box"
         print(f"FLASH: {msg}", flush=True)
         # Best-effort terminal marker so the driver/sweeper sees a terminal failure instead of polling
@@ -325,7 +332,7 @@ def _arm_preload_wall_cap(payload: dict) -> threading.Timer | None:
     timer = threading.Timer(wall_s, _fire)
     timer.daemon = True
     timer.start()
-    return timer
+    return timer, done
 
 
 def run_preload(payload: dict) -> dict:
@@ -418,11 +425,15 @@ def main() -> int:
         if payload.get("mode") == "preload":
             # Enforce the wall cap on the in-process download (the training path enforces it on the
             # worker subprocess via run_mode; preload has no subprocess, so arm a watchdog here).
-            wall_timer = _arm_preload_wall_cap(payload)
+            wall_cap = _arm_preload_wall_cap(payload)
             try:
                 result = run_preload(payload)
             finally:
-                if wall_timer is not None:
+                if wall_cap is not None:
+                    wall_timer, wall_done = wall_cap
+                    # Mark done FIRST so a wall expiry racing this clean finish no-ops in _fire, THEN
+                    # cancel the timer (cancel can't stop an _fire that is already in flight).
+                    wall_done.set()
                     wall_timer.cancel()
             with open("/tmp/preload_result.json", "w") as f:
                 json.dump(result, f)
