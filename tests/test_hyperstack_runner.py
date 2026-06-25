@@ -35,12 +35,12 @@ def _inst(gpu="L40", region="CANADA-1", flavor="n3-L40x1", price=1.00):
     )
 
 
-def _handle(started_ts=10_000.0, rate=1.00):
+def _handle(started_ts=10_000.0, rate=1.00, attempt=0):
     from flash.providers.hyperstack.jobs.builders import HyperstackJobHandle
 
     return HyperstackJobHandle(
         vm_id="vm-9999", flavor="n3-L40x1", region="CANADA-1", name="flash-x-s0-a0",
-        gpu="L40", hourly_usd=rate, attempt=0, started_ts=started_ts,
+        gpu="L40", hourly_usd=rate, attempt=attempt, started_ts=started_ts,
     )
 
 
@@ -590,21 +590,40 @@ def test_poll_dead_vm_with_retriable_error_still_preempted(monkeypatch):
 
 
 def test_poll_dead_vm_stale_error_with_fresh_boot_heartbeat_is_preempted(monkeypatch):
-    """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. A
-    fresh retry that posts a boot heartbeat (THIS attempt is still booting) then loses the VM must NOT
-    be classified terminal job_failed off the stale file: in_early_setup_now() sees the fresh boot-stage
-    heartbeat and keeps the loss retriable (job_preempted). Mirrors the Lambda path."""
+    """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. On
+    a RETRY (attempt > 0) that posts a boot heartbeat (THIS attempt is still booting) then loses the VM,
+    the loss must NOT be classified terminal job_failed off the stale file: in_early_setup_now() sees
+    the fresh boot-stage heartbeat and keeps it retriable (job_preempted). Mirrors the Lambda path."""
     jobs = _wire_poll(
         monkeypatch,
         vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
         error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a retriable prior attempt
     )
     res = jobs.poll_hs_job(
-        _handle(), _spec(), seed=0, interval_s=0,
+        _handle(attempt=1), _spec(), seed=0, interval_s=0,  # a RETRY: a stale prior-attempt file is possible
         heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
     )
     assert not res.ok
     assert res.failure == "job_preempted"  # stale error file did not flip a host loss to terminal
+
+
+def test_poll_dead_vm_first_attempt_error_with_setup_heartbeat_is_job_failed(monkeypatch):
+    """The inverse guard: on the FIRST attempt (attempt 0) no prior attempt exists, so a present
+    error_<phase>.txt is unambiguously THIS attempt's crash. A worker that wrote the error file then
+    died in setup BEFORE stamping its terminal error heartbeat (last heartbeat still a setup stage)
+    must still fail fast as job_failed -- the stale-file guard must not misread a genuine current crash
+    as retriable. Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
+        error="Traceback ...\nValueError: bad config -> deterministic crash this attempt",
+    )
+    res = jobs.poll_hs_job(
+        _handle(attempt=0), _spec(), seed=0, interval_s=0,  # FIRST attempt: error file can't be stale
+        heartbeat_reader=lambda force=False: {"stage": "sft_model_load", "step": 0, "ts": 10_000.0},
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"  # current-attempt crash trusted despite the setup-stage heartbeat
 
 
 def test_poll_active_no_liveness_fails_over_fast(monkeypatch):

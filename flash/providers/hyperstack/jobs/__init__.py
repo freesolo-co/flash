@@ -556,15 +556,18 @@ def poll_hs_job(
             # region, which is healthy. A crash the worker flagged retriable (RetriableInfraError,
             # stamped in the heartbeat) still retries. error_{phase}.txt is SEED-scoped, so guard with
             # in_early_setup_now() against a stale prior-attempt traceback flipping a fresh retry's host
-            # loss to terminal. Mirrors the Lambda dead-host path exactly so the two instance substrates
-            # classify pre-training deaths identically.
+            # loss to terminal -- but only on a RETRY (attempt > 0): on the FIRST attempt no prior
+            # attempt exists, so a present error file is unambiguously THIS attempt's crash and is
+            # trusted even if the VM died before stamping its terminal heartbeat (a genuine setup-stage
+            # crash must not be misread as stale). Mirrors the Lambda dead-host path exactly so the two
+            # instance substrates classify pre-training deaths identically.
             from flash.providers.runpod.jobs import worker_flagged_retriable
 
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
             worker_crashed = (
                 bool(err and err.strip())
                 and not worker_flagged_retriable(heartbeat_reader)
-                and not in_early_setup_now()
+                and not (handle.attempt > 0 and in_early_setup_now())
             )
             return PollResult(
                 False,

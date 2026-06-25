@@ -620,14 +620,18 @@ def poll_lambda_job(
             # (NOT attempt-scoped), so a retriable PRIOR attempt's traceback can linger; a fresh retry
             # that posts a boot heartbeat then loses the box would be mis-failed terminal. Guard with
             # in_early_setup_now(): if THIS attempt's fresh heartbeat is still boot/setup, the worker
-            # has not crashed yet and the error file is stale -> the loss stays retriable.
+            # has not crashed yet and the error file is stale -> the loss stays retriable. That guard
+            # only applies on a RETRY (attempt > 0): on the FIRST attempt no prior attempt exists, so a
+            # present error file is unambiguously THIS attempt's crash and is trusted even if the worker
+            # died before stamping its terminal heartbeat (a genuine setup-stage crash must not be
+            # misread as stale -> job_failed, not a wasteful job_preempted retry of a repeatable crash).
             from flash.providers.runpod.jobs import worker_flagged_retriable
 
             err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
             worker_crashed = (
                 bool(err and err.strip())
                 and not worker_flagged_retriable(heartbeat_reader)
-                and not in_early_setup_now()
+                and not (handle.attempt > 0 and in_early_setup_now())
             )
             return PollResult(
                 False,

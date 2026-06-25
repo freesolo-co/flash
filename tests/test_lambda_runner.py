@@ -38,7 +38,7 @@ def _inst(gpu="A10", region="us-east-1", itype="gpu_1x_a10", price=1.29):
     return LambdaInstance(gpu=gpu, instance_type=itype, region=region, vram_gb=24, price_usd_hr=price)
 
 
-def _handle(started_ts=10_000.0, rate=1.29):
+def _handle(started_ts=10_000.0, rate=1.29, attempt=0):
     from flash.providers.lambdalabs.jobs.builders import LambdaJobHandle
 
     return LambdaJobHandle(
@@ -48,7 +48,7 @@ def _handle(started_ts=10_000.0, rate=1.29):
         name="flash-x-s0-a0",
         gpu="A10",
         hourly_usd=rate,
-        attempt=0,
+        attempt=attempt,
         started_ts=started_ts,
     )
 
@@ -678,11 +678,11 @@ def test_poll_dead_host_with_retriable_error_still_preempted(monkeypatch):
 
 
 def test_poll_dead_host_stale_error_with_fresh_boot_heartbeat_is_preempted(monkeypatch):
-    """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. A
-    fresh retry that posts a boot heartbeat (THIS attempt overwrote the prior retriable one and is
-    still booting) then loses the host must NOT be classified terminal job_failed off the stale file:
-    in_early_setup_now() sees the fresh boot-stage heartbeat and keeps the loss retriable
-    (job_preempted). (The prior code, keyed only on the seed-scoped file + heartbeat retriable bit,
+    """error_<phase>.txt is SEED-scoped, so a retriable PRIOR attempt's traceback can linger on HF. On
+    a RETRY (attempt > 0) that posts a boot heartbeat (THIS attempt overwrote the prior retriable one
+    and is still booting) then loses the host, the loss must NOT be classified terminal job_failed off
+    the stale file: in_early_setup_now() sees the fresh boot-stage heartbeat and keeps it retriable
+    (job_preempted). (The pre-fix code, keyed only on the seed-scoped file + heartbeat retriable bit,
     returned job_failed here.)"""
     jobs = _wire_poll(
         monkeypatch,
@@ -690,11 +690,30 @@ def test_poll_dead_host_stale_error_with_fresh_boot_heartbeat_is_preempted(monke
         error="Traceback ...\nValueError: prior-attempt crash",  # STALE, left by a retriable prior attempt
     )
     res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0,
+        _handle(attempt=1), _spec(), seed=0, interval_s=0,  # a RETRY: a stale prior-attempt file is possible
         heartbeat_reader=lambda force=False: {"stage": "boot", "step": 0, "ts": 10_000.0},
     )
     assert not res.ok
     assert res.failure == "job_preempted"  # stale error file did not flip a host loss to terminal
+
+
+def test_poll_dead_host_first_attempt_error_with_setup_heartbeat_is_job_failed(monkeypatch):
+    """The inverse guard: on the FIRST attempt (attempt 0) no prior attempt exists, so a present
+    error_<phase>.txt is unambiguously THIS attempt's crash. A worker that wrote the error file then
+    died in setup BEFORE stamping its terminal error heartbeat (last heartbeat still a setup stage)
+    must still fail fast as job_failed -- the stale-file guard must not misread a genuine current crash
+    as retriable and burn the retry budget re-running a deterministic failure."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminating"}],
+        error="Traceback ...\nValueError: bad config -> deterministic crash this attempt",
+    )
+    res = jobs.poll_lambda_job(
+        _handle(attempt=0), _spec(), seed=0, interval_s=0,  # FIRST attempt: error file can't be stale
+        heartbeat_reader=lambda force=False: {"stage": "sft_model_load", "step": 0, "ts": 10_000.0},
+    )
+    assert not res.ok
+    assert res.failure == "job_failed"  # current-attempt crash trusted despite the setup-stage heartbeat
 
 
 def test_poll_loading_timeout(monkeypatch):
