@@ -36,6 +36,7 @@ def cancel_run(run_id: str) -> RunStatus:
         _gc_run_endpoints,
         _update,
         get_status,
+        mark_cancel_requested,
         mark_deployment_undeployed,
     )
 
@@ -55,10 +56,10 @@ def cancel_run(run_id: str) -> RunStatus:
     # thread/process) keys host_fault on run_cancelled(); the terminal `cancelled` state isn't
     # persisted until the end of this function (after provider.destroy + endpoint GC, which take
     # time), so without this flag a poll that observes the box vanish mid-teardown would quarantine
-    # a HEALTHY region for our own cancellation. A same-state field-only write (state is non-terminal
-    # here — we returned above otherwise), so it neither flips the run nor races the final transition.
-    with contextlib.suppress(Exception):
-        _update(run_id, status.state, cancel_requested=True)
+    # a HEALTHY region for our own cancellation. mark_cancel_requested re-reads state under the lock
+    # and writes ONLY the flag, so it can't regress a concurrently-advanced state nor be dropped by
+    # _update's terminal CAS (the failure modes of passing the captured entry state to _update).
+    mark_cancel_requested(run_id)
     # A deployed run also owns a serving registration with the freesolo serving
     # app that the training-endpoint GC below does not touch; deregister it too so
     # a cancelled run can't leave a deployment registered as active.

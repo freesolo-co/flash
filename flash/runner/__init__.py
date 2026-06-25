@@ -643,6 +643,26 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
     _report_status(status)
 
 
+def mark_cancel_requested(run_id: str) -> None:
+    """Record a cancel INTENT (``cancel_requested=True``) WITHOUT touching the run's state. Like
+    ``record_realized_cost`` (and UNLIKE ``_update``, which sets ``state`` from its caller), this
+    re-reads the current status under the lock and writes only the one flag, so it can neither REGRESS
+    a concurrently-advanced state (cancel_run captured the entry state, which may be stale by now) nor
+    be silently dropped by ``_update``'s terminal CAS. ``cancel_run`` calls this BEFORE remote teardown
+    so the run's poll loop (run_cancelled()) can suppress a host_fault quarantine in the window before
+    the terminal ``cancelled`` state is persisted. No-ops if the run vanished; a field-only update is
+    always allowed on any state (a completed/terminal run isn't being polled, so the flag is harmless)."""
+    with _STATUS_LOCK:
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        status.cancel_requested = True
+        status.updated_at = time.time()
+        _save_status(status)
+    _report_status(status)
+
+
 def _report_status(status: RunStatus) -> None:
     with contextlib.suppress(Exception):
         from flash.server.run_registry import record_training_run

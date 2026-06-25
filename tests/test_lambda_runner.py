@@ -805,6 +805,30 @@ def test_poll_host_failmark_still_quarantines(monkeypatch):
     assert res.host_fault  # docker/GPU never ready, no host_neutral -> region quarantined
 
 
+def test_poll_marker_path_cancel_requested_not_quarantined(monkeypatch):
+    """fail_from_marker must ALSO honor run_cancelled(): a cancel-in-progress (state still 'running',
+    cancel_requested true) that lands via a just-written / stale attempt failure marker must NOT
+    quarantine a healthy region for our own teardown -- mirroring the dead-host and first-liveness
+    paths. (Same marker that quarantines a non-cancelled run above.)"""
+    import flash.runner
+
+    monkeypatch.setattr(
+        flash.runner, "get_status",
+        lambda run_id: type("S", (), {"state": "running", "cancel_requested": True})(),
+    )
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        marker=json.dumps(
+            {"ok": False, "attempt": 0, "retriable": True, "error": "host: docker run failed"}
+        ),
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable marker -> retry
+    assert not res.host_fault  # cancel-in-progress -> NOT quarantined even via the marker path
+
+
 def test_poll_github_ratelimit_heartbeat_not_quarantined(monkeypatch):
     """A pre-training GitHubRateLimitError (env resolution hit a GLOBAL GitHub/control-plane rate limit)
     makes the worker stamp a FRESH error heartbeat flagged retriable + host_neutral, while the bootstrap

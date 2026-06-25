@@ -564,7 +564,12 @@ def poll_hs_job(
             and not reached_training_now()
             and not bool(marker and marker.get("trained"))
             and not bool(marker and marker.get("host_neutral"))
-            and not fresh_host_neutral_hb(),
+            and not fresh_host_neutral_hb()
+            # A cancel-in-progress (VM deleted by cancel_run before the terminal `cancelled` state is
+            # persisted) can land here via a just-written / stale attempt marker; WE killed the VM, so
+            # the region is healthy -> never quarantine for our own teardown (mirrors the dead-VM and
+            # first-liveness paths).
+            and not run_cancelled(),
         )
 
     def terminal_artifact_result() -> PollResult | None:

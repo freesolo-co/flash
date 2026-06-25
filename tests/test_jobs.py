@@ -1286,7 +1286,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
 
 
 def test_attach_recovery_purges_before_clearing_handle(monkeypatch):
-    """Lso: the stale-artifact purge must run BEFORE the _update that durably clears the handle and
+    """Recovery purge ordering: the stale-artifact purge must run BEFORE the _update that durably clears the handle and
     records resume_seed_index. Once that persists, a control-plane kill in the gap routes the next
     restart to resume_run (not back here); if the purge ran only afterwards, that relaunch would start
     attempt 0 over un-purged stale boot/marker artifacts. Assert the purge observes the handle still
@@ -1325,7 +1325,7 @@ def test_attach_recovery_purges_before_clearing_handle(monkeypatch):
 
 
 def test_resume_run_purges_stale_artifacts_for_resumed_seed(monkeypatch):
-    """Lso defense-in-depth: resume_run is the durable continuation of an attach_run recovery (a kill
+    """Recovery purge (defense-in-depth): resume_run is the durable continuation of an attach_run recovery (a kill
     after it persisted remote=None+resume_seed_index but before its in-process purge). resume_run must
     itself purge the resumed seed's stale liveness artifacts (spec.train.seeds[resume_seed_index]) so a
     leftover boot.log / error / attempt marker can't mislead the fresh attempt-0 box."""
@@ -1352,6 +1352,22 @@ def test_resume_run_purges_stale_artifacts_for_resumed_seed(monkeypatch):
         )
         orch.resume_run("r1", log_stream=sys.stderr)
         assert observed["seed"] == 0  # seeds[resume_seed_index=0] == seed 0
+
+
+def test_mark_cancel_requested_sets_flag_without_regressing_state(monkeypatch):
+    """mark_cancel_requested writes ONLY cancel_requested, re-reading state under the lock -- so a run
+    that ADVANCED after cancel_run's entry snapshot keeps its CURRENT state (no regression to the
+    captured one) and the flag is never dropped by _update's terminal CAS. Vanished run -> no-op."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        orch._save_status(orch.RunStatus(run_id="mc1", state="running", spec=_spec("mc1").to_dict()))
+        # The run advances to a DIFFERENT non-terminal state after a hypothetical cancel-entry snapshot.
+        orch._update("mc1", "deployed")
+        orch.mark_cancel_requested("mc1")
+        st = orch.get_status("mc1")
+        assert st.cancel_requested is True
+        assert st.state == "deployed"  # CURRENT state preserved, NOT regressed to a captured "running"
+        orch.mark_cancel_requested("does-not-exist")  # must not raise
 
 
 def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):

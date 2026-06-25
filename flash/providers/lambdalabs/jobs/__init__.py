@@ -620,7 +620,12 @@ def poll_lambda_job(
             and not reached_training_now()
             and not bool(marker and marker.get("trained"))
             and not bool(marker and marker.get("host_neutral"))
-            and not fresh_host_neutral_hb(),
+            and not fresh_host_neutral_hb()
+            # A cancel-in-progress (box torn down by cancel_run before the terminal `cancelled` state is
+            # persisted) can land here via a just-written / stale attempt marker; WE killed the box, so
+            # the region is healthy -> never quarantine for our own teardown (mirrors the dead-host and
+            # first-liveness paths).
+            and not run_cancelled(),
         )
 
     def terminal_artifact_result() -> PollResult | None:
