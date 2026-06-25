@@ -2028,12 +2028,12 @@ def run_rl():
                     r = float(breakdown.get("total", 0.0))
                 else:
                     r = env.reward(graded, ex)
-                if _think_penalty > 0 and THINKING:
-                    r -= _think_penalty * think_token_count(comp, tok)
             except Exception as _reward_exc:
                 # The user's environment raised during scoring (e.g. a transient network error
                 # calling an LLM judge). Treat this sample as 0 reward rather than crashing the
-                # entire RL run — a single bad score call should not kill the worker.
+                # entire RL run — a single bad score call should not kill the worker. Scoped
+                # deliberately to the env calls above: flash's own logic (the think penalty below)
+                # stays outside so a tokenizer/config bug fails loud instead of hiding as a 0.0.
                 print(
                     f"[reward_fn] env scoring raised for completion {idx} "
                     f"({type(_reward_exc).__name__}: {_reward_exc}); scoring as 0.0",
@@ -2041,6 +2041,11 @@ def run_rl():
                 )
                 rewards.append(0.0)
                 continue
+            # Thinking-length penalty is computed from flash's own tokenizer (not the user env), so it
+            # lives outside the try/except above — an internal failure here should crash the run, not
+            # be silently swallowed into a 0.0 reward.
+            if _think_penalty > 0 and THINKING:
+                r -= _think_penalty * think_token_count(comp, tok)
             rewards.append(r)
             if idx < 8:
                 debug_rows.append(
