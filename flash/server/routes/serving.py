@@ -254,11 +254,20 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     # failure (which would misclassify the bad payload as an upstream serving fault).
     try:
         temperature = float(payload.get("temperature") or 0.0)
-        max_tokens = int(payload.get("max_tokens") or 512)
+        # Default ONLY when max_tokens is missing/None — `or 512` would silently turn an
+        # explicit 0 into 512, surprising callers and inflating cost/latency. An explicit
+        # non-positive value is rejected below as a request error rather than masked.
+        raw_max_tokens = payload.get("max_tokens")
+        max_tokens = 512 if raw_max_tokens is None else int(raw_max_tokens)
     except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=400, detail=f"invalid temperature/max_tokens: {exc}"
         ) from exc
+    if max_tokens <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_tokens must be a positive integer, got {max_tokens}",
+        )
     try:
         if payload.get("stream") is True:
             return StreamingResponse(
