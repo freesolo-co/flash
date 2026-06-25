@@ -854,6 +854,43 @@ def test_poll_reattach_setup_stall_no_liveness_quarantines(monkeypatch):
     assert res.host_fault  # active but never any liveness past setup grace on reattach -> quarantine
 
 
+def test_poll_setup_stall_done_marker_wins_over_quarantine(monkeypatch):
+    """The pre-training setup-stall path force-reads terminal artifacts before returning, exactly as the
+    first-liveness branch does. A worker can finish right at the stall boundary and have its DONE delayed
+    by Hub rate-limiting (the NON-forced loop read misses it); the FORCED terminal read at the stall must
+    surface that DONE so a completed run is reported as success, NOT a wrongful stall that quarantines a
+    region which actually finished. Pre-fix the setup-stall return host_fault'd without reading. Mirrors Lambda."""
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "get_vm", lambda vm_id: {"status": "ACTIVE"})
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    # step=0.1 keeps the observed-grace floor (120s) unreached -> first-liveness branch stays deferred, so
+    # the SETUP-STALL branch (launch already past setup_grace) is the one that trips first.
+    clock = itertools.count(start=10_000, step=0.1)
+    monkeypatch.setattr(jobs.time, "time", lambda: float(next(clock)))
+    metrics = json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0})
+
+    def factory(hf_repo, path, min_interval_s=45.0):
+        def read(force=False):
+            if path.endswith("/DONE"):
+                return "10500.0" if force else None  # rate-limited: only the forced stall read surfaces it
+            if path.endswith("metrics.json"):
+                return metrics
+            return None  # no boot.log, no marker -> would otherwise be a no-liveness quarantine
+
+        return read
+
+    monkeypatch.setattr(jobs, "_make_hf_file_reader", factory)
+    # Launched 9_000s ago (clock starts 10_000): silent since launch, setup grace already exceeded on iter 1.
+    res = jobs.poll_hs_job(
+        _handle(started_ts=1_000.0), _spec(), seed=0, interval_s=0,
+        first_liveness_s=10.0, setup_grace_s=10.0,
+    )
+    assert res.ok  # forced DONE read before the setup-stall return -> success, not stall/quarantine
+    assert res.failure is None
+
+
 def test_poll_dead_vm_without_marker_is_preempted(monkeypatch):
     jobs = _wire_poll(
         monkeypatch, vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],

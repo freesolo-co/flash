@@ -895,6 +895,16 @@ def poll_lambda_job(
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
                 phase = "training" if seen_training_hb else "setup (pre-training)"
+                # A real DONE / error-marker must win over a 'stalled' classification: a worker can
+                # finish (or error out) right at the stall boundary and have its terminal HF artifact
+                # delayed by Hub rate-limiting, so the non-forced 60s marker re-read may not have seen
+                # it yet. Force-read terminal artifacts ONCE before returning -- exactly as the
+                # first-liveness branch above does -- so a completed seed is not discarded and, when the
+                # stall would otherwise quarantine (no_liveness_host_fault below), a finished/errored
+                # region is not wrongly marked sick on a missed marker.
+                terminal = terminal_artifact_result()
+                if terminal is not None:
+                    return terminal
                 # A box that reached active but produced NO liveness at all (no boot.log, no heartbeat)
                 # and then stalled out the full pre-training setup grace means the region never got a
                 # worker to boot -> host fault (quarantine), same as the first-liveness branch above.
