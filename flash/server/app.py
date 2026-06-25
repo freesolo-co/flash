@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import json
 import logging
 import os
 import threading
@@ -35,7 +37,7 @@ from flash.runner import (
 )
 from flash.runner.checkpoints import checkpoint_adapter_prefix, list_checkpoints
 from flash.schema import ConfigError, spec_from_dict
-from flash.serve.deploy import ServingError, deploy_adapter, undeploy_adapter
+from flash.serve.deploy import DEFAULT_MAX_TOKENS, ServingError, deploy_adapter, undeploy_adapter
 from flash.serve.deploy import chat as serve_chat
 from flash.serve.deploy import chat_stream as serve_chat_stream
 from flash.spec import JobSpec
@@ -53,6 +55,48 @@ _CHECKPOINT_DEPLOYABLE_STATES = _DEPLOYABLE_STATES | {"cancelled", "failed"}
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
 _log = logging.getLogger("flash.server")
+
+
+@functools.lru_cache(maxsize=64)
+def _env_system_prompt(env_id: str, params_json: str) -> str | None:
+    """Best-effort: the leading system message the environment prepends to every prompt.
+
+    A run is trained with the env's instruction in the system role (verifiers prepend a
+    ``system_prompt``; freesolo-sdk envs prepend the contract via ``start_episode``), so the
+    model's policy is conditioned on it. We recover it generically — load the env and read the
+    system-role message off ``prompt_messages`` of one dataset example — so serving can restore
+    it for parity regardless of env architecture. Cached by env id + params. Returns ``None``
+    if the env can't be loaded here (e.g. not installed on the control plane) so serving
+    degrades to today's behavior rather than failing.
+    """
+    if not env_id:
+        return None
+    try:
+        from flash.envs.registry import load_environment
+
+        env = load_environment(env_id, json.loads(params_json))
+        dataset = env.dataset()
+        if not dataset:
+            return None
+        for msg in env.prompt_messages(dataset[0]):
+            if msg.get("role") == "system" and msg.get("content"):
+                return str(msg["content"])
+        return None
+    except Exception as exc:  # env not installed / load failure — non-fatal for serving
+        _log.warning("could not resolve system prompt for env %s: %s", env_id, exc)
+        return None
+
+
+def _resolve_system_prompt(spec, deployment: dict) -> str | None:
+    """The trained system prompt to restore at chat time: the value captured on the
+    deployment record at deploy time, falling back to a live env load (covers deployments
+    recorded before the prompt was tracked)."""
+    stored = (deployment or {}).get("system_prompt")
+    if stored:
+        return str(stored)
+    return _env_system_prompt(
+        spec.environment.id, json.dumps(spec.environment.params, sort_keys=True)
+    )
 
 
 def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
@@ -693,6 +737,12 @@ def create_app():
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                     org_id=deploy_org_id,
+                    # Capture the env's training system prompt so chat can restore it for parity
+                    # (the model was trained conditioned on it). Best-effort: None if the env
+                    # can't be loaded here.
+                    system_prompt=_env_system_prompt(
+                        spec.environment.id, json.dumps(spec.environment.params, sort_keys=True)
+                    ),
                 )
             except ServingError as exc:
                 # The serving backend rejected the registration or was unreachable. This is an
@@ -803,6 +853,12 @@ def create_app():
                 status_code=409,
                 detail=f"run {run_id} has no [train].hf_repo (legacy run); its adapter cannot be served",
             )
+        # max_tokens is caller-supplied with a generous default so a reasoning model isn't
+        # truncated before its answer. Restore the env's training system prompt when the
+        # caller sent none (parity) — thinking stays the run's trained setting (it's fixed by
+        # the model + training, not a caller knob).
+        max_tokens = int(payload.get("max_tokens") or DEFAULT_MAX_TOKENS)
+        system_prompt = _resolve_system_prompt(spec, deployment)
         try:
             if payload.get("stream") is True:
                 return StreamingResponse(
@@ -810,9 +866,10 @@ def create_app():
                         run_id=run_id,
                         messages=payload.get("messages") or [],
                         temperature=float(payload.get("temperature") or 0.0),
-                        max_tokens=int(payload.get("max_tokens") or 512),
+                        max_tokens=max_tokens,
                         # a run trained with thinking serves with thinking (per-run parity)
                         thinking=spec.thinking,
+                        system_prompt=system_prompt,
                     ),
                     media_type="text/plain; charset=utf-8",
                 )
@@ -820,9 +877,10 @@ def create_app():
                 run_id=run_id,
                 messages=payload.get("messages") or [],
                 temperature=float(payload.get("temperature") or 0.0),
-                max_tokens=int(payload.get("max_tokens") or 512),
+                max_tokens=max_tokens,
                 # a run trained with thinking serves with thinking (per-run parity)
                 thinking=spec.thinking,
+                system_prompt=system_prompt,
             )
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc

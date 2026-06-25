@@ -38,6 +38,13 @@ logger = get_logger(__name__)
 # Default freesolo serving base URL (the Modal multi-LoRA app). Overridable per-env.
 DEFAULT_FREESOLO_SERVING_URL = "https://clado-ai--freesolo-lora-serving.modal.run"
 
+# Serving default token budget. Kept generous (was 512) because reasoning-capable models
+# emit a think/scratchpad block before the answer and a small budget truncates them before
+# they ever reach the payload (e.g. the JSON), so a served completion looks broken even
+# though the same model finishes cleanly with room. Callers pass their own max_tokens; this
+# is only the fallback when they don't.
+DEFAULT_MAX_TOKENS = 2048
+
 
 class ServingError(RuntimeError):
     """The freesolo serving backend (Modal LoRA app) rejected a request or was unreachable.
@@ -121,9 +128,26 @@ class Deployment:
     openai_model: str
     endpoint_name: str
     state: str = "ready"
+    # The environment's training system prompt, captured at deploy time so chat can restore
+    # it for parity when the caller sends no system message (see _with_system_prompt). Empty
+    # for legacy deployments recorded before this was tracked.
+    system_prompt: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _with_system_prompt(messages: list[dict], system_prompt: str | None) -> list[dict]:
+    """Prepend the env's training system prompt unless the caller already sent one.
+
+    A run is trained with the environment's system prompt in the system role (verifiers
+    prepends it to every train/rollout/eval prompt), so the model's policy is conditioned
+    on it. Serving must reproduce that: without it the model gets none of the task spec and
+    free-associates. When the caller supplies their own system message we leave it alone.
+    """
+    if not system_prompt or any(m.get("role") == "system" for m in messages):
+        return list(messages)
+    return [{"role": "system", "content": system_prompt}, *messages]
 
 
 def serve_endpoint_name(friendly_gpu: str, run_id: str) -> str:
@@ -158,6 +182,7 @@ def deploy_adapter(
     dry_run: bool = False,
     thinking: bool = False,
     org_id: str | None = None,
+    system_prompt: str | None = None,
 ) -> Deployment:
     """Register the trained adapter with the freesolo serving app.
 
@@ -176,6 +201,7 @@ def deploy_adapter(
         openai_model=run_id,
         endpoint_name=serving_base_url(),
         state="dry_run" if dry_run else "ready",
+        system_prompt=system_prompt or None,
     )
     if dry_run:
         return dep
@@ -241,8 +267,9 @@ def chat(
     run_id: str,
     messages: list[dict],
     temperature: float = 0.0,
-    max_tokens: int = 512,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     thinking: bool = False,
+    system_prompt: str | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
@@ -253,7 +280,7 @@ def chat(
     base = serving_base_url()
     body = {
         "model": run_id,
-        "messages": messages,
+        "messages": _with_system_prompt(messages, system_prompt),
         "max_tokens": int(max_tokens),
         "temperature": float(temperature),
         # Per-run thinking parity: a run trained with thinking must serve with thinking, so
@@ -297,14 +324,15 @@ def chat_stream(
     run_id: str,
     messages: list[dict],
     temperature: float = 0.0,
-    max_tokens: int = 512,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     thinking: bool = False,
+    system_prompt: str | None = None,
 ) -> Iterator[str]:
     """Yield text deltas from the freesolo OpenAI-compatible streaming endpoint."""
     base = serving_base_url()
     body = {
         "model": run_id,
-        "messages": messages,
+        "messages": _with_system_prompt(messages, system_prompt),
         "max_tokens": int(max_tokens),
         "temperature": float(temperature),
         "chat_template_kwargs": {"enable_thinking": bool(thinking)},

@@ -314,6 +314,67 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
 
+def test_with_system_prompt_restores_when_absent_and_preserves_caller():
+    """_with_system_prompt prepends the env's training system prompt only when the caller
+    sent none (parity restore), and is a no-op when the prompt is empty or already has one."""
+    import flash.serve.deploy as d
+
+    user = [{"role": "user", "content": "hi"}]
+    # No env prompt available → unchanged.
+    assert d._with_system_prompt(user, None) == user
+    # Restored when the caller supplied no system message.
+    assert d._with_system_prompt(user, "SYS") == [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "hi"},
+    ]
+    # Caller's own system message wins (never double-prepended / overridden).
+    caller_sys = [{"role": "system", "content": "A"}, {"role": "user", "content": "hi"}]
+    assert d._with_system_prompt(caller_sys, "SYS") == caller_sys
+
+
+def test_chat_injects_env_system_prompt_for_parity(monkeypatch):
+    """chat() restores the env's training system prompt when the caller sent none, so the
+    served model gets the task spec it was trained with (deploy/chat parity)."""
+    import flash.serve.deploy as d
+
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"role": "assistant", "content": "{}"}}]}
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            seen["json"] = json
+            return _Resp()
+
+    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
+    d.chat(
+        run_id="flash-7-abcd",
+        messages=[{"role": "user", "content": "find founders"}],
+        system_prompt="TRAINED-SYS",
+    )
+    assert seen["json"]["messages"][0] == {"role": "system", "content": "TRAINED-SYS"}
+    assert seen["json"]["messages"][1] == {"role": "user", "content": "find founders"}
+    # Default token budget is generous (not the old 512) so a reasoning model isn't truncated.
+    assert seen["json"]["max_tokens"] == d.DEFAULT_MAX_TOKENS == 2048
+
+
 def test_chat_stream_yields_openai_sse_content(monkeypatch):
     """chat_stream requests OpenAI streaming and yields assistant content deltas only."""
     import flash.serve.deploy as d

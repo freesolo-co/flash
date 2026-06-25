@@ -296,7 +296,7 @@ class ApiClient:
         run_id: str,
         messages: list[dict],
         temperature: float = 0.0,
-        max_tokens: int = 512,
+        max_tokens: int = 2048,
     ) -> dict:
         # Serving warmup can take minutes; give inference a generous timeout.
         return self._request(
@@ -311,7 +311,7 @@ class ApiClient:
         run_id: str,
         messages: list[dict],
         temperature: float = 0.0,
-        max_tokens: int = 512,
+        max_tokens: int = 2048,
     ) -> Iterator[str]:
         headers = {"Content-Type": "application/json"}
         if self.api_key:

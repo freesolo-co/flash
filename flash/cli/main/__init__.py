@@ -199,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     chat = sub.add_parser("chat", help="chat with a deployed adapter")
     chat.add_argument("run_id")
     chat.add_argument("-m", "--message", required=True)
-    chat.add_argument("--max-tokens", type=int, default=512)
+    chat.add_argument("--max-tokens", type=int, default=2048)
     chat.add_argument("--temperature", type=float, default=0.0)
     chat.set_defaults(func=cmd_chat)
 
