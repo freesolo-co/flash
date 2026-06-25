@@ -413,11 +413,23 @@ def poll_lambda_job(
             terminal = terminal_artifact_result()
             if terminal is not None:
                 return terminal
-            # Dead host, no marker, no DONE: a host loss, not a worker code error -> retry on a
-            # fresh host/class. Surface whatever the boot log captured.
+            # Dead host with no ok-marker/DONE. Distinguish a genuine host LOSS (retry on a fresh
+            # host/class) from a worker that actually RAN and CRASHED early -- before it could write
+            # the attempt marker terminal_artifact_result() reads -- but DID leave error_{phase}.txt
+            # (a bad env id, a config/code error, an OOM). That is a DETERMINISTIC worker error, so
+            # fail FAST: classifying it job_preempted burns fresh GPUs re-running a crash that will
+            # repeat. A crash the worker flagged retriable (RetriableInfraError, stamped in the
+            # heartbeat) still retries, exactly like fail_from_marker. error_{phase}.txt is not
+            # attempt-scoped, but this can't flip a genuine preemption to job_failed: a prior
+            # attempt's NON-retriable crash already ended the run via this same branch, and a prior
+            # retriable crash leaves a retriable heartbeat that keeps this path on job_preempted.
+            from flash.providers.runpod.jobs import worker_flagged_retriable
+
+            err = _make_hf_file_reader(hf_repo, f"{prefix}/error_{spec.phase}.txt")(force=True)
+            worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(heartbeat_reader)
             return PollResult(
                 False,
-                failure="job_preempted",
+                failure="job_failed" if worker_crashed else "job_preempted",
                 detail=_failure_detail(hf_repo, prefix, spec.phase, None),
             )
 
@@ -450,8 +462,13 @@ def poll_lambda_job(
             # window, so their ts ~= now (no behavior change on the normal path). ``fresh`` is False
             # for a LEFTOVER heartbeat from a prior attempt (ts < launch); we then neither advance
             # last_progress nor mark training seen, so a stale training heartbeat can't arm the
-            # tighter training stall window before this attempt overwrites the file.
-            hb_ts, fresh = heartbeat_progress_ts(new_key, handle.started_ts)
+            # tighter training stall window before this attempt overwrites the file. Dates against
+            # ``launch_ts`` (NOT the raw handle.started_ts) so an unknown-launch (0.0) handle is
+            # anchored to the SAME ``now`` reference as done_is_fresh / the load+stall clocks: a
+            # leftover heartbeat predating this reattach is then consistently rejected instead of
+            # blanket-trusted (which could otherwise arm the tighter training window off a prior
+            # attempt's training heartbeat). On a real launch this is exactly handle.started_ts.
+            hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts)
             if fresh:
                 last_progress = hb_ts
                 if stage not in _SETUP_HEARTBEAT_STAGES:

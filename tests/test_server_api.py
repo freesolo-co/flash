@@ -1362,5 +1362,6 @@ def test_create_run_records_flash_training_run(api, monkeypatch):
     assert calls
     last = calls[-1]
     assert last["status"].run_id == resp.json()["run_id"]
+    # Org attribution rides on the persisted platform_context (org_id/user_id/api_key_id),
+    # which submit_job reports for us — create_run no longer double-POSTs with an explicit key.
     assert last["status"].platform_context["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
-    assert last["key"]["org_id"] == f"org-{key.removeprefix(_USER_PREFIX)}"
