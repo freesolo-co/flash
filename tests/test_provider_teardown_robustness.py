@@ -76,3 +76,61 @@ def test_hyperstack_sweep_reports_only_truly_reaped(monkeypatch):
     monkeypatch.setattr(hs_api, "delete_vms", lambda ids: [i for i in ids if hs_api.delete_vm(i)])
     out = jobs.sweep_orphans(active_labels=set())
     assert out == ["vm-a"]  # vm-b still billing -> NOT reported as reaped
+
+
+# --- review-fix regressions (bounded label, provider rates, cuda image, fail-fast user_data) ---
+def test_label_bounded_and_sweep_matches_for_long_run_id():
+    """A run id long enough to overflow the provider name cap is shortened DETERMINISTICALLY, and the
+    same bounded prefix is used by launch AND sweep matching (so a live run can't be mis-swept)."""
+    from flash.providers._instance import instance_label, run_label_prefix
+
+    long_id = "flash-" + "x" * 200
+    name = instance_label(long_id, 0, 0)
+    assert len(name) <= 60
+    # the bounded prefix the sweep matches on is a prefix of the launched name
+    assert name.startswith(run_label_prefix(long_id))
+    assert name == run_label_prefix(long_id) + "-s0-a0"
+    # deterministic + collision-resistant: two distinct long ids -> distinct bounded prefixes
+    assert run_label_prefix(long_id) != run_label_prefix("flash-" + "y" * 200)
+    # short ids pass through unchanged (the common case)
+    assert run_label_prefix("flash-1700-abcd") == "flash-1700-abcd"
+
+
+def test_provider_cost_uses_provider_rate():
+    """A provider-specific quote prices through the provider's pricing, not the RunPod nominal."""
+    from flash.cost.facts import gpu_hourly_usd
+
+    runpod = gpu_hourly_usd("RTX A6000")  # nominal RunPod snapshot
+    lam = gpu_hourly_usd("RTX A6000", provider="lambda")  # Lambda static fallback (no key in tests)
+    hs = gpu_hourly_usd("RTX A6000", provider="hyperstack")
+    assert runpod == 0.49
+    assert lam == 1.09  # Lambda A6000
+    assert hs == 0.50  # Hyperstack A6000
+    # unknown-on-provider class falls back to nominal (e.g. a RunPod-only consumer card on lambda)
+    assert gpu_hourly_usd("RTX 4090", provider="lambda") == gpu_hourly_usd("RTX 4090")
+
+
+def test_hyperstack_image_cuda_parse_and_floor():
+    """docker_image_for_region must pick an image whose CUDA covers the GPU floor (Blackwell=13)."""
+    from flash.providers.hyperstack import api as hs
+
+    assert hs._image_cuda("Ubuntu Server 24.04 LTS R570 CUDA 12.8 with Docker") == 12.8
+    assert hs._image_cuda("plain ubuntu") == 0.0
+
+
+def test_user_data_fails_fast_and_throttles_bootlog():
+    """The cloud-init writes a retriable failure marker on docker failure and throttles the host
+    boot-log (no 30s-forever loop that would blow HF's commit budget)."""
+    from flash.providers._instance import build_user_data
+
+    payload = {
+        "hf_repo": "org/repo", "hf_prefix": "sft/x/seed0", "flash_arm": "lambda", "attempt": 0,
+        "job_spec_json": "{}", "phase": "sft", "seed": 0, "max_wall_s": 60, "extra_pip": [],
+        "env": {"HF_TOKEN": "t"},
+    }
+    s = build_user_data(payload, image="img:tag")
+    assert "failmark.py" in s  # host writes the attempt-failure marker
+    assert 'fail "worker image pull failed' in s  # fail fast when the image can't pull
+    assert 'fail "worker container did not start' in s
+    assert "sleep 120" in s  # boot-log throttled to 120s
+    assert "sleep 30;" not in s  # NOT the old 30s-forever loop

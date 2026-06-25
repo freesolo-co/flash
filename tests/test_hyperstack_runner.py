@@ -82,13 +82,13 @@ def test_launch_walks_regions_on_rejection(monkeypatch):
     from flash.providers.hyperstack import jobs
 
     monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "flash-managed")
-    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r: "Ubuntu Docker CUDA 12.8")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "Ubuntu Docker CUDA 12.8")
     attempts = []
 
     def fake_launch(*, name, environment_name, image_name, flavor_name, key_name, user_data):
         attempts.append(environment_name)
         if len(attempts) < 2:
-            raise hs_api.HyperstackApiError("no stock")
+            raise hs_api.HyperstackApiError("POST /core/virtual-machines -> HTTP 400: no stock")
         return "vm-4242"
 
     monkeypatch.setattr(hs_api, "launch_vm", fake_launch)
@@ -105,11 +105,11 @@ def test_launch_raises_when_no_stock(monkeypatch):
     from flash.providers.hyperstack import jobs
 
     monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
-    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r: "img")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
     monkeypatch.setattr(
-        hs_api, "launch_vm", lambda **k: (_ for _ in ()).throw(hs_api.HyperstackApiError("no stock"))
+        hs_api, "launch_vm", lambda **k: (_ for _ in ()).throw(hs_api.HyperstackApiError("POST /core/virtual-machines -> HTTP 400: no stock"))
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu: [])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [])
     with pytest.raises(hs_api.HyperstackApiError, match="no stock"):
         jobs.launch_and_submit(_spec(), seed=0, instances=[_inst()], attempt=0)
     with pytest.raises(hs_api.HyperstackApiError, match="no Hyperstack stock"):
@@ -241,7 +241,7 @@ def _wire_runner(monkeypatch, poll_outcome):
 
     deleted = []
     monkeypatch.setattr(hs_api, "delete_vm", lambda vid: deleted.append(vid) or True)
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu: [_inst()])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: _handle())
 
     def fake_poll(*a, **k):
@@ -406,3 +406,38 @@ def test_allocator_capacity_aware(monkeypatch):
     a = allocator.allocate("Qwen/Qwen3.5-4B", "sft", train={"max_length": 4096, "lora_rank": 16})
     hs = {c.gpu for c in a.candidates if c.provider == "hyperstack"}
     assert hs == {"L40"}  # only the in-stock class
+
+
+# --- review-fix regressions ---
+def test_poll_ok_marker_succeeds_with_stale_done(monkeypatch):
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}],
+        done="9000.0",  # stale
+        marker=json.dumps({"ok": True, "attempt": 0}),
+        metrics=json.dumps({"wall_seconds": 50, "cost_usd": 0.0}),
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert res.ok
+    assert res.metrics["notes"]["provider"] == "hyperstack"
+
+
+def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
+    monkeypatch.setattr(hs_api, "docker_image_for_region", lambda r, min_cuda="12.8": "img")
+    reaped = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda rid: reaped.append(rid) or [])
+    attempts = []
+
+    def fake_launch(**k):
+        attempts.append(k["environment_name"])
+        raise hs_api.HyperstackApiError("POST /core/virtual-machines failed after 5 attempts: timeout")
+
+    monkeypatch.setattr(hs_api, "launch_vm", fake_launch)
+    insts = [_inst(region=r) for r in ("CANADA-1", "US-1")]
+    with pytest.raises(hs_api.HyperstackApiError, match="ambiguous"):
+        jobs.launch_and_submit(_spec(), seed=0, instances=insts, attempt=0)
+    assert attempts == ["default-CANADA-1"]  # no second launch
+    assert reaped == ["flash-1700000000-abcd1234"]

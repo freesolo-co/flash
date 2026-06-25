@@ -137,7 +137,9 @@ def launch_instance(
         "region_name": region_name,
         "instance_type_name": instance_type_name,
         "ssh_key_names": list(ssh_key_names),
-        "name": name[:60],  # Lambda caps ``name`` at 64 chars
+        # ``name`` is bounded <=60 by ``_instance.run_label_prefix`` (NOT truncated here) so the
+        # stored name always equals the prefix ``sweep_orphans`` matches on.
+        "name": name,
         "quantity": 1,
         "user_data": user_data,
     }

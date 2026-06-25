@@ -143,7 +143,9 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         2.09,
         min_cuda_modern="13.0",
         validated=True,
-        hyperstack_name="n3-RTX-PRO6000-SEx1",
+        # NOT mapped to Hyperstack: this Blackwell class needs a CUDA-13 host driver, but Hyperstack
+        # only ships up to CUDA-12.8 (R570) images — it would boot then fail at worker setup. Re-add
+        # ``hyperstack_name="n3-RTX-PRO6000-SEx1"`` once a CUDA-13 Hyperstack image is available.
     ),
 )
 

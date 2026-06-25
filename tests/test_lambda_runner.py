@@ -171,7 +171,7 @@ def test_launch_walks_regions_on_capacity_rejection(monkeypatch):
     def fake_launch(*, region_name, instance_type_name, ssh_key_names, name, user_data):
         attempts.append(region_name)
         if len(attempts) < 3:
-            raise lambda_api.LambdaApiError("insufficient-capacity")
+            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
         return "i-4242"
 
     monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
@@ -193,12 +193,12 @@ def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
 
     def fake_launch(*, region_name, **kw):
         if region_name != "us-fresh-1":
-            raise lambda_api.LambdaApiError("no capacity")
+            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")
         created.append(region_name)
         return "i-7"
 
     monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu: [_inst(region="us-fresh-1")])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst(region="us-fresh-1")])
     h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="us-east-1")], attempt=0)
     assert created == ["us-fresh-1"]
     assert h.instance_id == "i-7"
@@ -212,9 +212,9 @@ def test_launch_raises_when_no_capacity(monkeypatch):
     monkeypatch.setattr(
         lambda_api,
         "launch_instance",
-        lambda **k: (_ for _ in ()).throw(lambda_api.LambdaApiError("no capacity")),
+        lambda **k: (_ for _ in ()).throw(lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")),
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu: [])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [])
     with pytest.raises(lambda_api.LambdaApiError, match="no capacity"):
         jobs.launch_and_submit(_spec(), seed=0, instances=[_inst()], attempt=0)
     with pytest.raises(lambda_api.LambdaApiError, match="no Lambda capacity"):
@@ -403,7 +403,7 @@ def _wire_runner(monkeypatch, poll_outcome):
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.append(list(ids)) or True
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu: [_inst()])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: _handle())
 
     def fake_poll(*a, **k):
@@ -608,3 +608,41 @@ def test_allocator_capacity_aware(monkeypatch):
     assert lam == {"A10"}  # only the in-capacity class
     # RunPod still wins on price (cheaper static rates), so it's the chosen provider.
     assert a.provider == "runpod"
+
+
+# --- review-fix regressions ---
+def test_poll_ok_marker_succeeds_with_stale_done(monkeypatch):
+    """A retry that hits the worker's already-complete path leaves DONE stale but writes ok marker +
+    metrics; the poller must treat that as SUCCESS, not poll until it stalls."""
+    jobs = _wire_poll(
+        monkeypatch, instances=[{"status": "active"}],
+        done="9000.0",  # STALE (before the handle's started_ts=10000)
+        marker=json.dumps({"ok": True, "attempt": 0}),
+        metrics=json.dumps({"wall_seconds": 50, "cost_usd": 0.0}),
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert res.ok
+    assert res.metrics["notes"]["provider"] == "lambda"
+
+
+def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
+    """An ambiguous launch failure (timeout/5xx, maybe created an instance) must NOT walk to another
+    region — it reconciles by name and raises so the run retries cleanly (cost safety)."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    reaped = []
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda rid: reaped.append(rid) or [])
+    attempts = []
+
+    def fake_launch(**k):
+        attempts.append(k["region_name"])
+        raise lambda_api.LambdaApiError("PUT /asks/1/ failed after 5 attempts: timed out")
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    insts = [_inst(region=r) for r in ("us-east-1", "us-west-1")]
+    with pytest.raises(lambda_api.LambdaApiError, match="ambiguous"):
+        jobs.launch_and_submit(_spec(), seed=0, instances=insts, attempt=0)
+    assert attempts == ["us-east-1"]  # stopped after the first ambiguous failure (no 2nd launch)
+    assert reaped == ["flash-1700000000-abcd1234"]  # reconciled by run-name

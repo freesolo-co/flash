@@ -15,22 +15,38 @@ marker name.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 
+# Lambda/Hyperstack cap an instance/VM ``name`` at 64 chars. We keep the label at or under this so
+# the name is NEVER silently truncated at launch — truncation would desync the stored name from the
+# ``run_label_prefix`` the orphan-sweep matches on, which could fail to protect (or wrongly reap) a
+# live run. The seed/attempt suffix ``-s{seed}-a{attempt}`` is bounded (<=12 chars), so the prefix
+# is bounded to leave room for it.
+_MAX_NAME = 60
+_PREFIX_BUDGET = _MAX_NAME - 12
+
 
 def run_label_prefix(run_id: str) -> str:
-    """The prefix EVERY instance label for ``run_id`` starts with.
+    """The prefix EVERY instance label for ``run_id`` starts with, bounded to the name budget.
 
-    The platform run ids already start with ``flash-``; anything else (direct-API callers, tests)
-    gets the prefix forced — so the orphan-sweep allowlist (which applies the SAME transform) can
-    never miss an instance we rented, and a live run's instance is never mistakenly swept."""
-    return f"flash-{run_id}" if not run_id.startswith("flash-") else run_id
+    Platform run ids already start with ``flash-``; anything else (direct-API callers, tests) gets
+    the prefix forced. A run id long enough to overflow the provider name cap is shortened
+    DETERMINISTICALLY (a stable 8-char hash suffix) so launch AND ``sweep_orphans`` compute the
+    IDENTICAL bounded prefix — and two distinct long run ids never collide onto the same name (which
+    could otherwise reap the wrong live instance). Short ids (the common case) pass through
+    unchanged."""
+    base = run_id if run_id.startswith("flash-") else f"flash-{run_id}"
+    if len(base) <= _PREFIX_BUDGET:
+        return base
+    h = hashlib.sha1(base.encode()).hexdigest()[:8]
+    return f"{base[: _PREFIX_BUDGET - 9]}-{h}"
 
 
 def instance_label(run_id: str, seed: int, attempt: int) -> str:
     """Instance name: run-derived so ``sweep_orphans`` can tell ours from anything else on the
-    account. (Both providers cap the name at 64 chars; platform run ids keep the label under that.)"""
+    account, and bounded (via ``run_label_prefix``) so the provider never truncates it."""
     return f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"
 
 
@@ -77,6 +93,28 @@ except Exception:
     pass
 """
 
+# Host helper: write the attempt-failure marker (<arm>_attempt<N>.json, ok=false, RETRIABLE) to HF
+# when the box can't even start the worker container (docker/GPU never ready, image pull failure).
+# Without it a pre-container failure leaves NO marker, so the poller would burn the whole setup
+# grace (~50 min) before reporting a generic stall; this surfaces a fast, RETRYABLE failure so the
+# runner re-provisions on a fresh host immediately. Reads creds from the on-box payload.json.
+_FAILMARK_PY = """\
+import json, sys
+try:
+    p = json.load(open("/opt/flash/payload.json"))
+    arm = p.get("flash_arm", "instance"); att = int(p.get("attempt") or 0)
+    reason = sys.argv[1] if len(sys.argv) > 1 else "host boot failure"
+    open("/opt/flash/fm.json", "w").write(json.dumps({"ok": False, "attempt": att, "retriable": True, "error": "host: " + reason}))
+    from huggingface_hub import HfApi
+    HfApi(token=(p.get("env") or {}).get("HF_TOKEN")).upload_file(
+        path_or_fileobj="/opt/flash/fm.json",
+        path_in_repo=p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + ".json",
+        repo_id=p["hf_repo"], repo_type="dataset",
+    )
+except Exception:
+    pass
+"""
+
 
 def build_user_data(payload: dict, *, image: str) -> str:
     """Cloud-init ``user_data``: run the worker ``image`` via Docker on the host.
@@ -107,29 +145,47 @@ cat > /opt/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
 {bootstrap_src}FLASH_BOOTSTRAP_EOF
 cat > /opt/flash/hostlog.py <<'FLASH_HOSTLOG_EOF'
 {_HOSTLOG_PY}FLASH_HOSTLOG_EOF
+cat > /opt/flash/failmark.py <<'FLASH_FAILMARK_EOF'
+{_FAILMARK_PY}FLASH_FAILMARK_EOF
 IMAGE={image!r}
-# Best-effort host->HF boot-log uploader (detached so it survives cloud-init exiting).
-( pip3 install -q huggingface_hub >/dev/null 2>&1 \\
-    || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
-  while true; do python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true; sleep 30; done ) &
-disown || true
+# huggingface_hub on the host for the boot-log + failure-marker uploaders (best-effort).
+pip3 install -q huggingface_hub >/dev/null 2>&1 \\
+  || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
+fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/failmark.py "$1" >/dev/null 2>&1 || true; exit 1; }}
 # The provider's default image ships Docker + the NVIDIA Container Toolkit, but cloud-init can run
 # before they finish initializing — wait for both (up to ~10 min) before launching the worker.
 for i in $(seq 1 100); do
   if docker info >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then break; fi
   echo "FLASH: waiting for docker+gpu ($i)"; sleep 6
 done
-docker info >/dev/null 2>&1 || {{ echo "FLASH: docker never became ready" >&2; exit 1; }}
-nvidia-smi >/dev/null 2>&1 || {{ echo "FLASH: gpu never became ready" >&2; exit 1; }}
-# Pull with retries (the image is large; a transient registry blip must not fail the run).
-for i in 1 2 3 4 5; do docker pull "$IMAGE" && break; echo "FLASH: pull retry $i"; sleep 20; done
+docker info >/dev/null 2>&1 || fail "docker never became ready"
+nvidia-smi >/dev/null 2>&1 || fail "gpu never became ready"
+# Pull with retries (the image is large; a transient registry blip must not fail the run). On total
+# failure, write a RETRYABLE marker and exit NOW instead of leaving a billed box idling the whole
+# setup grace with no DONE/marker.
+PULLED=0
+for i in 1 2 3 4 5; do docker pull "$IMAGE" && {{ PULLED=1; break; }}; echo "FLASH: pull retry $i"; sleep 20; done
+[ "$PULLED" -eq 1 ] || fail "worker image pull failed after retries"
 # Run the worker container detached so cloud-init completes promptly; completion is signaled via the
 # worker's HF artifacts (DONE/metrics.json/marker), never a return channel from the box.
 docker run -d --name flashrun --gpus all --shm-size=16g --network host \\
   -v /opt/flash:/root/flash -w /root/flash \\
-  "$IMAGE" python /root/flash/bootstrap.py
+  "$IMAGE" python /root/flash/bootstrap.py || fail "docker run failed"
+sleep 5
+docker ps --filter name=flashrun --filter status=running -q | grep -q . \\
+  || {{ docker logs flashrun >>/opt/flash/host_boot.log 2>&1 || true; fail "worker container did not start"; }}
 # Mirror the container's stdout into the host boot log (detached) so an early in-container crash is
 # visible on HF even if it dies before uploading its own console artifact.
 ( docker logs -f flashrun >>/opt/flash/host_boot.log 2>&1 || true ) &
+disown || true
+# Host->HF boot-log uploader: THROTTLED to 120s and STOPPED once the container exits (bounded ~30
+# min). The worker itself uploads rate-limited heartbeats/console once running, so a 30s diagnostic
+# loop for the whole run would risk Hugging Face's per-repo hourly commit cap and starve the
+# required metrics/DONE commits.
+( for i in $(seq 1 15); do
+    python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true
+    docker ps --filter name=flashrun --filter status=running -q | grep -q . || break
+    sleep 120
+  done ) &
 disown || true
 """

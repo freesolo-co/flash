@@ -19,7 +19,7 @@ import time
 
 from flash._logging import get_logger
 from flash.providers._poll import PollErrorTracker, make_say, surface_heartbeat
-from flash.providers.base import GPU_INFO, PollResult
+from flash.providers.base import GPU_INFO, PollResult, min_cuda_modern
 from flash.providers.hyperstack import api as hs_api
 from flash.providers.hyperstack.jobs.builders import (
     HyperstackInstance,
@@ -49,8 +49,10 @@ _SETUP_HEARTBEAT_STAGES = frozenset(
 _DEAD_STATES = {"ERROR", "FAILED", "DELETING", "DELETED", "TERMINATED"}
 
 
-def usable_instances(gpu_class: str) -> list[HyperstackInstance]:
+def usable_instances(gpu_class: str, force: bool = False) -> list[HyperstackInstance]:
     """Launchable (region) candidates for a managed GPU class, only where the flavor has stock now.
+    ``force`` bypasses the ``/core/flavors`` cache (used by the in-launch refresh so it can discover
+    newly-restocked regions instead of re-reading the just-populated allocation cache).
 
     Hyperstack prices per flavor (not per region), so every candidate carries the same $/hr; the
     list is the regions whose flavor currently advertises stock. Empty == no Hyperstack capacity now.
@@ -70,8 +72,18 @@ def usable_instances(gpu_class: str) -> list[HyperstackInstance]:
             vram_gb=info.vram_gb,
             price_usd_hr=rate,
         )
-        for region in hs_api.regions_with_stock(flavor)
+        for region in hs_api.regions_with_stock(flavor, force=force)
     ]
+
+
+def _launch_rejection_is_clean(err: Exception) -> bool:
+    """True when a launch error is a DEFINITIVE rejection that created NO VM (safe to walk). The
+    shared RestClient fast-fails a non-429 4xx as ``... -> HTTP 4xx: ...`` (request rejected, e.g.
+    no stock). Anything else — 429, 5xx/timeout (``failed after N attempts``), or accepted-but-no-id
+    (``returned no VM id``) — is AMBIGUOUS: Hyperstack may have created a billed VM, so we must NOT
+    issue another launch."""
+    s = str(err)
+    return "-> HTTP 4" in s and "HTTP 429" not in s
 
 
 def launch_and_submit(
@@ -102,7 +114,8 @@ def launch_and_submit(
             continue
         tried_regions.add(inst.region)
         try:
-            image = hs_api.docker_image_for_region(inst.region)
+            # Pick a boot image whose host CUDA covers this GPU class's floor (Blackwell needs 13).
+            image = hs_api.docker_image_for_region(inst.region, min_cuda=min_cuda_modern(inst.gpu))
             key_name = hs_api.resolve_key_name(inst.environment)
             vm_id = hs_api.launch_vm(
                 name=name,
@@ -114,11 +127,23 @@ def launch_and_submit(
             )
         except hs_api.HyperstackApiError as e:
             last_err = e
+            if not _launch_rejection_is_clean(e):
+                # Ambiguous failure (timeout / 5xx / 429 / accepted-but-no-id): Hyperstack may have
+                # created a billed VM whose id we never got. Do NOT launch another in this attempt —
+                # reconcile any phantom by run-name and stop; the runner's retry (+ gc /
+                # sweep_orphans) re-provisions cleanly.
+                say(f"ambiguous launch failure in {inst.region}: {e}; reconciling + retrying fresh")
+                with contextlib.suppress(Exception):
+                    terminate_run_instances(spec.run_id)
+                raise hs_api.HyperstackApiError(
+                    f"ambiguous Hyperstack launch failure (possible phantom reaped): {e}"
+                ) from e
             say(f"region {inst.region} ({inst.gpu} {inst.flavor}) rejected: {e}")
             if not candidates and not refreshed:
                 refreshed = True
+                # Force a fresh stock fetch (the allocation cache is ~45s stale).
                 candidates = [
-                    c for c in usable_instances(inst.gpu) if c.region not in tried_regions
+                    c for c in usable_instances(inst.gpu, force=True) if c.region not in tried_regions
                 ]
             continue
         say(
@@ -221,10 +246,17 @@ def poll_hs_job(
         except ValueError:
             return False
 
+    def finish_from_ok_marker() -> PollResult:
+        # ok marker => the worker finished (it wrote metrics before the marker) even if DONE is STALE
+        # (a retry hit the already-complete path). Treat ok-marker + metrics as terminal success.
+        d = done_reader(force=True)
+        return finish_ok(d if (d is not None and done_is_fresh(d)) else None)
+
     def fail_from_marker(marker: dict | None) -> PollResult:
         from flash.providers.runpod.jobs import worker_flagged_retriable
 
-        retriable = worker_flagged_retriable(heartbeat_reader)
+        # Host failure marker sets retriable=True; the worker stamps it for a RetriableInfraError.
+        retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(heartbeat_reader)
         return PollResult(
             False,
             failure="job_preempted" if retriable else "job_failed",
@@ -272,6 +304,8 @@ def poll_hs_job(
             if raw_marker:
                 with contextlib.suppress(ValueError):
                     marker = json.loads(raw_marker)
+            if marker is not None and marker.get("ok"):
+                return finish_from_ok_marker()  # finished right before teardown (stale DONE ok)
             if marker is not None and not marker.get("ok"):
                 return fail_from_marker(marker)
             return PollResult(
@@ -289,9 +323,7 @@ def poll_hs_job(
             if marker and not marker.get("ok"):
                 return fail_from_marker(marker)
             if marker and marker.get("ok"):
-                done = done_reader(force=True)
-                if done is not None and done_is_fresh(done):
-                    return finish_ok(done)
+                return finish_from_ok_marker()  # ok marker + metrics == success (DONE may be stale)
 
         if not became_active and time.time() - start > LOAD_TIMEOUT_S:
             return PollResult(

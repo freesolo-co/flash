@@ -70,6 +70,10 @@ class LambdaProvider:
         )
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
+        import contextlib
+        import time
+
+        from flash.providers.lambdalabs import api as lambda_api
         from flash.providers.lambdalabs.jobs import (
             PROVISION_GRACE_S,
             LambdaJobHandle,
@@ -83,11 +87,20 @@ class LambdaProvider:
         lh = LambdaJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: lambda instance={lh.instance_id}", file=log, flush=True)
-        # Reattach must apply the SAME wall-cap deadline as submit_run_lambda — Lambda has no
-        # server-side execution timeout, so a recovered run that dropped the client deadline could
-        # bill unbounded.
-        deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
-        return poll_lambda_job(lh, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline)
+        # The wall-cap deadline counts from the instance's LAUNCH (handle.started_ts), not from this
+        # reattach — Lambda has no server-side execution timeout, so resetting it on every recovery
+        # would let a control-plane restart extend the billable window unbounded. Subtract the
+        # already-elapsed time so the cap is enforced from launch.
+        elapsed = max(0.0, time.time() - lh.started_ts) if lh.started_ts else 0.0
+        deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S - elapsed)
+        try:
+            return poll_lambda_job(lh, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline)
+        finally:
+            # Recovery (attach_run) has no submit_run_lambda teardown ``finally``; terminate the
+            # reattached instance here so a finished/abandoned recovered seed stops billing
+            # immediately instead of idling until the whole run ends.
+            with contextlib.suppress(Exception):
+                lambda_api.terminate_instances([lh.instance_id])
 
     def cancel(self, handle: JobHandle) -> None:
         # Terminating the instance both stops the job and tears down the (only) billable resource —

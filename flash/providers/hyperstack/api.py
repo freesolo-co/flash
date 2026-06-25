@@ -18,6 +18,7 @@ retries, nothing persisted locally. Hyperstack specifics:
 
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 import time
@@ -188,11 +189,24 @@ def resolve_key_name(environment_name: str) -> str:
 _image_cache: dict[str, str] = {}
 
 
-def docker_image_for_region(region: str) -> str:
-    """Name of a Docker-preinstalled CUDA-12.8 Ubuntu image in ``region`` (matches the cu128 worker
-    image). Prefers the newest (24.04 / R570). Raises if none is found."""
-    if region in _image_cache:
-        return _image_cache[region]
+def _image_cuda(name: str) -> float:
+    """Parse the CUDA version out of a Hyperstack image name (e.g. '... CUDA 12.8 ...' -> 12.8)."""
+    m = re.search(r"cuda (\d+(?:\.\d+)?)", name.lower())
+    return float(m.group(1)) if m else 0.0
+
+
+def docker_image_for_region(region: str, min_cuda: str = "12.8") -> str:
+    """A Docker-preinstalled Ubuntu image in ``region`` whose host CUDA covers the run.
+
+    The host driver's CUDA must be at least the GPU class's floor (``min_cuda`` — e.g. 13.0 for
+    Blackwell) AND the cu128 worker container's 12.8. Among the fitting Docker images we pick the
+    LOWEST qualifying CUDA (closest to the worker stack) and prefer the newest Ubuntu. Raises if
+    none qualifies, so ``launch_and_submit`` skips the region rather than booting a box on a driver
+    that can't JIT the GPU's kernels (a Blackwell class on a CUDA-12.8 image would fail at setup)."""
+    required = max(12.8, float(min_cuda))
+    key = f"{region}|{required}"
+    if key in _image_cache:
+        return _image_cache[key]
     out = request_with_retries(f"/core/images?region={region}")
     images = out.get("images", []) if isinstance(out, dict) else []
     flat: list[dict] = []
@@ -202,22 +216,16 @@ def docker_image_for_region(region: str) -> str:
         elif isinstance(x, dict):
             flat.append(x)
     names = [im.get("name", "") for im in flat]
-    # Prefer "with Docker" + CUDA 12.8 (matches WORKER_IMAGE cu128); then any "with Docker".
-    def _score(n: str) -> tuple:
-        nl = n.lower()
-        return (
-            "with docker" in nl,
-            "cuda 12.8" in nl,
-            "24.04" in nl,
+    # Docker-preinstalled ONLY (the cloud-init does not install Docker) AND CUDA >= required.
+    docker_imgs = [n for n in names if "with docker" in n.lower()]
+    fitting = [n for n in docker_imgs if _image_cuda(n) >= required - 1e-9]
+    if not fitting:
+        have = sorted({_image_cuda(n) for n in docker_imgs})
+        raise HyperstackApiError(
+            f"no Docker image with CUDA>={required} in {region} (available Docker CUDA: {have})"
         )
-    # Docker-preinstalled ONLY: a plain-Ubuntu fallback would boot, never start Docker (the
-    # cloud-init does not install it), and silently stall. Raise so launch_and_submit skips the
-    # region (its except handler) instead of provisioning a box that can never run the worker.
-    candidates = [n for n in names if "with docker" in n.lower()]
-    if not candidates:
-        raise HyperstackApiError(f"no Docker-preinstalled image found in {region}")
-    best = max(candidates, key=_score)
-    _image_cache[region] = best
+    best = min(fitting, key=lambda n: (_image_cuda(n), "24.04" not in n))
+    _image_cache[key] = best
     return best
 
 
@@ -232,7 +240,9 @@ def launch_vm(
     NON-IDEMPOTENT: never retried (a blind retry on a timeout where Hyperstack accepted the first
     request would double-provision)."""
     body = {
-        "name": name[:60],
+        # ``name`` is bounded <=60 by ``_instance.run_label_prefix`` (NOT truncated here) so the
+        # stored name always equals the prefix ``sweep_orphans`` matches on.
+        "name": name,
         "environment_name": environment_name,
         "image_name": image_name,
         "flavor_name": flavor_name,

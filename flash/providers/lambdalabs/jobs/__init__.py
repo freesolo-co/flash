@@ -84,13 +84,15 @@ def resolve_ssh_key_names() -> list[str]:
     return [names[0]]
 
 
-def usable_instances(gpu_class: str) -> list[LambdaInstance]:
+def usable_instances(gpu_class: str, force: bool = False) -> list[LambdaInstance]:
     """Launchable (region) candidates for a managed GPU class, only where capacity exists now.
 
     Lambda prices per instance type (not per region), so every candidate for a class carries the
     same $/hr; the list is the set of regions currently advertising capacity. Empty == the class
     has no Lambda capacity right now (the allocator skips it; a mid-run vanish is handled by the
-    region walk + the runner's retry).
+    region walk + the runner's retry). ``force`` bypasses the ``/instance-types`` cache — used by the
+    in-launch refresh so it can actually discover newly-freed regions rather than re-reading the
+    just-populated allocation cache.
     """
     from flash.providers.lambdalabs.gpus import instance_type_for
     from flash.providers.lambdalabs.pricing import hourly_rate
@@ -106,8 +108,19 @@ def usable_instances(gpu_class: str) -> list[LambdaInstance]:
             vram_gb=info.vram_gb,
             price_usd_hr=rate,
         )
-        for region in lambda_api.regions_with_capacity(itype)
+        for region in lambda_api.regions_with_capacity(itype, force=force)
     ]
+
+
+def _launch_rejection_is_clean(err: Exception) -> bool:
+    """True when a launch error is a DEFINITIVE rejection that created NO instance (safe to walk to
+    the next region). The shared RestClient fast-fails a non-429 4xx as ``... -> HTTP 4xx: ...``
+    (the provider rejected the request outright, e.g. no capacity). Anything else — a 429
+    (rate-limited), a 5xx / timeout (``failed after N attempts``), or a 2xx whose response lacked an
+    id (``returned no instance id``) — is AMBIGUOUS: the provider may have created a billed instance,
+    so we must NOT issue another launch."""
+    s = str(err)
+    return "-> HTTP 4" in s and "HTTP 429" not in s
 
 
 def launch_and_submit(
@@ -153,13 +166,26 @@ def launch_and_submit(
             )
         except lambda_api.LambdaApiError as e:
             last_err = e
+            if not _launch_rejection_is_clean(e):
+                # Ambiguous failure (timeout / 5xx / 429 / accepted-but-no-id): Lambda may have
+                # created a billed instance whose id we never got. Do NOT launch another in this
+                # attempt — reconcile any phantom by run-name and stop; the runner's retry (+ gc /
+                # sweep_orphans) re-provisions cleanly. This is the non-idempotent-launch cost-safety
+                # the region walk would otherwise violate.
+                say(f"ambiguous launch failure in {inst.region}: {e}; reconciling + retrying fresh")
+                with contextlib.suppress(Exception):
+                    terminate_run_instances(spec.run_id)
+                raise lambda_api.LambdaApiError(
+                    f"ambiguous Lambda launch failure (possible phantom reaped): {e}"
+                ) from e
             say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {e}")
             if not candidates and not refreshed:
                 refreshed = True
-                fresh = [
-                    c for c in usable_instances(inst.gpu) if c.region not in tried_regions
+                # Force a fresh capacity fetch (the allocation cache is ~45s stale) so the refresh
+                # can discover regions that freed up since the walk started.
+                candidates = [
+                    c for c in usable_instances(inst.gpu, force=True) if c.region not in tried_regions
                 ]
-                candidates = fresh
             continue
         say(
             f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
@@ -280,12 +306,21 @@ def poll_lambda_job(
         except ValueError:
             return False
 
+    def finish_from_ok_marker() -> PollResult:
+        # An ok marker means the worker finished (it wrote metrics.json before the marker), even if
+        # the DONE sentinel is STALE — a retry that hit the worker's already-complete path restores
+        # the prior attempt's metrics but leaves DONE at the old timestamp. Treat ok-marker + metrics
+        # as terminal success; pass the DONE only when it's genuinely fresh (so cost bills to it).
+        d = done_reader(force=True)
+        return finish_ok(d if (d is not None and done_is_fresh(d)) else None)
+
     def fail_from_marker(marker: dict | None) -> PollResult:
-        # A real worker error fails fast UNLESS the worker flagged it retriable (the structured
-        # worker<->poller contract) — then retry on a fresh host like a platform termination.
+        # A real worker error fails fast UNLESS it is flagged retriable — the host failure marker
+        # (docker/GPU never ready) sets retriable=True, and the worker stamps it in heartbeat for a
+        # RetriableInfraError; either retries on a fresh host like a platform termination.
         from flash.providers.runpod.jobs import worker_flagged_retriable
 
-        retriable = worker_flagged_retriable(heartbeat_reader)
+        retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(heartbeat_reader)
         return PollResult(
             False,
             failure="job_preempted" if retriable else "job_failed",
@@ -335,6 +370,8 @@ def poll_lambda_job(
             if raw_marker:
                 with contextlib.suppress(ValueError):
                     marker = json.loads(raw_marker)
+            if marker is not None and marker.get("ok"):
+                return finish_from_ok_marker()  # finished right before teardown (stale DONE ok)
             if marker is not None and not marker.get("ok"):
                 return fail_from_marker(marker)
             # Dead host, no marker, no DONE: a host loss, not a worker code error -> retry on a
@@ -354,9 +391,7 @@ def poll_lambda_job(
             if marker and not marker.get("ok"):
                 return fail_from_marker(marker)
             if marker and marker.get("ok"):
-                done = done_reader(force=True)
-                if done is not None and done_is_fresh(done):
-                    return finish_ok(done)
+                return finish_from_ok_marker()  # ok marker + metrics == success (DONE may be stale)
 
         if not became_active and time.time() - start > LOAD_TIMEOUT_S:
             return PollResult(

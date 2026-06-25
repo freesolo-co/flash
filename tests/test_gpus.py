@@ -33,7 +33,7 @@ def test_providers_for():
     assert providers_for("RTX A6000") == ("runpod", "lambda", "hyperstack")
     assert providers_for("H100") == ("runpod", "lambda", "hyperstack")
     assert providers_for("A100 PCIe") == ("runpod", "hyperstack")
-    assert providers_for("RTX Pro 6000") == ("runpod", "hyperstack")
+    assert providers_for("RTX Pro 6000") == ("runpod",)  # Hyperstack lacks a CUDA-13 image for Blackwell
     # Provider-exclusive classes.
     assert providers_for("A10") == ("lambda",)  # Lambda-only
     assert providers_for("L40") == ("hyperstack",)  # Hyperstack-only

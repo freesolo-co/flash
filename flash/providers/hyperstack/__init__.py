@@ -62,6 +62,10 @@ class HyperstackProvider:
         )
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
+        import contextlib
+        import time
+
+        from flash.providers.hyperstack import api as hs_api
         from flash.providers.hyperstack.jobs import (
             PROVISION_GRACE_S,
             HyperstackJobHandle,
@@ -75,8 +79,17 @@ class HyperstackProvider:
         hh = HyperstackJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: hyperstack vm={hh.vm_id}", file=log, flush=True)
-        deadline = max(60, int(spec.gpu.max_wall_seconds)) + PROVISION_GRACE_S
-        return poll_hs_job(hh, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline)
+        # Deadline counts from LAUNCH (started_ts), not this reattach (no server-side timeout, so a
+        # restart must not extend the billable window). Subtract elapsed-since-launch.
+        elapsed = max(0.0, time.time() - hh.started_ts) if hh.started_ts else 0.0
+        deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S - elapsed)
+        try:
+            return poll_hs_job(hh, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline)
+        finally:
+            # Recovery has no submit_run_hyperstack teardown ``finally``; delete the reattached VM
+            # here so a finished/abandoned recovered seed stops billing immediately.
+            with contextlib.suppress(Exception):
+                hs_api.delete_vm(hh.vm_id)
 
     def cancel(self, handle: JobHandle) -> None:
         from flash.providers.hyperstack import api as hs_api
