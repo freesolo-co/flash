@@ -86,6 +86,32 @@ def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
     assert not reconcile._due(_status(state="done", updated_at=settled, remote=None), now)
 
 
+def test_due_anchors_settle_and_window_to_finished_at_not_bumped_updated_at():
+    """_due bases the settle delay and the 7-day window on the frozen finished_at (teardown), not
+    the mutable updated_at that deploy / late heartbeat move past teardown. So a run finished long
+    enough ago is due even if updated_at was just bumped, and one finished outside the window is
+    NOT resurrected by a recent bump."""
+    now = 1_000_000.0
+    handle = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29}
+
+    # deployed run: updated_at bumped to the deploy time 1 min ago (would look "too fresh" under
+    # the old rule), but it finished training 2h ago -> past the settle delay -> DUE.
+    assert reconcile._due(
+        _status(state="deployed", updated_at=now - 60, finished_at=now - 7200, remote=handle), now
+    )
+    # finished 8 days ago but bumped 1 day ago: old rule (updated_at) would reconcile it; the
+    # window must bound by finish time -> NOT due.
+    assert not reconcile._due(
+        _status(state="done", updated_at=now - 86400, finished_at=now - 8 * 86400, remote=handle),
+        now,
+    )
+    # finished only 1 min ago -> still within the settle delay -> NOT due (even if updated_at is
+    # older from some earlier write).
+    assert not reconcile._due(
+        _status(state="done", updated_at=now - 7200, finished_at=now - 60, remote=handle), now
+    )
+
+
 def test_reconcile_run_reports_and_persists(monkeypatch):
     now = 1_000_000.0
     status = _status(

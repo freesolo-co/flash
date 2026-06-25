@@ -73,6 +73,17 @@ def _report(body: dict) -> bool:
         return False
 
 
+def _terminal_ts(status: runner.RunStatus) -> float:
+    """The run's training-teardown time, used for both billing (``run_end``) and eligibility
+    (settle delay + window). Prefer the frozen ``finished_at`` over the mutable ``updated_at``:
+    deploy / late heartbeat / reconcile all move ``updated_at`` past teardown, which would both
+    DELAY the settle gate (it counts from the bump, not the finish) and let a long-finished run
+    that was merely bumped look "recent" and slip back inside ``_WINDOW_SECONDS``. ``finished_at``
+    is stamped once at the terminal transition and never moved; falls back to ``updated_at`` for
+    pre-feature runs."""
+    return float(status.finished_at or status.updated_at)
+
+
 def _due(status: runner.RunStatus, now: float) -> bool:
     """Whether a run should be reconciled this pass: a billable run whose training is finished
     (a terminal billable state, or `deployed` -- see _RECONCILABLE_STATES), not yet reconciled,
@@ -81,7 +92,7 @@ def _due(status: runner.RunStatus, now: float) -> bool:
         return False
     if status.reconciled_at:
         return False
-    age = now - float(status.updated_at)
+    age = now - _terminal_ts(status)  # from teardown, not a later updated_at bump (see _terminal_ts)
     if age < _SETTLE_SECONDS or age > _WINDOW_SECONDS:
         return False
     return bool(status.remote)
@@ -94,12 +105,10 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     now = time.time() if now is None else now
     remote = status.remote or {}
     start = float(remote.get("started_ts") or status.created_at)
-    # The run's true terminal time (~teardown / billing stop). Prefer the frozen ``finished_at``
-    # over the mutable ``updated_at``: a run deployed (or heartbeat-touched, or reconciled) after
-    # completion has ``updated_at`` moved past teardown, which would make the instance providers'
-    # flat $/hr bill from launch until that later event. ``finished_at`` is stamped once at the
-    # terminal transition and never moved. Falls back to ``updated_at`` for pre-feature runs.
-    run_end = float(status.finished_at or status.updated_at)
+    # The run's true terminal time (~teardown / billing stop); see _terminal_ts for why this is
+    # the frozen finished_at rather than the mutable updated_at (which deploy/heartbeat move past
+    # teardown and would make the instance providers' flat $/hr bill until that later event).
+    run_end = _terminal_ts(status)
     # RunPod's billing query pads past run end so the settled invoice is in range; the instance
     # providers bill flat $/hr to teardown, so they get the UN-padded run_end (no extra settle hour).
     realized = realized_cost_for_remote(remote, start=start, end=run_end + _SETTLE_SECONDS, run_end=run_end)
