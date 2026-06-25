@@ -706,6 +706,74 @@ def test_teardown_works_inside_running_event_loop(monkeypatch):
     assert out == ["flash-weights-us-ca-2"]
 
 
+def test_teardown_lambda_filesystems_deletes_only_fleet(monkeypatch):
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.runpod import preload
+
+    fses = [
+        {"id": "f1", "name": "flash-weights", "region": {"name": "us-east-1"}},
+        {"id": "f2", "name": "flash-weights", "region": {"name": "us-west-2"}},
+        {"id": "f3", "name": "someones-data", "region": {"name": "us-east-1"}},  # NOT ours
+    ]
+    deleted = []
+    monkeypatch.setattr(lambda_api, "list_filesystems", lambda: fses)
+    monkeypatch.setattr(lambda_api, "delete_filesystem", lambda i: deleted.append(i) or True)
+
+    out = preload.teardown_lambda_filesystems()
+    assert sorted(deleted) == ["f1", "f2"]  # only the flash-weights FSes, across regions
+    assert sorted(out) == ["lambda:us-east-1/flash-weights", "lambda:us-west-2/flash-weights"]
+
+
+def test_teardown_lambda_filesystems_no_key_is_noop(monkeypatch):
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        lambda_api, "list_filesystems",
+        lambda: (_ for _ in ()).throw(lambda_api.LambdaApiError("LAMBDA_API_KEY not set")),
+    )
+    assert preload.teardown_lambda_filesystems() == []  # absent provider -> nothing reclaimed, no raise
+
+
+def test_teardown_hyperstack_volumes_deletes_only_fleet(monkeypatch):
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.runpod import preload
+
+    vols = [
+        {"id": 11, "name": "flash-weights", "environment": {"name": "default-CANADA-1"}},
+        {"id": 12, "name": "flash-weights", "environment": {"name": "default-US-1"}},
+        {"id": 13, "name": "user-volume", "environment": {"name": "default-US-1"}},  # NOT ours
+    ]
+    deleted = []
+    monkeypatch.setattr(hs_api, "list_volumes", lambda: vols)
+    monkeypatch.setattr(hs_api, "delete_volume", lambda i: deleted.append(i) or True)
+
+    out = preload.teardown_hyperstack_volumes()
+    assert sorted(deleted) == [11, 12]
+    assert sorted(out) == ["hyperstack:default-CANADA-1/flash-weights", "hyperstack:default-US-1/flash-weights"]
+
+
+def test_teardown_hyperstack_volumes_no_key_is_noop(monkeypatch):
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(
+        hs_api, "list_volumes",
+        lambda: (_ for _ in ()).throw(hs_api.HyperstackApiError("HYPERSTACK_API_KEY not set")),
+    )
+    assert preload.teardown_hyperstack_volumes() == []
+
+
+def test_teardown_cli_reclaims_all_three_providers(monkeypatch):
+    """`preload --teardown` sweeps RunPod + Lambda + Hyperstack in one shot."""
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "teardown_weight_cache", lambda dcs: ["flash-weights-us-ca-2"])
+    monkeypatch.setattr(preload, "teardown_lambda_filesystems", lambda: ["lambda:us-east-1/flash-weights"])
+    monkeypatch.setattr(preload, "teardown_hyperstack_volumes", lambda: ["hyperstack:default-US-1/flash-weights"])
+    assert preload.main(["--teardown"]) == 0
+
+
 def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
     from flash.providers.runpod import preload
 

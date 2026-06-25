@@ -142,8 +142,22 @@ def launch_and_submit(
         raise lambda_api.LambdaApiError(
             f"no Lambda capacity for {spec.gpu.type} (no region advertises the instance type)"
         )
-    payload = build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets)
-    user_data = build_user_data(payload)
+    # Weight cache: when the run wants it (runner-assigned network_volume), HF_HOME points at the
+    # Lambda filesystem bind-mounted at /lambda/nfs/<name> (region-independent path -> one user_data
+    # serves every region; we just ensure the FS exists per region in the walk). If the FS can't be
+    # ensured in a region, fall back to the cold user_data there.
+    cache_name = getattr(spec.gpu, "network_volume", None)
+    cold_user_data = build_user_data(build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets))
+    cache_user_data = (
+        build_user_data(
+            build_payload(
+                spec, seed, attempt, runtime_secrets=runtime_secrets,
+                cache_host_mount=f"/lambda/nfs/{cache_name}",
+            )
+        )
+        if cache_name
+        else None
+    )
     name = instance_label(spec.run_id, seed, attempt)
     ssh_keys = resolve_ssh_key_names()
 
@@ -156,6 +170,15 @@ def launch_and_submit(
         if inst.region in tried_regions:
             continue
         tried_regions.add(inst.region)
+        # Ensure the cache filesystem exists in THIS region (create-if-absent) and attach it at
+        # launch; on any failure, launch cold here (best-effort cache, never blocks the run).
+        user_data, fs_names = cold_user_data, None
+        if cache_name:
+            try:
+                lambda_api.ensure_filesystem(cache_name, inst.region)
+                user_data, fs_names = cache_user_data, [cache_name]
+            except Exception as e:
+                say(f"weight cache unavailable in {inst.region} ({e}); launching cold")
         try:
             instance_id = lambda_api.launch_instance(
                 region_name=inst.region,
@@ -163,6 +186,7 @@ def launch_and_submit(
                 ssh_key_names=ssh_keys,
                 name=name,
                 user_data=user_data,
+                file_system_names=fs_names,
             )
         except lambda_api.LambdaApiError as e:
             last_err = e

@@ -123,11 +123,16 @@ def launch_instance(
     ssh_key_names: list[str],
     name: str,
     user_data: str,
+    file_system_names: list[str] | None = None,
 ) -> str:
     """Launch one instance -> its id. Raises ``LambdaApiError`` on rejection (no capacity, etc.).
 
     NON-IDEMPOTENT (see module docstring): never retried. A transient failure surfaces to the
     launcher, which walks to the next region/class.
+
+    ``file_system_names`` attaches persistent filesystems (the weight cache) AT LAUNCH — Lambda can
+    only attach at launch, and each must already exist in ``region_name`` (auto-mounted on the host
+    at ``/lambda/nfs/<name>``).
     """
     body = {
         "region_name": region_name,
@@ -139,11 +144,53 @@ def launch_instance(
         "quantity": 1,
         "user_data": user_data,
     }
+    if file_system_names:
+        body["file_system_names"] = list(file_system_names)
     out = _data(request_with_retries("/instance-operations/launch", method="POST", body=body, retries=0))
     ids = out.get("instance_ids") if isinstance(out, dict) else None
     if not ids:
         raise LambdaApiError(f"launch({instance_type_name}@{region_name}) returned no instance id: {out}")
     return str(ids[0])
+
+
+# ---------------------------------------------------------------------------
+# Persistent filesystems (the weight cache). Region-scoped, NFS, multi-attach; auto-mounted on the
+# host at /lambda/nfs/<name>. Created via the Cloud API, attached at launch via file_system_names.
+# ---------------------------------------------------------------------------
+def list_filesystems() -> list[dict]:
+    """All filesystems on the account: ``[{id, name, mount_point, region:{name}, is_in_use}, ...]``."""
+    out = _data(request_with_retries("/file-systems"))
+    return out if isinstance(out, list) else []
+
+
+def create_filesystem(name: str, region_name: str) -> dict:
+    """Create filesystem ``name`` in ``region_name`` -> its object (incl. ``mount_point``)."""
+    out = _data(
+        request_with_retries(
+            "/filesystems", method="POST", body={"name": name, "region": region_name}, retries=2
+        )
+    )
+    return out if isinstance(out, dict) else {}
+
+
+def delete_filesystem(filesystem_id: str) -> bool:
+    """Delete a filesystem by id (best-effort). Returns True if the request didn't raise."""
+    try:
+        request_with_retries(f"/filesystems/{filesystem_id}", method="DELETE", retries=2)
+        return True
+    except Exception as exc:
+        logger.warning("lambda delete_filesystem(%s) failed: %s", filesystem_id, exc)
+        return False
+
+
+def ensure_filesystem(name: str, region_name: str) -> str:
+    """Create-if-absent the cache filesystem ``name`` in ``region_name``; return its mount_point
+    (``/lambda/nfs/<name>``). Idempotent: reuses an existing same-name filesystem in that region."""
+    for fs in list_filesystems():
+        if fs.get("name") == name and (fs.get("region") or {}).get("name") == region_name:
+            return fs.get("mount_point") or f"/lambda/nfs/{name}"
+    created = create_filesystem(name, region_name)
+    return created.get("mount_point") or f"/lambda/nfs/{name}"
 
 
 def get_instance(instance_id: str) -> dict | None:

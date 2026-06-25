@@ -100,8 +100,25 @@ def launch_and_submit(
         raise hs_api.HyperstackApiError(
             f"no Hyperstack stock for {spec.gpu.type} (no region advertises the flavor)"
         )
-    payload = build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets)
-    user_data = build_user_data(payload)
+    # Weight cache: when wanted (runner-assigned network_volume), HF_HOME points at a block volume
+    # formatted+mounted at /mnt/flash-weights (region-independent path) and bind-mounted into the
+    # container; the volume is created-if-absent per environment and attached AFTER launch. If the
+    # volume can't be ensured we launch cold; if attach fails the cloud-init preamble degrades to cold
+    # (no device appears). Block volumes are single-attach, so a concurrent same-region run runs cold.
+    cache_name = getattr(spec.gpu, "network_volume", None)
+    cold_user_data = build_user_data(build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets))
+    cache_user_data = None
+    cache_gb = 0
+    if cache_name:
+        from flash.runner import WEIGHT_CACHE_VOLUME_GB
+
+        cache_gb = WEIGHT_CACHE_VOLUME_GB
+        cache_user_data = build_user_data(
+            build_payload(
+                spec, seed, attempt, runtime_secrets=runtime_secrets,
+                cache_host_mount="/mnt/flash-weights", cache_block_device=True,
+            )
+        )
     name = instance_label(spec.run_id, seed, attempt)
 
     tried_regions: set[str] = set()
@@ -135,6 +152,17 @@ def launch_and_submit(
             say(f"region {inst.region} ({inst.gpu} {inst.flavor}) unusable (no boot image/key): {e}")
             refresh_once(inst.gpu)
             continue
+        # Ensure the cache volume exists in this environment (create-if-absent); on success use the
+        # cache user_data and attach the volume after launch. Any failure -> launch cold here.
+        vol_id, user_data = None, cold_user_data
+        if cache_name:
+            try:
+                vol_id = hs_api.ensure_volume(cache_name, inst.environment, cache_gb) or None
+                if vol_id is not None:
+                    user_data = cache_user_data
+            except Exception as e:
+                vol_id = None
+                say(f"weight cache unavailable in {inst.region} ({e}); launching cold")
         try:
             vm_id = hs_api.launch_vm(
                 name=name,
@@ -160,6 +188,12 @@ def launch_and_submit(
             say(f"region {inst.region} ({inst.gpu} {inst.flavor}) rejected: {e}")
             refresh_once(inst.gpu)
             continue
+        # Attach the cache volume to the freshly-launched VM (best-effort: the cloud-init preamble
+        # degrades to a cold run if no device appears, e.g. attach failed or the volume is busy on
+        # another VM — block volumes are single-attach).
+        if vol_id is not None:
+            with contextlib.suppress(Exception):
+                hs_api.attach_volume(vm_id, vol_id)
         say(
             f"launched hyperstack vm {vm_id}: {inst.gpu} {inst.flavor} "
             f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"

@@ -97,9 +97,16 @@ def lambda_image() -> str:
     return os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
 
 
-def build_payload(spec, seed: int, attempt: int, runtime_secrets: dict | None = None) -> dict:
-    """The Lambda bootstrap payload (shared builder, arm='lambda')."""
-    return _shared_build_payload(spec, seed, attempt, arm="lambda", runtime_secrets=runtime_secrets)
+def build_payload(
+    spec, seed: int, attempt: int, runtime_secrets: dict | None = None,
+    cache_host_mount: str | None = None,
+) -> dict:
+    """The Lambda bootstrap payload (shared builder, arm='lambda'). ``cache_host_mount`` (the host
+    NFS mount of the attached weight-cache filesystem, /lambda/nfs/<name>) points HF_HOME at it."""
+    return _shared_build_payload(
+        spec, seed, attempt, arm="lambda", runtime_secrets=runtime_secrets,
+        cache_host_mount=cache_host_mount,
+    )
 
 
 def build_user_data(payload: dict) -> str:

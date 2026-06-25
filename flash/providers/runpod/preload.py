@@ -253,6 +253,57 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     return deleted
 
 
+def teardown_lambda_filesystems(name: str | None = None) -> list[str]:
+    """Delete the Lambda persistent filesystems named ``name`` (default ``flash-weights``) across ALL
+    regions, reclaiming the standing NFS cache storage.
+
+    Best-effort and idempotent: Lambda refuses to delete a filesystem that is still in use (an
+    instance is mounting it), so a live run keeps its cache — re-run teardown once the run finishes.
+    Returns ``lambda:<region>/<name>`` per filesystem deleted. A missing/empty Lambda key is not an
+    error (nothing to reclaim) — it logs and returns ``[]``.
+    """
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    target = name or WEIGHT_CACHE_VOLUME_NAME
+    deleted: list[str] = []
+    try:
+        fses = lambda_api.list_filesystems()
+    except Exception as exc:
+        logger.warning("teardown: lambda list_filesystems failed (skipping): %s", exc)
+        return deleted
+    for fs in fses:
+        if fs.get("name") == target and fs.get("id") and lambda_api.delete_filesystem(fs["id"]):
+            region = (fs.get("region") or {}).get("name") or "?"
+            deleted.append(f"lambda:{region}/{target}")
+    return deleted
+
+
+def teardown_hyperstack_volumes(name: str | None = None) -> list[str]:
+    """Delete the Hyperstack cache volumes named ``name`` (default ``flash-weights``) across ALL
+    environments, reclaiming the standing block storage.
+
+    Best-effort and idempotent: a volume attached to a live VM won't delete — re-run once the run
+    finishes. Returns ``hyperstack:<env>/<name>`` per volume deleted. A missing Hyperstack key is not
+    an error — it logs and returns ``[]``.
+    """
+    from flash.providers.hyperstack import api as hs_api
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    target = name or WEIGHT_CACHE_VOLUME_NAME
+    deleted: list[str] = []
+    try:
+        vols = hs_api.list_volumes()
+    except Exception as exc:
+        logger.warning("teardown: hyperstack list_volumes failed (skipping): %s", exc)
+        return deleted
+    for v in vols:
+        if v.get("name") == target and v.get("id") and hs_api.delete_volume(v["id"]):
+            env = (v.get("environment") or {}).get("name") or "?"
+            deleted.append(f"hyperstack:{env}/{target}")
+    return deleted
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Preload the flash weight-cache volumes.")
     ap.add_argument("--models", help="comma-separated HF model ids (default: whole catalog)")
@@ -274,7 +325,11 @@ def main(argv: list[str] | None = None) -> int:
         else [dc.value for dc in weight_cache_datacenters()]
     )
     if args.teardown:
+        # Reclaim the cache storage on EVERY provider: RunPod network volumes, Lambda filesystems,
+        # and Hyperstack block volumes (each best-effort; a provider with no configured key is a no-op).
         deleted = teardown_weight_cache(dcs)
+        deleted += teardown_lambda_filesystems()
+        deleted += teardown_hyperstack_volumes()
         print(f"deleted {len(deleted)} weight-cache volume(s): {', '.join(deleted) or '(none)'}")
         return 0
     if args.dry_run:

@@ -168,7 +168,7 @@ def test_launch_walks_regions_on_capacity_rejection(monkeypatch):
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     attempts = []
 
-    def fake_launch(*, region_name, instance_type_name, ssh_key_names, name, user_data):
+    def fake_launch(*, region_name, instance_type_name, ssh_key_names, name, user_data, file_system_names=None):
         attempts.append(region_name)
         if len(attempts) < 3:
             raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
@@ -233,6 +233,96 @@ def test_resolve_ssh_key_names(monkeypatch):
     monkeypatch.setattr(lambda_api, "list_ssh_keys", lambda: [])
     with pytest.raises(lambda_api.LambdaApiError, match="requires an SSH key"):
         resolve_ssh_key_names()
+
+
+# ---------------------------------------------------------------------------
+# launch_and_submit: per-region weight cache (Lambda persistent filesystem)
+# ---------------------------------------------------------------------------
+def _wire_launch(monkeypatch):
+    """Common launch wiring: ssh key + a launch that records (region, user_data, file_system_names)."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    calls = []
+
+    def fake_launch(*, region_name, instance_type_name, ssh_key_names, name, user_data, file_system_names=None):
+        calls.append({"region": region_name, "user_data": user_data, "fs": file_system_names})
+        return "i-cache"
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    return jobs, lambda_api, calls
+
+
+def test_cache_ensures_filesystem_and_attaches_at_launch(monkeypatch):
+    jobs, lambda_api, calls = _wire_launch(monkeypatch)
+    ensured = []
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: ensured.append((n, r)) or f"/lambda/nfs/{n}")
+
+    spec = _spec(network_volume="flash-weights")
+    jobs.launch_and_submit(spec, seed=0, instances=[_inst(region="us-east-1")], attempt=0)
+
+    assert ensured == [("flash-weights", "us-east-1")]  # create-if-absent in THIS region
+    assert calls[0]["fs"] == ["flash-weights"]  # attached at launch (Lambda can't attach later)
+    # The cloud-init binds the auto-mounted NFS path into the worker at the fixed cache mount.
+    assert "-v /lambda/nfs/flash-weights:/weight-cache" in calls[0]["user_data"]
+
+
+def test_cache_payload_points_hf_home_at_the_bind(monkeypatch):
+    """The base64 payload's worker env redirects HF_HOME onto the bind (so the model download persists)."""
+    from flash.providers.lambdalabs.jobs import build_payload
+
+    payload = build_payload(_spec(network_volume="flash-weights"), 0, 0, cache_host_mount="/lambda/nfs/flash-weights")
+    assert payload["env"]["HF_HOME"] == "/weight-cache/hf-cache"
+    assert payload["cache_host_mount"] == "/lambda/nfs/flash-weights"
+    assert "cache_block_device" not in payload  # NFS: no format/mount preamble
+
+
+def test_cache_falls_back_to_cold_when_filesystem_unavailable(monkeypatch):
+    jobs, lambda_api, calls = _wire_launch(monkeypatch)
+    monkeypatch.setattr(
+        lambda_api, "ensure_filesystem",
+        lambda n, r: (_ for _ in ()).throw(lambda_api.LambdaApiError("filesystem quota exceeded")),
+    )
+    jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+    assert calls[0]["fs"] is None  # no filesystem attached
+    assert "/weight-cache" not in calls[0]["user_data"]  # cold user_data, no bind
+
+
+def test_no_cache_never_touches_filesystems(monkeypatch):
+    jobs, lambda_api, calls = _wire_launch(monkeypatch)
+
+    def boom(*a, **k):
+        raise AssertionError("ensure_filesystem must not be called without a requested cache")
+
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", boom)
+    jobs.launch_and_submit(_spec(), seed=0, instances=[_inst()], attempt=0)  # spec has no network_volume
+    assert calls[0]["fs"] is None
+    assert "/weight-cache" not in calls[0]["user_data"]
+
+
+def test_cache_ensured_per_region_in_the_walk(monkeypatch):
+    """Lazy per-region: the FS is ensured ONLY in the region the run actually lands in (walk skips on
+    capacity, ensuring then launching cold/cache per region)."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    ensured, attempts = [], []
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: ensured.append(r) or f"/lambda/nfs/{n}")
+
+    def fake_launch(*, region_name, file_system_names=None, **kw):
+        attempts.append(region_name)
+        if len(attempts) < 2:
+            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
+        return "i-2"
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    insts = [_inst(region="us-east-1"), _inst(region="us-west-2")]
+    jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=insts, attempt=0)
+    # Ensured in every region we actually attempted (east failed capacity, west succeeded) — never a
+    # whole-fleet pre-create.
+    assert ensured == ["us-east-1", "us-west-2"]
 
 
 # ---------------------------------------------------------------------------

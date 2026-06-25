@@ -50,10 +50,59 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
     return f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"
 
 
-def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: dict | None = None) -> dict:
+# The worker container path the per-region cache is bind-mounted at, and the HF cache under it. The
+# host mount differs per provider (Lambda NFS /lambda/nfs/<name>; Hyperstack block /mnt/flash-weights)
+# but the CONTAINER path is fixed, so HF_HOME is uniform regardless of substrate.
+CACHE_CONTAINER_MOUNT = "/weight-cache"
+CACHE_HF_HOME = f"{CACHE_CONTAINER_MOUNT}/hf-cache"
+
+
+def _cache_block_device_setup(payload: dict) -> str:
+    """Cloud-init preamble (block-volume providers, e.g. Hyperstack): wait for the attached volume's
+    block device, format it ONCE if it has no filesystem (NEVER reformat a populated cache — guarded
+    by ``blkid``), and mount it at the host ``cache_host_mount``. No-op for NFS providers (Lambda
+    auto-mounts) and for cold runs. Best-effort: if the device never appears / mount fails, the bind
+    falls back to an empty dir (a correct cold run), never a hard failure."""
+    if not payload.get("cache_block_device") or not payload.get("cache_host_mount"):
+        return ""
+    mount = payload["cache_host_mount"]
+    return f"""
+# --- weight-cache block volume: wait-for-device, format-if-new (blkid-guarded), mount ---
+echo "FLASH: waiting for the attached cache block device..."
+CACHE_DEV=""
+for i in $(seq 1 60); do
+  CACHE_DEV="$(lsblk -dpn -o NAME,TYPE,MOUNTPOINT | awk '$2=="disk" && $3=="" {{print $1}}' | head -1)"
+  [ -n "$CACHE_DEV" ] && break
+  sleep 5
+done
+if [ -n "$CACHE_DEV" ]; then
+  blkid "$CACHE_DEV" >/dev/null 2>&1 || mkfs.ext4 -q "$CACHE_DEV" || true   # format ONCE; never reformat a populated cache
+  mkdir -p {mount}
+  mount "$CACHE_DEV" {mount} 2>/dev/null || echo "FLASH: cache mount failed; running cold"
+else
+  echo "FLASH: no cache block device appeared; running cold"
+fi
+"""
+
+
+def build_payload(
+    spec,
+    seed: int,
+    attempt: int,
+    *,
+    arm: str,
+    runtime_secrets: dict | None = None,
+    cache_host_mount: str | None = None,
+    cache_block_device: bool = False,
+) -> dict:
     """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
-    ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
+    ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name).
+
+    ``cache_host_mount`` (set by the provider when it attaches a per-region weight cache) points
+    HF_HOME at the bind-mounted cache (``/weight-cache/hf-cache``) instead of stripping the
+    RunPod redirect; ``cache_block_device`` adds the format/mount preamble for block-volume providers.
+    """
     from flash.envs.registry import worker_pip_for_env
     from flash.providers.runpod.train import (
         build_worker_env,
@@ -61,19 +110,18 @@ def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: d
         strip_runpod_volume_env,
     )
 
-    return {
+    # Start from the shared env with the RunPod /runpod-volume redirect stripped (that mount is
+    # RunPod-only). If THIS provider attached a cache, point HF_HOME at the instance cache mount.
+    env = strip_runpod_volume_env(build_worker_env(spec, seed, runtime_secrets=runtime_secrets))
+    if cache_host_mount:
+        env["HF_HOME"] = CACHE_HF_HOME
+    payload = {
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "seed": int(seed),
         "flash_arm": arm,
-        # build_worker_env redirects HF_HOME onto the RunPod /runpod-volume mount when the run carries
-        # a (platform-assigned) weight-cache volume. That mount is RunPod-only; instance providers
-        # don't mount it, so strip the redirect — otherwise the instance worker would point HF at a
-        # nonexistent /runpod-volume path. (RunPod's own submit path keeps the redirect.)
-        "env": strip_runpod_volume_env(
-            build_worker_env(spec, seed, runtime_secrets=runtime_secrets)
-        ),
+        "env": env,
         # The bootstrap pip-installs extra_pip for every job, so the per-run env wheel + the opt-in
         # chalk spec ride along here to reach default runs (mirrors runpod/jobs.submit_run).
         "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
@@ -82,6 +130,11 @@ def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: d
         "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
         "attempt": int(attempt),
     }
+    if cache_host_mount:
+        payload["cache_host_mount"] = cache_host_mount
+        if cache_block_device:
+            payload["cache_block_device"] = True
+    return payload
 
 
 # Host helper: best-effort upload of the consolidated boot log to HF. Neither Lambda nor Hyperstack
@@ -141,6 +194,14 @@ def build_user_data(payload: dict, *, image: str) -> str:
     """
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent / "_instance_bootstrap.py").read_text()
+    # Weight cache: the provider mounts its region-scoped persistent storage on the HOST at
+    # ``cache_host_mount`` (Lambda auto-mounts its NFS filesystem there; Hyperstack's preamble below
+    # formats+mounts the attached block device there). Bind it into the worker container at the FIXED
+    # ``/weight-cache`` so the worker's HF_HOME=/weight-cache/hf-cache (set in build_payload) persists
+    # the model download across runs in this region. Absent -> no bind (cold run).
+    cache_host_mount = payload.get("cache_host_mount")
+    cache_bind = f"-v {cache_host_mount}:{CACHE_CONTAINER_MOUNT} \\\n  " if cache_host_mount else ""
+    cache_setup = _cache_block_device_setup(payload)
     return f"""#!/bin/bash
 # Flash instance worker (generated by flash.providers._instance.build_user_data; arm={payload.get('flash_arm')})
 set -x
@@ -170,6 +231,7 @@ for i in $(seq 1 100); do
 done
 docker info >/dev/null 2>&1 || fail "docker never became ready"
 nvidia-smi >/dev/null 2>&1 || fail "gpu never became ready"
+{cache_setup}
 # Pull with retries (the image is large; a transient registry blip must not fail the run). On total
 # failure, write a RETRYABLE marker and exit NOW instead of leaving a billed box idling the whole
 # setup grace with no DONE/marker.
@@ -179,7 +241,7 @@ for i in 1 2 3 4 5; do docker pull "$IMAGE" && {{ PULLED=1; break; }}; echo "FLA
 # Run the worker container detached so cloud-init completes promptly; completion is signaled via the
 # worker's HF artifacts (DONE/metrics.json/marker), never a return channel from the box.
 docker run -d --name flashrun --gpus all --shm-size=16g --network host \\
-  -v /opt/flash:/root/flash -w /root/flash \\
+  -v /opt/flash:/root/flash {cache_bind}-w /root/flash \\
   "$IMAGE" python /root/flash/bootstrap.py || fail "docker run failed"
 sleep 5
 # The container must be running OR have already exited CLEANLY. The bootstrap returns 0 ONLY on

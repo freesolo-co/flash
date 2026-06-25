@@ -302,6 +302,68 @@ def delete_vm(vm_id: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Volumes (the weight cache). Region/environment-scoped block storage; created via the API, attached
+# to a VM AFTER launch, then formatted+mounted in the VM by the cloud-init preamble. Block volumes
+# are single-attach (one VM at a time) — concurrent same-region runs fall back to cold.
+# ---------------------------------------------------------------------------
+_CACHE_VOLUME_TYPE = "Cloud-SSD"
+
+
+def list_volumes() -> list[dict]:
+    """All volumes: ``[{id, name, environment:{name,region}, status, attachments}, ...]``."""
+    out = request_with_retries("/core/volumes")
+    vols = out.get("volumes") if isinstance(out, dict) else None
+    return vols if isinstance(vols, list) else []
+
+
+def create_volume(name: str, environment_name: str, size_gb: int) -> dict:
+    """Create a ``Cloud-SSD`` volume in ``environment_name`` -> its object (incl. integer ``id``)."""
+    body = {
+        "name": name,
+        "environment_name": environment_name,
+        "volume_type": _CACHE_VOLUME_TYPE,
+        "size": int(size_gb),
+    }
+    out = request_with_retries("/core/volumes", method="POST", body=body, retries=2)
+    return (out.get("volume") if isinstance(out, dict) else None) or {}
+
+
+def delete_volume(volume_id) -> bool:
+    """Delete a volume by id (best-effort)."""
+    try:
+        request_with_retries(f"/core/volumes/{volume_id}", method="DELETE", retries=2)
+        return True
+    except Exception as exc:
+        logger.warning("hyperstack delete_volume(%s) failed: %s", volume_id, exc)
+        return False
+
+
+def attach_volume(vm_id: str, volume_id) -> bool:
+    """Attach a volume to a VM (best-effort). The cloud-init preamble then formats+mounts the device;
+    if this fails the run still proceeds COLD (the preamble degrades when no device appears)."""
+    try:
+        request_with_retries(
+            f"/core/virtual-machines/{vm_id}/attach-volumes",
+            method="POST",
+            body={"volume_ids": [volume_id]},
+            retries=2,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("hyperstack attach_volume(vm=%s, vol=%s) failed: %s", vm_id, volume_id, exc)
+        return False
+
+
+def ensure_volume(name: str, environment_name: str, size_gb: int) -> object:
+    """Create-if-absent the cache volume ``name`` in ``environment_name``; return its id. Idempotent:
+    reuses an existing same-name volume in that environment."""
+    for v in list_volumes():
+        if v.get("name") == name and (v.get("environment") or {}).get("name") == environment_name:
+            return v.get("id")
+    return create_volume(name, environment_name, size_gb).get("id")
+
+
 def delete_vms(vm_ids: list[str]) -> list[str]:
     """Delete several VMs (best-effort, per-id isolated). Return the ids that ACTUALLY deleted so
     callers (sweep_orphans / terminate_run_instances) report only what was truly torn down — a

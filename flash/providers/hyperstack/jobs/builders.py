@@ -99,9 +99,17 @@ def hyperstack_image() -> str:
     return os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
 
 
-def build_payload(spec, seed: int, attempt: int, runtime_secrets: dict | None = None) -> dict:
-    """The Hyperstack bootstrap payload (shared builder, arm='hyperstack')."""
-    return _shared_build_payload(spec, seed, attempt, arm="hyperstack", runtime_secrets=runtime_secrets)
+def build_payload(
+    spec, seed: int, attempt: int, runtime_secrets: dict | None = None,
+    cache_host_mount: str | None = None, cache_block_device: bool = False,
+) -> dict:
+    """The Hyperstack bootstrap payload (shared builder, arm='hyperstack'). ``cache_host_mount`` (the
+    host path the attached block volume is formatted+mounted at) points HF_HOME at it;
+    ``cache_block_device`` enables the cloud-init wait-for-device/format/mount preamble."""
+    return _shared_build_payload(
+        spec, seed, attempt, arm="hyperstack", runtime_secrets=runtime_secrets,
+        cache_host_mount=cache_host_mount, cache_block_device=cache_block_device,
+    )
 
 
 def build_user_data(payload: dict) -> str:
