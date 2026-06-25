@@ -155,9 +155,10 @@ def _spill_large_spec_to_hf(payload: dict) -> dict:
     if len(spec_json) <= _SPEC_SPILL_THRESHOLD:
         return payload
     from huggingface_hub import HfApi
+    import io
 
     HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
-        path_or_fileobj=spec_json.encode(),
+        path_or_fileobj=io.BytesIO(spec_json.encode("utf-8")),
         path_in_repo=f"{payload['hf_prefix']}/job_spec.json",
         repo_id=payload["hf_repo"],
         repo_type="dataset",
