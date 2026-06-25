@@ -158,8 +158,10 @@ def _purge_stale_seed_artifacts(spec: JobSpec, seed: int, log) -> None:
 
     Clearing all three lets the relaunch start from a clean slate (a healthy new box rewrites its own; a
     dead one leaves none -> correct fast failover / retry). Only these liveness artifacts are removed
-    (the worker owns/needs DONE/metrics/adapter/checkpoints). Best-effort, never raises into recovery; a
-    no-op for RunPod (it writes none)."""
+    (the worker owns/needs DONE/metrics/adapter/checkpoints). Best-effort, never raises into recovery.
+    For RunPod it only ever clears a stale ``error_<phase>.txt`` (RunPod writes no host boot.logs and no
+    ``<arm>_attempt<N>.json`` markers — those are instance-provider only), which is the same clean-slate
+    recovery semantics, just a narrower set."""
     import os
 
     repo = spec.train.hf_repo

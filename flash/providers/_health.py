@@ -11,8 +11,11 @@ that hits one quarantines that region and the next attempt lands elsewhere.
 
 TTL-based so a TRANSIENT regional blip self-heals without a human editing a denylist; in-process only
 (resets on control-plane restart) and strictly best-effort: it can only DEMOTE a region for a bounded
-window, never hard-fail a run — if every region for a class is quarantined the class simply offers no
-capacity and the runner falls back to another provider (or the TTL lapses and it is tried again).
+window, never hard-fail a run. The demotion is a strict RANKING preference, not a hard exclusion — a
+healthy candidate always outranks a quarantined one, but if a class's only capacity is in quarantined
+regions the allocator and the launch-time region walk still REACH it via a last-resort ``ignore_sick``
+pass rather than hard-failing, so the run launches there anyway (and simply re-quarantines + escapes
+cross-provider if it is still broken). The TTL also lapses and the region is tried fresh.
 
 The quarantine fires only on a HOST-fault signal (``PollResult.host_fault``), which the instance
 pollers set just for failures that prove the region/host never got a worker to training — NOT for a
