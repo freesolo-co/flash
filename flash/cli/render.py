@@ -538,6 +538,7 @@ def env_setup(paths: list[str]) -> str:
         "datasets/train.jsonl": "starter training rows",
         "configs/rl.toml": "GRPO run config",
         "configs/sft.toml": "SFT run config",
+        "TRAINING.md": "how to train well — read this first",
     }
     keyw = max(len(p) for p in paths)
     tree = "\n".join(
