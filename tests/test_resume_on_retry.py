@@ -194,10 +194,16 @@ def _fake_snapshot(steps, *, with_weights=True):
 
 @pytest.fixture
 def resume_run_id():
-    """hf_resume_checkpoint downloads to the worker's hardcoded /tmp/resume; reap our subtree."""
-    run = "flash-resume-utest"
+    """hf_resume_checkpoint downloads to the worker's hardcoded /tmp/resume; reap our subtree.
+
+    Hermetic: the run id is unique per process and the subtree is cleaned BOTH before and after, so
+    stale data left under the same id (a prior aborted run, or a concurrent xdist worker) can't make
+    hf_resume_checkpoint resolve an unexpected higher checkpoint and flake the latest-step assertions."""
+    run = f"flash-resume-utest-{os.getpid()}"
+    path = os.path.join("/tmp/resume", "rl", run)
+    shutil.rmtree(path, ignore_errors=True)
     yield run
-    shutil.rmtree(os.path.join("/tmp/resume", "rl", run), ignore_errors=True)
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def test_hf_resume_checkpoint_returns_latest_step(monkeypatch, resume_run_id):
@@ -338,6 +344,11 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
 
     Only infra-shaped failures resume; a real training crash would just reproduce on a fresh
     host, so it fails immediately instead of burning the budget on a doomed resume.
+
+    Uses the REAL failure label a worker/code crash produces — ``job_failed`` (the providers emit
+    ``"job_preempted" if retriable else "job_failed"``, e.g. runpod/jobs.py) — NOT a placeholder, so
+    this actually guards the classification: if ``job_failed`` were ever added to the supervisor's
+    infra-shaped retry set, this test would FAIL (it'd relaunch a doomed crash and burn GPU budget).
     """
     from flash.providers.base import PollResult
     from flash.providers.runpod import jobs as rp_jobs
@@ -347,7 +358,7 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         calls.append(attempt)
         on_handle(_runpod_handle())
-        return PollResult(False, failure="error", detail="ValueError in reward_fn")
+        return PollResult(False, failure="job_failed", detail="ValueError in reward_fn")
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
     spec = _spec()
