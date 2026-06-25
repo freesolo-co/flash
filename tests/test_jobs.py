@@ -372,21 +372,31 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     assert "next-best GPU" in res.detail
 
 
-def test_capacity_grace_defaults_are_one_minute():
+def test_capacity_grace_scales_with_gpu_walk_position():
     # The two no-capacity backstops — IN_QUEUE with no worker (queue_grace_s) and a worker stuck
-    # THROTTLED (throttled_grace_s) — fail fast (~1 min) so the runner's gpu-walk re-provisions on
-    # the next-best class instead of blocking the run on a class that is out of capacity. A *placed*
-    # worker that is still cold-starting is governed by the much larger setup_grace_s and must NOT be
-    # shortened — assert it stays large so we never abandon a legitimately-initializing worker.
+    # THROTTLED (throttled_grace_s) — are tuned to the gpu-walk position. While a next-best class
+    # still exists they wait ~5 min, long enough to ride out a brief blip but short enough to hand
+    # off promptly to the next-best class. On the LAST candidate there is nowhere to walk, so they
+    # wait ~15 min before giving up. A *placed* worker that is still cold-starting is governed by
+    # the much larger setup_grace_s and must NOT be shortened — assert it stays large so we never
+    # abandon a legitimately-initializing worker.
     import inspect
 
     from flash.providers.runpod import jobs
 
-    assert jobs.stall_kwargs()["queue_grace_s"] == 60.0
-    assert jobs.stall_kwargs()["setup_grace_s"] >= 1800.0  # cold-start budget unchanged
+    not_last = jobs.stall_kwargs()  # default on_last_gpu=False
+    assert not_last["queue_grace_s"] == 300.0
+    assert not_last["throttled_grace_s"] == 300.0
+    assert not_last["setup_grace_s"] >= 1800.0  # cold-start budget unchanged
+
+    last = jobs.stall_kwargs(on_last_gpu=True)
+    assert last["queue_grace_s"] == 900.0
+    assert last["throttled_grace_s"] == 900.0
+    assert last["setup_grace_s"] == not_last["setup_grace_s"]  # only the capacity backstops move
+
     sig = inspect.signature(jobs.poll_job)
-    assert sig.parameters["queue_grace_s"].default == 60.0
-    assert sig.parameters["throttled_grace_s"].default == 60.0
+    assert sig.parameters["queue_grace_s"].default == 300.0
+    assert sig.parameters["throttled_grace_s"].default == 300.0
     assert sig.parameters["setup_grace_s"].default >= 1800.0
 
 
@@ -736,7 +746,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}"})
@@ -763,7 +773,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{calls['n']}"})
@@ -787,7 +797,7 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(
                 False, failure="job_failed", detail="Remote execution failed: ValueError"
@@ -806,7 +816,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
     # A policy ("cheapest") request that keeps hitting infra-shaped failures must walk
     # down the ranked candidate list, not burn every retry on the same (capacity-starved)
     # class. With static rates the validated >=24 GB pool for a 0.8B GRPO run ranks
-    # RTX 3090 < RTX A6000 < ... by $/hr, so successive attempts step through them.
+    # RTX A6000 < RTX 4090 < RTX 5090 < ... by $/hr, so successive attempts step through them.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
@@ -815,7 +825,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
 
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
@@ -845,7 +855,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         rates = [hourly_rate(g) for g in gpus_seen]
         assert rates == sorted(rates)
         # cheapest validated class with >= 24 GB
-        assert gpus_seen[0] == "RTX 3090"
+        assert gpus_seen[0] == "RTX A6000"
 
 
 def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
@@ -859,7 +869,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(
                 False, failure="job_failed", detail="ValueError: bad reward fn (no infra marker)"
@@ -913,7 +923,7 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
@@ -937,6 +947,59 @@ def test_supervisor_gpu_walk_clamps_at_last_candidate(monkeypatch):
         assert orch.get_status("clamp").state == "done"
         # Walk advances to the last candidate then clamps on it (never out of range).
         assert gpus_seen == ["A100 PCIe", "A100 SXM", "A100 SXM"]
+
+
+def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
+    # on_last_gpu must reach the provider so the no-capacity backstops know whether there is a
+    # next-best class to fall to: False while the walk still has somewhere to go (attempt 0 on the
+    # cheaper of two classes), True once it lands on (and clamps to) the last candidate.
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.allocator as allocator
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+        # Same trim as the clamp test: exactly two 80 GB candidates so the walk has one step.
+        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
+        real_allocate = allocator.allocate
+
+        def two_candidate_allocate(*a, **k):
+            alloc = real_allocate(*a, **k)
+            keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "A100 SXM"))
+            best = keep[0]
+            return dataclasses.replace(alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep)
+
+        monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
+        last_flags: list[bool] = []
+
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
+            last_flags.append(on_last_gpu)
+            if on_handle:
+                on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
+            if attempt < 2:
+                return jobs.PollResult(False, failure="stalled", detail="frozen")
+            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
+
+        monkeypatch.setattr(jobs, "submit_run", fake_submit)
+        monkeypatch.setattr(flash_train, "upload_code", lambda repo=None: "repo")
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+
+        spec = JobSpec(
+            run_id="lastgpu",
+            model="Qwen/Qwen3.5-0.8B",
+            algorithm="grpo",
+            train=TrainSpec(seeds=(0,), steps=1),
+            gpu=GpuSpec(type="cheapest", max_retries=2),
+        )
+        orch.submit_job(spec, dry_run=False, background=False)
+
+        assert orch.get_status("lastgpu").state == "done"
+        # attempt 0: cheaper class, a next-best still exists -> False; attempts 1 & 2: on the last
+        # candidate (and clamped onto it) -> True.
+        assert last_flags == [False, True, True]
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -963,7 +1026,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
 
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0):
+        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle({"endpoint_id": "ep", "endpoint_name": "n", "job_id": f"j{attempt}"})
@@ -984,8 +1047,8 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
 
         assert orch.get_status("alloc-blip").state == "done"
         # First allocation failed (no provision); the retry provisioned the cheapest class
-        # (RTX 3090, the cheapest validated 24 GB RunPod class).
-        assert gpus_seen == ["RTX 3090"]
+        # (RTX A6000, the cheapest validated RunPod class that fits 24 GB).
+        assert gpus_seen == ["RTX A6000"]
 
 
 def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
