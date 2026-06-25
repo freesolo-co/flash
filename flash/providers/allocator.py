@@ -109,6 +109,30 @@ def _lambda_candidates(need: int) -> list[Candidate]:
     return out
 
 
+def _hyperstack_candidates(need: int) -> list[Candidate]:
+    """Hyperstack's fitting classes that currently have flavor STOCK, priced statically.
+
+    Capacity-aware, exactly like Lambda: a class with no in-stock flavor is excluded so the runner
+    never walks onto a class that would immediately fail to launch. A capacity-lookup failure
+    degrades to the other providers.
+    """
+    from flash.providers.hyperstack.jobs import usable_instances
+
+    provider = get_provider("hyperstack")
+    out: list[Candidate] = []
+    try:
+        for g in provider.gpu_classes():
+            if g.vram_gb < need:
+                continue
+            # usable_instances reads the cached /core/flavors, so only the first call hits the API.
+            if usable_instances(g.name):
+                out.append(Candidate("hyperstack", g.name, provider.hourly_rate(g.name), g.vram_gb))
+    except Exception as exc:
+        logger.warning("hyperstack capacity lookup failed (%s); allocating without hyperstack", exc)
+        return []
+    return out
+
+
 def allocate(
     model_id: str,
     algorithm: str,
@@ -133,6 +157,8 @@ def allocate(
         candidates += _runpod_candidates(need)
     if "lambda" in available:
         candidates += _lambda_candidates(need)
+    if "hyperstack" in available:
+        candidates += _hyperstack_candidates(need)
     if not candidates:
         raise UnsupportedGpuError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}) on any available provider "

@@ -136,18 +136,20 @@ def _submit_seed_supervised(
                 except Exception:
                     # Logging the host-escape note is cosmetic; never let it abort the retry.
                     pass
-            elif last_handle.get("provider") == "lambda" and last_handle.get("instance_id"):
+            elif last_handle.get("provider") in ("lambda", "hyperstack"):
                 # An instance-based provider bills until terminated: tear the previous attempt's
                 # instance down so the retry lands on a fresh host (and we stop paying for the sick
-                # one). Dispatched generically through the handle's provider.
+                # one). Dispatched generically through the handle's provider (destroy() knows the
+                # provider's own id field — instance_id for Lambda, vm_id for Hyperstack).
                 with contextlib.suppress(Exception):
                     from flash.providers import get_provider
                     from flash.providers.base import JobHandle
 
-                    get_provider("lambda").destroy(JobHandle.from_dict(last_handle))
+                    _prov = last_handle["provider"]
+                    get_provider(_prov).destroy(JobHandle.from_dict(last_handle))
+                    _iid = last_handle.get("instance_id") or last_handle.get("vm_id")
                     print(
-                        f"retry {attempt}: terminated lambda instance "
-                        f"{last_handle.get('instance_id')} (escaping sick host)",
+                        f"retry {attempt}: terminated {_prov} instance {_iid} (escaping sick host)",
                         file=log,
                         flush=True,
                     )
@@ -498,11 +500,13 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     except Exception:
         # Best-effort GC; an undeleted endpoint only holds worker quota, never blocks the run.
         pass
-    # Lambda instances bill until terminated: the runner's per-attempt `finally` already terminates
-    # them, but a crashed supervisor thread can leave one behind. Reap any instance still named for
-    # this run via the provider's gc (best-effort; only when Lambda is configured here).
+    # Instance-based providers (Lambda, Hyperstack) bill until terminated: the runner's per-attempt
+    # `finally` already tears them down, but a crashed supervisor thread can leave one behind. Reap
+    # any instance still named for this run via each configured provider's gc (best-effort).
     from flash.providers import available_providers, get_provider
 
-    if "lambda" in available_providers():
-        with contextlib.suppress(Exception):
-            get_provider("lambda").gc(spec)
+    _avail = available_providers()
+    for _prov in ("lambda", "hyperstack"):
+        if _prov in _avail:
+            with contextlib.suppress(Exception):
+                get_provider(_prov).gc(spec)

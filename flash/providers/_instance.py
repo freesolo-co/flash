@@ -1,0 +1,135 @@
+"""Shared building blocks for the instance-based providers (Lambda, Hyperstack).
+
+Both rent a single-GPU instance and bootstrap it identically: ship a cloud-init ``user_data`` that
+runs the prebuilt ``WORKER_IMAGE`` via Docker on the host, detect completion from the worker's HF
+artifacts, and guarantee teardown control-plane-side. The per-provider packages differ only in the
+REST API (launch/list/terminate) and the capacity model; everything below — the run-derived
+sweep-matchable label, the bootstrap payload, and the cloud-init script — is identical, so it lives
+here (single source of truth, parameterized by the substrate ``arm`` and the run's image).
+
+The shipped bootstrap is the sibling ``_instance_bootstrap.py``; ``arm`` (e.g. ``lambda`` /
+``hyperstack``) travels in ``payload["flash_arm"]`` and decides FLASH_ARM + the ``<arm>_attempt<N>``
+marker name.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from pathlib import Path
+
+
+def run_label_prefix(run_id: str) -> str:
+    """The prefix EVERY instance label for ``run_id`` starts with.
+
+    The platform run ids already start with ``flash-``; anything else (direct-API callers, tests)
+    gets the prefix forced — so the orphan-sweep allowlist (which applies the SAME transform) can
+    never miss an instance we rented, and a live run's instance is never mistakenly swept."""
+    return f"flash-{run_id}" if not run_id.startswith("flash-") else run_id
+
+
+def instance_label(run_id: str, seed: int, attempt: int) -> str:
+    """Instance name: run-derived so ``sweep_orphans`` can tell ours from anything else on the
+    account. (Both providers cap the name at 64 chars; platform run ids keep the label under that.)"""
+    return f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"
+
+
+def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: dict | None = None) -> dict:
+    """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
+    bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
+    ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
+    from flash.envs.registry import worker_pip_for_env
+    from flash.providers.runpod.train import build_worker_env, chalk_extra_pip
+
+    return {
+        "hf_repo": spec.train.hf_repo,
+        "job_spec_json": spec.to_json(),
+        "phase": spec.phase,
+        "seed": int(seed),
+        "flash_arm": arm,
+        "env": build_worker_env(spec, seed, runtime_secrets=runtime_secrets),
+        # The bootstrap pip-installs extra_pip for every job, so the per-run env wheel + the opt-in
+        # chalk spec ride along here to reach default runs (mirrors runpod/jobs.submit_run).
+        "extra_pip": (list(spec.environment.pip) or worker_pip_for_env(spec.environment.id))
+        + chalk_extra_pip(spec),
+        "hf_prefix": f"{spec.phase}/{spec.run_id}/seed{seed}",
+        "max_wall_s": max(60, int(spec.gpu.max_wall_seconds)),
+        "attempt": int(attempt),
+    }
+
+
+# Host helper: best-effort upload of the consolidated boot log to HF. Neither Lambda nor Hyperstack
+# exposes an instance console/log API, so the box pushes its own boot log to HF — the only window
+# into a failure BEFORE the worker container can write its own artifacts (docker/GPU not ready,
+# image pull failure). Reads creds from the on-box payload.json. Never raises.
+_HOSTLOG_PY = """\
+import json
+try:
+    p = json.load(open("/opt/flash/payload.json"))
+    from huggingface_hub import HfApi
+    HfApi(token=(p.get("env") or {}).get("HF_TOKEN")).upload_file(
+        path_or_fileobj="/opt/flash/host_boot.log",
+        path_in_repo=p["hf_prefix"] + "/" + p.get("flash_arm", "instance") + "_boot.log",
+        repo_id=p["hf_repo"],
+        repo_type="dataset",
+    )
+except Exception:
+    pass
+"""
+
+
+def build_user_data(payload: dict, *, image: str) -> str:
+    """Cloud-init ``user_data``: run the worker ``image`` via Docker on the host.
+
+    cloud-init runs this once at first boot as root. Everything dynamic travels base64-encoded
+    inside the script (never interpolated into shell syntax), so the job-spec JSON survives
+    byte-exact. The full training stack is baked into the image, so the box only needs Docker + an
+    NVIDIA GPU — both shipped by the providers' default Docker-capable images — and the container
+    does the rest (fetch code from HF, run the worker, stream artifacts back to HF).
+
+    Secrets-wise the script carries the same content as the worker env on RunPod (HF token, env
+    secrets). The operator's provider API key is NEVER shipped (teardown is control-plane-side via
+    the runner ``finally`` / poll deadline / ``sweep_orphans``).
+    """
+    payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
+    bootstrap_src = (Path(__file__).parent / "_instance_bootstrap.py").read_text()
+    return f"""#!/bin/bash
+# Flash instance worker (generated by flash.providers._instance.build_user_data; arm={payload.get('flash_arm')})
+set -x
+mkdir -p /opt/flash
+# Consolidate ALL boot output (this script + the container) into one host log the uploader ships
+# to HF — neither substrate has a console API, so this is the only window into a pre-worker failure.
+exec >>/opt/flash/host_boot.log 2>&1
+cat > /opt/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
+{payload_b64}FLASH_PAYLOAD_EOF
+base64 -d /opt/flash/payload.b64 > /opt/flash/payload.json
+cat > /opt/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
+{bootstrap_src}FLASH_BOOTSTRAP_EOF
+cat > /opt/flash/hostlog.py <<'FLASH_HOSTLOG_EOF'
+{_HOSTLOG_PY}FLASH_HOSTLOG_EOF
+IMAGE={image!r}
+# Best-effort host->HF boot-log uploader (detached so it survives cloud-init exiting).
+( pip3 install -q huggingface_hub >/dev/null 2>&1 \\
+    || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
+  while true; do python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true; sleep 30; done ) &
+disown || true
+# The provider's default image ships Docker + the NVIDIA Container Toolkit, but cloud-init can run
+# before they finish initializing — wait for both (up to ~10 min) before launching the worker.
+for i in $(seq 1 100); do
+  if docker info >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then break; fi
+  echo "FLASH: waiting for docker+gpu ($i)"; sleep 6
+done
+docker info >/dev/null 2>&1 || {{ echo "FLASH: docker never became ready" >&2; exit 1; }}
+nvidia-smi >/dev/null 2>&1 || {{ echo "FLASH: gpu never became ready" >&2; exit 1; }}
+# Pull with retries (the image is large; a transient registry blip must not fail the run).
+for i in 1 2 3 4 5; do docker pull "$IMAGE" && break; echo "FLASH: pull retry $i"; sleep 20; done
+# Run the worker container detached so cloud-init completes promptly; completion is signaled via the
+# worker's HF artifacts (DONE/metrics.json/marker), never a return channel from the box.
+docker run -d --name flashrun --gpus all --shm-size=16g --network host \\
+  -v /opt/flash:/root/flash -w /root/flash \\
+  "$IMAGE" python /root/flash/bootstrap.py
+# Mirror the container's stdout into the host boot log (detached) so an early in-container crash is
+# visible on HF even if it dies before uploading its own console artifact.
+( docker logs -f flashrun >>/opt/flash/host_boot.log 2>&1 || true ) &
+disown || true
+"""

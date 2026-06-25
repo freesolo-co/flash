@@ -175,6 +175,11 @@ def launch_and_submit(
             attempt=attempt,
             started_ts=time.time(),
         )
+    # Phantom-instance safety: a non-idempotent launch Lambda ACCEPTED but whose response lacked a
+    # parseable id raises (caught above as a region rejection), leaving a billed instance under our
+    # run name that no handle owns. Best-effort reap any such instance by run-name before giving up.
+    with contextlib.suppress(Exception):
+        terminate_run_instances(spec.run_id)
     raise lambda_api.LambdaApiError(
         f"all {len(tried_regions)} Lambda region(s) rejected the {spec.gpu.type} launch "
         f"(no capacity): {last_err}"
@@ -455,9 +460,7 @@ def terminate_run_instances(run_id: str) -> list[str]:
         if i.get("id")
         and (str(i.get("name") or "") == prefix or str(i.get("name") or "").startswith(prefix + "-s"))
     ]
-    if ids and lambda_api.terminate_instances(ids):
-        return ids
-    return []
+    return lambda_api.terminate_instances(ids) if ids else []
 
 
 def sweep_orphans(active_labels: set[str] | None = None) -> list[str]:
@@ -487,8 +490,7 @@ def sweep_orphans(active_labels: set[str] | None = None) -> list[str]:
         iid = inst.get("id")
         if iid:
             orphans.append(str(iid))
-    if orphans and lambda_api.terminate_instances(orphans):
-        for iid in orphans:
-            logger.warning("terminated orphaned lambda instance %s", iid)
-        return orphans
-    return []
+    deleted = lambda_api.terminate_instances(orphans) if orphans else []
+    for iid in deleted:
+        logger.warning("terminated orphaned lambda instance %s", iid)
+    return deleted

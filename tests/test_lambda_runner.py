@@ -104,7 +104,7 @@ def test_user_data_skips_capacity_for_baked_image_default(monkeypatch):
 
 
 def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
-    from flash.providers.lambdalabs import _bootstrap as lb
+    from flash.providers import _instance_bootstrap as lb
 
     calls: list[str] = []
     markers: list[tuple[bool, str]] = []
@@ -116,6 +116,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
             "job_spec_json": "{}",
             "phase": phase,
             "seed": 0,
+            "flash_arm": "lambda",
             "env": {},
             "extra_pip": [],
             "hf_prefix": "sft/x/seed0",
@@ -145,12 +146,16 @@ def test_bootstrap_fails_without_metrics(monkeypatch):
     assert "metrics.json" in error
 
 
-def test_bootstrap_sets_lambda_arm(monkeypatch):
-    """The worker env stamps FLASH_ARM=lambda so the metrics record attributes the substrate."""
-    from flash.providers.lambdalabs import _bootstrap as lb
+def test_bootstrap_sets_lambda_arm():
+    """The shared bootstrap stamps FLASH_ARM from payload['flash_arm'] so the metrics record
+    attributes the substrate (Lambda's build_payload sets it to 'lambda')."""
+    from flash.providers import _instance_bootstrap as lb
 
-    env = lb.build_worker_env({"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}})
+    env = lb.build_worker_env({"job_spec_json": "{}", "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"})
     assert env["FLASH_ARM"] == "lambda"
+    # And Lambda's build_payload is what sets flash_arm='lambda'.
+    from flash.providers.lambdalabs.jobs.builders import build_payload
+    assert build_payload(_spec(), 0, 0)["flash_arm"] == "lambda"
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +486,7 @@ def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or True
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     assert jobs.terminate_run_instances("fail-fast") == ["i-1"]
     assert terminated == ["i-1"]
@@ -509,7 +514,7 @@ def test_sweep_orphans_label_safety(monkeypatch):
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or True
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"flash-1700-bbbb"})
     assert out == ["i-1"]
@@ -528,7 +533,7 @@ def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or True
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"flash-100"})
     assert out == ["i-2"]
@@ -545,7 +550,7 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or True
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"fail-fast"})  # RAW run id (what the server tracks)
     assert out == ["i-2"]
@@ -561,7 +566,7 @@ def test_provider_cancel_destroy_terminate(monkeypatch):
 
     terminated = []
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or True
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     h = JobHandle("lambda", {"instance_id": "i-9"})
     get_provider("lambda").cancel(h)

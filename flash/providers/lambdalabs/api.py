@@ -21,7 +21,7 @@ import time
 from typing import Any
 
 from flash._logging import get_logger
-from flash.providers._http import RestClient
+from flash.providers._http import RestClient, is_not_found
 
 logger = get_logger(__name__)
 
@@ -153,7 +153,7 @@ def get_instance(instance_id: str) -> dict | None:
     try:
         out = request_with_retries(f"/instances/{instance_id}")
     except LambdaApiError as e:
-        if "404" in str(e):
+        if is_not_found(e):
             return None
         raise
     data = _data(out)
@@ -165,19 +165,24 @@ def list_instances() -> list[dict]:
     return out if isinstance(out, list) else []
 
 
-def terminate_instances(instance_ids: list[str]) -> bool:
-    """Terminate (and stop billing for) instances. Best-effort: never raises."""
-    ids = [str(i) for i in instance_ids if i]
-    if not ids:
-        return False
-    try:
-        request_with_retries(
-            "/instance-operations/terminate",
-            method="POST",
-            body={"instance_ids": ids},
-            retries=2,
-        )
-        return True
-    except Exception as exc:
-        logger.warning("lambda terminate(%s) failed: %s", ids, exc)
-        return False
+def terminate_instances(instance_ids: list[str]) -> list[str]:
+    """Terminate (and stop billing for) instances; return the ids that ACTUALLY terminated.
+
+    PER-ID ISOLATED (one POST per id), so a single stale/invalid/race-deleted id can't abort
+    teardown of the rest — this is the crash-backstop path (``sweep_orphans`` /
+    ``terminate_run_instances`` pass many ids at once, where stale ids are common). Lambda's
+    terminate endpoint validates the whole request, so a batch of N ids with one bad id 4xx's and
+    terminates NONE; isolating per id removes that money-leak. Best-effort: never raises."""
+    deleted: list[str] = []
+    for iid in [str(i) for i in instance_ids if i]:
+        try:
+            request_with_retries(
+                "/instance-operations/terminate",
+                method="POST",
+                body={"instance_ids": [iid]},
+                retries=2,
+            )
+            deleted.append(iid)
+        except Exception as exc:
+            logger.warning("lambda terminate(%s) failed: %s", iid, exc)
+    return deleted

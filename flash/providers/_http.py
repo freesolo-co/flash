@@ -19,6 +19,22 @@ from collections.abc import Callable
 from typing import Any
 
 
+def is_not_found(err: Exception) -> bool:
+    """True only when a provider API error represents a genuine HTTP 404 (resource already gone).
+
+    ``request_with_retries`` chains the original urllib ``HTTPError`` as ``__cause__`` for every
+    fast-failed 4xx (and on the "failed after N attempts" path), so the status CODE is authoritative
+    when a cause is present: 404 == gone, anything else (403/401/5xx) is a real failure that must NOT
+    be swallowed. We only fall back to a text match when there is no HTTPError cause, and even then
+    only on an unambiguous ``HTTP 404`` token — NEVER a bare ``"404"`` substring, which would
+    misfire on a transient 5xx whose error text embeds a resource id containing the digits 404
+    (Hyperstack VM ids are short integers). Mirrors ``runpod.api._is_not_found``."""
+    cause = getattr(err, "__cause__", None)
+    if isinstance(cause, urllib.error.HTTPError):
+        return cause.code == 404
+    return "http 404" in str(err).lower()
+
+
 class RestClient:
     """Parametrized urllib REST client with jittered-backoff retries.
 
@@ -43,6 +59,8 @@ class RestClient:
         keys_provider: Callable[[], list[str]] | None = None,
         failover_predicate: Callable[[Exception], bool] | None = None,
         extra_headers: dict[str, str] | None = None,
+        auth_header_name: str = "Authorization",
+        auth_value_format: str = "Bearer {key}",
     ) -> None:
         self.env_var = env_var
         self.error_cls = error_cls
@@ -54,9 +72,14 @@ class RestClient:
         self.failover_predicate = failover_predicate
         # Static headers added to EVERY request (e.g. a custom User-Agent). Lambda Cloud sits
         # behind Cloudflare, which 403s the stdlib default ``Python-urllib/<v>`` UA — so the
-        # Lambda client passes a real UA here. ``Authorization``/``Content-Type`` are always set
+        # Lambda client passes a real UA here. The auth + ``Content-Type`` headers are always set
         # by ``request`` and win on a key collision.
         self.extra_headers = dict(extra_headers or {})
+        # How the API key is presented. Default is RunPod/Lambda's ``Authorization: Bearer <key>``;
+        # Hyperstack uses a bare ``api_key: <key>`` header instead (``auth_header_name="api_key"``,
+        # ``auth_value_format="{key}"``).
+        self.auth_header_name = auth_header_name
+        self.auth_value_format = auth_value_format
 
     def api_key(self) -> str:
         key = os.environ.get(self.env_var)
@@ -87,7 +110,7 @@ class RestClient:
             data=json.dumps(body).encode() if body is not None else None,
             headers={
                 **self.extra_headers,
-                "Authorization": f"Bearer {key or self.api_key()}",
+                self.auth_header_name: self.auth_value_format.format(key=key or self.api_key()),
                 "Content-Type": "application/json",
             },
         )
