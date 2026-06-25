@@ -689,6 +689,49 @@ def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
     assert "no worker liveness" not in (res.detail or "")
 
 
+def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):
+    """An empty ("") boot.log still proves cloud-init ran — its mere EXISTENCE is liveness. A bare
+    ``not boot_log_reader()`` would treat "" as absent and spuriously fail the box over; the fix uses
+    ``is None``. Box later dies as a host loss -> job_preempted, NOT the 'no worker liveness' stall."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
+        boot="",
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"
+    assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_active_boot_log_seen_once_survives_rate_limited_none(monkeypatch):
+    """Regression: make_hf_text_reader returns None for BOTH a missing boot.log AND a rate-limited
+    read, so a bare ``not boot_log_reader()`` re-checked each poll would spuriously stall a HEALTHY box
+    on the first throttled read after the log was already seen. The boot.log is read with force=True and
+    latched once observed, so a later None can't re-trigger failover. Modeled by a boot.log present on
+    the first read then None (rate-limited) after; the box later dies -> job_preempted, not stalled."""
+    calls = {"n": 0}
+
+    def boot_then_rate_limited():
+        calls["n"] += 1
+        return "+ docker pull ..." if calls["n"] == 1 else None  # seen once, then "rate-limited"
+
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[
+            {"status": "active"}, {"status": "active"}, {"status": "active"}, {"status": "terminated"}
+        ],
+        boot=boot_then_rate_limited,
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"  # NOT a spurious 'stalled' from the throttled None
+    assert "no worker liveness" not in (res.detail or "")
+    # Latched after the first observation: the liveness check reads the boot.log once (not once per
+    # poll); the only other read is the terminal-failure-detail surfacer when the box dies.
+    assert calls["n"] <= 2
+
+
 def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
     """Any FRESH heartbeat (even the early 'boot' stage) proves the worker started, so the
     first-liveness deadline is satisfied and must not fire."""

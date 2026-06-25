@@ -434,6 +434,9 @@ def poll_hs_job(
     # the first-liveness deadline. A leftover prior-attempt heartbeat (ts < launch) is NOT fresh, so
     # it cannot disarm the deadline on the retry into a sick region it must catch.
     seen_fresh_hb = False
+    # Latched once the attempt's host boot.log is OBSERVED (even empty ""): its existence proves
+    # cloud-init ran, so a later rate-limited reader None can't spuriously fail the VM over as stalled.
+    boot_log_seen = False
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
@@ -529,20 +532,28 @@ def poll_hs_job(
             # box — even one still pulling the multi-GB image — emits its boot.log within ~2 min, so
             # the log's ABSENCE past first_liveness_s means cloud-init/the worker never ran. 'stalled'
             # is infra-shaped, so the runner escapes it cross-provider (PR #241) instead of burning
-            # the full setup grace (~50 min). boot_log_reader() is consulted only AFTER the timer
-            # (short-circuit), so the normal cold-start path makes no extra HF read.
+            # the full setup grace (~50 min). The boot.log is read only AFTER the timer AND only until
+            # it's seen once (short-circuit + latch), so the normal cold-start path makes at most one
+            # extra HF read.
             if (
                 not seen_fresh_hb
+                and not boot_log_seen
                 and time.time() - active_since > first_liveness_s
-                and not boot_log_reader()
             ):
-                return PollResult(
-                    False,
-                    failure="stalled",
-                    detail=f"no worker liveness (boot.log/heartbeat) for "
-                    f"{int(time.time() - active_since)}s after vm became active "
-                    f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
-                )
+                # make_hf_text_reader returns None for BOTH a missing file AND a rate-limited read, so a
+                # bare ``not boot_log_reader()`` would spuriously stall a healthy VM on a throttled
+                # poll. force=True bypasses the rate-limit (accurate absent-vs-present); ``is None`` keeps
+                # an empty "" boot.log counting as liveness (the file existing proves cloud-init ran);
+                # the latch then stops re-reading once the VM has proven itself.
+                if boot_log_reader(force=True) is None:
+                    return PollResult(
+                        False,
+                        failure="stalled",
+                        detail=f"no worker liveness (boot.log/heartbeat) for "
+                        f"{int(time.time() - active_since)}s after vm became active "
+                        f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
+                    )
+                boot_log_seen = True
             limit = stall_after_s if seen_training_hb else setup_grace_s
             if time.time() - last_progress > limit:
                 phase = "training" if seen_training_hb else "setup (pre-training)"
