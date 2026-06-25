@@ -1029,13 +1029,16 @@ def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
     """
     import time
 
+    from flash.providers._instance import instance_label
     from flash.providers._poll import preload_instance_run_id
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
 
+    # Build the name the way a launch does (instance_label bounds it to the provider name budget) so the
+    # reap parser is tested against the REAL, possibly-truncated VM name, not the raw run id.
     fresh = preload_instance_run_id("lambda", "us-east-1", int(time.time()) + 1800, "abcdef")
     instances = [
-        {"id": "i-1", "name": f"{fresh}-s0-a0"},  # in-deadline warm box -> KEEP
+        {"id": "i-1", "name": instance_label(fresh, 0, 0)},  # in-deadline warm box -> KEEP
         {"id": "i-legacy", "name": "flash-preload-lambda-us-east-1-abcdef-s0-a0"},  # no deadline -> KEEP
         {"id": "i-2", "name": "flash-1700-cccc-s0-a0"},  # genuine orphan -> terminate
     ]
@@ -1055,14 +1058,16 @@ def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
     must reap it to bound the billing leak rather than exempt it forever."""
     import time
 
+    from flash.providers._instance import instance_label
     from flash.providers._poll import PRELOAD_REAP_GRACE_S, preload_instance_run_id
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
 
-    # Deadline well past now + the reap grace -> driver provably gone.
+    # Deadline well past now + the reap grace -> driver provably gone. Name built via instance_label so
+    # the front-loaded deadline token must survive the provider name-budget truncation to be reaped.
     stale_deadline = int(time.time()) - int(PRELOAD_REAP_GRACE_S) - 600
     stale = preload_instance_run_id("lambda", "us-west-1", stale_deadline, "deadbe")
-    instances = [{"id": "i-9", "name": f"{stale}-s0-a0"}]
+    instances = [{"id": "i-9", "name": instance_label(stale, 0, 0)}]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
     monkeypatch.setattr(
