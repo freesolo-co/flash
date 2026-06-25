@@ -64,6 +64,16 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
         if platform_context:
             submit_kwargs["platform_context"] = platform_context
         status = _app.submit_job(spec, **submit_kwargs)
+    except Exception as exc:
+        db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Freesolo platform reporting is best-effort and runs AFTER the run is already submitted, so it
+    # must NEVER roll back ownership or 400 the request — a reporting failure (import error /
+    # unexpected runtime error; the network path already swallows internally) would otherwise
+    # delete an already-submitted run and report failure to the caller. Swallow it instead.
+    try:
         from flash.server.run_registry import record_training_run
 
         record_training_run(status=status, key=key)
@@ -73,10 +83,7 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
         if is_managed_environment_slug(spec.environment.id):
             record_environment_use(slug=spec.environment.id, run_id=spec.run_id, key=key)
     except Exception as exc:
-        db.delete_run(spec.run_id)  # idempotent: a no-op if record_run never landed
-        if isinstance(exc, HTTPException):
-            raise
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        print(f"[runs] platform reporting failed for {spec.run_id} (run already submitted): {exc}")
     return status.to_dict()
 
 

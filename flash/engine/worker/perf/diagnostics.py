@@ -23,15 +23,19 @@ def _reset_peak_gpu() -> None:
 
 
 def _peak_gpu_gb() -> float:
-    """Peak torch-allocated CUDA memory (GB) since the last reset; 0.0 if no CUDA. Note: bnb paged
-    8-bit optimizer state lives in unified/managed memory outside torch's caching allocator and is
-    NOT counted here — so this OVERSTATES the 8-bit saving. _GpuPeakSampler measures the true
-    device footprint (incl. bnb managed pages) for the honest A/B number."""
+    """Peak torch-allocated CUDA memory (binary GiB) since the last reset; 0.0 if no CUDA. Note: bnb
+    paged 8-bit optimizer state lives in unified/managed memory outside torch's caching allocator and
+    is NOT counted here — so this OVERSTATES the 8-bit saving. _GpuPeakSampler measures the true
+    device footprint (incl. bnb managed pages) for the honest A/B number.
+
+    Binary GiB (/(1024**3)) to match this diagnostics module's other torch memory fields
+    (torch_memory_total_gb etc. + _round_gb_from_mib), so every reported memory number shares one
+    unit. (This is telemetry, NOT VRAM sizing — the sizing subsystem is decimal GB by design.)"""
     try:
         import torch
 
         if torch.cuda.is_available():
-            return round(torch.cuda.max_memory_allocated() / 1e9, 3)
+            return round(torch.cuda.max_memory_allocated() / (1024**3), 3)
     except Exception:
         pass
     return 0.0
@@ -77,7 +81,9 @@ class _GpuPeakSampler:
         self._stop = True
         if self._thread is not None:
             self._thread.join(timeout=2)
-        return round(self.peak_used / 1e9, 3)
+        # Binary GiB (/(1024**3)) to match this module's other torch memory fields (telemetry
+        # convention; the VRAM-sizing subsystem is decimal GB and stays separate).
+        return round(self.peak_used / (1024**3), 3)
 
 
 def _float_or_none(value) -> float | None:
