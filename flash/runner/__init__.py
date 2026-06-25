@@ -198,6 +198,8 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
     or a non-GitHub env) leaves resolved_sha empty and the worker resolves the ref itself via the
     in-worker jittered retry + retriable-reschedule path, so submission never blocks on GitHub.
     """
+    import logging
+
     env_id = spec.environment.id
     if not env_id or spec.environment.resolved_sha:
         return spec
@@ -215,11 +217,16 @@ def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
         parsed = _parse_github_environment_ref(ref_str)
         if parsed is None:
             return spec  # local/path or non-GitHub env: nothing to pin
-        sha = _resolve_ref_sha(parsed)
+        # Fail fast: a single short request, no rate-limit sleeps. This best-effort pin must never
+        # delay/block run creation (esp. submit_job(background=True)); if GitHub is slow or limiting,
+        # we fall straight through and the worker resolves the ref itself with the full retry budget.
+        sha = _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
     except Exception as e:
         # Never block submission on a control-plane resolve; the worker falls back to resolving the
-        # ref itself. Log for visibility.
-        print(f"resolve-once: could not pin env ref->sha for {env_id!r} ({e}); worker will resolve")
+        # ref itself. Log for visibility (consistent with the rest of this module's logging).
+        logging.getLogger(__name__).warning(
+            "resolve-once: could not pin env ref->sha for %r (%s); worker will resolve", env_id, e
+        )
         return spec
     if not sha:
         return spec

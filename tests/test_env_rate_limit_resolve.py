@@ -98,18 +98,24 @@ def test_rate_limit_error_is_retriable_runtime_error():
 # ----------------------------- registry: user-param preservation (#214 comment 2) -----------------
 
 
-def test_registry_preserves_user_resolved_sha_param_and_pins_under_reserved_name(monkeypatch):
+def _fake_loader(captured):
+    # Mirrors the real signature: pinned_sha is POSITIONAL-ONLY (the `/`), so a user param named
+    # "pinned_sha" lands in **kwargs instead of binding to the internal pin.
+    def loader(env_id, pinned_sha=None, /, **kwargs):
+        captured["env_id"] = env_id
+        captured["pinned_sha"] = pinned_sha
+        captured["kwargs"] = kwargs
+        return object()
+
+    return loader
+
+
+def test_registry_preserves_user_params_and_pins_out_of_band(monkeypatch):
     import flash.envs.adapter as adapter
     from flash.envs.registry import load_environment
 
     captured = {}
-
-    def fake_loader(env_id, **kwargs):
-        captured["env_id"] = env_id
-        captured["kwargs"] = kwargs
-        return object()
-
-    monkeypatch.setattr(adapter, "load_freesolo_environment", fake_loader)
+    monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
 
     load_environment(
         "owner/env",
@@ -117,11 +123,26 @@ def test_registry_preserves_user_resolved_sha_param_and_pins_under_reserved_name
         resolved_sha="a" * 40,
     )
 
-    # The user's freeform param is forwarded verbatim (NOT stripped)...
+    # The user's freeform params are forwarded verbatim (NOT stripped)...
     assert captured["kwargs"]["resolved_sha"] == "user-value"
     assert captured["kwargs"]["difficulty"] == "hard"
-    # ...and the control-plane pin rides under the reserved internal name, no collision.
-    assert captured["kwargs"]["pinned_sha"] == "a" * 40
+    # ...and the control-plane pin rides out-of-band as the positional-only arg, no collision.
+    assert captured["pinned_sha"] == "a" * 40
+
+
+def test_registry_user_pinned_sha_param_is_forwarded_not_consumed(monkeypatch):
+    # Even a user param literally named "pinned_sha" must reach the SDK loader untouched while the
+    # control-plane pin stays separate (the whole point of making it positional-only).
+    import flash.envs.adapter as adapter
+    from flash.envs.registry import load_environment
+
+    captured = {}
+    monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
+
+    load_environment("owner/env", params={"pinned_sha": "user-data"}, resolved_sha="a" * 40)
+
+    assert captured["pinned_sha"] == "a" * 40  # control-plane pin (positional)
+    assert captured["kwargs"]["pinned_sha"] == "user-data"  # user's param, forwarded to the SDK
 
 
 def test_registry_omits_pin_when_unset(monkeypatch):
@@ -129,13 +150,9 @@ def test_registry_omits_pin_when_unset(monkeypatch):
     from flash.envs.registry import load_environment
 
     captured = {}
-    monkeypatch.setattr(
-        adapter,
-        "load_freesolo_environment",
-        lambda env_id, **kwargs: captured.setdefault("kwargs", kwargs) or object(),
-    )
+    monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
     load_environment("owner/env", params={"difficulty": "hard"})
-    assert "pinned_sha" not in captured["kwargs"]
+    assert captured["pinned_sha"] is None
     assert captured["kwargs"] == {"difficulty": "hard"}
 
 
@@ -155,6 +172,26 @@ def test_assign_resolved_env_sha_pins_when_resolver_succeeds(monkeypatch):
     assert out.environment.resolved_sha == "b" * 40
     # Untouched fields survive the rebuild.
     assert out.environment.id == _GH_ENV
+
+
+def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
+    # The control-plane pin must never block run creation on GitHub retries: it resolves with a
+    # short timeout and zero rate-limit retries (the worker keeps the full retry budget).
+    import flash.envs.adapter as adapter
+    from flash import runner
+    from flash.spec import EnvironmentSpec, JobSpec
+
+    seen = {}
+
+    def fake_resolve(parsed, pinned_sha=None, *, timeout=60.0, max_rate_limit_retries=5):
+        seen["timeout"] = timeout
+        seen["max_rate_limit_retries"] = max_rate_limit_retries
+        return "d" * 40
+
+    monkeypatch.setattr(adapter, "_resolve_ref_sha", fake_resolve)
+    runner._assign_resolved_env_sha(JobSpec(environment=EnvironmentSpec(id=_GH_ENV)))
+    assert seen["max_rate_limit_retries"] == 0
+    assert seen["timeout"] <= 15.0
 
 
 def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):

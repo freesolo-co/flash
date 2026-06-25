@@ -211,13 +211,21 @@ def _is_commit_sha(value: str) -> bool:
     return _COMMIT_SHA_RE.fullmatch(value) is not None
 
 
-def _resolve_ref_sha(parsed: GitHubEnvironmentRef, pinned_sha: str | None = None) -> str:
+def _resolve_ref_sha(
+    parsed: GitHubEnvironmentRef,
+    pinned_sha: str | None = None,
+    *,
+    timeout: float = 60.0,
+    max_rate_limit_retries: int = 5,
+) -> str:
     # Resolve-once hook: the control plane resolves ref->sha ONCE (runner._assign_resolved_env_sha)
     # and threads the pinned commit sha through, so every worker in a fan-out short-circuits here
     # without hitting GitHub at all — this is what actually defuses a cold spawn wave (the prior
     # in-process cache could not, since each worker is a separate process). Same effect as the
     # immutable-ref fast path below, but applied to a symbolic ref (e.g. "main"). Only a real
-    # 40-char sha is trusted; anything else falls through to a live resolve.
+    # 40-char sha is trusted; anything else falls through to a live resolve. The control plane
+    # passes a short timeout + max_rate_limit_retries=0 so its best-effort pin can't block run
+    # creation; the worker keeps the full retry budget.
     if pinned_sha and _is_commit_sha(pinned_sha):
         return pinned_sha
     if _is_commit_sha(parsed.ref):
@@ -232,7 +240,7 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef, pinned_sha: str | None = None
         headers["Authorization"] = f"Bearer {token}"
     commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
     req = urllib.request.Request(commit_url, headers=headers)
-    data = _urlopen(req, timeout=60.0)
+    data = _urlopen(req, timeout=timeout, max_rate_limit_retries=max_rate_limit_retries)
     try:
         payload = json.loads(data)
     except json.JSONDecodeError as exc:
@@ -245,20 +253,25 @@ def _resolve_ref_sha(parsed: GitHubEnvironmentRef, pinned_sha: str | None = None
     return sha
 
 
-def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
+def _urlopen(
+    req: urllib.request.Request, *, timeout: float = 60.0, max_rate_limit_retries: int = 5
+) -> bytes:
     """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
 
     On a 429 or a 403 whose body says "rate limit" (a cold spawn wave of workers all hitting the
-    commits/tarball endpoint trips GitHub's abuse detection), retry a few times with jitter so
-    concurrent workers don't all retry in lockstep. If the limit persists past the retries, raise
-    ``GitHubRateLimitError`` so the worker's top-level handler stamps ``retriable=True`` and the run
-    reschedules on a fresh worker, instead of hard-failing on a transient limit. Any other HTTP /
-    URL error raises a plain ``RuntimeError`` (non-retriable).
+    commits/tarball endpoint trips GitHub's abuse detection), retry up to ``max_rate_limit_retries``
+    times with jitter so concurrent workers don't all retry in lockstep. If the limit persists past
+    the retries, raise ``GitHubRateLimitError`` so the worker's top-level handler stamps
+    ``retriable=True`` and the run reschedules on a fresh worker, instead of hard-failing on a
+    transient limit. Any other HTTP / URL error raises a plain ``RuntimeError`` (non-retriable).
+
+    ``max_rate_limit_retries=0`` makes it fail fast (one request, no sleeps): the control plane uses
+    that for its best-effort resolve-once pin so a persistent limit can never block run creation —
+    the long retry belongs on the worker, which can afford to wait.
     """
     import random
     import time
 
-    _MAX_RATE_LIMIT_RETRIES = 5
     _RATE_LIMIT_BASE_DELAY = 10.0
     attempt = 0
     while True:
@@ -268,7 +281,7 @@ def _urlopen(req: urllib.request.Request, *, timeout: float = 60.0) -> bytes:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
             is_rate_limit = exc.code == 429 or (exc.code == 403 and "rate limit" in body.lower())
-            if is_rate_limit and attempt < _MAX_RATE_LIMIT_RETRIES:
+            if is_rate_limit and attempt < max_rate_limit_retries:
                 delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
                 time.sleep(delay)
                 attempt += 1
@@ -761,13 +774,13 @@ class FreesoloEnvironment(BaseEnvironment):
 
 
 def load_freesolo_environment(
-    env_id: str, *, pinned_sha: str | None = None, **kwargs
+    env_id: str, pinned_sha: str | None = None, /, **kwargs
 ) -> FreesoloEnvironment:
-    # pinned_sha is a keyword-only resolve-once hook (the control-plane-pinned commit sha). It is a
-    # RESERVED internal name kept OUT of **kwargs because those are user [environment.params]
-    # forwarded verbatim to the Freesolo SDK env loader — using a distinct name means a user param
-    # (even one literally named "resolved_sha") is never shadowed or stripped. None (default)
-    # preserves today's behavior — the worker resolves the env ref->sha itself.
+    # pinned_sha is a POSITIONAL-ONLY resolve-once hook (the control-plane-pinned commit sha). It is
+    # positional-only (the `/`) precisely so a user [environment.params] entry of ANY name — even
+    # one literally named "pinned_sha" — lands in **kwargs and is forwarded verbatim to the Freesolo
+    # SDK loader, never binding to or shadowing this internal pin. None (default) preserves today's
+    # behavior — the worker resolves the env ref->sha itself.
     tools = _import_freesolo_environment_tools()
     reference = _resolve_environment_reference(env_id, pinned_sha)
     reference_path = Path(reference)

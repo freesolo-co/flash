@@ -56,10 +56,7 @@ def load_environment(
             "`flash env push --name <name>` (for example 'your-name/your-env')"
         )
     # User [environment.params] are freeform and forwarded verbatim to the SDK loader. The
-    # control-plane resolve-once pin travels under the adapter's RESERVED `pinned_sha` kwarg (a
-    # distinct internal name), so it never shadows or strips a user param — including one literally
-    # named "resolved_sha". The `not in params` guard keeps even a user `pinned_sha` collision-free.
-    extra = {}
-    if resolved_sha and "pinned_sha" not in params:
-        extra["pinned_sha"] = resolved_sha
-    return load_freesolo_environment(env_id, **extra, **params)
+    # control-plane resolve-once pin is passed out-of-band as a POSITIONAL-ONLY argument, so a user
+    # param of ANY name (even "pinned_sha"/"resolved_sha") lands in **params and reaches the SDK
+    # unchanged — it can never bind to or disable the pin. None/"" keeps today's behavior.
+    return load_freesolo_environment(env_id, resolved_sha or None, **params)
