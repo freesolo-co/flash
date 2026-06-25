@@ -72,7 +72,6 @@ class LambdaProvider:
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
         import contextlib
-        import time
 
         from flash.providers.lambdalabs import api as lambda_api
         from flash.providers.lambdalabs.jobs import (
@@ -88,12 +87,13 @@ class LambdaProvider:
         lh = LambdaJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: lambda instance={lh.instance_id}", file=log, flush=True)
-        # The wall-cap deadline counts from the instance's LAUNCH (handle.started_ts), not from this
-        # reattach — Lambda has no server-side execution timeout, so resetting it on every recovery
-        # would let a control-plane restart extend the billable window unbounded. Subtract the
-        # already-elapsed time so the cap is enforced from launch.
-        elapsed = max(0.0, time.time() - lh.started_ts) if lh.started_ts else 0.0
-        deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S - elapsed)
+        # The wall-cap deadline counts from the instance's LAUNCH, not from this reattach — Lambda
+        # has no server-side execution timeout, so resetting it on every recovery would let a
+        # control-plane restart extend the billable window unbounded. The poll loop already anchors
+        # its deadline check to ``handle.started_ts`` (start = launch), so we pass the FULL
+        # launch-relative budget here; pre-subtracting elapsed too would double-count and tear down
+        # a still-valid instance the moment a recovered run is past half its window.
+        deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S)
         try:
             return poll_lambda_job(lh, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline)
         finally:
