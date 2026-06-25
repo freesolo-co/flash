@@ -453,6 +453,22 @@ def test_drop_weight_cache_noop_without_volume():
     assert _drop_weight_cache(spec) is spec  # no copy when there's nothing to drop
 
 
+def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
+    # Review (Copilot): the no-capacity cache-drop must NOT strip a non-shared per-org/custom volume —
+    # that is the deliberate escape-hatch isolation an open-model run opted into. Only the SHARED
+    # platform cache (WEIGHT_CACHE_VOLUME_NAME) is dropped.
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.lifecycle import _drop_weight_cache
+
+    custom = _vol_spec(name="org-1234-private")
+    assert custom.gpu.network_volume != WEIGHT_CACHE_VOLUME_NAME
+    out = _drop_weight_cache(custom)
+    assert out is custom  # untouched (no copy) — the escape-hatch volume survives the retry
+    assert out.gpu.network_volume == "org-1234-private"
+    # the SHARED cache, by contrast, IS dropped
+    assert _drop_weight_cache(_vol_spec(name=WEIGHT_CACHE_VOLUME_NAME)).gpu.network_volume is None
+
+
 def _supervised_walk(monkeypatch, failures):
     """Run the supervised seed loop, returning per-attempt (gpu.network_volume, gpu.type) tuples.
 

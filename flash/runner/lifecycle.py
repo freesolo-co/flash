@@ -58,7 +58,7 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str) -> JobSpec:
 
 
 def _drop_weight_cache(spec: JobSpec) -> JobSpec:
-    """Spec with the weight-cache volume removed (run cold + fully cross-region).
+    """Spec with the SHARED weight-cache volume removed (run cold + fully cross-region).
 
     Used after a no-capacity attempt: attaching the cache restricts the endpoint to the cache's
     datacenter set, so if that whole set is momentarily starved the next attempt should fall back to
@@ -66,8 +66,15 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     return ``{}`` (no volume, no datacenter list) and turns off the worker's HF_HOME redirect — i.e.
     exactly today's cold cross-region behavior. Worst case for the cache is one capacity-grace wait,
     never a permanent IN_QUEUE block.
+
+    ONLY the platform-managed SHARED cache (``WEIGHT_CACHE_VOLUME_NAME``) is dropped. A non-shared
+    per-org/custom ``network_volume`` is a deliberate escape-hatch isolation (see
+    runner._assign_weight_cache_volume) the user opted into — it is PRESERVED across retries rather
+    than silently stripped.
     """
-    if not getattr(spec.gpu, "network_volume", None):
+    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
+    if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
         return spec
     d = spec.to_dict()
     d["gpu"] = {**d["gpu"], "network_volume": None}
@@ -311,10 +318,15 @@ def _submit_seed_supervised(
         # RunPod-specific. Instance providers (Lambda/Hyperstack) already fall back to a cold run
         # per-region INSIDE the launch walk, so their no_capacity isn't cache-caused — dropping the
         # cache there would needlessly forfeit the warm-weights benefit on retry.
+        # Only the SHARED platform cache triggers the cache-drop retry; a non-shared per-org/custom
+        # volume is the intended escape-hatch isolation (runner._assign_weight_cache_volume) and must
+        # NOT be stripped on no_capacity — gate on the exact shared name, not any truthy volume.
+        from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+
         run_had_cache = bool(
             chosen is not None
             and chosen.provider == "runpod"
-            and getattr(run_spec.gpu, "network_volume", None)
+            and getattr(run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
         )
         first_cache_drop = (
             run_had_cache
