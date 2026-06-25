@@ -154,6 +154,7 @@ from flash.engine.worker.wandb_log import (
     wandb_run_info,
     wandb_run_name,
 )
+from flash.envs.adapter import GitHubRateLimitError
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
 
@@ -209,7 +210,11 @@ def _load_active_env():
             "(a Freesolo environment id like 'your-name/your-env', returned by "
             "`flash env push --name <name>`)."
         )
-    return load_environment(env_id, JOB_SPEC.environment.params)
+    # Pass the control-plane-pinned commit sha (resolve-once hook) when present so the adapter
+    # skips the GitHub ref->sha resolve; "" (the default) keeps the worker resolving it itself.
+    return load_environment(
+        env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
+    )
 
 
 ACTIVE_ENV = None
@@ -326,7 +331,11 @@ def main():
         os._exit(0)
     except Exception as e:
         # Structured retry signal both pollers read: an infra failure -> retry on a fresh worker.
-        retriable = isinstance(e, RetriableInfraError)
+        # GitHubRateLimitError (env ref resolution hit a persistent GitHub rate limit) is retriable:
+        # reschedule on a fresh worker once the limit window resets rather than hard-failing. Env
+        # resolution runs lazily inside this try (require_active_env, called by the handlers above),
+        # never at import, so a rate-limit raise reaches here and is classified correctly.
+        retriable = isinstance(e, (RetriableInfraError, GitHubRateLimitError))
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
