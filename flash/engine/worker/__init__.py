@@ -2068,7 +2068,9 @@ def run_rl():
             from flash.engine.vram import colocate_kv_util
 
             _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
-            _vllm_gpu_mem_util = colocate_kv_util(_params_b, vllm_max_len, _total_vram_gb, sleep_mode)
+            _vllm_gpu_mem_util = colocate_kv_util(
+                _params_b, vllm_max_len, _total_vram_gb, sleep_mode, num_generations=group_size
+            )
         except Exception:
             _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10  # safe fallback to the old constants
         grpo_kwargs.update(

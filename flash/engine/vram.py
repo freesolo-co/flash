@@ -98,26 +98,34 @@ _KV_CAP = 8.0
 
 
 def colocate_kv_util(
-    params_b: float | None, vllm_max_len: int, total_vram_gb: float, sleep_mode: bool
+    params_b: float | None,
+    vllm_max_len: int,
+    total_vram_gb: float,
+    sleep_mode: bool,
+    num_generations: int = 8,
 ) -> float:
-    """``vllm_gpu_memory_utilization`` for the colocated GRPO rollout engine, sized to the ACTUAL KV
-    need rather than a blanket fraction of the card.
+    """``vllm_gpu_memory_utilization`` for the colocated GRPO rollout engine, sized to the ACTUAL need
+    rather than a blanket fraction of the card.
 
-    A GRPO rollout only holds ~num_generations x context tokens of KV. We estimate that need
-    (``_KV_COEF x seq x sqrt(params)``, capped at ``_KV_CAP``) and convert it to a utilization
-    fraction, capped at 0.45. The old blanket 0.45 reserved ~36 GB of KV on an 80 GB A100 — MEASURED
-    as the dominant resident allocation that set the GRPO step peak (~46 GB) — so deriving from need
-    frees ~20 GB at 4B (and ~40 GB at 35B/H200) while staying well above the rollout's real KV
-    footprint; a too-small pool only makes vLLM page/recompute, never OOM. The non-sleep path keeps
-    its existing 8 GB target (KV stays resident through the backward, so headroom matters); the sleep
-    path (which offloads under the backward) takes a generous 2.5x margin + a 12 GB floor. On small
-    cards the 0.45 cap binds and behaviour is unchanged."""
+    ``gpu_memory_utilization`` is vLLM's WHOLE model-executor budget — its (2nd) bf16 weight copy PLUS
+    the KV cache — so we budget BOTH (budgeting KV alone would starve the weights and, for big models,
+    under-size the engine). The KV a GRPO rollout needs scales with the engine context AND the
+    concurrent generation group (``num_generations`` simultaneous sequences), so we size the pool as
+    ``_KV_COEF x seq x sqrt(params) x group/8`` with a 1.5x margin and an 8 GB floor — NOT capped, so
+    long-context / large-group runs keep a big pool (the 0.45 utilization cap bounds it like the old
+    blanket did). The old blanket sleep-path 0.45 reserved ~36 GB on an 80 GB A100 — MEASURED as the
+    dominant resident allocation that set the GRPO step peak (~46 GB). The non-sleep path is unchanged
+    (its resident-KV target). MEASURED at 4B/group8/2k ctx: 0.25 util -> peak 46 -> 26 GB, reward
+    byte-identical, train_wall neutral; a tighter 12 GB budget preempts, confirming this as the floor."""
     if not sleep_mode:
-        return min(0.45, _KV_CAP / max(1.0, total_vram_gb))  # unchanged: cap resident KV at _KV_CAP
-    kv_width = math.sqrt(max(float(params_b), 0.1)) if params_b else math.sqrt(2.0)
-    kv_est_gb = min(_KV_COEF * (max(1, vllm_max_len) / 1024.0) * kv_width, _KV_CAP)
-    kv_target_gb = max(12.0, 2.5 * kv_est_gb)
-    return min(0.45, kv_target_gb / max(1.0, total_vram_gb))
+        return min(0.45, _KV_CAP / max(1.0, total_vram_gb))  # unchanged: resident-KV target (_KV_CAP)
+    width = math.sqrt(max(float(params_b), 0.1)) if params_b else math.sqrt(2.0)
+    weights_gb = max(0.5, float(params_b or 1.0)) * 2.0  # vLLM's bf16 weight copy lives in the budget
+    kv_pool_gb = max(
+        8.0,
+        1.5 * _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width * (max(1, num_generations) / 8.0),
+    )
+    return min(0.45, (weights_gb + kv_pool_gb) / max(1.0, total_vram_gb))
 # GRPO backward (activations + fp32 logits over the completion micro-batch) per unit
 # context x model width. Grad checkpointing makes this MILD in seq -- calibrated to
 # measured boundaries: 0.8B GRPO fits 24 GB up to seq 32k (seq ~free), while 4.7B GRPO
