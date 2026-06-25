@@ -184,6 +184,45 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "") -> None:
     hf_upload(payload, p, f"{_arm(payload)}_attempt{marker['attempt']}.json")
 
 
+def run_preload(payload: dict) -> dict:
+    """Download-only warm: pull the requested models into the bind-mounted cache (HF_HOME) and exit.
+
+    The instance-provider mirror of runpod/train/endpoints._train_body's ``preload`` branch. NO
+    training, NO env code, NO worker subprocess — just ``snapshot_download`` straight into the cache so
+    the very first real run in this region is warm. HF_HOME (from the payload env) is rooted at the
+    per-region bind-mounted cache mount; we pass ``cache_dir`` EXPLICITLY (huggingface_hub freezes
+    HF_HUB_CACHE at import, so setting the env var here would be too late) and FAIL if the cache isn't
+    mounted (otherwise we'd warm ephemeral local disk that vanishes with the box).
+    """
+    env = payload.get("env") or {}
+    hf_home = env.get("HF_HOME") or ""
+    token = env.get("HF_TOKEN")
+    # The cache bind-mount must be present; HF_HOME is <mount>/hf-cache, so its parent is the mount.
+    # Checked BEFORE importing huggingface_hub so a missing mount fails fast (and stays testable).
+    mount = os.path.dirname(hf_home.rstrip("/")) if hf_home else ""
+    if not hf_home or not mount or not os.path.isdir(mount):
+        return {"preloaded": [], "already_cached": [], "failed": {},
+                "error": f"weight-cache not mounted (HF_HOME={hf_home!r}); refusing to warm ephemeral disk"}
+    from huggingface_hub import snapshot_download
+
+    cache_dir = os.path.join(hf_home, "hub")
+    done, already, failed = [], [], {}
+    for repo_id in payload.get("models") or []:
+        try:
+            before = os.path.isdir(cache_dir) and any(repo_id.replace("/", "--") in d for d in os.listdir(cache_dir))
+            snapshot_download(
+                repo_id=repo_id, token=token, cache_dir=cache_dir,
+                # weights + tokenizer/config only (same exclusions as prefetch_model / the image bake)
+                ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
+            )
+            (already if before else done).append(repo_id)
+            print(f"preload: {repo_id} -> {cache_dir} ({'cached' if before else 'downloaded'})", flush=True)
+        except Exception as exc:
+            failed[repo_id] = str(exc)
+            print(f"preload FAILED {repo_id}: {exc}", flush=True)
+    return {"preloaded": done, "already_cached": already, "failed": failed}
+
+
 def main() -> int:
     # Make SIGTERM (docker stop / wall-cap) unwind through finally so the terminal marker still
     # gets uploaded.
@@ -200,6 +239,16 @@ def main() -> int:
                 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         except Exception as _e:
             print("hf_transfer setup skipped:", _e)
+        # Preload (warm) mode: download-only into the mounted cache, then exit. No code fetch, no
+        # extra_pip, no worker subprocess — the warm driver detects completion via the attempt marker.
+        if payload.get("mode") == "preload":
+            result = run_preload(payload)
+            with open("/tmp/preload_result.json", "w") as f:
+                json.dump(result, f)
+            hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
+            ok = not result.get("error") and not result.get("failed")
+            error = result.get("error") or (f"models failed: {sorted(result.get('failed') or {})}" if result.get("failed") else "")
+            return 0 if ok else 1
         # The base training stack is baked into WORKER_IMAGE; only the per-run extras install here
         # (the verifiers/Freesolo env wheel + the chalk kernels) — exactly the payload's extra_pip.
         extra_pip = payload.get("extra_pip") or []

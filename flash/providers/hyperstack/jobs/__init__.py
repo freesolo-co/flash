@@ -93,8 +93,13 @@ def launch_and_submit(
     attempt: int = 0,
     log=None,
     runtime_secrets: dict | None = None,
+    mode: str | None = None,
+    models: list | None = None,
 ) -> HyperstackJobHandle:
-    """Launch the first region that accepts the job; walk regions on a stock rejection, refresh once."""
+    """Launch the first region that accepts the job; walk regions on a stock rejection, refresh once.
+
+    ``mode="preload"`` + ``models`` launches a download-only warm (the bootstrap pulls the models into
+    the mounted cache volume and exits — no worker)."""
     say = make_say(log)
     if not instances:
         raise hs_api.HyperstackApiError(
@@ -118,6 +123,7 @@ def launch_and_submit(
             build_payload(
                 spec, seed, attempt, runtime_secrets=runtime_secrets,
                 cache_host_mount="/mnt/flash-weights", cache_block_device=True,
+                mode=mode, models=models,
             )
         )
     name = instance_label(spec.run_id, seed, attempt)

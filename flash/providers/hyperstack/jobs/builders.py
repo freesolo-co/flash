@@ -102,13 +102,16 @@ def hyperstack_image() -> str:
 def build_payload(
     spec, seed: int, attempt: int, runtime_secrets: dict | None = None,
     cache_host_mount: str | None = None, cache_block_device: bool = False,
+    mode: str | None = None, models: list | None = None,
 ) -> dict:
     """The Hyperstack bootstrap payload (shared builder, arm='hyperstack'). ``cache_host_mount`` (the
     host path the attached block volume is formatted+mounted at) points HF_HOME at it;
-    ``cache_block_device`` enables the cloud-init wait-for-device/format/mount preamble."""
+    ``cache_block_device`` enables the cloud-init wait-for-device/format/mount preamble.
+    ``mode='preload'`` + ``models`` makes it a download-only warm payload (no worker)."""
     return _shared_build_payload(
         spec, seed, attempt, arm="hyperstack", runtime_secrets=runtime_secrets,
         cache_host_mount=cache_host_mount, cache_block_device=cache_block_device,
+        mode=mode, models=models,
     )
 
 

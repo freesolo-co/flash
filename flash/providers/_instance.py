@@ -107,6 +107,8 @@ def build_payload(
     runtime_secrets: dict | None = None,
     cache_host_mount: str | None = None,
     cache_block_device: bool = False,
+    mode: str | None = None,
+    models: list | None = None,
 ) -> dict:
     """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
@@ -152,6 +154,11 @@ def build_payload(
             from flash.runner import WEIGHT_CACHE_VOLUME_GB
 
             payload["cache_size_gb"] = int(getattr(spec.gpu, "network_volume_gb", 0) or WEIGHT_CACHE_VOLUME_GB)
+    # Preload (warm) mode: the bootstrap downloads ``models`` into the mounted cache and exits — no
+    # code fetch, no worker. Only meaningful with a cache attached (else there's nothing to warm).
+    if mode:
+        payload["mode"] = mode
+        payload["models"] = list(models or [])
     return payload
 
 

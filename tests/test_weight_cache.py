@@ -1037,3 +1037,95 @@ def test_warm_weight_cache_defaults_to_full_fleet_and_catalog(monkeypatch):
     results = preload.warm_weight_cache()  # no args -> all DCs, whole catalog
     assert len(results) == _ndc()
     assert set(captured["models"]) == set(preload.catalog_model_ids())
+
+
+# ---------------------------------------------------------------------------
+# Instance-provider WARM — the baked download-only preload mode + payload plumbing
+# ---------------------------------------------------------------------------
+def _preload_spec():
+    return JobSpec.from_dict({
+        "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": "flash-1700000000-abcd1234",
+        "train": {"epochs": 1, "seeds": [0], "hf_repo": "org/repo"},
+        "gpu": {"type": "A10", "max_wall_seconds": 3600,
+                "network_volume": "flash-weights", "network_volume_gb": 100},
+    })
+
+
+def test_instance_build_payload_preload_mode():
+    from flash.providers import _instance
+
+    p = _instance.build_payload(
+        _preload_spec(), 0, 0, arm="lambda",
+        cache_host_mount="/lambda/nfs/flash-weights", mode="preload", models=["a/b", "c/d"],
+    )
+    assert p["mode"] == "preload"
+    assert p["models"] == ["a/b", "c/d"]
+    # HF_HOME points at the bind-mounted cache so the download persists across runs in the region
+    assert p["env"]["HF_HOME"] == _instance.CACHE_HF_HOME
+
+
+def test_instance_build_payload_no_mode_by_default():
+    from flash.providers import _instance
+
+    p = _instance.build_payload(_preload_spec(), 0, 0, arm="lambda",
+                                cache_host_mount="/lambda/nfs/flash-weights")
+    assert "mode" not in p  # ordinary train payload
+    assert "models" not in p
+
+
+def test_instance_preload_requires_mounted_cache():
+    from flash.providers import _instance_bootstrap as b
+
+    # HF_HOME rooted at an UNMOUNTED cache path -> refuse (would warm ephemeral disk), no download
+    r = b.run_preload({"env": {"HF_HOME": "/weight-cache/hf-cache"}, "models": ["x/y"]})
+    assert r["preloaded"] == []
+    assert r["failed"] == {}
+    assert "not mounted" in r["error"]
+
+
+def test_instance_preload_downloads_into_cache(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from flash.providers import _instance_bootstrap as b
+
+    calls = []
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = lambda **k: calls.append(k)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    hf_home = str(tmp_path / "hf-cache")
+    r = b.run_preload({"env": {"HF_HOME": hf_home, "HF_TOKEN": "t"}, "models": ["a/b"]})
+    assert r["preloaded"] == ["a/b"]
+    assert not r["failed"]
+    assert calls[0]["cache_dir"] == str(tmp_path / "hf-cache" / "hub")  # straight into the mount
+    assert calls[0]["token"] == "t"
+
+
+def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
+    """launch_and_submit(mode='preload', models=...) embeds a preload payload in the cache user_data."""
+    import base64
+    import json as _json
+
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    launched = {}
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: f"/lambda/nfs/{n}")
+    monkeypatch.setattr(lambda_api, "resolve_ssh_key_names", lambda: ["k"], raising=False)
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["k"])
+    monkeypatch.setattr(
+        lambda_api, "launch_instance",
+        lambda **kw: launched.update(kw) or "i-123",
+    )
+    from tests.test_lambda_runner import _inst  # reuse the runner's instance candidate
+
+    jobs.launch_and_submit(
+        _preload_spec(), seed=0, instances=[_inst()], attempt=0,
+        mode="preload", models=["Qwen/Qwen3.5-0.8B"],
+    )
+    # decode the base64 payload embedded in the cache user_data
+    ud = launched["user_data"]
+    b64 = ud.split("FLASH_PAYLOAD_EOF")[1].strip()
+    payload = _json.loads(base64.b64decode(b64))
+    assert payload["mode"] == "preload"
+    assert payload["models"] == ["Qwen/Qwen3.5-0.8B"]

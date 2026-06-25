@@ -100,12 +100,14 @@ def lambda_image() -> str:
 def build_payload(
     spec, seed: int, attempt: int, runtime_secrets: dict | None = None,
     cache_host_mount: str | None = None,
+    mode: str | None = None, models: list | None = None,
 ) -> dict:
     """The Lambda bootstrap payload (shared builder, arm='lambda'). ``cache_host_mount`` (the host
-    NFS mount of the attached weight-cache filesystem, /lambda/nfs/<name>) points HF_HOME at it."""
+    NFS mount of the attached weight-cache filesystem, /lambda/nfs/<name>) points HF_HOME at it.
+    ``mode='preload'`` + ``models`` makes it a download-only warm payload (no worker)."""
     return _shared_build_payload(
         spec, seed, attempt, arm="lambda", runtime_secrets=runtime_secrets,
-        cache_host_mount=cache_host_mount,
+        cache_host_mount=cache_host_mount, mode=mode, models=models,
     )
 
 

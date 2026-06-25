@@ -130,12 +130,17 @@ def launch_and_submit(
     attempt: int = 0,
     log=None,
     runtime_secrets: dict | None = None,
+    mode: str | None = None,
+    models: list | None = None,
 ) -> LambdaJobHandle:
     """Launch the first region that accepts the job; walk regions on a capacity rejection.
 
     Capacity is a live market — between the allocator's capacity check and the launch the only
     region with capacity is often taken. We walk every advertised region, then refresh the capacity
     list once.
+
+    ``mode="preload"`` + ``models`` launches a download-only warm (the bootstrap pulls the models into
+    the mounted cache and exits — no worker); the cache user_data carries the preload payload.
     """
     say = make_say(log)
     if not instances:
@@ -152,7 +157,7 @@ def launch_and_submit(
         build_user_data(
             build_payload(
                 spec, seed, attempt, runtime_secrets=runtime_secrets,
-                cache_host_mount=f"/lambda/nfs/{cache_name}",
+                cache_host_mount=f"/lambda/nfs/{cache_name}", mode=mode, models=models,
             )
         )
         if cache_name
