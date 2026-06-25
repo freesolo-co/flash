@@ -27,6 +27,18 @@ def _vol_spec(name="flash-weights", gb=100, **gpu):
     return JobSpec(model="m", gpu=GpuSpec(network_volume=name, network_volume_gb=gb, **gpu))
 
 
+def _ndc() -> int:
+    """Expected cache-fleet size — derived from the SAME source the code uses (DataCenter.all() via
+    weight_cache_datacenters), so the tests track the SDK's storage-DC set instead of hard-coding a
+    count that breaks when a region is added/removed. >1 so 'one per DC' / uniqueness stays meaningful.
+    """
+    from flash.providers.runpod.jobs import weight_cache_datacenters
+
+    n = len(weight_cache_datacenters())
+    assert n > 1
+    return n
+
+
 # ---------------------------------------------------------------------------
 # spec carrier round-trips (the field must survive every to_dict()->from_dict() hop)
 # ---------------------------------------------------------------------------
@@ -65,33 +77,38 @@ def test_network_volume_gb_tolerant_of_bad_values():
 # jobs.weight_cache_* — the volume fleet + endpoint kwargs (fully managed, no knobs)
 # ---------------------------------------------------------------------------
 def test_weight_cache_datacenters_is_all_storage_dcs():
+    from runpod_flash.core.resources.datacenter import DataCenter
+
     from flash.providers.runpod import jobs
 
     dcs = jobs.weight_cache_datacenters()
-    assert len(dcs) == 11  # 8 NA + 3 EU storage-capable datacenters
-    assert len(set(dcs)) == 11  # all distinct
+    assert set(dcs) == set(DataCenter.all())  # exactly the SDK's storage-capable DC set
+    assert len(set(dcs)) == len(dcs)  # all distinct
 
 
 def test_weight_cache_datacenters_ignores_removed_env_knob(monkeypatch):
     # Regression: the FLASH_WEIGHT_CACHE_DATACENTERS knob is GONE — the fleet is fixed/managed.
+    from runpod_flash.core.resources.datacenter import DataCenter
+
     from flash.providers.runpod import jobs
 
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DATACENTERS", "US-CA-2")
-    assert len(jobs.weight_cache_datacenters()) == 11  # env ignored
+    assert len(jobs.weight_cache_datacenters()) == len(DataCenter.all())  # env ignored
 
 
 def test_weight_cache_volumes_distinct_name_per_dc():
     from flash.providers.runpod import jobs
 
+    n = _ndc()
     vols = jobs.weight_cache_volumes(_vol_spec(gb=100))
-    assert len(vols) == 11
+    assert len(vols) == n  # one volume per cache DC
     # DISTINCT physical name per DC (the SDK keys resource tracking on name only, so same-named
     # volumes across DCs collide -> a 2nd-volume "replace" -> unimplemented undeploy -> crash).
-    assert len({v.name for v in vols}) == 11
+    assert len({v.name for v in vols}) == n
     assert all(v.name.startswith("flash-weights-") for v in vols)
     # the name encodes the DC, lowercased
     assert {v.name for v in vols} == {f"flash-weights-{v.dataCenterId.value.lower()}" for v in vols}
-    assert len({v.dataCenterId for v in vols}) == 11
+    assert len({v.dataCenterId for v in vols}) == n
     assert {v.size for v in vols} == {100}
 
 
@@ -114,7 +131,7 @@ def test_weight_cache_endpoint_kwargs_lists_match():
 
     kw = jobs.weight_cache_endpoint_kwargs(_vol_spec())
     assert sorted(kw) == ["datacenter", "volume"]
-    assert len(kw["volume"]) == len(kw["datacenter"]) == 11
+    assert len(kw["volume"]) == len(kw["datacenter"]) == _ndc()
     # the endpoint datacenter list == the volume DC set (so the SDK superset rule holds, and the
     # endpoint is allowed in exactly the regions it has a cache in).
     assert {v.dataCenterId for v in kw["volume"]} == set(kw["datacenter"])
@@ -152,7 +169,7 @@ def test_weight_cache_satisfies_real_sdk_superset_validation(monkeypatch):
     cfg = ep._build_resource_config()  # raises if the superset rule is violated
     vol_dcs = {v.dataCenterId for v in cfg.networkVolumes}
     assert vol_dcs <= set(cfg.datacenter)  # superset holds
-    assert len(cfg.locations.split(",")) == 11  # endpoint allowed across all storage DCs
+    assert len(cfg.locations.split(",")) == _ndc()  # endpoint allowed across all storage DCs
 
 
 def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
@@ -181,11 +198,12 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
     monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
 
+    n = _ndc()
     eid, _name = jobs.deploy_train_endpoint("RTX 4090", spec=_vol_spec(), disk_gb=None)
     assert eid == "ep-abc"
-    assert len(captured["volume"]) == 11
-    assert len(captured["datacenter"]) == 11
-    assert len({v.name for v in captured["volume"]}) == 11  # distinct per-DC names
+    assert len(captured["volume"]) == n
+    assert len(captured["datacenter"]) == n
+    assert len({v.name for v in captured["volume"]}) == n  # distinct per-DC names
     assert all(v.name.startswith("flash-weights-") for v in captured["volume"])
 
 
@@ -699,5 +717,5 @@ def test_warm_weight_cache_defaults_to_full_fleet_and_catalog(monkeypatch):
 
     monkeypatch.setattr(preload, "_preload_one_dc", fake_one)
     results = preload.warm_weight_cache()  # no args -> all DCs, whole catalog
-    assert len(results) == 11
+    assert len(results) == _ndc()
     assert set(captured["models"]) == set(preload.catalog_model_ids())
