@@ -6,8 +6,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from flash._logging import get_logger
 from flash.server._deps import require_key
 
+logger = get_logger("flash.server.routes.envs")
 router = APIRouter()
 
 
@@ -34,5 +36,11 @@ def publish_env(payload: dict, key: Annotated[dict, Depends(require_key)]):
 
     # Record the same normalized name passed to publish_package — "" for an unnamed upload, NOT
     # str(None) == "None", which would pollute platform metadata for unnamed uploads.
-    record_published_environment(slug=slug, name="" if _name is None else _name, key=key)
+    # Best-effort metadata write: the environment is ALREADY published (GitHub is the source of
+    # truth), so a backend-reporting failure — including ones the function's own guard misses, e.g. a
+    # misconfigured FREESOLO_BASE_URL making urllib raise ValueError — must never turn this into a 500.
+    try:
+        record_published_environment(slug=slug, name="" if _name is None else _name, key=key)
+    except Exception as exc:
+        logger.warning("record_published_environment failed (non-fatal): %s", exc)
     return {"id": slug}
