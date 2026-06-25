@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import time
 import uuid
@@ -41,6 +42,7 @@ from flash.providers.runpod import api as runpod_api
 from flash.providers.runpod.jobs import (
     build_function_input,
     deploy_train_endpoint,
+    make_hf_text_reader,
     weight_cache_datacenters,
     weight_cache_volume_name,
 )
@@ -322,6 +324,127 @@ def teardown_hyperstack_volumes(name: str | None = None) -> list[str]:
     return deleted
 
 
+# Instance-provider WARM (Lambda + Hyperstack). RunPod warms via the serverless preload above; the
+# instance providers have no serverless API, so a warm is a real (cheap, short) GPU launch in download
+# -only mode: the bootstrap pulls the catalog into the mounted cache and exits (no worker). The box
+# self-reports completion by uploading ``preload_result.json`` to a shared status repo, which the
+# driver polls; the instance is ALWAYS terminated in a finally. Cheap class by default (the work is a
+# download, not compute) — override with FLASH_PRELOAD_INSTANCE_GPU.
+_PRELOAD_INSTANCE_GPU = os.environ.get("FLASH_PRELOAD_INSTANCE_GPU") or "A10"
+# Shared dataset repo the preload boxes upload their status marker to (the driver polls it). The
+# warmed WEIGHTS go to the per-region cache volume, NOT here — this holds only tiny status JSON.
+_PRELOAD_STATUS_REPO = os.environ.get("FLASH_PRELOAD_STATUS_REPO") or "Freesolo-Co/flash-weight-preload"
+
+
+def _ensure_status_repo(token: str | None) -> None:
+    """Create the preload status dataset repo if absent (the boxes upload their marker there)."""
+    with contextlib.suppress(Exception):
+        from huggingface_hub import HfApi
+
+        HfApi(token=token).create_repo(_PRELOAD_STATUS_REPO, repo_type="dataset", exist_ok=True, private=True)
+
+
+def _preload_instance_spec(gpu: str, run_id: str):
+    """A minimal download-only preload spec: cache attached, status marker repo, placeholder model
+    (the bootstrap warms ``payload['models']``, not ``spec.model``)."""
+    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
+    from flash.spec import JobSpec
+
+    return JobSpec.from_dict({
+        "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": run_id,
+        "train": {"hf_repo": _PRELOAD_STATUS_REPO, "seeds": [0]},
+        "gpu": {"type": gpu, "max_wall_seconds": 1800,
+                "network_volume": WEIGHT_CACHE_VOLUME_NAME, "network_volume_gb": WEIGHT_CACHE_VOLUME_GB},
+    })
+
+
+def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: str,
+                       token: str | None, timeout_s: int, poll_interval_s: float) -> dict:
+    """Launch a download-only preload instance pinned to ``candidate``'s region, poll its status
+    marker, then ALWAYS terminate. One region failing never aborts the others."""
+    region = getattr(candidate, "region", "?")
+    run_id = f"flash-preload-{provider}-{region.lower()}-{uuid.uuid4().hex[:6]}"
+    spec = _preload_instance_spec(gpu, run_id)
+    prefix = f"{spec.phase}/{run_id}/seed0"
+    reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
+                                 min_interval_s=max(5.0, poll_interval_s))
+    try:
+        try:
+            jobs_mod.launch_and_submit(spec, seed=0, instances=[candidate], attempt=0,
+                                       mode="preload", models=models)
+        except Exception as exc:  # no capacity / launch reject — skip this region (warm-on-first-run covers it)
+            return {"provider": provider, "region": region, "status": "error", "error": f"launch: {exc}"}
+        logger.info("warm %s/%s: launched preload (%d models)", provider, region, len(models))
+        deadline = time.time() + timeout_s
+        text = None
+        while time.time() < deadline:
+            text = reader(force=True)
+            if text:
+                break
+            time.sleep(max(5.0, poll_interval_s))
+        if not text:
+            return {"provider": provider, "region": region, "status": "timeout"}
+        result = json.loads(text)
+        bad = result.get("error") or result.get("failed")
+        return {"provider": provider, "region": region,
+                "status": "partial" if bad else "ok", "result": result}
+    except Exception as exc:
+        return {"provider": provider, "region": region, "status": "error", "error": str(exc)}
+    finally:
+        with contextlib.suppress(Exception):
+            jobs_mod.terminate_run_instances(run_id)
+
+
+def warm_instances(models: list | None = None, gpu: str | None = None,
+                   providers: list | None = None, timeout_s: int = 1800,
+                   poll_interval_s: float = 20.0, max_workers: int = 4) -> list[dict]:
+    """WARM the Lambda + Hyperstack caches: one download-only launch per region that currently has
+    capacity (regions with no capacity now are skipped — warm-on-first-run covers them). Each launch
+    is pinned to its region, polled to completion, and terminated. Best-effort: a provider with no key
+    / no capacity contributes nothing. Returns a status dict per region attempted.
+
+    NB: requires a worker image carrying the bootstrap preload branch (lands on merge when the prod
+    image rebuilds) — a stale image launches but the box runs training/None instead of downloading.
+    """
+    models = models or catalog_model_ids()
+    gpu = gpu or _PRELOAD_INSTANCE_GPU
+    providers = providers or ["lambda", "hyperstack"]
+    token = os.environ.get("HF_TOKEN")
+    _ensure_status_repo(token)
+
+    from flash.providers.hyperstack import jobs as hs_jobs
+    from flash.providers.lambdalabs import jobs as lambda_jobs
+
+    mods = {"lambda": lambda_jobs, "hyperstack": hs_jobs}
+    # One launch per region (dedupe so two candidates in a region don't double-launch — block volumes
+    # are single-attach anyway).
+    targets: list = []
+    for provider in providers:
+        jobs_mod = mods.get(provider)
+        if jobs_mod is None:
+            continue
+        seen_regions: set = set()
+        try:
+            candidates = jobs_mod.usable_instances(gpu)
+        except Exception as exc:
+            logger.warning("warm %s: usable_instances failed (skipping): %s", provider, exc)
+            continue
+        for c in candidates:
+            if c.region in seen_regions:
+                continue
+            seen_regions.add(c.region)
+            targets.append((provider, jobs_mod, c))
+    if not targets:
+        logger.warning("warm: no Lambda/Hyperstack capacity right now (nothing to warm)")
+        return []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [
+            ex.submit(_warm_one_instance, provider, jobs_mod, c, models, gpu, token, timeout_s, poll_interval_s)
+            for (provider, jobs_mod, c) in targets
+        ]
+        return [f.result() for f in as_completed(futs)]
+
+
 def provision_lambda_filesystems(name: str | None = None) -> list[str]:
     """Eagerly create the ``flash-weights`` filesystem in EVERY Lambda region (create-if-absent), so
     the cache storage exists region-wide before any run lands — pure control-plane API, no GPU.
@@ -421,6 +544,11 @@ def main(argv: list[str] | None = None) -> int:
              "inverse to set up all storage up front.",
     )
     ap.add_argument(
+        "--warm-instances", action="store_true",
+        help="WARM the Lambda + Hyperstack caches: one download-only GPU launch per region with "
+             "capacity now (needs the merged worker image carrying the bootstrap preload branch).",
+    )
+    ap.add_argument(
         "--teardown", action="store_true",
         help="DELETE the weight-cache storage on every provider (reclaim standing storage) and exit. "
              "With --datacenters it is SCOPED to that RunPod-DC subset only (Lambda/Hyperstack caches "
@@ -445,6 +573,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"provisioned {len(provisioned)} instance-provider cache store(s): "
               f"{', '.join(provisioned) or '(none — no Lambda/Hyperstack key, or no regions)'}")
         return 0
+    if args.warm_instances:
+        if args.dry_run:
+            print("would warm Lambda + Hyperstack caches (one download-only launch per region with capacity)")
+            return 0
+        results = warm_instances(models=models, gpu=args.gpu if args.gpu != _PRELOAD_GPU else None,
+                                 timeout_s=args.timeout_s, max_workers=args.max_workers)
+        failed = [r for r in results if r.get("status") not in ("ok",)]
+        for r in results:
+            print(f"  {r['provider']}/{r['region']}: {r['status']}"
+                  + (f" ({r.get('error')})" if r.get("error") else ""))
+        print(f"{len(results) - len(failed)}/{len(results)} regions warmed")
+        return 1 if failed else 0
     if args.teardown:
         # Reclaim the cache storage on EVERY provider: RunPod network volumes, Lambda filesystems,
         # and Hyperstack block volumes. Each provider is guarded INDEPENDENTLY so one provider's

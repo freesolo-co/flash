@@ -1129,3 +1129,104 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     payload = _json.loads(base64.b64decode(b64))
     assert payload["mode"] == "preload"
     assert payload["models"] == ["Qwen/Qwen3.5-0.8B"]
+
+
+# ---------------------------------------------------------------------------
+# Instance-provider WARM orchestrator (warm_instances): launch -> poll marker -> terminate
+# ---------------------------------------------------------------------------
+def _cand(region):
+    return types.SimpleNamespace(region=region)
+
+
+def _wire_warm(monkeypatch, marker):
+    """Stub the warm path: status repo, both providers' usable_instances/launch/terminate, marker poll."""
+    import json as _json
+
+    from flash.providers.hyperstack import jobs as hj
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    launched, terminated = [], []
+    monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
+    monkeypatch.setattr(
+        preload, "make_hf_text_reader",
+        lambda repo, path, min_interval_s=45.0: (lambda force=False: _json.dumps(marker) if marker else None),
+    )
+
+    def fake_launch(spec, seed, instances, attempt=0, mode=None, models=None, **k):
+        launched.append((instances[0].region, mode, tuple(models or [])))
+
+    for mod in (lj, hj):
+        monkeypatch.setattr(mod, "launch_and_submit", fake_launch)
+        monkeypatch.setattr(mod, "terminate_run_instances", lambda rid: terminated.append(rid))
+    return preload, lj, hj, launched, terminated
+
+
+def test_warm_instances_one_launch_per_region_and_terminates(monkeypatch):
+    preload, lj, hj, launched, terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}})
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1"), _cand("us-east-1"), _cand("us-west-2")])
+    monkeypatch.setattr(hj, "usable_instances", lambda gpu: [_cand("CANADA-1")])
+
+    res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
+
+    assert sorted(r["region"] for r in res) == ["CANADA-1", "us-east-1", "us-west-2"]  # us-east-1 deduped
+    assert all(r["status"] == "ok" for r in res)
+    assert all(m == "preload" for _, m, _ in launched)  # download-only launches
+    assert len(terminated) == 3  # every launch ALWAYS torn down
+
+
+def test_warm_instance_partial_when_a_model_failed(monkeypatch):
+    preload, lj, hj, _launched, terminated = _wire_warm(
+        monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {"c/d": "gated"}})
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(hj, "usable_instances", lambda gpu: [])
+    res = preload.warm_instances(models=["a/b", "c/d"], timeout_s=5, poll_interval_s=0.0)
+    assert [r["status"] for r in res] == ["partial"]
+    assert len(terminated) == 1
+
+
+def test_warm_instance_times_out_when_no_marker(monkeypatch):
+    preload, lj, hj, _launched, terminated = _wire_warm(monkeypatch, None)  # marker never appears
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(hj, "usable_instances", lambda gpu: [])
+    res = preload.warm_instances(models=["a/b"], timeout_s=0, poll_interval_s=0.0)
+    assert [r["status"] for r in res] == ["timeout"]
+    assert len(terminated) == 1  # terminated regardless of timeout
+
+
+def test_warm_instance_terminates_on_launch_failure(monkeypatch):
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    terminated = []
+    monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
+    monkeypatch.setattr(preload, "make_hf_text_reader", lambda *a, **k: (lambda force=False: None))
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(lj, "launch_and_submit",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no capacity")))
+    monkeypatch.setattr(lj, "terminate_run_instances", lambda rid: terminated.append(rid))
+    res = preload.warm_instances(models=["a/b"], providers=["lambda"], timeout_s=5, poll_interval_s=0.0)
+    assert res[0]["status"] == "error"
+    assert "no capacity" in res[0]["error"]
+    assert len(terminated) == 1  # finally still tears down
+
+
+def test_warm_instances_no_capacity_returns_empty(monkeypatch):
+    from flash.providers.hyperstack import jobs as hj
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [])
+    monkeypatch.setattr(hj, "usable_instances", lambda gpu: [])
+    assert preload.warm_instances(models=["a/b"]) == []
+
+
+def test_warm_instances_cli_dry_run(monkeypatch):
+    from flash.providers.runpod import preload
+
+    called = {"n": 0}
+    monkeypatch.setattr(preload, "warm_instances", lambda **k: called.__setitem__("n", called["n"] + 1) or [])
+    assert preload.main(["--warm-instances", "--dry-run"]) == 0
+    assert called["n"] == 0  # dry-run launches nothing
