@@ -520,8 +520,9 @@ def test_preload_branch_passes_explicit_cache_dir(monkeypatch):
     monkeypatch.setattr(_os.path, "isdir", lambda p: True)  # pretend the volume IS mounted
     calls = []
 
-    def fake_snapshot(repo_id, token=None, cache_dir=None, local_files_only=False):
-        calls.append({"repo": repo_id, "cache_dir": cache_dir, "probe": local_files_only})
+    def fake_snapshot(repo_id, token=None, cache_dir=None, local_files_only=False, ignore_patterns=None):
+        calls.append({"repo": repo_id, "cache_dir": cache_dir, "probe": local_files_only,
+                      "ignore": ignore_patterns})
         if local_files_only:
             raise FileNotFoundError("not cached yet")  # force the real download path
         return "/somewhere"
@@ -536,6 +537,9 @@ def test_preload_branch_passes_explicit_cache_dir(monkeypatch):
     # both the probe and the real download must target the on-volume HF hub dir, not the default
     assert calls
     assert all(c["cache_dir"] == "/runpod-volume/hf-cache/hub" for c in calls)
+    # and both must apply the SAME exclusions as the worker prefetch / instance preload (no cache bloat)
+    expected_ignore = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
+    assert all(c["ignore"] == expected_ignore for c in calls)
 
 
 def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):

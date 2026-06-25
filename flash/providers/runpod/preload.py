@@ -412,8 +412,10 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
     is pinned to its region, polled to completion, and terminated. Best-effort: a provider with no key
     / no capacity contributes nothing. Returns a status dict per region attempted.
 
-    NB: requires a worker image carrying the bootstrap preload branch (lands on merge when the prod
-    image rebuilds) — a stale image launches but the box runs training/None instead of downloading.
+    NB: the preload logic itself ships in the cloud-init ``user_data`` — ``_instance.build_user_data``
+    reads the current ``_instance_bootstrap.py`` from the repo and embeds it, so every launch runs the
+    latest bootstrap (no image rebuild needed for the preload code). The only image requirement is the
+    HF download deps (huggingface_hub + hf_transfer), which the worker image already carries.
     """
     models = models or catalog_model_ids()
     gpu = gpu or _PRELOAD_INSTANCE_GPU

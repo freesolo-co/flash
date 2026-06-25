@@ -256,6 +256,12 @@ def _train_body(input_data: dict) -> dict:
                 "hf_home": hf_home,
             }
         cache_dir = os.path.join(hf_home, "hub") if hf_home else None
+        # Same exclusions as the worker prefetch (engine/worker.prefetch_model), the image bake, and
+        # the instance-provider preload (_instance_bootstrap.run_preload): weights + tokenizer/config
+        # only, never the large unused artifacts. Inlined (this handler is baked self-contained, so it
+        # can't import a shared constant). Keeps the warmed cache byte-for-byte what workers fetch,
+        # so the 100GB sizing holds and the local_files_only `already_cached` probe stays consistent.
+        ignore_patterns = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
         done, already, failed = [], [], {}
         for repo_id in input_data.get("models") or []:
             try:
@@ -264,14 +270,17 @@ def _train_body(input_data: dict) -> dict:
                 # ``already_cached`` proves the weights survived a previous, separate deployment.
                 try:
                     snapshot_download(
-                        repo_id=repo_id, token=tok, cache_dir=cache_dir, local_files_only=True
+                        repo_id=repo_id, token=tok, cache_dir=cache_dir,
+                        ignore_patterns=ignore_patterns, local_files_only=True,
                     )
                     already.append(repo_id)
                     done.append(repo_id)
                     continue
                 except Exception:
                     pass
-                snapshot_download(repo_id=repo_id, token=tok, cache_dir=cache_dir)
+                snapshot_download(
+                    repo_id=repo_id, token=tok, cache_dir=cache_dir, ignore_patterns=ignore_patterns
+                )
                 done.append(repo_id)
             except Exception as exc:  # one bad/gated repo must not abort warming the rest
                 failed[repo_id] = str(exc)[:300]

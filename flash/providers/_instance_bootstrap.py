@@ -251,7 +251,9 @@ def main() -> int:
         except Exception as _e:
             print("hf_transfer setup skipped:", _e)
         # Preload (warm) mode: download-only into the mounted cache, then exit. No code fetch, no
-        # extra_pip, no worker subprocess — the warm driver detects completion via the attempt marker.
+        # extra_pip, no worker subprocess — the warm driver (warm_instances) detects completion by
+        # polling the `<prefix>/preload_result.json` we upload just below (the attempt marker is still
+        # written in the finally, but it is NOT the preload completion signal).
         if payload.get("mode") == "preload":
             result = run_preload(payload)
             with open("/tmp/preload_result.json", "w") as f:
