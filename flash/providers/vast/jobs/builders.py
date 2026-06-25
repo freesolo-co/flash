@@ -224,7 +224,19 @@ def build_onstart(payload: dict, install_deps: bool = True) -> str:
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent.parent / "_bootstrap.py").read_text()
     if install_deps:
-        deps = " ".join(shlex.quote(d) for d in resolve_worker_deps())
+        # Reconstruct the spec from the payload so resolve_worker_deps resolves FLASH_CHALK_WHEEL from
+        # the effective worker env (os.environ + spec.worker_env), matching the RunPod live path — a
+        # wheel staged only via [worker_env] still strips the PyPI chalk floor.
+        _spec = None
+        _spec_json = payload.get("job_spec_json")
+        if _spec_json:
+            from contextlib import suppress
+
+            from flash.spec import JobSpec
+
+            with suppress(Exception):
+                _spec = JobSpec.from_json(_spec_json)
+        deps = " ".join(shlex.quote(d) for d in resolve_worker_deps(spec=_spec))
         # Vast cold-start is dominated by this dep install (torch/vllm/transformers cu128 stack) on
         # fresh hosts — RunPod caches it as a Flash artifact, but Vast reinstalls per host, so use
         # `uv pip` (validated in the worker image: resolves + installs the full pinned cu128 stack

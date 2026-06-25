@@ -134,7 +134,7 @@ WORKER_IMAGE = (
 ).strip() or "ghcr.io/freesolo-co/flash-worker:cu128"
 
 
-def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
+def resolve_worker_deps(friendly_gpu: str | None = None, spec=None) -> list[str]:
     """The dependency list Flash installs on the GPU worker for this run.
 
     Precedence: FLASH_WORKER_DEPS (explicit list) > the pinned ``WORKER_DEPS``.
@@ -152,8 +152,13 @@ def resolve_worker_deps(friendly_gpu: str | None = None) -> list[str]:
     # Applied to BOTH the explicit (FLASH_WORKER_DEPS) and the pinned path: an explicit dep list that
     # still names freesolo-chalk would otherwise install the PyPI chalk floor ahead of the staged
     # wheel, defeating the unpublished-wheel validation the FLASH_CHALK_WHEEL stage is for.
+    # FLASH_CHALK_WHEEL is read from the EFFECTIVE worker env (os.environ + spec.worker_env) — the
+    # SAME source chalk_extra_pip()/upload_code use to stage + reference the wheel — so a wheel set
+    # only in the run's [worker_env] block still strips PyPI chalk here. (spec=None -> os.environ.)
+    _chalk_wheel = _effective_worker_env(spec).get("FLASH_CHALK_WHEEL")
+
     def _strip_pypi_chalk_for_staged_wheel(d: list[str]) -> list[str]:
-        if os.environ.get("FLASH_CHALK_WHEEL"):
+        if _chalk_wheel:
             return [x for x in d if not x.startswith("freesolo-chalk")]
         return d
 

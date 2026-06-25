@@ -403,7 +403,7 @@ def get_train_endpoint(
     if image:
         kwargs["image"] = image
     else:
-        kwargs["dependencies"] = resolve_worker_deps(friendly)
+        kwargs["dependencies"] = resolve_worker_deps(friendly, spec=spec)
         kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
     ep = Endpoint(**kwargs)
     handler = ep(_train_body)  # register the queue-based handler; returns the callable

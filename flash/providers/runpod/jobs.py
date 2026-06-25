@@ -215,7 +215,7 @@ def deploy_train_endpoint(
             # Pass the resolved GPU so Hopper (sm90) gets its fla-drop treatment (resolve_worker_deps
             # is GPU-scoped); a bare call would ship the generic deps and run fla's #640-buggy GDN
             # Triton kernel on an H100 instead of the correct pure-PyTorch delta rule.
-            kwargs["dependencies"] = resolve_worker_deps(friendly)
+            kwargs["dependencies"] = resolve_worker_deps(friendly, spec=spec)
             kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
         ep = Endpoint(**kwargs)
         ep._qb_target = _train_body
@@ -248,13 +248,27 @@ def build_function_input(payload: dict, friendly_gpu: str | None = None) -> dict
     from runpod_flash.runtime.serialization import serialize_args
     from runpod_flash.stubs.live_serverless import get_function_source
 
+    # Reconstruct the spec from the payload so resolve_worker_deps resolves FLASH_CHALK_WHEEL from the
+    # EFFECTIVE worker env (os.environ + spec.worker_env): a wheel staged only via the run's
+    # [worker_env] must still strip the PyPI chalk floor here, matching chalk_extra_pip/upload_code.
+    _spec = None
+    _spec_json = payload.get("job_spec_json")
+    if _spec_json:
+        from contextlib import suppress
+
+        from flash.spec import JobSpec
+
+        with suppress(Exception):
+            _spec = JobSpec.from_json(_spec_json)
     source, _src_hash = get_function_source(_train_body)
     return {
         "function_name": "_train_body",
         "function_code": source,
         "args": serialize_args((payload,)),
         "accelerate_downloads": True,
-        "dependencies": resolve_worker_deps(canonical_gpu(friendly_gpu) if friendly_gpu else None),
+        "dependencies": resolve_worker_deps(
+            canonical_gpu(friendly_gpu) if friendly_gpu else None, spec=_spec
+        ),
         "system_dependencies": WORKER_SYSTEM_DEPS,
     }
 
