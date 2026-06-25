@@ -27,8 +27,14 @@ def preload_instance_run_id(provider: str, region: str, reap_deadline_epoch: int
 
     The epoch lets an orphan sweep reap a driver-lost warm box by NAME alone (no provider creation-time
     field needed). ``reap_deadline_epoch`` is the box's wall-cap deadline in epoch seconds. Kept in sync
-    with ``preload_box_reap_due``'s parser — change both together."""
-    return f"flash-preload-{provider}-{region.lower()}-d{int(reap_deadline_epoch)}-{suffix}"
+    with ``preload_box_reap_due``'s parser — change both together.
+
+    The epoch is placed RIGHT AFTER ``flash-preload-`` (before provider/region) on purpose: the launched
+    instance NAME is bounded to the provider name budget by ``run_label_prefix``, which truncates the
+    TAIL and appends a hash. A long provider+region (e.g. hyperstack + a long region) would otherwise
+    push the deadline token past the cut and the reap parser would never see it — front-loading keeps
+    ``-d<epoch>-`` inside the surviving prefix."""
+    return f"flash-preload-d{int(reap_deadline_epoch)}-{provider}-{region.lower()}-{suffix}"
 
 
 def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GRACE_S) -> bool:
