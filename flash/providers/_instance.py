@@ -23,10 +23,11 @@ from pathlib import Path
 # Lambda/Hyperstack cap an instance/VM ``name`` at 64 chars. We keep the label at or under this so
 # the name is NEVER silently truncated at launch — truncation would desync the stored name from the
 # ``run_label_prefix`` the orphan-sweep matches on, which could fail to protect (or wrongly reap) a
-# live run. The seed/attempt suffix ``-s{seed}-a{attempt}`` is bounded (<=12 chars), so the prefix
-# is bounded to leave room for it.
+# live run. The seed/attempt suffix ``-s{seed}-a{attempt}`` is held to ``_SUFFIX_BUDGET`` chars (see
+# ``instance_label``), so the prefix budget leaves exactly that much room.
 _MAX_NAME = 60
-_PREFIX_BUDGET = _MAX_NAME - 12
+_SUFFIX_BUDGET = 12
+_PREFIX_BUDGET = _MAX_NAME - _SUFFIX_BUDGET
 
 # Above this many chars, the serialized job spec is spilled OUT of the inline cloud-init user_data
 # (uploaded to HF; the bootstrap fetches it) so a large inline spec can't overflow the provider's
@@ -55,8 +56,30 @@ def run_label_prefix(run_id: str) -> str:
 
 def instance_label(run_id: str, seed: int, attempt: int) -> str:
     """Instance name: run-derived so ``sweep_orphans`` can tell ours from anything else on the
-    account, and bounded (via ``run_label_prefix``) so the provider never truncates it."""
-    return f"{run_label_prefix(run_id)}-s{seed}-a{attempt}"
+    account, and bounded (via ``run_label_prefix``) so the provider never truncates it.
+
+    ``seed``/``attempt`` are coerced to ints and the ``-s{seed}-a{attempt}`` suffix is held to
+    ``_SUFFIX_BUDGET`` chars: a caller-supplied spec could carry an absurdly large seed (or a
+    non-int) whose unbounded text would push the name past the provider's cap and get it silently
+    truncated — desyncing the stored name from the ``run_label_prefix`` the orphan-sweep matches on
+    (the same failure the prefix bounding already guards against). The seed is the only unbounded
+    input, so it is the one trimmed; the deterministic prefix + ``-a{attempt}`` boundary keep the
+    name sweep-matchable."""
+    try:
+        seed_i = int(seed)
+    except (TypeError, ValueError):
+        seed_i = 0
+    try:
+        attempt_i = int(attempt)
+    except (TypeError, ValueError):
+        attempt_i = 0
+    suffix = f"-s{seed_i}-a{attempt_i}"
+    if len(suffix) > _SUFFIX_BUDGET:
+        # Trim the (sole unbounded) seed field, keeping the ``-a{attempt}`` boundary intact so the
+        # name stays parseable + matchable. ``-s`` + ``-a{attempt}`` is the fixed framing.
+        keep = _SUFFIX_BUDGET - len(f"-s-a{attempt_i}")
+        suffix = f"-s{str(seed_i)[: max(0, keep)]}-a{attempt_i}"
+    return f"{run_label_prefix(run_id)}{suffix}"
 
 
 def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: dict | None = None) -> dict:
@@ -115,6 +138,13 @@ except Exception:
 # retry / hide the root cause. So this writes the host marker ONLY when no worker attempt marker
 # yet exists at the path (i.e. the container never got far enough to write one). The check is
 # best-effort: on a read error it stays conservative and SKIPS the write (never clobbers).
+#
+# RACE: the existence check and the upload are not atomic — the worker could finish and upload its
+# own marker in the window BETWEEN them, and the host upload would then clobber it. We narrow that
+# window to near-zero by RE-CHECKING immediately before the upload (so the worker's marker has to
+# land inside a sub-second gap to be lost). HF itself offers no compare-and-set, so the residual gap
+# is irreducible; the double check makes a clobber practically impossible while keeping the helper a
+# tiny self-contained snippet. On any read error we stay conservative and SKIP (never clobber).
 _FAILMARK_PY = """\
 import json, sys
 try:
@@ -124,17 +154,21 @@ try:
     marker_path = p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + ".json"
     from huggingface_hub import HfApi
     api = HfApi(token=(p.get("env") or {}).get("HF_TOKEN"))
-    try:
-        worker_marker_exists = api.file_exists(repo_id=p["hf_repo"], filename=marker_path, repo_type="dataset")
-    except Exception:
-        worker_marker_exists = True  # conservative: on a read error, never risk clobbering
-    if not worker_marker_exists:
+    def worker_marker_present():
+        try:
+            return api.file_exists(repo_id=p["hf_repo"], filename=marker_path, repo_type="dataset")
+        except Exception:
+            return True  # conservative: on a read error, never risk clobbering
+    if not worker_marker_present():
         open("/opt/flash/fm.json", "w").write(json.dumps({"ok": False, "attempt": att, "retriable": True, "error": "host: " + reason}))
-        api.upload_file(
-            path_or_fileobj="/opt/flash/fm.json",
-            path_in_repo=marker_path,
-            repo_id=p["hf_repo"], repo_type="dataset",
-        )
+        # Re-check right before the upload: the worker may have written its own ok=false marker in
+        # the gap since the first check; honor it instead of clobbering with the retriable host one.
+        if not worker_marker_present():
+            api.upload_file(
+                path_or_fileobj="/opt/flash/fm.json",
+                path_in_repo=marker_path,
+                repo_id=p["hf_repo"], repo_type="dataset",
+            )
 except Exception:
     pass
 """

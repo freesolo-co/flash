@@ -118,6 +118,14 @@ def build_worker_env(payload: dict) -> dict:
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
         spec_json = fetch_spec_from_hf(payload)
+    if not spec_json:
+        # Neither an inline spec NOR the spilled-to-HF sentinel rode in the payload: a malformed
+        # payload (the control plane always sets exactly one). Fail loudly with the cause instead of
+        # crashing on the len(None) below with an opaque TypeError that buries the real problem.
+        raise RuntimeError(
+            "bootstrap payload carries no job spec: both job_spec_json and the job_spec_in_hf "
+            "sentinel are absent/empty — the control plane built an invalid worker payload"
+        )
     # Pass a large spec via a file, not the environment: a job spec with large inline params can
     # reach hundreds of KB, which trips execve's "Argument list too long". Mirrors
     # runpod/train.py:_train_body.
@@ -210,7 +218,12 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             uploader = threading.Thread(target=upload_loop, daemon=True)
             uploader.start()
         try:
-            proc.wait(timeout=max(10.0, deadline_ts - time.time()))
+            # Honor the wall-clock deadline: wait only up to the time left (floored to a small
+            # positive so the call never blocks forever on a 0/negative timeout). A prior ``max(10.0,
+            # …)`` floor could overshoot the deadline by ~10s when little/no time remained — that
+            # leftover 10s is paid GPU time past the run's wall cap, so we clamp to the remaining
+            # budget instead.
+            proc.wait(timeout=max(1.0, deadline_ts - time.time()))
         except subprocess.TimeoutExpired:
             timed_out = True
             proc.kill()
