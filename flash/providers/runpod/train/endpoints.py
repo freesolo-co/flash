@@ -23,6 +23,7 @@ from flash.providers.runpod.train.deps import (
     WORKER_SYSTEM_DEPS,
     logger,
     resolve_worker_deps,
+    worker_image_for_gpu,
 )
 
 # The control plane runs each training run in its own thread. All runpod_flash deploy/
@@ -513,10 +514,9 @@ def get_train_endpoint(
             "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
             "workers": (0, 1),  # one dedicated worker per run; scale to zero when idle
         }
-        # RunPod Flash needs its serverless runtime baked into the worker image. Boot-install
-        # WORKER_DEPS on Flash's default template instead (cached as a Flash artifact). Optional
-        # FLASH_WORKER_IMAGE override for a RunPod-serverless-compatible image.
-        image = os.environ.get("FLASH_WORKER_IMAGE")
+        # live endpoints keep the boot-install path by default. an operator can still opt into a
+        # serverless-compatible image through FLASH_WORKER_IMAGE or the per-sm image template.
+        image = worker_image_for_gpu(friendly, allow_default=False)
         if image:
             kwargs["image"] = image
         else:

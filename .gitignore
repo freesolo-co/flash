@@ -4,7 +4,14 @@ __pycache__/
 venv/
 *.egg-info/
 dist/
-build/
+# ignore build/ CONTENTS (not the dir itself) so a single subtree can be un-ignored below: git
+# won't descend into a fully-excluded `build/` to re-include anything inside it, but `build/*` lets
+# it descend. (same shape as the benchmark/results un-ignore farther down.)
+build/*
+# ...the opt-in baked kernel-cache staging dir IS tracked: its .keep placeholder keeps
+# Dockerfile.worker's `COPY build/kernel_cache/` source present. build/kernel_cache/.gitignore then
+# ignores the GPU-produced mega_cache.bin (a large binary, baked into the image, not a deliverable).
+!build/kernel_cache/
 .ruff_cache/
 .cache/
 artifacts_local/
