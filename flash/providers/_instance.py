@@ -176,6 +176,10 @@ def build_payload(
         payload["cache_host_mount"] = cache_host_mount
         if cache_block_device:
             payload["cache_block_device"] = True
+            # Carry the mount sentinel filename so the bootstrap's mount-check reads it from ONE source
+            # of truth (this constant) instead of re-hardcoding the literal — the cloud-init preamble
+            # (_cache_block_device_setup) writes the same CACHE_MOUNT_MARKER, so they can't drift.
+            payload["cache_mount_marker"] = CACHE_MOUNT_MARKER
             # The block-device preamble matches the attached volume by its EXACT provisioned size, so
             # carry the runner-assigned size (falls back to the default cache size). Parse tolerantly
             # via _volume_gb so a non-int / stale spec value ("0", "", "abc", bool) can't crash the

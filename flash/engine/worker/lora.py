@@ -316,6 +316,7 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
         # without torch.compile is still faster than the unmasked path: the gather already
         # eliminated the masked FLOPs; eager overhead is negligible at 0.8B scale.
         import torch._dynamo as _dynamo
+
         _disabled_orig = getattr(masked_liger_loss, "_flash_disabled_orig", None)
         if _disabled_orig is None:
             _disabled_orig = _dynamo.disable(orig)

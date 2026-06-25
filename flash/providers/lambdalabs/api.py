@@ -99,13 +99,15 @@ def regions_with_capacity(instance_type: str, force: bool = False) -> list[str]:
 
 
 def all_regions(force: bool = False) -> list[str]:
-    """Every Lambda region the account can reach, capacity-independent — the UNION of the regions
-    advertised across all instance types (the API has no standalone region list). Used by the
-    eager weight-cache provision step to create the ``flash-weights`` filesystem in every region.
+    """Every Lambda region with at least one capacity-available instance type — the UNION of the
+    ``regions_with_capacity_available`` lists across all instance types (the API has no standalone
+    region list, so this is the only way to enumerate reachable regions). Used by the eager
+    weight-cache provision step to create the ``flash-weights`` filesystem in those regions.
 
-    A region that currently advertises ZERO capacity for every instance type won't appear (Lambda
-    only surfaces regions through the per-type capacity list); the launch-time ``ensure_filesystem``
-    backstop covers any such region the moment a run lands there. Sorted for a stable provision order.
+    This is therefore capacity-DEPENDENT: a region that currently advertises ZERO capacity for every
+    instance type won't appear (Lambda only surfaces regions through the per-type capacity list); the
+    launch-time ``ensure_filesystem`` backstop covers any such region the moment a run lands there.
+    Sorted for a stable provision order.
     """
     regions: set[str] = set()
     for info in list_instance_types(force=force).values():

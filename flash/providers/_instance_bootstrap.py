@@ -272,7 +272,10 @@ def run_preload(payload: dict) -> dict:
     # is absent, which would otherwise warm ephemeral disk yet report success. Require it. (NFS/Lambda
     # has no block device and no preamble; the platform genuinely auto-mounts, so isdir alone is sound.)
     if payload.get("cache_block_device"):
-        marker = os.path.join(mount, ".flash-cache-mounted")  # mirrors _instance.CACHE_MOUNT_MARKER
+        # Marker filename flows in via the payload from _instance.CACHE_MOUNT_MARKER (ONE source of
+        # truth, written by the same constant in the cloud-init preamble); the literal is only a
+        # defensive fallback for an older payload that predates the field.
+        marker = os.path.join(mount, payload.get("cache_mount_marker") or ".flash-cache-mounted")
         if not os.path.exists(marker):
             return {"preloaded": [], "already_cached": [], "failed": {},
                     "error": (f"weight-cache block volume not mounted (no sentinel at {marker}); "
