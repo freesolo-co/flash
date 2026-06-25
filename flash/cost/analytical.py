@@ -138,7 +138,7 @@ def _notes(config: RunConfig, raw_train_s: float, wall_capped: bool, cap_s: floa
 def estimate_cost(config: RunConfig, *, wall_cap_s: float = DEFAULT_WALL_CAP_S) -> CostEstimate:
     """Deterministic pre-flight cost calculation."""
     gpu, need = select_gpu(config)
-    hourly = gpu_hourly_usd(gpu)
+    hourly = gpu_hourly_usd(gpu, provider=config.provider)
     # Mirror the runner's max(60, max_wall_seconds) floor so a sub-60s cap isn't underpriced.
     cap_s = max(60.0, float(config.max_wall_seconds)) if config.max_wall_seconds is not None else wall_cap_s
 
