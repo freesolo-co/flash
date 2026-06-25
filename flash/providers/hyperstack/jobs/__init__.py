@@ -23,6 +23,7 @@ from flash.providers._poll import (
     PollErrorTracker,
     heartbeat_progress_ts,
     make_say,
+    preload_box_reap_due,
     surface_heartbeat,
 )
 from flash.providers.base import GPU_INFO, PollResult, min_cuda_modern
@@ -99,15 +100,46 @@ def launch_and_submit(
     attempt: int = 0,
     log=None,
     runtime_secrets: dict | None = None,
+    mode: str | None = None,
+    models: list | None = None,
 ) -> HyperstackJobHandle:
-    """Launch the first region that accepts the job; walk regions on a stock rejection, refresh once."""
+    """Launch the first region that accepts the job; walk regions on a stock rejection, refresh once.
+
+    ``mode="preload"`` + ``models`` launches a download-only warm (the bootstrap pulls the models into
+    the mounted cache volume and exits — no worker)."""
     say = make_say(log)
     if not instances:
         raise hs_api.HyperstackApiError(
             f"no Hyperstack stock for {spec.gpu.type} (no region advertises the flavor)"
         )
-    payload = build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets)
-    user_data = build_user_data(payload, gpu=spec.gpu.type)
+    # Weight cache: when wanted (runner-assigned network_volume), HF_HOME points at a block volume
+    # formatted+mounted at /mnt/flash-weights (region-independent path) and bind-mounted into the
+    # container; the volume is created-if-absent per environment and attached AFTER launch. If the
+    # volume can't be ensured we launch cold; if attach fails the cloud-init preamble degrades to cold
+    # (no device appears). Block volumes are single-attach, so a concurrent same-region run runs cold.
+    # ``gpu=`` selects the per-GPU worker image (dev: worker_image_for_gpu via hyperstack_image).
+    cache_name = getattr(spec.gpu, "network_volume", None)
+    cold_user_data = build_user_data(
+        build_payload(spec, seed, attempt, runtime_secrets=runtime_secrets), gpu=spec.gpu.type
+    )
+    cache_user_data = None
+    cache_gb = 0
+    if cache_name:
+        from flash.runner import WEIGHT_CACHE_VOLUME_GB
+        from flash.spec import _volume_gb
+
+        # Honor the runner-assigned size (mirrors RunPod), defaulting to the standard cache size. Parse
+        # tolerantly via _volume_gb: this best-effort weight-cache path must never crash the run on a
+        # non-int / stale / hand-edited size ("0", "", "abc", bool) — it just falls back to the default.
+        cache_gb = _volume_gb(getattr(spec.gpu, "network_volume_gb", None), default=WEIGHT_CACHE_VOLUME_GB)
+        cache_user_data = build_user_data(
+            build_payload(
+                spec, seed, attempt, runtime_secrets=runtime_secrets,
+                cache_host_mount="/mnt/flash-weights", cache_block_device=True,
+                mode=mode, models=models,
+            ),
+            gpu=spec.gpu.type,
+        )
     name = instance_label(spec.run_id, seed, attempt)
 
     tried_regions: set[str] = set()
@@ -116,8 +148,17 @@ def launch_and_submit(
     last_err: Exception | None = None
 
     def refresh_once(gpu: str) -> None:
-        """One forced stock re-fetch when the walk is exhausted (the alloc cache is ~45s stale)."""
+        """One forced stock re-fetch when the walk is exhausted (the alloc cache is ~45s stale).
+
+        NO-OP in preload mode: ``warm_instances`` pins each preload launch to ONE specific target
+        region (``instances=[candidate]``) and reports that exact region as warmed. Refreshing to a
+        DIFFERENT region here would warm region B while the caller reports the target region A as
+        warmed (its cache actually still cold). A preload that can't run in its target region must
+        FAIL that region (the walk exhausts -> raise), never silently warm another.
+        """
         nonlocal refreshed, candidates
+        if mode == "preload":
+            return
         if not candidates and not refreshed:
             refreshed = True
             candidates = [
@@ -141,6 +182,38 @@ def launch_and_submit(
             say(f"region {inst.region} ({inst.gpu} {inst.flavor}) unusable (no boot image/key): {e}")
             refresh_once(inst.gpu)
             continue
+        # Ensure the cache volume exists in this environment (create-if-absent); on success use the
+        # cache user_data and attach the volume after launch. Any failure -> launch cold here — EXCEPT
+        # in preload mode, where the cold user_data carries no mode/models, so a cold fallback would
+        # boot a full training bootstrap (GPU billing, timeout) and warm nothing. There we SKIP the
+        # region instead and let the walk try the next one (failing if none can host the cache).
+        vol_id, user_data = None, cold_user_data
+        cache_unavailable_reason = None
+        if cache_name and not hs_api.region_supports_cache(inst.region):
+            cache_unavailable_reason = "weight cache not supported in region"
+        elif cache_name:
+            try:
+                # Per-region physical name (Hyperstack volume names are GLOBALLY unique — a bare
+                # cache_name can exist in only one environment account-wide).
+                vol_name = hs_api.cache_volume_name(cache_name, inst.region)
+                vol_id = hs_api.ensure_volume(vol_name, inst.environment, cache_gb) or None
+                if vol_id is not None:
+                    user_data = cache_user_data
+                else:
+                    cache_unavailable_reason = "ensure_volume returned no id"
+            except Exception as e:
+                vol_id = None
+                cache_unavailable_reason = str(e)
+        if cache_name and cache_unavailable_reason is not None:
+            if mode == "preload":
+                say(f"weight cache unavailable in {inst.region} ({cache_unavailable_reason}); "
+                    "skipping (preload needs it)")
+                last_err = hs_api.HyperstackApiError(
+                    f"preload: weight cache unavailable in {inst.region} ({cache_unavailable_reason})"
+                )
+                refresh_once(inst.gpu)
+                continue
+            say(f"weight cache unavailable in {inst.region} ({cache_unavailable_reason}); launching cold")
         try:
             vm_id = hs_api.launch_vm(
                 name=name,
@@ -166,6 +239,27 @@ def launch_and_submit(
             say(f"region {inst.region} ({inst.gpu} {inst.flavor}) rejected: {e}")
             refresh_once(inst.gpu)
             continue
+        # Attach the cache volume to the freshly-launched VM (best-effort: the cloud-init preamble
+        # degrades to a cold run if no device appears, e.g. attach failed or the volume is busy on
+        # another VM — block volumes are single-attach).
+        if vol_id is not None:
+            attached = False
+            with contextlib.suppress(Exception):
+                attached = hs_api.attach_volume(vm_id, vol_id)
+            # A training run survives a failed attach (the preamble runs cold), but a PRELOAD box can't:
+            # with no device it would refuse to warm ephemeral disk (the sentinel check) and just burn
+            # paid GPU until the wall cap. Treat a failed preload attach as a launch failure — tear the
+            # VM down and walk to the next region (failing the warm if none can attach the cache).
+            if not attached and mode == "preload":
+                say(f"preload: cache attach failed in {inst.region} (vol busy/absent); "
+                    "terminating box and trying next region")
+                with contextlib.suppress(Exception):
+                    terminate_run_instances(spec.run_id)
+                last_err = hs_api.HyperstackApiError(
+                    f"preload: cache volume attach failed in {inst.region}"
+                )
+                refresh_once(inst.gpu)
+                continue
         say(
             f"launched hyperstack vm {vm_id}: {inst.gpu} {inst.flavor} "
             f"${inst.price_usd_hr:.2f}/hr in {inst.region} attempt={attempt} seed={seed}"
@@ -504,10 +598,28 @@ def sweep_orphans(
         logger.warning("hyperstack orphan sweep skipped: could not resolve active set: %s", exc)
         return []
     active = {run_label_prefix(a) for a in (labels or set())}
+    now = time.time()
     orphans: list[str] = []
     for v in vms:
         name = str(v.get("name") or "")
         if not name.startswith("flash-"):
+            continue
+        # Warm/preload boxes (``flash-preload-...``) are driver-owned: launched by
+        # preload.warm_instances (mode="preload"), NEVER persisted in the run DB (so never in
+        # ``active``), and self-terminated in _warm_one_instance's ``finally`` (and by startup
+        # recover_runs). A catalog warm can outlast this ~10-min sweep, so reaping them by the bare
+        # ``flash-`` prefix would kill an in-progress preload mid-download; normally exempt them.
+        # EXCEPTION: a box still alive past its embedded wall deadline + grace has lost its driver (the
+        # only thing that terminates instance providers — nothing on the box self-terminates the VM), so
+        # reap it to bound the leak rather than exempt it forever (see preload_box_reap_due).
+        if name.startswith("flash-preload-"):
+            if preload_box_reap_due(name, now):
+                vid = v.get("id")
+                if vid:
+                    orphans.append(str(vid))
+                    logger.warning(
+                        "reaping orphaned hyperstack preload vm %s (outlived its wall deadline + "
+                        "grace; driver lost)", name)
             continue
         if any(name == a or name.startswith(a + "-s") for a in active):
             continue
