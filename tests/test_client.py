@@ -228,3 +228,23 @@ def test_unreachable_server_is_actionable():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     with pytest.raises(ClientError, match="FLASH_API_URL"):
         client.health()
+
+
+def test_deploy_rejects_bool_step():
+    """#176: a bool step must be rejected client-side (the server guard treats a bool as invalid).
+    `int(True)`/`int(False)` would silently coerce to step 1/0, so reject before that — without ever
+    reaching the network (a 127.0.0.1:1 target would error if it did)."""
+    client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
+    for bad in (True, False):
+        with pytest.raises(ClientError, match="invalid checkpoint step"):
+            client.deploy("flash-run", step=bad)
+
+
+def test_deploy_passes_integer_step(stub):
+    """A genuine integer step is forwarded as an int in the body (the bool guard doesn't block it)."""
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.deploy("flash-run", step=40)
+    assert seen["path"] == "/v1/runs/flash-run/deploy"
+    assert seen["body"]["step"] == 40
+    assert seen["body"]["dry_run"] is False

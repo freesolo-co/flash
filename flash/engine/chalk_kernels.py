@@ -68,7 +68,7 @@ def active_kernels(report: Mapping[str, object] | None) -> list[str]:
 
 
 def install_chalk_kernels(model=None) -> dict:
-    """Apply chalk's gap-filling kernels to ``model`` — ON by default (like Liger), flags override.
+    """Apply chalk's gap-filling kernels to ``model`` — ON by default (like Liger).
 
     Uses chalk's Liger-style entry point ``apply_chalk_kernel_to_qwen35(model, liger=False, ...)``:
     Liger is already applied by TRL (``use_liger_kernel``), so chalk composes on top of the live

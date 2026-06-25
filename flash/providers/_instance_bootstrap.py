@@ -33,6 +33,17 @@ CODE_ROOT = "/runcode"
 CODE_DIR = "/runcode/code"
 
 
+class RetriableBootstrapError(RuntimeError):
+    """An infra-shaped bootstrap failure that should RETRY on a fresh host, not fail the run.
+
+    The control-plane pollers classify an attempt marker carrying ``retriable=True`` as
+    ``job_preempted`` (retried within the HF infra-retry budget) rather than ``job_failed`` (fails
+    fast). The bootstrap is self-contained (can't import the worker's ``RetriableInfraError``), so
+    this local sentinel marks the same shape: an HF-side failure (the spilled-spec fetch, or a
+    required-artifact upload that never landed) that a retry on a healthy host would clear. ``main``
+    keys the marker's ``retriable`` flag off whether the raised error is an instance of this."""
+
+
 def load_payload() -> dict:
     with open(PAYLOAD_PATH) as f:
         return json.load(f)
@@ -117,7 +128,26 @@ def build_worker_env(payload: dict) -> dict:
     # provider's cloud-init user_data cap); fetch it here when only the sentinel rode in the payload.
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
-        spec_json = fetch_spec_from_hf(payload)
+        # This fetch is the FIRST HF round-trip in the bootstrap and runs pre-worker (so the worker
+        # never starts and can't stamp a retriable heartbeat). Any failure here is infra-shaped, so
+        # surface it as RetriableBootstrapError — otherwise main() would mark ok=false with no
+        # retriable flag and the poller would fail the run fast (job_failed) instead of retrying it
+        # on a fresh host (job_preempted). A permanently missing/unreadable spec (a control-plane bug
+        # on the rare spilled-spec path) just burns the bounded infra-retry budget, then fails.
+        try:
+            spec_json = fetch_spec_from_hf(payload)
+        except Exception as e:
+            raise RetriableBootstrapError(
+                f"failed to fetch the spilled job spec from HF: {e}"
+            ) from e
+    if not spec_json:
+        # Neither an inline spec NOR the spilled-to-HF sentinel rode in the payload: a malformed
+        # payload (the control plane always sets exactly one). Fail loudly with the cause instead of
+        # crashing on the len(None) below with an opaque TypeError that buries the real problem.
+        raise RuntimeError(
+            "bootstrap payload carries no job spec: both job_spec_json and the job_spec_in_hf "
+            "sentinel are absent/empty — the control plane built an invalid worker payload"
+        )
     # Pass a large spec via a file, not the environment: a job spec with large inline params can
     # reach hundreds of KB, which trips execve's "Argument list too long". Mirrors
     # runpod/train.py:_train_body.
@@ -210,7 +240,12 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             uploader = threading.Thread(target=upload_loop, daemon=True)
             uploader.start()
         try:
-            proc.wait(timeout=max(10.0, deadline_ts - time.time()))
+            # Honor the wall-clock deadline: wait only up to the time left (floored to a small
+            # positive so the call never blocks forever on a 0/negative timeout). A prior ``max(10.0,
+            # …)`` floor could overshoot the deadline by ~10s when little/no time remained — that
+            # leftover 10s is paid GPU time past the run's wall cap, so we clamp to the remaining
+            # budget instead.
+            proc.wait(timeout=max(1.0, deadline_ts - time.time()))
         except subprocess.TimeoutExpired:
             timed_out = True
             proc.kill()
@@ -232,13 +267,19 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     return proc.returncode
 
 
-def write_attempt_marker(payload: dict, ok: bool, error: str = "") -> None:
+def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bool = False) -> None:
     """Attempt-scoped terminal marker (``<arm>_attempt<N>.json``): how the control plane
-    distinguishes THIS attempt's failure from a prior attempt's leftovers under the same prefix."""
+    distinguishes THIS attempt's failure from a prior attempt's leftovers under the same prefix.
+
+    ``retriable`` stamps the same flag the host failmark and the worker heartbeat use: the pollers
+    read ``marker.get("retriable")`` and classify a flagged failure as ``job_preempted`` (retried on
+    a fresh host within the HF infra budget) instead of ``job_failed`` (fails fast). Set it for
+    infra-shaped bootstrap failures (HF fetch/upload) so an HF outage doesn't burn the run."""
     marker = {
         "ok": bool(ok),
         "ts": time.time(),
         "attempt": int(payload.get("attempt") or 0),
+        "retriable": bool(retriable),
         "error": error[:2000],
     }
     p = "/tmp/attempt_marker.json"
@@ -254,6 +295,7 @@ def main() -> int:
     payload = load_payload()
     ok = False
     error = ""
+    retriable = False
     try:
         # hf_transfer is baked into the worker image; enable it so model pulls saturate the NIC.
         try:
@@ -289,7 +331,12 @@ def main() -> int:
                 f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF dataset repo"
             )
         if rc != 0 and not remote_completion_confirmed(payload):
-            raise RuntimeError(
+            # The local metrics.json exists but the REQUIRED uploads (DONE/metrics.json) never landed
+            # on HF — an upload/HF-infra failure, not a code error. Surface it as retriable so the
+            # poller retries on a fresh host (job_preempted) within the HF infra budget instead of
+            # failing the run fast. During a full HF outage the worker's own retriable heartbeat may
+            # also be missing, so the marker's retriable flag is what carries the classification.
+            raise RetriableBootstrapError(
                 f"train phase '{phase}' exited non-zero ({rc}) and its required completion "
                 f"artifacts (DONE/metrics.json) are not on HF — the run did not finish (e.g. a "
                 f"failed upload after the local metrics.json was written); see error_{phase}.txt "
@@ -302,9 +349,13 @@ def main() -> int:
         # cause from reattach/debugging. BaseException records a useful error and still re-exits
         # nonzero (return 1) with the marker written in `finally`.
         error = f"{type(exc).__name__}: {exc}"
+        # An infra-shaped bootstrap failure (the pre-worker spilled-spec HF fetch, or a required
+        # artifact that never uploaded) is raised as RetriableBootstrapError so the marker carries
+        # retriable=True and the poller retries on a fresh host instead of failing the run fast.
+        retriable = isinstance(exc, RetriableBootstrapError)
         print(f"bootstrap failed: {error}", flush=True)
     finally:
-        write_attempt_marker(payload, ok, error)
+        write_attempt_marker(payload, ok, error, retriable=retriable)
     return 0 if ok else 1
 
 

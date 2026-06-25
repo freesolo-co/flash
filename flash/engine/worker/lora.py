@@ -432,7 +432,16 @@ def _rewrite_safetensors_header_keys(path: str, rename) -> int:
         header_bytes = f.read(hdr_len)
         if len(header_bytes) < hdr_len:
             raise ValueError(f"{path}: truncated safetensors header")
-        header = json.loads(header_bytes)
+        try:
+            header = json.loads(header_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # Re-raise with the file path so a corrupt adapter being rewritten is diagnosable
+            # (a bare JSONDecodeError/UnicodeDecodeError names no file). Non-UTF8 header bytes
+            # raise UnicodeDecodeError, not JSONDecodeError, so catch both to keep the context.
+            raise ValueError(
+                f"{path}: safetensors header is not valid JSON "
+                f"(corrupt or not a safetensors file): {exc}"
+            ) from exc
     data_start = 8 + hdr_len
 
     new_header = {}
@@ -550,14 +559,23 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
             header_bytes = f.read(hdr_len)
             if len(header_bytes) < hdr_len:
                 raise ValueError(f"{st_path}: truncated safetensors header")
-            header = json.loads(header_bytes)
+            try:
+                header = json.loads(header_bytes)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                # A bare JSONDecodeError ("Expecting value: line 1 column 1") — or a
+                # UnicodeDecodeError from non-UTF8 header bytes — gives no clue WHICH adapter is
+                # corrupt. Re-raise with the file path so a bad download is diagnosable.
+                raise ValueError(
+                    f"{st_path}: safetensors header is not valid JSON "
+                    f"(corrupt or not a safetensors file): {exc}"
+                ) from exc
         # The safetensors header MUST be a JSON object keyed by tensor name. A corrupt/hostile file
-        # could decode to a list/int/str or carry non-string keys, which would later blow up with a
-        # confusing TypeError in _is_lora_key (substring search on a non-str). Validate the shape here
-        # (this reader is the "reject hostile headers early" hardening) and fail with a clear message.
-        if not isinstance(header, dict) or not all(isinstance(k, str) for k in header):
+        # could decode to a list/int/str, which would later blow up with a confusing TypeError in
+        # _is_lora_key (substring search on a non-str). (JSON object keys are always str, so only the
+        # container type needs checking.) Reject a non-object header early with a clear message.
+        if not isinstance(header, dict):
             raise ValueError(
-                f"{st_path}: safetensors header is not a JSON object with string keys "
+                f"{st_path}: safetensors header is not a JSON object "
                 "(corrupt or not a safetensors file)"
             )
         return [k for k in header if k != "__metadata__"]

@@ -187,9 +187,10 @@ def test_read_adapter_keys_rejects_oversized_header(tmp_path):
 
 
 def test_read_adapter_keys_rejects_non_object_header(tmp_path):
-    # The safetensors header must decode to a JSON object with string keys. A header that decodes to
-    # a list/int (or carries non-string keys) would otherwise raise a confusing TypeError later in
-    # _is_lora_key (substring search on a non-str); fail with a clear ValueError here instead.
+    # The safetensors header must decode to a JSON object. A header that decodes to a list/int would
+    # otherwise raise a confusing TypeError later in _is_lora_key (substring search on a non-str);
+    # fail with a clear ValueError here instead. (JSON object keys are always str, so only the
+    # container type is checked.)
     import json
     import struct
 
@@ -201,8 +202,37 @@ def test_read_adapter_keys_rejects_non_object_header(tmp_path):
     # A well-formed length prefix + valid JSON that is a LIST, not an object.
     body = json.dumps([1, 2, 3]).encode("utf-8")
     st.write_bytes(struct.pack("<Q", len(body)) + body)
-    with pytest.raises(ValueError, match="not a JSON object with string keys"):
+    with pytest.raises(ValueError, match="not a JSON object"):
         lora._read_adapter_tensor_keys(str(adir))
+
+
+def test_read_adapter_keys_corrupt_json_reraises_with_path(tmp_path):
+    # A header that isn't valid JSON at all must re-raise with the FILE PATH (a bare JSONDecodeError
+    # names no file), so a bad adapter download is diagnosable (#198).
+    import struct
+
+    import flash.engine.worker.lora as lora
+
+    adir = tmp_path / "adapter"
+    adir.mkdir()
+    st = adir / "adapter_model.safetensors"
+    body = b"this is not json{{{"
+    st.write_bytes(struct.pack("<Q", len(body)) + body)
+    with pytest.raises(ValueError, match=r"adapter_model\.safetensors: safetensors header is not valid JSON"):
+        lora._read_adapter_tensor_keys(str(adir))
+
+
+def test_rewrite_safetensors_corrupt_json_reraises_with_path(tmp_path):
+    # The in-place header rewriter has the same diagnostic gap; a corrupt header must name the file.
+    import struct
+
+    import flash.engine.worker.lora as lora
+
+    st = tmp_path / "adapter_model.safetensors"
+    body = b"not-json"
+    st.write_bytes(struct.pack("<Q", len(body)) + body)
+    with pytest.raises(ValueError, match=r"adapter_model\.safetensors: safetensors header is not valid JSON"):
+        lora._rewrite_safetensors_header_keys(str(st), lambda k: k)
 
 
 def test_remap_raises_when_adapter_has_no_lora_keys(monkeypatch, tmp_path):
