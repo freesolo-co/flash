@@ -101,6 +101,48 @@ def remote_completion_confirmed(payload: dict) -> bool:
         return False
 
 
+def _hf_fetch_is_transient(exc: BaseException) -> bool:
+    """True if an HF download error is transient (worth retrying on a fresh host).
+
+    PERMANENT failures — the spec file is missing (``EntryNotFoundError``), the repo/revision
+    doesn't exist (``RepositoryNotFoundError``/``RevisionNotFoundError``), or the token can't read
+    it (``GatedRepoError`` / a 401/403/404 ``HfHubHTTPError``) — never clear by retrying; they mean
+    the control plane wrote a bad sentinel (wrong repo/prefix) or the HF token is unauthorized, so
+    they must fail FAST. TRANSIENT failures — network/DNS/timeout (raised as bare ``OSError`` /
+    ``requests`` errors, not ``HfHubHTTPError``) or a server-side 5xx / 429 rate-limit — are the
+    infra shape the retry budget exists for. Anything unrecognized is treated as transient so a
+    genuine outage still retries rather than failing the run on an unknown error class."""
+    from huggingface_hub.errors import (
+        EntryNotFoundError,
+        GatedRepoError,
+        HfHubHTTPError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+
+    # PERMANENT, checked FIRST: the file/repo/revision genuinely isn't there, or the token is
+    # unauthorized to read it. (Some of these subclass HfHubHTTPError, so they MUST be matched
+    # before the generic HfHubHTTPError status check below — and matching by class is robust even
+    # if the carried response/status is somehow unreadable.) None of these clear by retrying.
+    if isinstance(
+        exc,
+        (EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError, GatedRepoError),
+    ):
+        return False
+    # A generic HTTP error carries an explicit status that decides retriable vs permanent.
+    if isinstance(exc, HfHubHTTPError):
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+        if status is None:
+            return True  # couldn't even read a status (connection-level) -> transient
+        # 5xx server errors and 429 rate-limits are transient; every other 4xx is permanent
+        # (404 not-found, 401/403 auth — re-fetching never makes them succeed).
+        return status >= 500 or status == 429
+    # Network/DNS/timeout (OSError, requests.ConnectionError/Timeout) and anything unrecognized:
+    # treat as transient so a genuine outage retries instead of failing the run fast.
+    return True
+
+
 def fetch_spec_from_hf(payload: dict) -> str:
     """Download the run's spec spilled out-of-band to HF (``<hf_prefix>/job_spec.json``).
 
@@ -129,16 +171,21 @@ def build_worker_env(payload: dict) -> dict:
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
         # This fetch is the FIRST HF round-trip in the bootstrap and runs pre-worker (so the worker
-        # never starts and can't stamp a retriable heartbeat). A transient HF outage here is exactly
+        # never starts and can't stamp a retriable heartbeat). A TRANSIENT HF outage here is exactly
         # the infra shape the retry budget exists for, so surface it as RetriableBootstrapError —
         # otherwise main() would mark ok=false with no retriable flag and the poller would fail the
-        # run fast (job_failed) instead of retrying it on a fresh host (job_preempted).
+        # run fast (job_failed) instead of retrying it on a fresh host (job_preempted). A PERMANENT
+        # failure (missing job_spec.json, bad repo/prefix, 404, or an auth/gated error) never clears
+        # by retrying, so it must NOT be wrapped — let it propagate so the poller fails fast instead
+        # of burning the whole infra-retry budget re-fetching a spec that will never appear.
         try:
             spec_json = fetch_spec_from_hf(payload)
         except Exception as e:
-            raise RetriableBootstrapError(
-                f"failed to fetch the spilled job spec from HF (infra/transient): {e}"
-            ) from e
+            if _hf_fetch_is_transient(e):
+                raise RetriableBootstrapError(
+                    f"failed to fetch the spilled job spec from HF (infra/transient): {e}"
+                ) from e
+            raise
     if not spec_json:
         # Neither an inline spec NOR the spilled-to-HF sentinel rode in the payload: a malformed
         # payload (the control plane always sets exactly one). Fail loudly with the cause instead of

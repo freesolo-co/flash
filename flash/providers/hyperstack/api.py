@@ -322,6 +322,7 @@ def list_vms() -> list[dict]:
     fleet and lets a sweep miss still-billing VMs (or reap survivors)."""
     out: list[dict] = []
     seen_ids: set[str] = set()
+    terminated = False
     for page in range(1, _VM_MAX_PAGES + 1):
         resp = request_with_retries(
             f"/core/virtual-machines?page={page}&per_page={_VM_PAGE_SIZE}"
@@ -337,6 +338,7 @@ def list_vms() -> list[dict]:
             )
         insts = resp["instances"]
         if not insts:
+            terminated = True
             break  # valid empty page -> done paginating
         added = 0
         for v in insts:
@@ -352,7 +354,20 @@ def list_vms() -> list[dict]:
             added += 1
         # Last page (short) OR a full page that added nothing new (server ignoring pagination): done.
         if len(insts) < _VM_PAGE_SIZE or added == 0:
+            terminated = True
             break
+    if not terminated:
+        # The loop fell off the page cap while the LAST fetched page was still FULL — pagination did
+        # not naturally terminate, so more VMs almost certainly exist past _VM_MAX_PAGES. Returning
+        # ``out`` here would hand back a truncated fleet as if authoritative, and an orphan sweep /
+        # run-terminate keying off it would miss (or fail to reap) still-billing VMs. Surface it as a
+        # HyperstackApiError instead — same as the malformed-page guard above — so the incomplete
+        # list never masquerades as the complete one.
+        raise HyperstackApiError(
+            f"/core/virtual-machines pagination did not terminate within {_VM_MAX_PAGES} pages "
+            f"(last page was full at {_VM_PAGE_SIZE}/page, {len(out)} VMs collected) — refusing to "
+            f"return a truncated fleet that an orphan sweep could read as authoritative"
+        )
     return out
 
 

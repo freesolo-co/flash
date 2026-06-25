@@ -2004,7 +2004,20 @@ def run_rl():
         # rollout_func (pure multi-turn) path: the per-rollout reward is computed by the env
         # during the rollout and forwarded as the "reward" extra field — pass it through.
         if kwargs.get("reward") is not None:
-            return [float(r) for r in kwargs["reward"]]
+            precomputed = kwargs["reward"]
+            # Mirror the example_idx guard below: a precomputed reward array that doesn't line up
+            # 1:1 with the sampled completions would silently MISALIGN rewards (TRL zips them
+            # positionally), training on a shifted signal. A short/long array is a real bug (env
+            # forwarded the wrong count, or TRL reordered/dropped rows), so fail LOUD rather than
+            # pass through a misaligned vector.
+            if len(precomputed) != len(completions):
+                raise RuntimeError(
+                    f"GRPO reward_fn precomputed 'reward'/completions length mismatch "
+                    f"({len(precomputed)} vs {len(completions)}) — the forwarded per-rollout "
+                    "rewards would be misaligned with the sampled completions; aborting rather "
+                    "than training on a shifted reward signal."
+                )
+            return [float(r) for r in precomputed]
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
         # The dataset carries example_idx (not the record); map each back to its original object.

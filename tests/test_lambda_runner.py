@@ -987,6 +987,76 @@ def test_build_worker_env_spilled_spec_fetch_failure_is_retriable(monkeypatch):
         )
 
 
+def _payload_in_hf():
+    return {"job_spec_json": "", "job_spec_in_hf": True, "phase": "sft", "seed": 0,
+            "env": {}, "flash_arm": "lambda"}
+
+
+def _fake_hf_response(status):
+    """A minimal stand-in for the httpx.Response that HfHubHTTPError reads (.status_code, .headers,
+    .request) so we can construct these errors with a chosen HTTP status in tests."""
+
+    class _Req:
+        def __init__(self):
+            self.headers: dict = {}
+            self.url = "https://hf/x"
+
+    class _Resp:
+        def __init__(self, st):
+            self.status_code = st
+            self.headers: dict = {}
+            self.request = _Req()
+
+    return _Resp(status)
+
+
+def test_build_worker_env_permanent_spec_fetch_failure_is_not_retriable(monkeypatch):
+    """A PERMANENT spilled-spec fetch failure (missing file, bad repo/prefix, auth/gated, a 4xx
+    other than 429) must NOT be wrapped as RetriableBootstrapError — it never clears by retrying,
+    so it propagates and main() fails the run FAST instead of burning the whole infra-retry budget
+    re-fetching a spec that will never appear."""
+    from huggingface_hub.errors import (
+        EntryNotFoundError,
+        GatedRepoError,
+        HfHubHTTPError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+
+    from flash.providers import _instance_bootstrap as lb
+
+    permanent = [
+        EntryNotFoundError("missing job_spec.json"),
+        RepositoryNotFoundError("no such repo", response=_fake_hf_response(404)),
+        RevisionNotFoundError("no such revision", response=_fake_hf_response(404)),
+        GatedRepoError("token cannot read", response=_fake_hf_response(403)),
+        HfHubHTTPError("not found", response=_fake_hf_response(404)),
+        HfHubHTTPError("unauthorized", response=_fake_hf_response(401)),
+        HfHubHTTPError("forbidden", response=_fake_hf_response(403)),
+    ]
+    for exc in permanent:
+        monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p, _e=exc: (_ for _ in ()).throw(_e))
+        # The original (non-retriable) exception propagates; it is NOT RetriableBootstrapError.
+        with pytest.raises(Exception) as ei:  # noqa: PT011 - asserting the class below
+            lb.build_worker_env(_payload_in_hf())
+        assert not isinstance(ei.value, lb.RetriableBootstrapError)
+        assert ei.value is exc  # propagated unchanged
+
+
+def test_build_worker_env_transient_http_spec_fetch_failure_is_retriable(monkeypatch):
+    """A TRANSIENT HF fetch failure (5xx / 429 rate-limit) IS wrapped as RetriableBootstrapError so
+    the poller retries on a fresh host."""
+    from huggingface_hub.errors import HfHubHTTPError
+
+    from flash.providers import _instance_bootstrap as lb
+
+    for status in (500, 502, 503, 504, 429):
+        exc = HfHubHTTPError("boom", response=_fake_hf_response(status))
+        monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p, _e=exc: (_ for _ in ()).throw(_e))
+        with pytest.raises(lb.RetriableBootstrapError, match="spilled job spec"):
+            lb.build_worker_env(_payload_in_hf())
+
+
 def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     """End-to-end: a payload whose spilled-spec HF fetch fails -> main() exits non-zero AND the
     written attempt marker carries retriable=True (so the poller -> job_preempted, not job_failed)."""

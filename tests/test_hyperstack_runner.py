@@ -661,6 +661,27 @@ def test_list_vms_empty_page_one_is_valid_not_an_error(monkeypatch):
     assert hs_api.list_vms() == []
 
 
+def test_list_vms_raises_when_page_cap_hit_with_full_last_page(monkeypatch):
+    """Pagination that never naturally terminates (every page full, NEW ids, up to _VM_MAX_PAGES)
+    must RAISE rather than return a truncated fleet — an orphan sweep keying off a partial list
+    would miss still-billing VMs past the cap."""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    # Lower the cap so the test is cheap; each page is full AND adds brand-new ids, so none of the
+    # natural-termination conditions (short page / empty page / no-new-ids) ever fire.
+    monkeypatch.setattr(hs_api, "_VM_MAX_PAGES", 3)
+
+    def fake_req(path, **k):
+        page = int(path.split("page=")[1].split("&")[0])
+        base = (page - 1) * page_size
+        return {"instances": [{"id": base + i, "name": f"flash-r-s0-a0-{base + i}"} for i in range(page_size)]}
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    with pytest.raises(hs_api.HyperstackApiError, match="did not terminate"):
+        hs_api.list_vms()
+
+
 # ---------------------------------------------------------------------------
 # API: managed-keypair create is race-tolerant (two concurrent launches into one env)
 # ---------------------------------------------------------------------------
