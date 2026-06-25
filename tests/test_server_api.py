@@ -656,6 +656,82 @@ def test_deploy_serving_error_is_clean_502(api, monkeypatch):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
+    """The adapter is registered under the RUN's owning org (its persisted billing_context) so
+    serving can authorize external chat by org — not merely whatever key initiated the deploy."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.billing_context = {"org_id": "run-owner-org"}
+    runner._save_status(status)
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return Deployment(
+            run_id=run_id,
+            model=kwargs["model"],
+            adapter_hf_prefix="x/adapter",
+            gpu="RTX 5090",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            state="ready",
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", capture)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 200, resp.text
+    # The run's owning org (billing_context) is what's attributed, not the bare caller key.
+    assert seen["org_id"] == "run-owner-org"
+
+
+def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
+    """An internal/operator deploy has no billing_context but persists the org in
+    platform_context; the adapter must still be attributed to that run-owning org."""
+    import flash.runner as runner
+    import flash.server.app as app_mod
+    from flash.serve.deploy import Deployment
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.billing_context = None
+    status.platform_context = {"org_id": "platform-org"}
+    runner._save_status(status)
+
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return Deployment(
+            run_id=run_id,
+            model=kwargs["model"],
+            adapter_hf_prefix="x/adapter",
+            gpu="RTX 5090",
+            openai_model=run_id,
+            endpoint_name="https://serve.example",
+            state="ready",
+        )
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", capture)
+
+    resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+    assert resp.status_code == 200, resp.text
+    assert seen["org_id"] == "platform-org"
+
+
 def test_chat_streams_deployed_run(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
