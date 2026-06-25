@@ -389,9 +389,13 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
     marker, then ALWAYS terminate. One region failing never aborts the others."""
     region = getattr(candidate, "region", "?")
     run_id = f"flash-preload-{provider}-{region.lower()}-{uuid.uuid4().hex[:6]}"
-    # The worker wall cap tracks the requested warm timeout, so a long catalog warm isn't killed at
-    # 30 min while _warm_one_instance is still polling for the result.
-    spec = _preload_instance_spec(gpu, run_id, wall_s=timeout_s)
+    # ONE effective budget shared by the worker wall cap AND the driver poll, so the two can't disagree.
+    # The worker spec floors the wall cap at 60s (a sub-minute cap can't even boot+download), so the
+    # driver must poll for that SAME floored budget — otherwise a `--timeout-s` under 60 would have the
+    # driver report timeout + terminate the box at e.g. 30s while the worker still had ~60s to finish,
+    # aborting an in-progress preload.
+    effective_s = max(60, int(timeout_s))
+    spec = _preload_instance_spec(gpu, run_id, wall_s=effective_s)
     prefix = f"{spec.phase}/{run_id}/seed0"
     reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
                                  min_interval_s=max(5.0, poll_interval_s))
@@ -402,7 +406,7 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
         except Exception as exc:  # no capacity / launch reject — skip this region (warm-on-first-run covers it)
             return {"provider": provider, "region": region, "status": "error", "error": f"launch: {exc}"}
         logger.info("warm %s/%s: launched preload (%d models)", provider, region, len(models))
-        deadline = time.time() + timeout_s
+        deadline = time.time() + effective_s
         text = None
         while time.time() < deadline:
             text = reader(force=True)

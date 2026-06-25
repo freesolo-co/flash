@@ -1437,12 +1437,55 @@ def test_warm_instance_partial_when_a_model_failed(monkeypatch):
 
 
 def test_warm_instance_times_out_when_no_marker(monkeypatch):
+    import types as _types
+
     preload, lj, hj, _launched, terminated = _wire_warm(monkeypatch, None)  # marker never appears
     monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
     monkeypatch.setattr(hj, "usable_instances", lambda gpu: [])
+    # Fake clock: jump straight past the deadline so the poll loop exits at once (no real 60s wait,
+    # which the effective-budget floor of 60 would otherwise impose). sleep is a no-op.
+    clock = {"t": 0.0}
+    fake_time = _types.SimpleNamespace(
+        time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1e6))
+    monkeypatch.setattr(preload, "time", fake_time)
     res = preload.warm_instances(models=["a/b"], timeout_s=0, poll_interval_s=0.0)
     assert [r["status"] for r in res] == ["timeout"]
     assert len(terminated) == 1  # terminated regardless of timeout
+
+
+def test_warm_poll_budget_matches_worker_wall_cap_below_floor(monkeypatch):
+    """`--timeout-s` under the 60s floor: the driver polls for the SAME effective budget (60) the
+    worker wall cap is floored to — so a short timeout can't kill a still-running preload early.
+
+    Regression for the mismatch where the spec capped at max(60, timeout_s) but the poll used the raw
+    timeout_s (e.g. timeout_s=10 -> worker 60s, driver 10s -> premature terminate)."""
+    import types as _types
+
+    preload, lj, hj, _launched, terminated = _wire_warm(monkeypatch, None)
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(hj, "usable_instances", lambda gpu: [])
+
+    # Capture the wall cap the spec was built with.
+    wall_caps = []
+    orig_spec = preload._preload_instance_spec
+    monkeypatch.setattr(
+        preload, "_preload_instance_spec",
+        lambda gpu, run_id, wall_s=1800: wall_caps.append(wall_s) or orig_spec(gpu, run_id, wall_s),
+    )
+    # Fake clock that ticks 1 (virtual) second per sleep, so we can read how long the poll ran.
+    clock = {"t": 1000.0}
+    start = clock["t"]
+    monkeypatch.setattr(
+        preload, "time",
+        _types.SimpleNamespace(time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + 1)),
+    )
+
+    res = preload.warm_instances(models=["a/b"], timeout_s=10, poll_interval_s=0.0)  # 10 < 60 floor
+    assert [r["status"] for r in res] == ["timeout"]
+    assert wall_caps == [60]  # worker wall cap floored to 60
+    # the poll ran the FULL 60s effective budget (would have stopped at ~10s under the old bug)
+    assert clock["t"] - start >= 60
+    assert len(terminated) == 1
 
 
 def test_warm_instance_terminates_on_launch_failure(monkeypatch):
