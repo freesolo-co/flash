@@ -70,6 +70,7 @@ from flash.engine.worker.packing import (
     model_is_pure_attention,
     pack_token_ids,
     packing_efficiency,
+    tokenize_for_packing,
 )
 from flash.engine.worker.perf import (
     RetriableInfraError,
@@ -1001,13 +1002,19 @@ def run_sft():
     # notably on sm120 (RTX 5090, flash's DEFAULT GPU), and anywhere the best-effort flash-attn
     # build didn't land. For a PURE full-attention model we can still pack: concatenate examples
     # into max_length blocks and feed a 4D block-diagonal causal mask SDPA honors natively, so
-    # packed examples never attend across boundaries (boundary-correct, bit-identical to unpacked —
-    # verified on a tiny Qwen3/Llama: max|packed-separate| logits == 0.0). This reclaims the packing
+    # packed examples never attend across boundaries (boundary-correct, numerically identical to
+    # unpacked — verified on a tiny Qwen3/Llama: |packed-separate| logits ~1e-7). This reclaims the packing
     # throughput win on the default GPU with neither flash-attn nor flex_attention. GatedDeltaNet
     # hybrids (Qwen3.5/3.6) take the NEXT branch instead — a mask alone can't reset their linear-
     # attention state, so they also need the cu_seqlens/seq_idx varlen kwargs.
     _collator = None
-    _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn)
+    # The mask paths materialize a dense [B, 1, T, T] mask — O(T^2) memory. At very long context that
+    # tax (hundreds of MB to >1 GB) can OOM a run that previously fit under memory-efficient SDPA, and
+    # packing buys little there anyway (long rows already fill a block). Above this cap, leave packing
+    # off (train unpacked, as today). 16384: the dense bf16/bool mask stays <=~256 MB at bsz=1.
+    _PACK_MASK_MAX_LEN = 16384
+    _mask_pack_ok = sft_max_len <= _PACK_MASK_MAX_LEN
+    _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok)
     if _sdpa_pack:
         # The 4D mask requires a MASK-READING attn (SDPA). DOWNGRADE any flash impl optimal_attn_impl
         # picked — e.g. FA3 on a Hopper worker whose FA2 wheel didn't build — to SDPA: a flash varlen
@@ -1035,9 +1042,9 @@ def run_sft():
         )
         cfg_kwargs["per_device_train_batch_size"] = _pd_pack
         cfg_kwargs["gradient_accumulation_steps"] = _ga_pack
-        # Pre-tokenize the already chat-templated texts (the template carries its own special tokens
-        # -> add_special_tokens=False to avoid a double BOS) and bin-pack into <= max_length blocks.
-        _tokenized = [tok(t["text"], add_special_tokens=False)["input_ids"] for t in texts]
+        # Tokenize EXACTLY like TRL's non-packed prep (EOS-append parity so the model still learns to
+        # stop; batched; truncate to max_length) then bin-pack into <= max_length blocks.
+        _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
         _packed_rows = pack_token_ids(_tokenized, sft_max_len)
         ds = Dataset.from_list(_packed_rows)
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id)
@@ -1047,7 +1054,7 @@ def run_sft():
             f"({packing_efficiency(_packed_rows, sft_max_len):.0%} dense); "
             "no flash-attn / no flex_attention required"
         )
-    elif not cfg_kwargs.get("packing") and _gdn and gdn_packing_available():
+    elif not cfg_kwargs.get("packing") and _gdn and gdn_packing_available() and _mask_pack_ok:
         # GatedDeltaNet hybrid (Qwen3.5/3.6, flash's flagship tier): the 4D block-diagonal mask makes
         # the FULL-attention layers boundary-correct, and the linear-attention (DeltaNet) layers reset
         # their recurrence + causal conv at example boundaries via cu_seq_lens_q (fla kernel) + seq_idx
@@ -1069,7 +1076,8 @@ def run_sft():
         # effective batch into grad-accumulation instead.
         cfg_kwargs["per_device_train_batch_size"] = 1
         cfg_kwargs["gradient_accumulation_steps"] = max(1, per_device_bs * grad_accum)
-        _tokenized = [tok(t["text"], add_special_tokens=False)["input_ids"] for t in texts]
+        # EOS-append parity + batched + truncated tokenization (same as the unpacked path), then pack.
+        _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
         _packed_rows = pack_token_ids(_tokenized, sft_max_len)
         ds = Dataset.from_list(_packed_rows)
         _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
@@ -1078,6 +1086,12 @@ def run_sft():
             f"varlen): {len(_tokenized)} examples -> {len(_packed_rows)} blocks of <= {sft_max_len} "
             f"tok ({packing_efficiency(_packed_rows, sft_max_len):.0%} dense); per_device_bs forced "
             "to 1 (cu_seqlens spans one block), effective batch via grad-accum"
+        )
+    elif not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _mask_pack_ok:
+        print(
+            f"[sft] packing stays OFF: max_length {sft_max_len} > {_PACK_MASK_MAX_LEN} — the dense "
+            "O(T^2) block-diagonal mask gets too large at long context (unpacked is more memory-"
+            "efficient there, and long rows already fill a block)."
         )
     elif not cfg_kwargs.get("packing") and not _pure_attn:
         _why = (

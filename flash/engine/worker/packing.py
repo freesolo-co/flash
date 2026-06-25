@@ -67,12 +67,15 @@ def model_is_pure_attention(model_id: str) -> bool:
         for attr in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim"):
             if getattr(cfg, attr, None):
                 return False
-        # A GLOBALLY sliding-window model (no per-layer layer_types, e.g. some Mistral/Qwen configs)
-        # applies a window the model builds itself — a pre-built 4D mask BYPASSES it (wrong
-        # semantics), so it is NOT pure. Gate on the ACTIVE flag (use_sliding_window=True), not on
-        # sliding_window merely being set: Qwen2.5 ships a sliding_window value but keeps it DISABLED
-        # (use_sliding_window=False), and must still pack.
-        return not getattr(cfg, "use_sliding_window", False)
+        # A GLOBALLY sliding-window model (no per-layer layer_types, e.g. Mistral / Qwen2 configs)
+        # builds its own LOCAL-attention causal mask; a pre-built full block-diagonal mask would
+        # BYPASS the window and train with global attention instead of the checkpoint's intended
+        # local attention. Exclude when a window is configured AND active: honor use_sliding_window
+        # when the config exposes it (Qwen2.5 ships a sliding_window value but DISABLES it via
+        # use_sliding_window=False -> still packs), else assume a configured window is active
+        # (Mistral-style configs have no such flag).
+        sliding = getattr(cfg, "sliding_window", None)
+        return not (sliding and getattr(cfg, "use_sliding_window", True))
     except Exception as e:  # network/parse/arch failure -> do NOT pack (boundary-safe default)
         print(f"[pack] pure-attention probe failed for {model_id!r} (treating as NOT pure): {e}")
         return False
@@ -109,14 +112,30 @@ def gdn_packing_available() -> bool:
     so packing must stay off. GPU-validated (RTX 5090, Qwen3.5-0.8B): with both present, a packed
     example's outputs are byte-identical regardless of its neighbors' content (zero information
     leakage); the only difference vs unpacked is benign bf16 kernel-tiling numerics (~0.3 on logits,
-    the same order as flash-attn-vs-SDPA drift)."""
+    the same order as flash-attn-vs-SDPA drift).
+
+    Two guards beyond the find_spec probes: (a) REALLY import causal_conv1d — its availability check
+    is find_spec-based, so a built-but-broken wheel (ABI/symbol mismatch) would pass it and then crash
+    at model load; (b) verify the INSTALLED Qwen3.5 DeltaNet forward actually threads cu_seq_lens_q AND
+    seq_idx — transformers 5.6-5.8 hard-coded seq_idx=None / dropped cu_seq_lens_q, so on those builds
+    the collator's reset kwargs are silently ignored and packed examples would still leak. Either
+    guard failing -> packing stays off (the model trains unpacked, safely)."""
     try:
+        import importlib
+        import inspect
+
         from transformers.utils.import_utils import (
             is_causal_conv1d_available,
             is_flash_linear_attention_available,
         )
 
-        return bool(is_flash_linear_attention_available() and is_causal_conv1d_available())
+        if not (is_flash_linear_attention_available() and is_causal_conv1d_available()):
+            return False
+        importlib.import_module("causal_conv1d")  # (a) fail a built-but-broken wheel here, not at load
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as _m  # (b) version/API gate
+
+        fwd = inspect.getsource(_m.Qwen3_5GatedDeltaNet.forward)
+        return ("cu_seq_lens_q" in fwd) and ("seq_idx" in fwd)
     except Exception:
         return False
 
@@ -152,10 +171,27 @@ def pack_token_ids(sequences: list[list[int]], max_length: int) -> list[dict]:
 
 def packing_efficiency(rows: list[dict], max_length: int) -> float:
     """Fraction of block capacity filled with real tokens (1.0 = no padding). Diagnostic only."""
-    if not rows:
+    if not rows or max_length <= 0:
         return 0.0
     real = sum(sum(r["seq_lengths"]) for r in rows)
     return real / (len(rows) * max_length)
+
+
+def tokenize_for_packing(texts: list[str], tokenizer, max_length: int) -> list[list[int]]:
+    """Tokenize chat-templated ``text`` rows for packing, MATCHING TRL's non-packed SFT prep so a
+    packed run trains on the SAME token sequences as the unpacked/FA2 path (no quality drift):
+      * append the EOS token to any row that doesn't already end with it — TRL's add_eos step does
+        this for the language-modeling ``text`` case, and skipping it would stop teaching the model
+        the final stop token (it'd never learn to halt);
+      * tokenize in ONE batched call (faster than a per-row Python loop, and the worker's chat
+        template already added every other special token, so add_special_tokens=False);
+      * truncate to ``max_length`` in the tokenizer so a pathological long row never materializes a
+        huge id list only to be sliced by pack_token_ids.
+    """
+    eos = tokenizer.eos_token or ""
+    rows = [t if (eos and t.endswith(eos)) else t + eos for t in texts]
+    enc = tokenizer(rows, add_special_tokens=False, truncation=True, max_length=max_length)
+    return enc["input_ids"]
 
 
 @dataclass
@@ -200,6 +236,14 @@ class BlockDiagonalCollator:
         bsz = len(rows)
         if self.emit_varlen and bsz != 1:
             raise ValueError("emit_varlen packing requires per_device_train_batch_size == 1")
+        # Fail fast on a broken row rather than silently mis-tag tokens as pad (or vice versa): the
+        # whole mask/labels/cu_seqlens construction assumes sum(seq_lengths) == len(input_ids).
+        for ids, lens in zip(rows, seglens, strict=True):
+            if sum(lens) != len(ids):
+                raise ValueError(
+                    f"packed row invariant broken: sum(seq_lengths)={sum(lens)} != "
+                    f"len(input_ids)={len(ids)} (rows must come from pack_token_ids)"
+                )
         longest = max((len(r) for r in rows), default=0)
         m = self.pad_to_multiple_of
         # No padding on the varlen path: cu_seqlens must cover the whole sequence (a trailing pad

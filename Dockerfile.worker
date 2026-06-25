@@ -101,11 +101,17 @@ RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
 # is byte-identical regardless of its neighbors' content (zero cross-example leakage). Best-effort
 # source build (small + fast vs flash-attn); on failure GDN packing simply stays off and Qwen3.5/3.6
 # train UNPACKED as before — no correctness risk. Arch-bounded to the catalog GPUs to cap build time.
+# PINNED (compiled CUDA extension) for reproducible image builds — an unpinned upstream release could
+# silently change behavior or break the build. On a build that compiles but then fails to IMPORT
+# (ABI/symbol mismatch), UNINSTALL it: transformers' is_causal_conv1d_available() is a find_spec probe,
+# so a present-but-broken package would pass it and then crash at Qwen3.5 model load instead of safely
+# training unpacked. (engine.worker.packing.gdn_packing_available also re-imports it as defense.)
 RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
-    pip install --no-cache-dir causal-conv1d --no-build-isolation \
-    && python -c "import causal_conv1d; print('causal_conv1d: import OK')" \
+    pip install --no-cache-dir "causal-conv1d==1.5.2" --no-build-isolation \
+    && python -c "import causal_conv1d" \
     && echo "causal_conv1d: installed (GDN packing enabled)" \
-    || echo "causal_conv1d: build failed -> GDN packing stays off (Qwen3.5/3.6 train unpacked)"
+    || { echo "causal_conv1d: build/import failed -> removing + GDN packing stays off (Qwen3.5/3.6 train unpacked)"; \
+         pip uninstall -y causal-conv1d 2>/dev/null || true; }
 
 # Kernel JIT caches are NOT baked here, on purpose. The fused Triton (Liger/fla/chalk),
 # TorchInductor, and Hopper tilelang kernels the trainer builds on first use are

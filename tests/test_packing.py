@@ -1,9 +1,10 @@
 """True token packing (block-diagonal SDPA mask) — CPU-only correctness.
 
-The headline guarantee: a packed forward through the 4D block-diagonal causal mask is
-BIT-IDENTICAL to running each example separately (no cross-example contamination) under plain
-SDPA — so packing buys throughput with zero quality change. Plus the pure-attention arch gate,
-the bin-packer invariants, and the collator's mask/label construction.
+The headline guarantee: a packed forward through the 4D block-diagonal causal mask matches running
+each example separately to FLOAT PRECISION (~1e-7 reduction-order noise, no cross-example
+contamination) under plain SDPA — so packing buys throughput with zero training-relevant quality
+change. Plus the pure-attention arch gate, the bin-packer invariants, and the collator's
+mask/label construction.
 """
 
 from __future__ import annotations
@@ -19,7 +20,35 @@ from flash.engine.worker.packing import (
     model_is_pure_attention,
     pack_token_ids,
     packing_efficiency,
+    tokenize_for_packing,
 )
+
+
+class _FakeTok:
+    """Minimal tokenizer for the tokenize_for_packing logic (char-code ids)."""
+
+    def __init__(self, eos="<e>"):
+        self.eos_token = eos
+
+    def __call__(self, rows, add_special_tokens, truncation, max_length):
+        assert add_special_tokens is False
+        assert truncation is True
+        return {"input_ids": [[ord(c) for c in r][:max_length] for r in rows]}
+
+
+def test_tokenize_for_packing_appends_eos_for_parity():
+    tok = _FakeTok(eos="!")
+    # row WITHOUT eos -> eos appended (so the model learns to stop, matching TRL's add_eos);
+    # row WITH eos -> not doubled.
+    ids = tokenize_for_packing(["ab", "cd!"], tok, max_length=100)
+    assert ids[0] == [ord("a"), ord("b"), ord("!")]
+    assert ids[1] == [ord("c"), ord("d"), ord("!")]
+
+
+def test_tokenize_for_packing_truncates_and_handles_no_eos():
+    assert tokenize_for_packing(["abcdef"], _FakeTok("!"), max_length=3) == [[ord("a"), ord("b"), ord("c")]]
+    # eos_token None -> no append, no crash
+    assert tokenize_for_packing(["ab"], _FakeTok(eos=None), max_length=100) == [[ord("a"), ord("b")]]
 
 
 def _split_by_lengths(ids: list[int], lengths: list[int]) -> list[list[int]]:
@@ -84,6 +113,12 @@ def test_disabled_sliding_window_still_pure(monkeypatch):
     assert model_is_pure_attention("Qwen/Qwen2.5-7B") is True
 
 
+def test_mistral_style_sliding_window_excluded(monkeypatch):
+    # Mistral-style: sliding_window set, NO use_sliding_window flag -> window is ACTIVE -> exclude.
+    _patch_cfg(monkeypatch, types.SimpleNamespace(sliding_window=4096))
+    assert model_is_pure_attention("mistralai/Mistral-7B") is False
+
+
 def test_multimodal_reads_text_config(monkeypatch):
     # Decoder dims live under text_config for VL checkpoints; the probe must look there.
     _patch_cfg(
@@ -121,22 +156,18 @@ def test_gdn_hybrid_false_for_pure_and_sliding(monkeypatch):
     assert model_is_gdn_hybrid("any/sliding") is False  # sliding != linear_attention
 
 
-def test_gdn_packing_available_requires_both_kernels(monkeypatch):
+def test_gdn_packing_available_false_when_either_kernel_missing(monkeypatch):
+    # Safety-critical: if EITHER find_spec probe is False the gate short-circuits to False BEFORE the
+    # heavy real-import / source-API checks — a missing kernel must NEVER enable packing (it would
+    # leak). (The both-present path additionally requires the real kernels + a kwargs-aware
+    # transformers; that is GPU-validated end-to-end, not unit-tested here.)
     pytest.importorskip("transformers")
     import transformers.utils.import_utils as iu
 
-    def setk(fla, conv):
-        monkeypatch.setattr(iu, "is_flash_linear_attention_available", lambda: fla, raising=False)
-        monkeypatch.setattr(iu, "is_causal_conv1d_available", lambda: conv, raising=False)
-
-    setk(True, True)
-    assert gdn_packing_available() is True
-    setk(True, False)  # conv missing -> conv leaks across boundaries
-    assert gdn_packing_available() is False
-    setk(False, True)  # fla missing -> recurrence leaks across boundaries
-    assert gdn_packing_available() is False
-    setk(False, False)
-    assert gdn_packing_available() is False
+    for fla, conv in [(False, True), (True, False), (False, False)]:
+        monkeypatch.setattr(iu, "is_flash_linear_attention_available", lambda fla=fla: fla, raising=False)
+        monkeypatch.setattr(iu, "is_causal_conv1d_available", lambda conv=conv: conv, raising=False)
+        assert gdn_packing_available() is False
 
 
 # --------------------------------------------------------------------------- bin packer
@@ -150,8 +181,11 @@ def test_packer_conserves_tokens_and_never_splits():
         assert len(r["input_ids"]) <= 8
     got = sorted(length for r in rows for length in r["seq_lengths"])
     assert got == sorted(len(s) for s in seqs)
-    # token content is conserved across all blocks
-    assert sum(sum(r["input_ids"]) for r in rows) == sum(sum(s) for s in seqs)
+    # token CONTENT is conserved exactly — a multiset comparison (not just the sum, which a swap or
+    # duplicate could preserve).
+    from collections import Counter
+
+    assert Counter(t for r in rows for t in r["input_ids"]) == Counter(t for s in seqs for t in s)
 
 
 def test_packer_truncates_overlong_example():
@@ -167,6 +201,14 @@ def test_packer_drops_empty_and_efficiency():
     assert len(rows) == 1
     assert packing_efficiency(rows, 4) == pytest.approx(1.0)
     assert packing_efficiency([], 4) == 0.0
+    assert packing_efficiency(rows, 0) == 0.0  # no ZeroDivisionError on a bad max_length
+
+
+def test_collator_rejects_broken_row_invariant():
+    pytest.importorskip("torch")
+    col = BlockDiagonalCollator(pad_token_id=0)
+    with pytest.raises(ValueError, match="invariant broken"):
+        col([{"input_ids": [1, 2, 3], "seq_lengths": [2]}])  # sum(lens)=2 != len=3
 
 
 def test_packer_ffd_minimizes_blocks():
@@ -279,7 +321,11 @@ def test_packed_forward_bit_identical_to_separate(arch):
 
     n_real = sum(len(e) for e in packed_examples)
     diff = (packed[:n_real] - sep).abs().max().item()
-    assert diff < 1e-4, f"packed != separate (max diff {diff})"
+    # NUMERICALLY identical: masked positions get ~0 softmax weight, so a real token's output equals
+    # its standalone forward up to float reduction-order noise (the longer packed sequence sums more
+    # terms) — ~1e-7 here, far below any training-relevant scale. NOT cross-boundary contamination
+    # (which the leaky control below shows is ~0.5).
+    assert diff < 1e-5, f"packed != separate (max diff {diff})"
     assert not torch.isnan(packed).any()
 
 
