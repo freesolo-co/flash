@@ -169,8 +169,10 @@ async def _reap_idle_endpoints_loop() -> None:
 # ``deployed`` after it went ``done`` (the seed loop's ``finally`` already tore every training
 # instance down), so a deployed run owns no training worker — keeping it in the protection set would
 # instead SHIELD a genuine leaked instance under its prefix from the sweep (the very thing the sweep
-# exists to reap). Terminal states are excluded for the same reason.
-_INSTANCE_OWNING_STATES = frozenset({"queued", "provisioning", "running"})
+# exists to reap). Terminal states are excluded for the same reason. This is exactly ``_RECOVERABLE``
+# — a run is recoverable on restart iff it may still have an in-flight worker — so it is ALIASED
+# (one source of truth) to keep the two protection sets from silently drifting apart.
+_INSTANCE_OWNING_STATES = _RECOVERABLE
 
 
 def _active_run_ids() -> set[str]:

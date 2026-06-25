@@ -514,7 +514,14 @@ def sweep_orphans(
     except Exception as exc:
         logger.warning("lambda orphan sweep skipped: %s", exc)
         return []
-    labels = active_labels() if callable(active_labels) else active_labels
+    try:
+        labels = active_labels() if callable(active_labels) else active_labels
+    except Exception as exc:
+        # Resolving the protection set failed (e.g. a db/status read error in the callable). SKIP the
+        # sweep — never fall through to an empty set, which would treat every live run's instance as
+        # an orphan and reap it. Honors the "never raises" contract.
+        logger.warning("lambda orphan sweep skipped: could not resolve active set: %s", exc)
+        return []
     active = {run_label_prefix(a) for a in (labels or set())}
     orphans: list[str] = []
     for inst in instances:

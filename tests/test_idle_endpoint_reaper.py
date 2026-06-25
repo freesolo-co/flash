@@ -257,3 +257,29 @@ def test_sweep_resolves_active_labels_after_listing(monkeypatch):
     assert events == ["list", "active"]  # protection set resolved AFTER the instance list
     assert out == ["i-orphan"]  # fresh worker protected, orphan reaped
     assert terminated == ["i-orphan"]
+
+
+def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
+    """If resolving a callable ``active_labels`` raises (e.g. a db/status read error), the sweep must
+    SKIP (return []) — never fall through to an empty protection set, which would treat every live
+    run's instance as an orphan and reap it. Honors the 'never raises' contract."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    terminated = []
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instances",
+        lambda: [{"id": "i-live", "name": jobs.instance_label("flash-live", 0, 0)}],
+    )
+    monkeypatch.setattr(
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+    )
+
+    def boom():
+        raise RuntimeError("db read failed")
+
+    out = jobs.sweep_orphans(active_labels=boom)
+
+    assert out == []  # skipped, did NOT raise
+    assert terminated == []  # and crucially did NOT reap the live instance
