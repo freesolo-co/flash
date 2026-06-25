@@ -313,9 +313,15 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "steps = 150" in grpo.read_text()
     assert 'algorithm = "sft"' in sft.read_text()
     assert "epochs = 1" in sft.read_text()
+    training = tmp_path / "TRAINING.md"
+    assert training.is_file()
+    training_text = training.read_text(encoding="utf-8")
+    assert "how to actually improve a model with Flash" in training_text
+    assert "## Using Flash" in training_text  # end-to-end library usage, not just conventions
     out = capsys.readouterr().out
     assert "datasets/train.jsonl" in out
     assert "configs/rl.toml" in out
+    assert "TRAINING.md" in out
 
 
 def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None:
