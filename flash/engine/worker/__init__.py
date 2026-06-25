@@ -30,6 +30,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -2571,6 +2572,19 @@ def _load_kernel_cache_if_present() -> bool:
     JITs on first use exactly as before (#163's init heartbeat covers that stall). Never raises:
     a missing torch / missing file / unusable blob just logs and leaves the JIT path intact.
     """
+    def _reject(reason: str) -> bool:
+        # a baked cache is present but unusable (no/garbled metadata or wrong arch): repoint
+        # triton/inductor OFF the baked trees (Dockerfile points them at /opt/flash/kernelcache)
+        # so the JIT fallback compiles fresh into scratch instead of reusing wrong-arch baked
+        # entries that would collide with this worker's arch.
+        print(f"[kernel-cache] {reason} -> first-run JIT fallback")
+        scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
+        for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
+            d = os.path.join(scratch, sub)
+            os.makedirs(d, exist_ok=True)
+            os.environ[var] = d
+        return False
+
     if not os.path.isfile(_KERNEL_CACHE_FILE):
         print(f"[kernel-cache] no baked cache at {_KERNEL_CACHE_FILE} -> first-run JIT (expected default)")
         return False
@@ -2582,22 +2596,17 @@ def _load_kernel_cache_if_present() -> bool:
             with open(_KERNEL_CACHE_META_FILE) as f:
                 meta = json.load(f)
         except FileNotFoundError:
-            print("[kernel-cache] baked cache has no metadata -> first-run JIT fallback")
-            return False
+            return _reject("baked cache has no metadata")
         except Exception as e:
-            print(f"[kernel-cache] metadata unreadable ({e}) -> first-run JIT fallback")
-            return False
+            return _reject(f"metadata unreadable ({e})")
         cached_sm = str(meta.get("sm") or "")
         if not current_sm:
             # can't verify the worker's GPU arch -> don't risk loading a wrong-arch blob; JIT instead.
-            print("[kernel-cache] worker GPU arch undetermined -> first-run JIT fallback")
-            return False
+            return _reject("worker GPU arch undetermined")
         if cached_sm != current_sm:
-            print(
-                f"[kernel-cache] baked cache arch {cached_sm or 'unknown'} does not match "
-                f"worker arch {current_sm} -> first-run JIT fallback"
+            return _reject(
+                f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
             )
-            return False
         with open(_KERNEL_CACHE_FILE, "rb") as f:
             blob = f.read()
         torch.compiler.load_cache_artifacts(blob)
