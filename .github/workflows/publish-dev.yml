@@ -8,7 +8,8 @@ name: Publish flash dev-channel package
 # merging to `dev` cuts a release; ordinary dev pushes (version unchanged -> already published)
 # no-op. This mirrors freesolo-flash's publish.yml, but keyed on the dev version and on `dev`
 # instead of `main`, and a no-op is a clean success (not a failure) since most dev pushes don't
-# bump it. Manual runs via workflow_dispatch force a publish attempt of the current dev version.
+# bump it. Manual runs via workflow_dispatch re-run the same version check for the current dev
+# version (still a no-op when it's already on PyPI — not a forced re-publish).
 on:
   push:
     branches:
@@ -45,15 +46,28 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Read dev-channel version
+      - name: Read dev-channel version (and enforce parity with the prod version)
         id: meta
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import sys
           import tomllib
 
           with open("pyproject.toml", "rb") as f:
               data = tomllib.load(f)
-          print(f"version={data['tool']['flash-dev']['version']}")
+          dev_version = data["tool"]["flash-dev"]["version"]
+          prod_version = data["project"]["version"]
+          # The two channels MUST ship in lockstep (version-parity.yml enforces this on PRs). Re-check
+          # it here so the PUBLISH path can never ship a dev wheel out of sync with freesolo-flash even
+          # if the parity CI was bypassed or branch protection isn't strict — fail before build/publish.
+          if dev_version != prod_version:
+              print(
+                  f"::error::version mismatch: [tool.flash-dev].version={dev_version} != "
+                  f"[project].version={prod_version}; bump both in lockstep before publishing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print(f"version={dev_version}")
           PY
 
       - name: Decide whether to publish
