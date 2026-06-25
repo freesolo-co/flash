@@ -1,17 +1,15 @@
-"""Server-side managed Freesolo env publishing to GitHub."""
+"""Server-side managed Freesolo env publishing to Azure Blob + Postgres."""
 
 from __future__ import annotations
 
 import base64
 import io
 import json
-import subprocess
 import tarfile
-from pathlib import Path
 
 import pytest
 
-from flash.server import envs
+from flash.server import azure_blob, environment_store, envs
 
 _MINIMAL = {
     "pyproject.toml": "[project]\nname = 'e'\n",
@@ -30,6 +28,24 @@ def _pkg_b64(files: dict[str, str]) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+@pytest.fixture
+def fake_azure(monkeypatch):
+    """Stub Azure Blob upload + Postgres upsert; capture what publish would write."""
+    captured: dict[str, object] = {}
+
+    def fake_upload(blob_key, data):
+        captured["blob_key"] = blob_key
+        captured["data"] = data
+
+    def fake_upsert(**kwargs):
+        captured["upsert"] = kwargs
+
+    monkeypatch.setattr(azure_blob, "upload_package", fake_upload)
+    monkeypatch.setattr(azure_blob, "container_name", lambda: "flash-environments")
+    monkeypatch.setattr(environment_store, "upsert", fake_upsert)
+    return captured
+
+
 def test_namespace_is_stable_and_repo_safe():
     assert envs.namespace_for({"email": "Dev@Clado.ai"}) == "dev-clado-ai"
     assert envs.namespace_for({"email": "dev@clado.ai"}) == "dev-clado-ai"
@@ -42,9 +58,6 @@ def test_namespace_requires_email():
 
 
 def test_internal_key_gets_reserved_namespace_without_email():
-    # The internal/operator service key has a synthetic/shared identity (no per-user email) but is
-    # trusted to submit runs and read everything, so it must be able to publish too. It gets a
-    # fixed reserved namespace instead of raising — regardless of whether its row carries an email.
     assert envs.namespace_for({"auth_kind": "internal"}) == envs._INTERNAL_NAMESPACE
     assert envs.namespace_for({"auth_kind": "internal", "email": ""}) == envs._INTERNAL_NAMESPACE
     assert (
@@ -54,8 +67,6 @@ def test_internal_key_gets_reserved_namespace_without_email():
 
 
 def test_internal_special_case_does_not_loosen_user_keys():
-    # The bypass is reserved for auth_kind == "internal" ONLY: a user key (any other auth_kind, or
-    # none) without a valid email must still be rejected so two users can't collide on a namespace.
     for key in ({"auth_kind": "external"}, {"auth_kind": "user", "email": "no-at"}, {"email": ""}):
         with pytest.raises(envs.EnvPublishError, match="email"):
             envs.namespace_for(key)
@@ -68,40 +79,34 @@ def test_sanitize_name_never_returns_path_segments():
     assert envs._sanitize_name("My Env!") == "my-env"
 
 
-def test_publish_uploads_to_github_and_returns_slug(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    captured: dict[str, object] = {}
+def test_blob_key_is_deterministic_from_slug():
+    assert envs.blob_key_for("dev-clado-ai/my-env") == "flash-envs/dev-clado-ai/my-env/package.tar.gz"
 
-    def fake_publish_once(*, dest, repo, token, publish_root, message):
-        captured.update(
-            repo=repo,
-            token=token,
-            publish_root=publish_root,
-            message=message,
-            files=sorted(
-                path.relative_to(dest).as_posix() for path in dest.rglob("*") if path.is_file()
-            ),
-        )
 
-    monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
+def test_publish_uploads_to_azure_and_returns_slug(fake_azure):
+    package = _pkg_b64(_MINIMAL)
     ref = envs.publish_package(
-        package_b64=_pkg_b64(_MINIMAL),
+        package_b64=package,
         name="My Env!",
         key={"email": "dev@clado.ai"},
     )
 
-    root = "dev-clado-ai/my-env"
-    assert ref == root
-    assert captured["repo"] == "freesolo-co/environment-hub"
-    assert captured["token"] == "ghp-test"
-    assert captured["publish_root"] == root
-    assert captured["message"] == "Upload Flash environment dev-clado-ai/my-env"
-    assert captured["files"] == ["environment.py", "pyproject.toml"]
+    slug = "dev-clado-ai/my-env"
+    assert ref == slug
+    assert fake_azure["blob_key"] == "flash-envs/dev-clado-ai/my-env/package.tar.gz"
+    # The original uploaded tarball bytes are stored verbatim.
+    assert fake_azure["data"] == base64.b64decode(package)
+    upsert = fake_azure["upsert"]
+    assert upsert["slug"] == slug
+    assert upsert["namespace"] == "dev-clado-ai"
+    assert upsert["name"] == "my-env"
+    assert upsert["blob_container"] == "flash-environments"
+    assert upsert["blob_key"] == "flash-envs/dev-clado-ai/my-env/package.tar.gz"
+    assert len(upsert["package_sha256"]) == 64
+    assert upsert["size_bytes"] == len(base64.b64decode(package))
 
 
-def test_publish_rejects_bad_input(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)
+def test_publish_rejects_bad_input(fake_azure):
     with pytest.raises(envs.EnvPublishError, match="base64"):
         envs.publish_package(package_b64="not base64!!!", name="e", key={})
     with pytest.raises(envs.EnvPublishError, match="empty"):
@@ -116,28 +121,37 @@ def test_publish_rejects_bad_input(monkeypatch):
         )
 
 
-def test_publish_requires_github_token(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+def test_publish_requires_blob_config(monkeypatch):
+    # No connection string configured -> AzureBlobNotConfigured -> 503 (control-plane misconfig).
+    monkeypatch.delenv("FLASH_ENV_BLOB_CONNECTION_STRING", raising=False)
     with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", key={})
+        envs.publish_package(
+            package_b64=_pkg_b64(_MINIMAL), name="e", key={"email": "dev@clado.ai"}
+        )
     assert excinfo.value.status == 503
-    assert "GITHUB_TOKEN" in str(excinfo.value)
+    assert "FLASH_ENV_BLOB_CONNECTION_STRING" in str(excinfo.value)
 
 
-def test_publish_does_not_accept_github_pat_alias(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.setenv("GITHUB_PAT", "github_pat_test")
-    with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.publish_package(package_b64=_pkg_b64(_MINIMAL), name="e", key={})
-    assert excinfo.value.status == 503
-    assert "GITHUB_TOKEN" in str(excinfo.value)
-
-
-def test_record_published_environment_posts_to_backend(monkeypatch):
+def test_record_published_environment_posts_blob_pointer(monkeypatch):
     from flash.server import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
+    monkeypatch.setattr(azure_blob, "container_name", lambda: "flash-environments")
+    monkeypatch.setattr(
+        environment_store,
+        "lookup",
+        lambda slug: environment_store.EnvironmentRecord(
+            slug=slug,
+            namespace="dev-clado-ai",
+            name="my-env",
+            blob_container="flash-environments",
+            blob_key="flash-envs/dev-clado-ai/my-env/package.tar.gz",
+            package_sha256="a" * 64,
+            size_bytes=10,
+            version=1,
+        ),
+    )
     seen: dict[str, object] = {}
 
     class _Resp:
@@ -171,9 +185,9 @@ def test_record_published_environment_posts_to_backend(monkeypatch):
         "orgId": "org-1",
         "slug": "dev-clado-ai/my-env",
         "name": "My Env",
-        "hubRepo": "freesolo-co/environment-hub",
-        "hubRef": "main",
-        "hubPath": "dev-clado-ai/my-env/environment.py",
+        "blobContainer": "flash-environments",
+        "blobKey": "flash-envs/dev-clado-ai/my-env/package.tar.gz",
+        "packageSha256": "a" * 64,
         "publishedByUserId": "user-1",
         "apiKeyId": "key-1",
         "metadata": {"source": "flash.env.push"},
@@ -351,24 +365,6 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
     assert body["metrics"] == {"cost_usd": 0.25}
 
 
-def test_redacts_raw_and_url_encoded_token():
-    token = "ghp_test/with:special"
-    encoded = "ghp_test%2Fwith%3Aspecial"
-    assert envs._redact(f"https://x-access-token:{encoded}@github.com\n{token}", token) == (
-        "https://x-access-token:<redacted>@github.com\n<redacted>"
-    )
-
-
-def test_copy_package_to_checkout_rejects_escape(tmp_path):
-    source = tmp_path / "source"
-    checkout = tmp_path / "checkout"
-    source.mkdir()
-    checkout.mkdir()
-    (source / "environment.py").write_text("def load_environment(**k): pass\n")
-    with pytest.raises(envs.EnvPublishError, match="unsafe"):
-        envs._copy_package_to_checkout(source=source, checkout=checkout, publish_root="../escape")
-
-
 def test_safe_extract_rejects_traversal(tmp_path):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -446,77 +442,3 @@ def test_safe_extract_allows_environment_sidecars(tmp_path):
 
     for name, content in files.items():
         assert (tmp_path / name).read_text() == content
-
-
-def test_push_environment_commit_rebases_before_push(monkeypatch, tmp_path):
-    calls: list[list[str]] = []
-
-    def fake_run_git(cwd, args, *, token):
-        calls.append(args)
-        return subprocess.CompletedProcess(["git", *args], 0, "", "")
-
-    monkeypatch.setattr(envs, "_run_git", fake_run_git)
-    envs._push_environment_commit(checkout=tmp_path, token="tok")
-
-    assert calls == [
-        ["pull", "--rebase", "origin", "main"],
-        ["push", "origin", "HEAD:main"],
-    ]
-
-
-def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    (tmp_path / "environment.py").write_text("def load_environment(**k): pass\n")
-    calls = {"count": 0}
-
-    def fake_publish_once(**_kwargs):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            raise envs.EnvPublishError("failed to push some refs")
-
-    monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
-    monkeypatch.setattr(envs.time, "sleep", lambda _seconds: None)
-
-    ref = envs._github_publish(tmp_path, name="e", key={"email": "dev@clado.ai"})
-
-    assert calls["count"] == 2
-    assert ref == "dev-clado-ai/e"
-
-
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
-def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypatch):
-    remote = tmp_path / "training.git"
-    seed = tmp_path / "seed"
-    seed.mkdir()
-    _git(seed, "init", "--initial-branch", "main")
-    _git(seed, "config", "user.name", "test")
-    _git(seed, "config", "user.email", "test@example.com")
-    (seed / "README.md").write_text("hub\n")
-    _git(seed, "add", "README.md")
-    _git(seed, "commit", "-m", "seed")
-    _git(seed, "init", "--bare", str(remote))
-    _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "origin", "main")
-
-    package = tmp_path / "package"
-    package.mkdir()
-    (package / "environment.py").write_text("def load_environment(**k): pass\n")
-
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
-
-    envs._github_publish_once(
-        dest=package,
-        repo="ignored/repo",
-        token="tok",
-        publish_root="ns/env/publish-1",
-        message="Upload test env",
-    )
-
-    verify = tmp_path / "verify"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
-    assert (verify / "ns/env/publish-1/environment.py").read_text() == (
-        "def load_environment(**k): pass\n"
-    )

@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+    "environment": {"id": "freesolo-co/gsm8k"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
@@ -205,7 +205,8 @@ def test_http_error_detail_falls_back_to_reason():
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setenv("FLASH_ENV_BLOB_CONNECTION_STRING", "DefaultEndpointsProtocol=https;x=y")
+    monkeypatch.setenv("FLASH_ENV_PG_URL", "postgres://u:p@h/db")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     import flash.runner as runner
     import flash.server.auth as auth_mod

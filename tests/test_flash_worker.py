@@ -63,13 +63,12 @@ def test_build_worker_env_forwards_judge_model(monkeypatch):
     assert "FLASH_JUDGE_MODEL" not in build_worker_env(_spec(), 0)
 
 
-def test_build_worker_env_forwards_github_env_source_token(monkeypatch):
-    """The worker receives the control-plane token used for managed Freesolo environments."""
+def test_build_worker_env_does_not_forward_github_token(monkeypatch):
+    """The worker fetches env packages via a SAS URL threaded in the spec, so it needs no
+    GITHUB_TOKEN (or Azure credentials) in its environment."""
     from flash.providers.runpod.train import build_worker_env
 
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
-    assert build_worker_env(_spec(), 0).get("GITHUB_TOKEN") == "ghp-secret"
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     assert "GITHUB_TOKEN" not in build_worker_env(_spec(), 0)
 
 

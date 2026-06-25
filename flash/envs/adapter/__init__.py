@@ -20,20 +20,17 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from flash.envs.base import BaseEnvironment
 
-_DEFAULT_GITHUB_REF = "main"
 _DEFAULT_ENVIRONMENT_PATH = "environment.py"
-_DEFAULT_MANAGED_ENV_REPO = "freesolo-co/environment-hub"
 _CACHE_ROOT = Path(os.environ.get("FLASH_ENV_CACHE_DIR", "/tmp/flash-env-cache"))
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 5000
-_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
-_GITHUB_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_DOWNLOAD_TIMEOUT_S = 120.0
+_SLUG_SAFE_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _TAR_METADATA_TYPES = {
     tarfile.XHDTYPE,
     tarfile.XGLTYPE,
@@ -44,53 +41,14 @@ _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
 
 
-class GitHubRateLimitError(RuntimeError):
-    """Raised when the GitHub API rate-limits us (HTTP 429, or a 403 whose body says "rate limit").
-
-    Raised by ``_urlopen`` only after the in-process jittered retry is exhausted, so it signals a
-    *persistent* limit. The worker's top-level handler catches it and stamps ``retriable=True`` so
-    the control plane reschedules the job on a fresh worker once the limit window resets, instead of
-    permanently failing the run. The real spawn-wave mitigation is the control-plane resolve-once
-    pin (EnvironmentSpec.resolved_sha) that lets workers skip the GitHub resolve entirely.
-    """
-
-
-@dataclass(frozen=True)
-class GitHubEnvironmentRef:
-    owner: str
-    repo: str
-    ref: str
-    path: str
-
-    @property
-    def repo_full_name(self) -> str:
-        return f"{self.owner}/{self.repo}"
-
-    def canonical(self) -> str:
-        return f"github:{self.repo_full_name}@{self.ref}:{self.path}"
-
-
-def is_github_environment_ref(value: str) -> bool:
-    return _parse_github_environment_ref(value) is not None
-
-
 def is_managed_environment_slug(value: str) -> bool:
     return _parse_managed_environment_slug(value) is not None
 
 
 def is_freesolo_environment_id(value: str) -> bool:
-    return is_managed_environment_slug(value) or is_github_environment_ref(value)
-
-
-def managed_slug_to_github_ref(value: str) -> str:
-    parsed = _parse_managed_environment_slug(value)
-    if parsed is None:
-        raise ValueError(f"not a Freesolo environment slug: {value!r}")
-    namespace, name = parsed
-    return (
-        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
-        f"{namespace}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
-    )
+    # Managed Hub slugs (``namespace/name``) are the only environment id form Flash accepts now that
+    # package storage is Azure Blob (the old ``github:`` / github.com URL refs are gone).
+    return is_managed_environment_slug(value)
 
 
 def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
@@ -101,227 +59,37 @@ def _parse_managed_environment_slug(value: str) -> tuple[str, str] | None:
     if parsed.scheme or parsed.netloc:
         return None
     parts = text.split("/")
-    if len(parts) != 2 or not _is_safe_github_path_parts(tuple(parts)):
+    if len(parts) != 2 or not _is_safe_slug_parts(tuple(parts)):
         return None
     return parts[0], parts[1]
 
 
-def _parse_github_environment_ref(value: str) -> GitHubEnvironmentRef | None:
-    text = (value or "").strip()
-    if not text:
-        return None
-    if text.startswith("github:"):
-        body = text[len("github:") :]
-        repo_ref, sep, path = body.partition(":")
-        try:
-            path = _normalize_env_path(path)
-        except ValueError:
-            return None
-        if not sep:
-            path = _DEFAULT_ENVIRONMENT_PATH
-        repo_part, at, ref = repo_ref.partition("@")
-        if not at:
-            ref = _DEFAULT_GITHUB_REF
-        if not ref:
-            return None
-        if not _is_safe_github_path_parts((ref,)):
-            return None
-        owner_repo = repo_part.split("/")
-        if len(owner_repo) == 2 and _is_safe_github_path_parts(owner_repo):
-            return GitHubEnvironmentRef(owner_repo[0], owner_repo[1], ref, path)
-        return None
-
-    parsed = urllib.parse.urlparse(text)
-    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "github.com":
-        return None
-    parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/") if p]
-    if len(parts) < 2:
-        return None
-    owner, repo = parts[0], parts[1]
-    repo = repo[:-4] if repo.endswith(".git") else repo
-    if not _is_safe_github_path_parts((owner, repo)):
-        return None
-    if len(parts) >= 5 and parts[2] in {"blob", "tree"}:
-        ref = parts[3]
-        if not _is_safe_github_path_parts((ref,)):
-            return None
-        raw_path = "/".join(parts[4:])
-        if not _is_safe_environment_path(raw_path):
-            return None
-        try:
-            path = _normalize_env_path(raw_path)
-        except ValueError:
-            return None
-        if not raw_path:
-            path = _DEFAULT_ENVIRONMENT_PATH
-        if parts[2] == "tree" and raw_path and not path.endswith(".py"):
-            path = f"{path.rstrip('/')}/{_DEFAULT_ENVIRONMENT_PATH}"
-    elif len(parts) == 2:
-        ref = _DEFAULT_GITHUB_REF
-        path = _DEFAULT_ENVIRONMENT_PATH
-    else:
-        return None
-    return GitHubEnvironmentRef(owner, repo, ref, path)
-
-
-def _normalize_env_path(path: str | None) -> str:
-    if not path:
-        return _DEFAULT_ENVIRONMENT_PATH
-    raw = path.strip()
-    if not raw:
-        return _DEFAULT_ENVIRONMENT_PATH
-    raw = raw.replace("\\", "/")
-    if raw.startswith("/"):
-        raise ValueError(f"unsafe environment path: {path!r}")
-    if not raw:
-        return _DEFAULT_ENVIRONMENT_PATH
-    parts = [part for part in raw.split("/") if part]
-    if not parts:
-        return _DEFAULT_ENVIRONMENT_PATH
-    if any(part == ".." or part == "." for part in parts):
-        raise ValueError(f"unsafe environment path: {path!r}")
-    return "/".join(parts)
-
-
-def _is_safe_environment_path(path: str) -> bool:
-    if not path:
-        return True
-    raw = path.strip().replace("\\", "/")
-    if raw.startswith("/"):
-        return False
-    parts = [part for part in raw.split("/") if part]
-    if not parts:
-        return True
-    return not any(part in {".", ".."} for part in parts)
-
-
-def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
+def _is_safe_slug_parts(parts: list[str] | tuple[str, ...]) -> bool:
     if not parts:
         return False
     if any(part in {".", "..", ""} for part in parts):
         return False
-    return all(_GITHUB_SAFE_PART_RE.fullmatch(part) for part in parts)
+    return all(_SLUG_SAFE_PART_RE.fullmatch(part) for part in parts)
 
 
-def _github_token() -> str | None:
-    return os.environ.get("GITHUB_TOKEN")
-
-
-def _is_commit_sha(value: str) -> bool:
-    return _COMMIT_SHA_RE.fullmatch(value) is not None
-
-
-def _resolve_ref_sha(
-    parsed: GitHubEnvironmentRef,
-    pinned_sha: str | None = None,
-    *,
-    timeout: float = 60.0,
-    max_rate_limit_retries: int = 5,
-) -> str:
-    # Resolve-once hook: the control plane resolves ref->sha ONCE (runner._assign_resolved_env_sha)
-    # and threads the pinned commit sha through, so every worker in a fan-out short-circuits here
-    # without hitting GitHub at all — this is what actually defuses a cold spawn wave (the prior
-    # in-process cache could not, since each worker is a separate process). Same effect as the
-    # immutable-ref fast path below, but applied to a symbolic ref (e.g. "main"). Only a real
-    # 40-char sha is trusted; anything else falls through to a live resolve. The control plane
-    # passes a short timeout + max_rate_limit_retries=0 so its best-effort pin can't block run
-    # creation; the worker keeps the full retry budget.
-    if pinned_sha and _is_commit_sha(pinned_sha):
-        return pinned_sha
-    if _is_commit_sha(parsed.ref):
-        return parsed.ref
-    # No pin (legacy spec / non-managed ref / control-plane resolve failed): resolve the symbolic
-    # ref live every time. We deliberately do NOT cache symbolic refs in-process — a long-lived
-    # process must see a moved branch (managed slugs point at environment-hub@main, which moves on
-    # `flash env push`), and the immutable-sha cases above already skip the network.
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "freesolo-flash"}
-    token = _github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
-    req = urllib.request.Request(commit_url, headers=headers)
-    data = _urlopen(req, timeout=timeout, max_rate_limit_retries=max_rate_limit_retries)
+def _download_bytes(url: str) -> bytes:
+    """GET the bytes at ``url`` (an Azure Blob read SAS URL). No auth header — the SAS carries it."""
+    req = urllib.request.Request(url, headers={"User-Agent": "freesolo-flash"})
     try:
-        payload = json.loads(data)
-    except json.JSONDecodeError as exc:
+        with urllib.request.urlopen(req, timeout=_DOWNLOAD_TIMEOUT_S) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
         raise RuntimeError(
-            f"Failed to resolve GitHub environment ref {parsed.canonical()}: invalid response"
+            f"environment package download failed (HTTP {exc.code}): {body[:300]}"
         ) from exc
-    sha = payload.get("sha")
-    if not isinstance(sha, str) or not _is_commit_sha(sha):
-        raise RuntimeError(f"Failed to resolve GitHub environment ref {parsed.canonical()}")
-    return sha
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"environment package download failed: {exc.reason}") from exc
 
 
-def _urlopen(
-    req: urllib.request.Request, *, timeout: float = 60.0, max_rate_limit_retries: int = 5
-) -> bytes:
-    """Fetch bytes for a GitHub request, surviving GitHub's secondary rate limit.
-
-    On a 429 or a 403 whose body says "rate limit" (a cold spawn wave of workers all hitting the
-    commits/tarball endpoint trips GitHub's abuse detection), retry up to ``max_rate_limit_retries``
-    times with jitter so concurrent workers don't all retry in lockstep. If the limit persists past
-    the retries, raise ``GitHubRateLimitError`` so the worker's top-level handler stamps
-    ``retriable=True`` and the run reschedules on a fresh worker, instead of hard-failing on a
-    transient limit. Any other HTTP / URL error raises a plain ``RuntimeError`` (non-retriable).
-
-    ``max_rate_limit_retries=0`` makes it fail fast (one request, no sleeps): the control plane uses
-    that for its best-effort resolve-once pin so a persistent limit can never block run creation —
-    the long retry belongs on the worker, which can afford to wait.
-    """
-    import random
-    import time
-
-    _RATE_LIMIT_BASE_DELAY = 10.0
-    attempt = 0
-    while True:
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
-            is_rate_limit = exc.code == 429 or (exc.code == 403 and "rate limit" in body.lower())
-            if is_rate_limit and attempt < max_rate_limit_retries:
-                delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
-                time.sleep(delay)
-                attempt += 1
-                continue
-            if is_rate_limit:
-                # Persistent limit: signal retriable so the control plane reschedules (#209).
-                raise GitHubRateLimitError(
-                    f"GitHub API rate limit exceeded ({exc.code}): {body[:300]}"
-                ) from exc
-            raise RuntimeError(f"GitHub environment request failed ({exc.code}): {body[:500]}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"GitHub environment request failed: {exc.reason}") from exc
-
-
-def _download_github_tarball(ref: GitHubEnvironmentRef) -> bytes:
-    # Callers download the tarball for the ALREADY-resolved commit sha (see
-    # _resolve_github_environment_file), which extracts it into the content-addressed disk cache
-    # under _CACHE_ROOT/<hash(repo@sha:path)> and never re-downloads on a hit. So reuse is handled
-    # on disk; we deliberately do NOT also retain the (up to _MAX_ARCHIVE_BYTES) archive bytes in a
-    # module-level cache for the worker's lifetime — that wasted hundreds of MiB of RAM per process.
-    url = f"https://api.github.com/repos/{ref.repo_full_name}/tarball/{urllib.parse.quote(ref.ref, safe='')}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "freesolo-flash",
-    }
-    token = _github_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    data = _urlopen(urllib.request.Request(url, headers=headers), timeout=120.0)
-    if len(data) > _MAX_ARCHIVE_BYTES:
-        raise RuntimeError(
-            f"environment archive is too large ({len(data)} bytes; "
-            f"limit {_MAX_ARCHIVE_BYTES} bytes)"
-        )
-    return data
-
-
-def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
+def _extract_env_package(tar_bytes: bytes, dest: Path) -> None:
+    """Extract a published env ``.tar.gz`` (environment.py at the root) safely into ``dest``."""
     root = dest.resolve()
-    top_dirs: set[str] = set()
     total = 0
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
         for count, member in enumerate(tar, start=1):
@@ -346,80 +114,94 @@ def _safe_extract_archive(tar_bytes: bytes, dest: Path) -> Path:
                 raise RuntimeError(f"unsafe path in environment archive: {member.name!r}")
             if member.islnk() or member.issym() or not (member.isreg() or member.isdir()):
                 continue
-            top_dirs.add(parts[0])
             total += max(0, member.size)
             if total > _MAX_ARCHIVE_BYTES:
                 raise RuntimeError(
-                    f"environment archive is too large uncompressed ({total} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+                    f"environment archive is too large uncompressed ({total} bytes; "
+                    f"limit {_MAX_ARCHIVE_BYTES} bytes)"
                 )
             member.name = normalized_name
             tar.extract(member, dest)
-    if len(top_dirs) != 1:
-        raise RuntimeError("environment archive had an unexpected layout")
-    extracted = dest / next(iter(top_dirs))
-    if not extracted.is_dir():
-        raise RuntimeError("environment archive did not extract to a directory")
-    return extracted
 
 
-def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
-    parsed = _parse_github_environment_ref(env_ref)
-    if parsed is None:
-        raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
-    # Only forward pinned_sha when set, so the unpatched _resolve_ref_sha(parsed) call shape stays
-    # single-arg (a test monkeypatch like ``lambda parsed: ...`` keeps working).
-    resolved_ref = (
-        _resolve_ref_sha(parsed, pinned_sha=pinned_sha) if pinned_sha else _resolve_ref_sha(parsed)
-    )
-    cache_key = hashlib.sha256(
-        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
-    ).hexdigest()[:24]
+def _find_env_entrypoint(base: Path) -> Path | None:
+    """Locate ``environment.py`` in an extracted package (at the root, or one wrapper dir down)."""
+    if not base.is_dir():
+        return None
+    direct = base / _DEFAULT_ENVIRONMENT_PATH
+    if direct.is_file():
+        return direct
+    subdirs = [p for p in base.iterdir() if p.is_dir()]
+    if len(subdirs) == 1:
+        nested = subdirs[0] / _DEFAULT_ENVIRONMENT_PATH
+        if nested.is_file():
+            return nested
+    return None
+
+
+def _download_env_package(url: str, sha256: str | None) -> Path:
+    """Download + verify + extract an env package from a SAS URL; return the cached environment.py.
+
+    Content-addressed by sha (or the URL when no sha is pinned): a second run with the same package
+    reuses the extracted disk cache under ``_CACHE_ROOT`` and never re-downloads.
+    """
+    cache_key = hashlib.sha256((sha256 or url).encode()).hexdigest()[:24]
     cache_dir = _CACHE_ROOT / cache_key
-    env_file = cache_dir / parsed.path
-    if env_file.is_dir():
-        env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
-    if env_file.is_file():
-        return env_file
-    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
-    resolved = GitHubEnvironmentRef(
-        parsed.owner,
-        parsed.repo,
-        resolved_ref,
-        parsed.path,
-    )
-    try:
-        extracted = _safe_extract_archive(_download_github_tarball(resolved), tmp_parent)
-        candidate = extracted / parsed.path
-        if candidate.is_dir():
-            candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
-        required_entrypoint = candidate.relative_to(extracted).as_posix()
-        if not candidate.is_file():
-            raise FileNotFoundError(
-                f"environment archive did not contain required entrypoint {required_entrypoint!r}"
+    cached = _find_env_entrypoint(cache_dir)
+    if cached is not None:
+        return cached
+    data = _download_bytes(url)
+    if len(data) > _MAX_ARCHIVE_BYTES:
+        raise RuntimeError(
+            f"environment archive is too large ({len(data)} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
+        )
+    if sha256:
+        got = hashlib.sha256(data).hexdigest()
+        if got != sha256:
+            raise RuntimeError(
+                f"environment package checksum mismatch (expected {sha256}, got {got}); refusing "
+                f"to load a tampered or truncated package"
             )
+    tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-pkg-"))
+    try:
+        _extract_env_package(data, tmp_parent)
+        entry = _find_env_entrypoint(tmp_parent)
+        if entry is None:
+            raise FileNotFoundError("environment package did not contain environment.py")
+        base = entry.parent
         cache_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
-        shutil.copytree(extracted, cache_dir)
-        return cache_dir / candidate.relative_to(extracted)
+        shutil.copytree(base, cache_dir)
+        return cache_dir / entry.name
     finally:
         shutil.rmtree(tmp_parent, ignore_errors=True)
 
 
-def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) -> str:
-    # pinned_sha (resolve-once hook, item 3): when the control plane already resolved this env's
-    # ref->sha, it threads the commit sha here so the GitHub commits API is skipped entirely. None
-    # (the default and today's behavior) means the worker resolves the ref itself.
-    if is_managed_environment_slug(env_ref):
-        return str(
-            _resolve_github_environment_file(managed_slug_to_github_ref(env_ref), pinned_sha)
+def _resolve_environment_reference(
+    env_id: str, resolved_package_url: str | None = None, resolved_sha: str | None = None
+) -> str:
+    # Managed slug (namespace/name): the control plane resolves it to an Azure Blob read SAS URL at
+    # submit (runner._assign_resolved_env_pkg) and threads it here. The worker downloads + verifies
+    # + extracts the package and returns the path to environment.py. There is NO GitHub fallback.
+    if is_managed_environment_slug(env_id):
+        if resolved_package_url:
+            return str(_download_env_package(resolved_package_url, resolved_sha or None))
+        # Offline/local checkout at this path (tests), else a clear unresolved error.
+        local = Path(env_id)
+        if local.exists():
+            return str(local)
+        raise RuntimeError(
+            f"environment {env_id!r} could not be resolved to a package: no Azure Blob URL was "
+            f"provided (it may not be published — run `flash env push`)"
         )
-    parsed = _parse_github_environment_ref(env_ref)
-    if parsed is None:
-        path = Path(env_ref)
-        if path.exists():
-            return str(path)
-        return env_ref
-    return str(_resolve_github_environment_file(env_ref, pinned_sha))
+    # A direct local path (offline tests / programmatic use).
+    local = Path(env_id)
+    if local.exists():
+        return str(local)
+    raise ValueError(
+        f"unrecognized environment id {env_id!r}: expected a published slug 'namespace/name' "
+        f"or an existing local path"
+    )
 
 
 def _resolve_path_arg(value: object, base_dir: Path) -> object:
@@ -783,15 +565,19 @@ class FreesoloEnvironment(BaseEnvironment):
 
 
 def load_freesolo_environment(
-    env_id: str, pinned_sha: str | None = None, /, **kwargs
+    env_id: str,
+    resolved_package_url: str | None = None,
+    resolved_sha: str | None = None,
+    /,
+    **kwargs,
 ) -> FreesoloEnvironment:
-    # pinned_sha is a POSITIONAL-ONLY resolve-once hook (the control-plane-pinned commit sha). It is
-    # positional-only (the `/`) precisely so a user [environment.params] entry of ANY name — even
-    # one literally named "pinned_sha" — lands in **kwargs and is forwarded verbatim to the Freesolo
-    # SDK loader, never binding to or shadowing this internal pin. None (default) preserves today's
-    # behavior — the worker resolves the env ref->sha itself.
+    # resolved_package_url + resolved_sha are POSITIONAL-ONLY resolve-once hooks (the control-plane
+    # Azure Blob read SAS URL + the package SHA-256). Positional-only (the `/`) precisely so a user
+    # [environment.params] entry of ANY name lands in **kwargs and is forwarded verbatim to the
+    # Freesolo SDK loader, never binding to or shadowing these internal hints. None (the default)
+    # leaves the env unresolved unless ``env_id`` is an existing local path.
     tools = _import_freesolo_environment_tools()
-    reference = _resolve_environment_reference(env_id, pinned_sha)
+    reference = _resolve_environment_reference(env_id, resolved_package_url, resolved_sha)
     reference_path = Path(reference)
     base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
 
@@ -835,10 +621,7 @@ def load_freesolo_environment(
 
 __all__ = [
     "FreesoloEnvironment",
-    "GitHubEnvironmentRef",
     "is_freesolo_environment_id",
-    "is_github_environment_ref",
     "is_managed_environment_slug",
     "load_freesolo_environment",
-    "managed_slug_to_github_ref",
 ]

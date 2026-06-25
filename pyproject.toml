@@ -65,6 +65,11 @@ server = [
     "huggingface-hub>=0.34",
     "datasets>=2.19",
     "freesolo>=0.2.49",
+    # Environment package storage: bytes live in Azure Blob, the slug->blob index in
+    # Azure PostgreSQL. Control-plane only -- the GPU worker fetches via a SAS URL over
+    # httpx (no Azure SDK), see flash/envs/adapter.
+    "azure-storage-blob>=12.19",
+    "psycopg[binary]>=3.1",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
@@ -78,6 +83,8 @@ dev = [
     "huggingface-hub>=0.34",
     "datasets>=2.19",
     "freesolo>=0.2.49",
+    "azure-storage-blob>=12.19",
+    "psycopg[binary]>=3.1",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on separate machines.

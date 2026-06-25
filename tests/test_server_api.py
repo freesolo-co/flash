@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "algorithm": "grpo",
-    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+    "environment": {"id": "freesolo-co/gsm8k"},
     "train": {"steps": 1, "seeds": [0], "hf_repo": "org/test-runs"},
     "gpu": {"type": "RTX 5090"},
 }
@@ -61,7 +61,8 @@ def _identity_for_token(token: str) -> dict[str, str]:
 @pytest.fixture
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setenv("FLASH_ENV_BLOB_CONNECTION_STRING", "DefaultEndpointsProtocol=https;x=y")
+    monkeypatch.setenv("FLASH_ENV_PG_URL", "postgres://u:p@h/db")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     import flash.runner as runner
     import flash.server.auth as auth_mod
@@ -1102,19 +1103,22 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     )
 
 
-def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
-    """POST /v1/envs publishes an uploaded package to the managed environment hub."""
+def test_publish_env_endpoint_publishes_to_azure(api, monkeypatch):
+    """POST /v1/envs uploads an env package to Azure Blob and indexes it in Azure Postgres."""
     import base64
     import io
     import tarfile
 
-    import flash.server.envs as envs_mod
+    import flash.server.azure_blob as azure_blob
+    import flash.server.environment_store as environment_store
 
-    published_roots: list[str] = []
+    captured: dict = {}
     monkeypatch.setattr(
-        envs_mod,
-        "_github_publish_once",
-        lambda *, publish_root, **_kwargs: published_roots.append(publish_root),
+        azure_blob, "upload_package", lambda blob_key, data: captured.update(blob_key=blob_key)
+    )
+    monkeypatch.setattr(azure_blob, "container_name", lambda: "flash-environments")
+    monkeypatch.setattr(
+        environment_store, "upsert", lambda **kwargs: captured.update(slug=kwargs["slug"])
     )
 
     buf = io.BytesIO()
@@ -1136,7 +1140,8 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     assert resp.status_code == 200
     ref = resp.json()["id"]
     assert ref.endswith("/myenv")
-    assert any(root.endswith("/myenv") for root in published_roots)
+    assert captured["slug"] == ref
+    assert captured["blob_key"] == f"flash-envs/{ref}/package.tar.gz"
 
     # Unauthenticated requests are rejected.
     assert api.post("/v1/envs", json={"name": "e", "package_b64": pkg}).status_code in (401, 403)

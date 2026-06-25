@@ -1,37 +1,33 @@
 """Managed Freesolo environment publishing.
 
-``POST /v1/envs`` accepts a packaged Freesolo environment and uploads it to the
-managed environment hub. The returned id is a Freesolo environment slug
-(``namespace/name``) that Flash resolves internally.
+``POST /v1/envs`` accepts a packaged Freesolo environment and stores it as a single ``.tar.gz``
+blob in Azure Blob Storage, indexed by slug (``namespace/name``) in Azure PostgreSQL. The returned
+id is the slug, which Flash resolves internally: at run submission the control plane looks the slug
+up, mints a short-lived read-only SAS URL for the blob, and threads it to the worker — so the GPU
+worker downloads the package over plain HTTPS with no Azure credentials (see ``flash/envs/adapter``).
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
-import os
 import re
-import shutil
-import subprocess
 import tarfile
 import tempfile
-import time
-import urllib.parse
 from pathlib import Path
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_MEMBERS = 5000
-_DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
-_GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
+# Blob key layout: one tarball per environment slug.
+_BLOB_KEY_PREFIX = "flash-envs"
 _BLOCKED_TOP_LEVEL_PATHS = {
     ".github",
     ".git",
     "source",
 }
-_GIT_TIMEOUT_S = 180
-_GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
 
 def _human_mb(n: int) -> str:
@@ -74,6 +70,11 @@ def _sanitize_name(name: str) -> str:
     if slug in {".", ".."} or not re.search(r"[a-z0-9]", slug):
         return "env"
     return slug or "env"
+
+
+def blob_key_for(slug: str) -> str:
+    """The deterministic blob key for a published environment slug."""
+    return f"{_BLOB_KEY_PREFIX}/{slug}/package.tar.gz"
 
 
 def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
@@ -124,167 +125,6 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
         raise EnvPublishError(f"env package could not be extracted: {exc}") from exc
 
 
-def _github_repo() -> str:
-    return _DEFAULT_GITHUB_REPO
-
-
-def _github_token() -> str | None:
-    return os.environ.get("GITHUB_TOKEN")
-
-
-def _redact(value: str, token: str) -> str:
-    if not token:
-        return value
-    return value.replace(token, "<redacted>").replace(
-        urllib.parse.quote(token, safe=""), "<redacted>"
-    )
-
-
-def _credentialed_repo_url(repo: str, token: str) -> str:
-    quoted = urllib.parse.quote(token, safe="")
-    return f"https://x-access-token:{quoted}@github.com/{repo}.git"
-
-
-def _run_git(cwd: Path, args: list[str], *, token: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    try:
-        proc = subprocess.run(
-            ["git", *args],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
-        )
-    except FileNotFoundError as exc:
-        raise EnvPublishError(
-            "git is required to upload environments to Freesolo", status=503
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise EnvPublishError(
-            f"Freesolo environment upload git command timed out after {_GIT_TIMEOUT_S}s",
-            status=504,
-        ) from exc
-    if proc.returncode != 0:
-        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
-        cmd = "git " + " ".join(args)
-        raise EnvPublishError(
-            _redact(f"Freesolo environment upload failed during `{cmd}`: {output[:1000]}", token),
-            status=502,
-        )
-    return proc
-
-
-def _is_retryable_git_publish_error(message: str) -> bool:
-    lowered = message.lower()
-    permanent = (
-        "authentication failed",
-        "could not read username",
-        "repository not found",
-        "permission denied",
-        "403",
-        "401",
-    )
-    if any(marker in lowered for marker in permanent):
-        return False
-    retryable = (
-        "failed to push some refs",
-        "fetch first",
-        "non-fast-forward",
-        "stale info",
-        "cannot lock ref",
-        "connection reset",
-        "operation timed out",
-        "the remote end hung up",
-        "early eof",
-        "index.lock",
-        "rebase",
-    )
-    return any(marker in lowered for marker in retryable)
-
-
-def _copy_package_to_checkout(*, source: Path, checkout: Path, publish_root: str) -> None:
-    target = checkout / publish_root
-    checkout_root = checkout.resolve()
-    target_root = target.resolve()
-    if target_root != checkout_root and checkout_root not in target_root.parents:
-        raise EnvPublishError("unsafe environment publish path")
-    shutil.rmtree(target, ignore_errors=True)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, target)
-
-
-def _commit_environment_update(
-    *, checkout: Path, publish_root: str, message: str, token: str
-) -> bool:
-    _run_git(checkout, ["config", "user.name", "freesolo-bot"], token=token)
-    _run_git(checkout, ["config", "user.email", "bot@freesolo.co"], token=token)
-    _run_git(checkout, ["add", "-A", "--", publish_root], token=token)
-    try:
-        proc = subprocess.run(
-            ["git", "diff", "--cached", "--quiet", "--", publish_root],
-            cwd=checkout,
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise EnvPublishError(
-            f"Freesolo environment upload git command timed out after {_GIT_TIMEOUT_S}s",
-            status=504,
-        ) from exc
-    if proc.returncode == 0:
-        return False
-    if proc.returncode != 1:
-        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
-        raise EnvPublishError(
-            _redact(
-                f"Freesolo environment upload failed during staged diff check: {output}", token
-            ),
-            status=502,
-        )
-    _run_git(checkout, ["commit", "-m", message], token=token)
-    return True
-
-
-def _push_environment_commit(*, checkout: Path, token: str) -> None:
-    _run_git(checkout, ["pull", "--rebase", "origin", _GITHUB_BRANCH], token=token)
-    _run_git(checkout, ["push", "origin", f"HEAD:{_GITHUB_BRANCH}"], token=token)
-
-
-def _github_publish_once(
-    *,
-    dest: Path,
-    repo: str,
-    token: str,
-    publish_root: str,
-    message: str,
-) -> None:
-    with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
-        tmp_path = Path(tmp)
-        checkout = tmp_path / "environment-hub"
-        _run_git(
-            tmp_path,
-            [
-                "clone",
-                "--branch",
-                _GITHUB_BRANCH,
-                "--single-branch",
-                _credentialed_repo_url(repo, token),
-                str(checkout),
-            ],
-            token=token,
-        )
-        _copy_package_to_checkout(source=dest, checkout=checkout, publish_root=publish_root)
-        if _commit_environment_update(
-            checkout=checkout,
-            publish_root=publish_root,
-            message=message,
-            token=token,
-        ):
-            _push_environment_commit(checkout=checkout, token=token)
-
-
 def _environment_file_relative_path(root: Path) -> str:
     canonical = root / _DEFAULT_ENVIRONMENT_FILE
     if canonical.is_file():
@@ -292,42 +132,40 @@ def _environment_file_relative_path(root: Path) -> str:
     raise EnvPublishError("env package must contain environment.py")
 
 
-def _github_publish(dest: Path, *, name: str, key: dict) -> str:
-    token = _github_token()
-    if not token:
-        raise EnvPublishError(
-            "GITHUB_TOKEN is required to upload environments to Freesolo",
-            status=503,
-        )
-    repo = _github_repo()
-    ns = namespace_for(key)
-    clean = _sanitize_name(name)
-    publish_root = f"{ns}/{clean}"
-    _environment_file_relative_path(dest)
-    if not any(path.is_file() for path in dest.rglob("*")):
-        raise EnvPublishError("env package contains no files")
-    message = f"Upload Flash environment {ns}/{clean}"
+def _azure_publish(*, slug: str, namespace: str, name: str, tar_bytes: bytes) -> None:
+    """Upload the package tarball to Azure Blob and index the pointer in Azure Postgres.
 
-    last_error: EnvPublishError | None = None
-    max_attempts = len(_GIT_PUSH_RETRY_DELAYS_SECONDS) + 1
-    for attempt in range(max_attempts):
-        if attempt:
-            time.sleep(_GIT_PUSH_RETRY_DELAYS_SECONDS[attempt - 1])
-        try:
-            _github_publish_once(
-                dest=dest,
-                repo=repo,
-                token=token,
-                publish_root=publish_root,
-                message=message,
-            )
-            return f"{ns}/{clean}"
-        except EnvPublishError as exc:
-            last_error = exc
-            if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
-                raise
-    assert last_error is not None
-    raise last_error
+    Translates configuration / backend failures into the right HTTP status: 503 when the control
+    plane isn't configured for Azure storage, 502 when the upload or index write fails.
+    """
+    from flash.server import azure_blob, environment_store
+
+    blob_key = blob_key_for(slug)
+    sha = hashlib.sha256(tar_bytes).hexdigest()
+    try:
+        azure_blob.upload_package(blob_key, tar_bytes)
+    except azure_blob.AzureBlobNotConfigured as exc:
+        raise EnvPublishError(str(exc), status=503) from exc
+    except Exception as exc:
+        raise EnvPublishError(
+            f"failed to upload environment package to Azure Blob storage: {exc}", status=502
+        ) from exc
+    try:
+        environment_store.upsert(
+            slug=slug,
+            namespace=namespace,
+            name=name,
+            blob_container=azure_blob.container_name(),
+            blob_key=blob_key,
+            package_sha256=sha,
+            size_bytes=len(tar_bytes),
+        )
+    except environment_store.EnvironmentStoreNotConfigured as exc:
+        raise EnvPublishError(str(exc), status=503) from exc
+    except Exception as exc:
+        raise EnvPublishError(
+            f"failed to index environment package in Azure Postgres: {exc}", status=502
+        ) from exc
 
 
 def publish_package(*, package_b64: str, name: str, key: dict) -> str:
@@ -354,7 +192,14 @@ def publish_package(*, package_b64: str, name: str, key: dict) -> str:
             f"env package upload is too large (limit {_human_mb(_MAX_UPLOAD_BYTES)} compressed)",
             status=413,
         )
+    ns = namespace_for(key)
+    clean = _sanitize_name(name)
+    slug = f"{ns}/{clean}"
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
-        return _github_publish(dest, name=name, key=key)
+        _environment_file_relative_path(dest)
+        if not any(path.is_file() for path in dest.rglob("*")):
+            raise EnvPublishError("env package contains no files")
+    _azure_publish(slug=slug, namespace=ns, name=clean, tar_bytes=tar_bytes)
+    return slug

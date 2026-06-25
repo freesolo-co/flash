@@ -11,11 +11,17 @@ import flash.providers.preflight as pf
 def clean_env(monkeypatch):
     for var in (
         "RUNPOD_API_KEY",
-        "GITHUB_TOKEN",
+        "FLASH_ENV_BLOB_CONNECTION_STRING",
+        "FLASH_ENV_PG_URL",
         "HF_REPO",
         "HF_TOKEN",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+def _set_azure(monkeypatch):
+    monkeypatch.setenv("FLASH_ENV_BLOB_CONNECTION_STRING", "DefaultEndpointsProtocol=https;x=y")
+    monkeypatch.setenv("FLASH_ENV_PG_URL", "postgres://u:p@h/db")
 
 
 def test_preflight_lists_all_missing(clean_env):
@@ -23,7 +29,8 @@ def test_preflight_lists_all_missing(clean_env):
         pf.check_run_preflight()
     msg = str(excinfo.value)
     assert "RUNPOD_API_KEY" in msg
-    assert "GITHUB_TOKEN" in msg
+    assert "FLASH_ENV_BLOB_CONNECTION_STRING" in msg
+    assert "FLASH_ENV_PG_URL" in msg
     assert "HF_REPO" not in msg
     assert "HF_TOKEN" in msg
     assert "operator" in msg
@@ -31,14 +38,14 @@ def test_preflight_lists_all_missing(clean_env):
 
 def test_preflight_passes_when_present(clean_env, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-key")
+    _set_azure(monkeypatch)
     monkeypatch.setenv("HF_TOKEN", "hf_token")
     pf.check_run_preflight()
 
 
 def test_preflight_require_hf_false_still_needs_provider_keys(clean_env, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-key")
+    _set_azure(monkeypatch)
     pf.check_run_preflight(require_hf=False)
     with pytest.raises(pf.PreflightError):
         pf.check_run_preflight(require_hf=True)
@@ -52,7 +59,7 @@ def test_runpod_key_is_env_only(clean_env):
 
 def test_preflight_requires_runpod_by_default(clean_env, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_token")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-key")
+    _set_azure(monkeypatch)
     with pytest.raises(pf.PreflightError) as excinfo:
         pf.check_run_preflight()
     assert "RUNPOD_API_KEY" in str(excinfo.value)
@@ -62,19 +69,20 @@ def test_preflight_requires_runpod_by_default(clean_env, monkeypatch):
 
 def test_preflight_passes_with_required_operator_keys(clean_env, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp")
+    _set_azure(monkeypatch)
     monkeypatch.setenv("HF_TOKEN", "hf")
     pf.check_run_preflight()
 
 
-def test_preflight_always_requires_shared_hf_and_github(clean_env, monkeypatch):
+def test_preflight_always_requires_shared_hf_and_azure(clean_env, monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp")
     with pytest.raises(pf.PreflightError) as excinfo:
         pf.check_run_preflight()
     msg = str(excinfo.value)
     assert "HF_REPO" not in msg
     assert "HF_TOKEN" in msg
-    assert "GITHUB_TOKEN" in msg
+    assert "FLASH_ENV_BLOB_CONNECTION_STRING" in msg
+    assert "FLASH_ENV_PG_URL" in msg
 
 
 def test_client_requires_login(monkeypatch, tmp_path):

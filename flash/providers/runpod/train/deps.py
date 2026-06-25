@@ -261,16 +261,16 @@ def build_worker_env(
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
     }
-    # HF artifact creds + managed environment hub creds + optional reward-judge creds: a Freesolo
-    # environment whose reward calls an LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER,
-    # where the reward runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env
-    # reads (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's
+    # HF artifact creds + optional reward-judge creds: a Freesolo environment whose reward calls an
+    # LLM judge (e.g. OpenRouter gpt-oss-120b) needs the API key ON THE WORKER, where the reward
+    # runs. FLASH_JUDGE_MODEL is the judge model id the optimizer-authored env reads
+    # (agents/common/prompt.py) to pick the JudgeRubric client model; forward the operator's
     # control-plane override so SFT-eval/GRPO-reward/rejection-sampling judges don't silently fall
     # back to the env's generated default. Forward any that the operator has set; absent ones are
-    # simply not passed (the env then uses its own default model).
+    # simply not passed (the env then uses its own default model). The env PACKAGE is fetched via a
+    # SAS URL threaded through the spec, so the worker needs no GITHUB_TOKEN or Azure credentials.
     for key in (
         "HF_TOKEN",
-        "GITHUB_TOKEN",
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "FLASH_JUDGE_MODEL",

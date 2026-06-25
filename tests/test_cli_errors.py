@@ -47,7 +47,7 @@ def test_bad_model_is_friendly():
         with open(cfg, "w") as f:
             f.write(
                 'model = "Not/AReal-Model"\nalgorithm = "grpo"\n'
-                '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+                '[environment]\nid = "freesolo-co/gsm8k"\n'
             )
         proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
     assert proc.returncode == 1
@@ -69,7 +69,7 @@ def test_train_without_login_fails_fast():
         with open(cfg, "w") as f:
             f.write(
                 'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
-                '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
+                '[environment]\nid = "freesolo-co/gsm8k"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
             )
         proc = _run(["train", cfg], env=_logged_out_env(tmp))
     assert proc.returncode == 1, proc.stdout + proc.stderr
@@ -98,7 +98,7 @@ def test_dry_run_needs_no_credentials_or_server():
         with open(cfg, "w") as f:
             f.write(
                 'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
-                '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
+                '[environment]\nid = "freesolo-co/gsm8k"\n[train]\nsteps = 1\nseeds = [0]\nhf_repo = "owner/runs"\n'
             )
         proc = _run(["train", cfg, "--dry-run"], env=_logged_out_env(tmp))
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -112,7 +112,7 @@ def test_cost_needs_no_live_pricing():
         with open(cfg, "w") as f:
             f.write(
                 'model = "Qwen/Qwen3.5-4B"\nalgorithm = "grpo"\n'
-                '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+                '[environment]\nid = "freesolo-co/gsm8k"\n'
                 "[train]\nsteps = 1\nseeds = [0]\nhf_repo = \"owner/runs\"\n"
             )
         proc = _run(["train", cfg, "--cost"], env=_logged_out_env(tmp))

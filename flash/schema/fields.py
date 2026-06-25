@@ -100,65 +100,12 @@ def _require_slug(value: str, message: str) -> None:
 
 
 def _require_environment_ref(value: str, message: str) -> None:
-    """Require a Freesolo environment id."""
-    try:
-        _require_slug(value, message)
-        return
-    except ConfigError:
-        pass
-    if value.startswith("github:"):
-        body = value[len("github:") :]
-        repo_ref, sep, path = body.partition(":")
-        repo, at, ref = repo_ref.partition("@")
-        if at and not ref:
-            raise ConfigError(message)
-        owner_repo = repo.split("/")
-        if (
-            len(owner_repo) == 2
-            and _is_safe_github_path_parts(owner_repo)
-            and (not at or _is_safe_github_path_parts([ref]))
-            and (not sep or _is_safe_environment_path(path))
-        ):
-            return
-        raise ConfigError(message)
-    if value.startswith("https://github.com/") or value.startswith("http://github.com/"):
-        parsed = urllib.parse.urlparse(value)
-        if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "github.com":
-            parts = [
-                part for part in urllib.parse.unquote(parsed.path).strip("/").split("/") if part
-            ]
-            if len(parts) < 2:
-                raise ConfigError(message)
-            owner, repo = parts[0], parts[1]
-            repo = repo[:-4] if repo.endswith(".git") else repo
-            if len(parts) == 2:
-                if not _is_safe_github_path_parts([owner, repo]):
-                    raise ConfigError(message)
-            elif len(parts) >= 5 and parts[2] in {"blob", "tree"}:
-                ref = parts[3]
-                if not _is_safe_github_path_parts([ref]):
-                    raise ConfigError(message)
-                raw_path = "/".join(parts[4:])
-                if not _is_safe_environment_path(raw_path):
-                    raise ConfigError(message)
-                if not _is_safe_github_path_parts([owner, repo, ref]):
-                    raise ConfigError(message)
-            else:
-                raise ConfigError(message)
-            return
-    raise ConfigError(message)
+    """Require a Freesolo environment id: a published Hub slug ``owner/name``.
 
-
-def _is_safe_environment_path(path: str) -> bool:
-    if not path:
-        return True
-    raw = path.strip().replace("\\", "/")
-    if raw.startswith("/"):
-        return False
-    parts = [part for part in raw.split("/") if part]
-    if not parts:
-        return True
-    return not any(part in {".", ".."} for part in parts)
+    Package storage is Azure Blob now, so the old ``github:`` / github.com URL ref forms are no
+    longer accepted — every environment is referenced by its slug.
+    """
+    _require_slug(value, message)
 
 
 def _is_safe_github_path_parts(parts: list[str]) -> bool:
@@ -195,7 +142,6 @@ _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
         "RUNPOD_API_KEY",
         "HF_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
-        "GITHUB_TOKEN",
         "FREESOLO_API_KEY",
         "FREESOLO_INTERNAL_KEY",
         "RUN_ID",

@@ -103,7 +103,6 @@ from flash.engine.worker.perf import (
     setup_perf_backends,
     wait_for_gpu,
 )
-from flash.envs.adapter import GitHubRateLimitError
 from flash.envs.registry import load_environment
 from flash.spec import load_job_spec_from_env
 
@@ -142,10 +141,14 @@ def _load_active_env():
             "(a Freesolo environment id like 'your-name/your-env', returned by "
             "`flash env push --name <name>`)."
         )
-    # Pass the control-plane-pinned commit sha (resolve-once hook) when present so the adapter
-    # skips the GitHub ref->sha resolve; "" (the default) keeps the worker resolving it itself.
+    # Pass the control-plane-resolved Azure Blob SAS URL + package SHA-256 (resolve-once hook) so
+    # the worker downloads + verifies the env package; "" (unresolved) makes the adapter fail fast
+    # with a clear error (there is no GitHub fallback).
     return load_environment(
-        env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
+        env_id,
+        JOB_SPEC.environment.params,
+        resolved_package_url=JOB_SPEC.environment.resolved_package_url,
+        resolved_sha=JOB_SPEC.environment.resolved_sha,
     )
 
 
@@ -2821,11 +2824,7 @@ def main():
         os._exit(0)
     except Exception as e:
         # Structured retry signal both pollers read: an infra failure -> retry on a fresh worker.
-        # GitHubRateLimitError (env ref resolution hit a persistent GitHub rate limit) is retriable:
-        # reschedule on a fresh worker once the limit window resets rather than hard-failing. Env
-        # resolution runs lazily inside this try (require_active_env, called by the handlers above),
-        # never at import, so a rate-limit raise reaches here and is classified correctly.
-        retriable = isinstance(e, (RetriableInfraError, GitHubRateLimitError))
+        retriable = isinstance(e, RetriableInfraError)
         tb = traceback.format_exc()
         traceback.print_exc()
         try:

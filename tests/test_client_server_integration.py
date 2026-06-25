@@ -89,7 +89,8 @@ def make_client(tmp_path, monkeypatch):
     """Yields a factory building real ``ApiClient``s wired into one in-process
     control-plane app via a ``urllib`` -> ``TestClient`` shim."""
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setenv("FLASH_ENV_BLOB_CONNECTION_STRING", "DefaultEndpointsProtocol=https;x=y")
+    monkeypatch.setenv("FLASH_ENV_PG_URL", "postgres://u:p@h/db")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
 
     import flash.runner as runner

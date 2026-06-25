@@ -351,7 +351,7 @@ def test_spec_payload_resolves_worker_pip(monkeypatch, tmp_path) -> None:
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
         environment=EnvironmentSpec(
-            id="github:owner/repo@main:env/environment.py", pip=("custom==1",)
+            id="owner/env", pip=("custom==1",)
         ),
     )
     assert list(spec_payload(spec)["environment"]["pip"]) == ["custom==1"]

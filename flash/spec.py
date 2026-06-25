@@ -110,13 +110,15 @@ class EnvironmentSpec:
     # spec; the client reads matching local env/.env values and sends them out-of-band via
     # runtime_secrets.
     secrets: tuple[str, ...] = ()
-    # Optional pinned commit SHA for the environment's GitHub ref, resolved ONCE in the control
-    # plane (runner._assign_resolved_env_sha, called from submit_job after the spec is finalized) so
-    # every worker boots from an immutable sha instead of each one re-resolving the symbolic ref
-    # (e.g. "main") against the GitHub commits API — which trips GitHub's secondary rate limit on a
-    # cold spawn wave. Empty (the default, and whenever the control-plane resolve fails) preserves
-    # today's behavior: the worker resolves the ref itself. The adapter only trusts a real 40-char
-    # sha (see adapter._resolve_ref_sha), so a stale/garbage value falls back to live resolution.
+    # Environment package resolution, done ONCE in the control plane (runner._assign_resolved_env_pkg,
+    # called from submit_job after the spec is finalized) so a fan-out of workers all download an
+    # immutable, content-verified package instead of each re-resolving the slug:
+    #   * resolved_package_url — a short-lived read-only Azure Blob SAS URL the worker GETs to
+    #     download the env's .tar.gz (no Azure credentials on the worker). Empty means "unresolved":
+    #     the worker has no way to fetch the package and fails fast with a clear error.
+    #   * resolved_sha — the package's SHA-256, used by the worker to verify the download and as the
+    #     local cache key. Empty skips verification (still downloads).
+    resolved_package_url: str = ""
     resolved_sha: str = ""
 
 
@@ -243,6 +245,7 @@ class JobSpec:
                 params=dict(env.get("params") or {}),
                 pip=tuple(str(p) for p in env.get("pip") or ()),
                 secrets=_str_tuple(env.get("secrets")),
+                resolved_package_url=str(env.get("resolved_package_url") or ""),
                 resolved_sha=str(env.get("resolved_sha") or ""),
             ),
             train=TrainSpec(

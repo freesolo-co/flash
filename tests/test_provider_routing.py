@@ -193,7 +193,7 @@ def test_config_gpu_fields(monkeypatch):
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
-        "environment": {"id": "github:owner/repo@main:env/environment.py"},
+        "environment": {"id": "owner/env"},
     }
     spec = spec_from_dict(dict(base), run_id="x")
     assert spec.gpu.type == "RTX A6000"

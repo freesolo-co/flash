@@ -22,8 +22,15 @@ __all__ = [
 def _missing_hf_credentials() -> list[str]:
     """Shared run infra every substrate needs."""
     problems: list[str] = []
-    if not os.environ.get("GITHUB_TOKEN"):
-        problems.append("  - GITHUB_TOKEN: server token with access to managed Freesolo environments")
+    if not os.environ.get("FLASH_ENV_BLOB_CONNECTION_STRING"):
+        problems.append(
+            "  - FLASH_ENV_BLOB_CONNECTION_STRING: Azure Storage connection string for the "
+            "managed environment package store (Azure Blob)"
+        )
+    if not os.environ.get("FLASH_ENV_PG_URL"):
+        problems.append(
+            "  - FLASH_ENV_PG_URL: Azure PostgreSQL URL for the environment package index"
+        )
     if not os.environ.get("HF_TOKEN"):
         problems.append(
             "  - HF_TOKEN: a token with write access to each run's "

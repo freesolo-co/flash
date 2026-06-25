@@ -195,49 +195,50 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
-    """Resolve the environment's GitHub ref->SHA ONCE here so every worker in the fan-out boots from
-    an immutable pinned sha instead of each re-resolving the symbolic ref (e.g. "main") against the
-    GitHub commits API. A cold spawn wave of N workers otherwise fires N concurrent commit-API calls
-    and trips GitHub's secondary rate limit; a worker-side in-process cache cannot help, because
-    each worker is a separate process. Best-effort: any failure (no network/token, transient limit,
-    or a non-GitHub env) leaves resolved_sha empty and the worker resolves the ref itself via the
-    in-worker jittered retry + retriable-reschedule path, so submission never blocks on GitHub.
+def _assign_resolved_env_pkg(spec: JobSpec) -> JobSpec:
+    """Resolve the environment slug -> Azure Blob package ONCE here so every worker in the fan-out
+    downloads the same immutable, content-verified package over a short-lived read-only SAS URL
+    instead of holding any Azure credentials. Looks the slug up in the Azure Postgres index and mints
+    a read SAS for its blob; threads the URL + package SHA-256 onto the spec. Best-effort: any failure
+    (env not indexed, transient Azure error, or a non-managed env id) leaves the fields empty and the
+    worker fails fast with a clear "environment package could not be resolved" error — there is no
+    GitHub fallback. Submission itself never blocks on Azure.
     """
     import logging
 
     env_id = spec.environment.id
-    if not env_id or spec.environment.resolved_sha:
+    if not env_id or spec.environment.resolved_package_url:
         return spec
     try:
-        from flash.envs.adapter import (
-            _parse_github_environment_ref,
-            _resolve_ref_sha,
-            is_managed_environment_slug,
-            managed_slug_to_github_ref,
-        )
+        from flash.envs.adapter import is_managed_environment_slug
 
-        ref_str = (
-            managed_slug_to_github_ref(env_id) if is_managed_environment_slug(env_id) else env_id
-        )
-        parsed = _parse_github_environment_ref(ref_str)
-        if parsed is None:
-            return spec  # local/path or non-GitHub env: nothing to pin
-        # Fail fast: a single short request, no rate-limit sleeps. This best-effort pin must never
-        # delay/block run creation (esp. submit_job(background=True)); if GitHub is slow or limiting,
-        # we fall straight through and the worker resolves the ref itself with the full retry budget.
-        sha = _resolve_ref_sha(parsed, timeout=10.0, max_rate_limit_retries=0)
+        if not is_managed_environment_slug(env_id):
+            return spec  # not a managed slug: nothing to resolve
+        from flash.server import azure_blob, environment_store
+
+        record = environment_store.lookup(env_id)
+        if record is None:
+            logging.getLogger(__name__).warning(
+                "resolve-once: env %r is not in the Azure index (not published?); the worker will "
+                "fail to fetch it",
+                env_id,
+            )
+            return spec
+        url = azure_blob.read_sas_url(record.blob_key)
+        sha = record.package_sha256
     except Exception as e:
-        # Never block submission on a control-plane resolve; the worker falls back to resolving the
-        # ref itself. Log for visibility (consistent with the rest of this module's logging).
+        # Never block submission on a control-plane resolve; log for visibility (the worker then
+        # fails fast since there is no GitHub fallback).
         logging.getLogger(__name__).warning(
-            "resolve-once: could not pin env ref->sha for %r (%s); worker will resolve", env_id, e
+            "resolve-once: could not resolve env package for %r (%s)", env_id, e
         )
-        return spec
-    if not sha:
         return spec
     d = spec.to_dict()
-    d["environment"] = {**d["environment"], "resolved_sha": sha}
+    d["environment"] = {
+        **d["environment"],
+        "resolved_package_url": url,
+        "resolved_sha": sha,
+    }
     return JobSpec.from_dict(d)
 
 
@@ -294,10 +295,10 @@ def submit_job(
     # The artifact repo is assigned here, after the run_id is finalized: per-run, operator-owned.
     spec = _assign_managed_hf_repo(spec)
     if not dry_run:
-        # Resolve the env ref->sha ONCE before fan-out so workers boot from the pin and skip the
-        # GitHub commits API (defuses the cold-spawn rate-limit wave). Skipped on dry-run: no
-        # workers fan out, and it avoids a network call on a preview/test submission.
-        spec = _assign_resolved_env_sha(spec)
+        # Resolve the env slug -> Azure Blob SAS URL ONCE before fan-out so every worker downloads
+        # the same immutable, content-verified package without holding Azure credentials. Skipped on
+        # dry-run: no workers fan out, and it avoids an Azure round-trip on a preview/test submission.
+        spec = _assign_resolved_env_pkg(spec)
     status = RunStatus(
         run_id=spec.run_id,
         state="queued",

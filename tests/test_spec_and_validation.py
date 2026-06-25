@@ -159,7 +159,7 @@ def test_environment_subfields_reject_wrong_types() -> None:
     for bad in ("notatable", 123, False):
         raw = _raw()
         raw["environment"] = {
-            "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+            "id": "freesolo-co/gsm8k",
             "params": bad,
         }
         with pytest.raises(ConfigError, match=r"\[environment\] params must be a table"):
@@ -167,14 +167,14 @@ def test_environment_subfields_reject_wrong_types() -> None:
     for bad in ("notalist", 123, False):
         raw = _raw()
         raw["environment"] = {
-            "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+            "id": "freesolo-co/gsm8k",
             "pip": bad,
         }
         with pytest.raises(ConfigError, match=r"\[environment\] pip must be a list of strings"):
             spec_from_dict(raw)
     raw = _raw()
     raw["environment"] = {
-        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "id": "freesolo-co/gsm8k",
         "pip": ["ok", 123],
     }
     with pytest.raises(ConfigError, match=r"\[environment\] pip entries must be strings"):
@@ -182,28 +182,28 @@ def test_environment_subfields_reject_wrong_types() -> None:
     for bad in ("notalist", 123, False):
         raw = _raw()
         raw["environment"] = {
-            "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+            "id": "freesolo-co/gsm8k",
             "secrets": bad,
         }
         with pytest.raises(ConfigError, match=r"\[environment\] secrets must be a list"):
             spec_from_dict(raw)
     raw = _raw()
     raw["environment"] = {
-        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "id": "freesolo-co/gsm8k",
         "secrets": ["OK_SECRET", 123],
     }
     with pytest.raises(ConfigError, match=r"\[environment\] secrets entries must be strings"):
         spec_from_dict(raw)
     raw = _raw()
     raw["environment"] = {
-        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "id": "freesolo-co/gsm8k",
         "secrets": ["BAD KEY"],
     }
     with pytest.raises(ConfigError, match=r"\[environment\] secrets has invalid"):
         spec_from_dict(raw)
     raw = _raw()
     raw["environment"] = {
-        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "id": "freesolo-co/gsm8k",
         "secrets": ["HF_TOKEN"],
     }
     with pytest.raises(ConfigError, match=r"platform-managed"):
@@ -213,14 +213,14 @@ def test_environment_subfields_reject_wrong_types() -> None:
 def test_environment_subfields_accept_valid_and_missing() -> None:
     # Missing sub-fields keep their defaults, and valid values pass through unchanged.
     raw = _raw()
-    raw["environment"] = {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"}
+    raw["environment"] = {"id": "freesolo-co/gsm8k"}
     spec = spec_from_dict(raw)
     assert spec.environment.params == {}
     assert spec.environment.pip == ()
     assert spec.environment.secrets == ()
     raw = _raw()
     raw["environment"] = {
-        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "id": "freesolo-co/gsm8k",
         "params": {"k": "v"},
         "pip": ["pkg==1.0"],
         "secrets": ["SERPAPI_API_KEY", "OPENAI_API_KEY", "SERPAPI_API_KEY"],
@@ -232,7 +232,7 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     # An explicit None (e.g. JSON `null`) is treated as missing -> default, NOT rejected.
     raw = _raw()
     raw["environment"] = {
-        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+        "id": "freesolo-co/gsm8k",
         "params": None,
         "pip": None,
         "secrets": None,

@@ -101,7 +101,7 @@ def test_config_cheapest_policy_validated_pool(monkeypatch):
     raw = {
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "sft",
-        "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+        "environment": {"id": "freesolo-co/gsm8k"},
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
         "gpu": {"type": "cheapest"},
     }
@@ -137,7 +137,7 @@ def test_config_defaults_gpu_from_model():
     raw = {
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
-        "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+        "environment": {"id": "freesolo-co/gsm8k"},
         "train": {"epochs": 1, "seeds": [0], "hf_repo": "owner/runs"},
     }
     spec = spec_from_dict(raw, run_id="x")

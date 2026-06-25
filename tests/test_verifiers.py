@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import io
 import json
@@ -11,6 +12,7 @@ import tarfile
 import tempfile
 import types
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -323,7 +325,7 @@ def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
 
     env = FreesoloEnvironment(
         _FakeSingleTurnEnv(),
-        "github:owner/repo@main:env/environment.py",
+        "owner/env",
         source=None,
         contract_text="",
     )
@@ -386,7 +388,7 @@ def test_freesolo_multiturn_hooks(monkeypatch):
 
     env = FreesoloEnvironment(
         _FakeMultiTurnEnv(),
-        "github:owner/repo@main:env/environment.py",
+        "owner/env",
         source=[{"input": "browse", "output": "done"}],
         contract_text="contract",
     )
@@ -410,175 +412,133 @@ def test_freesolo_multiturn_hooks(monkeypatch):
     )
 
 
-def test_github_environment_ref_parsing():
-    from flash.envs.adapter import (
-        is_freesolo_environment_id,
-        is_github_environment_ref,
-        is_managed_environment_slug,
-        managed_slug_to_github_ref,
-    )
+def _env_package_tar(files: dict[str, str]) -> bytes:
+    """A flat env package tarball (environment.py at the root), like `flash env push` uploads."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in files.items():
+            data = content.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
-    assert is_github_environment_ref("github:owner/repo@dev:envs/e/environment.py")
-    assert is_github_environment_ref("github:owner/repo")
-    assert not is_github_environment_ref("github:owner/repo@main:/etc/passwd")
-    assert not is_github_environment_ref("github:owner/repo/extra@main:envs/e/environment.py")
-    assert not is_github_environment_ref("github:owner/repo@:envs/e/environment.py")
-    assert is_github_environment_ref("https://github.com/owner/repo/blob/dev/envs/e/environment.py")
-    assert is_github_environment_ref("https://github.com/owner/repo")
-    assert not is_github_environment_ref("owner/env")
-    assert not is_github_environment_ref("gsm8k")
-    assert not is_github_environment_ref("github:owner/repo@main:../../etc/passwd")
-    assert not is_github_environment_ref("https://github.com/owner/repo/blob/dev/../../etc/passwd")
-    assert not is_github_environment_ref("https://github.com/owner/repo/blob/main:/etc/passwd")
-    assert not is_github_environment_ref("https://github.com/owner/repo/issues/1")
-    assert not is_github_environment_ref("github:owner /repo@main:envs/e/environment.py")
-    assert not is_github_environment_ref("github:owner/repo@bad/ref:envs/e/environment.py")
-    assert not is_github_environment_ref(
-        "https://github.com/owner/repo/blob/bad ref/envs/e/environment.py"
-    )
+
+def test_environment_id_helpers():
+    from flash.envs.adapter import is_freesolo_environment_id, is_managed_environment_slug
+
     assert is_managed_environment_slug("owner/env")
     assert is_freesolo_environment_id("owner/env")
-    assert managed_slug_to_github_ref("owner/env") == (
-        "github:freesolo-co/environment-hub@main:owner/env/environment.py"
-    )
     assert not is_managed_environment_slug("owner/env/extra")
-    assert not is_freesolo_environment_id("gsm8k")
+    assert not is_managed_environment_slug("gsm8k")
+    assert not is_managed_environment_slug("owner/env:tag")
+    # github: / github.com forms are no longer environment ids (storage is Azure Blob now).
+    assert not is_freesolo_environment_id("github:owner/repo@main:env/environment.py")
+    assert not is_freesolo_environment_id("https://github.com/owner/repo")
 
 
-def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
+def test_resolve_environment_reference_downloads_and_verifies(tmp_path, monkeypatch):
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(
-        adapter,
-        "_resolve_ref_sha",
-        lambda parsed: "b" * 40,
+    data = _env_package_tar(
+        {
+            "environment.py": "def load_environment(**k):\n    return None\n",
+            "datasets/train.jsonl": '{"x": 1}\n',
+        }
     )
-
+    sha = hashlib.sha256(data).hexdigest()
     downloads: list[str] = []
 
-    def fake_download(ref):
-        downloads.append(ref.ref)
-        return _github_environment_tarball("repo-root")
+    def fake_download(url):
+        downloads.append(url)
+        return data
 
-    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
+    monkeypatch.setattr(adapter, "_download_bytes", fake_download)
 
-    resolved = adapter._resolve_environment_reference(
-        "github:owner/repo@main:envs/e/environment.py"
-    )
-    assert resolved.endswith("envs/e/environment.py")
-    assert downloads == ["b" * 40]
+    resolved = adapter._resolve_environment_reference("owner/env", "https://blob/sas", sha)
+    assert resolved.endswith("environment.py")
+    assert Path(resolved).is_file()
+    # A sidecar dataset is extracted alongside the entrypoint.
+    assert (Path(resolved).parent / "datasets" / "train.jsonl").is_file()
+    # Content-addressed cache: a second resolve does not re-download.
+    again = adapter._resolve_environment_reference("owner/env", "https://blob/sas", sha)
+    assert again == resolved
+    assert downloads == ["https://blob/sas"]
 
 
-def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, monkeypatch):
+def test_resolve_environment_reference_handles_single_wrapper_dir(tmp_path, monkeypatch):
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    data = _github_environment_tarball("repo-root", env_path="environment.py")
+    sha = hashlib.sha256(data).hexdigest()
+    monkeypatch.setattr(adapter, "_download_bytes", lambda url: data)
 
-    downloads: list[str] = []
-
-    def fake_download(ref):
-        downloads.append(ref.ref)
-        return _github_environment_tarball("repo-root")
-
-    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
-
-    resolved = adapter._resolve_environment_reference("github:owner/repo@main:envs/e")
-    assert resolved.endswith("envs/e/environment.py")
-    assert adapter._resolve_environment_reference("github:owner/repo@main:envs/e") == resolved
-    assert downloads == ["b" * 40]
+    resolved = adapter._resolve_environment_reference("owner/env", "https://blob/sas", sha)
+    assert resolved.endswith("environment.py")
+    assert Path(resolved).is_file()
 
 
-def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path, monkeypatch):
+def test_resolve_environment_reference_sha_mismatch(tmp_path, monkeypatch):
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
+    data = _env_package_tar({"environment.py": "x = 1\n"})
+    monkeypatch.setattr(adapter, "_download_bytes", lambda url: data)
 
-    downloads: list[str] = []
-
-    def fake_download(ref):
-        downloads.append(ref.path)
-        return _github_environment_tarball(
-            "repo-root",
-            env_path="envs/e/freesolo/environment.py",
-        )
-
-    monkeypatch.setattr(adapter, "_download_github_tarball", fake_download)
-
-    resolved = adapter._resolve_environment_reference(
-        "https://github.com/owner/repo/tree/main/envs/e/freesolo"
-    )
-    assert resolved.endswith("envs/e/freesolo/environment.py")
-    assert "freesolo/freesolo" not in resolved
-    assert downloads == ["envs/e/freesolo/environment.py"]
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        adapter._resolve_environment_reference("owner/env", "https://blob/sas", "a" * 64)
 
 
-def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, monkeypatch):
+def test_resolve_environment_reference_missing_entrypoint(tmp_path, monkeypatch):
     import flash.envs.adapter as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed: "b" * 40)
-    monkeypatch.setattr(
-        adapter,
-        "_download_github_tarball",
-        lambda ref: _github_environment_tarball("repo-root", env_path="envs/e/helper.py"),
-    )
+    data = _env_package_tar({"helper.py": "x = 1\n"})
+    sha = hashlib.sha256(data).hexdigest()
+    monkeypatch.setattr(adapter, "_download_bytes", lambda url: data)
 
-    with pytest.raises(FileNotFoundError, match=r"envs/e/environment\.py"):
-        adapter._resolve_environment_reference("github:owner/repo@main:envs/e")
+    with pytest.raises(FileNotFoundError, match=r"environment\.py"):
+        adapter._resolve_environment_reference("owner/env", "https://blob/sas", sha)
 
 
-def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
-    from flash.envs.adapter import _safe_extract_archive
+def test_resolve_environment_reference_unresolved_slug_errors():
+    import flash.envs.adapter as adapter
 
-    def make_members_tar(members: list[tuple[str, bytes | None]]):
-        tar = io.BytesIO()
-        with tarfile.open(fileobj=tar, mode="w:gz") as handle:
-            for name, payload in members:
-                info = tarfile.TarInfo(name)
-                if payload is None:
-                    info.type = tarfile.DIRTYPE
-                    info.size = 0
-                    handle.addfile(info)
-                else:
-                    info.size = len(payload)
-                    handle.addfile(info, io.BytesIO(payload))
-        return tar.getvalue()
+    # A managed slug with no SAS URL (not published / control-plane resolve failed) and no local
+    # checkout -> a clear error. There is no GitHub fallback.
+    with pytest.raises(RuntimeError, match="could not be resolved"):
+        adapter._resolve_environment_reference("owner/env", None, None)
 
-    dest = tmp_path / "extract_many"
+
+def test_extract_env_package_rejects_unbounded_and_traversal(monkeypatch, tmp_path):
+    from flash.envs.adapter import _extract_env_package
+
+    dest = tmp_path / "many"
     dest.mkdir()
     monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 0)
     with pytest.raises(RuntimeError, match="too many members"):
-        _safe_extract_archive(make_members_tar([("a", b"")]), dest)
+        _extract_env_package(_env_package_tar({"environment.py": "x"}), dest)
 
-    dest = tmp_path / "extract_big"
+    dest = tmp_path / "big"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 5)
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_MEMBERS", 50)
     monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 1)
     with pytest.raises(RuntimeError, match="too large"):
-        _safe_extract_archive(
-            make_members_tar([("repo-root/", None), ("repo-root/keep.txt", b"xx")]), dest
-        )
+        _extract_env_package(_env_package_tar({"environment.py": "xxxxx"}), dest)
 
-    dest = tmp_path / "extract_pax"
+    dest = tmp_path / "trav"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 100)
-    tar = io.BytesIO()
-    with tarfile.open(fileobj=tar, mode="w:gz") as handle:
-        pax = tarfile.TarInfo("pax_global_header")
-        pax.type = tarfile.XGLTYPE
-        handle.addfile(pax)
-        root = tarfile.TarInfo("repo-root/")
-        root.type = tarfile.DIRTYPE
-        root.mode = 0o755
-        handle.addfile(root)
-        file_info = tarfile.TarInfo("repo-root/environment.py")
-        payload = b"def load_environment(**k):\n    return None\n"
-        file_info.size = len(payload)
-        handle.addfile(file_info, io.BytesIO(payload))
-    assert _safe_extract_archive(tar.getvalue(), dest) == dest / "repo-root"
+    monkeypatch.setattr("flash.envs.adapter._MAX_ARCHIVE_BYTES", 1000)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        payload = b"pwn"
+        info = tarfile.TarInfo("../escape.txt")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    with pytest.raises(RuntimeError, match="unsafe path"):
+        _extract_env_package(buf.getvalue(), dest)
 
 
 def test_install_manifest_and_worker_deps():
@@ -587,7 +547,7 @@ def test_install_manifest_and_worker_deps():
         import flash.envs.registry as registry
 
         importlib.reload(registry)
-        env_id = "github:owner/repo@main:env/environment.py"
+        env_id = "owner/env"
         registry.record_installed_env(env_id, package="freesolo")
         assert registry.worker_pip_for_env(env_id) == ["freesolo"]
         assert registry.list_installed_environments() == [env_id]

@@ -15,29 +15,50 @@ _LOG = logging.getLogger("flash.server.environments")
 _TIMEOUT_S = 10.0
 _PATH = "/api/flash/environments/internal"
 _USE_PATH = "/api/flash/environments/use/internal"
-_DEFAULT_HUB_REPO = "freesolo-co/environment-hub"
-_DEFAULT_HUB_REF = "main"
 
 
 def record_published_environment(*, slug: str, name: str, key: dict) -> bool:
-    """Persist Hub metadata in the platform backend.
+    """Persist the environment's Azure-blob pointer in the platform backend.
 
-    The GitHub publish is the source of truth for the environment package. This
-    metadata write exists so the web UI can list Flash environments, so it is
-    deliberately best-effort and never blocks `flash env push`.
+    Azure Blob (indexed in Azure Postgres) is the source of truth for the package; this metadata
+    write mirrors the pointer into the platform DB so the web UI can list Flash environments. It is
+    deliberately best-effort and never blocks `flash env push`. The blob pointer is read back from
+    the Azure Postgres index just written by `publish_package`.
     """
     internal_key = os.environ.get(INTERNAL_KEY_ENV)
     org_id = str(key.get("org_id") or "").strip()
     if not internal_key or not org_id:
         return False
 
+    # Read the pointer the publish step just indexed. Best-effort: if the index is unreachable we
+    # skip the mirror rather than fail the push.
+    from .azure_blob import container_name
+
+    blob_container = container_name()
+    blob_key = ""
+    package_sha256: str | None = None
+    try:
+        from . import environment_store
+
+        record = environment_store.lookup(slug)
+        if record is not None:
+            blob_container = record.blob_container
+            blob_key = record.blob_key
+            package_sha256 = record.package_sha256
+    except Exception as exc:
+        _LOG.warning("could not read Azure env pointer for %s: %s", slug, exc)
+        return False
+    if not blob_key:
+        _LOG.warning("no Azure env pointer found for %s; skipping platform mirror", slug)
+        return False
+
     body = {
         "orgId": org_id,
         "slug": slug,
         "name": name,
-        "hubRepo": _DEFAULT_HUB_REPO,
-        "hubRef": _DEFAULT_HUB_REF,
-        "hubPath": f"{slug}/environment.py",
+        "blobContainer": blob_container,
+        "blobKey": blob_key,
+        "packageSha256": package_sha256,
         "publishedByUserId": key.get("user_id"),
         "apiKeyId": key.get("api_key_id"),
         "metadata": {"source": "flash.env.push"},

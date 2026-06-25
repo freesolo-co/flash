@@ -162,7 +162,8 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    monkeypatch.setenv("FLASH_ENV_BLOB_CONNECTION_STRING", "DefaultEndpointsProtocol=https;x=y")
+    monkeypatch.setenv("FLASH_ENV_PG_URL", "postgres://u:p@h/db")
 
     import flash.runner as runner
     import flash.server.auth as auth_mod

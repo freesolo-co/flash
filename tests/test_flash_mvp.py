@@ -42,7 +42,7 @@ def test_config_to_job_spec():
                 'model = "Qwen/Qwen3.5-4B"\n'
                 'algorithm = "grpo"\n'
                 "[environment]\n"
-                'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+                'id = "freesolo-co/gsm8k"\n'
                 "[train]\n"
                 "steps = 10\n"
                 "seeds = [0, 1]\n"
@@ -96,7 +96,7 @@ def test_mcp_handler_dry_run(monkeypatch):
                     "run_id": "mcp-dry",
                     "model": "Qwen/Qwen3.5-4B",
                     "algorithm": "grpo",
-                    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
+                    "environment": {"id": "freesolo-co/gsm8k"},
                     "train": {"steps": 1, "seeds": [0], "hf_repo": "owner/runs"},
                     "gpu": {"type": "RTX 5090"},
                     "dry_run": True,
@@ -114,7 +114,7 @@ def test_cli_train_dry_run():
                 'model = "Qwen/Qwen3.5-4B"\n'
                 'algorithm = "grpo"\n'
                 "[environment]\n"
-                'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+                'id = "freesolo-co/gsm8k"\n'
                 # A user-set [train] hf_repo is silently ignored (platform-managed, assigned
                 # per-run); the dry-run still validates and the resolved hf_repo comes back blank.
                 "[train]\n"
