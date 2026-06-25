@@ -196,6 +196,25 @@ def test_select_candidate_never_prefers_cheaper_sick_over_healthy():
     assert (chosen.provider, chosen.gpu) == ("lambda", "A10")
 
 
+def test_select_candidate_untried_healthy_on_failed_provider_beats_sick():
+    """Even after a provider fails, an UNTRIED healthy class on that (failed) provider must still beat a
+    cheaper untried SICK candidate on a healthy provider -- escaping to a known-sick region before the
+    healthy capacity is exhausted would violate bounded demotion. `sick` is ranked ahead of the
+    failed-provider escape, so a healthy class is preferred even when it forgoes the escape."""
+    from flash.providers.base import Candidate
+    from flash.runner.lifecycle import _select_candidate
+
+    cands = (
+        Candidate("lambda", "A10", 0.40, 24, sick=True),  # CHEAPEST, healthy provider, but quarantine-only
+        Candidate("runpod", "RTX A6000", 0.49, 48),  # tried
+        Candidate("runpod", "RTX 6000 Ada", 0.55, 48),  # UNTRIED healthy, but on the failed provider
+    )
+    # RunPod failed once (A6000 tried). The untried healthy RunPod 6000Ada wins over the cheaper sick
+    # Lambda A10 -- the quarantined region is only reached after RunPod's healthy classes are exhausted.
+    chosen = _select_candidate(cands, {"runpod"}, {("runpod", "RTX A6000")})
+    assert (chosen.provider, chosen.gpu) == ("runpod", "RTX 6000 Ada")
+
+
 def test_select_candidate_single_provider_walks_classes():
     """With only one provider configured, the picker degrades to the cheapest untried class."""
     from flash.providers.base import Candidate

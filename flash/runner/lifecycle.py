@@ -103,16 +103,18 @@ def _select_candidate(candidates, failed_providers: set[str], tried_classes: set
     attempt re-allocates and the live-capacity ordering can shift between attempts.
 
     A SICK candidate (a class whose capacity is only in a quarantined region) is demoted by ``c.sick``
-    AHEAD of price, so a cheaper quarantined class never wins over a healthy one -- the runner only
-    walks to it once the healthy untried classes are exhausted (bounded-demotion; without this the
-    price tie-break would resurrect a cheap sick class, defeating the allocator's sick-last ranking).
+    ranked ABOVE the failed-provider escape AND price, so EVERY healthy candidate is preferred over any
+    sick one -- even a healthy class whose provider just failed (escaping to a known-sick region before
+    healthy capacity is exhausted would violate bounded demotion). ``c.sick`` sits AFTER ``class_tried``
+    so the walk still REACHES a sick class once the healthy classes are all tried (an untried sick beats
+    a tried healthy); within the healthy tier the cross-provider escape and price ordering are unchanged.
     """
     return min(
         candidates,
         key=lambda c: (
-            c.provider in failed_providers,  # 1) escape providers that already failed this run
-            (c.provider, c.gpu) in tried_classes,  # 2) then prefer a class not yet tried
-            getattr(c, "sick", False),  # 3) then prefer a HEALTHY class over a quarantine-only one
+            (c.provider, c.gpu) in tried_classes,  # 1) prefer a class not yet tried this run
+            getattr(c, "sick", False),  # 2) then prefer ANY healthy class over a quarantine-only one
+            c.provider in failed_providers,  # 3) then escape providers that already failed (healthy tier)
             c.hourly_usd,  # 4) then cheapest
             c.vram_gb,  # 5) then the smaller card (don't burn a big GPU on a small job)
         ),

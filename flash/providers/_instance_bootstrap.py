@@ -267,19 +267,28 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     return proc.returncode
 
 
-def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bool = False) -> None:
+def write_attempt_marker(
+    payload: dict, ok: bool, error: str = "", retriable: bool = False, trained: bool = False
+) -> None:
     """Attempt-scoped terminal marker (``<arm>_attempt<N>.json``): how the control plane
     distinguishes THIS attempt's failure from a prior attempt's leftovers under the same prefix.
 
     ``retriable`` stamps the same flag the host failmark and the worker heartbeat use: the pollers
     read ``marker.get("retriable")`` and classify a flagged failure as ``job_preempted`` (retried on
     a fresh host within the HF infra budget) instead of ``job_failed`` (fails fast). Set it for
-    infra-shaped bootstrap failures (HF fetch/upload) so an HF outage doesn't burn the run."""
+    infra-shaped bootstrap failures (HF fetch/upload) so an HF outage doesn't burn the run.
+
+    ``trained`` records that the worker REACHED THE END OF TRAINING this attempt (a local
+    ``/tmp/metrics.json`` exists) before the failure. A retriable completion-UPLOAD failure (training
+    finished, DONE/metrics never landed on HF) is then NOT a pre-training host fault: the pollers read
+    ``marker.get("trained")`` to suppress the region quarantine for it (the region was healthy and
+    productive) while a genuine pre-training retriable fault (no metrics) still quarantines."""
     marker = {
         "ok": bool(ok),
         "ts": time.time(),
         "attempt": int(payload.get("attempt") or 0),
         "retriable": bool(retriable),
+        "trained": bool(trained),
         "error": error[:2000],
     }
     p = "/tmp/attempt_marker.json"
@@ -509,7 +518,12 @@ def main() -> int:
         retriable = isinstance(exc, RetriableBootstrapError)
         print(f"bootstrap failed: {error}", flush=True)
     finally:
-        write_attempt_marker(payload, ok, error, retriable=retriable)
+        # The worker writes /tmp/metrics.json locally at the END of training, before the (required,
+        # retried) DONE/metrics upload. Its presence = training was REACHED this attempt, so a retriable
+        # completion-upload failure is post-training (a healthy region), NOT a pre-training host fault:
+        # the poller reads ``trained`` to skip the region quarantine for that path.
+        trained = os.path.exists("/tmp/metrics.json")
+        write_attempt_marker(payload, ok, error, retriable=retriable, trained=trained)
     return 0 if ok else 1
 
 

@@ -558,8 +558,12 @@ def poll_lambda_job(
             # The quarantine signal uses only a FRESH retriable (this attempt's marker, or a launch-fresh
             # heartbeat) -- a stale prior-attempt retriable heartbeat must not quarantine a healthy region
             # for THIS attempt's non-retriable error -- even though the (lenient) retry classification
-            # above still honors the seed-scoped heartbeat.
-            host_fault=(marker_retriable or fresh_retriable_hb()) and not reached_training_now(),
+            # above still honors the seed-scoped heartbeat. A marker flagged ``trained`` (the worker
+            # reached end-of-training; only the DONE/metrics UPLOAD failed -> retriable) is a post-training
+            # completion retry on a HEALTHY region, NOT a pre-training host fault -> never quarantine.
+            host_fault=(marker_retriable or fresh_retriable_hb())
+            and not reached_training_now()
+            and not bool(marker and marker.get("trained")),
         )
 
     def terminal_artifact_result() -> PollResult | None:

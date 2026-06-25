@@ -135,7 +135,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
     from flash.providers import _instance_bootstrap as lb
 
     calls: list[str] = []
-    markers: list[tuple[bool, str, bool]] = []
+    markers: list[tuple[bool, str, bool, bool]] = []
     monkeypatch.setattr(
         lb,
         "load_payload",
@@ -157,7 +157,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
     monkeypatch.setattr(
         lb,
         "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
+        lambda p, ok, error="", retriable=False, trained=False: markers.append((ok, error, retriable, trained)),
     )
     monkeypatch.setattr(lb.os.path, "exists", lambda p: metrics if "metrics.json" in p else False)
     return lb, calls, markers
@@ -167,18 +167,20 @@ def test_bootstrap_train_success(monkeypatch):
     lb, calls, markers = _bootstrap_env(monkeypatch)
     assert lb.main() == 0
     assert calls == ["sft"]  # one fresh worker process
-    assert markers == [(True, "", False)]  # success marker, not retriable
+    # success marker, not retriable; trained=True (local metrics.json exists).
+    assert markers == [(True, "", False, True)]
 
 
 def test_bootstrap_fails_without_metrics(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
     assert lb.main() == 1
-    ok, error, retriable = markers[0]
+    ok, error, retriable, trained = markers[0]
     assert not ok
     assert "metrics.json" in error
     # A genuine no-metrics crash (the worker never produced metrics) is a REAL failure, not infra:
     # it must NOT be flagged retriable (that would loop a deterministically-broken run).
     assert retriable is False
+    assert trained is False  # no local metrics -> training was NOT reached
 
 
 def test_bootstrap_sets_lambda_arm():
@@ -712,6 +714,28 @@ def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
     assert not res.ok
     assert res.failure == "job_preempted"
     assert not res.host_fault  # training already reached -> region healthy, do NOT quarantine
+
+
+def test_poll_trained_completion_upload_retry_not_quarantined(monkeypatch):
+    """A retriable marker flagged ``trained`` (the worker REACHED end-of-training -- local metrics.json
+    existed -- but the required DONE/metrics UPLOAD failed) is a post-training completion retry on a
+    HEALTHY region. It must retry (job_preempted) WITHOUT quarantining the region even on a fast run
+    where no fresh training heartbeat was latched and the latest forced hb is the worker's error_* stage
+    (so reached_training_now() is False) -- the marker's ``trained`` flag carries the post-training signal."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        marker=json.dumps(
+            {"ok": False, "attempt": 0, "retriable": True, "trained": True, "error": "DONE upload failed"}
+        ),
+    )
+    res = jobs.poll_lambda_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {"stage": "error_sft", "ts": 10_000.0},  # no training hb latched
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable upload failure -> retry on a fresh host
+    assert not res.host_fault  # trained: post-training completion retry on a healthy region -> NO quarantine
 
 
 def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
@@ -1812,10 +1836,13 @@ def test_bootstrap_honors_nonzero_exit_without_remote_artifacts(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
     assert lb.main() == 1
-    ok, error, retriable = markers[0]
+    ok, error, retriable, trained = markers[0]
     assert not ok
     assert "non-zero" in error  # propagated as a real (retriable) failure, not a false ok=true
     assert retriable is True  # infra/upload failure -> retried, not job_failed
+    # The worker REACHED end-of-training (local metrics.json exists); only the upload failed. trained=True
+    # tells the poller this is a post-training completion retry on a HEALTHY region -> do NOT quarantine.
+    assert trained is True
 
 
 def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
@@ -1825,7 +1852,7 @@ def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
     lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
     monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
     assert lb.main() == 0
-    assert markers[0] == (True, "", False)
+    assert markers[0] == (True, "", False, True)  # ok, no error, not retriable, trained (metrics exist)
 
 
 def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
@@ -1897,7 +1924,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     written attempt marker carries retriable=True (so the poller -> job_preempted, not job_failed)."""
     from flash.providers import _instance_bootstrap as lb
 
-    markers: list[tuple[bool, str, bool]] = []
+    markers: list[tuple[bool, str, bool, bool]] = []
     monkeypatch.setattr(
         lb,
         "load_payload",
@@ -1909,15 +1936,17 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     )
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)
     monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503")))
+    monkeypatch.setattr(lb.os.path, "exists", lambda p: False)  # no local metrics (fails before training)
     monkeypatch.setattr(
         lb, "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
+        lambda p, ok, error="", retriable=False, trained=False: markers.append((ok, error, retriable, trained)),
     )
     assert lb.main() == 1
-    ok, error, retriable = markers[0]
+    ok, error, retriable, trained = markers[0]
     assert not ok
     assert "spilled job spec" in error
     assert retriable is True
+    assert trained is False  # the spilled-spec fetch fails BEFORE training -> pre-training (region may quarantine)
 
 
 def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):

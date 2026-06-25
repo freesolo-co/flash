@@ -623,6 +623,26 @@ def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
     assert not res.host_fault  # training already reached -> region healthy, do NOT quarantine
 
 
+def test_poll_trained_completion_upload_retry_not_quarantined(monkeypatch):
+    """A retriable marker flagged ``trained`` (the worker REACHED end-of-training but the required
+    DONE/metrics UPLOAD failed) is a post-training completion retry on a HEALTHY region. It must retry
+    (job_preempted) WITHOUT quarantining the region even on a fast run where no fresh training heartbeat
+    was latched and the latest forced hb is the worker's error_* stage. Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}],
+        marker=json.dumps(
+            {"ok": False, "attempt": 0, "retriable": True, "trained": True, "error": "DONE upload failed"}
+        ),
+    )
+    res = jobs.poll_hs_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {"stage": "error_sft", "ts": 10_000.0},  # no training hb latched
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable upload failure -> retry on a fresh host
+    assert not res.host_fault  # trained: post-training completion retry on a healthy region -> NO quarantine
+
+
 def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
     """On a reattach whose first poll already sees the VM active, active_since is launch-anchored, so
     the launch-relative first_liveness deadline is already blown. The observed-grace floor stops a VM

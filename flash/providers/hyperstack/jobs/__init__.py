@@ -502,8 +502,12 @@ def poll_hs_job(
             # trained then failed within one poll interval would otherwise look pre-training. The
             # quarantine signal uses only a FRESH retriable (this attempt's marker, or a launch-fresh
             # heartbeat) so a stale prior-attempt retriable heartbeat can't quarantine a healthy region
-            # for THIS attempt's non-retriable error.
-            host_fault=(marker_retriable or fresh_retriable_hb()) and not reached_training_now(),
+            # for THIS attempt's non-retriable error. A marker flagged ``trained`` (the worker reached
+            # end-of-training; only the DONE/metrics UPLOAD failed -> retriable) is a post-training
+            # completion retry on a HEALTHY region, NOT a pre-training host fault -> never quarantine.
+            host_fault=(marker_retriable or fresh_retriable_hb())
+            and not reached_training_now()
+            and not bool(marker and marker.get("trained")),
         )
 
     def terminal_artifact_result() -> PollResult | None:
