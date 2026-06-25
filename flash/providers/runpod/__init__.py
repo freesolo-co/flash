@@ -87,13 +87,18 @@ class RunpodProvider:
         rh = RunpodJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
-        # Same stall tuning as the submit path so a reattached run isn't judged differently.
+        # Same stall tuning as the submit path so a reattached run isn't judged differently:
+        # the original submit's ``on_last_gpu`` is persisted in the handle (by the runner's
+        # on_handle), so reproduce its no-capacity grace here instead of defaulting to the
+        # shorter non-last window. Absent (a pre-persist / non-runpod handle) => False, the
+        # historical default.
+        on_last_gpu = bool(handle.to_dict().get("on_last_gpu", False))
         return poll_job(
             rh,
             log=log,
             heartbeat_reader=reader,
             failure_detail_reader=failure_reader,
-            **stall_kwargs(),
+            **stall_kwargs(on_last_gpu=on_last_gpu),
         )
 
     def cancel(self, handle: JobHandle) -> None:
