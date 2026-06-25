@@ -2045,6 +2045,20 @@ def run_rl():
     # string to TRL, so trainer.model is the authoritative target. chalk composes on top of Liger.
     # Capture the install report so the engaged kernels land in metrics (active_kernels below).
     _chalk_report = install_chalk_kernels(getattr(trainer, "model", None))
+    # Liger fused-loss chunk_size: TRL leaves it at the default 1, so the fused GRPO loss runs its
+    # whole detach -> chunk_forward -> compiled-loss -> autograd.grad cycle ONCE PER SEQUENCE
+    # (per_device_train_batch_size times) — Python/kernel-launch/compile-guard overhead that
+    # dominates at small-model scale where the GEMMs are tiny. Collapse it to ONE invocation over the
+    # whole per-device micro-batch. Numerically identical (every loss_type normalizes by the GLOBAL
+    # token count, not the chunk-local size, and chunk losses are summed). Must run BEFORE the
+    # mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure that has no
+    # chunk_size attribute.
+    _liger_loss = getattr(trainer, "liger_grpo_loss", None)
+    if _liger_loss is not None and hasattr(_liger_loss, "chunk_size"):
+        _cs = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
+        if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
+            _liger_loss.chunk_size = _cs
+            print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
     # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
     # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
     # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is
