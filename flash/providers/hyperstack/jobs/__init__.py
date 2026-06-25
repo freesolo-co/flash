@@ -158,7 +158,10 @@ def launch_and_submit(
         vol_id, user_data = None, cold_user_data
         if cache_name:
             try:
-                vol_id = hs_api.ensure_volume(cache_name, inst.environment, cache_gb) or None
+                # Per-region physical name (Hyperstack volume names are GLOBALLY unique — a bare
+                # cache_name can exist in only one environment account-wide).
+                vol_name = hs_api.cache_volume_name(cache_name, inst.region)
+                vol_id = hs_api.ensure_volume(vol_name, inst.environment, cache_gb) or None
                 if vol_id is not None:
                     user_data = cache_user_data
             except Exception as e:

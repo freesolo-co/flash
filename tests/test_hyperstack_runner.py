@@ -186,7 +186,8 @@ def test_cache_ensures_volume_and_attaches_after_launch(monkeypatch):
 
     jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
 
-    assert ensured == [("flash-weights", "default-CANADA-1", 100)]  # create-if-absent in the env
+    # per-region physical name (Hyperstack volume names are globally unique), created in the env
+    assert ensured == [("flash-weights-canada-1", "default-CANADA-1", 100)]
     assert attached == [("vm-cache", "vol-7")]  # attached AFTER launch (block volume can't attach at create)
     ud = launched[0]["user_data"]
     assert "-v '/mnt/flash-weights':/weight-cache" in ud  # bind into the worker (quoted host path)

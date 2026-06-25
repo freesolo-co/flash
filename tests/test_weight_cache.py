@@ -756,7 +756,7 @@ def test_provision_lambda_no_key_is_noop(monkeypatch):
     assert preload.provision_lambda_filesystems() == []
 
 
-def test_provision_hyperstack_volumes_one_per_env(monkeypatch):
+def test_provision_hyperstack_volumes_per_region_unique_names(monkeypatch):
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.runpod import preload
 
@@ -768,26 +768,27 @@ def test_provision_hyperstack_volumes_one_per_env(monkeypatch):
         lambda name, env, gb: ensured.append((name, env, gb)) or 1,
     )
     out = preload.provision_hyperstack_volumes()
+    # DISTINCT per-region name (Hyperstack enforces global name uniqueness) in each region's env
     assert ensured == [
-        ("flash-weights", "default-CANADA-1", 100),
-        ("flash-weights", "default-US-1", 100),
-        ("flash-weights", "default-NORWAY-1", 100),
+        ("flash-weights-canada-1", "default-CANADA-1", 100),
+        ("flash-weights-us-1", "default-US-1", 100),
+        ("flash-weights-norway-1", "default-NORWAY-1", 100),
     ]
-    assert out == ["hyperstack:default-CANADA-1", "hyperstack:default-US-1", "hyperstack:default-NORWAY-1"]
+    assert out == ["hyperstack:CANADA-1", "hyperstack:US-1", "hyperstack:NORWAY-1"]
 
 
-def test_provision_hyperstack_dedupes_shared_env(monkeypatch):
+def test_provision_hyperstack_distinct_name_even_in_shared_env(monkeypatch):
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.runpod import preload
 
     ensured = []
-    # two regions mapping to the SAME env -> ensure_volume runs once
+    # two regions mapping to the SAME env still get DISTINCT (globally-unique) volume names
     monkeypatch.setattr(hs_api, "_regions", lambda: ["US-1", "US-2"])
     monkeypatch.setattr(hs_api, "environment_for_region", lambda r: "shared-env")
-    monkeypatch.setattr(hs_api, "ensure_volume", lambda name, env, gb: ensured.append(env) or 1)
+    monkeypatch.setattr(hs_api, "ensure_volume", lambda name, env, gb: ensured.append(name) or 1)
     out = preload.provision_hyperstack_volumes()
-    assert ensured == ["shared-env"]
-    assert out == ["hyperstack:shared-env"]
+    assert ensured == ["flash-weights-us-1", "flash-weights-us-2"]
+    assert out == ["hyperstack:US-1", "hyperstack:US-2"]
 
 
 def test_provision_cli_creates_instance_storage(monkeypatch):

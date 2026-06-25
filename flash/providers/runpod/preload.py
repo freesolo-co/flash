@@ -296,17 +296,20 @@ def teardown_hyperstack_volumes(name: str | None = None) -> list[str]:
     from flash.providers.hyperstack import api as hs_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
-    target = name or WEIGHT_CACHE_VOLUME_NAME
+    base = name or WEIGHT_CACHE_VOLUME_NAME
     deleted: list[str] = []
     try:
         vols = hs_api.list_volumes()
     except Exception as exc:
         logger.warning("teardown: hyperstack list_volumes failed (skipping): %s", exc)
         return deleted
+    # Match the per-region fleet (``flash-weights-<region>``) AND the legacy bare ``flash-weights`` from
+    # before per-region naming — never other volumes.
     for v in vols:
-        if v.get("name") == target and v.get("id") and hs_api.delete_volume(v["id"]):
+        vname = v.get("name") or ""
+        if (vname == base or vname.startswith(f"{base}-")) and v.get("id") and hs_api.delete_volume(v["id"]):
             env = (v.get("environment") or {}).get("name") or "?"
-            deleted.append(f"hyperstack:{env}/{target}")
+            deleted.append(f"hyperstack:{env}/{vname}")
     return deleted
 
 
@@ -349,7 +352,7 @@ def provision_hyperstack_volumes(name: str | None = None, size_gb: int | None = 
     from flash.providers.hyperstack import api as hs_api
     from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
 
-    target = name or WEIGHT_CACHE_VOLUME_NAME
+    base = name or WEIGHT_CACHE_VOLUME_NAME
     gb = int(size_gb or WEIGHT_CACHE_VOLUME_GB)
     done: list[str] = []
     try:
@@ -357,23 +360,16 @@ def provision_hyperstack_volumes(name: str | None = None, size_gb: int | None = 
     except Exception as exc:
         logger.warning("provision: hyperstack _regions failed (skipping): %s", exc)
         return done
-    # One env per region (the per-region default env a launch targets); dedupe so a shared env isn't
-    # provisioned twice.
-    envs: list[str] = []
+    # One PER-REGION volume (Hyperstack names are globally unique — see cache_volume_name), created in
+    # that region's default environment.
     for region in regions:
         try:
             env = hs_api.environment_for_region(region)
+            vol_name = hs_api.cache_volume_name(base, region)
+            hs_api.ensure_volume(vol_name, env, gb)
+            done.append(f"hyperstack:{region}")
         except Exception as exc:
-            logger.warning("provision: hyperstack environment_for_region(%s) failed: %s", region, exc)
-            continue
-        if env and env not in envs:
-            envs.append(env)
-    for env in envs:
-        try:
-            hs_api.ensure_volume(target, env, gb)
-            done.append(f"hyperstack:{env}")
-        except Exception as exc:
-            logger.warning("provision: hyperstack ensure_volume(%s, %s) failed: %s", target, env, exc)
+            logger.warning("provision: hyperstack ensure_volume(%s, %s) failed: %s", base, region, exc)
     return done
 
 

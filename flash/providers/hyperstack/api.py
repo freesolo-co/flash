@@ -355,9 +355,23 @@ def attach_volume(vm_id: str, volume_id) -> bool:
         return False
 
 
+def cache_volume_name(base: str, region: str) -> str:
+    """Physical cache-volume name for ``base`` in ``region`` — DISTINCT per region.
+
+    Hyperstack enforces GLOBAL volume-name uniqueness (a plain ``flash-weights`` can exist in only ONE
+    environment account-wide; a 2nd create elsewhere returns HTTP 400 "This name is not available").
+    The cache is one logical volume (``base`` == ``spec.gpu.network_volume``, e.g. ``flash-weights``)
+    realized as one physical volume per region, so the region MUST be in the name. Mirrors RunPod's
+    per-DC ``weight_cache_volume_name``. The cloud-init preamble mounts by device size, not name, so
+    the worker is unaffected — every cache volume mounts at the same ``/mnt/flash-weights``.
+    """
+    return f"{base}-{region}".lower()
+
+
 def ensure_volume(name: str, environment_name: str, size_gb: int) -> object:
     """Create-if-absent the cache volume ``name`` in ``environment_name``; return its id. Idempotent:
-    reuses an existing same-name volume in that environment."""
+    reuses an existing same-name volume in that environment. ``name`` MUST be globally unique — use
+    ``cache_volume_name(base, region)`` (Hyperstack rejects a duplicate name across environments)."""
     for v in list_volumes():
         if v.get("name") == name and (v.get("environment") or {}).get("name") == environment_name:
             return v.get("id")
