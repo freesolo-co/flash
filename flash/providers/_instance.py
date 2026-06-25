@@ -58,13 +58,14 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
     """Instance name: run-derived so ``sweep_orphans`` can tell ours from anything else on the
     account, and bounded (via ``run_label_prefix``) so the provider never truncates it.
 
-    ``seed``/``attempt`` are coerced to ints and the ``-s{seed}-a{attempt}`` suffix is held to
-    ``_SUFFIX_BUDGET`` chars: a caller-supplied spec could carry an absurdly large seed (or a
-    non-int) whose unbounded text would push the name past the provider's cap and get it silently
+    ``seed``/``attempt`` are coerced to ints and the WHOLE ``-s{seed}-a{attempt}`` suffix is held to
+    ``_SUFFIX_BUDGET`` chars: a caller-supplied spec could carry an absurdly large (or corrupt) seed
+    OR attempt whose unbounded text would push the name past the provider's cap and get it silently
     truncated — desyncing the stored name from the ``run_label_prefix`` the orphan-sweep matches on
-    (the same failure the prefix bounding already guards against). The seed is the only unbounded
-    input, so it is the one trimmed; the deterministic prefix + ``-a{attempt}`` boundary keep the
-    name sweep-matchable."""
+    (the same failure the prefix bounding already guards against). BOTH numeric fields are unbounded
+    inputs, so both are trimmed (attempt first — it is normally tiny, so a long attempt is the
+    corrupt case — then seed), always keeping the ``-s``/``-a`` framing and the run-id prefix intact
+    so sweep prefix-matching still works."""
     try:
         seed_i = int(seed)
     except (TypeError, ValueError):
@@ -73,13 +74,14 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
         attempt_i = int(attempt)
     except (TypeError, ValueError):
         attempt_i = 0
-    suffix = f"-s{seed_i}-a{attempt_i}"
-    if len(suffix) > _SUFFIX_BUDGET:
-        # Trim the (sole unbounded) seed field, keeping the ``-a{attempt}`` boundary intact so the
-        # name stays parseable + matchable. ``-s`` + ``-a{attempt}`` is the fixed framing.
-        keep = _SUFFIX_BUDGET - len(f"-s-a{attempt_i}")
-        suffix = f"-s{str(seed_i)[: max(0, keep)]}-a{attempt_i}"
-    return f"{run_label_prefix(run_id)}{suffix}"
+    seed_s, attempt_s = str(seed_i), str(attempt_i)
+    # Fixed framing ``-s`` + ``-a`` (4 chars) always survives; the remaining budget is the digit
+    # space, split between attempt (kept short — usually 1 digit) and seed (gets the rest). This
+    # bounds the WHOLE suffix to _SUFFIX_BUDGET regardless of how large either field is.
+    digit_budget = _SUFFIX_BUDGET - len("-s-a")
+    attempt_s = attempt_s[: max(1, min(len(attempt_s), max(1, digit_budget - 1)))]
+    seed_s = seed_s[: max(0, digit_budget - len(attempt_s))]
+    return f"{run_label_prefix(run_id)}-s{seed_s}-a{attempt_s}"
 
 
 def build_payload(spec, seed: int, attempt: int, *, arm: str, runtime_secrets: dict | None = None) -> dict:

@@ -593,6 +593,47 @@ def test_list_vms_stops_when_server_ignores_pagination(monkeypatch):
     assert calls["n"] == 2  # one full page, then one more that added nothing -> stop
 
 
+def test_list_vms_raises_on_malformed_response(monkeypatch):
+    """An unexpected response schema (not a dict / no 'instances' list) must RAISE, not silently
+    return a partial fleet — orphan sweeping a partial list could miss still-billing VMs."""
+    from flash.providers.hyperstack import api as hs_api
+
+    # First page malformed (not a dict).
+    monkeypatch.setattr(hs_api, "request_with_retries", lambda path, **k: ["not", "a", "dict"])
+    with pytest.raises(hs_api.HyperstackApiError, match="unexpected /core/virtual-machines"):
+        hs_api.list_vms()
+
+    # 'instances' present but not a list.
+    monkeypatch.setattr(hs_api, "request_with_retries", lambda path, **k: {"instances": "oops"})
+    with pytest.raises(hs_api.HyperstackApiError, match="no 'instances' list"):
+        hs_api.list_vms()
+
+
+def test_list_vms_malformed_mid_walk_raises_not_partial(monkeypatch):
+    """A malformed LATER page (after valid pages) also raises rather than returning the partial list
+    gathered so far — that partial list would look authoritative to the orphan sweep."""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    full = [{"id": i, "name": f"flash-r-s0-a0-{i}"} for i in range(page_size)]
+
+    def fake_req(path, **k):
+        page = int(path.split("page=")[1].split("&")[0])
+        return {"instances": full} if page == 1 else {"unexpected": True}  # page 2 malformed
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    with pytest.raises(hs_api.HyperstackApiError, match="page 2"):
+        hs_api.list_vms()
+
+
+def test_list_vms_empty_page_one_is_valid_not_an_error(monkeypatch):
+    """A valid empty fleet (page 1 returns an empty 'instances' list) is NOT an error -> []."""
+    from flash.providers.hyperstack import api as hs_api
+
+    monkeypatch.setattr(hs_api, "request_with_retries", lambda path, **k: {"instances": []})
+    assert hs_api.list_vms() == []
+
+
 # ---------------------------------------------------------------------------
 # API: managed-keypair create is race-tolerant (two concurrent launches into one env)
 # ---------------------------------------------------------------------------

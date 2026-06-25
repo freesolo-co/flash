@@ -659,23 +659,37 @@ def test_instance_label_always_sweepable():
 
 def test_instance_label_bounds_seed_and_attempt():
     """The seed/attempt suffix is the only caller-supplied text appended after the (already-bounded)
-    run prefix: an absurd seed or a non-int must NOT push the name past the 60-char provider cap,
-    which would get the name silently truncated and desync it from the sweep-matched prefix."""
-    from flash.providers._instance import _MAX_NAME
+    run prefix: an absurd seed OR attempt (or a non-int) must NOT push the name past the 60-char
+    provider cap, which would get the name silently truncated and desync it from the sweep-matched
+    prefix. BOTH numeric fields are bounded so the WHOLE suffix stays <= _SUFFIX_BUDGET."""
+    from flash.providers._instance import _MAX_NAME, _SUFFIX_BUDGET, run_label_prefix
     from flash.providers.lambdalabs.jobs.builders import instance_label
+
+    def suffix_of(rid, label):
+        return label[len(run_label_prefix(rid)) :]
 
     # Normal small ids: unchanged.
     assert instance_label("flash-1700000000-abcd1234", 0, 0) == "flash-1700000000-abcd1234-s0-a0"
     # Absurdly large seed: name stays within the cap (and keeps the -a boundary).
-    huge = instance_label("flash-1700000000-abcd1234", 123456789012345, 0)
+    rid = "flash-1700000000-abcd1234"
+    huge = instance_label(rid, 123456789012345, 0)
     assert len(huge) <= _MAX_NAME
-    assert huge.endswith("-a0")
-    # A long run id AND a huge seed together still fit.
-    both = instance_label("flash-" + "x" * 80, 99999999999, 7)
+    assert len(suffix_of(rid, huge)) <= _SUFFIX_BUDGET
+    assert "-a0" in huge
+    # Absurdly large ATTEMPT (corrupt) alone: still bounded (the earlier fix only trimmed seed).
+    huge_att = instance_label(rid, 0, 999999999999)
+    assert len(huge_att) <= _MAX_NAME
+    assert len(suffix_of(rid, huge_att)) <= _SUFFIX_BUDGET
+    assert huge_att.startswith(rid + "-s")  # framing + prefix intact for sweep matching
+    # BOTH seed and attempt huge together: whole suffix bounded.
+    both_huge = instance_label(rid, 123456789, 987654321)
+    assert len(both_huge) <= _MAX_NAME
+    assert len(suffix_of(rid, both_huge)) <= _SUFFIX_BUDGET
+    # A long run id AND both fields huge together still fit.
+    both = instance_label("flash-" + "x" * 80, 99999999999, 7777777)
     assert len(both) <= _MAX_NAME
-    assert both.endswith("-a7")
-    # A non-int seed degrades to 0 instead of crashing / overflowing.
-    assert instance_label("flash-1700000000-abcd1234", "weird", 2).endswith("-s0-a2")
+    # A non-int seed/attempt degrades to 0 instead of crashing / overflowing.
+    assert instance_label(rid, "weird", "bad").startswith(rid + "-s0-a0")
 
 
 def test_terminate_run_instances_matches_forced_prefix(monkeypatch):

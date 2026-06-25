@@ -316,18 +316,28 @@ _VM_MAX_PAGES = 1000
 def list_vms() -> list[dict]:
     """Every Flash-listable VM across ALL pages (orphan-sweep + run-terminate read this).
 
-    Paginates ``/core/virtual-machines`` via ``page``/``per_page`` until a short/empty page (or the
-    server-reported total) is reached. A page fetch that errors propagates (so a partial list never
-    masquerades as the full fleet and lets a sweep reap survivors / miss orphans)."""
+    Paginates ``/core/virtual-machines`` via ``page``/``per_page`` until a short/empty page is
+    reached. A page fetch that errors propagates AND a malformed page schema raises
+    ``HyperstackApiError`` — so a partial/incomplete list never masquerades as the authoritative
+    fleet and lets a sweep miss still-billing VMs (or reap survivors)."""
     out: list[dict] = []
     seen_ids: set[str] = set()
     for page in range(1, _VM_MAX_PAGES + 1):
         resp = request_with_retries(
             f"/core/virtual-machines?page={page}&per_page={_VM_PAGE_SIZE}"
         )
-        insts = resp.get("instances") if isinstance(resp, dict) else None
-        if not isinstance(insts, list) or not insts:
-            break
+        # Distinguish a malformed response from a valid empty page. An unexpected schema (resp not a
+        # dict, or "instances" not a list) means we CANNOT trust this as the authoritative fleet —
+        # returning the partial list gathered so far would let an orphan sweep miss still-billing VMs
+        # past this point, so RAISE instead. A valid empty list is the legitimate end-of-pagination.
+        if not isinstance(resp, dict) or not isinstance(resp.get("instances"), list):
+            raise HyperstackApiError(
+                f"unexpected /core/virtual-machines response on page {page} "
+                f"(no 'instances' list): {resp!r}"
+            )
+        insts = resp["instances"]
+        if not insts:
+            break  # valid empty page -> done paginating
         added = 0
         for v in insts:
             # De-dupe across pages: an older API that ignores the ``page`` param would echo page 1
