@@ -393,9 +393,10 @@ def _rewrite_safetensors_header_keys(path: str, rename) -> int:
             raise ValueError(f"{path}: truncated safetensors header")
         try:
             header = json.loads(header_bytes)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             # Re-raise with the file path so a corrupt adapter being rewritten is diagnosable
-            # (a bare JSONDecodeError names no file).
+            # (a bare JSONDecodeError/UnicodeDecodeError names no file). Non-UTF8 header bytes
+            # raise UnicodeDecodeError, not JSONDecodeError, so catch both to keep the context.
             raise ValueError(
                 f"{path}: safetensors header is not valid JSON "
                 f"(corrupt or not a safetensors file): {exc}"
@@ -519,9 +520,10 @@ def _read_adapter_tensor_keys(adir: str) -> list[str] | None:
                 raise ValueError(f"{st_path}: truncated safetensors header")
             try:
                 header = json.loads(header_bytes)
-            except json.JSONDecodeError as exc:
-                # A bare JSONDecodeError ("Expecting value: line 1 column 1") gives no clue WHICH
-                # adapter is corrupt. Re-raise with the file path so a bad download is diagnosable.
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                # A bare JSONDecodeError ("Expecting value: line 1 column 1") — or a
+                # UnicodeDecodeError from non-UTF8 header bytes — gives no clue WHICH adapter is
+                # corrupt. Re-raise with the file path so a bad download is diagnosable.
                 raise ValueError(
                     f"{st_path}: safetensors header is not valid JSON "
                     f"(corrupt or not a safetensors file): {exc}"
