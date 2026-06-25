@@ -33,6 +33,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -273,9 +274,26 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
 
     multi = len(pool) > 1
     deleted: list[str] = []
+    failed_accounts: list[str] = []
     for i, key in enumerate(pool):
-        names = _run_async(_go_one(key))
+        # One bad key (expired / revoked / network) must NOT abort the sweep: the cache volume a
+        # failover created under a LATER account would otherwise stay billed forever. Catch, record,
+        # and keep going so every other account is still reclaimed.
+        try:
+            names = _run_async(_go_one(key))
+        except Exception as exc:
+            failed_accounts.append(f"acct{i}")
+            logger.warning("teardown: RunPod account %d sweep FAILED (continuing): %s", i, exc)
+            continue
         deleted.extend((f"acct{i}:{n}" if multi else n) for n in names)
+    if failed_accounts:
+        # Surface the aggregate so a fully-failed (or partially-failed) sweep is observable, not silent
+        # — the caller logs/returns `deleted`, which would otherwise hide that some accounts never ran.
+        logger.warning(
+            "teardown: %d of %d RunPod account(s) failed to sweep (%s) — their cache volumes may "
+            "still be billed; re-run teardown once the key(s) are valid",
+            len(failed_accounts), len(pool), ", ".join(failed_accounts),
+        )
     return deleted
 
 
@@ -328,8 +346,29 @@ def teardown_hyperstack_volumes(name: str | None = None) -> list[str]:
     # broad ``startswith(base + "-")`` prefix would also nuke unrelated user volumes like
     # ``flash-weights-backup`` / ``flash-weights-test``, so match exact names only.
     fleet = {base}
-    with contextlib.suppress(Exception):
+    try:
         fleet |= {hs_api.cache_volume_name(base, r) for r in hs_api.cache_regions()}
+    except Exception as exc:
+        # cache_regions() failed (API down / auth). Do NOT silently narrow to just the legacy bare
+        # name — that would skip every per-region ``flash-weights-<region>`` and exit "successfully",
+        # leaking those billed volumes. Instead derive the canonical per-region targets from the
+        # ACTUALLY-LISTED names by round-tripping each candidate region segment through
+        # cache_volume_name: a listed ``<base>-<seg>`` is a fleet volume only if its region segment is
+        # region-SHAPED (``country-number``, e.g. ``us-1``) AND reproduces the exact listed name. That
+        # admits ``flash-weights-us-1`` but never the user's ``flash-weights-backup`` / ``-test``.
+        logger.warning("teardown: hyperstack cache_regions failed (%s) — deriving per-region cache "
+                       "targets from the listed volumes instead of skipping them", exc)
+        prefix = f"{base.lower()}-"
+        region_seg = re.compile(r"^[a-z]+(?:-[a-z]+)*-\d+$")  # canonical region shape (e.g. ``us-1``, ``canada-1``)
+        for v in vols:
+            vname = (v.get("name") or "").lower()
+            if not vname.startswith(prefix):
+                continue
+            seg = vname[len(prefix):]
+            # Round-trip: only accept names cache_volume_name(base, seg) would itself have produced,
+            # and only when the segment is region-shaped (excludes arbitrary user suffixes).
+            if region_seg.match(seg) and hs_api.cache_volume_name(base, seg) == vname:
+                fleet.add(vname)
     for v in vols:
         vname = v.get("name") or ""
         if vname in fleet and v.get("id") and hs_api.delete_volume(v["id"]):
@@ -614,7 +653,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else catalog_model_ids()
+    catalog = catalog_model_ids()
+    models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else catalog
+    # Confidentiality gate: an explicit --models override may ONLY name public catalog ids. Warming an
+    # arbitrary (private/gated) repo with the operator HF_TOKEN would leave those weights on the
+    # platform-wide WRITABLE shared cache for every other tenant — bypassing the same catalog gate the
+    # normal run path enforces. Reject any off-catalog id BEFORE launching any preload worker. Teardown
+    # (which only deletes, never downloads) is exempt — it never reaches a download path.
+    if args.models and not args.teardown:
+        off_catalog = [m for m in models if m not in set(catalog)]
+        if off_catalog:
+            print("--models: refusing to preload off-catalog model id(s) into the shared cache: "
+                  f"{', '.join(off_catalog)} — only public catalog models may be warmed (private/gated "
+                  "repos would leak onto the platform-wide shared volume). They download cold on first "
+                  "use instead.")
+            return 2
     # Parse --datacenters ONCE. `scoped` means the operator actually narrowed to >=1 real DC id — NOT
     # merely that the flag was present. A flag that parses to NOTHING (e.g. `--datacenters ""`, all
     # whitespace/commas, or an all-invalid list) must be an ERROR, never a silent full teardown: it
@@ -633,7 +686,15 @@ def main(argv: list[str] | None = None) -> int:
               "teardown, or pass real DC ids.")
         return 2
     scoped = bool(parsed_dcs)  # a real RunPod-DC subset -> RunPod-only scope
-    dcs = parsed_dcs or [dc.value for dc in weight_cache_datacenters()]
+
+    # LAZY default RunPod-DC list. weight_cache_datacenters() imports runpod_flash, so resolving it
+    # eagerly here would crash --provision / --warm-instances / --teardown --dry-run on an instance-only
+    # control plane (no/broken RunPod SDK) — modes that never touch a RunPod DC, or are non-destructive.
+    # Resolve it ONLY inside the branches that actually warm or tear down RunPod without an explicit
+    # --datacenters scope. When `scoped`, `parsed_dcs` is used directly and this is never called.
+    def _default_dcs() -> list[str]:
+        return [dc.value for dc in weight_cache_datacenters()]
+
     if args.provision:
         # Eagerly create the instance-provider cache storage in every region/env (GPU-free). RunPod's
         # per-DC fleet materializes on the next eager endpoint deploy / warm, so it's not created here.
@@ -675,8 +736,12 @@ def main(argv: list[str] | None = None) -> int:
                       "— refusing to run (nothing deleted)")
                 return 2
         if args.dry_run:
-            # `--teardown --dry-run` must only PRINT the plan — never call the destructive helpers.
-            print(f"would delete the RunPod weight-cache volumes in {len(dcs)} datacenter(s)"
+            # `--teardown --dry-run` must only PRINT the plan — never call the destructive helpers AND
+            # never resolve the full RunPod DC list (weight_cache_datacenters imports runpod_flash):
+            # describe the scope abstractly when unscoped so this stays usable on an instance-only host.
+            scope_desc = (f"{len(parsed_dcs)} datacenter(s): {', '.join(parsed_dcs)}"
+                          if scoped else "every RunPod storage datacenter")
+            print(f"would delete the RunPod weight-cache volumes in {scope_desc}"
                   + ("" if scoped else " + every Lambda filesystem + Hyperstack volume named flash-weights"))
             return 0
         # Reclaim the cache storage on EVERY provider: RunPod network volumes, Lambda filesystems,
@@ -686,7 +751,10 @@ def main(argv: list[str] | None = None) -> int:
         # leak behind a single RunPod error. A provider with no configured key is already a no-op.
         deleted: list[str] = []
         try:
-            deleted += teardown_weight_cache(dcs)
+            # Pass the scoped list, or None for a full teardown — teardown_weight_cache resolves the
+            # default DC fleet itself (lazily, and only AFTER it confirms a RunPod key is configured),
+            # so an instance-only control plane never imports the RunPod SDK here.
+            deleted += teardown_weight_cache(parsed_dcs or None)
         except Exception as exc:
             logger.warning("teardown: RunPod cache teardown failed (continuing): %s", exc)
         # `--datacenters` is a RunPod-DC subset and has no meaning for the instance providers (Lambda
@@ -706,6 +774,9 @@ def main(argv: list[str] | None = None) -> int:
             print("scoped teardown (--datacenters): RunPod-only; Lambda/Hyperstack caches left intact")
         print(f"deleted {len(deleted)} weight-cache volume(s): {', '.join(deleted) or '(none)'}")
         return 0
+    # Default mode = warm the RunPod serverless fleet. This is the ONE path that genuinely needs the
+    # RunPod DC list (and the SDK), so resolve the lazy default here rather than eagerly above.
+    dcs = parsed_dcs or _default_dcs()
     if args.dry_run:
         print(f"would warm {len(dcs)} datacenter(s): {', '.join(dcs)}")
         print(f"with {len(models)} model(s): {', '.join(models)}")
