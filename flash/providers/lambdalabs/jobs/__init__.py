@@ -761,8 +761,9 @@ def poll_lambda_job(
                             False,
                             failure="stalled",
                             detail=f"no worker liveness (boot.log/heartbeat) for "
-                            f"{int(time.time() - active_since)}s after instance became active "
-                            f"(cloud-init/worker never started; limit {int(first_liveness_s)}s)",
+                            f"{int(time.time() - active_since)}s since the active/launch anchor "
+                            f"(active_since is launch-anchored on a reattach that first saw it active; "
+                            f"cloud-init/worker never started; limit {int(first_liveness_s)}s)",
                             host_fault=True,  # the region never got the worker to boot -> quarantine it
                         )
                 else:
