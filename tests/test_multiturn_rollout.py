@@ -237,29 +237,39 @@ def test_rollout_batch_serial_when_reward_not_thread_safe():
     assert elapsed >= 0.6, f"reward_thread_safe=False env was parallelized ({elapsed:.2f}s)"
 
 
-def test_rollout_batch_reward_fails_fast():
-    """A reward failure surfaces IMMEDIATELY — pending scorers are cancelled and the slow in-flight
-    judge calls are not awaited — so one rate-limit/API error can't keep a paid rollout stuck."""
+def test_rollout_batch_reward_failure_drains_not_backgrounds():
+    """On a reward failure: scorers that haven't started are cancelled (no new calls launched) and the
+    few already in flight are DRAINED before we raise — none keep scoring in the background after
+    rollout_batch returns (no spent calls / mutated scorer state bleeding into the next step)."""
+    import threading
     import time
 
-    class _FailFastEnv(_VarTurnEnv):
+    started, finished = [], []
+    lock = threading.Lock()
+
+    class _FailEnv(_VarTurnEnv):
         def reward(self, completion, example, state=None):
+            with lock:
+                started.append(example["rid"])
             if example["rid"] == 0:
                 raise RuntimeError("judge 500")  # fails right away
-            time.sleep(0.5)  # the others are slow
+            time.sleep(0.25)  # the in-flight peers are slow
+            with lock:
+                finished.append(example["rid"])  # records ONLY if the call ran to completion
             return 1.0
 
     def batched(prefixes, max_tokens_list):
         return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
 
-    examples = [{"max_model": 1, "rid": i} for i in range(8)]
-    t0 = time.perf_counter()
+    examples = [{"max_model": 1, "rid": i} for i in range(8)]  # 8 <= max_workers(=8): all start at once
     with pytest.raises(RuntimeError, match="judge 500"):
         rollout_batch(
-            examples=examples, active_env=_FailFastEnv(), render=render,
+            examples=examples, active_env=_FailEnv(), render=render,
             batched_generate=batched, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
         )
-    assert time.perf_counter() - t0 < 0.3, "reward failure did not surface fast (blocked on slow calls)"
+    # Every scorer that STARTED has also FINISHED by the time we get here (drained, not backgrounded);
+    # nothing is still running. With wait=False the slow peers would still be sleeping -> finished < started.
+    assert sorted(finished) == sorted(s for s in started if s != 0), "in-flight rewards were not drained"
 
 
 def test_rollout_one_interleaves_and_masks_env_tokens():

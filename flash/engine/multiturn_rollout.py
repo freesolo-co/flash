@@ -360,9 +360,12 @@ def rollout_batch(
     # raced). Envs opt out with ``reward_thread_safe = False``.
     if len(rollouts) <= 1 or not getattr(active_env, "reward_thread_safe", True):
         return [r.result(_score(r)) for r in rollouts]
-    # Concurrent + fail-FAST: surface the first reward error immediately and cancel pending scorers
-    # (and don't block on in-flight ones), so one rate-limit / API failure can't keep a paid rollout
-    # stuck behind unrelated long-timeout judge calls — matching the serial path's stop-on-first-error.
+    # Concurrent. On the first reward error: cancel every scorer that has NOT started
+    # (``cancel_futures``) so a failure launches no further judge/API calls, and DRAIN the few that
+    # are already in flight (``wait=True``) so none keep scoring in the background after we raise — a
+    # failed step must not spend calls or touch scorer state during the next one. Python can't kill a
+    # running thread, so draining (bounded by ``max_workers`` and each reward's own timeout) is the
+    # clean stop; the run errors out on a reward failure anyway.
     pool = ThreadPoolExecutor(max_workers=min(16, len(rollouts)))
     try:
         futures = {pool.submit(_score, r): i for i, r in enumerate(rollouts)}
@@ -370,7 +373,7 @@ def rollout_batch(
         for fut in as_completed(futures):
             scores[futures[fut]] = fut.result()  # re-raises the first failed scorer
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        pool.shutdown(wait=True, cancel_futures=True)
     return [r.result(s) for r, s in zip(rollouts, scores, strict=True)]
 
 
