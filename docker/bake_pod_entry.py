@@ -17,6 +17,7 @@ import io
 import os
 import subprocess
 import sys
+import time
 
 
 def main() -> int:
@@ -67,6 +68,9 @@ def main() -> int:
         repo_type="dataset",
     )
     print(f"[bake] ENTRY_DONE rc={rc}", flush=True)
+    # stay alive briefly so the poller observes out/STATUS while the pod is still "up" (it polls on a
+    # ~45s cadence); without this the pod exits instantly and the poller may only ever see EXITED.
+    time.sleep(90)
     return rc
 
 

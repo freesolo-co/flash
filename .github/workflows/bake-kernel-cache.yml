@@ -120,16 +120,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build + push baked per-sm image
+      # thin layer FROM the SAME base the warmup ran inside -> the cache toolchain always matches the
+      # shipped image (rebuilding the full Dockerfile.worker from the checkout could drift from the
+      # published base and bake a cache that silently won't load).
+      - name: Build + push baked per-sm image (thin layer on the warmed base)
         if: steps.gate.outputs.run == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.worker
+          file: docker/Dockerfile.kernelcache
           push: true
           tags: ghcr.io/freesolo-co/flash-worker:cu128-${{ matrix.sm }}
           provenance: false
           build-args: |
-            BUILD_KERNEL_CACHE=true
-            FLASH_ATTN_SPEC=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
-            FLASH_ATTN_3_SPEC=https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.03.19-850211f/flash_attn_3-3.0.0%2B20260318.cu128torch2100cxx11abitrue.8afc61-cp39-abi3-linux_x86_64.whl
+            BASE=ghcr.io/freesolo-co/flash-worker:cu128

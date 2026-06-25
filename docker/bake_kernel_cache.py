@@ -154,8 +154,15 @@ def main() -> int:
             except Exception as e:
                 log(f"hf list err: {str(e)[:120]}")
             if dead >= 2:
-                outcome = "pod_died"
-                log("pod terminated/exited before STATUS")
+                # the pod exits right after uploading out/STATUS, so "exited" is the NORMAL success
+                # tail, not a failure. re-check STATUS authoritatively (retries ride out a transient
+                # HF list error) before concluding the bake actually died.
+                if _status_present(api, repo, retries=3):
+                    outcome = "done"
+                    log("out/STATUS present (pod exited after success) -> warmup complete")
+                else:
+                    outcome = "pod_died"
+                    log("pod terminated/exited before STATUS")
                 break
             time.sleep(45)
 
@@ -194,6 +201,19 @@ def main() -> int:
 
     log(f"DONE outcome={outcome} rc={rc}")
     return rc
+
+
+def _status_present(api, repo: str, retries: int = 1) -> bool:
+    """Authoritative out/STATUS check, retried to ride out a transient HF list error."""
+    for i in range(retries):
+        try:
+            if "out/STATUS" in api.list_repo_files(repo, repo_type="dataset"):
+                return True
+        except Exception as e:
+            log(f"hf list err (status recheck {i + 1}/{retries}): {str(e)[:100]}")
+        if i < retries - 1:
+            time.sleep(5)
+    return False
 
 
 def _verify(out: str, sm: str) -> int:
