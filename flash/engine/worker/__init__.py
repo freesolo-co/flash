@@ -1087,8 +1087,6 @@ def run_sft():
         _dk["skip_prepare_dataset"] = True
         cfg_kwargs["dataset_kwargs"] = _dk
         cfg_kwargs["remove_unused_columns"] = False
-        from flash.catalog import vocab_size_for
-
         # Tokenize EXACTLY like TRL's non-packed prep (EOS-append parity so the model still learns to
         # stop; batched; truncate to max_length) then bin-pack into <= max_length blocks.
         _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
@@ -1985,7 +1983,25 @@ def run_rl():
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
         # The dataset carries example_idx (not the record); map each back to its original object.
-        examples = [rollout_examples[int(i)] for i in kwargs.get("example_idx", [])]
+        # Fail LOUD if TRL stops forwarding example_idx (column pruning / a TRL change): defaulting to
+        # [] would zip to ZERO examples -> empty rewards -> silent no-op / broken training (issues
+        # #206 / #210). A reward over the wrong/empty examples is far worse than crashing the run.
+        example_idx = kwargs.get("example_idx")
+        if example_idx is None:
+            raise RuntimeError(
+                "GRPO reward_fn received no 'example_idx' column from TRL — the reward cannot be "
+                "mapped back to its training example, so every reward would be empty/misaligned "
+                f"(got kwargs keys {sorted(kwargs)}). This usually means TRL dropped the dataset "
+                "column (remove_unused_columns / a TRL version change); the run is aborted rather "
+                "than silently training on no signal."
+            )
+        if len(example_idx) != len(completions):
+            raise RuntimeError(
+                f"GRPO reward_fn example_idx/completions length mismatch "
+                f"({len(example_idx)} vs {len(completions)}) — rewards would be misaligned with "
+                "the sampled completions; aborting rather than training on a shifted reward signal."
+            )
+        examples = [rollout_examples[int(i)] for i in example_idx]
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
@@ -2627,6 +2643,13 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
+# How long to wait for wandb.finish() to flush. On SUCCESS the full run must sync (a slow network /
+# large run can exceed the old 5s and leave the run "crashed"), so give it a generous-but-bounded
+# window; on FAILURE abort fast (the run is failing regardless and the worker is hard-exiting).
+_WANDB_FINISH_WAIT_S = 120.0
+_WANDB_FINISH_FAIL_WAIT_S = 5.0
+
+
 # Baked compiled-kernel cache (opt-in; see Dockerfile.worker + flash/engine/worker/kernel_warmup.py).
 # The Dockerfile points TRITON_CACHE_DIR/TORCHINDUCTOR_CACHE_DIR here and, when built with
 # --build-arg BUILD_KERNEL_CACHE=true, bakes a portable mega-cache produced on a real GPU. These
@@ -2718,8 +2741,16 @@ def wandb_finish(exit_code: int = 0) -> None:
         return
     import importlib.util
 
-    if importlib.util.find_spec("wandb") is None:
-        return
+    # find_spec can RAISE (not just return None) when wandb is already in sys.modules with an
+    # absent/partial __spec__ (e.g. a namespace-package or a partially-initialized import) — that
+    # would propagate out of the shutdown path and skip the hard exit. Keep it best-effort: treat any
+    # probe failure as "wandb present enough to try", and let the import + finish below (already
+    # wrapped) decide. Only a definitive None (probe succeeded, module truly absent) returns early.
+    try:
+        if importlib.util.find_spec("wandb") is None:
+            return
+    except Exception:
+        pass  # ambiguous probe -> fall through and try to finish (still fully guarded below)
     try:
         import wandb
 
@@ -2736,9 +2767,14 @@ def wandb_finish(exit_code: int = 0) -> None:
 
         t = threading.Thread(target=_finish, daemon=True)
         t.start()
-        t.join(timeout=5)
+        # On SUCCESS (exit_code == 0) wandb.finish() must flush the full run; a slow network / large
+        # run can take well over 5s, and cutting it off there is what leaves the run dangling ->
+        # "crashed". Allow a longer, still-bounded wait on success; keep the short cut-off on the
+        # FAILURE path (exit_code != 0) where we want to abort fast and the run is failing anyway.
+        wait_s = _WANDB_FINISH_WAIT_S if exit_code == 0 else _WANDB_FINISH_FAIL_WAIT_S
+        t.join(timeout=wait_s)
         if t.is_alive():
-            print("[wandb] finish() timed out; continuing with hard exit")
+            print(f"[wandb] finish() did not complete within {wait_s}s; continuing with hard exit")
         elif errs:
             print(f"[wandb] finish() warning: {errs[0]}")
     except Exception as e:  # pragma: no cover - logging-only path
