@@ -43,6 +43,15 @@ class GpuClass:
     # server then refuses, and the run never submits. Exactly the smoke-validated members below
     # are marked True.
     validated: bool = False
+    # Lambda Cloud instance-type name for this class (e.g. "gpu_1x_a10"); None -> not on Lambda.
+    # Lambda is the instance-based complement to RunPod's serverless substrate: a class with a
+    # ``lambda_name`` is provisionable on Lambda (capacity permitting), priced from Lambda's own
+    # live ``/instance-types`` rate (NOT the RunPod ``hourly_usd`` snapshot above).
+    lambda_name: str | None = None
+    # Hyperstack single-GPU flavor name for this class (e.g. "n3-L40x1"); None -> not on Hyperstack.
+    # Same instance-based model as Lambda (cloud-init -> Docker); a class with a ``hyperstack_name``
+    # is provisionable on Hyperstack when its flavor has stock, priced from Hyperstack's static map.
+    hyperstack_name: str | None = None
 
 
 # Static hourly rates are RunPod secure-cloud on-demand snapshots.
@@ -69,21 +78,19 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     # ---- Ampere/Ada workstation + datacenter cards (cheap capacity pools) ----
     # 24 GB is the floor: the sub-24 GB tiers (16 GB RTX A4000 / RTX 2000 Ada, 20 GB RTX A4500 /
     # RTX 4000 Ada) were dropped — the 24 GB classes below are the smallest managed cards.
-    GpuClass(
-        "RTX 3090",
-        "NVIDIA_GEFORCE_RTX_3090",
-        24,
-        "3090",
-        "sm86",
-        0.46,
-        validated=True,
-    ),
+    # (RTX 3090 was removed from the catalog — see git history.)
     GpuClass("L4", "NVIDIA_L4", 24, "l4", "sm89", 0.39),
+    # Lambda-only 24 GB Ampere datacenter card (RunPod has no A10). Instance-based capacity
+    # complement: chosen by the allocator only when the cheaper RunPod 24 GB classes are out of
+    # capacity, so it never undercuts RunPod on price.
+    GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10"),
     # Live-validated 2026-06-22: Qwen3.5-0.8B/9B SFT+GRPO train smokes (RunPod). The 48 GB tier that
     # fills the 32->80 GB gap (e.g. 4B GRPO @ 35 GB) ~55% cheaper than the A100.
     GpuClass(
         "RTX A6000", "NVIDIA_RTX_A6000", 48, "a6000", "sm86", 0.49,
         validated=True,
+        lambda_name="gpu_1x_a6000",
+        hyperstack_name="n3-RTX-A6000x1",
     ),
     GpuClass("A40", "NVIDIA_A40", 48, "a40", "sm86", 0.44),
     GpuClass(
@@ -93,6 +100,14 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "6000ada",
         "sm89",
         0.77,
+    ),
+    # L40 48 GB (Ada, sm89): datacenter card on Hyperstack (+ Nebius/DO/Vultr/Scaleway), NOT on
+    # RunPod or Lambda. Hyperstack-only here. hourly_usd is the Hyperstack list price.
+    GpuClass("L40", None, 48, "l40", "sm89", 1.00, hyperstack_name="n3-L40x1"),
+    # Lambda-only 40 GB A100 (SXM4) — RunPod's A100s are all 80 GB, so this fills the 32->80 GB gap
+    # on Lambda (e.g. a 4B GRPO at ~35 GB) as an instance-based capacity complement.
+    GpuClass(
+        "A100 SXM 40GB", None, 40, "a100sxm40", "sm80", 1.99, lambda_name="gpu_1x_a100_sxm4"
     ),
     # ---- big-VRAM tier (9B bf16 GRPO, future >9B bf16) ----
     # Validated 2026-06-11: 0.6B SFT smoke (phase6).
@@ -104,6 +119,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm80",
         1.39,
         validated=True,
+        hyperstack_name="n3-A100x1",
     ),
     # Live-validated 2026-06-22: Qwen3.5 0.8B/MiniCPM/2B/9B SFT+GRPO train smokes (RunPod).
     GpuClass(
@@ -114,6 +130,8 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     GpuClass(
         "H100", "NVIDIA_H100_80GB_HBM3", 80, "h100", "sm90", 3.29,
         validated=True,
+        lambda_name="gpu_1x_h100_pcie",
+        hyperstack_name="n3-H100x1",
     ),
     # Live-validated 2026-06-22: MiniCPM/2B/4B SFT+GRPO train smokes (RunPod, sm120/CUDA-13).
     GpuClass(
@@ -125,6 +143,9 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         2.09,
         min_cuda_modern="13.0",
         validated=True,
+        # NOT mapped to Hyperstack: this Blackwell class needs a CUDA-13 host driver, but Hyperstack
+        # only ships up to CUDA-12.8 (R570) images — it would boot then fail at worker setup. Re-add
+        # ``hyperstack_name="n3-RTX-PRO6000-SEx1"`` once a CUDA-13 Hyperstack image is available.
     ),
 )
 
@@ -162,7 +183,6 @@ _ALIASES.update(
     {
         "nvidia geforce rtx 4090": "RTX 4090",
         "nvidia geforce rtx 5090": "RTX 5090",
-        "nvidia geforce rtx 3090": "RTX 3090",
         "nvidia l4": "L4",
         "nvidia a40": "A40",
         "nvidia rtx 6000 ada generation": "RTX 6000 Ada",
@@ -202,7 +222,14 @@ def get_gpu_info(name: str) -> GpuClass:
 def providers_for(name: str) -> tuple[str, ...]:
     """Providers that can provision this GPU class."""
     info = get_gpu_info(name)
-    return ("runpod",) if info.enum_member else ()
+    out: list[str] = []
+    if info.enum_member:
+        out.append("runpod")
+    if info.lambda_name:
+        out.append("lambda")
+    if info.hyperstack_name:
+        out.append("hyperstack")
+    return tuple(out)
 
 
 def gpu_short(name: str) -> str:
@@ -385,12 +412,13 @@ class Provider(Protocol):
         """Best-effort: reap any resource this run may have left registered."""
         ...
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
+    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int | str]:
         """Destroy any billable resource this provider owns that no live run claims.
 
         Crash recovery: run at server startup (and after runs). ``active_labels`` is the
         set of instance-label PREFIXES still owned by recoverable runs — anything this
         provider rented that matches none of them is an orphan. Returns the destroyed
-        resource ids. Providers without a standing-billing substrate (RunPod's
-        serverless endpoints self-reap) implement this as a no-op."""
+        resource ids (RunPod uses int ids; the instance providers use opaque string ids).
+        Providers without a standing-billing substrate (RunPod's serverless endpoints
+        self-reap) implement this as a no-op."""
         ...
