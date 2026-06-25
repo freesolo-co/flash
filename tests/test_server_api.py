@@ -895,6 +895,23 @@ def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monke
     assert out2.state == "deployed"
     assert out2.finished_at is None  # NOT stamped from the deploy-time updated_at
 
+    # (3) reconciled-then-deployed legacy `done` run: record_realized_cost bumped updated_at to the
+    # reconcile time, so the backfill must NOT freeze that (later) stamp as teardown.
+    runner._save_status(
+        runner.RunStatus(
+            run_id="dep-leg3",
+            state="done",
+            spec={**spec, "run_id": "dep-leg3"},
+            remote=None,
+            updated_at=9_000.0,  # reconcile-time bump, well after teardown
+            finished_at=None,
+            reconciled_at=8_500.0,
+        )
+    )
+    out3 = runner.mark_deployed("dep-leg3", {"endpoint_name": "e3"})
+    assert out3.state == "deployed"
+    assert out3.finished_at is None  # not frozen from the reconcile-bumped updated_at
+
 
 def test_deploy_lock_is_usable_and_weakly_cleaned():
     # threading.Lock() isn't weak-referenceable, so the per-run lock must be a wrapper that
