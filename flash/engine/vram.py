@@ -259,6 +259,7 @@ def estimate_vram_gb(
     thinking: bool = False,
     use_vllm: bool = True,
     vocab: int = _VOCAB_DEFAULT,
+    sleep_offload: bool = True,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU, over the full knob matrix.
 
@@ -300,7 +301,11 @@ def estimate_vram_gb(
         completion = max_tokens if max_tokens else min(seq_len, 1024)
         logits = min(completion * vocab * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
-        return base + max(rollout, train)
+        # Sleep mode offloads the vLLM rollout engine during the backward, so rollout and train
+        # don't peak together (peak = max). WITHOUT sleep the engine stays resident through the
+        # backward, so both are live at once (peak = sum). sleep_offload=False sizes that resident
+        # peak -- used by grpo_fits_resident to decide whether a run can skip sleep mode.
+        return base + (max(rollout, train) if sleep_offload else rollout + train)
     # SFT: peak = base + activations + the big-vocab logits term. Both activations and logits are
     # driven by the worker's per-device micro-batch (capped at 4 AND vocab-sized to the logits budget
     # when the fused CE is off), NOT the global/effective batch_size (grad-accum realizes that). Use
@@ -317,6 +322,47 @@ def estimate_vram_gb(
     # (SFT loss spans the sequence) -- the term the SFT estimate once ignored entirely.
     logits = 0.0 if fused else pd * seq_len * vocab * _SFT_LOGITS_BYTES_PER_ELEM / 1e9
     return base + activations + logits
+
+
+def grpo_fits_resident(
+    model_id: str,
+    *,
+    seq_len: int = 1024,
+    max_tokens: int | None = None,
+    lora_rank: int = 32,
+    group_size: int = 8,
+    thinking: bool = False,
+    card_vram_gb: float = 0.0,
+    margin: float = 1.15,
+) -> bool:
+    """Whether a colocated-vLLM GRPO run fits RESIDENT (no vLLM sleep-mode offload) on a card of
+    ``card_vram_gb`` with a safety ``margin``. When it fits, sleep mode is unnecessary -- and the
+    sleep/wake cycle is what stalls the large-model GRPO rollout -- so the worker can skip it.
+    Conservative: an unknown card size or unknown model size returns False (keep the memory-safe
+    sleep default)."""
+    if not card_vram_gb or card_vram_gb <= 0:
+        return False
+    from flash.catalog import MODELS, vocab_size_for
+
+    info = MODELS.get(model_id)
+    params_b = float(getattr(info, "params_b", 0.0) or 0.0) if info else 0.0
+    if params_b <= 0:
+        return False  # unknown size (open-model path) -> keep the safe default
+    quant = (getattr(info, "quant", "bf16") or "bf16") if info else "bf16"
+    resident = estimate_vram_gb(
+        params_b,
+        "grpo",
+        quant,
+        seq_len=max(1, int(seq_len or 1024)),
+        max_tokens=max_tokens,
+        lora_rank=lora_rank,
+        group_size=group_size,
+        thinking=thinking,
+        use_vllm=True,
+        vocab=vocab_size_for(model_id),
+        sleep_offload=False,
+    )
+    return resident * margin <= card_vram_gb
 
 
 def model_required_vram_gb(

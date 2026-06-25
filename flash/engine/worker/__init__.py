@@ -94,6 +94,7 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
+    grpo_sleep_mode,
     liger_on,
     loraplus_optimizer_cls,
     optimal_attn_impl,
@@ -651,16 +652,34 @@ def finalize_alloc_conf_for_sleep() -> None:
         return
     try:
         model_id = JOB_SPEC.model if JOB_SPEC else ""
-        # Resolve the GRPO context the SAME way the sleep gate does (run_rl): the run's
-        # [train].max_length, so a long-context run gets the right sleep default + alloc conf.
-        _spec_len = 0
+        # Resolve the sleep decision EXACTLY as run_rl does (grpo_sleep_mode: the size/context gate
+        # PLUS the resident-fit check against the live card), so the alloc conf matches the sleep
+        # mode the trainer will actually use.
+        _t = JOB_SPEC.train if JOB_SPEC else None
+        ctx = 0
         try:
-            if JOB_SPEC and JOB_SPEC.train and JOB_SPEC.train.max_length:
-                _spec_len = int(JOB_SPEC.train.max_length)
+            if _t and _t.max_length:
+                ctx = int(_t.max_length)
         except Exception:
-            _spec_len = 0
-        ctx = int(_spec_len or 0)
-        if not _memory_mode(model_id, ctx):  # sleep resolves OFF -> expandable is safe + better
+            ctx = 0
+        card_gb = 0.0
+        try:
+            import torch as _torch_card
+
+            if _torch_card.cuda.is_available():
+                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
+        except Exception:
+            card_gb = 0.0
+        sleep_on = grpo_sleep_mode(
+            model_id,
+            max_length=ctx,
+            group_size=int(_t.group_size) if _t and _t.group_size else 8,
+            max_tokens=(_t.max_tokens if _t else None),
+            lora_rank=int(_t.lora_rank) if _t and _t.lora_rank else 32,
+            thinking=THINKING,
+            card_vram_gb=card_gb,
+        )
+        if not sleep_on:  # sleep resolves OFF -> expandable is safe + better
             conf = "expandable_segments:True"
             os.environ["PYTORCH_ALLOC_CONF"] = conf
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = conf
@@ -1795,13 +1814,35 @@ def run_rl():
     _adv_clip = float(gcfg.get("advantage_clip") or 0.0)
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     # vLLM sleep mode offloads the rollout engine's weights between steps to free memory for the
-    # optimizer, but reloading each step is a large per-step cost — PR #174 measured ~2-2.6x faster
-    # GRPO with it OFF on models that fit. Gate it by model size (same small=speed / large=memory
-    # gate as gradient checkpointing): OFF for small/fitting models, ON for large.
-    # Gate on the GRPO rollout context (the run's [train].max_length sizes the engine + KV cache):
-    # a long-context GRPO run is memory-tight and needs sleep mode. Matches the liger-loss gate below.
+    # optimizer, but reloading each step is a large per-step cost (PR #174 measured ~2-2.6x faster
+    # GRPO with it OFF on models that fit) AND on the large-model GRPO path the sleep/wake cycle
+    # STALLS the colocated rollout (the rollout emits unparseable completions, then the worker
+    # hangs mid-training). So enable sleep only when the run genuinely can't fit RESIDENT on THIS
+    # card: large/long-context AND the policy + colocated rollout engine + training peak don't fit
+    # on the live GPU. When they fit (the common allocator-sized case), skip sleep entirely.
     _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
-    sleep_mode = _memory_mode(model_id, _grpo_ctx)
+    _card_vram_gb = 0.0
+    try:
+        import torch as _torch_card
+
+        if _torch_card.cuda.is_available():
+            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
+    except Exception as _e:
+        print("[rl] card VRAM probe failed (sleep-mode gate falls back to size/context):", _e)
+    _lora_rank = int(_t.lora_rank) if _t and _t.lora_rank else 32
+    sleep_mode = grpo_sleep_mode(
+        model_id,
+        max_length=_grpo_ctx,
+        group_size=group_size,
+        max_tokens=gcfg.get("max_tokens"),
+        lora_rank=_lora_rank,
+        thinking=THINKING,
+        card_vram_gb=_card_vram_gb,
+    )
+    print(
+        f"[rl] vLLM sleep mode = {sleep_mode} "
+        f"(model={model_id}, ctx={_grpo_ctx}, card={_card_vram_gb:.0f}GB)"
+    )
     # Rollout backend: always colocated vLLM (fast). The whole supported catalog runs GRPO with
     # colocated vLLM; there is no transformers-generation fallback.
     use_vllm = True
