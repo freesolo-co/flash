@@ -21,9 +21,15 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+from collections.abc import Callable
 
 from flash._logging import get_logger
-from flash.providers._poll import PollErrorTracker, make_say, surface_heartbeat
+from flash.providers._poll import (
+    PollErrorTracker,
+    heartbeat_progress_ts,
+    make_say,
+    surface_heartbeat,
+)
 from flash.providers.base import GPU_INFO, PollResult
 from flash.providers.lambdalabs import api as lambda_api
 from flash.providers.lambdalabs.jobs.builders import (
@@ -259,6 +265,13 @@ def poll_lambda_job(
     """
     say = make_say(log)
 
+    # Single source of truth for "when did this instance launch". started_ts is a non-Optional float
+    # that LambdaJobHandle.from_dict coerces to 0.0 when MISSING (old/corrupt handle), so 0.0 means
+    # "unknown launch" (a real launch is a large epoch ts, never 0.0). Fall back to now so EVERY use
+    # below -- the load/stall clocks AND done_is_fresh / finish_ok's wall+cost stamping -- treats a
+    # recovered corrupt handle consistently, instead of billing/comparing from the 1970 epoch.
+    launch_ts = handle.started_ts or time.time()
+
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     done_reader = _make_hf_file_reader(hf_repo, f"{prefix}/DONE")
@@ -279,11 +292,11 @@ def poll_lambda_job(
         if done_content:
             try:
                 done_ts = float(done_content.strip())
-                if handle.started_ts <= done_ts <= end_ts:
+                if launch_ts <= done_ts <= end_ts:
                     end_ts = done_ts
             except ValueError:
                 pass
-        wall_h = (end_ts - handle.started_ts) / 3600.0
+        wall_h = (end_ts - launch_ts) / 3600.0
         metrics["cost_usd"] = round(wall_h * handle.hourly_usd, 6)
         notes = metrics.get("notes") if isinstance(metrics.get("notes"), dict) else {}
         notes.update(
@@ -300,9 +313,10 @@ def poll_lambda_job(
 
     def done_is_fresh(content: str) -> bool:
         # DONE carries the worker's time.time(); 120 s of clock-skew grace. Anything older predates
-        # this attempt (leftover from a prior attempt's resume).
+        # this attempt (leftover from a prior attempt's resume). Uses launch_ts (not handle.started_ts)
+        # so an unknown-launch (0.0) handle doesn't accept every leftover DONE as fresh.
         try:
-            return float(content.strip()) > handle.started_ts - 120.0
+            return float(content.strip()) > launch_ts - 120.0
         except ValueError:
             return False
 
@@ -327,16 +341,45 @@ def poll_lambda_job(
             detail=_failure_detail(hf_repo, prefix, spec.phase, marker),
         )
 
+    def terminal_artifact_result() -> PollResult | None:
+        # One forced read of the worker's terminal HF artifacts (DONE / attempt ok-marker). Returns a
+        # terminal PollResult when the worker definitively finished or errored, else None. Used both
+        # when the host is dead AND before returning a recovered client-side-deadline `stalled`: a
+        # control-plane outage longer than max_wall+grace must not discard a seed the worker actually
+        # completed during the downtime (the deadline check would otherwise fire before any DONE read).
+        d = done_reader(force=True)
+        if d is not None and done_is_fresh(d):
+            return finish_ok(d)
+        raw = marker_reader(force=True)
+        if raw:
+            with contextlib.suppress(ValueError):
+                m = json.loads(raw)
+                if m.get("ok"):
+                    return finish_from_ok_marker()  # finished (stale DONE ok)
+                return fail_from_marker(m)
+        return None
+
     poll_errors = PollErrorTracker(say, interval_s)
-    start = time.time()
+    # Seed the load/stall clocks from the instance's LAUNCH (launch_ts), not this poll's start: on a
+    # delayed reattach after a control-plane restart the box has been billing since launch, so a
+    # still-booting instance that already blew LOAD_TIMEOUT_S must fail over NOW instead of getting
+    # another full window. launch_ts already maps an unknown-launch (0.0) handle to now (see above),
+    # so a fresh launch is a no-op and a corrupt handle won't peg the clocks to the epoch.
+    start = launch_ts
     last_status = None
     last_hb_key = None
-    last_progress = time.time()
+    last_progress = start
     became_active = False
     seen_training_hb = False
     missing_streak = 0
     while True:
         if deadline_s is not None and time.time() - start > deadline_s:
+            # A recovered run can blow a launch-anchored deadline on the FIRST reattach tick (the
+            # outage lasted past max_wall+grace). Read terminal artifacts once before giving up: if
+            # the worker finished/errored during the downtime, persist that instead of retrying.
+            terminal = terminal_artifact_result()
+            if terminal is not None:
+                return terminal
             return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
         try:
             inst = lambda_api.get_instance(handle.instance_id)
@@ -349,8 +392,13 @@ def poll_lambda_job(
         status = (inst or {}).get("status") or ("missing" if inst is None else "unknown")
         if status != last_status:
             say(f"instance {handle.instance_id}: {status}")
+            # Treat a status TRANSITION as progress, but NOT the first observation: last_status
+            # starts None, so on a reattach the very first read always "changes" — counting it as
+            # progress would overwrite the launch-anchored last_progress and hand a silent-since-
+            # launch worker a fresh full setup grace after every control-plane restart.
+            if last_status is not None:
+                last_progress = time.time()
             last_status = status
-            last_progress = time.time()
         if status == "active":
             became_active = True
 
@@ -362,18 +410,9 @@ def poll_lambda_job(
         if dead:
             # One forced final read: the worker may have finished right before the box was torn
             # down (the normal success order on this substrate).
-            done = done_reader(force=True)
-            if done is not None and done_is_fresh(done):
-                return finish_ok(done)
-            raw_marker = marker_reader(force=True)
-            marker = None
-            if raw_marker:
-                with contextlib.suppress(ValueError):
-                    marker = json.loads(raw_marker)
-            if marker is not None and marker.get("ok"):
-                return finish_from_ok_marker()  # finished right before teardown (stale DONE ok)
-            if marker is not None and not marker.get("ok"):
-                return fail_from_marker(marker)
+            terminal = terminal_artifact_result()
+            if terminal is not None:
+                return terminal
             # Dead host, no marker, no DONE: a host loss, not a worker code error -> retry on a
             # fresh host/class. Surface whatever the boot log captured.
             return PollResult(
@@ -404,9 +443,19 @@ def poll_lambda_job(
         new_key, stage = surface_heartbeat(heartbeat_reader, last_hb_key, say)
         if new_key != last_hb_key:
             last_hb_key = new_key
-            last_progress = time.time()
-            if stage not in _SETUP_HEARTBEAT_STAGES:
-                seen_training_hb = True
+            # Credit the heartbeat's OWN timestamp, not the poll time: a heartbeat that was
+            # already stale before a control-plane restart must not reset the stall clock to now
+            # on the first reattach read (last_hb_key starts None, so even an old heartbeat looks
+            # "new"). Clamped to [launch, now]. Healthy workers heartbeat well inside the stall
+            # window, so their ts ~= now (no behavior change on the normal path). ``fresh`` is False
+            # for a LEFTOVER heartbeat from a prior attempt (ts < launch); we then neither advance
+            # last_progress nor mark training seen, so a stale training heartbeat can't arm the
+            # tighter training stall window before this attempt overwrites the file.
+            hb_ts, fresh = heartbeat_progress_ts(new_key, handle.started_ts)
+            if fresh:
+                last_progress = hb_ts
+                if stage not in _SETUP_HEARTBEAT_STAGES:
+                    seen_training_hb = True
         # Before the first TRAINING heartbeat the box is still in the long cold start (Docker pull +
         # pip + model download), so use the larger setup grace; tighten only once training begins.
         if became_active:
@@ -491,20 +540,37 @@ def terminate_run_instances(run_id: str) -> list[str]:
     return lambda_api.terminate_instances(ids) if ids else []
 
 
-def sweep_orphans(active_labels: set[str] | None = None) -> list[str]:
+def sweep_orphans(
+    active_labels: set[str] | Callable[[], set[str]] | None = None,
+) -> list[str]:
     """Terminate Flash-named instances that no live run owns; return terminated ids.
 
     Run at server startup (crash recovery) and after runs. Only names carrying the ``flash-`` run
     prefix are ever touched — nothing else on the account is ours to terminate. ``active_labels``
     may be RAW run ids; each is passed through ``run_label_prefix`` so it matches the same forced
     prefix the instance names carry. Best-effort: never raises.
+
+    ``active_labels`` may also be a CALLABLE returning that set — it is then resolved AFTER the
+    instance list is fetched. The periodic in-lifetime sweep passes one so the protection set is
+    read post-listing: any instance present in the list had its run's status row committed before
+    the instance was launched (hence before this list call), so resolving the live set now is
+    guaranteed to include it — closing the launch race where a run started after a pre-captured set
+    could have its fresh worker reaped as a phantom orphan.
     """
     try:
         instances = lambda_api.list_instances()
     except Exception as exc:
         logger.warning("lambda orphan sweep skipped: %s", exc)
         return []
-    active = {run_label_prefix(a) for a in (active_labels or set())}
+    try:
+        labels = active_labels() if callable(active_labels) else active_labels
+    except Exception as exc:
+        # Resolving the protection set failed (e.g. a db/status read error in the callable). SKIP the
+        # sweep — never fall through to an empty set, which would treat every live run's instance as
+        # an orphan and reap it. Honors the "never raises" contract.
+        logger.warning("lambda orphan sweep skipped: could not resolve active set: %s", exc)
+        return []
+    active = {run_label_prefix(a) for a in (labels or set())}
     orphans: list[str] = []
     for inst in instances:
         name = str(inst.get("name") or "")

@@ -669,13 +669,21 @@ def finalize_alloc_conf_for_sleep() -> None:
             import torch as _torch_card
 
             if _torch_card.cuda.is_available():
-                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
+                # Binary GiB to match grpo_fits_resident (see run_rl); /1e9 over-reports ~7%.
+                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
         except Exception:
             card_gb = 0.0
+        # Resolve group_size EXACTLY as run_rl does (gcfg override, else the recipe default), not a
+        # flat 8: if the recipe's rl.group_size differs from 8 the alloc-conf sleep decision here
+        # would diverge from the trainer's, picking the wrong expandable/non-expandable conf.
+        from flash.engine.recipe import RECIPE as _RECIPE
+
+        _gcfg = grpo_overrides()
+        _group_size = int(_gcfg.get("group_size") or _RECIPE.rl.group_size)
         sleep_on = grpo_sleep_mode(
             model_id,
             max_length=ctx,
-            group_size=int(_t.group_size) if _t and _t.group_size else 8,
+            group_size=_group_size,
             max_tokens=(_t.max_tokens if _t else None),
             lora_rank=int(_t.lora_rank) if _t and _t.lora_rank else 32,
             thinking=THINKING,
@@ -1369,8 +1377,6 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     factor, so a run intended as 64 prompts/step actually optimized only
     ``64 / group_size = 8`` prompts/step (an 8x smaller effective batch).
     """
-    import math
-
     group_size = max(1, int(group_size))
     prompts_per_step = max(1, int(prompts_per_step))
     per_device = max(1, int(per_device_comps))
@@ -1379,15 +1385,21 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     # a small prompts_per_step would otherwise overshoot it (mirrors run_sft's
     # `min(per_device_bs, effective_batch)`). No-op at the default (prompts_per_step=64).
     per_device = max(1, min(per_device, target_comps))
+    # per_device is the fixed VRAM knob, but when it does NOT divide target_comps neither floor
+    # nor ceil of grad_accum is right: floor (the old bug) silently optimizes FEWER prompts than
+    # requested, while ceil over-shoots and asks TRL for MORE unique prompts than the (already
+    # dataset-capped) prompts_per_step -- which, on a small retained dataset, yields no batches
+    # after the paid worker is provisioned. Instead shrink per_device to the largest divisor of
+    # target_comps that is <= the requested per_device: that lowers (never raises) peak VRAM and
+    # makes per_device * grad_accum == target_comps EXACTLY, so unique prompts == prompts_per_step
+    # with no over/under-shoot. (per_device=16, target_comps=40 -> 10 -> grad_accum=4 -> 40 comps
+    # = exactly 5 prompts. A divisor always exists since 1 divides everything.)
+    while target_comps % per_device != 0:
+        per_device -= 1
     grad_accum = max(1, target_comps // per_device)
-    # TRL rejects a global completion batch (per_device * grad_accum) that is not
-    # divisible by num_generations (= group_size), failing only AFTER the paid worker
-    # is provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the
-    # next multiple that makes the batch divisible (grad_accum must be a multiple of
-    # group_size // gcd(per_device, group_size)). This only ever raises the effective
-    # batch slightly; the common per_device|group_size cases are unchanged.
-    accum_step = group_size // math.gcd(per_device, group_size)
-    grad_accum = ((grad_accum + accum_step - 1) // accum_step) * accum_step
+    # The global completion batch (per_device * grad_accum == target_comps) is divisible by
+    # num_generations (= group_size) by construction, since target_comps = prompts_per_step *
+    # group_size; TRL's divisibility requirement is satisfied with no further rounding.
     generations_per_step = per_device * grad_accum
     unique_prompts_per_step = generations_per_step // group_size
     return {
@@ -1834,7 +1846,10 @@ def run_rl():
         import torch as _torch_card
 
         if _torch_card.cuda.is_available():
-            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
+            # Binary GiB (/(1024**3)), NOT decimal GB (/1e9 over-reports ~7%): grpo_fits_resident's
+            # VRAM estimate is in GiB, so a decimal card size would make a marginal card look big
+            # enough to fit resident and wrongly disable sleep, risking OOM.
+            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
     except Exception as _e:
         print("[rl] card VRAM probe failed (sleep-mode gate falls back to size/context):", _e)
     _lora_rank = int(_t.lora_rank) if _t and _t.lora_rank else 32
