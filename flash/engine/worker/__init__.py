@@ -1086,8 +1086,6 @@ def run_sft():
         _dk["skip_prepare_dataset"] = True
         cfg_kwargs["dataset_kwargs"] = _dk
         cfg_kwargs["remove_unused_columns"] = False
-        from flash.catalog import vocab_size_for
-
         # Tokenize EXACTLY like TRL's non-packed prep (EOS-append parity so the model still learns to
         # stop; batched; truncate to max_length) then bin-pack into <= max_length blocks.
         _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
@@ -1455,6 +1453,11 @@ def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
 # past the top of that plateau, even on a card with VRAM to spare. (Reward histories at pd 4 and
 # 16 were identical -> per_device is a pure speed/VRAM knob, not an optimization change.)
 _RL_PER_DEVICE_MAX = 16
+# fp32-logits VRAM budget (bytes) for a SINGLE Liger chunk's [chunk, completion, vocab] tensor.
+# The same 6 GB ceiling rl_per_device_comps uses to bound per_device; reused to bound the fused
+# GRPO loss chunk_size so a large micro-batch on a short-seq run can't materialize the whole
+# batch's logits in one chunk and OOM (see liger_loss_chunk_size).
+_RL_LOGITS_BUDGET_BYTES = 6.0e9
 # Reference sequence length the activation/VRAM divisor is calibrated at. The colocate activation
 # peak grows with the training sequence length; the cap is scaled by seq_len/_RL_ACT_SEQ_REF so a
 # short-seq run (the underfed regime) is allowed a proportionally bigger micro-batch.
@@ -1528,7 +1531,7 @@ def rl_per_device_comps(
     # Logits budget: hard upper bound on the fp32 [per_device, completion, vocab] logprob tensor.
     logits_cap = _RL_PER_DEVICE_MAX
     if completion_len > 0:
-        logits_cap = max(1, int(6.0e9 / (max(1, completion_len) * vocab * 4)))
+        logits_cap = max(1, int(_RL_LOGITS_BUDGET_BYTES / (max(1, completion_len) * vocab * 4)))
 
     # Growth is gated to SHORT sequences (seq < the reference). At/above the reference seq the
     # micro-batch is left exactly as the historical code computed it: bigger per_device at long
@@ -1572,6 +1575,26 @@ def rl_per_device_comps(
     # i.e. byte-for-byte the historical value.
     ceiling = _RL_PER_DEVICE_MAX if (short_seq and not THINKING) else default
     return max(1, min(ceiling, logits_cap, vram_cap))
+
+
+def liger_loss_chunk_size(per_device: int, completion_len: int, vocab: int) -> int:
+    """Sequences-per-chunk for TRL's Liger fused GRPO loss, bounded by the fp32-logits VRAM budget.
+
+    TRL leaves ``chunk_size`` at 1 (one sequence per chunk -> one detach/forward/compiled-loss/
+    autograd cycle PER SEQUENCE), so we raise it toward ``per_device`` to collapse that overhead to
+    a single invocation. But the Liger chunk materializes ``[chunk, completion_len, vocab]`` fp32
+    logits at once, so chunking the WHOLE micro-batch (chunk == per_device) blows VRAM when
+    per_device is large — exactly the short-context GRPO regime where ``rl_per_device_comps`` now
+    grows the micro-batch to 8/16. Cap the chunk so a single chunk's logits stay within the same 6 GB
+    budget that bounds per_device, then clamp to ``[1, per_device]``. The loss is numerically
+    identical for any chunk_size (every loss_type normalizes by the GLOBAL token count and chunk
+    losses are summed), so this only trades per-chunk peak VRAM against per-chunk launch overhead.
+    """
+    per_device = max(1, int(per_device))
+    if completion_len <= 0 or vocab <= 0:
+        return per_device  # no budget signal (offline / unknown) -> keep the whole micro-batch
+    budget = max(1, int(_RL_LOGITS_BUDGET_BYTES / (completion_len * vocab * 4)))
+    return max(1, min(per_device, budget))
 
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
@@ -1984,7 +2007,25 @@ def run_rl():
         # Score the <think>-stripped text (graded_text), then — datums parity — deduct
         # the thinking-length penalty computed from the RAW completion's <think> span.
         # The dataset carries example_idx (not the record); map each back to its original object.
-        examples = [rollout_examples[int(i)] for i in kwargs.get("example_idx", [])]
+        # Fail LOUD if TRL stops forwarding example_idx (column pruning / a TRL change): defaulting to
+        # [] would zip to ZERO examples -> empty rewards -> silent no-op / broken training (issues
+        # #206 / #210). A reward over the wrong/empty examples is far worse than crashing the run.
+        example_idx = kwargs.get("example_idx")
+        if example_idx is None:
+            raise RuntimeError(
+                "GRPO reward_fn received no 'example_idx' column from TRL — the reward cannot be "
+                "mapped back to its training example, so every reward would be empty/misaligned "
+                f"(got kwargs keys {sorted(kwargs)}). This usually means TRL dropped the dataset "
+                "column (remove_unused_columns / a TRL version change); the run is aborted rather "
+                "than silently training on no signal."
+            )
+        if len(example_idx) != len(completions):
+            raise RuntimeError(
+                f"GRPO reward_fn example_idx/completions length mismatch "
+                f"({len(example_idx)} vs {len(completions)}) — rewards would be misaligned with "
+                "the sampled completions; aborting rather than training on a shifted reward signal."
+            )
+        examples = [rollout_examples[int(i)] for i in example_idx]
         rewards = []
         debug_rows = []
         for idx, (comp, ex) in enumerate(zip(completions, examples, strict=False)):
@@ -2382,17 +2423,25 @@ def run_rl():
     # Liger fused-loss chunk_size: TRL leaves it at the default 1, so the fused GRPO loss runs its
     # whole detach -> chunk_forward -> compiled-loss -> autograd.grad cycle ONCE PER SEQUENCE
     # (per_device_train_batch_size times) — Python/kernel-launch/compile-guard overhead that
-    # dominates at small-model scale where the GEMMs are tiny. Collapse it to ONE invocation over the
-    # whole per-device micro-batch. Numerically identical (every loss_type normalizes by the GLOBAL
-    # token count, not the chunk-local size, and chunk losses are summed). Must run BEFORE the
-    # mask-aware wrap below, which replaces trainer.liger_grpo_loss with a closure that has no
-    # chunk_size attribute.
+    # dominates at small-model scale where the GEMMs are tiny. Raise it toward the whole per-device
+    # micro-batch, but BOUND by the fp32-logits VRAM budget: a chunk materializes
+    # [chunk, completion, vocab] fp32 logits at once, so on a short-context run where per_device grew
+    # to 8/16 (see rl_per_device_comps) collapsing the WHOLE batch into one chunk would blow VRAM /
+    # OOM. liger_loss_chunk_size caps the chunk to the same 6 GB budget that bounds per_device.
+    # Numerically identical for any chunk_size (every loss_type normalizes by the GLOBAL token count,
+    # not the chunk-local size, and chunk losses are summed). Must run BEFORE the mask-aware wrap
+    # below, which replaces trainer.liger_grpo_loss with a closure that has no chunk_size attribute.
     _liger_loss = getattr(trainer, "liger_grpo_loss", None)
     if _liger_loss is not None and hasattr(_liger_loss, "chunk_size"):
-        _cs = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
+        _pd = max(1, int(getattr(trainer.args, "per_device_train_batch_size", 1)))
+        _cs = liger_loss_chunk_size(_pd, _cap_completion_len, vocab_size_for(model_id))
         if _cs > int(getattr(_liger_loss, "chunk_size", 1)):
             _liger_loss.chunk_size = _cs
-            print(f"[rl] liger fused-loss chunk_size -> {_cs} (one invocation, not one per sequence)")
+            _capped = " (logits-budget capped)" if _cs < _pd else ""
+            print(
+                f"[rl] liger fused-loss chunk_size -> {_cs} of per_device {_pd}{_capped} "
+                "(fewer invocations, bounded per-chunk logits VRAM)"
+            )
     # Mask-aware lm_head: skip the 248k-vocab projection at MASKED completion positions in the GRPO
     # loss — its most expensive op, and the trainer step dominates train_wall. For MULTI-TURN that
     # masked set is the ~half-to-most of the transcript that is env/tool text; for SINGLE-TURN it is
@@ -2626,6 +2675,13 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
+# How long to wait for wandb.finish() to flush. On SUCCESS the full run must sync (a slow network /
+# large run can exceed the old 5s and leave the run "crashed"), so give it a generous-but-bounded
+# window; on FAILURE abort fast (the run is failing regardless and the worker is hard-exiting).
+_WANDB_FINISH_WAIT_S = 120.0
+_WANDB_FINISH_FAIL_WAIT_S = 5.0
+
+
 def wandb_finish(exit_code: int = 0) -> None:
     """Finalize the W&B run before the worker's hard ``os._exit()``.
 
@@ -2639,8 +2695,16 @@ def wandb_finish(exit_code: int = 0) -> None:
         return
     import importlib.util
 
-    if importlib.util.find_spec("wandb") is None:
-        return
+    # find_spec can RAISE (not just return None) when wandb is already in sys.modules with an
+    # absent/partial __spec__ (e.g. a namespace-package or a partially-initialized import) — that
+    # would propagate out of the shutdown path and skip the hard exit. Keep it best-effort: treat any
+    # probe failure as "wandb present enough to try", and let the import + finish below (already
+    # wrapped) decide. Only a definitive None (probe succeeded, module truly absent) returns early.
+    try:
+        if importlib.util.find_spec("wandb") is None:
+            return
+    except Exception:
+        pass  # ambiguous probe -> fall through and try to finish (still fully guarded below)
     try:
         import wandb
 
@@ -2657,9 +2721,14 @@ def wandb_finish(exit_code: int = 0) -> None:
 
         t = threading.Thread(target=_finish, daemon=True)
         t.start()
-        t.join(timeout=5)
+        # On SUCCESS (exit_code == 0) wandb.finish() must flush the full run; a slow network / large
+        # run can take well over 5s, and cutting it off there is what leaves the run dangling ->
+        # "crashed". Allow a longer, still-bounded wait on success; keep the short cut-off on the
+        # FAILURE path (exit_code != 0) where we want to abort fast and the run is failing anyway.
+        wait_s = _WANDB_FINISH_WAIT_S if exit_code == 0 else _WANDB_FINISH_FAIL_WAIT_S
+        t.join(timeout=wait_s)
         if t.is_alive():
-            print("[wandb] finish() timed out; continuing with hard exit")
+            print(f"[wandb] finish() did not complete within {wait_s}s; continuing with hard exit")
         elif errs:
             print(f"[wandb] finish() warning: {errs[0]}")
     except Exception as e:  # pragma: no cover - logging-only path

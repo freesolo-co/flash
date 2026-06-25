@@ -500,6 +500,14 @@ def build_rollout_func(
             input order.
             """
             nonlocal bounds_checked
+            # Each prefix MUST have its own max_tokens. A length mismatch (a caller bug) would let
+            # vLLM zip the shorter of prompts/sampling_params and silently truncate or misbudget some
+            # rollouts' turns -> corrupted token alignment. Fail loudly instead.
+            if len(prefixes) != len(max_tokens_list):
+                raise ValueError(
+                    f"batched_generate got {len(prefixes)} prefix(es) but "
+                    f"{len(max_tokens_list)} max_tokens value(s) — they must be 1:1"
+                )
             for p in prefixes:
                 # Fail loudly on a degenerate prompt instead of letting it reach the embedding gather
                 # as an opaque async CUDA illegal-access (the failure mode #162 was first mistaken
