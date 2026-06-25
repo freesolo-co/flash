@@ -394,7 +394,7 @@ class Provider(Protocol):
         """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll.
 
         ``on_last_gpu`` is True when no further GPU attempt will be made after this one — either the
-        candidate list is exhausted or the retry budget is — so there is no next-best class to fall
+        candidate list is exhausted or the retry budget is exhausted — so there is no next-best class to fall
         to and capacity backstops should wait longer before giving up.
         """
         ...

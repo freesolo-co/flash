@@ -55,7 +55,7 @@ class RunpodProvider:
         on_last_gpu: bool = False,
     ) -> PollResult:
         # ``on_last_gpu`` stretches the no-capacity grace when no further GPU attempt will be made
-        # after this one — either the candidate list is exhausted or the retry budget is (see
+        # after this one — either the candidate list is exhausted or the retry budget is exhausted (see
         # ``jobs.stall_kwargs``); waiting longer can't cost a fallback there is none.
         from flash.providers.runpod.jobs import submit_run
 

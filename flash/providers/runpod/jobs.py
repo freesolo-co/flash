@@ -92,7 +92,7 @@ def stall_kwargs(on_last_gpu: bool = False) -> dict:
     fall to a next-best class (``on_last_gpu`` False) we wait ~5 min: long enough to ride out a brief
     capacity blip, short enough that a genuinely starved class hands off to the next-best one
     promptly. When no further GPU attempt will be made — the candidate list is exhausted OR the retry
-    budget is (``on_last_gpu`` True) — there is nowhere left to walk, so we wait ~15 min before
+    budget is exhausted (``on_last_gpu`` True) — there is nowhere left to walk, so we wait ~15 min before
     giving up: burning the last attempt on a class with no fallback (and no retry left to spend the
     saved time on) is worse than waiting out a longer queue. Both are no-capacity backstops only:
     once the job leaves IN_QUEUE (a worker picks it

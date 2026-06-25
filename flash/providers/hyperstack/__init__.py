@@ -56,7 +56,7 @@ class HyperstackProvider:
         on_last_gpu: bool = False,
     ) -> PollResult:
         # ``on_last_gpu`` stretches the setup/no-capacity grace when no further GPU attempt will be
-        # made after this one — either the candidate list is exhausted or the retry budget is.
+        # made after this one — either the candidate list is exhausted or the retry budget is exhausted.
         from flash.providers.hyperstack.jobs import submit_run_hyperstack
 
         return submit_run_hyperstack(
