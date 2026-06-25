@@ -74,6 +74,33 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     assert payload["env"]["HF_TOKEN"] == "hf-worker-token"
 
 
+def test_image_per_sm_opt_in_selects_arch_tag(monkeypatch):
+    """Opt-in per-SM warmed images (PR #213) reach Hyperstack too: with FLASH_WORKER_IMAGE_PER_SM
+    set, the GPU class picks the matching -smXX tag. Default + FLASH_WORKER_IMAGE override unchanged.
+    NB: this is the worker *container* image, distinct from the VM *boot* image (docker_image_for_region)."""
+    from flash.providers.hyperstack.jobs import builders
+    from flash.providers.runpod.train import WORKER_IMAGE
+
+    for key in ("FLASH_WORKER_IMAGE", "FLASH_WORKER_IMAGE_PER_SM", "FLASH_WORKER_IMAGE_TEMPLATE"):
+        monkeypatch.delenv(key, raising=False)
+
+    # default: flat base image, byte-identical to pre-PR behavior
+    assert builders.hyperstack_image() == WORKER_IMAGE
+    assert builders.hyperstack_image("L40") == WORKER_IMAGE
+
+    # per-SM opt-in: the GPU class appends the arch tag, and it lands in the cloud-init
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_PER_SM", "1")
+    assert builders.hyperstack_image("L40") == f"{WORKER_IMAGE}-sm89"  # L40 = sm89
+    assert builders.hyperstack_image("H100") == f"{WORKER_IMAGE}-sm90"  # H100 = sm90
+    payload = builders.build_payload(_spec(gpu_type="L40"), seed=0, attempt=0)
+    script = builders.build_user_data(payload, gpu="L40")
+    assert f"{WORKER_IMAGE}-sm89" in script
+
+    # absolute override still wins, even with per-SM enabled and a GPU class given
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/freesolo-co/flash-worker:hotfix")
+    assert builders.hyperstack_image("L40") == "ghcr.io/freesolo-co/flash-worker:hotfix"
+
+
 # ---------------------------------------------------------------------------
 # launch_and_submit: region/stock walk
 # ---------------------------------------------------------------------------
