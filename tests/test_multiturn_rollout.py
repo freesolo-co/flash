@@ -16,7 +16,6 @@ from flash.engine.multiturn_rollout import (
     build_examples_index,
     index_collisions,
     rollout_async,
-    rollout_batch,
     rollout_one,
 )
 
@@ -91,7 +90,7 @@ def _generator(turn_texts):
 
 class _VarTurnEnv:
     """Multi-turn env that stops after a PER-EXAMPLE number of model turns, so a batch contains
-    rollouts of different lengths (exercises rollout_batch's lockstep drop-out)."""
+    rollouts of different depths (exercises rollouts finishing at different turns)."""
 
     multi_turn = True
 
@@ -121,69 +120,8 @@ class _VarTurnEnv:
 
 def _det_generate(prefix_ids, max_tokens):
     """Deterministic single-turn generation: a pure function of nothing but the call, so running
-    rollout_one per example and rollout_batch over all examples see byte-identical turns."""
+    rollout_one per example and rollout_async over all examples see byte-identical turns."""
     return [CONTENT["a1"], END], [-0.1, -0.2], "a1"
-
-
-def test_rollout_batch_equals_rollout_one_per_example():
-    """rollout_batch is exactly N independent rollout_one() calls — same token alignment, env_mask,
-    logprobs and per-rollout reward, in input order — only the generation is batched. Different
-    per-example turn counts force the batch to shrink as rollouts finish at different turns."""
-    examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
-
-    ones = [
-        rollout_one(
-            example=e,
-            active_env=_VarTurnEnv(),
-            render=render,
-            generate=_det_generate,
-            env_glue=env_glue,
-            max_turns=8,
-            per_turn_max_tokens=8,
-        )
-        for e in examples
-    ]
-
-    def batched(prefixes, max_tokens_list):
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
-
-    batch = rollout_batch(
-        examples=examples,
-        active_env=_VarTurnEnv(),
-        render=render,
-        batched_generate=batched,
-        env_glue=env_glue,
-        max_turns=8,
-        per_turn_max_tokens=8,
-    )
-    assert batch == ones
-    # rewards differ per rollout (per-rollout scoring survived batching)
-    assert [r["reward"] for r in batch] == [1.0, 3.0, 2.0]
-    # the multi-turn rollouts carry masked (0) env-glue tokens; the single-turn one does not
-    assert set(batch[0]["env_mask"]) == {1}  # max_model=1: one turn, no env tokens
-    three_turn = batch[1]  # max_model=3: env replies -> masked glue tokens present
-    assert 0 in three_turn["env_mask"]  # masked env-glue tokens
-    assert 1 in three_turn["env_mask"]  # trained model tokens
-
-
-def test_rollout_batch_preserves_input_order_and_count():
-    """One result per example, in input order (so TRL's GRPO group stays aligned)."""
-
-    def batched(prefixes, max_tokens_list):
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
-
-    examples = [{"max_model": 2}, {"max_model": 1}, {"max_model": 1}, {"max_model": 3}]
-    out = rollout_batch(
-        examples=examples,
-        active_env=_VarTurnEnv(),
-        render=render,
-        batched_generate=batched,
-        env_glue=env_glue,
-        max_turns=8,
-        per_turn_max_tokens=8,
-    )
-    assert len(out) == 4
-    assert [r["reward"] for r in out] == [2.0, 1.0, 1.0, 3.0]
 
 
 def test_rollout_one_interleaves_and_masks_env_tokens():
@@ -518,47 +456,6 @@ def test_rollout_func_returns_one_completion_per_prompt():
     assert len(out["prompt_ids"]) == 3
 
 
-def test_batched_makes_far_fewer_engine_calls_than_sequential():
-    # The CPU-measurable heart of the optimization: rollout_batch issues ONE batched generate per
-    # TURN (every active rollout together) vs one generate per prompt per turn for per-example
-    # rollout_one. For P prompts over T model turns the batched path makes ~T dispatches, the
-    # sequential path ~P*T — far fewer, far larger GPU calls (vLLM batches the decode), at identical
-    # results. Measured at the core-function level (no env toggle — batching is always on).
-    examples = [{"max_model": 2} for _ in range(6)]  # 6 prompts, _VarTurnEnv -> 2 model turns each
-
-    seq_calls = 0
-
-    def counting_gen(prefix, mt):
-        nonlocal seq_calls
-        seq_calls += 1
-        return _det_generate(prefix, mt)
-
-    seq = [
-        rollout_one(
-            example=e, active_env=_VarTurnEnv(), render=render, generate=counting_gen,
-            env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
-        )
-        for e in examples
-    ]
-
-    batch_calls = 0
-
-    def counting_batched(prefixes, max_tokens_list):
-        nonlocal batch_calls
-        batch_calls += 1
-        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
-
-    batch = rollout_batch(
-        examples=examples, active_env=_VarTurnEnv(), render=render, batched_generate=counting_batched,
-        env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
-    )
-
-    assert batch == seq  # byte-identical rollouts
-    assert seq_calls == 6 * 2  # sequential: one engine call per prompt per turn
-    assert batch_calls == 2  # batched: one engine call per turn (all 6 rollouts in each)
-    assert batch_calls < seq_calls
-
-
 def _fake_async_engine(gen, *, one_at_a_time=False, lifo=False):
     """submit/poll/busy over an in-memory queue, for CPU-testing rollout_async. By default poll()
     finishes ALL pending requests (one decode round); ``one_at_a_time`` finishes a single request
@@ -585,10 +482,10 @@ def _fake_async_engine(gen, *, one_at_a_time=False, lifo=False):
     return submit, poll, busy
 
 
-def test_rollout_async_equals_rollout_batch_and_one():
+def test_rollout_async_equals_rollout_one():
     """rollout_async (continuous-batched, no turn barrier) returns byte-identical rollouts to one
     rollout_one per example — same token alignment, env_mask, logprobs, per-rollout reward and input
-    order. Only the SCHEDULING differs from the synchronized rollout_batch."""
+    order. Only the SCHEDULING differs from the pure single-rollout reference."""
     examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
     ones = [
         rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
@@ -637,28 +534,24 @@ class _BatchRewardEnv(_VarTurnEnv):
         return [super(_BatchRewardEnv, self).reward("", ex, st) for ex, st in items]
 
 
-def test_reward_many_batches_scoring_in_both_paths():
-    """When the env exposes reward_many, BOTH rollout paths score every rollout in ONE batched call
+def test_reward_many_batches_scoring():
+    """When the env exposes reward_many, rollout_async scores every rollout in ONE batched call
     (env scores them concurrently) instead of a blocking reward() per rollout — the judge/expensive-
-    reward win — at identical per-rollout values + order, and the batched result stays byte-identical
-    across sync and async."""
+    reward win — at the same per-rollout values + input order as one rollout_one per example."""
     examples = [{"max_model": 1}, {"max_model": 3}, {"max_model": 2}]
-
-    def batched(prefixes, mt):
-        return [_det_generate(p, m) for p, m in zip(prefixes, mt, strict=True)]
-
-    env_b = _BatchRewardEnv()
-    out_b = rollout_batch(examples=examples, active_env=env_b, render=render, batched_generate=batched,
-                          env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
-    env_a = _BatchRewardEnv()
+    ones = [
+        rollout_one(example=e, active_env=_VarTurnEnv(), render=render, generate=_det_generate,
+                    env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+        for e in examples
+    ]
+    env = _BatchRewardEnv()
     submit, poll, busy = _fake_async_engine(_det_generate)
-    out_a = rollout_async(examples=examples, active_env=env_a, render=render, submit=submit, poll=poll,
-                          busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
-    for env, out in ((env_b, out_b), (env_a, out_a)):
-        assert env.reward_many_calls == 1  # ONE batched scoring call...
-        assert env.per_rollout_reward_calls == 0  # ...not one reward() per rollout
-        assert [r["reward"] for r in out] == [1.0, 3.0, 2.0]
-    assert out_a == out_b  # batched-reward path is byte-identical across sync/async
+    out = rollout_async(examples=examples, active_env=env, render=render, submit=submit, poll=poll,
+                        busy=busy, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8)
+    assert env.reward_many_calls == 1  # ONE batched scoring call...
+    assert env.per_rollout_reward_calls == 0  # ...not one reward() per rollout
+    assert out == ones  # byte-identical to the single-rollout reference (reward_many only batches)
+    assert [r["reward"] for r in out] == [1.0, 3.0, 2.0]
 
 
 @pytest.mark.usefixtures("_stub_vllm")

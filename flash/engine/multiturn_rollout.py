@@ -196,11 +196,11 @@ def rollout_one(
 
 
 class _RolloutState:
-    """Mutable per-rollout accumulator for the turn-synchronized batched loop (:func:`rollout_batch`).
+    """Mutable per-rollout accumulator for the continuous-batched rollout (:func:`rollout_async`).
 
     Holds exactly the running fields :func:`rollout_one` keeps in locals, so the two paths produce
-    byte-identical token alignment / env_mask / reward — the only difference is that batched
-    generation advances every still-active rollout's assistant turn in ONE vLLM call.
+    byte-identical token alignment / env_mask / reward — the only difference is that the async path
+    advances rollouts' turns as independent, continuously-batched engine requests.
     """
 
     __slots__ = (
@@ -252,7 +252,7 @@ def _advance_after_turn(
 ) -> None:
     """Fold one freshly-sampled assistant turn into rollout ``r`` and run its env step, mirroring the
     body of :func:`rollout_one`'s loop EXACTLY. Sets ``r.done`` when the rollout should stop. Used by
-    :func:`rollout_batch` so the batched and single-rollout paths can never drift."""
+    :func:`rollout_async` so the continuous-batched and single-rollout paths can never drift."""
     r.completion_ids.extend(asst_ids)
     r.logprobs.extend(asst_lp)
     r.env_mask.extend([1] * len(asst_ids))
@@ -291,8 +291,8 @@ def _build_rollout_states(
     engine_max_len: int | None,
 ) -> list[_RolloutState]:
     """Initialise one :class:`_RolloutState` per example (initial prompt rendered, engine budget
-    computed). Shared by the synchronized (:func:`rollout_batch`) and async
-    (:func:`rollout_async`) paths so both start from byte-identical state."""
+    computed) for :func:`rollout_async`, starting from the same state :func:`rollout_one` builds
+    inline so the two paths stay byte-identical."""
     rollouts: list[_RolloutState] = []
     for example in examples:
         state = active_env.new_rollout_state(example)
@@ -334,62 +334,6 @@ def _score_rollouts(active_env, rollouts: list[_RolloutState]) -> list[float]:
     return [float(active_env.reward("", r.example, r.state)) for r in rollouts]
 
 
-def rollout_batch(
-    *,
-    examples: list[dict],
-    active_env,
-    render: Callable[[list, bool], list[int]],
-    batched_generate: Callable[
-        [list[list[int]], list[int]], list[tuple[list[int], list[float], str]]
-    ],
-    env_glue: Callable[[list], list[int]],
-    max_turns: int,
-    per_turn_max_tokens: int,
-    engine_max_len: int | None = None,
-) -> list[RolloutResult]:
-    """Run ``len(examples)`` multi-turn rollouts with TURN-SYNCHRONIZED batched generation.
-
-    Semantically identical to calling :func:`rollout_one` once per example (same token alignment,
-    env_mask, per-rollout reward, and input ordering), but every still-active rollout's assistant
-    turn is sampled in a SINGLE ``batched_generate`` call instead of one ``engine.generate`` per
-    prompt per turn. vLLM is built to decode many sequences at once, so this is the dominant
-    multi-turn speedup; combined with vLLM prefix caching (on for the colocate engine) each
-    rollout's growing prefix and the shared in-group prompt are computed once and reused across
-    turns. Rollouts that finish (budget / max_turns / env done) drop out of the batch; the rest
-    keep generating until all are done.
-
-    ``batched_generate(prefixes, max_tokens_list)`` returns ``(token_ids, logprobs, text)`` per
-    prefix, in input order. It is injected so the loop is unit-testable on CPU.
-    """
-    rollouts = _build_rollout_states(examples, active_env, render, engine_max_len)
-
-    # Advance all rollouts in lockstep: each iteration samples one assistant turn for every
-    # still-active rollout in a single batched call, then runs each rollout's env step.
-    while True:
-        batch: list[_RolloutState] = []
-        max_news: list[int] = []
-        for r in rollouts:
-            if r.done:
-                continue
-            max_new = _turn_budget(r, per_turn_max_tokens)
-            if max_new is None:  # engine headroom exhausted -> _turn_budget marked r.done
-                continue
-            batch.append(r)
-            max_news.append(max_new)
-        if not batch:
-            break
-        gen = batched_generate([r.cur_ids for r in batch], max_news)
-        for r, (asst_ids, asst_lp, text) in zip(batch, gen, strict=True):
-            _advance_after_turn(
-                r, asst_ids, asst_lp, text,
-                active_env=active_env, env_glue=env_glue, max_turns=max_turns,
-            )
-
-    # Score with the ACTUAL accumulated rollout state (matches rollout_one), batched per task.
-    rewards = _score_rollouts(active_env, rollouts)
-    return [r.result(rw) for r, rw in zip(rollouts, rewards, strict=True)]
-
-
 def rollout_async(
     *,
     examples: list[dict],
@@ -405,13 +349,13 @@ def rollout_async(
 ) -> list[RolloutResult]:
     """Run ``len(examples)`` multi-turn rollouts with CONTINUOUS-BATCHED generation (no turn barrier).
 
-    Same result as :func:`rollout_batch` / one :func:`rollout_one` per example — identical token
-    alignment, env_mask, per-rollout reward and input order — but rollouts are NOT advanced in
-    lockstep. Each rollout's assistant turn is an independent engine request; the moment one
-    finishes, its env step runs and its NEXT turn is submitted, so the decode batch stays full
-    instead of stalling at a turn boundary while the slowest rollout's turn (and then every
-    rollout's env reply) completes. For high-variance multi-turn (rollouts of very different
-    depths) this keeps the GPU busy across the many turn boundaries the synchronized path idles at.
+    Same result as one :func:`rollout_one` per example — identical token alignment, env_mask,
+    per-rollout reward and input order — but rollouts are NOT advanced in lockstep. Each rollout's
+    assistant turn is an independent engine request; the moment one finishes, its env step runs and
+    its NEXT turn is submitted, so the decode batch stays full instead of stalling at a turn boundary
+    while the slowest rollout's turn (and then every rollout's env reply) completes. For high-variance
+    multi-turn (rollouts of very different depths) this keeps the GPU busy across the many turn
+    boundaries a turn-synchronized rollout would idle at.
 
     The work is split across two threads so the per-turn ENV work (env reply + glue render — the
     overhead that bounds an otherwise GPU-light rollout) overlaps the GPU decode instead of blocking
