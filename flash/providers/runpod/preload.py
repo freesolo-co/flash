@@ -175,14 +175,16 @@ def warm_weight_cache(
     datacenters: list[str] | None = None,
     gpu: str = _PRELOAD_GPU,
     timeout_s: int = 1800,
-    max_workers: int = 8,
+    max_workers: int = 4,
     poll_interval_s: float = 10.0,
     token: str | None = None,
 ) -> list[dict]:
     """Warm every (datacenter) volume with the given models. Returns one result dict per DC.
 
-    Datacenters are warmed concurrently (bounded by ``max_workers``). A region that errors is
-    reported in its result dict and does not abort the others.
+    Datacenters are warmed concurrently (bounded by ``max_workers``). Each concurrent warm deploys a
+    preload endpoint, so ``max_workers`` MUST stay under the RunPod endpoint/worker quota (documented
+    default 5) — the default of 4 leaves a buffer so extra deploys don't fail on quota. A region that
+    errors is reported in its result dict and does not abort the others.
     """
     models = models or catalog_model_ids()
     dc_ids = datacenters or [dc.value for dc in weight_cache_datacenters()]
@@ -390,7 +392,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--datacenters", help="comma-separated DC ids (default: all storage DCs)")
     ap.add_argument("--gpu", default=_PRELOAD_GPU, help="GPU class for the preload worker")
     ap.add_argument("--timeout-s", type=int, default=1800, help="per-DC job timeout")
-    ap.add_argument("--max-workers", type=int, default=8, help="datacenters warmed concurrently")
+    ap.add_argument(
+        "--max-workers", type=int, default=4,
+        help="datacenters warmed concurrently. Each one deploys a preload endpoint, so this MUST stay "
+             "under your RunPod endpoint/worker quota (the documented default is 5); the default of 4 "
+             "leaves a 1-slot buffer. Raise it only if your account quota is higher.",
+    )
     ap.add_argument("--dry-run", action="store_true", help="print the plan, provision nothing")
     ap.add_argument(
         "--provision", action="store_true",
@@ -400,11 +407,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--teardown", action="store_true",
-        help="DELETE the per-DC weight-cache volumes (reclaim standing storage) and exit",
+        help="DELETE the weight-cache storage on every provider (reclaim standing storage) and exit. "
+             "With --datacenters it is SCOPED to that RunPod-DC subset only (Lambda/Hyperstack caches "
+             "are left intact, since DC ids don't map to their region/env namespace).",
     )
     args = ap.parse_args(argv)
 
     models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else catalog_model_ids()
+    scoped_dcs = bool(args.datacenters)  # operator narrowed to a RunPod-DC subset (RunPod-only scope)
     dcs = (
         [d.strip() for d in args.datacenters.split(",") if d.strip()]
         if args.datacenters
@@ -422,10 +432,30 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.teardown:
         # Reclaim the cache storage on EVERY provider: RunPod network volumes, Lambda filesystems,
-        # and Hyperstack block volumes (each best-effort; a provider with no configured key is a no-op).
-        deleted = teardown_weight_cache(dcs)
-        deleted += teardown_lambda_filesystems()
-        deleted += teardown_hyperstack_volumes()
+        # and Hyperstack block volumes. Each provider is guarded INDEPENDENTLY so one provider's
+        # failure (e.g. RunPod auth absent/broken on an instance-only control plane, or a RunPod
+        # outage) never aborts the others' best-effort cleanup — otherwise their billed caches would
+        # leak behind a single RunPod error. A provider with no configured key is already a no-op.
+        deleted: list[str] = []
+        try:
+            deleted += teardown_weight_cache(dcs)
+        except Exception as exc:
+            logger.warning("teardown: RunPod cache teardown failed (continuing): %s", exc)
+        # `--datacenters` is a RunPod-DC subset and has no meaning for the instance providers (Lambda
+        # regions / Hyperstack envs are a different namespace), so a SCOPED teardown stays RunPod-only
+        # rather than unexpectedly deleting every Lambda/Hyperstack `flash-weights` cache too. Only a
+        # FULL teardown (no --datacenters) reclaims the instance-provider caches.
+        if not scoped_dcs:
+            try:
+                deleted += teardown_lambda_filesystems()
+            except Exception as exc:
+                logger.warning("teardown: Lambda cache teardown failed (continuing): %s", exc)
+            try:
+                deleted += teardown_hyperstack_volumes()
+            except Exception as exc:
+                logger.warning("teardown: Hyperstack cache teardown failed (continuing): %s", exc)
+        else:
+            print("scoped teardown (--datacenters): RunPod-only; Lambda/Hyperstack caches left intact")
         print(f"deleted {len(deleted)} weight-cache volume(s): {', '.join(deleted) or '(none)'}")
         return 0
     if args.dry_run:

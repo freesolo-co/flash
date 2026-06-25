@@ -711,6 +711,37 @@ def test_teardown_cli_reclaims_all_three_providers(monkeypatch):
     assert preload.main(["--teardown"]) == 0
 
 
+def test_teardown_continues_when_runpod_unconfigured(monkeypatch):
+    """A RunPod teardown raise (auth absent / outage) must NOT abort Lambda + Hyperstack cleanup."""
+    from flash.providers.runpod import preload
+
+    def _boom(dcs):
+        raise RuntimeError("RUNPOD_API_KEY not configured")
+
+    lam, hs = [], []
+    monkeypatch.setattr(preload, "teardown_weight_cache", _boom)
+    monkeypatch.setattr(preload, "teardown_lambda_filesystems", lambda: lam.append(1) or ["lambda:us-east-1/flash-weights"])
+    monkeypatch.setattr(preload, "teardown_hyperstack_volumes", lambda: hs.append(1) or ["hyperstack:default-US-1/flash-weights"])
+    # RunPod raises but the instance providers still get cleaned up best-effort; the CLI still exits 0.
+    assert preload.main(["--teardown"]) == 0
+    assert lam == [1]
+    assert hs == [1]
+
+
+def test_scoped_teardown_is_runpod_only(monkeypatch):
+    """`--teardown --datacenters ...` scopes to RunPod; instance-provider caches are left intact."""
+    from flash.providers.runpod import preload
+
+    seen = {}
+    monkeypatch.setattr(preload, "teardown_weight_cache", lambda dcs: seen.setdefault("dcs", dcs) or ["flash-weights-us-ca-2"])
+    monkeypatch.setattr(preload, "teardown_lambda_filesystems", lambda: seen.setdefault("lambda", True) or [])
+    monkeypatch.setattr(preload, "teardown_hyperstack_volumes", lambda: seen.setdefault("hyperstack", True) or [])
+    assert preload.main(["--teardown", "--datacenters", "US-CA-2"]) == 0
+    assert seen["dcs"] == ["US-CA-2"]  # the RunPod scope was honored
+    assert "lambda" not in seen  # instance providers were NOT touched
+    assert "hyperstack" not in seen
+
+
 # ---------------------------------------------------------------------------
 # Eager PROVISION — create the instance-provider cache storage in every region/env (no GPU)
 # ---------------------------------------------------------------------------
