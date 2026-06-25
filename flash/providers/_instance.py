@@ -365,9 +365,18 @@ cat > /opt/flash/hostlog.py <<'FLASH_HOSTLOG_EOF'
 cat > /opt/flash/failmark.py <<'FLASH_FAILMARK_EOF'
 {_FAILMARK_PY}FLASH_FAILMARK_EOF
 IMAGE={image!r}
-# huggingface_hub on the host for the boot-log + failure-marker uploaders (best-effort).
-pip3 install -q huggingface_hub >/dev/null 2>&1 \\
-  || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
+# huggingface_hub on the host for the boot-log + failure-marker uploaders. Best-effort (we must NOT
+# wedge cloud-init if PyPI/HF is unreachable — the worker container ships its own baked-in copy and
+# heartbeats once it starts), but RETRIED with an import verify: the boot.log this enables is exactly
+# what the poller's fast "active but the worker never started" failover keys on, so a transient
+# PyPI/network blip at boot must not PERMANENTLY disable the uploader and get a healthy box (still in
+# a long image pull) failed over for a missing liveness artifact it never had a chance to write.
+for i in 1 2 3; do
+  pip3 install -q huggingface_hub >/dev/null 2>&1 \\
+    || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
+  python3 -c "import huggingface_hub" >/dev/null 2>&1 && break
+  echo "FLASH: hf_hub install retry $i"; sleep 10
+done
 fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/failmark.py "$1" >/dev/null 2>&1 || true; exit 1; }}
 # Host->HF boot-log uploader, STARTED EARLY — BEFORE the docker-readiness wait and the (large, slow)
 # image pull — so a box that actually executed cloud-init leaves a liveness artifact on HF within

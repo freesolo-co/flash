@@ -186,6 +186,11 @@ def test_user_data_fails_fast_and_throttles_bootlog():
     assert 'fail "worker container did not start' in s
     assert "sleep 120" in s  # boot-log throttled to 120s
     assert "sleep 30;" not in s  # NOT the old 30s-forever loop
+    # The host hf_hub install (which the liveness boot-log uploader depends on) is RETRIED with an
+    # import verify, so a transient PyPI blip at boot can't permanently disable the uploader and get a
+    # healthy slow-pull box failed over for a missing boot.log it never had a chance to write.
+    assert 'python3 -c "import huggingface_hub" >/dev/null 2>&1 && break' in s
+    assert "FLASH: hf_hub install retry" in s
     # A fast CLEAN exit (code 0 — an already-complete retry restores metrics + writes its ok-marker
     # in <5s) is the success signal itself: the host inspects the exit code and writes the retriable
     # failmark ONLY on a non-zero exit, so it never clobbers the worker's just-written ok-marker.
