@@ -437,11 +437,42 @@ def poll_hs_job(
         _, fresh = heartbeat_progress_ts((stage, hb.get("step"), hb.get("ts")), launch_ts)
         return fresh
 
+    def fresh_retriable_hb() -> bool:
+        """True if THIS attempt's worker flagged a retriable infra fault in a FRESH heartbeat. The
+        heartbeat is seed-scoped, so ``worker_flagged_retriable()`` alone can read a PRIOR attempt's
+        RetriableInfraError heartbeat; gating on launch freshness keeps that stale signal from
+        quarantining the current (healthy) region for THIS attempt's non-retriable setup/worker error
+        (e.g. a bootstrap/extra_pip failure that wrote a non-retriable marker before any fresh hb)."""
+        if heartbeat_reader is None:
+            return False
+        try:
+            hb = heartbeat_reader(force=True)
+        except Exception:
+            return False
+        if not isinstance(hb, dict) or not hb.get("retriable"):
+            return False
+        _, fresh = heartbeat_progress_ts((hb.get("stage"), hb.get("step"), hb.get("ts")), launch_ts)
+        return fresh
+
+    def run_cancelled() -> bool:
+        """True if the run was deliberately cancelled. A user cancel during setup deletes the VM, which
+        the poller then sees as a dead host with no training heartbeat -> host_fault; but WE killed it,
+        so the region is healthy and must NOT be quarantined. Best-effort: a status-read error defaults
+        to 'not cancelled' (preserve the quarantine); a cancel that lands after this read is handled by
+        the runner's own cancellation path."""
+        try:
+            from flash.runner import get_status
+
+            return get_status(spec.run_id).state == "cancelled"
+        except Exception:
+            return False
+
     def fail_from_marker(marker: dict | None) -> PollResult:
         from flash.providers.runpod.jobs import worker_flagged_retriable
 
         # Host failure marker sets retriable=True; the worker stamps it for a RetriableInfraError.
-        retriable = bool(marker and marker.get("retriable")) or worker_flagged_retriable(heartbeat_reader)
+        marker_retriable = bool(marker and marker.get("retriable"))
+        retriable = marker_retriable or worker_flagged_retriable(heartbeat_reader)
         return PollResult(
             False,
             failure="job_preempted" if retriable else "job_failed",
@@ -450,8 +481,11 @@ def poll_hs_job(
             # docker/GPU never ready) -> the region is sick (this is the CANADA-1 case). A retriable
             # crash after training started is NOT a region fault. Use reached_training_now (not the bare
             # loop flag): this branch runs before surface_heartbeat() this iteration, so a worker that
-            # trained then failed within one poll interval would otherwise look pre-training.
-            host_fault=retriable and not reached_training_now(),
+            # trained then failed within one poll interval would otherwise look pre-training. The
+            # quarantine signal uses only a FRESH retriable (this attempt's marker, or a launch-fresh
+            # heartbeat) so a stale prior-attempt retriable heartbeat can't quarantine a healthy region
+            # for THIS attempt's non-retriable error.
+            host_fault=(marker_retriable or fresh_retriable_hb()) and not reached_training_now(),
         )
 
     def terminal_artifact_result() -> PollResult | None:
@@ -577,8 +611,10 @@ def poll_hs_job(
                 # region -> quarantine it; a worker-CODE crash (not infra) or a loss after training is
                 # NOT a region fault, so it must not quarantine an otherwise-healthy region.
                 # reached_training_now (not the bare loop flag) covers a worker that trained then died
-                # within one poll interval, before surface_heartbeat() ran this iteration.
-                host_fault=not worker_crashed and not reached_training_now(),
+                # within one poll interval, before surface_heartbeat() ran this iteration. Nor is it a
+                # region fault if WE killed the box: a user cancel during setup deletes the VM, which
+                # lands here with no training heartbeat -> run_cancelled() suppresses the quarantine.
+                host_fault=not worker_crashed and not reached_training_now() and not run_cancelled(),
             )
 
         raw_marker = marker_reader()

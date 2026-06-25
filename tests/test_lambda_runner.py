@@ -572,19 +572,58 @@ def test_poll_marker_failure_is_job_failed(monkeypatch):
 
 def test_poll_retriable_marker_is_job_preempted(monkeypatch):
     """A worker-flagged retriable failure retries on a fresh host (job_preempted), not job_failed.
-    With NO training heartbeat (only the retriable bit), it is a pre-training infra fault -> the region
-    is quarantined (host_fault)."""
+    With a FRESH retriable heartbeat and NO training heartbeat, it is a pre-training infra fault -> the
+    region is quarantined (host_fault)."""
     jobs = _wire_poll(
         monkeypatch,
         instances=[{"status": "active"}],
         marker=json.dumps({"ok": False, "attempt": 0, "error": "transient"}),
     )
     res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {"retriable": True}
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 10_000.0},  # fresh (ts >= launch)
     )
     assert not res.ok
     assert res.failure == "job_preempted"
-    assert res.host_fault  # retriable crash before any training heartbeat -> sick region
+    assert res.host_fault  # fresh retriable crash before any training heartbeat -> sick region
+
+
+def test_poll_marker_stale_retriable_heartbeat_does_not_quarantine(monkeypatch):
+    """On a RETRY, worker_flagged_retriable() can read a PRIOR attempt's RetriableInfraError heartbeat
+    (seed-scoped, ts < this attempt's launch). THIS attempt's non-retriable setup failure then still
+    retries (the lenient classification honors the stale bit) but must NOT quarantine the healthy
+    region: fresh_retriable_hb() rejects the stale heartbeat for the host_fault signal."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        marker=json.dumps({"ok": False, "attempt": 1, "error": "bootstrap pip failed"}),  # non-retriable
+    )
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=10_000.0, attempt=1), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {"retriable": True, "ts": 5_000.0},  # STALE: ts < launch 10_000
+    )
+    assert not res.ok
+    assert not res.host_fault  # stale prior-attempt retriable heartbeat did not quarantine the region
+
+
+def test_poll_dead_host_cancelled_run_not_quarantined(monkeypatch):
+    """A user cancel during setup terminates the box; the poller sees a dead host with no training
+    heartbeat. run_cancelled() suppresses host_fault so a HEALTHY region is not quarantined for a
+    deliberate teardown."""
+    import flash.runner
+
+    monkeypatch.setattr(
+        flash.runner, "get_status", lambda run_id: type("S", (), {"state": "cancelled"})()
+    )
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "terminated"}],
+        boot="+ docker pull ... (still in setup when cancelled)",
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "job_preempted"
+    assert not res.host_fault  # cancelled -> region NOT quarantined
 
 
 def test_poll_midtraining_retriable_marker_does_not_quarantine(monkeypatch):
