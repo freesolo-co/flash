@@ -588,6 +588,61 @@ def test_teardown_weight_cache_sweeps_all_pool_accounts(monkeypatch):
     assert sorted(out) == ["acct0:flash-weights-us-ca-2", "acct1:flash-weights-us-ca-2"]
 
 
+def test_teardown_does_not_report_failed_deletes(monkeypatch):
+    # A real delete failure (auth/5xx/network) leaves the volume present -> it must NOT appear in the
+    # "deleted" result (the re-list is the source of truth), and a warning is logged.
+    import runpod_flash.core.api.runpod as rp_api
+
+    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import preload
+
+    class FakeRest:
+        def __init__(self, api_key=None):
+            self.vols = {"v1": "flash-weights-us-ca-2"}  # delete will "fail" -> stays present
+
+        async def list_network_volumes(self):
+            return {"networkVolumes": [{"name": n, "id": i} for i, n in self.vols.items()]}
+
+        async def _execute_rest(self, method, url):
+            raise Exception("403 Forbidden")  # real failure: volume NOT removed
+
+    monkeypatch.setattr(rp_keys, "keys", lambda: ["k1"])
+    monkeypatch.setattr(rp_api, "RunpodRestClient", FakeRest)
+    out = preload.teardown_weight_cache(["US-CA-2"])
+    assert out == []  # nothing confirmed gone -> not reported as deleted
+
+
+def test_teardown_works_inside_running_event_loop(monkeypatch):
+    # teardown is normally a sync CLI call, but _run_async must also work if invoked from an async
+    # context (notebook/server) — asyncio.run() alone would raise "running event loop".
+    import asyncio
+
+    import runpod_flash.core.api.runpod as rp_api
+
+    from flash.providers.runpod import keys as rp_keys
+    from flash.providers.runpod import preload
+
+    class FakeRest:
+        def __init__(self, api_key=None):
+            self.vols = {"v1": "flash-weights-us-ca-2"}
+
+        async def list_network_volumes(self):
+            return {"networkVolumes": [{"name": n, "id": i} for i, n in self.vols.items()]}
+
+        async def _execute_rest(self, method, url):
+            self.vols.pop(url.rsplit("/", 1)[-1], None)
+            return {}
+
+    monkeypatch.setattr(rp_keys, "keys", lambda: ["k1"])
+    monkeypatch.setattr(rp_api, "RunpodRestClient", FakeRest)
+
+    async def _from_async():
+        return preload.teardown_weight_cache(["US-CA-2"])  # sync call from within a live loop
+
+    out = asyncio.run(_from_async())
+    assert out == ["flash-weights-us-ca-2"]
+
+
 def test_preload_one_dc_deploys_pins_single_dc_and_tears_down(monkeypatch):
     from flash.providers.runpod import preload
 

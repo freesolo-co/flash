@@ -46,6 +46,26 @@ from flash.providers.runpod.jobs import (
 
 logger = get_logger(__name__)
 
+
+def _run_async(coro):
+    """Run a coroutine to completion from sync code, even if an event loop is already running.
+
+    teardown is normally a sync CLI/operator entrypoint (asyncio.run is fine), but it may also be
+    called from an async context (a notebook, a FastAPI handler) where ``asyncio.run`` raises
+    "cannot be called from a running event loop". In that case run it on a worker thread instead.
+    """
+    import asyncio as _asyncio
+
+    try:
+        _asyncio.get_running_loop()
+    except RuntimeError:
+        return _asyncio.run(coro)  # no running loop — the normal CLI/sync path
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(_asyncio.run, coro).result()
+
+
 _HF_HOME = "/runpod-volume/hf-cache"
 # Cheapest broadly-available class; preload only downloads (no compute), so the GPU is incidental —
 # the job is short, so the cost is a few cents per region.
@@ -180,7 +200,6 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     another account on a quota error, so a cache volume may have been created under any pool key —
     a single-account teardown would leak the volumes the failover created elsewhere.
     """
-    import asyncio
 
     from runpod_flash.core.api.runpod import RunpodRestClient
     from runpod_flash.core.resources.datacenter import DataCenter
@@ -212,12 +231,19 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
             with contextlib.suppress(Exception):
                 await client._execute_rest("DELETE", f"{RUNPOD_REST_API_URL}/networkvolumes/{vid}")
         remaining = await _names(client)
-        return [name for name in to_delete if name not in remaining]  # provably gone
+        gone = [name for name in to_delete if name not in remaining]  # provably gone (confirmed)
+        # A target still present after its delete means a REAL failure (auth/permission/5xx/network)
+        # that the 204-tolerant suppress() above hid — surface it so a failed reclaim isn't silent.
+        still = [name for name in to_delete if name in remaining]
+        if still:
+            logger.warning("teardown: %d cache volume(s) FAILED to delete (still present): %s",
+                           len(still), ", ".join(sorted(still)))
+        return gone
 
     multi = len(pool) > 1
     deleted: list[str] = []
     for i, key in enumerate(pool):
-        names = asyncio.run(_go_one(key))
+        names = _run_async(_go_one(key))
         deleted.extend((f"acct{i}:{n}" if multi else n) for n in names)
     return deleted
 
