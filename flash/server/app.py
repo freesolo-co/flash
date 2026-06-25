@@ -164,6 +164,77 @@ async def _reap_idle_endpoints_loop() -> None:
             _log.debug("idle-endpoint reaper sweep failed; retrying next cycle", exc_info=True)
 
 
+def _active_run_ids() -> set[str]:
+    """Run ids of every NON-terminal run — the set whose provider instances must be PROTECTED from
+    the periodic orphan sweep below. The instance providers' ``sweep_orphans`` re-derives each
+    instance-label prefix from a run id via ``run_label_prefix``, so it wants raw run ids (unlike
+    ``_protected_train_endpoint_names``, which yields RunPod endpoint *names*).
+
+    Why this is a safe protection set with no idle grace: a run's status is flipped to a non-terminal
+    state BEFORE its first instance is ever launched (``_run_seed_loop`` writes ``running`` ahead of
+    ``_submit_seed_supervised``), and the launched instance is torn down BEFORE the run can reach a
+    terminal state (the provider lifecycle's ``finally``). So a billed instance exists ONLY while its
+    run is in this set — ownership is a deterministic name->run mapping, not the noisy idle signal the
+    RunPod reaper must grace. (Startup recovery in ``recover_runs`` deliberately uses a NARROWER set —
+    only handle-backed/resume runs — because it is simultaneously RESUBMITTING handle-less runs and
+    must reap their stale half-rented instances; in-lifetime we instead protect every live run.)"""
+    from flash.runner import TERMINAL_STATES
+
+    ids: set[str] = set()
+    for row in db.all_runs():
+        try:
+            status = get_status(row["run_id"])
+        except FileNotFoundError:
+            continue
+        if status.state not in TERMINAL_STATES:
+            ids.add(status.run_id)
+    return ids
+
+
+def _sweep_orphan_instances_once() -> int:
+    """One run-aware sweep of orphaned instance-provider workers — Lambda/Hyperstack VMs whose run
+    finished or crashed without the per-run ``finally`` tearing them down. Returns the count torn
+    down. Dispatched to every configured provider; RunPod's ``sweep_orphans`` is a no-op (its
+    serverless endpoints carry no standing per-run billing and are handled by the idle reaper)."""
+    from flash.providers import configured_providers
+
+    active = _active_run_ids()
+    torn = 0
+    for prov in configured_providers():
+        with contextlib.suppress(Exception):  # one provider's API blip must not skip the others
+            torn += len(prov.sweep_orphans(active_labels=active))
+    return torn
+
+
+async def _sweep_orphan_instances_loop() -> None:
+    """Background loop: proactively tear down orphaned Lambda/Hyperstack instances (billed VMs left
+    by finished/crashed runs that the per-run ``finally`` teardown missed) so they stop billing
+    without waiting for the next control-plane restart. This is the in-lifetime counterpart of the
+    instance providers' startup ``sweep_orphans`` (``recover_runs``) — the instance analogue of
+    ``_reap_idle_endpoints_loop`` for RunPod. Blocking provider calls are offloaded to a thread; a
+    failed sweep is logged and retried next cycle."""
+    interval = 600.0  # sweep every 10 min (matches the RunPod idle reaper)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            torn = await asyncio.to_thread(_sweep_orphan_instances_once)
+            if torn:
+                _log.info("swept %d orphaned instance-provider worker(s)", torn)
+        except asyncio.CancelledError:
+            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+        except Exception:
+            _log.debug("instance orphan sweep failed; retrying next cycle", exc_info=True)
+
+
+def _instance_providers_configured() -> bool:
+    """True when an instance-based provider (Lambda / Hyperstack) is configured on this plane, so the
+    periodic instance orphan sweep is worth running. RunPod-only planes skip it — RunPod has no
+    standing per-run billing to reap between restarts (its idle reaper covers warm endpoints)."""
+    from flash.providers import available_providers
+
+    return any(name in ("lambda", "hyperstack") for name in available_providers())
+
+
 class _RunLock:
     """A weak-referenceable mutex usable as a context manager.
 
@@ -374,10 +445,18 @@ def create_app():
             if os.environ.get("RUNPOD_API_KEY")
             else None
         )
+        # Periodic instance orphan sweep: proactively tear down Lambda/Hyperstack VMs left billing by
+        # finished/crashed runs (the in-lifetime counterpart of their startup sweep_orphans). Only
+        # when an instance provider is configured — RunPod-only planes have nothing standing to reap.
+        sweep_task = (
+            asyncio.create_task(_sweep_orphan_instances_loop())
+            if _instance_providers_configured()
+            else None
+        )
         try:
             yield
         finally:
-            for task in (cost_task, reap_task):
+            for task in (cost_task, reap_task, sweep_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
