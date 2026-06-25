@@ -550,7 +550,7 @@ def test_cache_ensured_per_region_in_the_walk(monkeypatch):
 # ---------------------------------------------------------------------------
 # poll_lambda_job state machine
 # ---------------------------------------------------------------------------
-def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0):
+def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0, legacy_boot=None):
     from flash.providers.lambdalabs import api as lambda_api
     from flash.providers.lambdalabs import jobs
 
@@ -574,8 +574,10 @@ def _wire_poll(monkeypatch, instances, done=None, marker=None, metrics=None, boo
                 return marker() if callable(marker) else marker
             if path.endswith("metrics.json"):
                 return metrics() if callable(metrics) else metrics
-            if path.endswith("_boot.log"):  # attempt-scoped: lambda_attempt<N>_boot.log
-                return boot() if callable(boot) else boot
+            if path.endswith("_boot.log"):
+                if "attempt" in path:  # attempt-scoped: lambda_attempt<N>_boot.log
+                    return boot() if callable(boot) else boot
+                return legacy_boot() if callable(legacy_boot) else legacy_boot  # legacy lambda_boot.log
             if "/error_" in path:
                 return error() if callable(error) else error
             return None
@@ -1070,6 +1072,25 @@ def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
     assert "no worker liveness" not in (res.detail or "")
     # died before any training heartbeat -> still a host fault (region quarantined)
     assert res.host_fault
+
+
+def test_poll_legacy_boot_log_satisfies_first_liveness_on_reattach(monkeypatch):
+    """Mixed-version reattach: a control plane upgraded to this PR while a box launched by the PREVIOUS
+    user-data is still pre-heartbeat. That old box wrote the legacy NON-attempt-scoped lambda_boot.log,
+    while the attempt-scoped lambda_attempt<N>_boot.log (the new path) is absent. The first-liveness
+    gate must accept the legacy log as liveness and NOT fast-fail/quarantine a healthy, still-booting
+    old box during the upgrade drain window. Box later dies -> job_preempted, NOT 'no worker liveness'."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
+        boot=None,  # attempt-scoped boot.log absent (new path the old box never wrote)
+        legacy_boot="+ docker pull ... (old-CP box, legacy boot.log)",  # legacy path present
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert not res.ok
+    assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
+    assert "no worker liveness" not in (res.detail or "")  # legacy boot.log satisfied first-liveness
 
 
 def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):

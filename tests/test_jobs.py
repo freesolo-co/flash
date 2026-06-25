@@ -1775,3 +1775,77 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
         assert not done.wait(0.2)
     t.join(timeout=2)
     assert done.is_set()  # completes as soon as the lock is released
+
+
+def test_purge_seed_boot_logs_deletes_only_this_seeds_boot_logs(monkeypatch):
+    """Recovery (attach_run's not-ok branch) restarts a seed's attempt loop at attempt 0 under the same
+    HF prefix; _purge_seed_boot_logs clears the abandoned attempt's host boot.log(s) so a stale one can't
+    falsely satisfy the fresh post-recovery box's first-liveness check (a silently-dead replacement would
+    otherwise burn the full setup grace). It must delete ONLY *_boot.log under THIS seed's prefix —
+    attempt-scoped AND legacy — leaving worker artifacts and other seeds' files untouched."""
+    import io
+
+    from flash.runner import deploy
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="flash-xyz", model="m", algorithm="grpo",
+        train=TrainSpec(seeds=(0,), steps=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type="RTX 4090", max_retries=2),
+    )
+    prefix = f"{spec.phase}/flash-xyz/seed0"
+    repo_files = [
+        f"{prefix}/lambda_attempt0_boot.log",  # stale pre-recovery boot log -> delete
+        f"{prefix}/lambda_attempt1_boot.log",  # another attempt's -> delete
+        f"{prefix}/lambda_boot.log",  # legacy boot log -> delete
+        f"{prefix}/metrics.json",  # worker artifact -> KEEP
+        f"{prefix}/DONE",  # worker artifact -> KEEP
+        f"{prefix}/checkpoints/step-1/adapter/adapter_model.safetensors",  # KEEP
+        f"{spec.phase}/flash-xyz/seed1/lambda_attempt0_boot.log",  # DIFFERENT seed -> KEEP
+    ]
+    deleted: list[str] = []
+
+    class FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo, repo_type=None):
+            return list(repo_files)
+
+        def delete_file(self, path_in_repo=None, repo_id=None, repo_type=None):
+            deleted.append(path_in_repo)
+
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
+    deploy._purge_seed_boot_logs(spec, 0, io.StringIO())
+    assert sorted(deleted) == sorted(
+        [
+            f"{prefix}/lambda_attempt0_boot.log",
+            f"{prefix}/lambda_attempt1_boot.log",
+            f"{prefix}/lambda_boot.log",
+        ]
+    )
+
+
+def test_purge_seed_boot_logs_is_best_effort(monkeypatch):
+    """A listing/auth failure during the boot-log purge must NEVER raise into recovery (the resume
+    proceeds; a stale boot.log at worst slows THIS seed's next failover, it doesn't block the run)."""
+    import io
+
+    from flash.runner import deploy
+    from flash.spec import GpuSpec, JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="flash-xyz", model="m", algorithm="grpo",
+        train=TrainSpec(seeds=(0,), steps=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type="RTX 4090", max_retries=2),
+    )
+
+    class BoomApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo, repo_type=None):
+            raise RuntimeError("hf list 503")
+
+    monkeypatch.setattr("huggingface_hub.HfApi", BoomApi)
+    deploy._purge_seed_boot_logs(spec, 0, io.StringIO())  # must not raise

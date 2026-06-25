@@ -441,7 +441,7 @@ def test_training_mode_tolerates_failed_attach(monkeypatch):
 # ---------------------------------------------------------------------------
 # poll_hs_job state machine
 # ---------------------------------------------------------------------------
-def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0):
+def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None, error=None, step=10.0, legacy_boot=None):
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.hyperstack import jobs
 
@@ -465,8 +465,10 @@ def _wire_poll(monkeypatch, vms, done=None, marker=None, metrics=None, boot=None
                 return marker() if callable(marker) else marker
             if path.endswith("metrics.json"):
                 return metrics() if callable(metrics) else metrics
-            if path.endswith("_boot.log"):  # attempt-scoped: hyperstack_attempt<N>_boot.log
-                return boot() if callable(boot) else boot
+            if path.endswith("_boot.log"):
+                if "attempt" in path:  # attempt-scoped: hyperstack_attempt<N>_boot.log
+                    return boot() if callable(boot) else boot
+                return legacy_boot() if callable(legacy_boot) else legacy_boot  # legacy hyperstack_boot.log
             if "/error_" in path:  # worker crash traceback (error_<phase>.txt)
                 return error() if callable(error) else error
             return None
@@ -882,6 +884,23 @@ def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
     res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
     assert res.failure == "job_preempted"
     assert "no worker liveness" not in (res.detail or "")
+
+
+def test_poll_legacy_boot_log_satisfies_first_liveness_on_reattach(monkeypatch):
+    """Mixed-version reattach: a VM launched by the PREVIOUS user-data wrote the legacy non-attempt-
+    scoped hyperstack_boot.log while the attempt-scoped path is absent. The first-liveness gate must
+    accept the legacy log as liveness and NOT fast-fail/quarantine a healthy, still-booting old VM
+    during the upgrade drain window. Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch,
+        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
+        boot=None,  # attempt-scoped boot.log absent
+        legacy_boot="+ docker pull ... (old-CP VM, legacy boot.log)",  # legacy path present
+        step=100.0,
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
+    assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
+    assert "no worker liveness" not in (res.detail or "")  # legacy boot.log satisfied first-liveness
 
 
 def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):

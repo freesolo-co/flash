@@ -125,6 +125,43 @@ def cancel_run(run_id: str) -> RunStatus:
     return get_status(run_id)
 
 
+def _purge_seed_boot_logs(spec: JobSpec, seed: int, log) -> None:
+    """Best-effort: delete a seed's host boot-log artifacts before a recovery RELAUNCH of that seed.
+
+    Recovery (``attach_run``'s not-ok branch) restarts the seed's attempt loop at attempt 0 under the
+    SAME HF prefix. The instance providers' fast first-liveness failover keys on the presence of an
+    attempt-scoped ``<arm>_attempt<N>_boot.log`` to tell a box that actually ran cloud-init from a
+    silently dead one. A pre-recovery attempt's boot.log left under the prefix would FALSELY prove
+    liveness for the fresh post-recovery box — whose attempt counter restarts at 0 and so reuses the
+    same path — making a silently-dead replacement host wait out the full setup grace (~50 min) instead
+    of failing over fast. Clearing the boot logs here lets the relaunch start from a clean slate (a
+    healthy new box rewrites its own within ~2 min; a dead one leaves none -> fast failover). Only the
+    boot logs are removed (the worker owns/needs the other artifacts: DONE/metrics/adapter/checkpoints).
+    Best-effort and never raises into recovery; a no-op for RunPod (it writes no boot logs)."""
+    import os
+
+    repo = spec.train.hf_repo
+    if not repo:
+        return
+    prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        stale = [
+            f
+            for f in api.list_repo_files(repo, repo_type="dataset")
+            if f.startswith(prefix + "/") and f.endswith("_boot.log")
+        ]
+        for f in stale:
+            with contextlib.suppress(Exception):
+                api.delete_file(path_in_repo=f, repo_id=repo, repo_type="dataset")
+        if stale:
+            print(f"attach: purged {len(stale)} stale boot log(s) under {prefix}", file=log)
+    except Exception as exc:  # listing/auth is best-effort; never block recovery
+        print(f"attach: boot-log purge warn for {spec.run_id}: {exc}", file=log)
+
+
 def attach_run(run_id: str, log_stream=None) -> RunStatus:
     """Re-attach to a run's remote job from ANY process (after a client crash/restart).
 
@@ -196,6 +233,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
+            # The relaunched seed loop restarts at attempt 0 under this same prefix; clear the abandoned
+            # box's boot log(s) first so a stale one can't falsely satisfy the fresh box's first-liveness
+            # check (see _purge_seed_boot_logs). Best-effort — never blocks the resume.
+            _purge_seed_boot_logs(spec, seed, log)
             _run_seed_loop(
                 spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0)
             )

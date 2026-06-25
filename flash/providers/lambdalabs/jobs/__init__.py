@@ -413,6 +413,17 @@ def poll_lambda_job(
     boot_log_reader = _make_hf_file_reader(
         hf_repo, f"{prefix}/lambda_attempt{handle.attempt}_boot.log", min_interval_s=60.0
     )
+    # Legacy fallback for a MIXED-VERSION reattach: a control plane upgraded to this PR while a Lambda
+    # instance launched by the PREVIOUS user-data is still pre-heartbeat wrote its host log to the
+    # NON-attempt-scoped <prefix>/lambda_boot.log (production's path before attempt-scoping). The new
+    # first-liveness gate reads only the attempt-scoped path, so without this fallback a healthy old box
+    # still pulling Docker would look boot-log-absent and get quarantined. Only pre-upgrade boxes ever
+    # write this path (the current uploader is attempt-scoped), so it can never carry a stale CURRENT-run
+    # retry's log; it just drains as old in-flight instances finish. Consulted ONLY when the attempt-
+    # scoped log is absent (the failover-deciding slow path), so it adds no hot-path read.
+    legacy_boot_log_reader = _make_hf_file_reader(
+        hf_repo, f"{prefix}/lambda_boot.log", min_interval_s=60.0
+    )
 
     def finish_ok(done_content: str | None = None) -> PollResult:
         raw = metrics_reader(force=True)
@@ -774,11 +785,13 @@ def poll_lambda_job(
                 # throttled poll. force=True bypasses the rate-limit (accurate absent-vs-present);
                 # ``is None`` keeps an empty "" boot.log counting as liveness (the file existing proves
                 # cloud-init ran); the latch then stops re-reading once the box has proven itself.
-                if boot_log_reader(force=True) is None:
+                if boot_log_reader(force=True) is None and legacy_boot_log_reader(force=True) is None:
                     # A lone None can also be a momentary HF/Hub network error (not a true absence), so
                     # require the absence to PERSIST across consecutive polls before failing over — a
                     # transient blip clears within a poll interval; a box whose worker never started
                     # stays absent. Avoids a Hub hiccup at the deadline burning a cross-provider retry.
+                    # Both the attempt-scoped AND the legacy boot.log must be absent (the legacy read is
+                    # short-circuited away unless the attempt-scoped one is missing).
                     boot_log_absent_polls += 1
                     if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
                         # The boot-log uploader is best-effort and may never have worked even though the
