@@ -135,7 +135,7 @@ flash train configs/rl.toml --background  # submit and return immediately
 
 ```bash
 flash status <run-id>            # state + accrued cost
-flash status <run-id> --logs     # reward/loss trend + rollout samples + any traceback
+flash status <run-id> --logs     # reward/loss trend + worker console/error logs + any traceback
 flash status <run-id> --follow   # stream a live run to completion
 flash runs                       # all your runs and their state/cost
 flash cancel <run-id>            # stop a run
@@ -190,9 +190,9 @@ A run is only evidence of improvement when **all** of these hold:
 
 - [ ] The run reached `done` (confirmed via `flash status <run-id>`), not merely submitted.
 - [ ] The reward trend rose (GRPO `reward_mean`) or the SFT loss fell — **beyond the noise band**, not within it.
-- [ ] You read at least **three real rollouts**, including failures — not just the metrics.
+- [ ] You **probed the trained adapter on real inputs** (`flash deploy` + `flash chat`), including cases it should fail — not just the metrics.
 - [ ] The score is real behavior, not empty/truncated/templated outputs, skipped rows, leakage, a swallowed exception, or a format-only win.
-- [ ] If you track a clean success signal separately from the shaped reward, *that* moved too.
+- [ ] If you track a clean success signal separately from the shaped reward (an explicit `RewardMetric`), *that* moved too.
 
 If any box is unchecked, the run is not done improving — keep training, don't declare success.
 
@@ -203,15 +203,19 @@ If any box is unchecked, the run is not done improving — keep training, don't 
 - **Judge the trend, not a single number.** The proof of training is the curve:
   `reward_mean` rising over steps (GRPO) or loss falling (SFT). Record the base/early
   value and the final value. A flat or noisy trend with no improvement is not success.
-- **Read the rollouts, not just the metrics.** Pull at least three real generations
-  (including failures) before you believe a number. A rising reward can come from
+- **Read the model's outputs, not just the metrics.** A rising reward can come from
   reward-hacking or a degenerate output the reward still credits — metrics alone never
-  establish that the model got better.
+  establish that the model got better. Flash does not expose training-time rollouts
+  through the CLI (`--logs` gives you the metric trend and the worker's console/error
+  logs, not the sampled generations), so to read real outputs **deploy the adapter and
+  probe it**: `flash deploy <run-id>` then `flash chat <run-id> -m "..."` on at least a
+  few real inputs, including ones it should get wrong.
 
   ```bash
   flash status <run-id>            # state + accrued cost
-  flash status <run-id> --logs     # the reward/loss trend and rollout samples
+  flash status <run-id> --logs     # metric trend + worker console/error logs (+ traceback)
   flash status <run-id> --follow   # stream a live run until completion
+  flash deploy <run-id>            # serve the adapter, then `flash chat` it to read real outputs
   ```
 
 - **Decide with the noise band.** When comparing two runs or two checkpoints, record
@@ -246,21 +250,27 @@ there is nothing to optimize.
 
 A good GRPO reward is usually **shaped** — partial credit so the model always has a
 gradient to climb. But a shaped score is the wrong thing to judge *final quality* on:
-it can rise from reward-hacking while the outcome you care about stays flat.
-`RewardResult` lets you report both at once — the shaped value as `score`, and a
-`threshold` (or explicit `success`) for the clean pass/fail:
+it can rise from reward-hacking while the outcome you care about stays flat. Report the
+shaped value as `score`, and surface the clean pass/fail as an **explicit
+`RewardMetric`** so it shows up in the run's metric breakdown — a bare `threshold` is
+used for grading but is *not* logged on its own, so it gives you nothing to judge:
 
 ```python
-from freesolo.environments import RewardResult
+from freesolo.environments import RewardResult, RewardMetric
 
 def score_response(self, example, response_text) -> RewardResult:
-    score = graded_score(example, response_text)     # shaped 0-1, the GRPO gradient
-    return RewardResult(score=score, threshold=1.0)  # success = score >= threshold
+    score = graded_score(example, response_text)         # shaped 0-1 — what GRPO optimizes
+    return RewardResult(
+        score=score,
+        threshold=1.0,                                   # success = score >= threshold
+        metrics=(RewardMetric(name="success", score=float(score >= 1.0)),),  # logged: judge on this
+    )
 ```
 
-`score` is what GRPO optimizes; `threshold` decides `success = score >= threshold`,
-tracked separately. Use the shaped `score` to confirm the model is learning *at all*,
-and judge the run on the clean success rate.
+`score` is what GRPO optimizes (it becomes the run's `total`). Each `RewardMetric` you
+attach is logged by name in the per-scorer breakdown — that is how the clean success
+rate becomes visible. Use the shaped `score` to confirm the model is learning *at all*,
+and judge the run on the explicit `success` metric.
 
 ### Reward rules that prevent silent failure
 
@@ -293,10 +303,12 @@ Pick SFT when you already have good answers and want the model to imitate them.
   A small set of high-quality examples beats a large mediocre one. Keep response format
   consistent (if you want JSON, *every* example is JSON) and keep the prompt format the
   same as inference time.
-- **Watch the loss fall — and watch for overfitting.** A falling training loss with a
-  stalling or rising held-out metric means the model is memorizing, not learning. Keep
-  an eval split it never trains on, and judge on that. If eval loss rises after the
-  first epoch, reduce `epochs` or add more data — not more passes.
+- **Watch the loss fall — and check overfitting yourself.** Flash SFT logs **training
+  loss only**; it runs no mid-training held-out eval (evaluation is deferred to the
+  deploy/serving side). A falling train loss alone can be memorization, so keep an eval
+  split the run never trains on, then **deploy the adapter and score it on that split**
+  (`flash deploy` + `flash chat`). If held-out quality stalls or drops while train loss
+  keeps falling, reduce `epochs` or add more data — not more passes.
 - **Start `max_length` small and grow it on evidence.** Begin from the smallest
   `max_length` that plausibly fits prompt + completion, and only raise it when you see
   truncation (outputs cut off mid-thought, degraded loss). A bigger context just costs
@@ -312,9 +324,9 @@ Pick SFT when you already have good answers and want the model to imitate them.
 algorithm = "grpo"
 
 [train]
-# the adapter prefix printed by `flash status <sft-run-id>`
-# (shape: <hf_repo>:sft/<run-id>/seed0 — the platform appends /adapter itself)
-init_from_adapter = "sft/<sft-run-id>/seed0"
+# paste the full adapter_ref `flash status <sft-run-id>` prints, verbatim
+# (shape: <owner>/<repo>:sft/<run-id>/seed0 — the owner/repo prefix is required)
+init_from_adapter = "your-org/your-repo:sft/<sft-run-id>/seed0"
 lora_rank = 32     # must match the SFT run
 lora_alpha = 64    # must match the SFT run
 ```
@@ -334,7 +346,6 @@ in a sensible value, so only override with a reason.
 | `max_tokens` | Completion budget per rollout. Size it to the expected output length — too small silently truncates good answers and poisons the reward; too large just costs more. |
 | `temperature` | Rollout sampling temperature. Keep it near 1.0 for GRPO — too low collapses diversity (and the model can collapse within a few steps); raise it to widen exploration against uniform-reward groups. |
 | `kl_penalty_coef` | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move. |
-| `advantage_clip` | Clamps the centered advantage so a few outliers don't dominate a step. |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy. |
 | `learning_rate` | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it. |
 | `batch_size` | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable. |
@@ -434,7 +445,7 @@ flash train configs/rl.toml --dry-run # validate the config locally (no GPU, no 
 flash train configs/rl.toml --cost    # pre-flight USD estimate, then exit
 flash train configs/rl.toml           # submit and follow logs (Ctrl-C detaches; --background to skip following)
 flash status <run-id>                 # state + accrued cost
-flash status <run-id> --logs          # reward/loss trend + rollout samples
+flash status <run-id> --logs          # reward/loss trend + worker console/error logs
 flash status <run-id> --follow        # stream a live run to completion
 flash runs                            # list your runs and their state/cost
 flash deploy <run-id>                 # serve the trained adapter

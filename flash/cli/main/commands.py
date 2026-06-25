@@ -276,7 +276,9 @@ def cmd_env_setup(args) -> int:
     # reward, what to read, and how to decide a run actually improved (not just finished).
     training = Path("TRAINING.md")
     if not training.exists():
-        training.write_text(TRAINING_MD)
+        # Explicit UTF-8: TRAINING_MD has non-ASCII (em dashes, ·, √, ≥, ≈), which would
+        # raise UnicodeEncodeError under a non-UTF-8 locale with write_text's default.
+        training.write_text(TRAINING_MD, encoding="utf-8")
     scaffolded = [
         "environment.py",
         "datasets/train.jsonl",

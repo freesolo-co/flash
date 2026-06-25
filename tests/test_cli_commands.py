@@ -315,7 +315,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "epochs = 1" in sft.read_text()
     training = tmp_path / "TRAINING.md"
     assert training.is_file()
-    training_text = training.read_text()
+    training_text = training.read_text(encoding="utf-8")
     assert "how to actually improve a model with Flash" in training_text
     assert "## Using Flash" in training_text  # end-to-end library usage, not just conventions
     out = capsys.readouterr().out
