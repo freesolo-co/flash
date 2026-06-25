@@ -24,8 +24,11 @@ from flash.engine.worker.lora import (
     patch_vllm_lm_weight_sync,
 )
 from flash.engine.worker.perf import (
+    _GpuPeakSampler,
     _memory_mode,
     _metric_curve,
+    _peak_gpu_gb,
+    _reset_peak_gpu,
     _sdpa_cudnn_ctx,
     free_gpu,
     fused_optim_name,
@@ -288,7 +291,13 @@ def run_rl():
     # OOMs the trainer forward. Single-turn keeps `_max_completion` (its true completion length).
     _cap_completion_len = vllm_max_len if is_multi_turn else _max_completion
     per_device_comps = _w.rl_per_device_comps(
-        _cap_completion_len, vocab=vocab_size_for(model_id), use_vllm=use_vllm, params_b=_params_b
+        _cap_completion_len,
+        vocab=vocab_size_for(model_id),
+        use_vllm=use_vllm,
+        params_b=_params_b,
+        # The trainer forward processes prompt+completion up to the engine context, so the
+        # activation/VRAM cap is sized against the worst-case training sequence length.
+        seq_len=vllm_max_len,
     )
     if is_multi_turn and _cap_completion_len != _max_completion:
         print(
@@ -603,10 +612,14 @@ def run_rl():
     # Mid-run eval is intentionally NOT run during training: held-out evaluation happens on the
     # deploy/serving side (against the trained adapter), keeping training pure (no eval-phase cost
     # or eval-boundary stalls). Training streams only the per-step reward heartbeat.
+    _reset_peak_gpu()  # peak_gpu_gb reflects the train loop (verifies the micro-batch headroom)
+    _gpu_sampler = _GpuPeakSampler().start()  # true device peak incl. vLLM colocate + bnb pages
     t_train = time.time()
     with _sdpa_cudnn_ctx(_attn):  # force cuDNN SDPA on sm120 (no-op otherwise)
         trainer.train(resume_from_checkpoint=resume_ckpt)
     train_wall = time.time() - t_train
+    rl_peak_gpu_gb = _peak_gpu_gb()
+    rl_device_peak_gpu_gb = _gpu_sampler.stop_gb()
     reward_history = list(getattr(hb_cb, "reward_history", []))
     # A GRPO run that finishes WITHOUT the reward callback ever firing (empty reward_history)
     # produced NO real training — the rollout scored nothing (e.g. vLLM generation silently
@@ -667,6 +680,12 @@ def run_rl():
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "reward_history": reward_history,
             "loss_curve": _metric_curve(trainer, "loss"),
+            # Peak torch-allocated GPU memory during the GRPO train loop (excludes bnb managed
+            # pages). device_peak_gpu_gb is the TRUE device footprint (total-free, incl. the vLLM
+            # colocate engine + bnb pages): the headline for verifying the per-device micro-batch
+            # left the card with headroom (no OOM) at the sized batch.
+            "peak_gpu_gb": rl_peak_gpu_gb,
+            "device_peak_gpu_gb": rl_device_peak_gpu_gb,
             # Which chalk gap-filling kernels actually ENGAGED (None = chalk not installed or every
             # kernel fell back) — verifies the chalk stack on a GRPO run without the console.
             "chalk_kernels": active_kernels(_chalk_report) or None,

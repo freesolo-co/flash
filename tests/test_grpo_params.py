@@ -380,14 +380,119 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
 def test_rl_per_device_logits_budget_cap(monkeypatch) -> None:
     """The per-device completion micro-batch caps to the fp32-logits budget: a short completion
     keeps the base (8), a long one (4096 tok x ~152k vocab x 4 B ~ 2.5 GB/unit) caps to fit the
-    6 GB budget, pushing the rest into grad-accum. (CPU: the colocate VRAM cap is GPU-only.)"""
-    from flash.engine.worker import rl_per_device_comps
+    6 GB budget, pushing the rest into grad-accum. (Offline: the colocate VRAM cap is GPU-only.)"""
+    import flash.engine.worker as w
 
-    monkeypatch.delenv("THINKING", raising=False)
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _no_cuda(monkeypatch)  # assert the offline contract deterministically, even on a GPU host
     # short completion: budget non-binding -> base default 8
-    assert rl_per_device_comps(512, vocab=152_000, use_vllm=True) == 8
+    assert w.rl_per_device_comps(512, vocab=152_000, use_vllm=True) == 8
     # long completion: 6e9 / (4096*152000*4) ~ 2.4 -> capped to 2 (budget fixed at 6 GB, managed)
-    assert rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 2
+    assert w.rl_per_device_comps(4096, vocab=152_000, use_vllm=True) == 2
+
+
+def _no_cuda(monkeypatch) -> None:
+    """Force the offline path: a `torch` whose CUDA is unavailable, so rl_per_device_comps falls
+    back to its historical default regardless of whether the test host has a GPU."""
+    import sys
+    import types
+
+    t = types.ModuleType("torch")
+    t.cuda = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", t)
+
+
+def _fake_cuda(monkeypatch, vram_gb: float) -> None:
+    """Install a fake `torch` exposing a live CUDA card of `vram_gb` so the colocate VRAM cap
+    in rl_per_device_comps engages off-GPU."""
+    import sys
+    import types
+
+    t = types.ModuleType("torch")
+
+    class _Props:
+        total_memory = int(vram_gb * 1024**3)
+
+    t.cuda = types.SimpleNamespace(
+        is_available=lambda: True, get_device_properties=lambda _i: _Props()
+    )
+    monkeypatch.setitem(sys.modules, "torch", t)
+
+
+def test_rl_per_device_grows_into_vram_on_short_seq(monkeypatch) -> None:
+    """On a VRAM-constrained card (24 GB) with a SHORT sequence, the per-device completion
+    micro-batch grows from the old seq-independent colocate cap (~5 for 0.8B) to the MEASURED-safe
+    plateau entry (8) -> +~12% trainer throughput (RunPod RTX 4090: pd8 fits at 19 GB). Holding
+    the effective batch constant (grad-accum) makes this a pure speed/VRAM knob."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _fake_cuda(monkeypatch, 23.99)  # RTX 4090 / 3090-class 24 GiB
+    # 0.8B, seq 1024: old cap = 24/(7.5*0.894/1.41) = 5; calibrated to grow to the measured-safe 8.
+    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 8
+    # An even shorter sequence does NOT grow further than the proven-safe value (floor clamps it).
+    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=512) == 8
+
+
+def test_rl_per_device_grows_to_plateau_ceiling_on_roomy_card(monkeypatch) -> None:
+    """On a roomy card (A100 80 GB) the micro-batch grows to the plateau ceiling (16) — MEASURED
+    flat-vs-default there — and never beyond (pd>=24 regresses)."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _fake_cuda(monkeypatch, 79.3)
+    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 16
+
+
+def test_rl_per_device_no_change_at_or_above_ref_seq(monkeypatch) -> None:
+    """At/above the calibration seq (2048) the value is byte-for-byte the historical one — growth
+    is GATED to short sequences. Holds in BOTH directions: a constrained card stays at its old (low)
+    cap, and a roomy card does NOT grow above the old default (the unvalidated long-seq region)."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    # Constrained 24 GB: old colocate cap = 24/(7.5*0.894/1.41) = 5 at any seq -> still 5.
+    _fake_cuda(monkeypatch, 23.99)
+    assert w.rl_per_device_comps(256, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=2048) == 5
+    assert w.rl_per_device_comps(256, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=8192) == 5
+    # Roomy 80 GB: at seq 1024 it would grow to 16, but at seq>=ref the gate holds it at the old
+    # default 8 (NO unvalidated long-seq growth — the regression is in tokens-in-flight = pd x seq).
+    _fake_cuda(monkeypatch, 79.3)
+    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 16
+    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=2048) == 8
+    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=8192) == 8
+
+
+def test_rl_per_device_interpolates_between_floor_and_ref(monkeypatch) -> None:
+    """A short seq strictly between the floor and the reference grows the cap by an interior
+    (non-clamped) seq_scale, not just the clamp endpoints."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _fake_cuda(monkeypatch, 23.99)  # 24 GiB
+    # seq 1536: seq_scale = 1536/2048 = 0.75 -> 24/(7.5*0.894/1.41*0.75) = 6.7 -> 6 (interior point).
+    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1536) == 6
+
+
+def test_rl_per_device_logits_budget_bounds_growth(monkeypatch) -> None:
+    """Even with abundant VRAM, the fp32-logits budget stays a hard ceiling on the micro-batch
+    (the Liger-fallback safety net): a long completion caps it regardless of free VRAM."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _fake_cuda(monkeypatch, 80)  # roomy A100 -> VRAM cap is large
+    # completion 4096 @ 248k vocab: 6e9/(4096*248320*4) ~ 1.4 -> logits budget binds at 1.
+    assert w.rl_per_device_comps(4096, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 1
+
+
+def test_rl_per_device_never_exceeds_hard_max(monkeypatch) -> None:
+    """The hard ceiling (16) holds even on an enormous card with a tiny completion (the throughput
+    plateau tops out there; pd>=24 was measured to regress)."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", False, raising=False)
+    _fake_cuda(monkeypatch, 640)  # absurd VRAM
+    assert w.rl_per_device_comps(64, vocab=152_000, use_vllm=True, params_b=0.5, seq_len=512) == 16
 
 
 def test_optimizer_knob_validation_rejects_bad_values() -> None:
