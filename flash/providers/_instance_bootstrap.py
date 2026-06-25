@@ -239,12 +239,13 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             uploader = threading.Thread(target=upload_loop, daemon=True)
             uploader.start()
         try:
-            # Honor the wall-clock deadline: wait only up to the time left (floored to a small
-            # positive so the call never blocks forever on a 0/negative timeout). A prior ``max(10.0,
-            # …)`` floor could overshoot the deadline by ~10s when little/no time remained — that
-            # leftover 10s is paid GPU time past the run's wall cap, so we clamp to the remaining
-            # budget instead.
-            proc.wait(timeout=max(1.0, deadline_ts - time.time()))
+            # Honor the wall-clock deadline: wait only up to the time left, floored to 0.0 so an
+            # already-expired (or sub-second) deadline kills the worker NOW instead of buying it
+            # more paid GPU time past the wall cap. A prior ``max(10.0, …)``/``max(1.0, …)`` floor
+            # overshot the deadline by that floor when little/no time remained. ``proc.wait(timeout=0.0)``
+            # on a still-running process returns immediately by raising ``TimeoutExpired`` (handled
+            # below: kill + reap), which is exactly the expired-deadline behavior we want.
+            proc.wait(timeout=max(0.0, deadline_ts - time.time()))
         except subprocess.TimeoutExpired:
             timed_out = True
             proc.kill()

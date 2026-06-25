@@ -44,12 +44,18 @@ def owned_run(run_id: str, key: dict):
 
 
 def _parse_spec(payload: dict, run_id: str) -> JobSpec:
-    spec_raw = payload.get("spec") or {}
-    # A non-object JSON value for `spec` (list/string/number) has no `.get`, so guard before
-    # touching it — a bad payload is a 400 request-validation error, not an unhandled 500.
+    # Default to {} ONLY when the field is missing/None — never `or {}`, which would coerce a
+    # falsy non-object (``""``/``0``/``[]``/``false``) to {} and bypass the type check below,
+    # producing a misleading downstream 400 ("config must set [environment] id") instead of the
+    # intended "spec must be a JSON object". A bad payload is a 400, not an unhandled 500.
+    spec_raw = payload.get("spec")
+    if spec_raw is None:
+        spec_raw = {}
     if not isinstance(spec_raw, dict):
         raise HTTPException(status_code=400, detail="spec must be a JSON object")
-    env_raw = spec_raw.get("environment") or {}
+    env_raw = spec_raw.get("environment")
+    if env_raw is None:
+        env_raw = {}
     if not isinstance(env_raw, dict):
         raise HTTPException(
             status_code=400, detail="spec.environment must be a JSON object"
@@ -70,7 +76,11 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
 def _runtime_secrets(
     payload: dict, spec: JobSpec, *, require_environment_secrets: bool
 ) -> dict[str, str]:
-    raw = payload.get("runtime_secrets") or {}
+    # Default to {} ONLY when missing/None — never `or {}`, which would coerce a falsy non-object
+    # (``""``/``0``/``[]``/``false``) to {} and bypass the type check below.
+    raw = payload.get("runtime_secrets")
+    if raw is None:
+        raw = {}
     if not isinstance(raw, dict):
         raise HTTPException(status_code=400, detail="runtime_secrets must be a JSON object")
     allowed = set(_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets)

@@ -451,12 +451,14 @@ def poll_lambda_job(
             # for a LEFTOVER heartbeat from a prior attempt (ts < launch); we then neither advance
             # last_progress nor mark training seen, so a stale training heartbeat can't arm the
             # tighter training stall window before this attempt overwrites the file. Dates against
-            # ``launch_ts`` (NOT the raw handle.started_ts) so an unknown-launch (0.0) handle is
-            # anchored to the SAME ``now`` reference as done_is_fresh / the load+stall clocks: a
-            # leftover heartbeat predating this reattach is then consistently rejected instead of
-            # blanket-trusted (which could otherwise arm the tighter training window off a prior
-            # attempt's training heartbeat). On a real launch this is exactly handle.started_ts.
-            hb_ts, fresh = heartbeat_progress_ts(new_key, launch_ts)
+            # the RAW ``handle.started_ts`` (NOT the synthesized ``launch_ts``): when launch is
+            # unknown (started_ts == 0.0) ``launch_ts`` has been floored to ``now`` for billing/
+            # clocks, but feeding ``now`` here would make the helper's floor ``now`` and mark every
+            # normal heartbeat -- timestamped a moment before it is read -- STALE, stalling a healthy
+            # recovered worker. Passing the raw 0.0 sentinel instead routes through the helper's
+            # unknown-launch floor (lo=0, all heartbeats fresh: don't discard progress we can't date).
+            # On a real launch started_ts == launch_ts, so this is identical on the normal path.
+            hb_ts, fresh = heartbeat_progress_ts(new_key, handle.started_ts)
             if fresh:
                 last_progress = hb_ts
                 if stage not in _SETUP_HEARTBEAT_STAGES:

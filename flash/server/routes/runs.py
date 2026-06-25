@@ -8,6 +8,7 @@ module (``_app.<name>``) at call time, so patching ``app.<name>`` is honored her
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 from typing import Annotated
 
@@ -18,6 +19,8 @@ from flash.server import app as _app
 from flash.server import db
 from flash.server._deps import _parse_spec, _runtime_secrets, owned_run, require_key
 from flash.spec import JobSpec
+
+_LOG = logging.getLogger("flash.server.runs")
 
 router = APIRouter()
 
@@ -84,8 +87,14 @@ def create_run(payload: dict, key: Annotated[dict, Depends(require_key)]):
 
         if is_managed_environment_slug(spec.environment.id):
             record_environment_use(slug=spec.environment.id, run_id=spec.run_id, key=key)
-    except Exception as exc:
-        print(f"[runs] platform reporting failed for {spec.run_id} (run already submitted): {exc}")
+    except Exception:
+        # Best-effort: log to the structured server logger (not stdout) and never re-raise — the
+        # run is already submitted, so a reporting failure must not 400 the caller.
+        _LOG.warning(
+            "platform reporting failed for %s (run already submitted)",
+            spec.run_id,
+            exc_info=True,
+        )
     return status.to_dict()
 
 
