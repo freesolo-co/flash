@@ -444,6 +444,20 @@ def test_rl_per_device_grows_to_plateau_ceiling_on_roomy_card(monkeypatch) -> No
     assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 16
 
 
+def test_rl_per_device_thinking_not_grown_by_short_seq(monkeypatch) -> None:
+    """THINKING runs are excluded from the short-seq growth path: thinking emits long completions
+    whose activation/logprob cost the prompt-only seq_len gate cannot see, so the conservative
+    thinking default (2) must hold even on a roomy card + short seq where a non-thinking run would
+    grow to the plateau ceiling (16)."""
+    import flash.engine.worker as w
+
+    monkeypatch.setattr(w, "THINKING", True, raising=False)
+    _fake_cuda(monkeypatch, 79.3)  # same roomy card that grows a non-thinking run to 16
+    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=1024) == 2
+    # An even shorter seq does not lift it either — the default ceiling, not _RL_PER_DEVICE_MAX.
+    assert w.rl_per_device_comps(128, vocab=248_320, use_vllm=True, params_b=0.8, seq_len=512) == 2
+
+
 def test_rl_per_device_no_change_at_or_above_ref_seq(monkeypatch) -> None:
     """At/above the calibration seq (2048) the value is byte-for-byte the historical one — growth
     is GATED to short sequences. Holds in BOTH directions: a constrained card stays at its old (low)
