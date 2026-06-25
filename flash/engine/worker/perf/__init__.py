@@ -70,6 +70,7 @@ from flash.engine.worker.perf.memory import (
     _memory_mode,
     fused_optim_name,
     grad_checkpointing_on,
+    grpo_sleep_mode,
 )
 
 
@@ -468,6 +469,7 @@ __all__ = [
     "fused_optim_name",
     "gpu_diagnostics",
     "grad_checkpointing_on",
+    "grpo_sleep_mode",
     "liger_on",
     "loraplus_optimizer_cls",
     "optimal_attn_impl",

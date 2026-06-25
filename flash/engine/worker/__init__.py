@@ -142,6 +142,7 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
+    grpo_sleep_mode,
     liger_on,
     loraplus_optimizer_cls,
     optimal_attn_impl,
@@ -427,6 +428,7 @@ __all__ = [
     "grad_checkpointing_on",
     "graded_text",
     "grpo_overrides",
+    "grpo_sleep_mode",
     # heartbeat
     "heartbeat",
     "hf_api",

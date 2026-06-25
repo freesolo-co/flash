@@ -14,6 +14,7 @@ The locks/frozensets/intervals that tests never patch live here and are re-expor
 from __future__ import annotations
 
 import contextlib
+import faulthandler
 import json
 import os
 import threading
@@ -45,6 +46,24 @@ _HB_UPLOAD_LOCK = threading.Lock()
 
 _STEP_GPU_DIAG_INTERVAL_S = 300.0
 _SFT_HEARTBEAT_INTERVAL_S = 60.0
+
+# Stall diagnostics: when FLASH_STALL_FAULTHANDLER_S > 0, arm a faulthandler watchdog that dumps
+# every thread's Python stack (then exits, so the run FAILS instead of hanging until the
+# control-plane stall watchdog kills it ~25 min later, and the dump is uploaded with
+# console_<phase>.txt). The timer is re-armed on every heartbeat, so it only fires when NO progress
+# heartbeat lands for the whole window -- i.e. a real hang. OFF by default (0); opt-in per run via
+# [worker_env]. Used to localize the GRPO sleep-mode rollout hang.
+_STALL_FAULTHANDLER_S = 0
+with contextlib.suppress(Exception):
+    _STALL_FAULTHANDLER_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_S", "0") or 0)
+
+
+def _rearm_stall_faulthandler() -> None:
+    if _STALL_FAULTHANDLER_S <= 0:
+        return
+    with contextlib.suppress(Exception):
+        faulthandler.cancel_dump_traceback_later()
+        faulthandler.dump_traceback_later(_STALL_FAULTHANDLER_S, exit=True)
 
 
 def heartbeat(stage: str, **kw):
@@ -99,6 +118,8 @@ def heartbeat(stage: str, **kw):
             finally:
                 with contextlib.suppress(OSError):
                     os.remove(up)
+    # Re-arm the stall watchdog: progress landed, so reset the no-heartbeat timer.
+    _rearm_stall_faulthandler()
     print("HEARTBEAT", json.dumps(payload))
 
 

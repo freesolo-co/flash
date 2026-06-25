@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 
 from flash.engine.worker._pkg import W as _w
-from flash.engine.worker.perf import _memory_mode
+from flash.engine.worker.perf import grpo_sleep_mode
 
 
 def force_vllm_backend_for_sm120() -> str | None:
@@ -44,24 +44,42 @@ def finalize_alloc_conf_for_sleep() -> None:
     PYTORCH_ALLOC_CONF for RL before this process starts, but it can't know the GRPO sleep decision:
     for a small model the worker resolves sleep OFF (the speed default), so the non-expandable conf
     is safe but fragments a long colocate run. Here (we have the model config + GPU) we resolve the
-    SAME deterministic sleep default (``_memory_mode``, exactly run_rl's gate) and, if sleep is OFF,
-    switch to expandable_segments — which only crashes WITH sleep on, a case we've just ruled out.
-    PYTORCH_ALLOC_CONF is read lazily at the first CUDA allocation, so this must run before any
+    SAME deterministic sleep default (``grpo_sleep_mode``, exactly run_rl's gate) and, if sleep is
+    OFF, switch to expandable_segments — which only crashes WITH sleep on, a case we've just ruled
+    out. PYTORCH_ALLOC_CONF is read lazily at the first CUDA allocation, so this must run before any
     allocation (it does — called at boot)."""
     if _w.PHASE != "rl":
         return
     try:
         model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else ""
-        # Resolve the GRPO context the SAME way the sleep gate does (run_rl): the run's
-        # [train].max_length, so a long-context run gets the right sleep default + alloc conf.
-        _spec_len = 0
+        # Resolve the sleep decision EXACTLY as run_rl does (grpo_sleep_mode: the size/context gate
+        # PLUS the resident-fit check against the live card), so the alloc conf matches the sleep
+        # mode the trainer will actually use.
+        _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
+        ctx = 0
         try:
-            if _w.JOB_SPEC and _w.JOB_SPEC.train and _w.JOB_SPEC.train.max_length:
-                _spec_len = int(_w.JOB_SPEC.train.max_length)
+            if _t and _t.max_length:
+                ctx = int(_t.max_length)
         except Exception:
-            _spec_len = 0
-        ctx = int(_spec_len or 0)
-        if not _memory_mode(model_id, ctx):  # sleep resolves OFF -> expandable is safe + better
+            ctx = 0
+        card_gb = 0.0
+        try:
+            import torch as _torch_card
+
+            if _torch_card.cuda.is_available():
+                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
+        except Exception:
+            card_gb = 0.0
+        sleep_on = grpo_sleep_mode(
+            model_id,
+            max_length=ctx,
+            group_size=int(_t.group_size) if _t and _t.group_size else 8,
+            max_tokens=(_t.max_tokens if _t else None),
+            lora_rank=int(_t.lora_rank) if _t and _t.lora_rank else 32,
+            thinking=_w.THINKING,
+            card_vram_gb=card_gb,
+        )
+        if not sleep_on:  # sleep resolves OFF -> expandable is safe + better
             conf = "expandable_segments:True"
             os.environ["PYTORCH_ALLOC_CONF"] = conf
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = conf
