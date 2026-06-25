@@ -195,10 +195,16 @@ def reconcile_endpoint_slots() -> None:
     try:
         from flash.providers.runpod import api as runpod_api
 
+        # Match BOTH registered forms: the bare ``flash-<gpu>-<run>`` AND RunPod Flash's
+        # ``live-flash-...`` (live-provisioned) name. Reconciling only the bare prefix omitted
+        # every live endpoint, leaving their slot rows unreclaimed after a crash. Use the
+        # canonical sweep predicate (``jobs._is_flash_endpoint``) so the two stay in lockstep.
+        from flash.providers.runpod.jobs import _is_flash_endpoint
+
         live = [
             name
             for e in runpod_api.list_endpoints()
-            if (name := (e.get("name") or "")).startswith("flash-")
+            if _is_flash_endpoint(name := (e.get("name") or ""))
         ]
     except Exception as exc:  # listing failed: do NOT reconcile against a partial/empty list
         logger.warning("slot reconcile skipped: could not list RunPod endpoints (%s)", exc)
