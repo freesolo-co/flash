@@ -12,6 +12,7 @@ import argparse
 import sys
 
 from flash import __version__
+from flash._channel import CLI_NAME
 from flash._logging import configure_logging, get_logger
 from flash._update_check import emit_update_notice, maybe_start_update_check
 
@@ -50,8 +51,8 @@ logger = get_logger("flash.cli.main")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="flash", description="Managed LoRA post-training")
-    parser.add_argument("-V", "--version", action="version", version=f"flash {__version__}")
+    parser = argparse.ArgumentParser(prog=CLI_NAME, description="Managed LoRA post-training")
+    parser.add_argument("-V", "--version", action="version", version=f"{CLI_NAME} {__version__}")
     parser.add_argument(
         "--debug",
         action="store_true",

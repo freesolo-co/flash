@@ -32,14 +32,16 @@ import urllib.error
 import urllib.request
 
 from flash import __version__
+from flash._channel import DIST_NAME
 from flash._fileio import read_json_or_empty, secure_json_write
 from flash._logging import get_logger
 from flash.client.config import CONFIG_DIR
 
 logger = get_logger("flash.update_check")
 
-# The PyPI distribution name (== pyproject `name`) and the command that upgrades it.
-PACKAGE_NAME = "freesolo-flash"
+# The PyPI distribution name (== pyproject `name`) and the command that upgrades it. Follows the
+# installed channel (freesolo-flash, or freesolo-flash-dev for the dev build) — see flash/_channel.py.
+PACKAGE_NAME = DIST_NAME
 UPGRADE_COMMAND = f"uv tool upgrade {PACKAGE_NAME}"
 _PYPI_JSON_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
 
