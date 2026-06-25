@@ -77,6 +77,37 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
     assert out.state == "cancelled"
 
 
+def test_cancel_run_sets_cancel_requested_before_teardown(tmp_path, monkeypatch):
+    """cancel_run must persist cancel_requested=True BEFORE remote teardown, so the run's own poll loop
+    (run_cancelled) can suppress a host_fault quarantine in the window between box destroy and the final
+    terminal 'cancelled' write. Assert the intent is already persisted (without prematurely flipping the
+    terminal state) when terminate_endpoint runs."""
+    import flash.runner as orch
+
+    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
+    from flash.spec import JobSpec
+
+    spec = JobSpec.from_dict(
+        {"model": "Qwen/Qwen3.5-4B", "algorithm": "grpo", "gpu": {"type": "RTX 5090"},
+         "run_id": "flash-9-cancelreq"}
+    )
+    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+    seen = {}
+
+    def fake_terminate(gpu, run_id):
+        st = orch.get_status(run_id)
+        seen["cancel_requested_at_teardown"] = st.cancel_requested
+        seen["state_at_teardown"] = st.state
+        return [{"success": True}]
+
+    monkeypatch.setattr(ftrain, "terminate_endpoint", fake_terminate)
+    out = orch.cancel_run(spec.run_id)
+    assert seen["cancel_requested_at_teardown"] is True, "intent must be persisted BEFORE teardown"
+    assert seen["state_at_teardown"] == "running", "intent set without prematurely flipping to terminal"
+    assert out.state == "cancelled"
+    assert out.cancel_requested is True
+
+
 def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     # Cancelling a deployed run tears down its serve endpoint; the deployment record
     # must flip to "undeployed" so /v1/deployments and /chat stop treating the

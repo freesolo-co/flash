@@ -183,7 +183,11 @@ def test_user_data_fails_fast_and_throttles_bootlog():
     s = build_user_data(payload, image="img:tag")
     assert "failmark.py" in s  # host writes the attempt-failure marker
     assert 'fail "worker image pull failed' in s  # fail fast when the image can't pull
-    assert 'fail "worker container did not start' in s
+    assert 'fail "worker container exited during startup (exit ${EXIT})" 1' in s  # started -> neutral=1
+    # never-started host faults stay region-quarantining (no neutral flag -> failmark defaults to 0)
+    assert 'fail "docker never became ready"' in s
+    assert 'fail "worker image pull failed after retries"' in s
+    assert 'after retries" 1' not in s  # pull failure is NOT flagged neutral (genuine sick region)
     assert "sleep 120" in s  # boot-log throttled to 120s
     assert "sleep 30;" not in s  # NOT the old 30s-forever loop
     # The host hf_hub install (which the liveness boot-log uploader depends on) is RETRIED with an
@@ -197,6 +201,69 @@ def test_user_data_fails_fast_and_throttles_bootlog():
     assert "{{.State.ExitCode}}" in s
     assert '[ "$EXIT" = "0" ] || fail' in s
     assert "donecheck" not in s  # no host-side HF check (it would race the worker's marker upload)
+
+
+def test_failmark_neutral_flag_controls_host_neutral(monkeypatch):
+    """The host failmark writes host_neutral=True ONLY when called with neutral=1 (a container that
+    STARTED then exited -> not sick-region evidence, so a lost in-container neutral marker can't make
+    the host fallback quarantine a healthy region). Never-started host faults (neutral defaulted 0)
+    stay region-quarantining (no host_neutral key)."""
+    import json as _json
+    import sys
+    import types
+
+    from flash.providers._instance import _FAILMARK_PY
+
+    payload = {
+        "flash_arm": "lambda", "attempt": 0, "hf_prefix": "sft/x/seed0",
+        "hf_repo": "org/repo", "env": {"HF_TOKEN": "t"},
+    }
+    writes: dict = {}
+
+    class FakeFile:
+        def __init__(self, name):
+            self.name = name
+
+        def read(self):
+            return _json.dumps(payload)
+
+        def write(self, s):
+            writes[self.name] = s
+
+    def fake_open(path, mode="r", *a, **k):
+        return FakeFile(path)
+
+    uploaded: dict = {}
+
+    class FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def file_exists(self, repo_id=None, filename=None, repo_type=None):
+            return False  # no worker marker -> the host fallback writes
+
+        def upload_file(self, path_or_fileobj=None, path_in_repo=None, repo_id=None, repo_type=None):
+            uploaded["path"] = path_in_repo
+            uploaded["content"] = _json.loads(writes["/opt/flash/fm.json"])
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = FakeApi
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    # neutral=1 (container started then exited) -> host_neutral True
+    monkeypatch.setattr(sys, "argv", ["failmark.py", "worker container exited during startup (exit 1)", "1"])
+    exec(_FAILMARK_PY, {"open": fake_open})
+    assert uploaded["content"]["retriable"] is True
+    assert uploaded["content"]["host_neutral"] is True
+    assert uploaded["path"] == "sft/x/seed0/lambda_attempt0.json"
+
+    # neutral=0 (never started: docker/GPU never ready) -> no host_neutral (stays quarantining)
+    uploaded.clear()
+    writes.clear()
+    monkeypatch.setattr(sys, "argv", ["failmark.py", "docker never became ready", "0"])
+    exec(_FAILMARK_PY, {"open": fake_open})
+    assert uploaded["content"]["retriable"] is True
+    assert "host_neutral" not in uploaded["content"]
 
 
 def test_instance_realized_cost_is_wall_times_rate():

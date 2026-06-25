@@ -87,6 +87,12 @@ class RunStatus:
     # is cleared in the gap between seeds. Lets recover_runs resume the remaining seeds
     # after an inter-seed restart instead of failing the run (losing completed work).
     resume_seed_index: int | None = None
+    # Set TRUE by cancel_run BEFORE it tears the remote box down, so the run's own poll
+    # loop (a separate thread/process) can recognize a user cancel-IN-PROGRESS while the
+    # terminal ``cancelled`` state is still being persisted. Without it the box-vanished
+    # detection can fire host_fault and quarantine a HEALTHY region for our own teardown
+    # in the window between provider.destroy() and the final _update(...,"cancelled").
+    cancel_requested: bool = False
     # Realized provider cost (COGS), pulled from the provider's billing API after the run
     # finishes by the reconciliation job (flash/server/reconcile.py) and reported to the
     # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the wall x $/hr

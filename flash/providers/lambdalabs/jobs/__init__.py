@@ -553,16 +553,38 @@ def poll_lambda_job(
         _, fresh = heartbeat_progress_ts((hb.get("stage"), hb.get("step"), hb.get("ts")), launch_ts)
         return fresh
 
+    def fresh_trained_hb() -> bool:
+        """True if THIS attempt's worker REACHED end-of-training before failing (it stamps ``trained``
+        on the error heartbeat once /tmp/train_reached is set — right before the first required
+        post-training upload). A retriable failure on that upload (adapter/DONE/metrics) is a completion
+        retry on a HEALTHY productive region, NOT a pre-training host fault, so it must not quarantine.
+        This is the heartbeat-level equivalent of the marker's ``trained`` flag, for the dead-host path
+        that has no marker (its upload was lost / the box vanished). Launch-fresh so a stale prior-attempt
+        heartbeat can't suppress a genuine THIS-attempt pre-training host fault."""
+        if heartbeat_reader is None:
+            return False
+        try:
+            hb = heartbeat_reader(force=True)
+        except Exception:
+            return False
+        if not isinstance(hb, dict) or not hb.get("trained"):
+            return False
+        _, fresh = heartbeat_progress_ts((hb.get("stage"), hb.get("step"), hb.get("ts")), launch_ts)
+        return fresh
+
     def run_cancelled() -> bool:
-        """True if the run was deliberately cancelled. A user cancel during setup terminates the box,
-        which the poller then sees as a dead host with no training heartbeat -> host_fault; but WE
-        killed it, so the region is healthy and must NOT be quarantined. Best-effort: a status-read
-        error defaults to 'not cancelled' (preserve the quarantine); a cancel that lands after this read
-        is handled by the runner's own cancellation path."""
+        """True if the run was deliberately cancelled (or a cancel is IN PROGRESS). A user cancel during
+        setup terminates the box, which the poller then sees as a dead host with no training heartbeat ->
+        host_fault; but WE killed it, so the region is healthy and must NOT be quarantined. cancel_run
+        tears the box down BEFORE it persists the terminal ``cancelled`` state, so also honor the
+        ``cancel_requested`` intent it sets first -- else a poll landing in that teardown window would
+        quarantine a healthy region. Best-effort: a status-read error defaults to 'not cancelled'
+        (preserve the quarantine); a cancel that lands after this read is handled by the runner itself."""
         try:
             from flash.runner import get_status
 
-            return get_status(spec.run_id).state == "cancelled"
+            st = get_status(spec.run_id)
+            return st.state == "cancelled" or bool(getattr(st, "cancel_requested", False))
         except Exception:
             return False
 
@@ -738,10 +760,15 @@ def poll_lambda_job(
                 # but if its attempt marker is missing (upload failed / box lost before it wrote) we land
                 # here instead of fail_from_marker; mirror that path's fresh_host_neutral_hb() guard so a
                 # global GitHub/control-plane rate limit doesn't quarantine an otherwise-healthy region.
+                # fresh_trained_hb() is the same idea for a POST-training upload retry: training reached
+                # end (the worker stamps ``trained`` on the error hb) on a healthy productive region, but
+                # the bootstrap's ``trained`` marker is unavailable on this no-marker path, so read it
+                # from the heartbeat to avoid quarantining a region that just finished training.
                 host_fault=not worker_crashed
                 and not reached_training_now()
                 and not run_cancelled()
-                and not fresh_host_neutral_hb(),
+                and not fresh_host_neutral_hb()
+                and not fresh_trained_hb(),
             )
 
         raw_marker = marker_reader()

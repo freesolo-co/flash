@@ -721,6 +721,44 @@ def test_poll_dead_vm_neutral_heartbeat_without_marker_not_quarantined(monkeypat
     assert not res.host_fault  # host_neutral hb on the dead-VM path: NO quarantine of a healthy region
 
 
+def test_poll_dead_vm_cancel_requested_not_quarantined(monkeypatch):
+    """cancel_run sets cancel_requested=True BEFORE it deletes the VM and persists the terminal
+    'cancelled' state. A poll landing in that teardown window (state still 'running') must honor the
+    intent and NOT quarantine a healthy region for our own cancellation."""
+    import flash.runner
+
+    monkeypatch.setattr(
+        flash.runner, "get_status",
+        lambda run_id: type("S", (), {"state": "running", "cancel_requested": True})(),
+    )
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
+        boot="+ docker pull ... (cancel in progress)",
+    )
+    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert not res.host_fault  # cancel-in-progress -> region NOT quarantined
+
+
+def test_poll_dead_vm_trained_heartbeat_without_marker_not_quarantined(monkeypatch):
+    """A post-training required upload fails retriably and BOTH the worker's attempt marker and the VM
+    are lost, leaving only a fresh error_* heartbeat flagged trained=True. The dead-VM path must read
+    that heartbeat 'trained' flag (the marker is unavailable here) and NOT quarantine a HEALTHY region
+    that actually finished training -- mirroring the marker.trained guard."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
+    )
+    res = jobs.poll_hs_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {
+            "stage": "error_rl", "ts": 10_000.0, "retriable": True, "trained": True
+        },
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable hb -> retry
+    assert not res.host_fault  # trained hb: finished training on a healthy region -> NO quarantine
+
+
 def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
     """On a reattach whose first poll already sees the VM active, active_since is launch-anchored, so
     the launch-relative first_liveness deadline is already blown. The observed-grace floor stops a VM

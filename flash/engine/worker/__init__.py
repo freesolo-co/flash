@@ -2947,7 +2947,18 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        hb_flags = {"retriable": retriable, "host_neutral": host_neutral}
+        # ``trained``: training REACHED end-of-training (the /tmp/train_reached sentinel is stamped
+        # right before the first REQUIRED post-training upload). A retriable failure on that upload
+        # (adapter/DONE/metrics) overwrites the last heartbeat with this error_* stage, so the dead-host
+        # poll path (which can't see the bootstrap's ``trained`` MARKER when the marker upload is also
+        # lost / the box vanished) would otherwise read error_* as pre-training and quarantine a HEALTHY
+        # productive region for a post-training upload retry. Carrying it on the heartbeat lets that path
+        # suppress the quarantine too (fresh_trained_hb), mirroring the marker's ``trained`` flag.
+        hb_flags = {
+            "retriable": retriable,
+            "host_neutral": host_neutral,
+            "trained": os.path.exists(TRAIN_REACHED_SENTINEL),
+        }
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:

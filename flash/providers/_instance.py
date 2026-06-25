@@ -269,6 +269,14 @@ try:
     p = json.load(open("/opt/flash/payload.json"))
     arm = p.get("flash_arm", "instance"); att = int(p.get("attempt") or 0)
     reason = sys.argv[1] if len(sys.argv) > 1 else "host boot failure"
+    # neutral=1 when the CONTAINER STARTED and then exited (the host verified docker+GPU were ready
+    # and `docker run` succeeded). That is NOT sick-region evidence: an in-container failure (e.g. a
+    # region-independent spilled-spec/HF-delivery retry) whose own neutral marker upload was lost would
+    # otherwise be relabeled a pre-training HOST fault by this fallback and quarantine a healthy region.
+    # So flag the fallback host_neutral; a genuinely sick GPU surfacing inside the container still
+    # quarantines via the worker's own non-neutral retriable heartbeat on the next clean signal. The
+    # never-started failures (docker/GPU never ready, pull/run failed) pass neutral=0 -> real sick region.
+    neutral = len(sys.argv) > 2 and sys.argv[2] == "1"
     marker_path = p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + ".json"
     from huggingface_hub import HfApi
     api = HfApi(token=(p.get("env") or {}).get("HF_TOKEN"))
@@ -277,7 +285,10 @@ try:
     except Exception:
         worker_marker_exists = True  # conservative: on a read error, never risk clobbering
     if not worker_marker_exists:
-        open("/opt/flash/fm.json", "w").write(json.dumps({"ok": False, "attempt": att, "retriable": True, "error": "host: " + reason}))
+        fm = {"ok": False, "attempt": att, "retriable": True, "error": "host: " + reason}
+        if neutral:
+            fm["host_neutral"] = True
+        open("/opt/flash/fm.json", "w").write(json.dumps(fm))
         api.upload_file(
             path_or_fileobj="/opt/flash/fm.json",
             path_in_repo=marker_path,
@@ -377,7 +388,9 @@ for i in 1 2 3; do
   python3 -c "import huggingface_hub" >/dev/null 2>&1 && break
   echo "FLASH: hf_hub install retry $i"; sleep 10
 done
-fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/failmark.py "$1" >/dev/null 2>&1 || true; exit 1; }}
+# $2 (optional) = "1" to flag the failmark host_neutral (container started then exited -> not a sick
+# region). Defaults to 0 (never-started host fault) so existing callers stay region-quarantining.
+fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/failmark.py "$1" "${{2:-0}}" >/dev/null 2>&1 || true; exit 1; }}
 # Host->HF boot-log uploader, STARTED EARLY — BEFORE the docker-readiness wait and the (large, slow)
 # image pull — so a box that actually executed cloud-init leaves a liveness artifact on HF within
 # ~2 min. The control plane's poller keys its fast "instance active but the worker never started"
@@ -432,7 +445,10 @@ sleep 5
 if ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
   EXIT="$(docker inspect -f '{{{{.State.ExitCode}}}}' flashrun 2>/dev/null || echo 1)"
   docker logs flashrun >>/opt/flash/host_boot.log 2>&1 || true
-  [ "$EXIT" = "0" ] || fail "worker container did not start (exit ${{EXIT}})"
+  # The container STARTED (docker run succeeded above) then exited non-zero -> neutral=1: an
+  # in-container failure whose own marker upload was lost must not quarantine a region whose
+  # docker+GPU we already verified healthy (see _FAILMARK_PY).
+  [ "$EXIT" = "0" ] || fail "worker container exited during startup (exit ${{EXIT}})" 1
 fi
 # Mirror the container's stdout into the host boot log (detached) so an early in-container crash is
 # visible on HF even if it dies before uploading its own console artifact (the early boot-log
