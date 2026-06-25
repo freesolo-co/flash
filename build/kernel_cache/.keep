@@ -1,0 +1,4 @@
+# placeholder so Dockerfile.worker's `COPY build/kernel_cache/` source always exists.
+# the opt-in baked compiled-kernel cache (mega_cache.bin + mega_cache.json) is produced here by
+# `python -m flash.engine.worker.kernel_warmup --out build/kernel_cache`, then baked into the image
+# with `docker build --build-arg BUILD_KERNEL_CACHE=true`. see docs/kernel-cache.md.

@@ -44,6 +44,7 @@ from flash.providers.runpod.train import (
     isolate_flash_state,
     min_cuda_for,
     resolve_worker_deps,
+    worker_image_for_gpu,
 )
 
 logger = get_logger(__name__)
@@ -274,13 +275,10 @@ def deploy_train_endpoint(
     _patch_runpod_backoff()
     friendly = canonical_gpu(friendly_gpu)
     name = endpoint_name(friendly, name_suffix)
-    # The baked WORKER_IMAGE is now a self-contained RunPod Serverless worker (its CMD runs
-    # rp_handler.py, which reads job["input"] and runs the training) — deploy it directly (Flash
-    # "client mode"). build_function_input then sends the payload as the job input. FLASH_WORKER_IMAGE
-    # overrides the baked image (e.g. a hotfix tag); since WORKER_IMAGE is a non-empty constant the
-    # image is always set, so the boot-install/live-function path is only reachable if both are
-    # explicitly cleared (not a normal configuration).
-    image = os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
+    # deploy a self-contained serverless-worker image directly. by default this is WORKER_IMAGE;
+    # when per-sm warmed images are enabled, the selected GPU class picks the matching image tag.
+    # FLASH_WORKER_IMAGE remains the absolute hotfix override.
+    image = worker_image_for_gpu(friendly, allow_default=True)
 
     def _deploy_once():
         """One get_or_deploy on the currently-active account (SDK + lock critical section)."""
