@@ -39,7 +39,13 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     # a small prompts_per_step would otherwise overshoot it (mirrors run_sft's
     # `min(per_device_bs, effective_batch)`). No-op at the default (prompts_per_step=64).
     per_device = max(1, min(per_device, target_comps))
-    grad_accum = max(1, target_comps // per_device)
+    # Ceil-div (NOT floor): the global completion batch (per_device * grad_accum) must be at
+    # LEAST target_comps, never below it. Floor division shrank it under the target when
+    # target_comps wasn't divisible by per_device and the quotient was 1 (e.g. group_size=2,
+    # prompts_per_step=5, per_device=8 -> floor 10//8=1 -> 8 < 10), silently optimizing fewer
+    # prompts/step than requested. Ceil keeps generations_per_step >= target_comps; when
+    # per_device divides target_comps (the common case) ceil == floor, so this is a no-op there.
+    grad_accum = max(1, -(-target_comps // per_device))
     # TRL rejects a global completion batch (per_device * grad_accum) that is not
     # divisible by num_generations (= group_size), failing only AFTER the paid worker
     # is provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the
@@ -109,15 +115,20 @@ _RL_PER_DEVICE_MAX = 16
 # short-seq run (the underfed regime) is allowed a proportionally bigger micro-batch.
 _RL_ACT_SEQ_REF = 2048.0
 # VRAM-per-(micro-batch element) divisor at the reference seq, normalized to ~2B width (1.41).
-# MEASURED: Qwen3.5-2B group8 seq2048 OOMs a 32 GB card at per_device=8 but trains at 4 ->
-# 32 / (7.5 * 1.0 * 1.0) = 4. (Unchanged from the historical colocate cap, so at/above the
-# reference seq the value is byte-for-byte the old one — no regression.)
-_RL_ACT_DIVISOR = 7.5
+# MEASURED: Qwen3.5-2B group8 seq2048 OOMs a 32 GB card at per_device=8 but trains at 4.
+# vram_gb is now decimal GB (/1e9) to match the rest of the VRAM logic, so the divisor is the
+# old GiB-calibrated 7.5 scaled by 1024**3/1e9 (=7.5*1.0737=8.053). A physical 32 GiB card reports
+# 34.36 decimal GB -> 34.36 / (8.053 * 1.0 * 1.0) = 4, byte-for-byte the old GiB result (32/7.5=4);
+# the scaling makes the unit switch a pure no-op on real cards. (Unchanged historical colocate cap,
+# so at/above the reference seq the value is byte-for-byte the old one — no regression.)
+_RL_ACT_DIVISOR = 8.053
 # Floor on the seq scale: caps how far a short sequence may grow the micro-batch. Set so the
 # underfed case that motivated this — Qwen3.5-0.8B GRPO on a 24 GB card at seq<=1024 — lands on
 # the MEASURED-SAFE per_device 8 (RunPod RTX 4090 24 GB: pd8 fits at 19.0 GB and is +12.6% over
 # pd4, while the old seq-independent cap under-fed it at ~5; pd16 there would need ~27 GB -> OOM).
-# 24 / (7.5 * (0.894/1.41) * 0.63) = 8.0. Bounds short-seq growth to ~1.6x the reference cap.
+# A physical 24 GiB card reports 25.77 decimal GB: 25.77 / (8.053 * (0.894/1.41) * 0.63) = 8.0
+# (the old GiB form 24/(7.5*...)=8.0, unchanged by the unit switch). Bounds short-seq growth to
+# ~1.6x the reference cap.
 _RL_ACT_SEQ_SCALE_FLOOR = 0.63
 # Clamp the seq scale at 1.0 (never ABOVE the reference). Combined with the short_seq growth gate,
 # this makes a seq>=reference run byte-for-byte the old value: seq_scale==1.0 -> vram_cap == the
@@ -165,7 +176,8 @@ def rl_per_device_comps(
       card's VRAM, model width (~sqrt(params)), and — unlike the old seq-independent cap — the
       training sequence length: activations scale ~linearly with seq, so a SHORT-seq run gets a
       proportionally bigger cap. MEASURED at seq_ref=2048: Qwen3.5-2B (width ~1.41) group8 OOMs a
-      32 GB card at per_device=8 but trains at 4 -> 32 / 7.5 = 4.
+      32 GB card at per_device=8 but trains at 4 -> 34.36 / 8.053 = 4 (decimal GB; the old GiB
+      form 32/7.5=4, unchanged by the unit switch).
 
     Off a live card (allocator / unit tests) there is no VRAM signal, so we fall back to the
     conservative historical default (8, or 2 with thinking) bounded by the logits budget — the
@@ -194,7 +206,10 @@ def rl_per_device_comps(
             import torch
 
             if torch.cuda.is_available():
-                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                # Decimal GB (/1e9), matching the rest of the VRAM sizing logic
+                # (flash.engine.vram + gpu_setup.finalize_alloc_conf_for_sleep) so the
+                # divisor/scale thresholds and calibration comments stay on one unit.
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
                 width = (max(float(params_b), 0.1) ** 0.5) if params_b else 1.41
                 seq_scale = min(
                     _RL_ACT_SEQ_SCALE_CEIL,

@@ -86,14 +86,23 @@ def _flash_attn_available() -> bool:
     produces flattened/padding-free
     batches whose example boundaries are carried by ``position_ids`` and enforced ONLY by a
     varlen-capable attention impl (FA2/FA3/flex). Under plain SDPA, packed examples attend ACROSS
-    boundaries (silent quality loss). find_spec only — no import side effects (no CUDA init). FA2 is
-    used whenever the wheel is importable — fixed, no disable knob."""
+    boundaries (silent quality loss). Prefer transformers' own ``is_flash_attn_2_available`` probe
+    (it verifies real importability); only if that's unavailable fall back to a GUARDED import of
+    ``flash_attn`` — NOT a bare ``find_spec``, so an on-disk-but-broken install (ABI mismatch /
+    missing .so) reads as unavailable instead of a false positive that would later force
+    ``attn_implementation="flash_attention_2"`` and crash transformers at model load. FA2 is used
+    whenever it's importable — fixed, no disable knob."""
     try:
-        import importlib.util
+        from transformers.utils import is_flash_attn_2_available
 
-        return importlib.util.find_spec("flash_attn") is not None
+        return bool(is_flash_attn_2_available())
     except Exception:
-        return False
+        try:
+            import flash_attn  # noqa: F401  (guarded: verifies real importability)
+
+            return True
+        except Exception:
+            return False
 
 
 def optimal_attn_impl() -> str | None:

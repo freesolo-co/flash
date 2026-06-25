@@ -57,13 +57,29 @@ _STALL_FAULTHANDLER_S = 0
 with contextlib.suppress(Exception):
     _STALL_FAULTHANDLER_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_S", "0") or 0)
 
+# Startup grace: model/vLLM/GRPO init can legitimately run for many minutes between the FIRST
+# heartbeat and the first per-step one, exceeding a tight FLASH_STALL_FAULTHANDLER_S window and
+# tripping the watchdog on a HEALTHY run. So the very first arm uses a wider window (at least
+# FLASH_STALL_FAULTHANDLER_STARTUP_S, default 900s) and only once real progress has re-armed it do
+# we tighten to the configured interval. OFF inherits from _STALL_FAULTHANDLER_S (0 -> disabled).
+_STALL_STARTUP_GRACE_S = 900
+with contextlib.suppress(Exception):
+    _STALL_STARTUP_GRACE_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_STARTUP_S", "900") or 900)
+# False until the watchdog has been armed at least once; the first arm gets the startup grace.
+_STALL_ARMED = False
+
 
 def _rearm_stall_faulthandler() -> None:
+    global _STALL_ARMED
     if _STALL_FAULTHANDLER_S <= 0:
         return
+    # First arm: widen to the startup grace so a slow init (no per-step heartbeat yet) can't
+    # trip a healthy run. Subsequent re-arms (real progress landed) use the configured interval.
+    window = _STALL_FAULTHANDLER_S if _STALL_ARMED else max(_STALL_FAULTHANDLER_S, _STALL_STARTUP_GRACE_S)
     with contextlib.suppress(Exception):
         faulthandler.cancel_dump_traceback_later()
-        faulthandler.dump_traceback_later(_STALL_FAULTHANDLER_S, exit=True)
+        faulthandler.dump_traceback_later(window, exit=True)
+        _STALL_ARMED = True
 
 
 def heartbeat(stage: str, **kw):

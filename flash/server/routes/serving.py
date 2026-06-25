@@ -50,6 +50,10 @@ def _resolve_deploy_step(run_id: str, spec, raw_step) -> int | None:
         want = int(raw_step) if raw_step.is_integer() else None
     elif isinstance(raw_step, str) and raw_step.strip().lstrip("-").isdigit():
         want = int(raw_step.strip())
+    # Checkpoint steps are always non-negative (derived from ``step-<N>``); reject a negative
+    # value as malformed (400) rather than letting it fall through to the 404 below.
+    if want is not None and want < 0:
+        want = None
     if want is None:
         raise HTTPException(status_code=400, detail=f"invalid checkpoint step: {raw_step!r}")
     checkpoints = _app.list_checkpoints(spec)
@@ -71,7 +75,12 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         spec = JobSpec.from_dict(status.spec)
-        dry_run = bool(payload.get("dry_run", False))
+        # Validate ``dry_run`` is an actual JSON boolean — never ``bool(...)`` a truthy non-bool
+        # (e.g. the string "false" would coerce to True and silently change deploy behavior).
+        dry_run_raw = payload.get("dry_run", False)
+        if not isinstance(dry_run_raw, bool):
+            raise HTTPException(status_code=400, detail="dry_run must be a boolean")
+        dry_run = dry_run_raw
         # Optional `step`: deploy a specific intermediate checkpoint instead of the run's
         # final adapter. We resolve it against what's actually on HF (the source of truth),
         # so a missing step 404s with the available list rather than 500ing at serve time.
@@ -240,14 +249,24 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             status_code=409,
             detail=f"run {run_id} has no [train].hf_repo (legacy run); its adapter cannot be served",
         )
+    # Parse the client-supplied sampling params BEFORE the broad try: a bad value
+    # (e.g. {"temperature": "hot"}) is a request error -> 400, not a 502 inference
+    # failure (which would misclassify the bad payload as an upstream serving fault).
+    try:
+        temperature = float(payload.get("temperature") or 0.0)
+        max_tokens = int(payload.get("max_tokens") or 512)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"invalid temperature/max_tokens: {exc}"
+        ) from exc
     try:
         if payload.get("stream") is True:
             return StreamingResponse(
                 _app.serve_chat_stream(
                     run_id=run_id,
                     messages=payload.get("messages") or [],
-                    temperature=float(payload.get("temperature") or 0.0),
-                    max_tokens=int(payload.get("max_tokens") or 512),
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                 ),
@@ -256,8 +275,8 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
         return _app.serve_chat(
             run_id=run_id,
             messages=payload.get("messages") or [],
-            temperature=float(payload.get("temperature") or 0.0),
-            max_tokens=int(payload.get("max_tokens") or 512),
+            temperature=temperature,
+            max_tokens=max_tokens,
             # a run trained with thinking serves with thinking (per-run parity)
             thinking=spec.thinking,
         )

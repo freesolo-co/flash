@@ -9,7 +9,6 @@ CALL time, so tests that ``monkeypatch.setattr(worker, "<name>", ...)`` then cal
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import threading
@@ -92,8 +91,14 @@ def upload_debug_jsonl(name: str, rows: list[dict], *, keep_last: int = 200) -> 
     try:
         with _DEBUG_UPLOAD_LOCK:
             existing: list[str] = []
-            with contextlib.suppress(FileNotFoundError), open(path) as f:
-                existing = f.readlines()[-keep_last:]
+            # try/except (not `suppress(...), open(...)`): open() is evaluated BEFORE the suppress()
+            # context is entered, so a missing file on the first call would raise and skip all
+            # writing/uploading. Swallow only the not-found case.
+            try:
+                with open(path) as f:
+                    existing = f.readlines()[-keep_last:]
+            except FileNotFoundError:
+                pass
             with open(path, "w") as f:
                 f.writelines(existing)
                 for row in rows:

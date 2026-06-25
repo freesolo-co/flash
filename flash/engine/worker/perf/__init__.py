@@ -329,10 +329,17 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
     def _pip(*args: str) -> bool:
         """Run pip install; return True only if pip exited 0. A failed install (network/build/
-        resolver) must NOT be silently treated as success — the caller gates ``ok`` on this."""
+        resolver) must NOT be silently treated as success — the caller gates ``ok`` on this.
+
+        Bounded by a timeout so a hung pip (network stall / resolver deadlock) can't pin the
+        worker before training/heartbeats progress, burning the GPU until the control plane kills
+        it. A timeout is treated as an install FAILURE so the fail-closed path (disabling fla)
+        still applies."""
         try:
             rc = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-q", *args], check=False
+                [sys.executable, "-m", "pip", "install", "-q", *args],
+                check=False,
+                timeout=600,
             ).returncode
         except Exception:
             return False
