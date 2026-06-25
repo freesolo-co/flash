@@ -29,6 +29,14 @@ def _offline(monkeypatch):
 
     monkeypatch.setattr(runpod_api, "list_endpoints", lambda: [], raising=False)
 
+    # Lambda + Hyperstack are OPT-IN instance-based complements (keyed by LAMBDA_API_KEY /
+    # HYPERSTACK_API_KEY). On an operator box whose shell sources a .env, those keys are present in
+    # the process env — which would make the providers "available" and pull live capacity/pricing
+    # into offline tests (allocation candidates, registry). Delete them by default so the suite
+    # stays hermetic and RunPod-only; a provider test opts back in with ``monkeypatch.setenv(...)``.
+    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
+    monkeypatch.delenv("HYPERSTACK_API_KEY", raising=False)
+
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
     # it to a single active key never loses the rest of the pool). Reset it around every
     # test so a key set/collapsed by one test can't leak into the next.
