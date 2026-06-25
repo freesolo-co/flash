@@ -821,3 +821,164 @@ def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=insts, attempt=0)
     assert attempts == ["us-east-1"]  # stopped after the first ambiguous failure (no 2nd launch)
     assert reaped == ["flash-1700000000-abcd1234"]  # reconciled by run-name
+
+
+# ---------------------------------------------------------------------------
+# #228 follow-up: don't mask worker failures + keep large specs out of user_data
+# ---------------------------------------------------------------------------
+def test_bootstrap_honors_nonzero_exit_without_remote_artifacts(monkeypatch):
+    """Bug: a worker that exits non-zero AFTER writing /tmp/metrics.json locally but BEFORE its
+    required DONE/metrics.json upload (e.g. a transient RetriableInfraError uploading them) must
+    NOT be reported as success. The local file exists, so the old code wrote ok=true; now we only
+    tolerate a non-zero exit when the REMOTE completion artifacts are confirmed on HF."""
+    lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
+    assert lb.main() == 1
+    ok, error = markers[0]
+    assert not ok
+    assert "non-zero" in error  # propagated as a real (retriable) failure, not a false ok=true
+
+
+def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
+    """The benign case the non-zero tolerance exists for: RL's colocated vLLM segfaults at
+    interpreter exit AFTER the adapter + metrics.json + DONE are uploaded. Remote artifacts present
+    -> still a success despite the non-zero rc."""
+    lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
+    assert lb.main() == 0
+    assert markers[0] == (True, "")
+
+
+def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
+    """remote_completion_confirmed is True ONLY when BOTH DONE and metrics.json exist on HF, and
+    stays conservative (False) on an HF read error so a non-zero exit propagates."""
+    from flash.providers import _instance_bootstrap as lb
+
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/x/seed0", "env": {}}
+    present = {"DONE", "metrics.json"}
+    monkeypatch.setattr(lb, "hf_file_exists", lambda p, sub: sub in present)
+    assert lb.remote_completion_confirmed(payload) is True
+    present.discard("DONE")
+    assert lb.remote_completion_confirmed(payload) is False  # metrics but no DONE
+
+    def boom(p, sub):
+        raise RuntimeError("hf down")
+
+    monkeypatch.setattr(lb, "hf_file_exists", boom)
+    assert lb.remote_completion_confirmed(payload) is False  # read error -> conservative
+
+
+def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
+    """A large spec is spilled to HF at launch (out of user_data); the bootstrap reconstructs it
+    from the sentinel (job_spec_in_hf) by fetching <hf_prefix>/job_spec.json."""
+    from flash.providers import _instance_bootstrap as lb
+
+    big = '{"k":"' + "v" * 200_000 + '"}'
+    monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: big)
+    env = lb.build_worker_env(
+        {"job_spec_json": "", "job_spec_in_hf": True, "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"}
+    )
+    # A >96k spec is passed via file, mirroring the inline-large path.
+    assert env["FLASH_JOB_SPEC_PATH"] == "/tmp/job_spec.json"
+    assert "FLASH_JOB_SPEC_JSON" not in env
+    with open("/tmp/job_spec.json") as f:
+        assert f.read() == big
+
+
+def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
+    """A large job_spec_json must NOT be embedded inline in user_data (it can overflow the
+    provider's cloud-init size cap and reject the launch). It is uploaded to HF and replaced by a
+    small sentinel; small specs ride inline unchanged."""
+    import huggingface_hub
+
+    from flash.providers import _instance as inst
+
+    uploaded = {}
+
+    class FakeApi:
+        def __init__(self, token=None):
+            self.token = token
+
+        def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
+            uploaded["path"] = path_in_repo
+            uploaded["repo"] = repo_id
+            uploaded["fileobj"] = path_or_fileobj
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+
+    big = '{"k":"' + "v" * 100_000 + '"}'
+    payload = {
+        "flash_arm": "lambda",
+        "job_spec_json": big,
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/x/seed0",
+        "env": {"HF_TOKEN": "t"},
+        "attempt": 0,
+    }
+    ud = inst.build_user_data(payload, image="img:latest")
+    embedded = json.loads(base64.b64decode(ud.split("FLASH_PAYLOAD_EOF")[1].strip()))
+    assert embedded["job_spec_json"] == ""
+    assert embedded["job_spec_in_hf"] is True
+    assert uploaded["path"] == "sft/x/seed0/job_spec.json"
+    assert uploaded["repo"] == "o/r"
+    # The spec is uploaded as an unambiguous file-like object (io.BytesIO), NOT raw bytes — raw
+    # bytes is a valid path type and huggingface_hub could misread it as a (huge) filesystem path.
+    assert isinstance(uploaded["fileobj"], io.BytesIO)
+    assert uploaded["fileobj"].getvalue() == big.encode()
+    # user_data is tiny despite a 100KB spec, and the caller's payload is untouched.
+    assert len(ud) < 25_000
+    assert payload["job_spec_json"] == big
+    assert "job_spec_in_hf" not in payload
+
+    # A small spec rides inline with no HF upload.
+    uploaded.clear()
+    small = inst.build_user_data({**payload, "job_spec_json": "{}"}, image="img:latest")
+    emb2 = json.loads(base64.b64decode(small.split("FLASH_PAYLOAD_EOF")[1].strip()))
+    assert emb2["job_spec_json"] == "{}"
+    assert "job_spec_in_hf" not in emb2
+    assert uploaded == {}
+
+
+def test_failmark_skips_when_worker_marker_exists(monkeypatch):
+    """Bug: a container that fast-fails on a real user/config error uploads its own ok=false marker,
+    then the host's ~5s liveness check fires fail() and would CLOBBER it with a retriable host
+    marker (relabeling the user error as job_preempted). The host failmark must SKIP the write when
+    a worker attempt marker already exists at the path (and stay conservative on a read error)."""
+    import sys
+    import types
+
+    from flash.providers import _instance as inst
+
+    payload = {"flash_arm": "lambda", "attempt": 0, "hf_prefix": "sft/x/seed0", "hf_repo": "o/r", "env": {}}
+
+    def run_failmark(worker_marker_exists, read_raises=False):
+        """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads."""
+        uploaded = []
+
+        class FakeApi:
+            def __init__(self, token=None):
+                pass
+
+            def file_exists(self, *, repo_id, filename, repo_type):
+                if read_raises:
+                    raise RuntimeError("hf down")
+                return worker_marker_exists
+
+            def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
+                uploaded.append(path_in_repo)
+
+        monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
+
+        def fake_open(path, *a, **k):
+            return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
+
+        glb = {"json": json, "sys": types.SimpleNamespace(argv=["failmark.py", "boom"]), "open": fake_open}
+        exec(inst._FAILMARK_PY, glb)  # controlled test of the embedded host script
+        return uploaded
+
+    # Worker already wrote its marker -> host must NOT clobber it.
+    assert run_failmark(worker_marker_exists=True) == []
+    # No worker marker (never-started container) -> host failmark IS written.
+    assert run_failmark(worker_marker_exists=False) == ["sft/x/seed0/lambda_attempt0.json"]
+    # HF read error -> conservative: skip the write (never risk clobbering).
+    assert run_failmark(worker_marker_exists=False, read_raises=True) == []
