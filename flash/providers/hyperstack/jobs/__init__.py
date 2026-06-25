@@ -723,13 +723,20 @@ def poll_hs_job(
                 # throttled poll. force=True bypasses the rate-limit (accurate absent-vs-present);
                 # ``is None`` keeps an empty "" boot.log counting as liveness (the file existing proves
                 # cloud-init ran); the latch then stops re-reading once the VM has proven itself.
-                if boot_log_reader(force=True) is None and legacy_boot_log_reader(force=True) is None:
+                if boot_log_reader(force=True) is None and (
+                    handle.attempt != 0 or legacy_boot_log_reader(force=True) is None
+                ):
                     # A lone None can also be a momentary HF/Hub network error (not a true absence), so
                     # require the absence to PERSIST across consecutive polls before failing over — a
                     # transient blip clears within a poll interval; a VM whose worker never started
                     # stays absent. Avoids a Hub hiccup at the deadline burning a cross-provider retry.
                     # Both the attempt-scoped AND the legacy boot.log must be absent (the legacy read is
-                    # short-circuited away unless the attempt-scoped one is missing).
+                    # short-circuited away unless the attempt-scoped one is missing). The legacy path is
+                    # SEED-scoped (shared across attempts), so it is consulted ONLY on attempt 0: a
+                    # RETRY (attempt >= 1) must never read a prior attempt's leftover legacy log and
+                    # mistake a dead replacement host for a live one. (A retry into a #260-era process
+                    # never has a legacy log anyway; the only writer is a pre-upgrade box, and a recovery
+                    # relaunch — also attempt 0 — already purges it via _purge_seed_boot_logs.)
                     boot_log_absent_polls += 1
                     if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
                         # The boot-log uploader is best-effort and may never have worked even though the

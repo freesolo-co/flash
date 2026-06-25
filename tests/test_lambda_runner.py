@@ -1093,6 +1093,25 @@ def test_poll_legacy_boot_log_satisfies_first_liveness_on_reattach(monkeypatch):
     assert "no worker liveness" not in (res.detail or "")  # legacy boot.log satisfied first-liveness
 
 
+def test_poll_retry_ignores_seed_scoped_legacy_boot_log(monkeypatch):
+    """The legacy (seed-scoped) boot.log fallback must NOT mask a dead host on a RETRY. On attempt >= 1
+    a prior attempt's leftover legacy <arm>_boot.log could otherwise falsely satisfy first-liveness for a
+    non-starting replacement box. The fallback is gated to attempt 0, so this attempt-1 box ignores the
+    present legacy log and still fails over fast (stalled + host_fault)."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        boot=None,  # attempt-scoped boot.log absent (this box never started)
+        legacy_boot="+ stale legacy boot.log from a prior attempt",  # present but must be IGNORED
+        step=100.0,
+    )
+    res = jobs.poll_lambda_job(_handle(attempt=1), _spec(), seed=0, interval_s=0, first_liveness_s=500.0)
+    assert not res.ok
+    assert res.failure == "stalled"  # fast failover, NOT masked by the seed-scoped legacy log
+    assert "no worker liveness" in res.detail
+    assert res.host_fault
+
+
 def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):
     """An empty ("") boot.log still proves cloud-init ran — its mere EXISTENCE is liveness. A bare
     ``not boot_log_reader()`` would treat "" as absent and spuriously fail the box over; the fix uses
