@@ -727,18 +727,23 @@ def test_teardown_hyperstack_volumes_deletes_only_fleet(monkeypatch):
     from flash.providers.hyperstack import api as hs_api
     from flash.providers.runpod import preload
 
+    # Known cache fleet = the per-region names for the cache regions + the legacy bare name.
+    monkeypatch.setattr(hs_api, "cache_regions", lambda: ["CANADA-1", "US-1"])
     vols = [
-        {"id": 11, "name": "flash-weights", "environment": {"name": "default-CANADA-1"}},
-        {"id": 12, "name": "flash-weights", "environment": {"name": "default-US-1"}},
+        {"id": 11, "name": "flash-weights", "environment": {"name": "default-CANADA-1"}},  # legacy bare
+        {"id": 12, "name": "flash-weights-us-1", "environment": {"name": "default-US-1"}},  # per-region
         {"id": 13, "name": "user-volume", "environment": {"name": "default-US-1"}},  # NOT ours
+        {"id": 14, "name": "flash-weights-backup", "environment": {"name": "default-US-1"}},  # NOT a fleet name
     ]
     deleted = []
     monkeypatch.setattr(hs_api, "list_volumes", lambda: vols)
+    monkeypatch.setattr(hs_api, "cache_volume_name", lambda base, r: f"{base}-{r.lower()}")
     monkeypatch.setattr(hs_api, "delete_volume", lambda i: deleted.append(i) or True)
 
     out = preload.teardown_hyperstack_volumes()
+    # only the EXACT fleet names — never the user's flash-weights-backup (broad-prefix bug) or user-volume
     assert sorted(deleted) == [11, 12]
-    assert sorted(out) == ["hyperstack:default-CANADA-1/flash-weights", "hyperstack:default-US-1/flash-weights"]
+    assert sorted(out) == ["hyperstack:default-CANADA-1/flash-weights", "hyperstack:default-US-1/flash-weights-us-1"]
 
 
 def test_teardown_hyperstack_volumes_no_key_is_noop(monkeypatch):
@@ -760,6 +765,30 @@ def test_teardown_cli_reclaims_all_three_providers(monkeypatch):
     monkeypatch.setattr(preload, "teardown_lambda_filesystems", lambda: ["lambda:us-east-1/flash-weights"])
     monkeypatch.setattr(preload, "teardown_hyperstack_volumes", lambda: ["hyperstack:default-US-1/flash-weights"])
     assert preload.main(["--teardown"]) == 0
+
+
+def test_teardown_dry_run_deletes_nothing(monkeypatch):
+    """`--teardown --dry-run` only PRINTS the plan — it must never call the destructive helpers."""
+    from flash.providers.runpod import preload
+
+    def _boom(*a, **k):
+        raise AssertionError("--teardown --dry-run must not call any teardown helper")
+
+    monkeypatch.setattr(preload, "teardown_weight_cache", _boom)
+    monkeypatch.setattr(preload, "teardown_lambda_filesystems", _boom)
+    monkeypatch.setattr(preload, "teardown_hyperstack_volumes", _boom)
+    assert preload.main(["--teardown", "--dry-run"]) == 0
+
+
+def test_scoped_teardown_rejects_invalid_datacenter(monkeypatch):
+    """`--teardown --datacenters <bad-id>` fails non-zero and deletes NOTHING (no silent success)."""
+    from flash.providers.runpod import preload
+
+    def _boom(*a, **k):
+        raise AssertionError("invalid scoped teardown must not delete anything")
+
+    monkeypatch.setattr(preload, "teardown_weight_cache", _boom)
+    assert preload.main(["--teardown", "--datacenters", "NOT-A-REAL-DC"]) == 2
 
 
 def test_teardown_continues_when_runpod_unconfigured(monkeypatch):
@@ -1161,6 +1190,22 @@ def test_instance_build_payload_no_mode_by_default():
     assert "models" not in p
 
 
+def test_instance_build_payload_preserves_worker_env_hf_home(monkeypatch):
+    """A per-run [worker_env].HF_HOME override is NOT clobbered by the instance cache path (parity
+    with RunPod, where the worker_env override wins)."""
+    from flash.providers import _instance
+
+    spec = JobSpec.from_dict({
+        "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": "flash-1700000000-abcd1234",
+        "train": {"seeds": [0], "hf_repo": "org/repo"},
+        "gpu": {"type": "A10", "max_wall_seconds": 3600, "network_volume": "flash-weights"},
+        "worker_env": {"HF_HOME": "/custom/hf"},  # user-set override
+    })
+    p = _instance.build_payload(spec, 0, 0, arm="lambda", cache_host_mount="/lambda/nfs/flash-weights")
+    # the user's HF_HOME survives — the instance cache path is only installed when HF_HOME is absent
+    assert p["env"]["HF_HOME"] == "/custom/hf"
+
+
 def test_instance_preload_requires_mounted_cache():
     from flash.providers import _instance_bootstrap as b
 
@@ -1362,6 +1407,69 @@ def test_warm_instances_no_capacity_returns_empty(monkeypatch):
     monkeypatch.setattr(lj, "usable_instances", lambda gpu: [])
     monkeypatch.setattr(hj, "usable_instances", lambda gpu: [])
     assert preload.warm_instances(models=["a/b"]) == []
+
+
+def test_warm_instances_uses_per_provider_default_gpu(monkeypatch):
+    """With no --gpu override, each provider warms with a GPU IT offers (A10 is Lambda-only, so
+    Hyperstack must not be queried with A10 and silently skipped)."""
+    from flash.providers.hyperstack import jobs as hj
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    seen = {}
+
+    def _rec(provider):
+        def _u(gpu):
+            seen[provider] = gpu
+            return []
+        return _u
+
+    monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
+    monkeypatch.setattr(lj, "usable_instances", _rec("lambda"))
+    monkeypatch.setattr(hj, "usable_instances", _rec("hyperstack"))
+    preload.warm_instances(models=["a/b"])  # gpu=None -> per-provider defaults
+    assert seen["lambda"] == preload._PRELOAD_GPU_BY_PROVIDER["lambda"] == "A10"
+    assert seen["hyperstack"] == preload._PRELOAD_GPU_BY_PROVIDER["hyperstack"] == "L40"
+
+
+def test_warm_instances_explicit_gpu_overrides_all_providers(monkeypatch):
+    from flash.providers.hyperstack import jobs as hj
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    seen = {}
+
+    def _rec(provider):
+        def _u(gpu):
+            seen[provider] = gpu
+            return []
+        return _u
+
+    monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
+    monkeypatch.setattr(lj, "usable_instances", _rec("lambda"))
+    monkeypatch.setattr(hj, "usable_instances", _rec("hyperstack"))
+    preload.warm_instances(models=["a/b"], gpu="H100")
+    assert seen == {"lambda": "H100", "hyperstack": "H100"}
+
+
+def test_warm_instances_fails_fast_without_status_repo(monkeypatch):
+    """If the status repo can't be created (bad/missing HF_TOKEN), warm must NOT launch paid GPUs."""
+    import pytest
+
+    from flash.providers.hyperstack import jobs as hj
+    from flash.providers.lambdalabs import jobs as lj
+    from flash.providers.runpod import preload
+
+    monkeypatch.setattr(preload, "_ensure_status_repo",
+                        lambda token: (_ for _ in ()).throw(RuntimeError("401 unauthorized")))
+
+    def _boom(gpu):
+        raise AssertionError("must not query capacity / launch before the status repo is ready")
+
+    monkeypatch.setattr(lj, "usable_instances", _boom)
+    monkeypatch.setattr(hj, "usable_instances", _boom)
+    with pytest.raises(RuntimeError, match="status repo"):
+        preload.warm_instances(models=["a/b"])
 
 
 def test_warm_instances_cli_dry_run(monkeypatch):

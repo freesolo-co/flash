@@ -323,11 +323,16 @@ def teardown_hyperstack_volumes(name: str | None = None) -> list[str]:
     except Exception as exc:
         logger.warning("teardown: hyperstack list_volumes failed (skipping): %s", exc)
         return deleted
-    # Match the per-region fleet (``flash-weights-<region>``) AND the legacy bare ``flash-weights`` from
-    # before per-region naming — never other volumes.
+    # Allowlist of EXACT deterministic cache-fleet names — the per-region ``flash-weights-<region>``
+    # this code provisions, PLUS the legacy bare ``flash-weights`` from before per-region naming. A
+    # broad ``startswith(base + "-")`` prefix would also nuke unrelated user volumes like
+    # ``flash-weights-backup`` / ``flash-weights-test``, so match exact names only.
+    fleet = {base}
+    with contextlib.suppress(Exception):
+        fleet |= {hs_api.cache_volume_name(base, r) for r in hs_api.cache_regions()}
     for v in vols:
         vname = v.get("name") or ""
-        if (vname == base or vname.startswith(f"{base}-")) and v.get("id") and hs_api.delete_volume(v["id"]):
+        if vname in fleet and v.get("id") and hs_api.delete_volume(v["id"]):
             env = (v.get("environment") or {}).get("name") or "?"
             deleted.append(f"hyperstack:{env}/{vname}")
     return deleted
@@ -339,30 +344,41 @@ def teardown_hyperstack_volumes(name: str | None = None) -> list[str]:
 # self-reports completion by uploading ``preload_result.json`` to a shared status repo, which the
 # driver polls; the instance is ALWAYS terminated in a finally. Cheap class by default (the work is a
 # download, not compute) — override with FLASH_PRELOAD_INSTANCE_GPU.
+# Per-provider default warm GPU: a cheap class that the provider actually offers. A10 is LAMBDA-ONLY
+# (no hyperstack_name), so using it for Hyperstack makes usable_instances("A10") empty/raise and
+# Hyperstack is silently never warmed — pick L40 (a cheap Hyperstack datacenter card) there. An
+# explicit --gpu / FLASH_PRELOAD_INSTANCE_GPU overrides BOTH.
 _PRELOAD_INSTANCE_GPU = os.environ.get("FLASH_PRELOAD_INSTANCE_GPU") or "A10"
+_PRELOAD_GPU_BY_PROVIDER = {"lambda": "A10", "hyperstack": "L40"}
 # Shared dataset repo the preload boxes upload their status marker to (the driver polls it). The
 # warmed WEIGHTS go to the per-region cache volume, NOT here — this holds only tiny status JSON.
 _PRELOAD_STATUS_REPO = os.environ.get("FLASH_PRELOAD_STATUS_REPO") or "Freesolo-Co/flash-weight-preload"
 
 
 def _ensure_status_repo(token: str | None) -> None:
-    """Create the preload status dataset repo if absent (the boxes upload their marker there)."""
-    with contextlib.suppress(Exception):
-        from huggingface_hub import HfApi
+    """Create the preload status dataset repo if absent (the boxes upload their marker there).
 
-        HfApi(token=token).create_repo(_PRELOAD_STATUS_REPO, repo_type="dataset", exist_ok=True, private=True)
+    RAISES on failure (missing/invalid HF_TOKEN, no access): the repo is the ONLY completion signal
+    — without it every launched box runs until timeout_s with no preload_result.json, so the warm
+    burns paid GPUs and reports nothing. Fail fast BEFORE launching instead of swallowing the error.
+    """
+    from huggingface_hub import HfApi
+
+    HfApi(token=token).create_repo(_PRELOAD_STATUS_REPO, repo_type="dataset", exist_ok=True, private=True)
 
 
-def _preload_instance_spec(gpu: str, run_id: str):
+def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
     """A minimal download-only preload spec: cache attached, status marker repo, placeholder model
-    (the bootstrap warms ``payload['models']``, not ``spec.model``)."""
+    (the bootstrap warms ``payload['models']``, not ``spec.model``). ``wall_s`` is the worker wall cap
+    — thread the warm timeout in so a long catalog warm isn't killed at the hard-coded 30 min while
+    the driver is still polling."""
     from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
     from flash.spec import JobSpec
 
     return JobSpec.from_dict({
         "model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft", "run_id": run_id,
         "train": {"hf_repo": _PRELOAD_STATUS_REPO, "seeds": [0]},
-        "gpu": {"type": gpu, "max_wall_seconds": 1800,
+        "gpu": {"type": gpu, "max_wall_seconds": max(60, int(wall_s)),
                 "network_volume": WEIGHT_CACHE_VOLUME_NAME, "network_volume_gb": WEIGHT_CACHE_VOLUME_GB},
     })
 
@@ -373,7 +389,9 @@ def _warm_one_instance(provider: str, jobs_mod, candidate, models: list, gpu: st
     marker, then ALWAYS terminate. One region failing never aborts the others."""
     region = getattr(candidate, "region", "?")
     run_id = f"flash-preload-{provider}-{region.lower()}-{uuid.uuid4().hex[:6]}"
-    spec = _preload_instance_spec(gpu, run_id)
+    # The worker wall cap tracks the requested warm timeout, so a long catalog warm isn't killed at
+    # 30 min while _warm_one_instance is still polling for the result.
+    spec = _preload_instance_spec(gpu, run_id, wall_s=timeout_s)
     prefix = f"{spec.phase}/{run_id}/seed0"
     reader = make_hf_text_reader(_PRELOAD_STATUS_REPO, f"{prefix}/preload_result.json",
                                  min_interval_s=max(5.0, poll_interval_s))
@@ -418,40 +436,50 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
     HF download deps (huggingface_hub + hf_transfer), which the worker image already carries.
     """
     models = models or catalog_model_ids()
-    gpu = gpu or _PRELOAD_INSTANCE_GPU
     providers = providers or ["lambda", "hyperstack"]
     token = os.environ.get("HF_TOKEN")
-    _ensure_status_repo(token)
+    # Fail fast BEFORE launching any paid GPU: the status repo is the only completion signal, so if it
+    # can't be created/accessed (missing/invalid HF_TOKEN) every box would just run to timeout warming
+    # nothing observable. Surface a clear error instead of silently burning instances.
+    try:
+        _ensure_status_repo(token)
+    except Exception as exc:
+        raise RuntimeError(
+            f"preload status repo {_PRELOAD_STATUS_REPO!r} unavailable ({exc}); set a valid HF_TOKEN "
+            "with write access before warming (refusing to launch paid GPUs that can't report)."
+        ) from exc
 
     from flash.providers.hyperstack import jobs as hs_jobs
     from flash.providers.lambdalabs import jobs as lambda_jobs
 
     mods = {"lambda": lambda_jobs, "hyperstack": hs_jobs}
     # One launch per region (dedupe so two candidates in a region don't double-launch — block volumes
-    # are single-attach anyway).
+    # are single-attach anyway). Each entry carries its provider's resolved GPU (an explicit override
+    # applies to all; otherwise the per-provider default — so A10 doesn't silently skip Hyperstack).
     targets: list = []
     for provider in providers:
         jobs_mod = mods.get(provider)
         if jobs_mod is None:
             continue
+        provider_gpu = gpu or _PRELOAD_GPU_BY_PROVIDER.get(provider, _PRELOAD_INSTANCE_GPU)
         seen_regions: set = set()
         try:
-            candidates = jobs_mod.usable_instances(gpu)
+            candidates = jobs_mod.usable_instances(provider_gpu)
         except Exception as exc:
-            logger.warning("warm %s: usable_instances failed (skipping): %s", provider, exc)
+            logger.warning("warm %s: usable_instances(%s) failed (skipping): %s", provider, provider_gpu, exc)
             continue
         for c in candidates:
             if c.region in seen_regions:
                 continue
             seen_regions.add(c.region)
-            targets.append((provider, jobs_mod, c))
+            targets.append((provider, jobs_mod, c, provider_gpu))
     if not targets:
         logger.warning("warm: no Lambda/Hyperstack capacity right now (nothing to warm)")
         return []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [
-            ex.submit(_warm_one_instance, provider, jobs_mod, c, models, gpu, token, timeout_s, poll_interval_s)
-            for (provider, jobs_mod, c) in targets
+            ex.submit(_warm_one_instance, provider, jobs_mod, c, models, provider_gpu, token, timeout_s, poll_interval_s)
+            for (provider, jobs_mod, c, provider_gpu) in targets
         ]
         return [f.result() for f in as_completed(futs)]
 
@@ -620,6 +648,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{len(results) - len(failed)}/{len(results)} regions warmed")
         return 1 if failed else 0
     if args.teardown:
+        # Validate any scoped DC ids BEFORE deleting anything: an invalid id (typo in teardown
+        # automation) must fail loudly with a non-zero exit, NOT get swallowed by the best-effort
+        # catch below and report success while deleting nothing / leaving the billed fleet in place.
+        if scoped:
+            from runpod_flash.core.resources.datacenter import DataCenter
+            bad = []
+            for d in parsed_dcs:
+                try:
+                    DataCenter.from_string(d)
+                except Exception:
+                    bad.append(d)
+            if bad:
+                print(f"--teardown --datacenters: invalid datacenter id(s): {', '.join(bad)} "
+                      "— refusing to run (nothing deleted)")
+                return 2
+        if args.dry_run:
+            # `--teardown --dry-run` must only PRINT the plan — never call the destructive helpers.
+            print(f"would delete the RunPod weight-cache volumes in {len(dcs)} datacenter(s)"
+                  + ("" if scoped else " + every Lambda filesystem + Hyperstack volume named flash-weights"))
+            return 0
         # Reclaim the cache storage on EVERY provider: RunPod network volumes, Lambda filesystems,
         # and Hyperstack block volumes. Each provider is guarded INDEPENDENTLY so one provider's
         # failure (e.g. RunPod auth absent/broken on an instance-only control plane, or a RunPod

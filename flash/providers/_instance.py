@@ -139,9 +139,14 @@ def build_payload(
     )
 
     # Start from the shared env with the RunPod /runpod-volume redirect stripped (that mount is
-    # RunPod-only). If THIS provider attached a cache, point HF_HOME at the instance cache mount.
+    # RunPod-only). If THIS provider attached a cache, point HF_HOME at the instance cache mount —
+    # but DON'T clobber a per-run [worker_env].HF_HOME the user set on purpose. build_worker_env
+    # merges [worker_env] LAST, so a user override survives the strip above (only /runpod-volume-
+    # rooted vars are stripped); on RunPod that override wins, so honor it here too for parity. We
+    # only install the cache path when HF_HOME is absent (i.e. the platform redirect was stripped and
+    # the user set nothing).
     env = strip_runpod_volume_env(build_worker_env(spec, seed, runtime_secrets=runtime_secrets))
-    if cache_host_mount:
+    if cache_host_mount and not env.get("HF_HOME"):
         env["HF_HOME"] = CACHE_HF_HOME
     payload = {
         "hf_repo": spec.train.hf_repo,

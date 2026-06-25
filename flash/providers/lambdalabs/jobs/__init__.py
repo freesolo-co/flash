@@ -231,6 +231,43 @@ def launch_and_submit(
                     f"ambiguous Lambda launch failure (possible phantom reaped): {e}"
                 ) from e
             say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {e}")
+            # A CLEAN reject of a CACHE-backed launch whose error mentions the FILESYSTEM was likely
+            # caused by the attach itself (a just-created FS not yet attachable, an attach quota, an
+            # unsupported pairing) — not the GPU class. Best-effort cache must never make a region the
+            # cold path could have served fail outright, so retry THIS region once WITHOUT the cache
+            # before walking. Gated to filesystem-shaped errors so a plain capacity reject still walks
+            # (a cold retry there would just reject again). Skipped in preload mode (a cache-less
+            # preload warms nothing). The reject was clean -> no billed instance -> a 2nd launch is safe.
+            fs_attach_reject = fs_names and any(
+                tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
+            )
+            if mode != "preload" and fs_attach_reject:
+                say(f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)")
+                try:
+                    instance_id = lambda_api.launch_instance(
+                        region_name=inst.region, instance_type_name=inst.instance_type,
+                        ssh_key_names=ssh_keys, name=name, user_data=cold_user_data,
+                        file_system_names=None,
+                    )
+                except lambda_api.LambdaApiError as e2:
+                    last_err = e2
+                    if not _launch_rejection_is_clean(e2):
+                        with contextlib.suppress(Exception):
+                            terminate_run_instances(spec.run_id)
+                        raise lambda_api.LambdaApiError(
+                            f"ambiguous Lambda launch failure (possible phantom reaped): {e2}"
+                        ) from e2
+                    say(f"region {inst.region} also rejected cold: {e2}")
+                else:
+                    say(
+                        f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
+                        f"{inst.instance_type} in {inst.region} attempt={attempt} seed={seed}"
+                    )
+                    return LambdaJobHandle(
+                        instance_id=instance_id, instance_type=inst.instance_type, region=inst.region,
+                        name=name, gpu=inst.gpu, hourly_usd=inst.price_usd_hr, attempt=attempt,
+                        started_ts=time.time(),
+                    )
             # NOT in preload mode: warm_instances pins each preload launch to ONE specific target
             # region and reports that exact region as warmed. Refreshing to a DIFFERENT region here
             # would warm region B while the caller reports the target region A as warmed (cache still

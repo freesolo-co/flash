@@ -307,6 +307,55 @@ def test_cache_falls_back_to_cold_when_filesystem_unavailable(monkeypatch):
     assert "/weight-cache" not in calls[0]["user_data"]  # cold user_data, no bind
 
 
+def test_filesystem_attach_reject_retries_same_region_cold(monkeypatch):
+    """A clean reject whose error mentions the FILESYSTEM retries THIS region cache-less before
+    walking — so a best-effort attach can't make a region the cold path would have served fail."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: f"/lambda/nfs/{n}")  # FS ensured
+    calls = []
+
+    def fake_launch(*, region_name, file_system_names=None, user_data=None, **kw):
+        calls.append({"region": region_name, "fs": file_system_names})
+        if file_system_names:  # the CACHED launch is rejected for a filesystem-attach reason
+            raise lambda_api.LambdaApiError(
+                "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
+            )
+        return "i-cold"  # the cold retry (no fs) succeeds in the SAME region
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    h = jobs.launch_and_submit(_spec(network_volume="flash-weights"),
+                               seed=0, instances=[_inst(region="us-east-1")], attempt=0)
+    assert h.region == "us-east-1"  # served by the SAME region, not lost to the walk
+    assert [c["fs"] for c in calls] == [["flash-weights"], None]  # cached attempt, then cold retry
+    assert all(c["region"] == "us-east-1" for c in calls)
+
+
+def test_capacity_reject_does_not_trigger_cold_fs_retry(monkeypatch):
+    """A plain CAPACITY reject (no filesystem in the error) walks normally — no extra cold retry."""
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", lambda n, r: f"/lambda/nfs/{n}")
+    calls = []
+
+    def fake_launch(*, region_name, file_system_names=None, **kw):
+        calls.append({"region": region_name, "fs": file_system_names})
+        if region_name == "us-east-1":
+            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
+        return "i-2"
+
+    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    h = jobs.launch_and_submit(_spec(network_volume="flash-weights"), seed=0,
+                               instances=[_inst(region="us-east-1"), _inst(region="us-west-2")], attempt=0)
+    assert h.region == "us-west-2"  # walked to the next region
+    # us-east-1 tried ONCE (with fs), then walked — no extra cold retry in us-east-1
+    assert [c["region"] for c in calls] == ["us-east-1", "us-west-2"]
+
+
 def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
     """In preload mode a cache-ensure failure SKIPS the region — never a cold full-training launch.
 
