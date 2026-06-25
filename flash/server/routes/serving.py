@@ -249,14 +249,24 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             status_code=409,
             detail=f"run {run_id} has no [train].hf_repo (legacy run); its adapter cannot be served",
         )
+    # Parse the client-supplied sampling params BEFORE the broad try: a bad value
+    # (e.g. {"temperature": "hot"}) is a request error -> 400, not a 502 inference
+    # failure (which would misclassify the bad payload as an upstream serving fault).
+    try:
+        temperature = float(payload.get("temperature") or 0.0)
+        max_tokens = int(payload.get("max_tokens") or 512)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"invalid temperature/max_tokens: {exc}"
+        ) from exc
     try:
         if payload.get("stream") is True:
             return StreamingResponse(
                 _app.serve_chat_stream(
                     run_id=run_id,
                     messages=payload.get("messages") or [],
-                    temperature=float(payload.get("temperature") or 0.0),
-                    max_tokens=int(payload.get("max_tokens") or 512),
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
                 ),
@@ -265,8 +275,8 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
         return _app.serve_chat(
             run_id=run_id,
             messages=payload.get("messages") or [],
-            temperature=float(payload.get("temperature") or 0.0),
-            max_tokens=int(payload.get("max_tokens") or 512),
+            temperature=temperature,
+            max_tokens=max_tokens,
             # a run trained with thinking serves with thinking (per-run parity)
             thinking=spec.thinking,
         )
