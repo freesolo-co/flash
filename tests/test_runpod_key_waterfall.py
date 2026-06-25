@@ -69,33 +69,38 @@ def test_advance_collapses_env_and_reorders(monkeypatch):
     # advance collapses RUNPOD_API_KEY to the active key for the runpod_flash SDK.
     assert os.environ["RUNPOD_API_KEY"] == "rk-b"
 
-    # Pool cycles: the pointer still wraps back to key #0 (so recovered quota there is reused),
-    # but the return value now reports exhaustion — every account was the active key once this
-    # cycle — so a `while advance_key()` failover loop stops after one full pass instead of
-    # spinning forever on an all-exhausted pool.
-    assert keys.advance_key() is False
+    # Pool cycles: the pointer wraps back to key #0 so recovered quota there is reused. advance_key
+    # ALWAYS advances (and returns True) for a multi-key pool — the return value is NOT an
+    # exhaustion signal (that depends on where a failover started, which advance_key can't know), so
+    # callers bound failovers by key_count() instead. See deploy_train_endpoint.
+    assert keys.advance_key() is True
     assert keys.active_key() == "rk-a"
     assert os.environ["RUNPOD_API_KEY"] == "rk-a"
 
 
-def test_advance_key_drain_loop_terminates(monkeypatch):
-    """`while advance_key()` drains the pool exactly once and stops — the False-on-wrap contract
-    that protects any caller relying on the return value (vs. spinning on an all-exhausted pool)."""
+def test_advance_key_count_bound_visits_every_account_from_any_start(monkeypatch):
+    """advance_key() always advances (wrapping), so a COUNT bound of key_count()-1 visits every
+    OTHER account exactly once — from ANY starting account, including mid-pool (a prior run may have
+    left the pointer advanced). This is the contract deploy_train_endpoint relies on; a wrap-to-0
+    'exhaustion' heuristic would wrongly stop a mid-pool failover before the wrapped-over keys."""
     import flash.providers.runpod.keys as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b,rk-c")
     keys.reset()
-    seen = [keys.active_key()]
-    iterations = 0
-    while keys.advance_key():
-        iterations += 1
-        seen.append(keys.active_key())
-        assert iterations < 10  # safety net: must terminate, never spin
-    # One full cycle: advanced to each of the other 2 accounts (True), then wrapped to rk-a (False).
-    assert iterations == 2
-    assert seen == ["rk-a", "rk-b", "rk-c"]
-    # The pointer DID still wrap back to the preferred account so recovered quota is reused.
-    assert keys.active_key() == "rk-a"
+
+    # Simulate a prior run that already failed over once: the active key starts at rk-b (mid-pool).
+    assert keys.advance_key() is True
+    assert keys.active_key() == "rk-b"
+
+    # A fresh failover bounded by key_count()-1 must now visit BOTH remaining accounts (rk-c, then
+    # wrap to rk-a) exactly once — never stopping early at the index-0 wrap.
+    failovers_left = keys.key_count() - 1  # == 2
+    visited = [keys.active_key()]
+    while failovers_left > 0:
+        assert keys.advance_key() is True  # multi-key pool: always advances
+        visited.append(keys.active_key())
+        failovers_left -= 1
+    assert visited == ["rk-b", "rk-c", "rk-a"]  # every account tried exactly once
 
 
 def test_select_active_collapses_env(monkeypatch):

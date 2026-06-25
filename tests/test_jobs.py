@@ -1489,9 +1489,9 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
 
 def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
     """When EVERY account is quota-exhausted, deploy fails over once per account and then RAISES —
-    it must NOT loop forever. advance_key() returns False once it wraps back to the starting
-    account, AND the deploy bounds its own failovers by key_count() (belt-and-suspenders); a
-    regression in either would spin here indefinitely."""
+    it must NOT loop forever. The deploy bounds its failovers by a key_count()-based COUNT (NOT by
+    advance_key()'s return value, which always advances/wraps for a multi-key pool); a regression
+    would spin here indefinitely."""
     import flash.providers.runpod.jobs as jobs
     import flash.providers.runpod.keys as keys
 
@@ -1520,6 +1520,56 @@ def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
         jobs.deploy_train_endpoint("A100", name_suffix="testrun")
     # 2 accounts x _QUOTA_MAX_RETRIES (3) = 6 deploy attempts, then it stops — never the unbounded spin.
     assert calls["count"] == 6
+
+
+def test_deploy_failover_from_midpool_tries_every_remaining_account(monkeypatch):
+    """REGRESSION: a deploy whose failover STARTS on a non-first account (a prior run already
+    advanced the active key) must still try EVERY remaining account before giving up. The earlier
+    'advance_key() returns False on wrap-to-index-0' exhaustion heuristic broke this — starting on
+    kB, the wrap kB→kC→kA hit index 0 at kA and stopped one account early, skipping kA. The fix
+    bounds failovers by key_count()-1, so each remaining account is tried exactly once from any
+    start. Here only kA has room; a mid-pool start MUST still reach it."""
+    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.keys as keys
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB,kC")
+    keys.reset()
+    # Simulate a prior run that left the pointer on kB (mid-pool start for THIS deploy).
+    assert keys.advance_key() is True
+    assert keys.active_key() == "kB"
+
+    tried: list[str] = []
+
+    class FakeResource:
+        id = "ep-on-kA"
+
+    class FakeRM:
+        async def get_or_deploy_resource(self, config):
+            tried.append(keys.active_key())
+            # Only kA has worker quota; kB and kC are exhausted. The deploy must fail over off the
+            # mid-pool start, wrap past kC, and reach kA — not stop at the index-0 wrap.
+            if keys.active_key() != "kA":
+                raise RuntimeError(
+                    "GraphQL errors: Max workers across all endpoints must not exceed "
+                    "your workers quota (30)"
+                )
+            return FakeResource()
+
+    _patch_deploy_deps(monkeypatch, jobs)
+    _make_runpod_flash_mocks(monkeypatch, FakeRM)
+    monkeypatch.setattr(
+        jobs, "_sweep_idle_flash_endpoints", lambda protected, min_idle_s=0.0, reap_warm=True: 0
+    )
+
+    ep_id, _name = jobs.deploy_train_endpoint("A100", name_suffix="testrun")
+    assert ep_id == "ep-on-kA"
+    assert keys.active_key() == "kA"  # wrapped past kC to the working account
+    # Every account was tried (each exhausted one _QUOTA_MAX_RETRIES times before failover); the
+    # mid-pool start reached kA via the wrap kB→kC→kA instead of stopping at the index-0 wrap.
+    assert set(tried) == {"kA", "kB", "kC"}
+    # Order: the failover walks kB then kC then wraps to kA — kA is the LAST distinct account tried.
+    first_seen = list(dict.fromkeys(tried))
+    assert first_seen == ["kB", "kC", "kA"]
 
 
 def test_sweep_idle_flash_endpoints(monkeypatch):
