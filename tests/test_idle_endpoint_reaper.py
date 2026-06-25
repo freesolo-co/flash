@@ -168,3 +168,51 @@ def test_instance_providers_configured_gating(monkeypatch):
         "flash.providers.available_providers", lambda: ("hyperstack",), raising=False
     )
     assert app_mod._instance_providers_configured() is True
+
+
+def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
+    """End-to-end through the REAL Lambda + Hyperstack ``sweep_orphans`` (only the provider REST
+    layer is faked): a periodic sweep tears down each provider's leaked instance while the live
+    run's instance — named from the SAME run id the server reports as active — is protected.
+
+    Exercises the full path the lifespan loop runs: ``_sweep_orphan_instances_once`` ->
+    ``configured_providers`` -> ``LambdaProvider/HyperstackProvider.sweep_orphans`` -> the real
+    name<->run matching -> the (faked) terminate call. No ``sweep_orphans`` mock anywhere."""
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs as hs_jobs
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs as lambda_jobs
+    from flash.runner import RunStatus
+
+    # One live run; its instance on each provider is named from this exact run id.
+    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "flash-live"}])
+    monkeypatch.setattr(
+        app_mod, "get_status", lambda rid: RunStatus(run_id="flash-live", state="running", spec={})
+    )
+    # Make both instance providers "configured" so the real ones are dispatched (RunPod absent here).
+    monkeypatch.setattr(
+        "flash.providers.available_providers", lambda: ("lambda", "hyperstack"), raising=False
+    )
+
+    lam_instances = [
+        {"id": "i-live", "name": lambda_jobs.instance_label("flash-live", 0, 0)},  # live -> KEEP
+        {"id": "i-orphan", "name": lambda_jobs.instance_label("flash-dead", 0, 0)},  # leaked -> kill
+        {"id": "i-foreign", "name": "not-ours"},  # never touch
+    ]
+    hs_vms = [
+        {"id": "vm-live", "name": hs_jobs.instance_label("flash-live", 0, 0)},  # live -> KEEP
+        {"id": "vm-orphan", "name": hs_jobs.instance_label("flash-gone", 0, 0)},  # leaked -> kill
+    ]
+    terminated, deleted = [], []
+    monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
+    monkeypatch.setattr(
+        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+    )
+    monkeypatch.setattr(hs_api, "list_vms", lambda: hs_vms)
+    monkeypatch.setattr(hs_api, "delete_vms", lambda ids: deleted.extend(ids) or list(ids))
+
+    torn = app_mod._sweep_orphan_instances_once()
+
+    assert torn == 2  # one Lambda instance + one Hyperstack VM
+    assert terminated == ["i-orphan"]  # leaked reaped, live + foreign untouched
+    assert deleted == ["vm-orphan"]
