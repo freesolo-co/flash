@@ -14,6 +14,8 @@ import pytest
 
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
+    gdn_packing_available,
+    model_is_gdn_hybrid,
     model_is_pure_attention,
     pack_token_ids,
     packing_efficiency,
@@ -69,6 +71,19 @@ def test_sliding_window_excluded(monkeypatch):
     assert model_is_pure_attention("any/sliding") is False
 
 
+def test_global_sliding_window_excluded(monkeypatch):
+    # A globally sliding-window model (no per-layer layer_types) builds its own window; a pre-built
+    # 4D mask would bypass it -> NOT pure. Gate on the ACTIVE flag.
+    _patch_cfg(monkeypatch, types.SimpleNamespace(use_sliding_window=True, sliding_window=4096))
+    assert model_is_pure_attention("any/sliding-global") is False
+
+
+def test_disabled_sliding_window_still_pure(monkeypatch):
+    # Qwen2.5 ships a sliding_window value but keeps it DISABLED -> still full attention -> packs.
+    _patch_cfg(monkeypatch, types.SimpleNamespace(use_sliding_window=False, sliding_window=32768))
+    assert model_is_pure_attention("Qwen/Qwen2.5-7B") is True
+
+
 def test_multimodal_reads_text_config(monkeypatch):
     # Decoder dims live under text_config for VL checkpoints; the probe must look there.
     _patch_cfg(
@@ -86,6 +101,41 @@ def test_probe_failure_is_safe_false(monkeypatch):
 
     monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", boom)
     assert model_is_pure_attention("unreachable/model") is False
+
+
+# --------------------------------------------------------------------- GDN (Qwen3.5/3.6) gate
+def test_gdn_hybrid_detected_by_layer_types(monkeypatch):
+    _patch_cfg(monkeypatch, types.SimpleNamespace(layer_types=["linear_attention", "full_attention"]))
+    assert model_is_gdn_hybrid("Qwen/Qwen3.5-4B") is True
+
+
+def test_gdn_hybrid_detected_by_linear_dims(monkeypatch):
+    _patch_cfg(monkeypatch, types.SimpleNamespace(linear_conv_kernel_dim=4))
+    assert model_is_gdn_hybrid("any/gdn") is True
+
+
+def test_gdn_hybrid_false_for_pure_and_sliding(monkeypatch):
+    _patch_cfg(monkeypatch, types.SimpleNamespace())  # plain dense -> not GDN
+    assert model_is_gdn_hybrid("any/dense") is False
+    _patch_cfg(monkeypatch, types.SimpleNamespace(layer_types=["sliding_attention", "full_attention"]))
+    assert model_is_gdn_hybrid("any/sliding") is False  # sliding != linear_attention
+
+
+def test_gdn_packing_available_requires_both_kernels(monkeypatch):
+    import transformers.utils.import_utils as iu
+
+    def setk(fla, conv):
+        monkeypatch.setattr(iu, "is_flash_linear_attention_available", lambda: fla, raising=False)
+        monkeypatch.setattr(iu, "is_causal_conv1d_available", lambda: conv, raising=False)
+
+    setk(True, True)
+    assert gdn_packing_available() is True
+    setk(True, False)  # conv missing -> conv leaks across boundaries
+    assert gdn_packing_available() is False
+    setk(False, True)  # fla missing -> recurrence leaks across boundaries
+    assert gdn_packing_available() is False
+    setk(False, False)
+    assert gdn_packing_available() is False
 
 
 # --------------------------------------------------------------------------- bin packer
@@ -154,6 +204,32 @@ def test_collator_pads_and_masks_pad_no_nan_rows():
     assert batch["labels"][0, 3:].tolist() == [-100] * 5
     # no query row is entirely False (would NaN the softmax): every row attends >= itself
     assert batch["attention_mask"][0, 0].any(dim=-1).all().item() is True
+
+
+def test_collator_emit_varlen_kwargs():
+    torch = pytest.importorskip("torch")
+    col = BlockDiagonalCollator(pad_token_id=0, emit_varlen=True)
+    batch = col([{"input_ids": [5, 6, 7, 8, 9], "seq_lengths": [3, 2]}])
+    # varlen kwargs for the GDN linear-attention layers
+    assert batch["cu_seq_lens_q"].tolist() == [0, 3, 5]
+    assert batch["cu_seq_lens_k"].tolist() == [0, 3, 5]
+    assert batch["cu_seq_lens_q"].dtype == torch.int32
+    assert batch["max_length_q"] == 3
+    assert batch["max_length_k"] == 3
+    assert batch["seq_idx"].tolist() == [[0, 0, 0, 1, 1]]
+    assert batch["seq_idx"].dtype == torch.int32
+    # no padding on the varlen path (cu_seqlens must cover the whole row)
+    assert batch["input_ids"].shape == (1, 5)
+    # still emits the 4D mask + position_ids + labels
+    assert batch["attention_mask"].shape == (1, 1, 5, 5)
+    assert batch["position_ids"][0].tolist() == [0, 1, 2, 0, 1]
+
+
+def test_collator_emit_varlen_requires_bsz_one():
+    pytest.importorskip("torch")
+    col = BlockDiagonalCollator(pad_token_id=0, emit_varlen=True)
+    with pytest.raises(ValueError, match="batch_size == 1"):
+        col([{"input_ids": [1, 2], "seq_lengths": [2]}, {"input_ids": [3, 4], "seq_lengths": [2]}])
 
 
 # --------------------------------------------------------------------------- the gold test

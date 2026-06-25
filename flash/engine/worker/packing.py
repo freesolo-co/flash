@@ -67,9 +67,57 @@ def model_is_pure_attention(model_id: str) -> bool:
         for attr in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim"):
             if getattr(cfg, attr, None):
                 return False
-        return True
+        # A GLOBALLY sliding-window model (no per-layer layer_types, e.g. some Mistral/Qwen configs)
+        # applies a window the model builds itself — a pre-built 4D mask BYPASSES it (wrong
+        # semantics), so it is NOT pure. Gate on the ACTIVE flag (use_sliding_window=True), not on
+        # sliding_window merely being set: Qwen2.5 ships a sliding_window value but keeps it DISABLED
+        # (use_sliding_window=False), and must still pack.
+        return not getattr(cfg, "use_sliding_window", False)
     except Exception as e:  # network/parse/arch failure -> do NOT pack (boundary-safe default)
         print(f"[pack] pure-attention probe failed for {model_id!r} (treating as NOT pure): {e}")
+        return False
+
+
+def model_is_gdn_hybrid(model_id: str) -> bool:
+    """True for a GatedDeltaNet *hybrid* (Qwen3.5/3.6): the config interleaves ``"linear_attention"``
+    layers with full attention. These need the varlen GDN path (cu_seqlens + seq_idx) to pack
+    boundary-correctly — a 4D mask alone can't reset their recurrent/conv state. Distinct from the
+    sliding-window case (also non-pure, but NOT packable this way). Config-only; safe-False on error.
+    """
+    try:
+        from transformers import AutoConfig
+
+        cfg = _text_config(AutoConfig.from_pretrained(model_id, trust_remote_code=True))
+        layer_types = getattr(cfg, "layer_types", None)
+        if layer_types and any(t == "linear_attention" for t in layer_types):
+            return True
+        # No layer_types but linear-attn dims declared -> still a GDN hybrid.
+        return any(
+            getattr(cfg, a, None)
+            for a in ("linear_num_key_heads", "linear_key_head_dim", "linear_conv_kernel_dim")
+        )
+    except Exception as e:
+        print(f"[pack] gdn-hybrid probe failed for {model_id!r} (treating as NOT gdn): {e}")
+        return False
+
+
+def gdn_packing_available() -> bool:
+    """True only when BOTH varlen kernels a GatedDeltaNet hybrid needs to pack boundary-correctly are
+    importable: ``flash-linear-attention`` (resets the DeltaNet recurrence via ``cu_seqlens`` — the
+    pure-torch fallback IGNORES it) AND ``causal_conv1d`` (resets the short causal conv via
+    ``seq_idx``). Without both, a packed GDN run would cross-contaminate across example boundaries,
+    so packing must stay off. GPU-validated (RTX 5090, Qwen3.5-0.8B): with both present, a packed
+    example's outputs are byte-identical regardless of its neighbors' content (zero information
+    leakage); the only difference vs unpacked is benign bf16 kernel-tiling numerics (~0.3 on logits,
+    the same order as flash-attn-vs-SDPA drift)."""
+    try:
+        from transformers.utils.import_utils import (
+            is_causal_conv1d_available,
+            is_flash_linear_attention_available,
+        )
+
+        return bool(is_flash_linear_attention_available() and is_causal_conv1d_available())
+    except Exception:
         return False
 
 
@@ -130,11 +178,19 @@ class BlockDiagonalCollator:
         pad set to -100.
 
     ``pad_to_multiple_of`` rounds T up (tensor-core friendliness); the extra positions are pad.
+
+    ``emit_varlen`` (GatedDeltaNet hybrids, e.g. Qwen3.5/3.6): additionally emit ``cu_seq_lens_q/k``
+    (resets the DeltaNet recurrence per example in the fla kernel) and ``seq_idx`` (resets the causal
+    conv in causal_conv1d) so the LINEAR-attention layers are boundary-correct too — the 4D mask only
+    fixes the full-attention layers. This path requires ``per_device_train_batch_size == 1`` (one
+    packed block per step; cu_seqlens spans that block) and does NOT pad (cu_seqlens must cover the
+    whole row), so set ``pad_to_multiple_of`` irrelevant here.
     """
 
     pad_token_id: int
     label_pad_token_id: int = -100
     pad_to_multiple_of: int = 8
+    emit_varlen: bool = False
 
     def __call__(self, features: list[dict]) -> dict:
         import torch
@@ -142,9 +198,13 @@ class BlockDiagonalCollator:
         rows = [list(f["input_ids"]) for f in features]
         seglens = [list(f["seq_lengths"]) for f in features]
         bsz = len(rows)
+        if self.emit_varlen and bsz != 1:
+            raise ValueError("emit_varlen packing requires per_device_train_batch_size == 1")
         longest = max((len(r) for r in rows), default=0)
         m = self.pad_to_multiple_of
-        total = ((longest + m - 1) // m) * m if m and m > 1 else longest
+        # No padding on the varlen path: cu_seqlens must cover the whole sequence (a trailing pad
+        # region not spanned by cu_seqlens would break the fla varlen kernel).
+        total = longest if self.emit_varlen else (((longest + m - 1) // m) * m if m and m > 1 else longest)
         total = max(total, 1)
 
         input_ids = torch.full((bsz, total), self.pad_token_id, dtype=torch.long)
@@ -177,9 +237,23 @@ class BlockDiagonalCollator:
         labels[seg < 0] = self.label_pad_token_id
         labels[position_ids == 0] = self.label_pad_token_id
 
-        return {
+        batch = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "labels": labels,
         }
+        if self.emit_varlen:
+            # bsz == 1 (asserted above): cu_seqlens covers this one block's examples, and seq_idx is
+            # the per-token segment id (no pad on this path, so seg has no -1). These reach the
+            # linear-attention layers via model(**batch) -> the fla chunk kernel (cu_seq_lens_q) and
+            # causal_conv1d (seq_idx), resetting their state at each example boundary.
+            lens = seglens[0]
+            cu = torch.zeros(len(lens) + 1, dtype=torch.int32)
+            cu[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
+            batch["cu_seq_lens_q"] = cu
+            batch["cu_seq_lens_k"] = cu
+            batch["max_length_q"] = int(max(lens))
+            batch["max_length_k"] = int(max(lens))
+            batch["seq_idx"] = seg.to(torch.int32)  # [1, T], non-negative (no pad on this path)
+        return batch

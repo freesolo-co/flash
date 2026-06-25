@@ -65,6 +65,8 @@ from flash.engine.worker.lora import (
 )
 from flash.engine.worker.packing import (
     BlockDiagonalCollator,
+    gdn_packing_available,
+    model_is_gdn_hybrid,
     model_is_pure_attention,
     pack_token_ids,
     packing_efficiency,
@@ -945,10 +947,23 @@ def run_sft():
     # packing is ON then (varlen keeps 'bfd' example boundaries correct). If the best-effort install
     # failed, _fa_ok is False and we SKIP packing — without a boundary-correct attn backend examples
     # would cross-contaminate under SDPA.
+    # Pure full-attention vs GatedDeltaNet hybrid (Qwen3.5/3.6) — probed ONCE here and reused across
+    # the whole packing decision (each probe reads the cached HF config). TRL 'bfd' packing keeps
+    # example boundaries via position_ids that a varlen attn honors, but it provides NO seq_idx, so it
+    # can't reset a GDN hybrid's causal conv -> bfd-packing a GDN model silently cross-contaminates its
+    # linear-attention layers. So bfd is enabled for PURE full-attention models only; GDN hybrids pack
+    # via the cu_seqlens/seq_idx varlen collator branch below (when their kernels are present).
+    _pure_attn = model_is_pure_attention(model_id)
+    _gdn = model_is_gdn_hybrid(model_id)
     _fa_ok = _flash_attn_available()
-    if _fa_ok:
+    if _fa_ok and _pure_attn:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
+    elif _fa_ok and _gdn:
+        print(
+            "[sft] TRL bfd packing NOT used for the GatedDeltaNet hybrid (bfd can't reset the conv); "
+            "the cu_seqlens/seq_idx varlen collator handles its packing when both kernels are present."
+        )
     else:
         print(
             "[sft] packing SKIPPED: flash_attn not importable (best-effort image build failed) "
@@ -988,15 +1003,19 @@ def run_sft():
     # into max_length blocks and feed a 4D block-diagonal causal mask SDPA honors natively, so
     # packed examples never attend across boundaries (boundary-correct, bit-identical to unpacked —
     # verified on a tiny Qwen3/Llama: max|packed-separate| logits == 0.0). This reclaims the packing
-    # throughput win on the default GPU with neither flash-attn nor flex_attention. Hybrid
-    # GatedDeltaNet models (Qwen3.5/3.6) are excluded by model_is_pure_attention — their
-    # linear-attention layers carry recurrent/conv state across boundaries a mask cannot reset.
+    # throughput win on the default GPU with neither flash-attn nor flex_attention. GatedDeltaNet
+    # hybrids (Qwen3.5/3.6) take the NEXT branch instead — a mask alone can't reset their linear-
+    # attention state, so they also need the cu_seqlens/seq_idx varlen kwargs.
     _collator = None
-    _pure_attn = model_is_pure_attention(model_id)
     _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn)
     if _sdpa_pack:
-        # The 4D mask is consumed by SDPA (a varlen flash kernel would ignore it) -> pin SDPA.
-        _attn = _attn or "sdpa"
+        # The 4D mask requires a MASK-READING attn (SDPA). DOWNGRADE any flash impl optimal_attn_impl
+        # picked — e.g. FA3 on a Hopper worker whose FA2 wheel didn't build — to SDPA: a flash varlen
+        # kernel SILENTLY IGNORES the 4D mask, so packed examples would attend across boundaries. (A
+        # bare ``_attn or "sdpa"`` would leave the truthy flash string in place — the bug this avoids.)
+        if _attn in ("flash_attention_2", "flash_attention_3"):
+            print(f"[sft] packing under SDPA: downgrading {_attn} -> sdpa (a flash kernel ignores the 4D mask)")
+        _attn = "sdpa"
         cfg_kwargs["packing"] = False  # we own the packing; TRL must not also pack
         # Hand TRL pre-tokenized, pre-packed rows + our collator: skip its dataset prep and stop the
         # signature-based column pruning from dropping our seq_lengths column before collation.
@@ -1004,6 +1023,18 @@ def run_sft():
         _dk["skip_prepare_dataset"] = True
         cfg_kwargs["dataset_kwargs"] = _dk
         cfg_kwargs["remove_unused_columns"] = False
+        # Each packed row is a FULL max_length block (not a short example) + a dense [B,1,T,T] mask, so
+        # the unpacked micro-batch sizing (assumes short rows) can OOM the [pd, max_length, vocab] fp32
+        # logits. Re-size per-device for the full-block logits budget — a no-op when Liger's fused CE
+        # is on (no logits materialized -> per_device stays at the default).
+        from flash.catalog import vocab_size_for
+
+        _pd_pack, _ga_pack = sft_grad_accum(
+            effective_batch, seq_len=sft_max_len, vocab=vocab_size_for(model_id),
+            fused=bool(cfg_kwargs.get("use_liger_kernel")),
+        )
+        cfg_kwargs["per_device_train_batch_size"] = _pd_pack
+        cfg_kwargs["gradient_accumulation_steps"] = _ga_pack
         # Pre-tokenize the already chat-templated texts (the template carries its own special tokens
         # -> add_special_tokens=False to avoid a double BOS) and bin-pack into <= max_length blocks.
         _tokenized = [tok(t["text"], add_special_tokens=False)["input_ids"] for t in texts]
@@ -1016,12 +1047,45 @@ def run_sft():
             f"({packing_efficiency(_packed_rows, sft_max_len):.0%} dense); "
             "no flash-attn / no flex_attention required"
         )
-    elif not cfg_kwargs.get("packing") and not _pure_attn:
+    elif not cfg_kwargs.get("packing") and _gdn and gdn_packing_available():
+        # GatedDeltaNet hybrid (Qwen3.5/3.6, flash's flagship tier): the 4D block-diagonal mask makes
+        # the FULL-attention layers boundary-correct, and the linear-attention (DeltaNet) layers reset
+        # their recurrence + causal conv at example boundaries via cu_seq_lens_q (fla kernel) + seq_idx
+        # (causal_conv1d). GPU-validated on Qwen3.5-0.8B (RTX 5090): a packed example's output is
+        # byte-identical regardless of its neighbors' content (ZERO cross-example leakage); the only
+        # diff vs unpacked is benign bf16 GDN-kernel tiling numerics (~0.3 on logits). Gated on BOTH
+        # kernels being importable (gdn_packing_available) so a worker without them stays unpacked.
+        # Pin SDPA for the full-attn layers (downgrade any flash impl, e.g. FA3 on Hopper — it would
+        # ignore the 4D mask); the DeltaNet layers are unaffected (they use cu_seqlens/seq_idx).
+        if _attn in ("flash_attention_2", "flash_attention_3"):
+            print(f"[sft] GDN packing under SDPA: downgrading {_attn} -> sdpa for the full-attn layers")
+        _attn = "sdpa"
+        cfg_kwargs["packing"] = False
+        _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
+        _dk["skip_prepare_dataset"] = True
+        cfg_kwargs["dataset_kwargs"] = _dk
+        cfg_kwargs["remove_unused_columns"] = False
+        # cu_seqlens spans ONE packed block, so the per-device batch must be a single block; fold the
+        # effective batch into grad-accumulation instead.
+        cfg_kwargs["per_device_train_batch_size"] = 1
+        cfg_kwargs["gradient_accumulation_steps"] = max(1, per_device_bs * grad_accum)
+        _tokenized = [tok(t["text"], add_special_tokens=False)["input_ids"] for t in texts]
+        _packed_rows = pack_token_ids(_tokenized, sft_max_len)
+        ds = Dataset.from_list(_packed_rows)
+        _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
         print(
-            "[sft] packing stays OFF: hybrid/linear-attention arch (GatedDeltaNet) — a block-"
-            "diagonal mask cannot reset its cross-boundary recurrent/conv state (needs the "
-            "cu_seqlens/seq_idx path). Pure full-attention models pack via the SDPA mask."
+            "[sft] true token packing ENABLED for GatedDeltaNet hybrid (4D mask + cu_seqlens/seq_idx "
+            f"varlen): {len(_tokenized)} examples -> {len(_packed_rows)} blocks of <= {sft_max_len} "
+            f"tok ({packing_efficiency(_packed_rows, sft_max_len):.0%} dense); per_device_bs forced "
+            "to 1 (cu_seqlens spans one block), effective batch via grad-accum"
         )
+    elif not cfg_kwargs.get("packing") and not _pure_attn:
+        _why = (
+            "hybrid GatedDeltaNet but the fla/causal_conv1d varlen kernels aren't both importable"
+            if _gdn
+            else "non-full-attention arch (e.g. sliding-window) a block-diagonal mask can't pack"
+        )
+        print(f"[sft] packing stays OFF: {_why}. (Pure full-attention models pack via the SDPA mask.)")
     # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
     # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
     # accelerate-offload large models to meta ("expected device meta but got

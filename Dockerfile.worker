@@ -93,6 +93,20 @@ RUN if [ -n "${FLASH_ATTN_3_SPEC}" ]; then \
       || echo "flash-attn-3: install failed -> SDPA fallback on Hopper"; \
     else echo "flash-attn-3: skipped (FLASH_ATTN_3_SPEC unset) -> SDPA on Hopper"; fi
 
+# causal_conv1d: the short depthwise causal conv kernel whose ``seq_idx`` arg resets the conv at
+# example boundaries. Together with fla's ``cu_seqlens`` (which resets the DeltaNet recurrence) it
+# lets the GatedDeltaNet hybrids (Qwen3.5/3.6) PACK boundary-correctly — a 4D block-diagonal mask
+# alone only fixes the full-attention layers (engine.worker.packing.gdn_packing_available gates the
+# SFT packing path on this import). GPU-validated (RTX 5090, Qwen3.5-0.8B): a packed example's output
+# is byte-identical regardless of its neighbors' content (zero cross-example leakage). Best-effort
+# source build (small + fast vs flash-attn); on failure GDN packing simply stays off and Qwen3.5/3.6
+# train UNPACKED as before — no correctness risk. Arch-bounded to the catalog GPUs to cap build time.
+RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+    pip install --no-cache-dir causal-conv1d --no-build-isolation \
+    && python -c "import causal_conv1d; print('causal_conv1d: import OK')" \
+    && echo "causal_conv1d: installed (GDN packing enabled)" \
+    || echo "causal_conv1d: build failed -> GDN packing stays off (Qwen3.5/3.6 train unpacked)"
+
 # Kernel JIT caches are NOT baked here, on purpose. The fused Triton (Liger/fla/chalk),
 # TorchInductor, and Hopper tilelang kernels the trainer builds on first use are
 # content-addressed by GPU ARCH + toolchain version, so they can only be compiled on a real
