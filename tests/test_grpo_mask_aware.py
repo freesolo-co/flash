@@ -1,9 +1,15 @@
 """CPU test for the mask-aware lm_head patch (skip masked completion positions in the GRPO loss).
 
-Verifies the wrapper is EXACTLY loss-preserving and that every per-token tensor is gathered with one
+Verifies the wrapper is loss-preserving and that every per-token tensor is gathered with one
 consistent index (a misaligned gather would change the loss), using a fake ``liger_grpo_loss`` whose
 loss depends on all per-token inputs the way TRL's dr_grpo does (numerator = sum over UNMASKED
 positions; normalizer = a constant independent of the sequence length).
+
+"Loss-preserving" is exact in the MATH (the gathered numerator sums exactly the same unmasked terms;
+the masked positions it drops contributed zero) but not bit-for-bit: reducing the gathered ``(B, T')``
+tensor visits elements in a different order than the full ``(B, T)`` one, so the float32 result can
+differ by ~1e-6. The ``assert_close`` tolerances are far below that-vs-a-misaligned-gather gap (a
+wrong index diverges by O(1)), so they still fail loudly on any real misalignment.
 """
 
 from __future__ import annotations
@@ -74,7 +80,7 @@ def test_mask_aware_lm_head_is_loss_preserving_and_aligned():
     assert rec_masked["ratio_T"] == 4  # the 2-D vllm_is_ratio was gathered with the SAME index
     # exactly loss-preserving — and since the numerator uses sel/_input/old/ref, this only holds if
     # every per-token tensor was gathered with the SAME index (a misaligned gather would diverge).
-    assert torch.allclose(loss_full, loss_masked)
+    torch.testing.assert_close(loss_masked, loss_full, rtol=1e-5, atol=1e-5)
     assert "reward" in metrics  # passes through the loss object's metrics dict
 
 
@@ -90,6 +96,20 @@ def test_mask_aware_lm_head_noop_when_nothing_masked():
     assert rec["T"] == 6  # untouched (no gather)
 
 
+def test_mask_aware_lm_head_bails_on_unknown_per_token_tensor():
+    # If TRL/Liger passes a NEW per-token tensor (B, T) the wrapper doesn't know to gather, gathering
+    # the rest to T' while leaving it full-length would misalign — so the wrapper must bail to the
+    # stock loss (full length) instead. The fake records selected_token_ids' length to detect this.
+    rec = {}
+    kw = _inputs()
+    kw["some_future_per_token"] = torch.randn(2, 6)  # (B, T), not in the known gather set
+    trainer = _FakeTrainer()
+    trainer.liger_grpo_loss = _make_fake_loss(rec)
+    patch_grpo_mask_aware_lm_head(trainer)
+    trainer.liger_grpo_loss(**kw)
+    assert rec["T"] == 6  # bailed to stock (no gather), so the fake saw the full length
+
+
 def test_mask_aware_lm_head_single_turn_padding():
     # Single-turn GRPO has no tool_mask, but completions are padded to the batch max -> the
     # completion_mask carries trailing right-padding zeros. The patch must skip those too, still
@@ -103,7 +123,7 @@ def test_mask_aware_lm_head_single_turn_padding():
     patch_grpo_mask_aware_lm_head(trainer)
     loss_masked, _ = trainer.liger_grpo_loss(**kw)
     assert rec_masked["T"] == 5  # gathered to the deepest real length (skips padding)
-    assert torch.allclose(loss_full, loss_masked)  # exactly loss-preserving for single-turn padding
+    torch.testing.assert_close(loss_masked, loss_full, rtol=1e-5, atol=1e-5)
 
 
 def test_mask_aware_lm_head_returns_false_without_loss_object():

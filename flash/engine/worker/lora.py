@@ -231,15 +231,17 @@ def patch_vllm_lm_weight_sync(model_id: str) -> bool:
 def patch_grpo_mask_aware_lm_head(trainer) -> bool:
     """Skip the 248k-vocab ``lm_head`` projection at MASKED completion positions in the GRPO loss.
 
-    Applies to ALL GRPO. In MULTI-TURN the masked set is the env/tool text (~half-to-most of the
-    transcript: the rollout's ``env_mask`` -> TRL's ``tool_mask``) plus right-padding; in SINGLE-TURN
-    it is the right-PADDING alone (GRPO samples variable-length completions, padded to the batch max,
-    so shorter ones carry masked padding). TRL 1.6's ``compute_liger_loss`` hands the FULL-length
-    hidden states to ``liger_grpo_loss``, and the Liger kernel runs the lm_head matmul + log-softmax
-    for EVERY position (in the forward AND the backward recompute). Masked positions contribute zero
-    loss and zero gradient but still pay the full FLOPs of the single most expensive GRPO op (the
-    248k-vocab projection Liger exists to tame). The saving scales with the masked fraction (env mask
-    + padding for multi-turn; completion-length variance for single-turn).
+    Targets MULTI-TURN GRPO, where the masked set is the env/tool text (~half-to-most of the
+    transcript: the rollout's ``env_mask`` -> TRL's ``tool_mask``) that EVERY row carries, so the
+    micro-batch has maskable headroom in all rows. TRL 1.6's ``compute_liger_loss`` hands the
+    FULL-length hidden states to ``liger_grpo_loss``, and the Liger kernel runs the lm_head matmul +
+    log-softmax for EVERY position (in the forward AND the backward recompute). Masked positions
+    contribute zero loss and zero gradient but still pay the full FLOPs of the single most expensive
+    GRPO op (the 248k-vocab projection Liger exists to tame). The saving scales with the env-masked
+    fraction. (SINGLE-TURN is effectively a no-op: its only mask is right-padding, and TRL pads
+    completions to the LONGEST in the micro-batch, so the deepest row has ``keep.sum() == full_t`` and
+    the across-batch no-op below triggers — there is no shared headroom to gather. It would engage
+    only if ``pad_to_multiple_of`` padded every row past the longest completion.)
 
     Wrap ``trainer.liger_grpo_loss`` to GATHER the unmasked positions — ONE shared index applied
     identically to every per-token tensor (``_input``, ``selected_token_ids``, ``attention_mask``,
@@ -250,8 +252,9 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
     (a config constant on the loss object, independent of the gathered length); the gathered
     sequence is re-padded with masked positions whose new mask is 0, so loss + credit assignment are
     unchanged while the gathered length T' < T cuts the projection FLOPs by ~the masked fraction.
-    No-op when nothing is masked (single-turn / full mask) or the loss object isn't present. Returns
-    True if wrapped."""
+    No-op when the deepest row is full-length (``max(unmasked) == T`` — e.g. single-turn padded to the
+    batch max), when nothing is masked at all, or when the loss object isn't present. Returns True if
+    wrapped."""
     orig = getattr(trainer, "liger_grpo_loss", None)
     if orig is None:
         return False
@@ -274,7 +277,20 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
         full_t = mask.size(1)
         tprime = int(keep.sum(dim=1).max().item())
         if tprime == 0 or tprime == full_t:
-            return orig(**kwargs)  # nothing maskable to skip
+            # Nothing maskable to skip across the batch: the DEEPEST row is full-length (max unmasked
+            # == T). Standard single-turn vLLM GRPO pads completions to the longest in the micro-batch,
+            # so this is its common case — the patch only engages where every row has masked headroom.
+            return orig(**kwargs)
+        # Defensive: we gather a KNOWN set of per-token tensors below. If TRL/Liger starts passing any
+        # OTHER per-token tensor shaped (B, T[, *]), it would stay full-length while the rest are
+        # gathered to T' -> a shape mismatch or misaligned credit. Bail to the unmodified loss instead.
+        # (Per-sequence ``advantages`` is (B,) and 2-D ``vllm_is_ratio`` is handled explicitly below.)
+        _known = {"attention_mask", "_input", "selected_token_ids", "old_per_token_logps",
+                  "ref_per_token_logps", "vllm_is_ratio"}
+        for _k, _v in kwargs.items():
+            if (_k not in _known and isinstance(_v, torch.Tensor) and _v.dim() >= 2
+                    and _v.size(0) == mask.size(0) and _v.size(1) == full_t):
+                return orig(**kwargs)  # unknown per-token tensor -> don't risk a misaligned gather
         # One shared gather index: the unmasked positions first (stable argsort -> their original
         # order preserved), then the remaining masked positions in original order. Keep only the
         # first tprime columns; a sequence with fewer than tprime unmasked positions has its filler
