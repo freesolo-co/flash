@@ -280,7 +280,13 @@ def _urlopen(
                 return resp.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
-            is_rate_limit = exc.code == 429 or (exc.code == 403 and "rate limit" in body.lower())
+            # GitHub signals an exhausted primary limit with a 403 + `X-RateLimit-Remaining: 0`
+            # header; the body may be empty or omit the phrase "rate limit", so check the header too
+            # rather than relying on substring matching alone. Secondary (abuse) limits come back 429.
+            remaining = (exc.headers.get("X-RateLimit-Remaining") if exc.headers else None) or ""
+            is_rate_limit = exc.code == 429 or (
+                exc.code == 403 and (remaining.strip() == "0" or "rate limit" in body.lower())
+            )
             if is_rate_limit and attempt < max_rate_limit_retries:
                 delay = max(_RATE_LIMIT_BASE_DELAY, min(45.0, _RATE_LIMIT_BASE_DELAY * (attempt + 1) * random.uniform(0.5, 1.5)))
                 time.sleep(delay)
