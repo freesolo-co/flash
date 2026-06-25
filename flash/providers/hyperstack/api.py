@@ -323,7 +323,11 @@ def list_vms() -> list[dict]:
     out: list[dict] = []
     seen_ids: set[str] = set()
     terminated = False
-    for page in range(1, _VM_MAX_PAGES + 1):
+    # Walk one page PAST the cap so a fleet that's an exact multiple of _VM_PAGE_SIZE can be CONFIRMED
+    # complete: its last in-cap page is full, so the only way to tell "complete (next page empty)"
+    # from "truncated (next page still has VMs)" is to fetch that extra probe page. The probe is
+    # gated below to fire ONLY at the cap boundary, so the normal walk still stops at _VM_MAX_PAGES.
+    for page in range(1, _VM_MAX_PAGES + 2):
         resp = request_with_retries(
             f"/core/virtual-machines?page={page}&per_page={_VM_PAGE_SIZE}"
         )
@@ -339,7 +343,7 @@ def list_vms() -> list[dict]:
         insts = resp["instances"]
         if not insts:
             terminated = True
-            break  # valid empty page -> done paginating
+            break  # valid empty page -> done paginating (incl. the boundary probe confirming complete)
         added = 0
         for v in insts:
             # De-dupe across pages: an older API that ignores the ``page`` param would echo page 1
@@ -356,17 +360,24 @@ def list_vms() -> list[dict]:
         if len(insts) < _VM_PAGE_SIZE or added == 0:
             terminated = True
             break
+        # A FULL page that added new VMs and we've now consumed the cap (page == _VM_MAX_PAGES): the
+        # fleet might be exactly a multiple of the page size (complete) OR genuinely larger
+        # (truncated). DON'T raise yet — let the loop fetch ONE more page (_VM_MAX_PAGES + 1) as a
+        # probe: if it comes back empty, the break above marks ``terminated`` and we return the full
+        # fleet; if it still has VMs, the fleet is genuinely over-cap and we raise below.
     if not terminated:
-        # The loop fell off the page cap while the LAST fetched page was still FULL — pagination did
-        # not naturally terminate, so more VMs almost certainly exist past _VM_MAX_PAGES. Returning
-        # ``out`` here would hand back a truncated fleet as if authoritative, and an orphan sweep /
-        # run-terminate keying off it would miss (or fail to reap) still-billing VMs. Surface it as a
-        # HyperstackApiError instead — same as the malformed-page guard above — so the incomplete
-        # list never masquerades as the complete one.
+        # The boundary probe page (_VM_MAX_PAGES + 1) ALSO came back full — pagination did not
+        # terminate within the cap and there are genuinely more VMs past it. Returning ``out`` here
+        # would hand back a truncated fleet as if authoritative, and an orphan sweep / run-terminate
+        # keying off it would miss (or fail to reap) still-billing VMs. Surface it as a
+        # HyperstackApiError — same as the malformed-page guard above — so the incomplete list never
+        # masquerades as the complete one. (An exact-multiple fleet whose probe page was empty
+        # already returned normally above and does NOT reach here.)
         raise HyperstackApiError(
             f"/core/virtual-machines pagination did not terminate within {_VM_MAX_PAGES} pages "
-            f"(last page was full at {_VM_PAGE_SIZE}/page, {len(out)} VMs collected) — refusing to "
-            f"return a truncated fleet that an orphan sweep could read as authoritative"
+            f"(the page past the cap was still full at {_VM_PAGE_SIZE}/page, {len(out)} VMs "
+            f"collected) — refusing to return a truncated fleet that an orphan sweep could read as "
+            f"authoritative"
         )
     return out
 

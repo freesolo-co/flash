@@ -662,14 +662,15 @@ def test_list_vms_empty_page_one_is_valid_not_an_error(monkeypatch):
 
 
 def test_list_vms_raises_when_page_cap_hit_with_full_last_page(monkeypatch):
-    """Pagination that never naturally terminates (every page full, NEW ids, up to _VM_MAX_PAGES)
-    must RAISE rather than return a truncated fleet — an orphan sweep keying off a partial list
-    would miss still-billing VMs past the cap."""
+    """A GENUINELY-truncated fleet (every page full of NEW ids, AND the page past the cap is STILL
+    full) must RAISE rather than return a truncated fleet — an orphan sweep keying off a partial
+    list would miss still-billing VMs past the cap."""
     from flash.providers.hyperstack import api as hs_api
 
     page_size = hs_api._VM_PAGE_SIZE
-    # Lower the cap so the test is cheap; each page is full AND adds brand-new ids, so none of the
-    # natural-termination conditions (short page / empty page / no-new-ids) ever fire.
+    # Lower the cap so the test is cheap; every page (incl. the cap+1 probe) is full AND adds
+    # brand-new ids, so none of the natural-termination conditions ever fire and the probe confirms
+    # the fleet is genuinely over-cap.
     monkeypatch.setattr(hs_api, "_VM_MAX_PAGES", 3)
 
     def fake_req(path, **k):
@@ -680,6 +681,38 @@ def test_list_vms_raises_when_page_cap_hit_with_full_last_page(monkeypatch):
     monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
     with pytest.raises(hs_api.HyperstackApiError, match="did not terminate"):
         hs_api.list_vms()
+
+
+def test_list_vms_exact_multiple_of_page_size_at_cap_does_not_raise(monkeypatch):
+    """A COMPLETE fleet whose size is an exact multiple of _VM_PAGE_SIZE and exactly fills
+    _VM_MAX_PAGES must NOT be mistaken for a truncated one: the last in-cap page is full, but the
+    probe page (_VM_MAX_PAGES + 1) comes back EMPTY -> the fleet is complete, return it WITHOUT
+    raising. (Regression for the exact-multiple edge case in the page-cap guard.)"""
+    from flash.providers.hyperstack import api as hs_api
+
+    page_size = hs_api._VM_PAGE_SIZE
+    cap = 2
+    monkeypatch.setattr(hs_api, "_VM_MAX_PAGES", cap)
+    seen_pages = []
+    total = cap * page_size  # exactly fills `cap` full pages, then page cap+1 is empty
+
+    def fake_req(path, **k):
+        page = int(path.split("page=")[1].split("&")[0])
+        seen_pages.append(page)
+        base = (page - 1) * page_size
+        # Pages 1..cap are full of distinct ids; the cap+1 probe page is genuinely empty.
+        items = [
+            {"id": base + i, "name": f"flash-r-s0-a0-{base + i}"}
+            for i in range(page_size)
+            if base + i < total
+        ]
+        return {"instances": items}
+
+    monkeypatch.setattr(hs_api, "request_with_retries", fake_req)
+    vms = hs_api.list_vms()  # must NOT raise
+    assert len(vms) == total  # whole fleet returned, nothing dropped
+    # Walked the cap pages plus exactly ONE probe page (cap+1) that confirmed completeness.
+    assert seen_pages == [1, 2, 3]
 
 
 # ---------------------------------------------------------------------------
