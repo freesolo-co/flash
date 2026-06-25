@@ -525,7 +525,7 @@ def heartbeat(stage: str, **kw):
     # diagnostic so the control plane / logs show which region a run hit (the eager weight-cache fleet
     # already has a volume in every storage DC). Empty/absent on non-RunPod (instance) workers and
     # harmless; only emitted when present.
-    _dc = os.environ.get("RUNPOD_DC_ID") or os.environ.get("RUNPOD_DATACENTER_ID") or ""
+    _dc = os.environ.get("RUNPOD_DC_ID") or ""
     if _dc:
         payload.setdefault("dc", _dc)
     os.makedirs("/tmp/hb", exist_ok=True)
