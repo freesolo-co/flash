@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 
 
@@ -345,8 +346,21 @@ def rollout_batch(
                 active_env=active_env, env_glue=env_glue, max_turns=max_turns,
             )
 
-    # Score with the ACTUAL accumulated rollout state (matches rollout_one).
-    return [r.result(float(active_env.reward("", r.example, r.state))) for r in rollouts]
+    # Score with the ACTUAL accumulated rollout state (matches rollout_one). The per-rollout reward is
+    # frequently an IO-bound call (an LLM-judge or tool round-trip), so score the batch CONCURRENTLY:
+    # the calls release the GIL on network/subprocess I/O and overlap, collapsing N serial GPU-idle
+    # round-trips into ~one. ``pool.map`` reassembles results in INPUT ORDER, so for any pure reward
+    # fn (the verifiers convention — ``reward`` reads only its own example+state) this is identical to
+    # the serial scoring; only the wall time differs. Compute-bound rewards see no change. A single
+    # rollout skips the pool.
+    def _score(r: _RolloutState) -> float:
+        return float(active_env.reward("", r.example, r.state))
+
+    if len(rollouts) <= 1:
+        return [r.result(_score(r)) for r in rollouts]
+    with ThreadPoolExecutor(max_workers=min(16, len(rollouts))) as pool:
+        scores = list(pool.map(_score, rollouts))
+    return [r.result(s) for r, s in zip(rollouts, scores, strict=True)]
 
 
 def render_message_ids(tok, messages, add_generation_prompt: bool, *, thinking: bool) -> list[int]:

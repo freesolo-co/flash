@@ -185,6 +185,31 @@ def test_rollout_batch_preserves_input_order_and_count():
     assert [r["reward"] for r in out] == [2.0, 1.0, 1.0, 3.0]
 
 
+def test_rollout_batch_scores_rewards_concurrently():
+    """The per-rollout reward (often an IO-bound judge/tool round-trip) is scored CONCURRENTLY:
+    results stay correct + in INPUT ORDER, and N slow rewards take ~1x (not Nx) the per-call latency."""
+    import time
+
+    class _SlowRewardEnv(_VarTurnEnv):
+        def reward(self, completion, example, state=None):
+            time.sleep(0.2)  # stand in for an IO-bound judge/tool round-trip (releases the GIL)
+            return float(example["rid"])  # per-rollout id -> proves order survives the pool
+
+    def batched(prefixes, max_tokens_list):
+        return [_det_generate(p, m) for p, m in zip(prefixes, max_tokens_list, strict=True)]
+
+    examples = [{"max_model": 1, "rid": i} for i in range(8)]
+    t0 = time.perf_counter()
+    out = rollout_batch(
+        examples=examples, active_env=_SlowRewardEnv(), render=render,
+        batched_generate=batched, env_glue=env_glue, max_turns=8, per_turn_max_tokens=8,
+    )
+    elapsed = time.perf_counter() - t0
+    assert [r["reward"] for r in out] == [float(i) for i in range(8)]  # correct + in input order
+    # 8 x 0.2s = 1.6s if serial; concurrent (<=16 workers) is ~0.2s. Generous bound for CI jitter.
+    assert elapsed < 1.0, f"reward scoring did not run concurrently ({elapsed:.2f}s for 8x0.2s)"
+
+
 def test_rollout_one_interleaves_and_masks_env_tokens():
     out = rollout_one(
         example={"answer": "GOOD"},
