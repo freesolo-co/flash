@@ -32,9 +32,17 @@ def wandb_report_to() -> list[str]:
         return []
     import importlib.util
 
-    if importlib.util.find_spec("wandb") is None:
-        print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
-        return []
+    # find_spec can RAISE (not just return None) when wandb is in sys.modules with an absent/partial
+    # __spec__ (a partially-initialized import / namespace package) — that would crash the worker even
+    # though W&B logging is best-effort (mirrors the guard in wandb_finish). Treat an ambiguous probe
+    # as "present enough to try" and let the guarded wandb.init below decide; only a definitive None
+    # (probe succeeded, module truly absent) skips logging here.
+    try:
+        if importlib.util.find_spec("wandb") is None:
+            print("[wandb] WANDB_API_KEY set but the wandb package is missing; skipping W&B logging")
+            return []
+    except Exception:
+        pass  # ambiguous probe -> fall through to the guarded wandb.init below
     # Best-effort, like the bitsandbytes import above: a partial/broken wandb install or an
     # init failure (auth, network, runtime import error) must NOT abort training — W&B logging is
     # optional and metrics.json is the source of truth. Any failure -> no W&B logging ([]).
