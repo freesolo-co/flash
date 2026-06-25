@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import random
 import re
@@ -63,6 +64,15 @@ from flash.engine.worker.lora import (
     remap_vl_adapter_dir,
     strip_language_model_infix,  # noqa: F401
     vllm_language_model_only_kwargs,  # noqa: F401
+)
+from flash.engine.worker.packing import (
+    BlockDiagonalCollator,
+    gdn_packing_available,
+    model_is_gdn_hybrid,
+    model_is_pure_attention,
+    pack_token_ids,
+    packing_efficiency,
+    tokenize_for_packing,
 )
 from flash.engine.worker.perf import (
     RetriableInfraError,
@@ -945,15 +955,29 @@ def run_sft():
     # packing is ON then (varlen keeps 'bfd' example boundaries correct). If the best-effort install
     # failed, _fa_ok is False and we SKIP packing — without a boundary-correct attn backend examples
     # would cross-contaminate under SDPA.
+    # Pure full-attention vs GatedDeltaNet hybrid (Qwen3.5/3.6) — probed ONCE here and reused across
+    # the whole packing decision (each probe reads the cached HF config). TRL 'bfd' packing keeps
+    # example boundaries via position_ids that a varlen attn honors, but it provides NO seq_idx, so it
+    # can't reset a GDN hybrid's causal conv -> bfd-packing a GDN model silently cross-contaminates its
+    # linear-attention layers. So bfd is enabled for PURE full-attention models only; GDN hybrids pack
+    # via the cu_seqlens/seq_idx varlen collator branch below (when their kernels are present).
+    _pure_attn = model_is_pure_attention(model_id)
+    _gdn = model_is_gdn_hybrid(model_id)
     _fa_ok = _flash_attn_available()
-    if _fa_ok:
+    if _fa_ok and _pure_attn:
         cfg_kwargs["packing"] = True
         print("[sft] example packing enabled (FA2 varlen)")
-    else:
+    elif _fa_ok and _gdn:
         print(
-            "[sft] packing SKIPPED: flash_attn not importable (best-effort image build failed) "
-            "— no boundary-correct attn backend, falling back to SDPA without packing."
+            "[sft] TRL bfd packing NOT used for the GatedDeltaNet hybrid (bfd can't reset the conv); "
+            "the cu_seqlens/seq_idx varlen collator handles its packing when both kernels are present."
         )
+    else:
+        # FA2 bfd packing not enabled here — either flash_attn isn't importable, or it is but the arch
+        # isn't bfd-safe (e.g. sliding-window). This is NOT the final word: the SDPA block-diagonal /
+        # GDN-varlen block below may still turn packing on for a pure-attention or GDN-hybrid model.
+        _bfd_why = "flash_attn not importable" if not _fa_ok else "arch not bfd-safe under FA2 varlen"
+        print(f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below.")
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
     if liger_on(_memory_mode(model_id, sft_max_len)):
@@ -980,6 +1004,122 @@ def run_sft():
         else:
             cfg_kwargs["packing"] = False
             print("[sft] packing disabled: no varlen flash backend (FA2/FA3) available -> plain SDPA")
+
+    # --- True token packing via a 4D block-diagonal SDPA mask (no flash-attn / no flex) ---------
+    # When the run lands on plain SDPA (no varlen flash backend) the block above left packing OFF —
+    # notably on sm120 (RTX 5090, flash's DEFAULT GPU), and anywhere the best-effort flash-attn
+    # build didn't land. For a PURE full-attention model we can still pack: concatenate examples
+    # into max_length blocks and feed a 4D block-diagonal causal mask SDPA honors natively, so
+    # packed examples never attend across boundaries (boundary-correct, numerically identical to
+    # unpacked — verified on a tiny Qwen3/Llama: |packed-separate| logits ~1e-7). This reclaims the packing
+    # throughput win on the default GPU with neither flash-attn nor flex_attention. GatedDeltaNet
+    # hybrids (Qwen3.5/3.6) take the NEXT branch instead — a mask alone can't reset their linear-
+    # attention state, so they also need the cu_seqlens/seq_idx varlen kwargs.
+    _collator = None
+    # The mask paths materialize a dense [B, 1, T, T] mask — O(T^2) memory. At very long context that
+    # tax (hundreds of MB to >1 GB) can OOM a run that previously fit under memory-efficient SDPA, and
+    # packing buys little there anyway (long rows already fill a block). Above this cap, leave packing
+    # off (train unpacked, as today). 16384: the dense bf16/bool mask stays <=~256 MB at bsz=1.
+    _PACK_MASK_MAX_LEN = 16384
+    _mask_pack_ok = sft_max_len <= _PACK_MASK_MAX_LEN
+    _sdpa_pack = bool(not cfg_kwargs.get("packing") and _pure_attn and _mask_pack_ok)
+    if _sdpa_pack:
+        # The 4D mask requires a MASK-READING attn (SDPA). DOWNGRADE any flash impl optimal_attn_impl
+        # picked — e.g. FA3 on a Hopper worker whose FA2 wheel didn't build — to SDPA: a flash varlen
+        # kernel SILENTLY IGNORES the 4D mask, so packed examples would attend across boundaries. (A
+        # bare ``_attn or "sdpa"`` would leave the truthy flash string in place — the bug this avoids.)
+        if _attn in ("flash_attention_2", "flash_attention_3"):
+            print(f"[sft] packing under SDPA: downgrading {_attn} -> sdpa (a flash kernel ignores the 4D mask)")
+        _attn = "sdpa"
+        cfg_kwargs["packing"] = False  # we own the packing; TRL must not also pack
+        # Hand TRL pre-tokenized, pre-packed rows + our collator: skip its dataset prep and stop the
+        # signature-based column pruning from dropping our seq_lengths column before collation.
+        _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
+        _dk["skip_prepare_dataset"] = True
+        cfg_kwargs["dataset_kwargs"] = _dk
+        cfg_kwargs["remove_unused_columns"] = False
+        from flash.catalog import vocab_size_for
+
+        # Tokenize EXACTLY like TRL's non-packed prep (EOS-append parity so the model still learns to
+        # stop; batched; truncate to max_length) then bin-pack into <= max_length blocks.
+        _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
+        _packed_rows = pack_token_ids(_tokenized, sft_max_len)
+        ds = Dataset.from_list(_packed_rows)
+        _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id)
+        # Memory: re-size the per-device micro-batch (in BLOCKS) for the full-block [pd, max_length,
+        # vocab] fp32 logits budget — a no-op under Liger's fused CE. Quality: each block holds
+        # ~ex_per_block examples, so KEEP the effective batch in EXAMPLES at the configured value by
+        # re-deriving grad_accum from the block count. Without this, packing balloons the effective
+        # batch ~ex_per_block-fold (fewer, larger updates -> mild undertraining at the same epochs:
+        # an A/B measured +5.2% held-out loss vs unpacked, closed to +0.1% once matched).
+        _pd_pack, _ = sft_grad_accum(
+            effective_batch, seq_len=sft_max_len, vocab=vocab_size_for(model_id),
+            fused=bool(cfg_kwargs.get("use_liger_kernel")),
+        )
+        # The dense [pd, 1, T, T] bool mask is pd*T^2 bytes — under Liger the logits cap doesn't bind
+        # so pd can be 4, and at long context that mask alone is GBs. Cap pd so the mask stays <=512MB
+        # (a no-op at short ctx: at T=2048 it allows pd up to ~125; it only bites past ~12k tokens).
+        _pd_pack = max(1, min(_pd_pack, (512 * 1024 * 1024) // (sft_max_len * sft_max_len)))
+        _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
+        cfg_kwargs["per_device_train_batch_size"] = _pd_pack
+        cfg_kwargs["gradient_accumulation_steps"] = max(
+            1, math.ceil(effective_batch / max(1.0, _pd_pack * _ex_per_block))
+        )
+        print(
+            "[sft] true token packing ENABLED (4D block-diagonal SDPA mask): "
+            f"{len(_tokenized)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} ex/block, "
+            f"{packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} tok; "
+            f"pd={_pd_pack} ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept "
+            f"~{effective_batch} ex); no flash-attn / no flex_attention"
+        )
+    elif not cfg_kwargs.get("packing") and _gdn and gdn_packing_available(model_id) and _mask_pack_ok:
+        # GatedDeltaNet hybrid (Qwen3.5/3.6, flash's flagship tier): the 4D block-diagonal mask makes
+        # the FULL-attention layers boundary-correct, and the linear-attention (DeltaNet) layers reset
+        # their recurrence + causal conv at example boundaries via cu_seq_lens_q (fla kernel) + seq_idx
+        # (causal_conv1d). GPU-validated on Qwen3.5-0.8B (RTX 5090): a packed example's output is
+        # byte-identical regardless of its neighbors' content (ZERO cross-example leakage); the only
+        # diff vs unpacked is benign bf16 GDN-kernel tiling numerics (~0.3 on logits). Gated on BOTH
+        # kernels being importable (gdn_packing_available) so a worker without them stays unpacked.
+        # Pin SDPA for the full-attn layers (downgrade any flash impl, e.g. FA3 on Hopper — it would
+        # ignore the 4D mask); the DeltaNet layers are unaffected (they use cu_seqlens/seq_idx).
+        if _attn in ("flash_attention_2", "flash_attention_3"):
+            print(f"[sft] GDN packing under SDPA: downgrading {_attn} -> sdpa for the full-attn layers")
+        _attn = "sdpa"
+        cfg_kwargs["packing"] = False
+        _dk = dict(cfg_kwargs.get("dataset_kwargs") or {})
+        _dk["skip_prepare_dataset"] = True
+        cfg_kwargs["dataset_kwargs"] = _dk
+        cfg_kwargs["remove_unused_columns"] = False
+        # EOS-append parity + batched + truncated tokenization (same as the unpacked path), then pack.
+        _tokenized = tokenize_for_packing([t["text"] for t in texts], tok, sft_max_len)
+        _packed_rows = pack_token_ids(_tokenized, sft_max_len)
+        ds = Dataset.from_list(_packed_rows)
+        _collator = BlockDiagonalCollator(pad_token_id=tok.pad_token_id, emit_varlen=True)
+        # cu_seqlens spans ONE packed block, so per-device is a single block; keep the effective batch
+        # in EXAMPLES at the configured value via grad-accum (each block holds ~ex_per_block examples —
+        # without this the effective batch would balloon ~ex_per_block-fold -> undertraining).
+        _ex_per_block = len(_tokenized) / max(1, len(_packed_rows))
+        cfg_kwargs["per_device_train_batch_size"] = 1
+        cfg_kwargs["gradient_accumulation_steps"] = max(1, math.ceil(effective_batch / max(1.0, _ex_per_block)))
+        print(
+            "[sft] true token packing ENABLED for GatedDeltaNet hybrid (4D mask + cu_seqlens/seq_idx "
+            f"varlen): {len(_tokenized)} examples -> {len(_packed_rows)} blocks (~{_ex_per_block:.1f} "
+            f"ex/block, {packing_efficiency(_packed_rows, sft_max_len):.0%} dense) of <= {sft_max_len} "
+            f"tok; pd=1 ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept ~{effective_batch} ex)"
+        )
+    elif not cfg_kwargs.get("packing") and (_pure_attn or _gdn) and not _mask_pack_ok:
+        print(
+            f"[sft] packing stays OFF: max_length {sft_max_len} > {_PACK_MASK_MAX_LEN} — the dense "
+            "O(T^2) block-diagonal mask gets too large at long context (unpacked is more memory-"
+            "efficient there, and long rows already fill a block)."
+        )
+    elif not cfg_kwargs.get("packing") and not _pure_attn:
+        _why = (
+            "hybrid GatedDeltaNet but the fla/causal_conv1d varlen kernels aren't both importable"
+            if _gdn
+            else "non-full-attention arch (e.g. sliding-window) a block-diagonal mask can't pack"
+        )
+        print(f"[sft] packing stays OFF: {_why}. (Pure full-attention models pack via the SDPA mask.)")
     # Explicit bf16 + no auto device-map: TRL/transformers-5 string loading can
     # otherwise fall back to fp32 (2x VRAM; observed 18.6 GB for a 4.66B model) or
     # accelerate-offload large models to meta ("expected device meta but got
@@ -1090,6 +1230,8 @@ def run_sft():
             train_dataset=ds,
             peft_config=make_lora(model_id),
             processing_class=tok,
+            # Our block-diagonal collator on the SDPA-packing path; None elsewhere == TRL default.
+            data_collator=_collator,
             callbacks=[make_sft_heartbeat_callback(), make_checkpoint_upload_callback()],
         )
     finally:
@@ -1914,24 +2056,24 @@ def run_rl():
         # Colocate shares one GPU between the policy model and the vLLM rollout engine.
         # vllm_max_model_length bounds the KV cache to what GRPO needs (else vLLM sizes for
         # the model's FULL context and won't start on a consumer GPU).
-        # vllm_gpu_memory_utilization sizes vLLM's KV pool. When sleep_mode is ON (>=3B /
-        # long-ctx), vLLM offloads ALL GPU memory (model + KV) to CPU during the backward
-        # pass, so 0.45 is safe — the peak is max(rollout, train). When sleep_mode is OFF
-        # (small/fast models), the KV cache stays resident during training; on large cards
-        # (A100/H100) 0.45 x 80 GB = 36 GB KV that never frees, leaving too little room
-        # for activations and causing OOM. Cap the KV pool at ~8 GB (the estimator's
-        # _KV_CAP in flash.engine.vram) so the non-sleep training peak stays within budget.
-        if sleep_mode:
-            _vllm_gpu_mem_util = 0.45
-        else:
-            try:
-                import torch as _torch_vram
+        # vllm_gpu_memory_utilization sizes vLLM's KV pool. The blanket sleep-path 0.45 was a
+        # misjudgement: on an 80 GB A100 it reserves 0.45 x 80 = 36 GB of KV, but a GRPO rollout only
+        # holds ~num_generations x context tokens. MEASURED (Qwen3.5-4B colocate): that 36 GB
+        # reservation is the dominant resident allocation and sets the step peak (~46 GB) — exactly why
+        # trainer-side optimisations (mask-aware lm_head, fused layers) moved nothing. colocate_kv_util
+        # sizes both paths from flash's per-model KV estimate instead (vram.py); MEASURED 4B/80 GB peak
+        # 46 -> 26 GB, reward byte-identical, train_wall neutral.
+        try:
+            import torch as _torch_vram
 
-                _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
-                _kv_target_gb = 8.0  # matches estimator's _KV_CAP (flash.engine.vram)
-                _vllm_gpu_mem_util = min(0.45, _kv_target_gb / max(1.0, _total_vram_gb))
-            except Exception:
-                _vllm_gpu_mem_util = 0.10  # safe fallback: ~8 GB KV on worst-case 80 GB card
+            from flash.engine.vram import colocate_kv_util
+
+            _total_vram_gb = _torch_vram.cuda.get_device_properties(0).total_memory / 1e9
+            _vllm_gpu_mem_util = colocate_kv_util(
+                _params_b, vllm_max_len, _total_vram_gb, sleep_mode, num_generations=group_size
+            )
+        except Exception:
+            _vllm_gpu_mem_util = 0.45 if sleep_mode else 0.10  # safe fallback to the old constants
         grpo_kwargs.update(
             vllm_mode="colocate",
             vllm_max_model_length=vllm_max_len,
