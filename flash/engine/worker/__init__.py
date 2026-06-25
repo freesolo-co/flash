@@ -2263,6 +2263,24 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
+def wandb_finish(exit_code: int = 0) -> None:
+    """Finalize the W&B run before the worker's hard ``os._exit()``.
+
+    The worker hard-exits to dodge the colocated-vLLM teardown deadlock (see main),
+    which skips wandb's atexit sync — so a *successfully completed* run was left
+    dangling and W&B eventually marked it ``crashed`` even though all metrics were
+    logged. Explicitly finish the run (we own it: we called ``wandb.init`` in
+    ``wandb_report_to``) so it shows ``finished``. Best-effort; never raises (W&B is
+    optional, metrics.json is the source of truth)."""
+    try:
+        import wandb
+
+        if getattr(wandb, "run", None) is not None:
+            wandb.finish(exit_code=exit_code)
+    except Exception as e:  # pragma: no cover - logging-only path
+        print(f"[wandb] finish() warning: {e}")
+
+
 def main():
     # Idempotency: if DONE was already uploaded, a re-delivered job re-fetches the final
     # metrics from HF and returns them immediately. (The previous behavior — sleeping in
@@ -2327,6 +2345,7 @@ def main():
         # handler's *blocking* `subprocess.run` (heartbeat frozen at "rl_train_done") and the
         # whole run stalls until the wall-clock cap. Hard-exit to bypass the hanging teardown now that
         # every output is safely persisted.
+        wandb_finish(exit_code=0)  # mark the W&B run finished BEFORE os._exit (which skips wandb's atexit sync)
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
@@ -2353,6 +2372,7 @@ def main():
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags)
         # keep container alive briefly so logs flush, then exit non-zero -> restart
+        wandb_finish(exit_code=1)  # finalize the W&B run as failed (don't leave it dangling -> "crashed")
         time.sleep(10)
         raise
 
