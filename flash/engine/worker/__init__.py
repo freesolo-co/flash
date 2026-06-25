@@ -2528,13 +2528,14 @@ def main():
         # init, any model size/arch). AFTER the fla fast path (a tilelang reinstall there rewrites
         # the stub) and BEFORE the model/vLLM import. See perf.py / flash #184.
         _neutralize_tilelang_cudart_stub()
-        # Opt-in: load a baked compiled-kernel mega-cache (if the image shipped one) so the worker
-        # skips the ~10-15 min first-run JIT. Best-effort + no-op when absent (the default), so the
-        # normal JIT path is untouched. Runs here, early in boot near the perf setup, before any
-        # model/kernel import that would otherwise trigger compilation.
-        _load_kernel_cache_if_present()
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
+        # Opt-in: load a baked compiled-kernel mega-cache (if the image shipped one) so the worker
+        # skips the ~10-15 min first-run JIT. Best-effort + no-op when absent (the default), so the
+        # normal JIT path is untouched. Runs AFTER finalize_alloc_conf_for_sleep: _load probes CUDA
+        # (_current_cuda_sm -> get_device_capability triggers CUDA init), so the allocator conf must be
+        # resolved first; still before any model/kernel import that would otherwise trigger compilation.
+        _load_kernel_cache_if_present()
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
             "sft": run_sft,  # SFT (TRL SFTTrainer)
