@@ -504,6 +504,20 @@ def main() -> int:
         # of stamping a false ok=true.
         rc = run_mode(payload, env, phase, deadline)
         if not os.path.exists("/tmp/metrics.json"):
+            if os.path.exists("/tmp/train_reached"):
+                # Training REACHED end-of-training (the sentinel is stamped right before the first
+                # required upload — the adapter), but no /tmp/metrics.json: the REQUIRED adapter upload,
+                # which precedes metrics.json, failed infra-shaped. That's a post-training UPLOAD
+                # failure, not a crash, so raise RetriableBootstrapError (retriable marker) — otherwise
+                # the poller hard-fails (job_failed) a COMPLETED training attempt when the worker's own
+                # retriable error heartbeat is also lost in the same HF outage. The marker's retriable
+                # flag is what carries the classification; host_neutral=retriable keeps it from
+                # quarantining the (healthy) region for a global upload failure.
+                raise RetriableBootstrapError(
+                    f"train phase '{phase}' reached end-of-training but produced no /tmp/metrics.json "
+                    f"— the required adapter upload (which precedes metrics.json) failed infra-shaped; "
+                    f"retry the missing upload on a fresh host. See error_{phase}.txt / console_{phase}.txt."
+                )
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF dataset repo"

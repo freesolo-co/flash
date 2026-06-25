@@ -1777,12 +1777,13 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
     assert done.is_set()  # completes as soon as the lock is released
 
 
-def test_purge_seed_boot_logs_deletes_only_this_seeds_boot_logs(monkeypatch):
+def test_purge_stale_seed_artifacts_deletes_only_this_seeds_liveness_files(monkeypatch):
     """Recovery (attach_run's not-ok branch) restarts a seed's attempt loop at attempt 0 under the same
-    HF prefix; _purge_seed_boot_logs clears the abandoned attempt's host boot.log(s) so a stale one can't
-    falsely satisfy the fresh post-recovery box's first-liveness check (a silently-dead replacement would
-    otherwise burn the full setup grace). It must delete ONLY *_boot.log under THIS seed's prefix —
-    attempt-scoped AND legacy — leaving worker artifacts and other seeds' files untouched."""
+    HF prefix; _purge_stale_seed_artifacts clears the abandoned attempt's SEED-scoped liveness files so a
+    stale one can't falsely satisfy the fresh post-recovery box's first-liveness check (a silently-dead
+    replacement would burn the full setup grace) NOR be mistaken for its own crash (the dead-host branch
+    trusts error_<phase>.txt on attempt 0). It must delete ONLY the boot.logs (attempt-scoped + legacy)
+    AND error_<phase>.txt under THIS seed's prefix, leaving worker artifacts and other seeds untouched."""
     import io
 
     from flash.runner import deploy
@@ -1798,10 +1799,13 @@ def test_purge_seed_boot_logs_deletes_only_this_seeds_boot_logs(monkeypatch):
         f"{prefix}/lambda_attempt0_boot.log",  # stale pre-recovery boot log -> delete
         f"{prefix}/lambda_attempt1_boot.log",  # another attempt's -> delete
         f"{prefix}/lambda_boot.log",  # legacy boot log -> delete
+        f"{prefix}/error_rl.txt",  # stale per-attempt crash traceback -> delete
         f"{prefix}/metrics.json",  # worker artifact -> KEEP
         f"{prefix}/DONE",  # worker artifact -> KEEP
+        f"{prefix}/console_rl.txt",  # NOT an error_*.txt -> KEEP
         f"{prefix}/checkpoints/step-1/adapter/adapter_model.safetensors",  # KEEP
         f"{spec.phase}/flash-xyz/seed1/lambda_attempt0_boot.log",  # DIFFERENT seed -> KEEP
+        f"{spec.phase}/flash-xyz/seed1/error_rl.txt",  # DIFFERENT seed -> KEEP
     ]
     deleted: list[str] = []
 
@@ -1816,19 +1820,20 @@ def test_purge_seed_boot_logs_deletes_only_this_seeds_boot_logs(monkeypatch):
             deleted.append(path_in_repo)
 
     monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
-    deploy._purge_seed_boot_logs(spec, 0, io.StringIO())
+    deploy._purge_stale_seed_artifacts(spec, 0, io.StringIO())
     assert sorted(deleted) == sorted(
         [
             f"{prefix}/lambda_attempt0_boot.log",
             f"{prefix}/lambda_attempt1_boot.log",
             f"{prefix}/lambda_boot.log",
+            f"{prefix}/error_rl.txt",
         ]
     )
 
 
-def test_purge_seed_boot_logs_is_best_effort(monkeypatch):
-    """A listing/auth failure during the boot-log purge must NEVER raise into recovery (the resume
-    proceeds; a stale boot.log at worst slows THIS seed's next failover, it doesn't block the run)."""
+def test_purge_stale_seed_artifacts_is_best_effort(monkeypatch):
+    """A listing/auth failure during the purge must NEVER raise into recovery (the resume proceeds; a
+    stale artifact at worst slows/over-fails THIS seed's next attempt, it doesn't block the run)."""
     import io
 
     from flash.runner import deploy
@@ -1848,4 +1853,4 @@ def test_purge_seed_boot_logs_is_best_effort(monkeypatch):
             raise RuntimeError("hf list 503")
 
     monkeypatch.setattr("huggingface_hub.HfApi", BoomApi)
-    deploy._purge_seed_boot_logs(spec, 0, io.StringIO())  # must not raise
+    deploy._purge_stale_seed_artifacts(spec, 0, io.StringIO())  # must not raise

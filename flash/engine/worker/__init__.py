@@ -2931,6 +2931,12 @@ def main():
         # resolution runs lazily inside this try (require_active_env, called by the handlers above),
         # never at import, so a rate-limit raise reaches here and is classified correctly.
         retriable = isinstance(e, (RetriableInfraError, GitHubRateLimitError))
+        # GitHubRateLimitError (env ref resolution hit a global GitHub/control-plane rate limit) is
+        # retriable but REGION-INDEPENDENT — it follows the job to any host — so flag the heartbeat
+        # host_neutral so the pollers retry (job_preempted) WITHOUT quarantining a healthy region for a
+        # global dependency. A RetriableInfraError (broken GPU/driver, NVML, required upload) is NOT
+        # host_neutral: it can be a sick region, so it still drives the quarantine.
+        host_neutral = isinstance(e, GitHubRateLimitError)
         tb = traceback.format_exc()
         traceback.print_exc()
         try:
@@ -2941,7 +2947,7 @@ def main():
             hf_upload_file(err_path, err_name)
         except Exception as up_err:
             print("error-upload warn:", up_err)
-        hb_flags = {"retriable": retriable}
+        hb_flags = {"retriable": retriable, "host_neutral": host_neutral}
         try:
             heartbeat(f"error_{RUN_MODE}", error=str(e)[:500], **hb_flags, diag=gpu_diagnostics())
         except Exception:

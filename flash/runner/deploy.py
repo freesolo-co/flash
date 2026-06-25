@@ -125,41 +125,52 @@ def cancel_run(run_id: str) -> RunStatus:
     return get_status(run_id)
 
 
-def _purge_seed_boot_logs(spec: JobSpec, seed: int, log) -> None:
-    """Best-effort: delete a seed's host boot-log artifacts before a recovery RELAUNCH of that seed.
+def _purge_stale_seed_artifacts(spec: JobSpec, seed: int, log) -> None:
+    """Best-effort: delete a seed's per-attempt LIVENESS artifacts before a recovery RELAUNCH of it.
 
     Recovery (``attach_run``'s not-ok branch) restarts the seed's attempt loop at attempt 0 under the
-    SAME HF prefix. The instance providers' fast first-liveness failover keys on the presence of an
-    attempt-scoped ``<arm>_attempt<N>_boot.log`` to tell a box that actually ran cloud-init from a
-    silently dead one. A pre-recovery attempt's boot.log left under the prefix would FALSELY prove
-    liveness for the fresh post-recovery box — whose attempt counter restarts at 0 and so reuses the
-    same path — making a silently-dead replacement host wait out the full setup grace (~50 min) instead
-    of failing over fast. Clearing the boot logs here lets the relaunch start from a clean slate (a
-    healthy new box rewrites its own within ~2 min; a dead one leaves none -> fast failover). Only the
-    boot logs are removed (the worker owns/needs the other artifacts: DONE/metrics/adapter/checkpoints).
-    Best-effort and never raises into recovery; a no-op for RunPod (it writes no boot logs)."""
+    SAME HF prefix, so a pre-recovery attempt's SEED-scoped files linger and can mislead the fresh
+    post-recovery box (whose attempt counter restarts at 0). Two such files matter to the instance
+    providers' poll classification:
+
+    - ``<arm>_attempt<N>_boot.log`` / the legacy ``<arm>_boot.log`` — fast first-liveness keys on a
+      boot.log's presence to tell a box that ran cloud-init from a silently dead one. A leftover would
+      FALSELY prove liveness for a silently-dead replacement, making it wait out the full setup grace
+      (~50 min) instead of failing over fast.
+    - ``error_<phase>.txt`` — the dead-host branch trusts this seed-scoped traceback as THIS attempt's
+      deterministic crash on attempt 0 (no prior attempt assumed). A leftover would make a fresh
+      attempt-0 box that's LOST before producing any signal be mis-classified terminal ``job_failed``
+      instead of retrying the recoverable host loss.
+
+    Clearing both lets the relaunch start from a clean slate (a healthy new box rewrites its own; a dead
+    one leaves none -> correct fast failover / retry). Only these liveness artifacts are removed (the
+    worker owns/needs DONE/metrics/adapter/checkpoints). Best-effort, never raises into recovery; a
+    no-op for RunPod (it writes neither)."""
     import os
 
     repo = spec.train.hf_repo
     if not repo:
         return
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
+
+    def _is_liveness_artifact(path: str) -> bool:
+        if not path.startswith(prefix + "/"):
+            return False
+        name = path.rsplit("/", 1)[-1]
+        return name.endswith("_boot.log") or (name.startswith("error_") and name.endswith(".txt"))
+
     try:
         from huggingface_hub import HfApi
 
         api = HfApi(token=os.environ.get("HF_TOKEN"))
-        stale = [
-            f
-            for f in api.list_repo_files(repo, repo_type="dataset")
-            if f.startswith(prefix + "/") and f.endswith("_boot.log")
-        ]
+        stale = [f for f in api.list_repo_files(repo, repo_type="dataset") if _is_liveness_artifact(f)]
         for f in stale:
             with contextlib.suppress(Exception):
                 api.delete_file(path_in_repo=f, repo_id=repo, repo_type="dataset")
         if stale:
-            print(f"attach: purged {len(stale)} stale boot log(s) under {prefix}", file=log)
+            print(f"attach: purged {len(stale)} stale liveness artifact(s) under {prefix}", file=log)
     except Exception as exc:  # listing/auth is best-effort; never block recovery
-        print(f"attach: boot-log purge warn for {spec.run_id}: {exc}", file=log)
+        print(f"attach: liveness-artifact purge warn for {spec.run_id}: {exc}", file=log)
 
 
 def attach_run(run_id: str, log_stream=None) -> RunStatus:
@@ -234,9 +245,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
             # The relaunched seed loop restarts at attempt 0 under this same prefix; clear the abandoned
-            # box's boot log(s) first so a stale one can't falsely satisfy the fresh box's first-liveness
-            # check (see _purge_seed_boot_logs). Best-effort — never blocks the resume.
-            _purge_seed_boot_logs(spec, seed, log)
+            # box's seed-scoped liveness artifacts (boot logs + error_<phase>.txt) first so a stale one
+            # can't falsely satisfy the fresh box's first-liveness check or be mistaken for its own crash
+            # (see _purge_stale_seed_artifacts). Best-effort — never blocks the resume.
+            _purge_stale_seed_artifacts(spec, seed, log)
             _run_seed_loop(
                 spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0)
             )

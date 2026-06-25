@@ -679,6 +679,27 @@ def test_poll_host_failmark_still_quarantines(monkeypatch):
     assert res.host_fault  # docker/GPU never ready, no host_neutral -> region quarantined
 
 
+def test_poll_github_ratelimit_heartbeat_not_quarantined(monkeypatch):
+    """A pre-training GitHubRateLimitError makes the worker stamp a FRESH error heartbeat flagged
+    retriable + host_neutral; the region-independent fault must retry (job_preempted) WITHOUT
+    quarantining a healthy region (fresh_host_neutral_hb suppresses host_fault). Mirrors the Lambda path."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}],
+        marker=json.dumps(
+            {"ok": False, "attempt": 0, "retriable": False, "error": "no /tmp/metrics.json (crashed)"}
+        ),
+    )
+    res = jobs.poll_hs_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {
+            "stage": "error_rl", "ts": 10_000.0, "retriable": True, "host_neutral": True
+        },
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable hb -> retry on a fresh host
+    assert not res.host_fault  # host_neutral hb: global rate limit, not a sick region -> NO quarantine
+
+
 def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
     """On a reattach whose first poll already sees the VM active, active_since is launch-anchored, so
     the launch-relative first_liveness deadline is already blown. The observed-grace floor stops a VM
@@ -903,22 +924,22 @@ def test_poll_legacy_boot_log_satisfies_first_liveness_on_reattach(monkeypatch):
     assert "no worker liveness" not in (res.detail or "")  # legacy boot.log satisfied first-liveness
 
 
-def test_poll_retry_ignores_seed_scoped_legacy_boot_log(monkeypatch):
-    """The legacy (seed-scoped) boot.log fallback must NOT mask a dead host on a RETRY: gated to attempt
-    0, so this attempt-1 VM ignores a present prior-attempt legacy log and still fails over fast. Mirrors
-    the Lambda path."""
+def test_poll_legacy_boot_log_honored_on_attempt1_reattach(monkeypatch):
+    """A mixed-version reattach can be polling a PRE-upgrade attempt 1+ VM whose old user-data wrote only
+    the legacy boot.log. The legacy fallback must be honored on ANY attempt (gating it to attempt 0 would
+    falsely quarantine the healthy old retry); a stale prior-attempt legacy log can't mask a relaunch
+    because recovery purges it. Mirrors the Lambda path."""
     jobs = _wire_poll(
         monkeypatch,
-        vms=[{"status": "ACTIVE"}],
-        boot=None,  # attempt-scoped boot.log absent (this VM never started)
-        legacy_boot="+ stale legacy boot.log from a prior attempt",  # present but must be IGNORED
+        vms=[{"status": "ACTIVE"}, {"status": "ACTIVE"}, {"status": "ERROR"}],
+        boot=None,  # attempt-scoped boot.log absent (old VM wrote only the legacy path)
+        legacy_boot="+ docker pull ... (old-CP attempt-1 VM, legacy boot.log)",
         step=100.0,
     )
-    res = jobs.poll_hs_job(_handle(attempt=1), _spec(), seed=0, interval_s=0, first_liveness_s=500.0)
+    res = jobs.poll_hs_job(_handle(attempt=1), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
     assert not res.ok
-    assert res.failure == "stalled"  # fast failover, NOT masked by the seed-scoped legacy log
-    assert "no worker liveness" in res.detail
-    assert res.host_fault
+    assert res.failure == "job_preempted"  # died as a host loss, NOT killed by the liveness deadline
+    assert "no worker liveness" not in (res.detail or "")  # legacy boot.log honored on attempt 1
 
 
 def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):

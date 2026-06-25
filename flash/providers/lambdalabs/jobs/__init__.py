@@ -536,6 +536,23 @@ def poll_lambda_job(
         _, fresh = heartbeat_progress_ts((hb.get("stage"), hb.get("step"), hb.get("ts")), launch_ts)
         return fresh
 
+    def fresh_host_neutral_hb() -> bool:
+        """True if THIS attempt's worker flagged a FRESH region-INDEPENDENT retriable fault (the worker
+        sets ``host_neutral`` on the error heartbeat for a GitHubRateLimitError — a global GitHub/
+        control-plane rate limit hit during env resolution, which would follow the job to any region).
+        Such a fault must retry (job_preempted) but must NOT quarantine the region. Launch-fresh so a
+        stale prior-attempt heartbeat can't suppress a genuine THIS-attempt host fault."""
+        if heartbeat_reader is None:
+            return False
+        try:
+            hb = heartbeat_reader(force=True)
+        except Exception:
+            return False
+        if not isinstance(hb, dict) or not hb.get("host_neutral"):
+            return False
+        _, fresh = heartbeat_progress_ts((hb.get("stage"), hb.get("step"), hb.get("ts")), launch_ts)
+        return fresh
+
     def run_cancelled() -> bool:
         """True if the run was deliberately cancelled. A user cancel during setup terminates the box,
         which the poller then sees as a dead host with no training heartbeat -> host_fault; but WE
@@ -575,10 +592,13 @@ def poll_lambda_job(
             # marker flagged ``host_neutral`` is a bootstrap-raised region-independent HF-delivery
             # failure (the spilled-spec fetch / a required-artifact upload) -> not a sick region; only
             # the HOST cloud-init failmark (docker/GPU never ready), which omits the flag, quarantines.
+            # fresh_host_neutral_hb() is the heartbeat-level equivalent: a region-independent retriable
+            # worker fault (GitHubRateLimitError) must retry but never quarantine the region.
             host_fault=(marker_retriable or fresh_retriable_hb())
             and not reached_training_now()
             and not bool(marker and marker.get("trained"))
-            and not bool(marker and marker.get("host_neutral")),
+            and not bool(marker and marker.get("host_neutral"))
+            and not fresh_host_neutral_hb(),
         )
 
     def terminal_artifact_result() -> PollResult | None:
@@ -785,20 +805,20 @@ def poll_lambda_job(
                 # throttled poll. force=True bypasses the rate-limit (accurate absent-vs-present);
                 # ``is None`` keeps an empty "" boot.log counting as liveness (the file existing proves
                 # cloud-init ran); the latch then stops re-reading once the box has proven itself.
-                if boot_log_reader(force=True) is None and (
-                    handle.attempt != 0 or legacy_boot_log_reader(force=True) is None
-                ):
+                if boot_log_reader(force=True) is None and legacy_boot_log_reader(force=True) is None:
                     # A lone None can also be a momentary HF/Hub network error (not a true absence), so
                     # require the absence to PERSIST across consecutive polls before failing over — a
                     # transient blip clears within a poll interval; a box whose worker never started
                     # stays absent. Avoids a Hub hiccup at the deadline burning a cross-provider retry.
                     # Both the attempt-scoped AND the legacy boot.log must be absent (the legacy read is
-                    # short-circuited away unless the attempt-scoped one is missing). The legacy path is
-                    # SEED-scoped (shared across attempts), so it is consulted ONLY on attempt 0: a
-                    # RETRY (attempt >= 1) must never read a prior attempt's leftover legacy log and
-                    # mistake a dead replacement host for a live one. (A retry into a #260-era process
-                    # never has a legacy log anyway; the only writer is a pre-upgrade box, and a recovery
-                    # relaunch — also attempt 0 — already purges it via _purge_seed_boot_logs.)
+                    # short-circuited away unless the attempt-scoped one is missing). The legacy fallback
+                    # is consulted on ANY attempt: ``attempt`` was persisted BEFORE this PR's attempt-
+                    # scoped boot-log change, so a mixed-version reattach can be polling a pre-upgrade
+                    # attempt 1+ box whose old user-data wrote only the legacy path — gating on the
+                    # attempt number would falsely quarantine that healthy old retry. A stale prior-attempt
+                    # legacy log can't mask a relaunched box instead: the only path that relaunches a new
+                    # attempt under this prefix is attach recovery, which PURGES the legacy boot.log first
+                    # (_purge_stale_seed_artifacts); a same-process #260 retry never has a legacy log.
                     boot_log_absent_polls += 1
                     if boot_log_absent_polls >= BOOT_LOG_ABSENT_POLLS:
                         # The boot-log uploader is best-effort and may never have worked even though the
