@@ -18,7 +18,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from flash.engine.worker.lora import patch_grpo_mask_aware_lm_head
+from flash.engine.worker.lora import (
+    disable_liger_grpo_torch_compile,
+    patch_grpo_mask_aware_lm_head,
+)
 
 
 class _FakeTrainer:
@@ -138,3 +141,40 @@ def test_mask_aware_lm_head_is_idempotent():
     wrapped = trainer.liger_grpo_loss
     assert patch_grpo_mask_aware_lm_head(trainer) is True
     assert trainer.liger_grpo_loss is wrapped  # unchanged — not wrapped again
+
+
+class _FakeLigerLoss:
+    """Stand-in for LigerFusedLinearGRPOLoss: carries the `compiled` flag liger reads to decide
+    `torch.compile(compute_loss) if compiled else compute_loss`."""
+
+    def __init__(self, compiled=True):
+        self.compiled = compiled
+
+
+def test_disable_liger_grpo_torch_compile_flips_flag():
+    # The fix: turn liger's broken torch.compile OFF (eager loss math) while leaving the loss object
+    # in place (its chunked memory path is unaffected — that never runs under compile).
+    trainer = _FakeTrainer()
+    trainer.liger_grpo_loss = _FakeLigerLoss(compiled=True)
+    assert disable_liger_grpo_torch_compile(trainer) is True
+    assert trainer.liger_grpo_loss.compiled is False
+
+
+def test_disable_liger_grpo_torch_compile_noop_when_off_or_absent():
+    # Already-off and the no-loss path both return False (nothing to do) and never raise.
+    trainer = _FakeTrainer()
+    trainer.liger_grpo_loss = _FakeLigerLoss(compiled=False)
+    assert disable_liger_grpo_torch_compile(trainer) is False
+    assert trainer.liger_grpo_loss.compiled is False
+    assert disable_liger_grpo_torch_compile(_FakeTrainer()) is False  # no liger_grpo_loss attr
+
+
+def test_disable_liger_grpo_torch_compile_runs_before_mask_aware_wrap():
+    # Order contract: the flip must land on the real loss instance BEFORE patch_grpo_mask_aware_lm_head
+    # replaces trainer.liger_grpo_loss with a closure (which has no `compiled` attr to flip).
+    loss = _FakeLigerLoss(compiled=True)
+    trainer = _FakeTrainer()
+    trainer.liger_grpo_loss = loss
+    assert disable_liger_grpo_torch_compile(trainer) is True
+    # the captured instance stays eager even after the mask-aware wrapper closes over it
+    assert loss.compiled is False
