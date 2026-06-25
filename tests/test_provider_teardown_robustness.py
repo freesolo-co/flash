@@ -142,10 +142,14 @@ def test_user_data_fails_fast_and_throttles_bootlog():
     # failed start: the script inspects the container exit code and only fails on a non-zero exit.
     assert "{{.State.ExitCode}}" in s
     assert '[ "$EXIT" = "0" ]' in s
+    # ...but a clean exit (code 0) with NO success artifact on HF (all best-effort uploads failed)
+    # still fails fast via the host donecheck instead of idling the billed box to the stall grace.
+    assert "donecheck.py" in s
+    assert "worker exited 0 but left no success artifact" in s
 
 
 def test_instance_realized_cost_is_wall_times_rate():
-    """Lambda/Hyperstack have no billing API; realized COGS = wall(launch->end) x flat $/hr."""
+    """Lambda/Hyperstack have no billing API; realized COGS = wall(launch->run_end) x flat $/hr."""
     from flash.providers.realized import realized_cost_for_remote
 
     remote = {"provider": "lambda", "instance_id": "i-9", "hourly_usd": 1.20, "started_ts": 1000.0}
@@ -157,3 +161,16 @@ def test_instance_realized_cost_is_wall_times_rate():
     assert rc.by_resource == {"gpu": 1.20}
     # no rate on the handle -> unattributable (stays unreconciled, never books $0)
     assert realized_cost_for_remote({"provider": "hyperstack", "vm_id": "v"}, start=0, end=10) is None
+
+
+def test_instance_realized_cost_uses_run_end_not_settle_padded_end():
+    """The instance wall must use the TRUE run end (run_end ~ teardown), never the settle-padded
+    billing-query ``end`` — otherwise reconciliation over-bills by the settle hour (up to 1h x rate)."""
+    from flash.providers.realized import realized_cost_for_remote
+
+    remote = {"provider": "hyperstack", "vm_id": "v-1", "hourly_usd": 2.0, "started_ts": 0.0}
+    # end is padded +3600 for the RunPod billing query; run_end is the real teardown at 1800s (0.5h).
+    rc = realized_cost_for_remote(remote, start=0.0, end=1800.0 + 3600.0, run_end=1800.0)
+    assert rc is not None
+    assert rc.wall_seconds == 1800.0  # 0.5h, NOT 1.5h
+    assert rc.realized_usd == 1.0  # 0.5h x $2.0 (not $3.0)
