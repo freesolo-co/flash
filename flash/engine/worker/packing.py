@@ -139,7 +139,7 @@ def _gdn_forward_threads_reset_kwargs(model_id: str | None) -> bool:
 
 def gdn_packing_available(model_id: str | None = None) -> bool:
     """True only when BOTH varlen kernels a GatedDeltaNet hybrid needs to pack boundary-correctly are
-    importable: ``flash-linear-attention`` (resets the DeltaNet recurrence via ``cu_seqlens`` — the
+    importable: ``flash-linear-attention`` (resets the DeltaNet recurrence via ``cu_seq_lens_q/k`` — the
     pure-torch fallback IGNORES it) AND ``causal_conv1d`` (resets the short causal conv via
     ``seq_idx``). Without both, a packed GDN run would cross-contaminate across example boundaries,
     so packing must stay off. GPU-validated (RTX 5090, Qwen3.5-0.8B): with both present, a packed
