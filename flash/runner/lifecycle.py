@@ -120,6 +120,11 @@ def _submit_seed_supervised(
     # so on_handle persists it into the run handle and a recovery via attach_run costs the
     # class actually used rather than the parse-time provisional spec.gpu.type.
     current_gpu: dict = {}
+    # Whether the CURRENT attempt's class is the last gpu-walk candidate (set right before each
+    # submit). Persisted into the run handle so a recovery via attach_run polls with the SAME
+    # no-capacity stall tuning the original submit used (see jobs.stall_kwargs / RunpodProvider.poll)
+    # — otherwise a reattached last-candidate run would be judged on the shorter non-last grace.
+    current_on_last_gpu: dict = {"value": False}
     # Every RunPod endpoint id this run registered across attempts. Retries run on
     # rN-suffixed endpoints whose names _gc_run_endpoints cannot reconstruct, and a
     # failed delete during the next attempt's teardown would otherwise lose the id;
@@ -134,7 +139,12 @@ def _submit_seed_supervised(
         _update(
             spec.run_id,
             "running",
-            remote={**handle, "seed": int(seed), "allocated_gpu": current_gpu.get("name")},
+            remote={
+                **handle,
+                "seed": int(seed),
+                "allocated_gpu": current_gpu.get("name"),
+                "on_last_gpu": bool(current_on_last_gpu["value"]),
+            },
         )
 
     def _gc_seen_endpoints() -> None:
@@ -248,6 +258,9 @@ def _submit_seed_supervised(
             # "last" from attempt 0, which is what we want.
             untried = [c for c in alloc.candidates if (c.provider, c.gpu) not in tried_classes]
             on_last_gpu = len(untried) <= 1 or attempt >= max_retries
+            # Mirror into the closure cell so on_handle persists THIS attempt's value (see
+            # current_on_last_gpu) for a recovery to reproduce the same stall tuning.
+            current_on_last_gpu["value"] = on_last_gpu
             print(allocation_summary(alloc), file=log, flush=True)
             if (chosen.provider, chosen.gpu) != (alloc.provider, alloc.gpu):
                 print(
