@@ -70,9 +70,10 @@ Two channels are published to PyPI from the *same source*, distinguished by one 
 
 The two install side by side (distinct package + CLI names). The dev build is produced by
 `scripts/build_dev_dist.py`, which renames the package/CLI and flips `CHANNEL` to `dev` before
-`uv build`. To cut a dev release, bump `[tool.flash-dev].version` and merge to `dev`. Either CLI
-still honours an explicit `FLASH_API_URL` / `flash login --api-url`; the channel only sets the
-default.
+`uv build`. Both channels ship at the **same version**: `[project].version` and
+`[tool.flash-dev].version` must match (CI enforces this via `.github/workflows/version-parity.yml`),
+so cutting a release means bumping both together. Either CLI still honours an explicit
+`FLASH_API_URL` / `flash login --api-url`; the channel only sets the default.
 
 ## Serving From an API
 

@@ -103,11 +103,12 @@ artifacts = ["flash/py.typed"]
 
 [tool.flash-dev]
 # Version of the dev-channel package `freesolo-flash-dev` (the `flash-dev` CLI, which defaults to
-# the staging plane flash-dev.freesolo.co). It is INDEPENDENT of [project].version above (the prod
-# `freesolo-flash`). The dev channel is built from this same source by scripts/build_dev_dist.py and
-# auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version here isn't yet
-# on PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
-# dev-channel release = bump this and merge to `dev`.
+# the staging plane flash-dev.freesolo.co). It MUST equal [project].version above (the prod
+# `freesolo-flash`) — the two channels ship in lockstep; .github/workflows/version-parity.yml fails
+# CI if they diverge. The dev channel is built from this same source by scripts/build_dev_dist.py and
+# auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
+# PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
+# dev-channel release = bump this (and [project].version) and merge to `dev`.
 version = "0.2.25"
 
 [tool.pytest.ini_options]

@@ -97,3 +97,12 @@ def test_read_dev_version():
     build = _load_build_module()
     src = '[project]\nname = "freesolo-flash"\nversion = "1.0.0"\n[tool.flash-dev]\nversion = "2.3.4"\n'
     assert build.read_dev_version(src) == "2.3.4"
+
+
+def test_channels_are_at_the_same_version():
+    # The prod (freesolo-flash) and dev (freesolo-flash-dev) channels must ship the same version;
+    # .github/workflows/version-parity.yml enforces this in CI too.
+    import tomllib
+
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    assert data["project"]["version"] == data["tool"]["flash-dev"]["version"]
