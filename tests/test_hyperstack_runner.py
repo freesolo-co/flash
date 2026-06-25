@@ -116,6 +116,32 @@ def test_launch_raises_when_no_stock(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=[], attempt=0)
 
 
+def test_launch_skips_region_with_no_boot_image_without_reconciling(monkeypatch):
+    """A pre-launch resolution failure (region has stock but no qualifying CUDA image / key) created
+    NO VM, so it's a CLEAN region SKIP — walk to the next region, never an ambiguous-phantom abort
+    that reconciles + stops the whole attempt (which would needlessly waste an otherwise-good walk)."""
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    # CANADA-1 has stock but no qualifying image (pre-launch raise); US-1 resolves + launches fine.
+    def fake_image(region, min_cuda="12.8"):
+        if region == "CANADA-1":
+            raise hs_api.HyperstackApiError(f"no Docker image in {region} with CUDA >= {min_cuda}")
+        return "Ubuntu 24.04 CUDA 13.0 with Docker"
+
+    reconciled = []
+    monkeypatch.setattr(hs_api, "docker_image_for_region", fake_image)
+    monkeypatch.setattr(hs_api, "resolve_key_name", lambda env: "k")
+    monkeypatch.setattr(hs_api, "launch_vm", lambda **kw: "vm-img")
+    monkeypatch.setattr(jobs, "terminate_run_instances", lambda rid: reconciled.append(rid))
+
+    insts = [_inst(region=r) for r in ("CANADA-1", "US-1")]
+    h = jobs.launch_and_submit(_spec(), seed=0, instances=insts, attempt=0)
+    assert h.vm_id == "vm-img"  # walked PAST CANADA-1's missing image to US-1
+    assert h.region == "US-1"
+    assert reconciled == []  # NEVER reconciled: a pre-launch failure leaves no phantom VM
+
+
 # ---------------------------------------------------------------------------
 # poll_hs_job state machine
 # ---------------------------------------------------------------------------

@@ -110,7 +110,9 @@ class HyperstackProvider:
 
         terminate_run_instances(spec.run_id)
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
+    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[str]:
+        """Hyperstack VM ids are opaque STRINGS (the ``base.Provider`` protocol widens the return to
+        ``list[int | str]`` to cover both substrates); the orchestrator only logs/counts them."""
         from flash.providers.hyperstack.jobs import sweep_orphans
 
         return sweep_orphans(active_labels=active_labels)

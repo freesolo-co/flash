@@ -1,8 +1,8 @@
 """Provider registry + ``base.Provider`` interface coverage (CPU-only, offline).
 
-RunPod (always on) and Lambda (instance-based complement, opt-in via LAMBDA_API_KEY) both
-implement the SAME ``base.Provider`` interface behind the SAME module layout, so the
-orchestrator/allocator treat them interchangeably."""
+RunPod (always on) and the instance-based complements — Lambda (opt-in via LAMBDA_API_KEY) and
+Hyperstack (opt-in via HYPERSTACK_API_KEY) — all implement the SAME ``base.Provider`` interface
+behind the SAME module layout, so the orchestrator/allocator treat them interchangeably."""
 
 from __future__ import annotations
 

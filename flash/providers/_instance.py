@@ -172,8 +172,14 @@ docker run -d --name flashrun --gpus all --shm-size=16g --network host \\
   -v /opt/flash:/root/flash -w /root/flash \\
   "$IMAGE" python /root/flash/bootstrap.py || fail "docker run failed"
 sleep 5
-docker ps --filter name=flashrun --filter status=running -q | grep -q . \\
-  || {{ docker logs flashrun >>/opt/flash/host_boot.log 2>&1 || true; fail "worker container did not start"; }}
+# The container must be running OR have already exited CLEANLY: an already-complete retry restores
+# the prior metrics and writes DONE in well under 5s, so a clean exit (code 0) is success, not a
+# failed start. Only a non-zero exit (or never-started) is a real, retriable failure.
+if ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
+  EXIT="$(docker inspect -f '{{{{.State.ExitCode}}}}' flashrun 2>/dev/null || echo 1)"
+  docker logs flashrun >>/opt/flash/host_boot.log 2>&1 || true
+  [ "$EXIT" = "0" ] || fail "worker container did not start (exit ${{EXIT}})"
+fi
 # Mirror the container's stdout into the host boot log (detached) so an early in-container crash is
 # visible on HF even if it dies before uploading its own console artifact.
 ( docker logs -f flashrun >>/opt/flash/host_boot.log 2>&1 || true ) &

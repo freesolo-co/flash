@@ -34,6 +34,10 @@ def test_is_not_found_keys_off_status_code_not_bare_404():
     # no chained cause: only an unambiguous "HTTP 404" token counts, never a bare "404"
     assert is_not_found(RuntimeError("GET /x -> HTTP 404: Not Found")) is True
     assert is_not_found(RuntimeError("GET /core/virtual-machines/1404 failed after 5 attempts")) is False
+    # a STATUS-like number that merely begins 404 must NOT match (trailing-\b rejects HTTP 4040/4041)
+    assert is_not_found(RuntimeError("GET /x -> HTTP 4040: weird")) is False
+    assert is_not_found(RuntimeError("GET /x -> HTTP 4041")) is False
+    assert is_not_found(RuntimeError("GET /x -> HTTP 404")) is True  # trailing token at end-of-string
 
 
 def test_lambda_terminate_is_per_id_isolated(monkeypatch):
@@ -134,3 +138,22 @@ def test_user_data_fails_fast_and_throttles_bootlog():
     assert 'fail "worker container did not start' in s
     assert "sleep 120" in s  # boot-log throttled to 120s
     assert "sleep 30;" not in s  # NOT the old 30s-forever loop
+    # A fast CLEAN exit (already-complete retry restores metrics + DONE in <5s) is success, not a
+    # failed start: the script inspects the container exit code and only fails on a non-zero exit.
+    assert "{{.State.ExitCode}}" in s
+    assert '[ "$EXIT" = "0" ]' in s
+
+
+def test_instance_realized_cost_is_wall_times_rate():
+    """Lambda/Hyperstack have no billing API; realized COGS = wall(launch->end) x flat $/hr."""
+    from flash.providers.realized import realized_cost_for_remote
+
+    remote = {"provider": "lambda", "instance_id": "i-9", "hourly_usd": 1.20, "started_ts": 1000.0}
+    rc = realized_cost_for_remote(remote, start=999.0, end=4600.0)  # 3600s = 1h after launch
+    assert rc is not None
+    assert rc.provider == "lambda"
+    assert rc.realized_usd == 1.20  # 1h x $1.20
+    assert rc.wall_seconds == 3600.0
+    assert rc.by_resource == {"gpu": 1.20}
+    # no rate on the handle -> unattributable (stays unreconciled, never books $0)
+    assert realized_cost_for_remote({"provider": "hyperstack", "vm_id": "v"}, start=0, end=10) is None

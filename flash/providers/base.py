@@ -412,12 +412,13 @@ class Provider(Protocol):
         """Best-effort: reap any resource this run may have left registered."""
         ...
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
+    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int | str]:
         """Destroy any billable resource this provider owns that no live run claims.
 
         Crash recovery: run at server startup (and after runs). ``active_labels`` is the
         set of instance-label PREFIXES still owned by recoverable runs — anything this
         provider rented that matches none of them is an orphan. Returns the destroyed
-        resource ids. Providers without a standing-billing substrate (RunPod's
-        serverless endpoints self-reap) implement this as a no-op."""
+        resource ids (RunPod uses int ids; the instance providers use opaque string ids).
+        Providers without a standing-billing substrate (RunPod's serverless endpoints
+        self-reap) implement this as a no-op."""
         ...

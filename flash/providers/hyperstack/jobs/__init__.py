@@ -108,15 +108,34 @@ def launch_and_submit(
     candidates = list(instances)
     refreshed = False
     last_err: Exception | None = None
+
+    def refresh_once(gpu: str) -> None:
+        """One forced stock re-fetch when the walk is exhausted (the alloc cache is ~45s stale)."""
+        nonlocal refreshed, candidates
+        if not candidates and not refreshed:
+            refreshed = True
+            candidates = [
+                c for c in usable_instances(gpu, force=True) if c.region not in tried_regions
+            ]
+
     while candidates:
         inst = candidates.pop(0)
         if inst.region in tried_regions:
             continue
         tried_regions.add(inst.region)
+        # Pre-launch resolution: pick a boot image whose host CUDA covers this GPU class's floor
+        # (Blackwell needs 13) and the SSH key. These run BEFORE any non-idempotent launch, so a
+        # failure here (e.g. the region advertises stock but has no qualifying CUDA image) created NO
+        # VM — it is a CLEAN region skip, never an ambiguous phantom. Walk to the next region.
         try:
-            # Pick a boot image whose host CUDA covers this GPU class's floor (Blackwell needs 13).
             image = hs_api.docker_image_for_region(inst.region, min_cuda=min_cuda_modern(inst.gpu))
             key_name = hs_api.resolve_key_name(inst.environment)
+        except hs_api.HyperstackApiError as e:
+            last_err = e
+            say(f"region {inst.region} ({inst.gpu} {inst.flavor}) unusable (no boot image/key): {e}")
+            refresh_once(inst.gpu)
+            continue
+        try:
             vm_id = hs_api.launch_vm(
                 name=name,
                 environment_name=inst.environment,
@@ -139,12 +158,7 @@ def launch_and_submit(
                     f"ambiguous Hyperstack launch failure (possible phantom reaped): {e}"
                 ) from e
             say(f"region {inst.region} ({inst.gpu} {inst.flavor}) rejected: {e}")
-            if not candidates and not refreshed:
-                refreshed = True
-                # Force a fresh stock fetch (the allocation cache is ~45s stale).
-                candidates = [
-                    c for c in usable_instances(inst.gpu, force=True) if c.region not in tried_regions
-                ]
+            refresh_once(inst.gpu)
             continue
         say(
             f"launched hyperstack vm {vm_id}: {inst.gpu} {inst.flavor} "

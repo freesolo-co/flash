@@ -4,16 +4,18 @@ Given a base model (+ algorithm), compute the VRAM the FULL run needs — sized 
 heavier phase, GRPO, since the typical pipeline is SFT followed by GRPO — then rank every
 fitting candidate by $/hr and pick the cheapest:
 
-  runpod  every validated Flash-provisionable class (static $/hr)
-  lambda  every fitting class that currently has LIVE regional capacity (live $/hr); opt-in,
-          available only when LAMBDA_API_KEY is set on the control plane
+  runpod      every validated Flash-provisionable class (static $/hr)
+  lambda      every fitting class that currently has LIVE regional capacity (live $/hr); opt-in,
+              available only when LAMBDA_API_KEY is set on the control plane
+  hyperstack  every fitting class whose single-GPU flavor currently has STOCK (static $/hr); opt-in,
+              available only when HYPERSTACK_API_KEY is set on the control plane
 
-RunPod's cheaper static rates almost always win on price, so Lambda joins the ranked list as a
-capacity COMPLEMENT: when RunPod's cheapest fitting class is out of capacity (THROTTLED / queue
-backstop), the runner's gpu-walk steps down the ranked list and reaches the in-capacity Lambda
-class. Lambda candidates are capacity-filtered up front (``_lambda_candidates`` only offers a
-class with a region advertising capacity), so the walk never lands on a class that would just
-fail to launch.
+RunPod's cheaper static rates almost always win on price, so the instance providers (Lambda,
+Hyperstack) join the ranked list as capacity COMPLEMENTS: when RunPod's cheapest fitting class is
+out of capacity (THROTTLED / queue backstop), the runner's gpu-walk steps down the ranked list and
+reaches an in-capacity instance class. Both instance providers are capacity-filtered up front
+(``_lambda_candidates`` / ``_hyperstack_candidates`` only offer a class a region/flavor can supply
+right now), so the walk never lands on a class that would just fail to launch.
 
 Allocation happens at SUBMIT time in the runner. The parse-time resolution in schema is a
 RunPod-static provisional for validation/dry-run display.

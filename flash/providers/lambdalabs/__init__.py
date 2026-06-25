@@ -123,12 +123,13 @@ class LambdaProvider:
 
         terminate_run_instances(spec.run_id)
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[int]:
-        """Lambda crash-recovery sweep (called via the provider object at startup)."""
+    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[str]:
+        """Lambda crash-recovery sweep (called via the provider object at startup).
+
+        Lambda instance ids are opaque hex STRINGS (the ``base.Provider`` protocol widens the return
+        to ``list[int | str]`` to cover both substrates); the orchestrator only logs/counts them."""
         from flash.providers.lambdalabs.jobs import sweep_orphans
 
-        # Lambda instance ids are opaque hex strings; the base.Provider signature types the return
-        # as list[int] (RunPod/legacy ids were ints), but the orchestrator only logs/counts them.
         return sweep_orphans(active_labels=active_labels)
 
 

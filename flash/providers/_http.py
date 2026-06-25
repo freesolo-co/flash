@@ -12,11 +12,17 @@ import contextlib
 import json
 import os
 import random
+import re
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from typing import Any
+
+# An unambiguous ``HTTP 404`` token: ``http 404`` bounded so a longer status-LIKE number can't
+# match. ``\b`` after ``404`` rejects ``HTTP 4040``/``HTTP 4041`` (digit immediately after), while
+# still matching ``HTTP 404:``, ``HTTP 404 Not Found``, and a trailing ``HTTP 404`` at end-of-string.
+_HTTP_404_RE = re.compile(r"\bhttp 404\b")
 
 
 def is_not_found(err: Exception) -> bool:
@@ -26,13 +32,14 @@ def is_not_found(err: Exception) -> bool:
     fast-failed 4xx (and on the "failed after N attempts" path), so the status CODE is authoritative
     when a cause is present: 404 == gone, anything else (403/401/5xx) is a real failure that must NOT
     be swallowed. We only fall back to a text match when there is no HTTPError cause, and even then
-    only on an unambiguous ``HTTP 404`` token — NEVER a bare ``"404"`` substring, which would
-    misfire on a transient 5xx whose error text embeds a resource id containing the digits 404
-    (Hyperstack VM ids are short integers). Mirrors ``runpod.api._is_not_found``."""
+    only on an unambiguous ``HTTP 404`` TOKEN (``_HTTP_404_RE``) — NEVER a bare ``"404"`` substring,
+    and never ``HTTP 4040``/``4041``: the regex's trailing ``\\b`` rejects a longer number that just
+    begins ``404``, so a transient 5xx whose error text embeds a resource id starting with 404
+    (Hyperstack VM ids are short integers) is not misread as gone. Mirrors ``runpod.api._is_not_found``."""
     cause = getattr(err, "__cause__", None)
     if isinstance(cause, urllib.error.HTTPError):
         return cause.code == 404
-    return "http 404" in str(err).lower()
+    return bool(_HTTP_404_RE.search(str(err).lower()))
 
 
 class RestClient:
