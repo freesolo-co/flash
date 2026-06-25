@@ -1285,6 +1285,75 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
         assert st.state == "done"
 
 
+def test_attach_recovery_purges_before_clearing_handle(monkeypatch):
+    """Lso: the stale-artifact purge must run BEFORE the _update that durably clears the handle and
+    records resume_seed_index. Once that persists, a control-plane kill in the gap routes the next
+    restart to resume_run (not back here); if the purge ran only afterwards, that relaunch would start
+    attempt 0 over un-purged stale boot/marker artifacts. Assert the purge observes the handle still
+    present (proving it ran first)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.train as flash_train
+        from flash.runner import deploy
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="p1", state="running", spec=_spec("p1").to_dict(), cost_usd=0.0,
+                remote={"endpoint_id": "epA", "endpoint_name": "n", "job_id": "jA", "seed": 0},
+            )
+        )
+        monkeypatch.setattr(
+            jobs, "poll_job",
+            lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="host vanished"),
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        observed = {}
+
+        def fake_purge(spec, seed, log):
+            observed["remote_at_purge"] = orch.get_status(spec.run_id).remote
+            observed["seed"] = seed
+
+        monkeypatch.setattr(deploy, "_purge_stale_seed_artifacts", fake_purge)
+        monkeypatch.setattr(
+            orch, "_run_seed_loop",
+            lambda spec, log, *, start_index, prior_cost: orch._update(spec.run_id, "done", cost_usd=prior_cost),
+        )
+        orch.attach_run("p1", log_stream=sys.stderr)
+        assert observed["remote_at_purge"] is not None, "purge must run BEFORE the handle (remote) is cleared"
+        assert observed["seed"] == 0
+
+
+def test_resume_run_purges_stale_artifacts_for_resumed_seed(monkeypatch):
+    """Lso defense-in-depth: resume_run is the durable continuation of an attach_run recovery (a kill
+    after it persisted remote=None+resume_seed_index but before its in-process purge). resume_run must
+    itself purge the resumed seed's stale liveness artifacts (spec.train.seeds[resume_seed_index]) so a
+    leftover boot.log / error / attempt marker can't mislead the fresh attempt-0 box."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.train as flash_train
+        from flash.runner import deploy
+
+        orch._save_status(
+            orch.RunStatus(
+                run_id="r1", state="running", spec=_spec("r1").to_dict(), cost_usd=0.0,
+                remote=None, resume_seed_index=0,
+            )
+        )
+        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
+        observed = {}
+        monkeypatch.setattr(
+            deploy, "_purge_stale_seed_artifacts",
+            lambda spec, seed, log: observed.update(seed=seed),
+        )
+        monkeypatch.setattr(
+            orch, "_run_seed_loop",
+            lambda spec, log, *, start_index, prior_cost: orch._update(spec.run_id, "done", cost_usd=prior_cost),
+        )
+        orch.resume_run("r1", log_stream=sys.stderr)
+        assert observed["seed"] == 0  # seeds[resume_seed_index=0] == seed 0
+
+
 def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
     # The resume delegates the genuine-vs-infra decision to the seed loop (unchanged): a run that
     # is truly broken reproduces the failure on the resumed attempt, the seed loop fails it, and
@@ -1782,8 +1851,11 @@ def test_purge_stale_seed_artifacts_deletes_only_this_seeds_liveness_files(monke
     HF prefix; _purge_stale_seed_artifacts clears the abandoned attempt's SEED-scoped liveness files so a
     stale one can't falsely satisfy the fresh post-recovery box's first-liveness check (a silently-dead
     replacement would burn the full setup grace) NOR be mistaken for its own crash (the dead-host branch
-    trusts error_<phase>.txt on attempt 0). It must delete ONLY the boot.logs (attempt-scoped + legacy)
-    AND error_<phase>.txt under THIS seed's prefix, leaving worker artifacts and other seeds untouched."""
+    trusts error_<phase>.txt on attempt 0) NOR be read as the new attempt-0 box's own attempt marker
+    (fail_from_marker would return the abandoned attempt's stale verdict / quarantine). It must delete
+    ONLY the boot.logs (attempt-scoped + legacy), error_<phase>.txt, AND the <arm>_attempt<N>.json
+    markers under THIS seed's prefix, leaving worker artifacts (incl. metrics.json / job_spec.json) and
+    other seeds untouched."""
     import io
 
     from flash.runner import deploy
@@ -1800,11 +1872,15 @@ def test_purge_stale_seed_artifacts_deletes_only_this_seeds_liveness_files(monke
         f"{prefix}/lambda_attempt1_boot.log",  # another attempt's -> delete
         f"{prefix}/lambda_boot.log",  # legacy boot log -> delete
         f"{prefix}/error_rl.txt",  # stale per-attempt crash traceback -> delete
-        f"{prefix}/metrics.json",  # worker artifact -> KEEP
+        f"{prefix}/lambda_attempt0.json",  # stale attempt marker (would re-read old verdict) -> delete
+        f"{prefix}/lambda_attempt1.json",  # another attempt's marker -> delete
+        f"{prefix}/metrics.json",  # worker artifact (no "_attempt") -> KEEP
+        f"{prefix}/job_spec.json",  # spilled spec (no "_attempt") -> KEEP
         f"{prefix}/DONE",  # worker artifact -> KEEP
         f"{prefix}/console_rl.txt",  # NOT an error_*.txt -> KEEP
         f"{prefix}/checkpoints/step-1/adapter/adapter_model.safetensors",  # KEEP
         f"{spec.phase}/flash-xyz/seed1/lambda_attempt0_boot.log",  # DIFFERENT seed -> KEEP
+        f"{spec.phase}/flash-xyz/seed1/lambda_attempt0.json",  # DIFFERENT seed marker -> KEEP
         f"{spec.phase}/flash-xyz/seed1/error_rl.txt",  # DIFFERENT seed -> KEEP
     ]
     deleted: list[str] = []
@@ -1827,6 +1903,8 @@ def test_purge_stale_seed_artifacts_deletes_only_this_seeds_liveness_files(monke
             f"{prefix}/lambda_attempt1_boot.log",
             f"{prefix}/lambda_boot.log",
             f"{prefix}/error_rl.txt",
+            f"{prefix}/lambda_attempt0.json",
+            f"{prefix}/lambda_attempt1.json",
         ]
     )
 

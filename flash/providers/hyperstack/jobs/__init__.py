@@ -673,7 +673,15 @@ def poll_hs_job(
                 # within one poll interval, before surface_heartbeat() ran this iteration. Nor is it a
                 # region fault if WE killed the box: a user cancel during setup deletes the VM, which
                 # lands here with no training heartbeat -> run_cancelled() suppresses the quarantine.
-                host_fault=not worker_crashed and not reached_training_now() and not run_cancelled(),
+                # Nor is a region-independent retriable worker fault: a pre-training GitHubRateLimitError
+                # stamps a fresh host_neutral retriable heartbeat (and retries via job_preempted above),
+                # but if its attempt marker is missing (upload failed / VM lost before it wrote) we land
+                # here instead of fail_from_marker; mirror that path's fresh_host_neutral_hb() guard so a
+                # global GitHub/control-plane rate limit doesn't quarantine an otherwise-healthy region.
+                host_fault=not worker_crashed
+                and not reached_training_now()
+                and not run_cancelled()
+                and not fresh_host_neutral_hb(),
             )
 
         raw_marker = marker_reader()

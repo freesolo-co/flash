@@ -141,11 +141,16 @@ def _purge_stale_seed_artifacts(spec: JobSpec, seed: int, log) -> None:
       deterministic crash on attempt 0 (no prior attempt assumed). A leftover would make a fresh
       attempt-0 box that's LOST before producing any signal be mis-classified terminal ``job_failed``
       instead of retrying the recoverable host loss.
+    - ``<arm>_attempt<N>.json`` — the attempt-failure marker (``fail_from_marker``). The relaunch
+      restarts at attempt 0, so a leftover ``<arm>_attempt0.json`` from the abandoned attempt is read by
+      the fresh attempt-0 box's poller BEFORE it writes its own -> it immediately returns the stale
+      ``job_preempted`` / ``job_failed`` (or, for a retriable pre-training marker, quarantines the new
+      region) without the new worker ever running.
 
-    Clearing both lets the relaunch start from a clean slate (a healthy new box rewrites its own; a dead
-    one leaves none -> correct fast failover / retry). Only these liveness artifacts are removed (the
-    worker owns/needs DONE/metrics/adapter/checkpoints). Best-effort, never raises into recovery; a
-    no-op for RunPod (it writes neither)."""
+    Clearing all three lets the relaunch start from a clean slate (a healthy new box rewrites its own; a
+    dead one leaves none -> correct fast failover / retry). Only these liveness artifacts are removed
+    (the worker owns/needs DONE/metrics/adapter/checkpoints). Best-effort, never raises into recovery; a
+    no-op for RunPod (it writes none)."""
     import os
 
     repo = spec.train.hf_repo
@@ -157,7 +162,12 @@ def _purge_stale_seed_artifacts(spec: JobSpec, seed: int, log) -> None:
         if not path.startswith(prefix + "/"):
             return False
         name = path.rsplit("/", 1)[-1]
-        return name.endswith("_boot.log") or (name.startswith("error_") and name.endswith(".txt"))
+        return (
+            name.endswith("_boot.log")
+            or (name.startswith("error_") and name.endswith(".txt"))
+            # attempt-failure marker <arm>_attempt<N>.json (metrics.json / job_spec.json lack "_attempt")
+            or (name.endswith(".json") and "_attempt" in name)
+        )
 
     try:
         from huggingface_hub import HfApi
@@ -239,16 +249,20 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             # restart mid-allocation resumes the right one.
             with contextlib.suppress(Exception):
                 _gc_run_endpoints(spec)
+            # The relaunched seed loop restarts at attempt 0 under this same prefix; clear the abandoned
+            # box's seed-scoped liveness artifacts (boot logs + error_<phase>.txt + attempt markers) so a
+            # stale one can't falsely satisfy the fresh box's first-liveness check, be mistaken for its
+            # own crash, or be read as its own attempt marker (see _purge_stale_seed_artifacts). Purge
+            # BEFORE the _update that durably clears the handle: once remote=None+resume_seed_index are
+            # persisted, a control-plane kill in this window routes the next restart to resume_run (which
+            # also purges, belt-and-suspenders) rather than back here, so the purge must already be done.
+            # Best-effort — never blocks the resume.
+            _purge_stale_seed_artifacts(spec, seed, log)
             # Bail if the run was raced to terminal during the long poll above: _update's CAS
             # returns False, and resuming would submit paid work for a dead run.
             if not _update(run_id, "running", remote=None, resume_seed_index=seed_index):
                 print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
                 return get_status(run_id)
-            # The relaunched seed loop restarts at attempt 0 under this same prefix; clear the abandoned
-            # box's seed-scoped liveness artifacts (boot logs + error_<phase>.txt) first so a stale one
-            # can't falsely satisfy the fresh box's first-liveness check or be mistaken for its own crash
-            # (see _purge_stale_seed_artifacts). Best-effort — never blocks the resume.
-            _purge_stale_seed_artifacts(spec, seed, log)
             _run_seed_loop(
                 spec, log, start_index=seed_index, prior_cost=float(status.cost_usd or 0.0)
             )
@@ -347,6 +361,14 @@ def resume_run(run_id: str, log_stream=None) -> RunStatus:
     spec = JobSpec.from_dict(status.spec)
     log = log_stream or sys.stderr
     print(f"resuming {run_id}: remaining seeds from index {status.resume_seed_index}", file=log)
+    # The seed loop restarts the resumed seed at attempt 0 under the same HF prefix. When this resume is
+    # the durable continuation of an attach_run recovery (kill after it persisted remote=None but before
+    # its in-process purge), clear that seed's stale liveness artifacts here too so a leftover boot.log /
+    # error_<phase>.txt / attempt marker can't mislead the fresh box. A no-op for the normal inter-seed
+    # gap (the next seed has no prior-attempt artifacts under its own prefix). Best-effort.
+    _seeds = list(spec.train.seeds)
+    if 0 <= status.resume_seed_index < len(_seeds):
+        _purge_stale_seed_artifacts(spec, _seeds[status.resume_seed_index], log)
     try:
         _run_seed_loop(
             spec,

@@ -700,6 +700,27 @@ def test_poll_github_ratelimit_heartbeat_not_quarantined(monkeypatch):
     assert not res.host_fault  # host_neutral hb: global rate limit, not a sick region -> NO quarantine
 
 
+def test_poll_dead_vm_neutral_heartbeat_without_marker_not_quarantined(monkeypatch):
+    """Same region-INDEPENDENT GitHubRateLimitError, but the attempt marker never landed (its upload
+    failed, or the VM was lost before write) so we hit the DEAD-VM branch instead of fail_from_marker.
+    That branch must apply the same fresh_host_neutral_hb() guard the marker path does: retry the global
+    rate limit (job_preempted via the retriable hb) WITHOUT quarantining an otherwise-healthy region.
+    Pre-fix this branch set host_fault unconditionally on a pre-training loss -> false quarantine."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}, {"status": "ERROR"}],
+        # NO marker -> falls through terminal_artifact_result() to the dead-VM branch
+    )
+    res = jobs.poll_hs_job(
+        _handle(), _spec(), seed=0, interval_s=0,
+        heartbeat_reader=lambda force=False: {
+            "stage": "error_rl", "ts": 10_000.0, "retriable": True, "host_neutral": True
+        },
+    )
+    assert not res.ok
+    assert res.failure == "job_preempted"  # retriable hb -> retry on a fresh host
+    assert not res.host_fault  # host_neutral hb on the dead-VM path: NO quarantine of a healthy region
+
+
 def test_poll_reattach_just_active_floored_by_observed_grace(monkeypatch):
     """On a reattach whose first poll already sees the VM active, active_since is launch-anchored, so
     the launch-relative first_liveness deadline is already blown. The observed-grace floor stops a VM
