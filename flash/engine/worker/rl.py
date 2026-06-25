@@ -117,10 +117,13 @@ def run_rl():
         import torch as _torch_card
 
         if _torch_card.cuda.is_available():
-            # Binary GiB (/(1024**3)), NOT decimal GB (/1e9 over-reports ~7%): grpo_fits_resident's
-            # VRAM estimate is in GiB, so a decimal card size would make a marginal card look big
-            # enough to fit resident and wrongly disable sleep, risking OOM.
-            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
+            # Decimal GB (/1e9), matching grpo_fits_resident's comparison target: estimate_vram_gb
+            # measures peak in decimal GB (its byte-counting logits terms divide by 1e9), and
+            # rl_per_device_comps sizes the micro-batch in decimal GB too. Binary GiB here would
+            # UNDER-report the card ~7% vs the estimate, so a card that genuinely fits resident
+            # could be told it doesn't (or the micro-batch could assume headroom the gate denied);
+            # one unit everywhere keeps the resident-fit decision and the micro-batch cap consistent.
+            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
     except Exception as _e:
         print("[rl] card VRAM probe failed (sleep-mode gate falls back to size/context):", _e)
     _lora_rank = int(_t.lora_rank) if _t and _t.lora_rank else 32

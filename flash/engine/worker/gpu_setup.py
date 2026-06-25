@@ -67,8 +67,10 @@ def finalize_alloc_conf_for_sleep() -> None:
             import torch as _torch_card
 
             if _torch_card.cuda.is_available():
-                # Binary GiB to match grpo_fits_resident (see run_rl); /1e9 over-reports ~7%.
-                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
+                # Decimal GB (/1e9) to match grpo_fits_resident's comparison target (see run_rl):
+                # estimate_vram_gb is decimal, so the card size fed to the same sleep gate must be
+                # decimal too or this alloc-conf decision would diverge from the trainer's.
+                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / 1e9
         except Exception:
             card_gb = 0.0
         # Resolve group_size EXACTLY as run_rl does (gcfg override, else the recipe default), not a

@@ -104,8 +104,16 @@ def run_logs(run_id: str, key: Annotated[dict, Depends(require_key)], offset: in
     chunk, end = "", max(0, offset)
     if os.path.exists(log_path):
         with open(log_path) as f:
-            f.seek(end)
-            chunk = f.read()
+            # A client-supplied/stale `offset` is only guaranteed valid as a cookie from a prior
+            # `.tell()` on this exact file; an arbitrary one can raise ValueError/OSError on a text
+            # stream. That's a bad-request, not a 500 — surface it as a clear 400.
+            try:
+                f.seek(end)
+                chunk = f.read()
+            except (ValueError, OSError) as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"invalid log offset {offset}: {exc}"
+                ) from exc
             end = f.tell()
     return {
         "run_id": run_id,
