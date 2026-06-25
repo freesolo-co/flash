@@ -661,6 +661,16 @@ def create_app():
             # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't be
             # silently overwritten by the deployment record.
             prev_state = status.state
+            # Attribute the adapter to the RUN's owning org (the same org billed for the run,
+            # persisted in billing_context), so serving can authorize external chat by org. This
+            # matches the caller's key for a user deploy, but an internal/operator deploy must
+            # still land on the run's owner; fall back to the caller's key when there's no context.
+            run_billing = getattr(status, "billing_context", None) or {}
+            deploy_org_id = (
+                str(run_billing.get("org_id") or "").strip()
+                or str(key.get("org_id") or "").strip()
+                or None
+            )
             try:
                 dep = deploy_adapter(
                     run_id=run_id,
@@ -671,9 +681,7 @@ def create_app():
                     dry_run=dry_run,
                     # a run trained with thinking serves with thinking (per-run parity)
                     thinking=spec.thinking,
-                    # attribute the adapter to the deploying org so serving can authorize
-                    # external chat by org (hosted_lora_adapters.org_id)
-                    org_id=str(key.get("org_id") or "").strip() or None,
+                    org_id=deploy_org_id,
                 )
             except ServingError as exc:
                 # The serving backend rejected the registration or was unreachable. This is an

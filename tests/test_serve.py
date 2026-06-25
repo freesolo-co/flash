@@ -319,6 +319,7 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
     import flash.serve.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
     seen = {}
 
     class _StreamResp:
@@ -377,6 +378,8 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
     assert chunks == ["hi", " there"]
     assert seen["client_kwargs"]["follow_redirects"] is True
     assert seen["method"] == "POST"
+    # Trusted-caller bypass: chat_stream presents the internal key, like the non-streaming chat.
+    assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     assert seen["url"] == "https://serve.example/v1/chat/completions"
     assert seen["json"]["stream"] is True
     assert seen["json"]["model"] == "flash-7-abcd"

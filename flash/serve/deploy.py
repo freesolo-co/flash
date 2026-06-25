@@ -11,12 +11,14 @@ The serving service exposes:
 
 - ``POST {FREESOLO_SERVING_URL}/adapters`` — register/deploy an adapter (auth header).
 - ``DELETE {FREESOLO_SERVING_URL}/adapters/{adapterId}`` — undeploy (auth header).
-- ``POST {FREESOLO_SERVING_URL}/v1/chat/completions`` — OpenAI-style chat (no auth).
+- ``POST {FREESOLO_SERVING_URL}/v1/chat/completions`` — OpenAI-style chat.
 - ``GET {FREESOLO_SERVING_URL}/healthz`` / ``GET .../adapters`` — health / list.
 
 The registration/teardown calls carry the shared ``X-Freesolo-Internal-Key`` header
-(the same internal credential flash already holds, ``FREESOLO_INTERNAL_KEY``); chat is
-unauthenticated.
+(the same internal credential flash already holds, ``FREESOLO_INTERNAL_KEY``). The chat
+calls also send it: the control plane is a trusted server-to-server caller (it has already
+authorized the user's key on its own ``/v1/runs/{run_id}/chat`` route), so it uses the
+serving app's internal-key bypass when serving enforces external chat auth.
 """
 
 from __future__ import annotations
@@ -193,9 +195,11 @@ def deploy_adapter(
     }
     # Attribute the adapter to the deploying org so serving can authorize external chat by org:
     # the backend maps adapterId -> org via hosted_lora_adapters.org_id, which serving persists
-    # from this field. Omitted when unknown (older callers) so the registration shape is unchanged.
-    if org_id:
-        body["orgId"] = org_id
+    # from this field. Normalize (strip) and omit when blank (older callers / whitespace) so the
+    # registration shape is unchanged and a stray " org " can't mis-attribute the adapter.
+    normalized_org_id = (org_id or "").strip()
+    if normalized_org_id:
+        body["orgId"] = normalized_org_id
     _post_adapter_or_raise(f"{base}/adapters", body)
     logger.info("registered adapter %s with freesolo serving (%s)", run_id, base)
     return dep
