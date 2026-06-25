@@ -91,6 +91,25 @@ def _regions() -> list[str]:
     return [n for n in names if n.upper() not in blocked]
 
 
+# Hyperstack regions that DON'T support block-volume operations. LIVE-FOUND: CANADA-2 returns HTTP 400
+# "Volume operations are not supported in this region" on create — the region is launchable for COMPUTE
+# but has no volume backend, so the cache can't live there. Mirrors RunPod's _VOLUME_INCAPABLE_DATACENTERS.
+# These regions stay in `_regions()` (still usable for GPU launches), but the cache provisioner and the
+# launch-time attach skip them rather than burning a guaranteed-failing API call (the launch path already
+# degrades to a cold run there, so a stale list is graceful — but list a region here to silence the noise).
+_VOLUME_INCAPABLE_REGIONS = frozenset({"CANADA-2"})
+
+
+def region_supports_cache(region: str) -> bool:
+    """Whether the weight cache can be stored in ``region`` (False for known volume-incapable regions)."""
+    return region not in _VOLUME_INCAPABLE_REGIONS
+
+
+def cache_regions() -> list[str]:
+    """The subset of ``_regions()`` that supports block volumes — where the cache is provisioned."""
+    return [r for r in _regions() if region_supports_cache(r)]
+
+
 def flavors_by_region(force: bool = False) -> dict[str, list[dict]]:
     """``region -> [flavor dict]`` across all regions, cached for ``_FLAVORS_TTL_S``.
 
@@ -418,6 +437,82 @@ def delete_vm(vm_id: str) -> bool:
             return True
         logger.warning("hyperstack delete_vm(%s) failed: %s", vm_id, exc)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Volumes (the weight cache). Region/environment-scoped block storage; created via the API, attached
+# to a VM AFTER launch, then formatted+mounted in the VM by the cloud-init preamble. Block volumes
+# are single-attach (one VM at a time) — concurrent same-region runs fall back to cold.
+# ---------------------------------------------------------------------------
+_CACHE_VOLUME_TYPE = "Cloud-SSD"
+
+
+def list_volumes() -> list[dict]:
+    """All volumes: ``[{id, name, environment:{name,region}, status, attachments}, ...]``."""
+    out = request_with_retries("/core/volumes")
+    vols = out.get("volumes") if isinstance(out, dict) else None
+    return vols if isinstance(vols, list) else []
+
+
+def create_volume(name: str, environment_name: str, size_gb: int) -> dict:
+    """Create a ``Cloud-SSD`` volume in ``environment_name`` -> its object (incl. integer ``id``)."""
+    body = {
+        "name": name,
+        "environment_name": environment_name,
+        "volume_type": _CACHE_VOLUME_TYPE,
+        "size": int(size_gb),
+    }
+    out = request_with_retries("/core/volumes", method="POST", body=body, retries=2)
+    return (out.get("volume") if isinstance(out, dict) else None) or {}
+
+
+def delete_volume(volume_id) -> bool:
+    """Delete a volume by id (best-effort)."""
+    try:
+        request_with_retries(f"/core/volumes/{volume_id}", method="DELETE", retries=2)
+        return True
+    except Exception as exc:
+        logger.warning("hyperstack delete_volume(%s) failed: %s", volume_id, exc)
+        return False
+
+
+def attach_volume(vm_id: str, volume_id) -> bool:
+    """Attach a volume to a VM (best-effort). The cloud-init preamble then formats+mounts the device;
+    if this fails the run still proceeds COLD (the preamble degrades when no device appears)."""
+    try:
+        request_with_retries(
+            f"/core/virtual-machines/{vm_id}/attach-volumes",
+            method="POST",
+            body={"volume_ids": [volume_id]},
+            retries=2,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("hyperstack attach_volume(vm=%s, vol=%s) failed: %s", vm_id, volume_id, exc)
+        return False
+
+
+def cache_volume_name(base: str, region: str) -> str:
+    """Physical cache-volume name for ``base`` in ``region`` — DISTINCT per region.
+
+    Hyperstack enforces GLOBAL volume-name uniqueness (a plain ``flash-weights`` can exist in only ONE
+    environment account-wide; a 2nd create elsewhere returns HTTP 400 "This name is not available").
+    The cache is one logical volume (``base`` == ``spec.gpu.network_volume``, e.g. ``flash-weights``)
+    realized as one physical volume per region, so the region MUST be in the name. Mirrors RunPod's
+    per-DC ``weight_cache_volume_name``. The cloud-init preamble mounts by device size, not name, so
+    the worker is unaffected — every cache volume mounts at the same ``/mnt/flash-weights``.
+    """
+    return f"{base}-{region}".lower()
+
+
+def ensure_volume(name: str, environment_name: str, size_gb: int) -> object:
+    """Create-if-absent the cache volume ``name`` in ``environment_name``; return its id. Idempotent:
+    reuses an existing same-name volume in that environment. ``name`` MUST be globally unique — use
+    ``cache_volume_name(base, region)`` (Hyperstack rejects a duplicate name across environments)."""
+    for v in list_volumes():
+        if v.get("name") == name and (v.get("environment") or {}).get("name") == environment_name:
+            return v.get("id")
+    return create_volume(name, environment_name, size_gb).get("id")
 
 
 def delete_vms(vm_ids: list[str]) -> list[str]:
