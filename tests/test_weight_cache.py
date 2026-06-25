@@ -1248,8 +1248,15 @@ def test_instance_preload_downloads_into_cache(tmp_path, monkeypatch):
     from flash.providers import _instance_bootstrap as b
 
     calls = []
+
+    def _snap(**k):
+        # local_files_only probe -> not cached yet (force the real download); record the real call
+        if k.get("local_files_only"):
+            raise FileNotFoundError("not cached")
+        calls.append(k)
+
     hub = types.ModuleType("huggingface_hub")
-    hub.snapshot_download = lambda **k: calls.append(k)
+    hub.snapshot_download = _snap
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     hf_home = str(tmp_path / "hf-cache")
     r = b.run_preload({"env": {"HF_HOME": hf_home, "HF_TOKEN": "t"}, "models": ["a/b"]})
@@ -1257,6 +1264,32 @@ def test_instance_preload_downloads_into_cache(tmp_path, monkeypatch):
     assert not r["failed"]
     assert calls[0]["cache_dir"] == str(tmp_path / "hf-cache" / "hub")  # straight into the mount
     assert calls[0]["token"] == "t"
+    assert calls[0]["ignore_patterns"] == ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
+
+
+def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypatch):
+    """The local_files_only probe (HF's own resolution, not a dir-name guess) marks an existing
+    snapshot already_cached and does NOT re-download it."""
+    import sys
+
+    from flash.providers import _instance_bootstrap as b
+
+    real_downloads = []
+
+    def _snap(**k):
+        if k.get("local_files_only"):
+            return "/cached"  # probe SUCCEEDS -> already on the volume
+        real_downloads.append(k)  # must never be reached
+        return "/dl"
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = _snap
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    hf_home = str(tmp_path / "hf-cache")
+    r = b.run_preload({"env": {"HF_HOME": hf_home}, "models": ["a/b"]})
+    assert r["already_cached"] == ["a/b"]
+    assert r["preloaded"] == []
+    assert real_downloads == []  # no network re-download for a cache hit
 
 
 def test_instance_preload_block_device_requires_mount_sentinel(tmp_path, monkeypatch):
@@ -1289,8 +1322,14 @@ def test_instance_preload_block_device_warms_when_sentinel_present(tmp_path, mon
     from flash.providers import _instance_bootstrap as b
 
     calls = []
+
+    def _snap(**k):
+        if k.get("local_files_only"):
+            raise FileNotFoundError("not cached")  # force the real download
+        calls.append(k)
+
     hub = types.ModuleType("huggingface_hub")
-    hub.snapshot_download = lambda **k: calls.append(k)
+    hub.snapshot_download = _snap
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     mount = tmp_path
     (mount / ".flash-cache-mounted").write_text("")  # preamble's real-mount sentinel

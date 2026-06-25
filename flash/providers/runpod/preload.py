@@ -485,8 +485,15 @@ def warm_instances(models: list | None = None, gpu: str | None = None,
 
 
 def provision_lambda_filesystems(name: str | None = None) -> list[str]:
-    """Eagerly create the ``flash-weights`` filesystem in EVERY Lambda region (create-if-absent), so
-    the cache storage exists region-wide before any run lands — pure control-plane API, no GPU.
+    """Eagerly create the ``flash-weights`` filesystem in every Lambda region ``all_regions()`` can
+    enumerate (create-if-absent), so the cache storage exists before runs land — pure control-plane
+    API, no GPU.
+
+    NB: Lambda has no standalone region list, so ``all_regions()`` is the UNION of regions currently
+    advertising capacity across instance types — a region advertising ZERO capacity right now won't be
+    covered here. That's fine: the launch-time ``ensure_filesystem`` backstop creates the FS the moment
+    a run actually lands in such a region. So this is a best-effort eager warm, not a hard guarantee of
+    coverage in literally every region Lambda might ever expose.
 
     Idempotent (``ensure_filesystem`` reuses an existing same-name FS). Returns ``lambda:<region>``
     per region provisioned. A missing/empty Lambda key is not an error (logs + returns ``[]``); a

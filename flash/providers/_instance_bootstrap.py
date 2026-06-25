@@ -217,17 +217,27 @@ def run_preload(payload: dict) -> dict:
     from huggingface_hub import snapshot_download
 
     cache_dir = os.path.join(hf_home, "hub")
+    # weights + tokenizer/config only (same exclusions as prefetch_model / the image bake / the RunPod
+    # preload branch) so the warmed cache matches exactly what workers later fetch.
+    ignore_patterns = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
     done, already, failed = [], [], {}
     for repo_id in payload.get("models") or []:
         try:
-            before = os.path.isdir(cache_dir) and any(repo_id.replace("/", "--") in d for d in os.listdir(cache_dir))
-            snapshot_download(
-                repo_id=repo_id, token=token, cache_dir=cache_dir,
-                # weights + tokenizer/config only (same exclusions as prefetch_model / the image bake)
-                ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
-            )
-            (already if before else done).append(repo_id)
-            print(f"preload: {repo_id} -> {cache_dir} ({'cached' if before else 'downloaded'})", flush=True)
+            # Idempotent: probe with local_files_only (HF's own resolution, NOT a dir-name guess) — if
+            # the snapshot is already on the volume, skip the network download. Mirrors the RunPod
+            # preload branch; accurate (no repo_id.replace heuristic) and avoids re-downloading.
+            try:
+                snapshot_download(repo_id=repo_id, token=token, cache_dir=cache_dir,
+                                  ignore_patterns=ignore_patterns, local_files_only=True)
+                already.append(repo_id)
+                print(f"preload: {repo_id} -> {cache_dir} (cached)", flush=True)
+                continue
+            except Exception:
+                pass
+            snapshot_download(repo_id=repo_id, token=token, cache_dir=cache_dir,
+                              ignore_patterns=ignore_patterns)
+            done.append(repo_id)
+            print(f"preload: {repo_id} -> {cache_dir} (downloaded)", flush=True)
         except Exception as exc:
             failed[repo_id] = str(exc)
             print(f"preload FAILED {repo_id}: {exc}", flush=True)
