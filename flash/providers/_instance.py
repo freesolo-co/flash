@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -26,6 +27,14 @@ from pathlib import Path
 # is bounded to leave room for it.
 _MAX_NAME = 60
 _PREFIX_BUDGET = _MAX_NAME - 12
+
+# Above this many chars, the serialized job spec is spilled OUT of the inline cloud-init user_data
+# (uploaded to HF; the bootstrap fetches it) so a large inline spec can't overflow the provider's
+# user_data size limit and get the launch rejected before a handle is persisted. Below it the spec
+# rides inline (the common, tiny-spec case) so launch needs no extra HF round-trip. The cap is well
+# under the bootstrap's own 96_000-char execve threshold, and the base64 + heredoc framing inflates
+# user_data ~1.4x, so the spilled ceiling keeps a typical run's user_data comfortably small.
+_SPEC_SPILL_THRESHOLD = 16_000
 
 
 def run_label_prefix(run_id: str) -> str:
@@ -209,22 +218,69 @@ except Exception:
 # Without it a pre-container failure leaves NO marker, so the poller would burn the whole setup
 # grace (~50 min) before reporting a generic stall; this surfaces a fast, RETRYABLE failure so the
 # runner re-provisions on a fresh host immediately. Reads creds from the on-box payload.json.
+#
+# CRITICAL: the worker OWNS this marker path. A container that starts but fast-fails on a real,
+# non-retriable user/config error can exit before the host's ~5s liveness check, having ALREADY
+# uploaded its own ok=false marker (the TRUE error) here. The host must NOT overwrite it with a
+# RETRIABLE host marker — that would relabel a genuine user error as job_preempted and silently
+# retry / hide the root cause. So this writes the host marker ONLY when no worker attempt marker
+# yet exists at the path (i.e. the container never got far enough to write one). The check is
+# best-effort: on a read error it stays conservative and SKIPS the write (never clobbers).
 _FAILMARK_PY = """\
 import json, sys
 try:
     p = json.load(open("/opt/flash/payload.json"))
     arm = p.get("flash_arm", "instance"); att = int(p.get("attempt") or 0)
     reason = sys.argv[1] if len(sys.argv) > 1 else "host boot failure"
-    open("/opt/flash/fm.json", "w").write(json.dumps({"ok": False, "attempt": att, "retriable": True, "error": "host: " + reason}))
+    marker_path = p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + ".json"
     from huggingface_hub import HfApi
-    HfApi(token=(p.get("env") or {}).get("HF_TOKEN")).upload_file(
-        path_or_fileobj="/opt/flash/fm.json",
-        path_in_repo=p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + ".json",
-        repo_id=p["hf_repo"], repo_type="dataset",
-    )
+    api = HfApi(token=(p.get("env") or {}).get("HF_TOKEN"))
+    try:
+        worker_marker_exists = api.file_exists(repo_id=p["hf_repo"], filename=marker_path, repo_type="dataset")
+    except Exception:
+        worker_marker_exists = True  # conservative: on a read error, never risk clobbering
+    if not worker_marker_exists:
+        open("/opt/flash/fm.json", "w").write(json.dumps({"ok": False, "attempt": att, "retriable": True, "error": "host: " + reason}))
+        api.upload_file(
+            path_or_fileobj="/opt/flash/fm.json",
+            path_in_repo=marker_path,
+            repo_id=p["hf_repo"], repo_type="dataset",
+        )
 except Exception:
     pass
 """
+
+
+def _spill_large_spec_to_hf(payload: dict) -> dict:
+    """Keep a large ``job_spec_json`` OUT of the inline cloud-init user_data.
+
+    A tiny spec already yields ~17 KB of cloud-init; a 100 KB inline param balloons user_data past
+    typical provider/cloud-init user-data caps and the launch is rejected before any handle is
+    persisted (an unrecoverable, billing-invisible failure). When the spec is large we upload it to
+    the run's HF dataset repo at ``<hf_prefix>/job_spec.json`` and replace the inline value with a
+    small ``job_spec_in_hf`` sentinel; the bootstrap fetches it from the SAME repo it already pulls
+    code from. Small specs (the common case) ride inline unchanged — no extra HF round-trip.
+
+    Returns the payload to embed (a shallow copy when spilled, else the original).
+    """
+    spec_json = payload.get("job_spec_json") or ""
+    if len(spec_json) <= _SPEC_SPILL_THRESHOLD:
+        return payload
+    from huggingface_hub import HfApi
+
+    # Wrap the bytes in BytesIO: huggingface_hub.upload_file accepts a path-like for
+    # path_or_fileobj, and raw ``bytes`` is itself a valid path type, so it could be
+    # misinterpreted as a (huge) filesystem path. BytesIO makes it an unambiguous file-like upload.
+    HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
+        path_or_fileobj=io.BytesIO(spec_json.encode("utf-8")),
+        path_in_repo=f"{payload['hf_prefix']}/job_spec.json",
+        repo_id=payload["hf_repo"],
+        repo_type="dataset",
+    )
+    spilled = dict(payload)
+    spilled["job_spec_json"] = ""
+    spilled["job_spec_in_hf"] = True
+    return spilled
 
 
 def build_user_data(payload: dict, *, image: str) -> str:
@@ -236,10 +292,14 @@ def build_user_data(payload: dict, *, image: str) -> str:
     NVIDIA GPU — both shipped by the providers' default Docker-capable images — and the container
     does the rest (fetch code from HF, run the worker, stream artifacts back to HF).
 
+    A large job spec is spilled to HF first (see ``_spill_large_spec_to_hf``) so it never inflates
+    user_data past the provider's size cap.
+
     Secrets-wise the script carries the same content as the worker env on RunPod (HF token, env
     secrets). The operator's provider API key is NEVER shipped (teardown is control-plane-side via
     the runner ``finally`` / poll deadline / ``sweep_orphans``).
     """
+    payload = _spill_large_spec_to_hf(payload)
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
     bootstrap_src = (Path(__file__).parent / "_instance_bootstrap.py").read_text()
     # Weight cache: the provider mounts its region-scoped persistent storage on the HOST at
@@ -297,8 +357,12 @@ sleep 5
 # genuine success (it confirms metrics.json and uploads its ok-marker first) — so an exit code of 0
 # is itself the success signal (e.g. an already-complete retry that finished in <5s), and the host
 # must NOT write any marker for it: the worker OWNS the attempt marker, and writing to that path here
-# would clobber its ok-marker (HF listing can lag the worker's just-finished upload). Only a NON-zero
-# exit (a real crash) — or a never-started container — gets the retriable host failmark.
+# would clobber its ok-marker (HF listing can lag the worker's just-finished upload). A NON-zero
+# exit reaches fail(), but its failmark uploader is itself marker-aware: a container that started
+# and then fast-failed on a real user/config error has ALREADY written its own ok=false marker here,
+# and the host failmark SKIPS the write when that marker exists (so a genuine user error is never
+# relabeled retriable/job_preempted). Only a never-started container — no worker marker — gets the
+# retriable host failmark.
 if ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
   EXIT="$(docker inspect -f '{{{{.State.ExitCode}}}}' flashrun 2>/dev/null || echo 1)"
   docker logs flashrun >>/opt/flash/host_boot.log 2>&1 || true

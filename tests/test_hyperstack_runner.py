@@ -74,6 +74,33 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     assert payload["env"]["HF_TOKEN"] == "hf-worker-token"
 
 
+def test_image_per_sm_opt_in_selects_arch_tag(monkeypatch):
+    """Opt-in per-SM warmed images (PR #213) reach Hyperstack too: with FLASH_WORKER_IMAGE_PER_SM
+    set, the GPU class picks the matching -smXX tag. Default + FLASH_WORKER_IMAGE override unchanged.
+    NB: this is the worker *container* image, distinct from the VM *boot* image (docker_image_for_region)."""
+    from flash.providers.hyperstack.jobs import builders
+    from flash.providers.runpod.train import WORKER_IMAGE
+
+    for key in ("FLASH_WORKER_IMAGE", "FLASH_WORKER_IMAGE_PER_SM", "FLASH_WORKER_IMAGE_TEMPLATE"):
+        monkeypatch.delenv(key, raising=False)
+
+    # default: flat base image, byte-identical to pre-PR behavior
+    assert builders.hyperstack_image() == WORKER_IMAGE
+    assert builders.hyperstack_image("L40") == WORKER_IMAGE
+
+    # per-SM opt-in: the GPU class appends the arch tag, and it lands in the cloud-init
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_PER_SM", "1")
+    assert builders.hyperstack_image("L40") == f"{WORKER_IMAGE}-sm89"  # L40 = sm89
+    assert builders.hyperstack_image("H100") == f"{WORKER_IMAGE}-sm90"  # H100 = sm90
+    payload = builders.build_payload(_spec(gpu_type="L40"), seed=0, attempt=0)
+    script = builders.build_user_data(payload, gpu="L40")
+    assert f"{WORKER_IMAGE}-sm89" in script
+
+    # absolute override still wins, even with per-SM enabled and a GPU class given
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/freesolo-co/flash-worker:hotfix")
+    assert builders.hyperstack_image("L40") == "ghcr.io/freesolo-co/flash-worker:hotfix"
+
+
 # ---------------------------------------------------------------------------
 # launch_and_submit: region/stock walk
 # ---------------------------------------------------------------------------
@@ -348,11 +375,26 @@ def test_poll_success_stamps_real_cost(monkeypatch):
         monkeypatch, vms=[{"status": "ACTIVE"}], done="10500.0",
         metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
     )
-    res = jobs.poll_hs_job(_handle(), _spec(), seed=0, interval_s=0)
+    # started_ts precedes the mocked clock (starts 10_000) so wall is positive on the first tick.
+    res = jobs.poll_hs_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
     assert res.ok
     assert res.metrics["cost_usd"] > 0
     assert res.metrics["notes"]["provider"] == "hyperstack"
     assert res.metrics["notes"]["hyperstack_region"] == "CANADA-1"
+
+
+def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
+    """started_ts coerced to 0.0 (MISSING / corrupt handle) means 'unknown launch'. EVERYTHING (the
+    timeout clocks AND done_is_fresh / finish_ok's wall+cost stamping) must anchor to now, NOT the
+    1970 epoch — otherwise a booting VM stalls instantly and wall/cost are billed from 1970. DONE
+    completes the run normally with a sane (tiny) wall."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}], done="10500.0",
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}), step=10.0,
+    )
+    res = jobs.poll_hs_job(_handle(started_ts=0.0), _spec(), seed=0, interval_s=0)
+    assert res.ok, res  # not instantly stalled by an epoch-anchored clock
+    assert res.metrics["cost_usd"] < 1.0, res.metrics["cost_usd"]  # not billed from 1970
 
 
 def test_poll_marker_failure_is_job_failed(monkeypatch):
@@ -404,6 +446,53 @@ def test_poll_client_deadline(monkeypatch):
     assert not res.ok
     assert res.failure == "stalled"
     assert "deadline" in res.detail
+
+
+def test_poll_recovered_deadline_persists_done_written_during_outage(monkeypatch):
+    """A control-plane outage longer than the launch-anchored deadline must NOT discard a seed the
+    worker finished during the downtime: before returning the deadline `stalled`, poll_hs_job reads
+    terminal artifacts once and persists a fresh DONE."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}], done="10400.0",
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}), step=10.0,
+    )
+    res = jobs.poll_hs_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
+    )
+    assert res.ok, res  # success persisted, NOT a stalled-retry
+    assert res.metrics["cost_usd"] > 0
+
+
+def test_poll_recovered_deadline_without_artifacts_still_stalls(monkeypatch):
+    jobs = _wire_poll(monkeypatch, vms=[{"status": "ACTIVE"}], step=10.0)
+    res = jobs.poll_hs_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "deadline" in res.detail
+
+
+def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
+    """Reattach must pass the FULL launch-relative budget: poll_hs_job already anchors its deadline
+    to handle.started_ts (= launch), so pre-subtracting elapsed too double-counts and deletes a
+    still-valid VM once a recovered run is past half its window."""
+    from flash.providers.base import JobHandle, PollResult
+    from flash.providers.hyperstack import HyperstackProvider
+    from flash.providers.hyperstack.jobs import PROVISION_GRACE_S
+
+    captured = {}
+
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None):
+        captured["deadline_s"] = deadline_s
+        return PollResult(True)
+
+    monkeypatch.setattr("flash.providers.hyperstack.jobs.poll_hs_job", fake_poll)
+    monkeypatch.setattr("flash.providers.hyperstack.api.delete_vm", lambda vid: None)
+    spec = _spec()  # max_wall_seconds=3600
+    handle = JobHandle.from_dict({"provider": "hyperstack", **_handle(started_ts=1.0).to_dict()})
+    HyperstackProvider().poll(handle, spec, seed=0)
+    assert captured["deadline_s"] == max(60.0, 3600 + PROVISION_GRACE_S)
 
 
 def test_poll_surfaces_worker_progress(monkeypatch):

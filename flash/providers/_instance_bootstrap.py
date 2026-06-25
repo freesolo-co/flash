@@ -57,13 +57,70 @@ def hf_upload(payload: dict, local_path: str, repo_subpath: str) -> None:
         print(f"hf upload warn ({repo_subpath}): {exc}", flush=True)
 
 
+def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
+    """True iff ``<hf_prefix>/<repo_subpath>`` exists in the run's HF dataset repo.
+
+    Used to confirm a worker's REQUIRED completion artifacts actually reached HF before the
+    bootstrap treats a non-zero worker exit as success — a local /tmp/metrics.json is NOT proof,
+    since the worker writes it locally before the (required, retried) upload that can still fail
+    infra-shaped. Raises on a genuine API error so the caller can be conservative."""
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=(payload.get("env") or {}).get("HF_TOKEN"))
+    return api.file_exists(
+        repo_id=payload["hf_repo"],
+        filename=f"{payload['hf_prefix']}/{repo_subpath}",
+        repo_type="dataset",
+    )
+
+
+def remote_completion_confirmed(payload: dict) -> bool:
+    """True iff the worker's required completion artifacts (DONE + metrics.json) are on HF.
+
+    The worker uploads metrics.json then DONE, both ``required=True`` (3 retries, then raises a
+    RetriableInfraError -> non-zero exit). Confirming the REMOTE artifacts — not just the local
+    /tmp/metrics.json — is the only proof the run actually finished; a transient upload failure
+    after the local file exists must propagate as a retriable failure, not a false ok=true."""
+    try:
+        return hf_file_exists(payload, "DONE") and hf_file_exists(payload, "metrics.json")
+    except Exception as exc:
+        # A read error here is itself infra-shaped; stay conservative (treat as unconfirmed) so a
+        # non-zero worker exit propagates and retries rather than masking the failure.
+        print(f"remote-completion check warn: {exc}", flush=True)
+        return False
+
+
+def fetch_spec_from_hf(payload: dict) -> str:
+    """Download the run's spec spilled out-of-band to HF (``<hf_prefix>/job_spec.json``).
+
+    A large inline job spec (100s of KB of env params) would blow the provider's cloud-init
+    ``user_data`` size cap and get the launch rejected before any handle is persisted, so the
+    control plane (``_instance.build_user_data``) keeps it OUT of ``user_data`` and uploads it to
+    the run's HF dataset repo instead, leaving only a sentinel in the payload. The bootstrap fetches
+    it here (the code is already fetched from the same repo, so this adds no new dependency)."""
+    from huggingface_hub import hf_hub_download
+
+    local = hf_hub_download(
+        repo_id=payload["hf_repo"],
+        repo_type="dataset",
+        filename=f"{payload['hf_prefix']}/job_spec.json",
+        token=(payload.get("env") or {}).get("HF_TOKEN"),
+    )
+    with open(local) as f:
+        return f.read()
+
+
 def build_worker_env(payload: dict) -> dict:
     env = dict(os.environ)
     env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
+    # The job spec may have been spilled to HF at launch (a large inline spec would overflow the
+    # provider's cloud-init user_data cap); fetch it here when only the sentinel rode in the payload.
+    spec_json = payload.get("job_spec_json")
+    if not spec_json and payload.get("job_spec_in_hf"):
+        spec_json = fetch_spec_from_hf(payload)
     # Pass a large spec via a file, not the environment: a job spec with large inline params can
     # reach hundreds of KB, which trips execve's "Argument list too long". Mirrors
     # runpod/train.py:_train_body.
-    spec_json = payload["job_spec_json"]
     if len(spec_json) > 96_000:
         with open("/tmp/job_spec.json", "w") as f:
             f.write(spec_json)
@@ -108,8 +165,14 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
 
     def upload_console_tail(extra: str = "") -> None:
         tail_path = console + ".tail"
-        with open(console) as f:
-            tail = f.read()[-64_000:]
+        # Seek to the last 64k instead of reading the whole file: on long-running jobs the
+        # console grows unbounded and this runs on a periodic loop, so an O(n) read each pass
+        # would balloon the bootstrap container's memory/time. Read binary + decode with
+        # errors="replace" so a seek landing mid-UTF-8-sequence can't raise.
+        with open(console, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 64_000))
+            tail = f.read().decode("utf-8", "replace")
         if extra:
             tail += extra
         with open(tail_path, "w") as f:
@@ -284,13 +347,25 @@ def main() -> int:
         for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(stale)
-        # Train. Nonzero rc tolerated — RL's colocated vLLM can segfault at interpreter exit AFTER
-        # the adapter + metrics.json + DONE are saved.
-        run_mode(payload, env, phase, deadline)
+        # Train. A non-zero rc is tolerated ONLY when the run genuinely finished: RL's colocated
+        # vLLM can segfault at interpreter exit AFTER the adapter + metrics.json + DONE are saved
+        # AND uploaded. The local /tmp/metrics.json is NOT sufficient proof — the worker writes it
+        # locally before the required (retried) upload, so a transient RetriableInfraError uploading
+        # metrics.json/DONE leaves the local file present yet the run UNFINISHED (no remote
+        # artifacts). In that case the worker exits non-zero; honor it and let the run retry instead
+        # of stamping a false ok=true.
+        rc = run_mode(payload, env, phase, deadline)
         if not os.path.exists("/tmp/metrics.json"):
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}.txt and console_{phase}.txt in the HF dataset repo"
+            )
+        if rc != 0 and not remote_completion_confirmed(payload):
+            raise RuntimeError(
+                f"train phase '{phase}' exited non-zero ({rc}) and its required completion "
+                f"artifacts (DONE/metrics.json) are not on HF — the run did not finish (e.g. a "
+                f"failed upload after the local metrics.json was written); see error_{phase}.txt "
+                f"and console_{phase}.txt in the HF dataset repo"
             )
         ok = True
     except BaseException as exc:  # incl. SIGTERM's SystemExit / KeyboardInterrupt

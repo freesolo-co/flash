@@ -24,12 +24,14 @@ JobSpec [train] table is the source of truth for per-run knobs.
 from __future__ import annotations
 
 import contextlib
+import faulthandler
 import json
 import math
 import os
 import random
 import re
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -94,6 +96,7 @@ from flash.engine.worker.perf import (
     fused_optim_name,
     gpu_diagnostics,
     grad_checkpointing_on,
+    grpo_sleep_mode,
     liger_on,
     loraplus_optimizer_cls,
     optimal_attn_impl,
@@ -487,6 +490,24 @@ _HB_LOCK = threading.Lock()
 # one on HF (reorder), so this lock makes uploads strictly ordered.
 _HB_UPLOAD_LOCK = threading.Lock()
 
+# Stall diagnostics: when FLASH_STALL_FAULTHANDLER_S > 0, arm a faulthandler watchdog that dumps
+# every thread's Python stack (then exits, so the run FAILS instead of hanging until the
+# control-plane stall watchdog kills it ~25 min later, and the dump is uploaded with
+# console_<phase>.txt). The timer is re-armed on every heartbeat, so it only fires when NO progress
+# heartbeat lands for the whole window -- i.e. a real hang. OFF by default (0); opt-in per run via
+# [worker_env]. Used to localize the GRPO sleep-mode rollout hang.
+_STALL_FAULTHANDLER_S = 0
+with contextlib.suppress(Exception):
+    _STALL_FAULTHANDLER_S = int(os.environ.get("FLASH_STALL_FAULTHANDLER_S", "0") or 0)
+
+
+def _rearm_stall_faulthandler() -> None:
+    if _STALL_FAULTHANDLER_S <= 0:
+        return
+    with contextlib.suppress(Exception):
+        faulthandler.cancel_dump_traceback_later()
+        faulthandler.dump_traceback_later(_STALL_FAULTHANDLER_S, exit=True)
+
 
 def heartbeat(stage: str, **kw):
     global _HB_LAST_UPLOAD
@@ -547,6 +568,8 @@ def heartbeat(stage: str, **kw):
             finally:
                 with contextlib.suppress(OSError):
                     os.remove(up)
+    # Re-arm the stall watchdog: progress landed, so reset the no-heartbeat timer.
+    _rearm_stall_faulthandler()
     print("HEARTBEAT", json.dumps(payload))
 
 
@@ -638,16 +661,42 @@ def finalize_alloc_conf_for_sleep() -> None:
         return
     try:
         model_id = JOB_SPEC.model if JOB_SPEC else ""
-        # Resolve the GRPO context the SAME way the sleep gate does (run_rl): the run's
-        # [train].max_length, so a long-context run gets the right sleep default + alloc conf.
-        _spec_len = 0
+        # Resolve the sleep decision EXACTLY as run_rl does (grpo_sleep_mode: the size/context gate
+        # PLUS the resident-fit check against the live card), so the alloc conf matches the sleep
+        # mode the trainer will actually use.
+        _t = JOB_SPEC.train if JOB_SPEC else None
+        ctx = 0
         try:
-            if JOB_SPEC and JOB_SPEC.train and JOB_SPEC.train.max_length:
-                _spec_len = int(JOB_SPEC.train.max_length)
+            if _t and _t.max_length:
+                ctx = int(_t.max_length)
         except Exception:
-            _spec_len = 0
-        ctx = int(_spec_len or 0)
-        if not _memory_mode(model_id, ctx):  # sleep resolves OFF -> expandable is safe + better
+            ctx = 0
+        card_gb = 0.0
+        try:
+            import torch as _torch_card
+
+            if _torch_card.cuda.is_available():
+                # Binary GiB to match grpo_fits_resident (see run_rl); /1e9 over-reports ~7%.
+                card_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
+        except Exception:
+            card_gb = 0.0
+        # Resolve group_size EXACTLY as run_rl does (gcfg override, else the recipe default), not a
+        # flat 8: if the recipe's rl.group_size differs from 8 the alloc-conf sleep decision here
+        # would diverge from the trainer's, picking the wrong expandable/non-expandable conf.
+        from flash.engine.recipe import RECIPE as _RECIPE
+
+        _gcfg = grpo_overrides()
+        _group_size = int(_gcfg.get("group_size") or _RECIPE.rl.group_size)
+        sleep_on = grpo_sleep_mode(
+            model_id,
+            max_length=ctx,
+            group_size=_group_size,
+            max_tokens=(_t.max_tokens if _t else None),
+            lora_rank=int(_t.lora_rank) if _t and _t.lora_rank else 32,
+            thinking=THINKING,
+            card_vram_gb=card_gb,
+        )
+        if not sleep_on:  # sleep resolves OFF -> expandable is safe + better
             conf = "expandable_segments:True"
             os.environ["PYTORCH_ALLOC_CONF"] = conf
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = conf
@@ -1335,8 +1384,6 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     factor, so a run intended as 64 prompts/step actually optimized only
     ``64 / group_size = 8`` prompts/step (an 8x smaller effective batch).
     """
-    import math
-
     group_size = max(1, int(group_size))
     prompts_per_step = max(1, int(prompts_per_step))
     per_device = max(1, int(per_device_comps))
@@ -1345,15 +1392,21 @@ def compute_grpo_batching(prompts_per_step: int, group_size: int, per_device_com
     # a small prompts_per_step would otherwise overshoot it (mirrors run_sft's
     # `min(per_device_bs, effective_batch)`). No-op at the default (prompts_per_step=64).
     per_device = max(1, min(per_device, target_comps))
+    # per_device is the fixed VRAM knob, but when it does NOT divide target_comps neither floor
+    # nor ceil of grad_accum is right: floor (the old bug) silently optimizes FEWER prompts than
+    # requested, while ceil over-shoots and asks TRL for MORE unique prompts than the (already
+    # dataset-capped) prompts_per_step -- which, on a small retained dataset, yields no batches
+    # after the paid worker is provisioned. Instead shrink per_device to the largest divisor of
+    # target_comps that is <= the requested per_device: that lowers (never raises) peak VRAM and
+    # makes per_device * grad_accum == target_comps EXACTLY, so unique prompts == prompts_per_step
+    # with no over/under-shoot. (per_device=16, target_comps=40 -> 10 -> grad_accum=4 -> 40 comps
+    # = exactly 5 prompts. A divisor always exists since 1 divides everything.)
+    while target_comps % per_device != 0:
+        per_device -= 1
     grad_accum = max(1, target_comps // per_device)
-    # TRL rejects a global completion batch (per_device * grad_accum) that is not
-    # divisible by num_generations (= group_size), failing only AFTER the paid worker
-    # is provisioned. per_device is the fixed VRAM knob, so round grad_accum UP to the
-    # next multiple that makes the batch divisible (grad_accum must be a multiple of
-    # group_size // gcd(per_device, group_size)). This only ever raises the effective
-    # batch slightly; the common per_device|group_size cases are unchanged.
-    accum_step = group_size // math.gcd(per_device, group_size)
-    grad_accum = ((grad_accum + accum_step - 1) // accum_step) * accum_step
+    # The global completion batch (per_device * grad_accum == target_comps) is divisible by
+    # num_generations (= group_size) by construction, since target_comps = prompts_per_step *
+    # group_size; TRL's divisibility requirement is satisfied with no further rounding.
     generations_per_step = per_device * grad_accum
     unique_prompts_per_step = generations_per_step // group_size
     return {
@@ -1519,7 +1572,13 @@ def rl_per_device_comps(
     # reference seq the ceiling is the historical default, and seq_scale is clamped to 1.0 so
     # vram_cap == the old colocate cap -> the result is byte-for-byte the old value (no regression,
     # no unvalidated long-seq growth).
-    ceiling = _RL_PER_DEVICE_MAX if short_seq else default
+    #
+    # THINKING runs are EXCLUDED from the growth path: they emit long completions whose
+    # activation/logprob cost the prompt-only `seq_len` gate cannot see, so letting short-seq
+    # growth raise the ceiling to _RL_PER_DEVICE_MAX would silently override the conservative
+    # thinking default (2) and risk OOM / unstable training. They keep `default` as the ceiling,
+    # i.e. byte-for-byte the historical value.
+    ceiling = _RL_PER_DEVICE_MAX if (short_seq and not THINKING) else default
     return max(1, min(ceiling, logits_cap, vram_cap))
 
 
@@ -1782,13 +1841,38 @@ def run_rl():
     _adv_clip = float(gcfg.get("advantage_clip") or 0.0)
     _think_penalty = float(gcfg.get("thinking_length_penalty_coef") or 0.0)
     # vLLM sleep mode offloads the rollout engine's weights between steps to free memory for the
-    # optimizer, but reloading each step is a large per-step cost — PR #174 measured ~2-2.6x faster
-    # GRPO with it OFF on models that fit. Gate it by model size (same small=speed / large=memory
-    # gate as gradient checkpointing): OFF for small/fitting models, ON for large.
-    # Gate on the GRPO rollout context (the run's [train].max_length sizes the engine + KV cache):
-    # a long-context GRPO run is memory-tight and needs sleep mode. Matches the liger-loss gate below.
+    # optimizer, but reloading each step is a large per-step cost (PR #174 measured ~2-2.6x faster
+    # GRPO with it OFF on models that fit) AND on the large-model GRPO path the sleep/wake cycle
+    # STALLS the colocated rollout (the rollout emits unparseable completions, then the worker
+    # hangs mid-training). So enable sleep only when the run genuinely can't fit RESIDENT on THIS
+    # card: large/long-context AND the policy + colocated rollout engine + training peak don't fit
+    # on the live GPU. When they fit (the common allocator-sized case), skip sleep entirely.
     _grpo_ctx = int(_t.max_length if _t and _t.max_length else 0)
-    sleep_mode = _memory_mode(model_id, _grpo_ctx)
+    _card_vram_gb = 0.0
+    try:
+        import torch as _torch_card
+
+        if _torch_card.cuda.is_available():
+            # Binary GiB (/(1024**3)), NOT decimal GB (/1e9 over-reports ~7%): grpo_fits_resident's
+            # VRAM estimate is in GiB, so a decimal card size would make a marginal card look big
+            # enough to fit resident and wrongly disable sleep, risking OOM.
+            _card_vram_gb = _torch_card.cuda.get_device_properties(0).total_memory / (1024**3)
+    except Exception as _e:
+        print("[rl] card VRAM probe failed (sleep-mode gate falls back to size/context):", _e)
+    _lora_rank = int(_t.lora_rank) if _t and _t.lora_rank else 32
+    sleep_mode = grpo_sleep_mode(
+        model_id,
+        max_length=_grpo_ctx,
+        group_size=group_size,
+        max_tokens=gcfg.get("max_tokens"),
+        lora_rank=_lora_rank,
+        thinking=THINKING,
+        card_vram_gb=_card_vram_gb,
+    )
+    print(
+        f"[rl] vLLM sleep mode = {sleep_mode} "
+        f"(model={model_id}, ctx={_grpo_ctx}, card={_card_vram_gb:.0f}GB)"
+    )
     # Rollout backend: always colocated vLLM (fast). The whole supported catalog runs GRPO with
     # colocated vLLM; there is no transformers-generation fallback.
     use_vllm = True
@@ -2550,6 +2634,84 @@ def _finalize(metrics: RunMetrics):
     print("NODE DONE:", metrics.to_json())
 
 
+# Baked compiled-kernel cache (opt-in; see Dockerfile.worker + flash/engine/worker/kernel_warmup.py).
+# The Dockerfile points TRITON_CACHE_DIR/TORCHINDUCTOR_CACHE_DIR here and, when built with
+# --build-arg BUILD_KERNEL_CACHE=true, bakes a portable mega-cache produced on a real GPU. These
+# names are kept in lockstep with kernel_warmup.DEFAULT_CACHE_DIR / MEGA_CACHE_FILENAME.
+_KERNEL_CACHE_DIR = "/opt/flash/kernelcache"
+_KERNEL_CACHE_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.bin")
+_KERNEL_CACHE_META_FILE = os.path.join(_KERNEL_CACHE_DIR, "mega_cache.json")
+
+
+def _current_cuda_sm(torch) -> str | None:
+    try:
+        if not torch.cuda.is_available():
+            return None
+        cap = torch.cuda.get_device_capability(0)
+        return f"sm{cap[0]}{cap[1]}"
+    except Exception:
+        return None
+
+
+def _load_kernel_cache_if_present() -> bool:
+    """Best-effort: if a baked mega-cache blob exists, load it so the worker skips first-run JIT.
+
+    Loads the portable cache that kernel_warmup.py wrote on a GPU builder via
+    ``torch.compiler.load_cache_artifacts()`` — measured cold compile ~124s -> warm load ~0.2s.
+    OPT-IN: when no baked cache is present (the default image build), this is a no-op and the worker
+    JITs on first use exactly as before (#163's init heartbeat covers that stall). Never raises:
+    a missing torch / missing file / unusable blob just logs and leaves the JIT path intact.
+    """
+    def _reject(reason: str) -> bool:
+        # a baked cache is present but unusable (no/garbled metadata or wrong arch): repoint
+        # triton/inductor OFF the baked trees (Dockerfile points them at /opt/flash/kernelcache)
+        # so the JIT fallback compiles fresh into scratch instead of reusing wrong-arch baked
+        # entries that would collide with this worker's arch.
+        print(f"[kernel-cache] {reason} -> first-run JIT fallback")
+        scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
+        for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
+            d = os.path.join(scratch, sub)
+            os.makedirs(d, exist_ok=True)
+            os.environ[var] = d
+        return False
+
+    if not os.path.isfile(_KERNEL_CACHE_FILE):
+        print(f"[kernel-cache] no baked cache at {_KERNEL_CACHE_FILE} -> first-run JIT (expected default)")
+        return False
+    try:
+        import torch
+
+        current_sm = _current_cuda_sm(torch)
+        try:
+            with open(_KERNEL_CACHE_META_FILE) as f:
+                meta = json.load(f)
+        except FileNotFoundError:
+            return _reject("baked cache has no metadata")
+        except Exception as e:
+            return _reject(f"metadata unreadable ({e})")
+        cached_sm = str(meta.get("sm") or "")
+        if not current_sm:
+            # can't verify the worker's GPU arch -> don't risk loading a wrong-arch blob; JIT instead.
+            return _reject("worker GPU arch undetermined")
+        if cached_sm != current_sm:
+            return _reject(
+                f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
+            )
+        with open(_KERNEL_CACHE_FILE, "rb") as f:
+            blob = f.read()
+        torch.compiler.load_cache_artifacts(blob)
+        print(
+            f"[kernel-cache] loaded baked mega-cache for {cached_sm or 'unknown'} "
+            f"({len(blob)} bytes) -> skipping first-run JIT"
+        )
+        return True
+    except Exception as e:
+        # never block boot on a bad/absent cache: fall back to the normal JIT path. repoint off the
+        # baked trees too — if the mega blob was present + arch-matched but load raised, the on-disk
+        # triton/inductor entries may be partial/corrupt, so JIT fresh into scratch.
+        return _reject(f"load skipped ({e})")
+
+
 def wandb_finish(exit_code: int = 0) -> None:
     """Finalize the W&B run before the worker's hard ``os._exit()``.
 
@@ -2638,6 +2800,12 @@ def main():
         _neutralize_tilelang_cudart_stub()
         heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
         finalize_alloc_conf_for_sleep()  # sync CUDA alloc conf to resolved sleep (before first CUDA alloc)
+        # Opt-in: load a baked compiled-kernel mega-cache (if the image shipped one) so the worker
+        # skips the ~10-15 min first-run JIT. Best-effort + no-op when absent (the default), so the
+        # normal JIT path is untouched. Runs AFTER finalize_alloc_conf_for_sleep: _load probes CUDA
+        # (_current_cuda_sm -> get_device_capability triggers CUDA init), so the allocator conf must be
+        # resolved first; still before any model/kernel import that would otherwise trigger compilation.
+        _load_kernel_cache_if_present()
         # Dispatch table — register new algorithms (e.g. ppo) here as they land.
         modes = {
             "sft": run_sft,  # SFT (TRL SFTTrainer)

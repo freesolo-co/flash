@@ -87,14 +87,16 @@ class LambdaJobHandle:
         )
 
 
-def lambda_image() -> str:
+def lambda_image(gpu: str | None = None) -> str:
     """Docker image the cloud-init runs on the Lambda host: the prebuilt, PUBLIC ``WORKER_IMAGE``
-    (the byte-identical training stack RunPod bakes). ``FLASH_WORKER_IMAGE`` overrides it."""
-    import os
+    (the byte-identical training stack RunPod bakes). ``FLASH_WORKER_IMAGE`` overrides it; when the
+    operator opts into per-SM warmed images (``FLASH_WORKER_IMAGE_PER_SM`` /
+    ``FLASH_WORKER_IMAGE_TEMPLATE``), the GPU class selects the matching ``-smXX`` tag so the worker's
+    baked kernel cache matches the rented GPU's arch (the same selector RunPod uses)."""
+    from flash.providers.runpod.train import WORKER_IMAGE, worker_image_for_gpu
 
-    from flash.providers.runpod.train import WORKER_IMAGE
-
-    return os.environ.get("FLASH_WORKER_IMAGE") or WORKER_IMAGE
+    # allow_default=True -> always a concrete image to docker-pull (override / per-sm tag / base).
+    return worker_image_for_gpu(gpu, allow_default=True) or WORKER_IMAGE
 
 
 def build_payload(
@@ -111,6 +113,6 @@ def build_payload(
     )
 
 
-def build_user_data(payload: dict) -> str:
+def build_user_data(payload: dict, *, gpu: str | None = None) -> str:
     """The Lambda cloud-init user_data (shared builder, runs the Lambda WORKER_IMAGE)."""
-    return _shared_build_user_data(payload, image=lambda_image())
+    return _shared_build_user_data(payload, image=lambda_image(gpu))

@@ -12,6 +12,7 @@ import base64
 import io
 import itertools
 import json
+import time
 
 import pytest
 
@@ -101,6 +102,33 @@ def test_user_data_skips_capacity_for_baked_image_default(monkeypatch):
     # No base training-stack pip install in the cloud-init (the image is baked); only the worker
     # container's own per-run extra_pip runs (inside _bootstrap, not the host script).
     assert "torch==2.10.0" not in script
+
+
+def test_image_per_sm_opt_in_selects_arch_tag(monkeypatch):
+    """Opt-in per-SM warmed images (PR #213) reach Lambda too: with FLASH_WORKER_IMAGE_PER_SM set,
+    the GPU class picks the matching -smXX tag (so the worker's baked kernel cache matches the rented
+    GPU's arch). Default + FLASH_WORKER_IMAGE override semantics are unchanged."""
+    from flash.providers.lambdalabs.jobs import builders
+    from flash.providers.runpod.train import WORKER_IMAGE
+
+    for key in ("FLASH_WORKER_IMAGE", "FLASH_WORKER_IMAGE_PER_SM", "FLASH_WORKER_IMAGE_TEMPLATE"):
+        monkeypatch.delenv(key, raising=False)
+
+    # default: flat base image, byte-identical to pre-PR behavior
+    assert builders.lambda_image() == WORKER_IMAGE
+    assert builders.lambda_image("H100") == WORKER_IMAGE
+
+    # per-SM opt-in: the GPU class appends the arch tag, and it lands in the cloud-init
+    monkeypatch.setenv("FLASH_WORKER_IMAGE_PER_SM", "1")
+    assert builders.lambda_image("H100") == f"{WORKER_IMAGE}-sm90"  # H100 = sm90
+    assert builders.lambda_image("A10") == f"{WORKER_IMAGE}-sm86"  # A10 = sm86
+    payload = builders.build_payload(_spec(gpu_type="H100"), seed=0, attempt=0)
+    script = builders.build_user_data(payload, gpu="H100")
+    assert f"{WORKER_IMAGE}-sm90" in script
+
+    # absolute override still wins, even with per-SM enabled and a GPU class given
+    monkeypatch.setenv("FLASH_WORKER_IMAGE", "ghcr.io/freesolo-co/flash-worker:hotfix")
+    assert builders.lambda_image("H100") == "ghcr.io/freesolo-co/flash-worker:hotfix"
 
 
 def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True):
@@ -498,7 +526,8 @@ def test_poll_success_stamps_real_cost(monkeypatch):
         done="10500.0",
         metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
     )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    # started_ts precedes the mocked clock (starts 10_000) so wall is positive on the first tick.
+    res = jobs.poll_lambda_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
     assert res.ok
     assert res.metrics["train_tokens"] == 4096
     # cost comes from the instance's real $/hr x wall time, not a runpod table rate
@@ -584,12 +613,185 @@ def test_poll_heartbeat_stall(monkeypatch):
     assert "no worker progress" in res.detail
 
 
+def test_poll_recovery_seeds_load_clock_from_launch(monkeypatch):
+    """Reattach after a control-plane restart: a still-booting box has been billing since LAUNCH
+    (handle.started_ts), so LOAD_TIMEOUT_S is measured from launch, NOT from this poll's first
+    tick. A box already past the load window fails over on the first reattach iteration instead of
+    getting another full window. (The mocked clock starts at 10_000; launch was 5000s earlier.)"""
+    import re
+
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "booting"}], step=10.0)
+    res = jobs.poll_lambda_job(_handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0)
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "never became active" in res.detail
+    m = re.search(r"for (\d+)s", res.detail)
+    assert m is not None, res.detail
+    # launch-relative (~5000s); the old "reset to reattach tick" code would report ~LOAD_TIMEOUT_S.
+    assert int(m.group(1)) >= 2000, res.detail
+
+
+def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
+    """started_ts is a non-Optional float coerced to 0.0 when MISSING (old/corrupt handle), so 0.0
+    means 'unknown launch' (a real launch is a large epoch ts). EVERYTHING (the timeout clocks AND
+    done_is_fresh / finish_ok's wall+cost stamping) must anchor to now, NOT the epoch — otherwise a
+    booting box would be 'past' a ~57-year-old load window and stall on the first tick, and wall/cost
+    would be billed from 1970. DONE then completes the run normally with a sane (tiny) wall."""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        done="10500.0",
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+        step=10.0,
+    )
+    res = jobs.poll_lambda_job(_handle(started_ts=0.0), _spec(), seed=0, interval_s=0)
+    assert res.ok, res  # not instantly stalled by an epoch-anchored deadline/load clock
+    # wall/cost are NOT billed from the 1970 epoch: launch_ts fell back to now (~10_000 mocked),
+    # so the stamped cost is a few seconds of wall, not ~57 years x $1.29/hr (= astronomically large).
+    assert res.metrics["cost_usd"] < 1.0, res.metrics["cost_usd"]
+
+
+def test_heartbeat_progress_ts_unknown_launch_treats_heartbeats_as_fresh():
+    """When launch is UNKNOWN (launch_ts=0.0, from a recovered handle missing started_ts), the
+    clamp floor must drop to 0.0 so a normal heartbeat — timestamped before it is read, i.e. < now —
+    counts as FRESH and credits its own ts. Flooring to `now` would mark every such heartbeat stale
+    and stall a healthy recovered worker after SETUP_GRACE_S despite continuous heartbeats."""
+    from flash.providers._poll import heartbeat_progress_ts
+
+    hb_ts = time.time() - 30.0  # a normal recent heartbeat, slightly in the past
+    ts, fresh = heartbeat_progress_ts(("rl", 4, hb_ts), launch_ts=0.0)
+    assert fresh is True  # unknown launch -> not discarded
+    assert abs(ts - hb_ts) < 1.0  # credits the heartbeat's own ts (not clamped up to now)
+
+    # A real (non-zero) launch still discriminates prior-attempt leftovers (ts < launch).
+    launch = time.time() - 100.0
+    _, fresh_old = heartbeat_progress_ts(("rl", 1, launch - 50.0), launch_ts=launch)
+    assert fresh_old is False
+    _, fresh_new = heartbeat_progress_ts(("rl", 9, launch + 10.0), launch_ts=launch)
+    assert fresh_new is True
+
+
+def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
+    """A heartbeat that was already stale before a restart must not reset the stall clock to the
+    reattach time: its OWN ts is credited as last-progress, so an active worker frozen long ago
+    stalls promptly instead of getting another full stall window. (Clock starts 10_000; the
+    worker's last heartbeat was at 8500, launch at 8000, stall budget 500s.)"""
+    import re
+
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    hb = {"stage": "rl", "step": 7, "ts": 8500.0}
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=8_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: hb,
+        stall_after_s=500.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "no worker progress" in res.detail
+    m = re.search(r"for (\d+)s", res.detail)
+    assert m is not None, res.detail
+    # measured from the heartbeat ts (~1500s+), not the reattach tick (which the old code used,
+    # yielding only ~stall_after_s).
+    assert int(m.group(1)) >= 1000, res.detail
+
+
+def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
+    """A LEFTOVER heartbeat from a PRIOR attempt (ts < this attempt's launch; retries reuse the same
+    seed heartbeat path) must not be treated as current progress. Clamping its ts up to launch made
+    a stale training-stage heartbeat arm the tighter training stall window and fail a healthy new
+    attempt mid-setup before it overwrote the file. With the freshness gate, a pre-launch heartbeat
+    neither advances last_progress nor sets seen_training_hb, so the run gets the longer SETUP grace
+    measured from launch. (Clock starts 10_000; launch 9000; old heartbeat ts 8000 < launch.)"""
+    import re
+
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    stale = {"stage": "rl", "step": 2, "ts": 8000.0}  # training stage, but predates this launch
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        heartbeat_reader=lambda force=False: stale,
+        setup_grace_s=3000.0,
+        stall_after_s=500.0,
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    # Stalls on SETUP grace (3000s from launch), not the tighter 500s training window the stale
+    # heartbeat would have armed -> the reported idle time exceeds the training budget.
+    assert "setup (pre-training)" in res.detail
+    m = re.search(r"for (\d+)s", res.detail)
+    assert m is not None, res.detail
+    assert int(m.group(1)) >= 3000, res.detail
+
+
 def test_poll_client_deadline(monkeypatch):
     jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
     res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, deadline_s=250.0)
     assert not res.ok
     assert res.failure == "stalled"
     assert "deadline" in res.detail
+
+
+def test_poll_recovered_deadline_persists_done_written_during_outage(monkeypatch):
+    """A control-plane outage longer than the launch-anchored deadline must NOT discard a seed the
+    worker actually finished during the downtime: before returning the deadline `stalled`, the poller
+    reads terminal artifacts once and persists a fresh DONE. (Clock starts 10_000; launch 5_000s ago,
+    so the very first deadline check fires; DONE=10_400 is fresh vs launch.)"""
+    jobs = _wire_poll(
+        monkeypatch,
+        instances=[{"status": "active"}],
+        done="10400.0",
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+        step=10.0,
+    )
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
+    )
+    assert res.ok, res  # success persisted, NOT a stalled-retry that throws away the finished seed
+    assert res.metrics["cost_usd"] > 0
+
+
+def test_poll_recovered_deadline_without_artifacts_still_stalls(monkeypatch):
+    """When the recovered deadline fires and there is NO terminal artifact, the poller still returns
+    `stalled` (the worker did not finish during the outage)."""
+    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
+    res = jobs.poll_lambda_job(
+        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_s=250.0
+    )
+    assert not res.ok
+    assert res.failure == "stalled"
+    assert "deadline" in res.detail
+
+
+def test_provider_poll_passes_full_launch_relative_deadline(monkeypatch):
+    """The reattach path must NOT pre-subtract elapsed-since-launch from the deadline: the poll loop
+    already anchors its deadline check to handle.started_ts (= launch), so subtracting elapsed here
+    too double-counts and tears down a still-valid instance once a recovered run is past half its
+    window. LambdaProvider.poll must pass the FULL launch-relative budget regardless of how old
+    started_ts is."""
+    from flash.providers.base import JobHandle
+    from flash.providers.lambdalabs import LambdaProvider
+    from flash.providers.lambdalabs.jobs import PROVISION_GRACE_S
+
+    captured = {}
+
+    def fake_poll(handle, spec, seed, *, log=None, heartbeat_reader=None, deadline_s=None):
+        captured["deadline_s"] = deadline_s
+        from flash.providers.base import PollResult
+
+        return PollResult(True)
+
+    monkeypatch.setattr("flash.providers.lambdalabs.jobs.poll_lambda_job", fake_poll)
+    monkeypatch.setattr("flash.providers.lambdalabs.api.terminate_instances", lambda ids: ids)
+    spec = _spec()  # max_wall_seconds=3600
+    # started_ts long in the past (recovered well past half its window).
+    handle = JobHandle.from_dict({"provider": "lambda", **_handle(started_ts=1.0).to_dict()})
+    LambdaProvider().poll(handle, spec, seed=0)
+    assert captured["deadline_s"] == max(60.0, 3600 + PROVISION_GRACE_S)
 
 
 def test_poll_surfaces_worker_progress_in_log(monkeypatch):
@@ -865,3 +1067,164 @@ def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
         jobs.launch_and_submit(_spec(), seed=0, instances=insts, attempt=0)
     assert attempts == ["us-east-1"]  # stopped after the first ambiguous failure (no 2nd launch)
     assert reaped == ["flash-1700000000-abcd1234"]  # reconciled by run-name
+
+
+# ---------------------------------------------------------------------------
+# #228 follow-up: don't mask worker failures + keep large specs out of user_data
+# ---------------------------------------------------------------------------
+def test_bootstrap_honors_nonzero_exit_without_remote_artifacts(monkeypatch):
+    """Bug: a worker that exits non-zero AFTER writing /tmp/metrics.json locally but BEFORE its
+    required DONE/metrics.json upload (e.g. a transient RetriableInfraError uploading them) must
+    NOT be reported as success. The local file exists, so the old code wrote ok=true; now we only
+    tolerate a non-zero exit when the REMOTE completion artifacts are confirmed on HF."""
+    lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
+    assert lb.main() == 1
+    ok, error = markers[0]
+    assert not ok
+    assert "non-zero" in error  # propagated as a real (retriable) failure, not a false ok=true
+
+
+def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
+    """The benign case the non-zero tolerance exists for: RL's colocated vLLM segfaults at
+    interpreter exit AFTER the adapter + metrics.json + DONE are uploaded. Remote artifacts present
+    -> still a success despite the non-zero rc."""
+    lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
+    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
+    assert lb.main() == 0
+    assert markers[0] == (True, "")
+
+
+def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
+    """remote_completion_confirmed is True ONLY when BOTH DONE and metrics.json exist on HF, and
+    stays conservative (False) on an HF read error so a non-zero exit propagates."""
+    from flash.providers import _instance_bootstrap as lb
+
+    payload = {"hf_repo": "o/r", "hf_prefix": "sft/x/seed0", "env": {}}
+    present = {"DONE", "metrics.json"}
+    monkeypatch.setattr(lb, "hf_file_exists", lambda p, sub: sub in present)
+    assert lb.remote_completion_confirmed(payload) is True
+    present.discard("DONE")
+    assert lb.remote_completion_confirmed(payload) is False  # metrics but no DONE
+
+    def boom(p, sub):
+        raise RuntimeError("hf down")
+
+    monkeypatch.setattr(lb, "hf_file_exists", boom)
+    assert lb.remote_completion_confirmed(payload) is False  # read error -> conservative
+
+
+def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
+    """A large spec is spilled to HF at launch (out of user_data); the bootstrap reconstructs it
+    from the sentinel (job_spec_in_hf) by fetching <hf_prefix>/job_spec.json."""
+    from flash.providers import _instance_bootstrap as lb
+
+    big = '{"k":"' + "v" * 200_000 + '"}'
+    monkeypatch.setattr(lb, "fetch_spec_from_hf", lambda p: big)
+    env = lb.build_worker_env(
+        {"job_spec_json": "", "job_spec_in_hf": True, "phase": "sft", "seed": 0, "env": {}, "flash_arm": "lambda"}
+    )
+    # A >96k spec is passed via file, mirroring the inline-large path.
+    assert env["FLASH_JOB_SPEC_PATH"] == "/tmp/job_spec.json"
+    assert "FLASH_JOB_SPEC_JSON" not in env
+    with open("/tmp/job_spec.json") as f:
+        assert f.read() == big
+
+
+def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
+    """A large job_spec_json must NOT be embedded inline in user_data (it can overflow the
+    provider's cloud-init size cap and reject the launch). It is uploaded to HF and replaced by a
+    small sentinel; small specs ride inline unchanged."""
+    import huggingface_hub
+
+    from flash.providers import _instance as inst
+
+    uploaded = {}
+
+    class FakeApi:
+        def __init__(self, token=None):
+            self.token = token
+
+        def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
+            uploaded["path"] = path_in_repo
+            uploaded["repo"] = repo_id
+            uploaded["fileobj"] = path_or_fileobj
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+
+    big = '{"k":"' + "v" * 100_000 + '"}'
+    payload = {
+        "flash_arm": "lambda",
+        "job_spec_json": big,
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/x/seed0",
+        "env": {"HF_TOKEN": "t"},
+        "attempt": 0,
+    }
+    ud = inst.build_user_data(payload, image="img:latest")
+    embedded = json.loads(base64.b64decode(ud.split("FLASH_PAYLOAD_EOF")[1].strip()))
+    assert embedded["job_spec_json"] == ""
+    assert embedded["job_spec_in_hf"] is True
+    assert uploaded["path"] == "sft/x/seed0/job_spec.json"
+    assert uploaded["repo"] == "o/r"
+    # The spec is uploaded as an unambiguous file-like object (io.BytesIO), NOT raw bytes — raw
+    # bytes is a valid path type and huggingface_hub could misread it as a (huge) filesystem path.
+    assert isinstance(uploaded["fileobj"], io.BytesIO)
+    assert uploaded["fileobj"].getvalue() == big.encode()
+    # user_data is tiny despite a 100KB spec, and the caller's payload is untouched.
+    assert len(ud) < 25_000
+    assert payload["job_spec_json"] == big
+    assert "job_spec_in_hf" not in payload
+
+    # A small spec rides inline with no HF upload.
+    uploaded.clear()
+    small = inst.build_user_data({**payload, "job_spec_json": "{}"}, image="img:latest")
+    emb2 = json.loads(base64.b64decode(small.split("FLASH_PAYLOAD_EOF")[1].strip()))
+    assert emb2["job_spec_json"] == "{}"
+    assert "job_spec_in_hf" not in emb2
+    assert uploaded == {}
+
+
+def test_failmark_skips_when_worker_marker_exists(monkeypatch):
+    """Bug: a container that fast-fails on a real user/config error uploads its own ok=false marker,
+    then the host's ~5s liveness check fires fail() and would CLOBBER it with a retriable host
+    marker (relabeling the user error as job_preempted). The host failmark must SKIP the write when
+    a worker attempt marker already exists at the path (and stay conservative on a read error)."""
+    import sys
+    import types
+
+    from flash.providers import _instance as inst
+
+    payload = {"flash_arm": "lambda", "attempt": 0, "hf_prefix": "sft/x/seed0", "hf_repo": "o/r", "env": {}}
+
+    def run_failmark(worker_marker_exists, read_raises=False):
+        """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads."""
+        uploaded = []
+
+        class FakeApi:
+            def __init__(self, token=None):
+                pass
+
+            def file_exists(self, *, repo_id, filename, repo_type):
+                if read_raises:
+                    raise RuntimeError("hf down")
+                return worker_marker_exists
+
+            def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
+                uploaded.append(path_in_repo)
+
+        monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
+
+        def fake_open(path, *a, **k):
+            return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
+
+        glb = {"json": json, "sys": types.SimpleNamespace(argv=["failmark.py", "boom"]), "open": fake_open}
+        exec(inst._FAILMARK_PY, glb)  # controlled test of the embedded host script
+        return uploaded
+
+    # Worker already wrote its marker -> host must NOT clobber it.
+    assert run_failmark(worker_marker_exists=True) == []
+    # No worker marker (never-started container) -> host failmark IS written.
+    assert run_failmark(worker_marker_exists=False) == ["sft/x/seed0/lambda_attempt0.json"]
+    # HF read error -> conservative: skip the write (never risk clobbering).
+    assert run_failmark(worker_marker_exists=False, read_raises=True) == []

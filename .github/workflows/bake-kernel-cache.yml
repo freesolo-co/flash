@@ -1,0 +1,136 @@
+name: flash worker kernel-cache (per-arch)
+
+# Builds per-SM worker images with the compiled-kernel mega-cache baked in, killing the ~10-15 min
+# first-use JIT on a cold worker (the regression #194 reintroduced). Each matrix leg:
+#   1. offloads the warmup to a RunPod GPU of that arch (GH runners have none) -> build/kernel_cache,
+#   2. docker build --build-arg BUILD_KERNEL_CACHE=true -> ghcr.io/freesolo-co/flash-worker:cu128-<sm>,
+#   3. pushes it. Activate by setting FLASH_WORKER_IMAGE_PER_SM=1 on the control plane so the
+#      allocator selects the cu128-<sm> tag per GPU class (see flash/providers/runpod/train/deps.py).
+#
+# Depends on the base ghcr.io/freesolo-co/flash-worker:cu128 image existing (worker-image.yml) — the
+# warmup runs INSIDE it so the cache matches the image's pinned torch/triton/fla/liger toolchain.
+#
+# Requires the RUNPOD_API_KEY repo secret (the warmup GPU pod) + the default GITHUB_TOKEN (GHCR push)
+# + HF_TOKEN (the temp dataset that ferries code + the cache artifact). Manual trigger; heavy + paid.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sms:
+        description: "comma-separated sm list to bake; default is all validated arches"
+        default: "sm80,sm86,sm89,sm90,sm120"
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  bake:
+    runs-on: ubuntu-24.04-8core
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {
+              sm: sm80,
+              arch: "8.0",
+              gpu_type_id: "NVIDIA A100 80GB PCIe",
+              allowed_cuda: "",
+            }
+          - {
+              sm: sm86,
+              arch: "8.6",
+              gpu_type_id: "NVIDIA RTX A6000",
+              allowed_cuda: "",
+            }
+          - {
+              sm: sm89,
+              arch: "8.9",
+              gpu_type_id: "NVIDIA GeForce RTX 4090",
+              allowed_cuda: "",
+            }
+          - {
+              sm: sm90,
+              arch: "9.0",
+              gpu_type_id: "NVIDIA H100 80GB HBM3",
+              allowed_cuda: "",
+            }
+          # Blackwell needs CUDA-13 hosts to JIT its PTX (matches min_cuda_for in the provider).
+          - {
+              sm: sm120,
+              arch: "12.0",
+              gpu_type_id: "NVIDIA GeForce RTX 5090",
+              allowed_cuda: "13.0",
+            }
+    steps:
+      - uses: actions/checkout@v6
+
+      # skip arches not requested in the dispatch input
+      - name: Should bake ${{ matrix.sm }}?
+        id: gate
+        run: |
+          req="${{ github.event.inputs.sms || 'sm80,sm86,sm89,sm90,sm120' }}"
+          req="${req// /}"   # tolerate spaces, e.g. "sm80, sm86"
+          case ",$req," in
+            *,${{ matrix.sm }},*) echo "run=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "run=false" >> "$GITHUB_OUTPUT"; echo "skipping ${{ matrix.sm }}" ;;
+          esac
+
+      - name: Install uv
+        if: steps.gate.outputs.run == 'true'
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync deps (flash + runpod + hf)
+        if: steps.gate.outputs.run == 'true'
+        run: uv sync --extra server
+
+      - name: Warm kernels on a RunPod ${{ matrix.sm }} GPU -> build/kernel_cache
+        if: steps.gate.outputs.run == 'true'
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          uv run python docker/bake_kernel_cache.py \
+            --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
+            --gpu-type-id "${{ matrix.gpu_type_id }}" \
+            --allowed-cuda "${{ matrix.allowed_cuda }}" \
+            --image ghcr.io/freesolo-co/flash-worker:cu128 \
+            --out build/kernel_cache
+
+      - name: Free disk space
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache /usr/share/swift \
+            /usr/local/share/boost /usr/local/lib/node_modules \
+            /usr/local/share/powershell /usr/share/miniconda || true
+          sudo apt-get clean || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.run == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # thin layer FROM the SAME base the warmup ran inside -> the cache toolchain always matches the
+      # shipped image (rebuilding the full Dockerfile.worker from the checkout could drift from the
+      # published base and bake a cache that silently won't load).
+      - name: Build + push baked per-sm image (thin layer on the warmed base)
+        if: steps.gate.outputs.run == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.kernelcache
+          push: true
+          tags: ghcr.io/freesolo-co/flash-worker:cu128-${{ matrix.sm }}
+          provenance: false
+          build-args: |
+            BASE=ghcr.io/freesolo-co/flash-worker:cu128

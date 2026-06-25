@@ -11,6 +11,7 @@ HF artifacts. It implements the SAME ``base.Provider`` interface as RunPod/Lambd
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from flash.providers.base import GpuClass, JobHandle, PollResult, Provider
@@ -63,7 +64,6 @@ class HyperstackProvider:
 
     def poll(self, handle: JobHandle, spec, seed: int, *, log: Any = None) -> PollResult:
         import contextlib
-        import time
 
         from flash.providers.hyperstack import api as hs_api
         from flash.providers.hyperstack.jobs import (
@@ -79,10 +79,12 @@ class HyperstackProvider:
         hh = HyperstackJobHandle.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: hyperstack vm={hh.vm_id}", file=log, flush=True)
-        # Deadline counts from LAUNCH (started_ts), not this reattach (no server-side timeout, so a
-        # restart must not extend the billable window). Subtract elapsed-since-launch.
-        elapsed = max(0.0, time.time() - hh.started_ts) if hh.started_ts else 0.0
-        deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S - elapsed)
+        # Deadline counts from LAUNCH, not this reattach (no server-side timeout, so a restart must
+        # not extend the billable window). The poll loop already anchors its deadline check to
+        # ``handle.started_ts`` (start = launch), so we pass the FULL launch-relative budget;
+        # pre-subtracting elapsed too would double-count and delete a still-valid VM the moment a
+        # recovered run is past half its window.
+        deadline = max(60.0, int(spec.gpu.max_wall_seconds) + PROVISION_GRACE_S)
         try:
             return poll_hs_job(hh, spec, seed, log=log, heartbeat_reader=reader, deadline_s=deadline)
         finally:
@@ -110,7 +112,9 @@ class HyperstackProvider:
 
         terminate_run_instances(spec.run_id)
 
-    def sweep_orphans(self, active_labels: set[str] | None = None) -> list[str]:
+    def sweep_orphans(
+        self, active_labels: set[str] | Callable[[], set[str]] | None = None
+    ) -> list[str]:
         """Hyperstack VM ids are opaque STRINGS (the ``base.Provider`` protocol widens the return to
         ``list[int | str]`` to cover both substrates); the orchestrator only logs/counts them."""
         from flash.providers.hyperstack.jobs import sweep_orphans

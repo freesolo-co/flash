@@ -20,6 +20,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1
 
+# Compiled-kernel cache dirs (Triton JIT + TorchInductor). Point both backends at a stable on-image
+# location so a BAKED mega-cache (below, opt-in) lands where the runtime looks, and so a first-run
+# JIT on a cold worker writes here too. These ENVs are always set (cheap); whether the dir is
+# pre-populated is what the opt-in bake controls. engine.worker._load_kernel_cache_if_present reads
+# /opt/flash/kernelcache at boot.
+ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
+    TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor
+RUN mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor
+
 # build-essential for Triton/Inductor (Liger) + any source builds; git for pip VCS installs.
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git curl \
     && rm -rf /var/lib/apt/lists/*
@@ -117,21 +126,49 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE M
     || { echo "causal_conv1d: build/import failed -> removing + GDN packing stays off (Qwen3.5/3.6 train unpacked)"; \
          pip uninstall -y causal-conv1d 2>/dev/null || true; }
 
-# Kernel JIT caches are NOT baked here, on purpose. The fused Triton (Liger/fla/chalk),
-# TorchInductor, and Hopper tilelang kernels the trainer builds on first use are
-# content-addressed by GPU ARCH + toolchain version, so they can only be compiled on a real
-# GPU of each catalog arch (8.0/8.6/8.9/9.0/12.0) — which the CI image builder doesn't have
-# (the FA2 *source* path above already OOMs runners; arch-specific kernel compiles are worse).
-# So that ~10-15 min first-use compile (engine.worker; flash #163's init heartbeat keeps the
-# stall detector quiet through it) is a per-run RUNTIME cost on a cold worker.
-# When the shared weight-cache network volume is attached (flash runner._assign_weight_cache_volume),
-# the control plane points HF_HOME at the persistent /runpod-volume mount per-run
-# (providers/runpod/train/deps.weight_cache_env), so the model download is reused across runs that
-# land in the same region. ONLY HF_HOME (inert model blobs) is redirected — the executable kernel-JIT
-# caches above are deliberately NOT shared, since the volume is multi-tenant and a poisoned compiled
-# artifact could affect another tenant's run; so that first-use compile stays a per-cold-worker cost.
-# The redirect can't be a static image ENV here: RunPod mounts the volume at a fixed path only at
-# runtime and only when one is attached, so a baked ENV would break cache-less (no-volume) cold runs.
+# Weight cache (this PR, RUNTIME not baked): when the shared weight-cache network volume is attached
+# (flash runner._assign_weight_cache_volume), the control plane points HF_HOME at the persistent mount
+# per-run (providers/.../deps.weight_cache_env), so the MODEL DOWNLOAD is reused across runs landing in
+# the same region. ONLY HF_HOME (inert model blobs) is redirected — the executable kernel-JIT caches
+# below are deliberately NOT shared (the volume is multi-tenant; a poisoned compiled artifact could
+# affect another tenant). The redirect can't be a static image ENV: the volume mounts at a fixed path
+# only at runtime and only when attached, so a baked ENV would break cache-less (no-volume) cold runs.
+#
+# Compiled-kernel cache: OPT-IN bake, JIT fallback. The fused Triton (Liger/fla/chalk),
+# TorchInductor, and Hopper tilelang kernels the trainer builds on first use are content-addressed
+# by GPU ARCH + toolchain version, so they can only be compiled on a real GPU of each catalog arch
+# (8.0/8.6/8.9/9.0/12.0) — which the CI image builder normally lacks (the FA2 *source* path above
+# already OOMs runners; arch-specific kernel compiles are worse). #194 reintroduced that ~10-15 min
+# first-use JIT as a per-run RUNTIME cost on a cold worker.
+#
+# OPT-IN PATH: build on a real GPU runner with --build-arg BUILD_KERNEL_CACHE=true after running
+# flash/engine/worker/kernel_warmup.py there to produce a portable mega-cache under build/kernel_cache/
+# (torch.compiler.save_cache_artifacts). The conditional COPY below then bakes it into
+# /opt/flash/kernelcache, and engine.worker._load_kernel_cache_if_present loads it at boot
+# (torch.compiler.load_cache_artifacts) — measured cold compile ~124s -> warm load ~0.2s (537x).
+#
+# FALLBACK (the DEFAULT, BUILD_KERNEL_CACHE=false): NOTHING is baked and the build needs no GPU. The
+# first-run JIT happens on the worker exactly as before; flash #163's init heartbeat keeps the stall
+# detector quiet through it. So the opt-in is purely additive — an absent cache changes nothing.
+#
+# The COPY is made safe-when-absent with the standard "COPY a path that always exists + a guard"
+# trick. `build/kernel_cache/` is checked into the repo with just a `.keep` placeholder, so the COPY
+# source ALWAYS exists (a bare glob that matches nothing is a hard BuildKit error — this avoids it).
+# kernel_warmup.py drops `mega_cache.bin` + `mega_cache.json` (+ triton/inductor cache trees) next
+# to that placeholder on a GPU builder. COPY STRAIGHT to the final /opt/flash/kernelcache so a
+# multi-GB baked cache lives in exactly ONE layer -- staging in /tmp then cp/mv would leave the
+# bytes in BOTH the COPY layer and the RUN layer (doubling image size). with the default the dir
+# holds only `.keep`, so the copy is harmless; the guard just removes any stale cache + logs.
+ARG BUILD_KERNEL_CACHE=false
+COPY build/kernel_cache/ /opt/flash/kernelcache/
+RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_cache.bin ]; then \
+      echo "kernel-cache: baked from build/kernel_cache/ -> /opt/flash/kernelcache"; \
+    else \
+      rm -rf /opt/flash/kernelcache/mega_cache.bin /opt/flash/kernelcache/mega_cache.json \
+        /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
+      mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
+      echo "kernel-cache: not baked (BUILD_KERNEL_CACHE=${BUILD_KERNEL_CACHE}) -> first-run JIT fallback"; \
+    fi
 
 # Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
 # Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/
