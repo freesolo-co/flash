@@ -88,12 +88,14 @@ def stall_kwargs(on_last_gpu: bool = False) -> dict:
     (``throttled_grace_s``) before we treat the pinned GPU class as out of capacity and walk to
     the next-best one.
 
-    These backstops are tuned to the gpu-walk position. While there is still a next-best class to
-    fall to (``on_last_gpu`` False) we wait ~5 min: long enough to ride out a brief capacity blip,
-    short enough that a genuinely starved class hands off to the next-best one promptly. On the
-    LAST candidate (``on_last_gpu`` True) there is nowhere left to walk, so we wait ~15 min before
-    giving up — burning a retry on a class with no fallback is worse than waiting out a longer
-    queue. Both are no-capacity backstops only: once the job leaves IN_QUEUE (a worker picks it
+    These backstops are tuned to whether a further GPU attempt will follow. While a retry can still
+    fall to a next-best class (``on_last_gpu`` False) we wait ~5 min: long enough to ride out a brief
+    capacity blip, short enough that a genuinely starved class hands off to the next-best one
+    promptly. When no further GPU attempt will be made — the candidate list is exhausted OR the retry
+    budget is exhausted (``on_last_gpu`` True) — there is nowhere left to walk, so we wait ~15 min before
+    giving up: burning the last attempt on a class with no fallback (and no retry left to spend the
+    saved time on) is worse than waiting out a longer queue. Both are no-capacity backstops only:
+    once the job leaves IN_QUEUE (a worker picks it
     up), the much larger ``setup_grace_s`` governs cold start and we never walk off an IN_PROGRESS
     job at the capacity grace.
     """
@@ -663,8 +665,9 @@ def submit_run(
     ``on_handle(handle_dict)`` is invoked as soon as the job is queued so the
     runner can persist {endpoint_id, job_id} for cross-process reattach.
 
-    ``on_last_gpu`` tells the no-capacity backstops there is no next-best class left to walk to,
-    so they wait longer before giving up (see ``stall_kwargs``).
+    ``on_last_gpu`` tells the no-capacity backstops no further GPU attempt will follow this one
+    (candidate list exhausted OR retry budget exhausted), so there is no next-best class to walk to
+    and they wait longer before giving up (see ``stall_kwargs``).
     """
     from flash.envs.registry import worker_pip_for_env
     from flash.providers.runpod.train import _run_suffix, build_worker_env, chalk_extra_pip
