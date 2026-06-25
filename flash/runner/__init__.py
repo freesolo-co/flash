@@ -463,13 +463,20 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         # thread is protected by the CAS below — cancel correctly loses to a real finish.
         if status.state in TERMINAL_STATES and state != status.state and not allow_from_terminal:
             return False
+        was_terminal = status.state in TERMINAL_STATES  # before this write overwrites updated_at
+        prev_updated_at = status.updated_at
         status.state = state
         status.updated_at = time.time()
         # Freeze the training-teardown time on the FIRST terminal transition (and only then) so
         # reconciliation has an immutable run-end even after deploy/heartbeat/reconcile later bump
         # updated_at. A same-state terminal re-write (terminal field updates) keeps the original.
         if state in TERMINAL_STATES and status.finished_at is None:
-            status.finished_at = status.updated_at
+            # A genuine non-terminal -> terminal transition: the just-set updated_at == teardown.
+            # But a LEGACY run (finished_at never stamped) that is ALREADY terminal and gets a
+            # same-state field-only touch (e.g. billing_state via _update(run_id, current_state,...))
+            # must backfill from the PRE-update updated_at -- the prior persisted terminal time --
+            # not the freshly-set now, which would skew run_end / the reconcile window.
+            status.finished_at = prev_updated_at if was_terminal else status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
         _save_status(status)

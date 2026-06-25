@@ -265,6 +265,13 @@ def poll_lambda_job(
     """
     say = make_say(log)
 
+    # Single source of truth for "when did this instance launch". started_ts is a non-Optional float
+    # that LambdaJobHandle.from_dict coerces to 0.0 when MISSING (old/corrupt handle), so 0.0 means
+    # "unknown launch" (a real launch is a large epoch ts, never 0.0). Fall back to now so EVERY use
+    # below -- the load/stall clocks AND done_is_fresh / finish_ok's wall+cost stamping -- treats a
+    # recovered corrupt handle consistently, instead of billing/comparing from the 1970 epoch.
+    launch_ts = handle.started_ts or time.time()
+
     hf_repo = spec.train.hf_repo
     prefix = f"{spec.phase}/{spec.run_id}/seed{seed}"
     done_reader = _make_hf_file_reader(hf_repo, f"{prefix}/DONE")
@@ -285,11 +292,11 @@ def poll_lambda_job(
         if done_content:
             try:
                 done_ts = float(done_content.strip())
-                if handle.started_ts <= done_ts <= end_ts:
+                if launch_ts <= done_ts <= end_ts:
                     end_ts = done_ts
             except ValueError:
                 pass
-        wall_h = (end_ts - handle.started_ts) / 3600.0
+        wall_h = (end_ts - launch_ts) / 3600.0
         metrics["cost_usd"] = round(wall_h * handle.hourly_usd, 6)
         notes = metrics.get("notes") if isinstance(metrics.get("notes"), dict) else {}
         notes.update(
@@ -306,9 +313,10 @@ def poll_lambda_job(
 
     def done_is_fresh(content: str) -> bool:
         # DONE carries the worker's time.time(); 120 s of clock-skew grace. Anything older predates
-        # this attempt (leftover from a prior attempt's resume).
+        # this attempt (leftover from a prior attempt's resume). Uses launch_ts (not handle.started_ts)
+        # so an unknown-launch (0.0) handle doesn't accept every leftover DONE as fresh.
         try:
-            return float(content.strip()) > handle.started_ts - 120.0
+            return float(content.strip()) > launch_ts - 120.0
         except ValueError:
             return False
 
@@ -334,16 +342,12 @@ def poll_lambda_job(
         )
 
     poll_errors = PollErrorTracker(say, interval_s)
-    # Seed the load/stall clocks from the instance's LAUNCH (handle.started_ts), not this poll's
-    # start: on a delayed reattach after a control-plane restart the box has been billing since
-    # launch, so a still-booting instance that already blew LOAD_TIMEOUT_S must fail over NOW
-    # instead of getting another full window. On a fresh launch started_ts ~= now (no-op).
-    # Truthiness (`or time.time()`), NOT `is not None`: started_ts is a non-Optional float and
-    # LambdaJobHandle.from_dict coerces a MISSING started_ts to 0.0, so 0.0 here means "unknown
-    # launch" (a real launch is a large epoch ts, never 0.0). Treat 0.0 as missing and anchor to
-    # now, else an old/corrupt handle would peg the deadline + stall clocks to the epoch and
-    # instantly trip "deadline exceeded".
-    start = handle.started_ts or time.time()
+    # Seed the load/stall clocks from the instance's LAUNCH (launch_ts), not this poll's start: on a
+    # delayed reattach after a control-plane restart the box has been billing since launch, so a
+    # still-booting instance that already blew LOAD_TIMEOUT_S must fail over NOW instead of getting
+    # another full window. launch_ts already maps an unknown-launch (0.0) handle to now (see above),
+    # so a fresh launch is a no-op and a corrupt handle won't peg the clocks to the epoch.
+    start = launch_ts
     last_status = None
     last_hb_key = None
     last_progress = start

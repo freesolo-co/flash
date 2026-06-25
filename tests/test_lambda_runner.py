@@ -387,9 +387,10 @@ def test_poll_recovery_seeds_load_clock_from_launch(monkeypatch):
 
 def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
     """started_ts is a non-Optional float coerced to 0.0 when MISSING (old/corrupt handle), so 0.0
-    means 'unknown launch' (a real launch is a large epoch ts). The clocks must anchor to now, NOT
-    the epoch — otherwise a booting box would be 'past' a ~57-year-old load window and stall on the
-    first tick. DONE then completes the run normally."""
+    means 'unknown launch' (a real launch is a large epoch ts). EVERYTHING (the timeout clocks AND
+    done_is_fresh / finish_ok's wall+cost stamping) must anchor to now, NOT the epoch — otherwise a
+    booting box would be 'past' a ~57-year-old load window and stall on the first tick, and wall/cost
+    would be billed from 1970. DONE then completes the run normally with a sane (tiny) wall."""
     jobs = _wire_poll(
         monkeypatch,
         instances=[{"status": "active"}],
@@ -399,6 +400,9 @@ def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
     )
     res = jobs.poll_lambda_job(_handle(started_ts=0.0), _spec(), seed=0, interval_s=0)
     assert res.ok, res  # not instantly stalled by an epoch-anchored deadline/load clock
+    # wall/cost are NOT billed from the 1970 epoch: launch_ts fell back to now (~10_000 mocked),
+    # so the stamped cost is a few seconds of wall, not ~57 years x $1.29/hr (= astronomically large).
+    assert res.metrics["cost_usd"] < 1.0, res.metrics["cost_usd"]
 
 
 def test_heartbeat_progress_ts_unknown_launch_treats_heartbeats_as_fresh():

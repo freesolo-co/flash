@@ -208,6 +208,20 @@ def test_poll_success_stamps_real_cost(monkeypatch):
     assert res.metrics["notes"]["hyperstack_region"] == "CANADA-1"
 
 
+def test_poll_missing_started_ts_anchors_to_now_not_epoch(monkeypatch):
+    """started_ts coerced to 0.0 (MISSING / corrupt handle) means 'unknown launch'. EVERYTHING (the
+    timeout clocks AND done_is_fresh / finish_ok's wall+cost stamping) must anchor to now, NOT the
+    1970 epoch — otherwise a booting VM stalls instantly and wall/cost are billed from 1970. DONE
+    completes the run normally with a sane (tiny) wall."""
+    jobs = _wire_poll(
+        monkeypatch, vms=[{"status": "ACTIVE"}], done="10500.0",
+        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}), step=10.0,
+    )
+    res = jobs.poll_hs_job(_handle(started_ts=0.0), _spec(), seed=0, interval_s=0)
+    assert res.ok, res  # not instantly stalled by an epoch-anchored clock
+    assert res.metrics["cost_usd"] < 1.0, res.metrics["cost_usd"]  # not billed from 1970
+
+
 def test_poll_marker_failure_is_job_failed(monkeypatch):
     jobs = _wire_poll(
         monkeypatch, vms=[{"status": "ACTIVE"}],
