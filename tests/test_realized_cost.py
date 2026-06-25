@@ -162,6 +162,34 @@ def test_instance_realized_cost_bills_launch_to_run_end_not_padded_end():
     assert rc.realized_usd == 2.0  # 1h x $2/hr
 
 
+def test_reconcile_run_falls_back_to_created_at_when_started_ts_missing_or_zero(monkeypatch):
+    """A persisted provider handle whose from_dict coerced a MISSING started_ts to 0.0 must NOT be
+    billed from the 1970 epoch (which would massively inflate realized cost). reconcile_run treats a
+    falsey started_ts as unknown and falls back to status.created_at for the billing `start`."""
+    captured: dict = {}
+
+    def fake_realized(remote, **kw):
+        captured.update(kw)
+        return realized.RealizedCost(provider="lambda", realized_usd=1.0, by_resource={})
+
+    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
+    monkeypatch.setattr(reconcile, "_report", lambda body: True)
+    monkeypatch.setattr(runner, "record_realized_cost", lambda *a, **k: None)
+    now = 1_000_000.0
+    created = now - 9000.0
+    for started in (0.0, None):  # coerced-to-0.0 and genuinely-absent both fall back
+        captured.clear()
+        remote = {"provider": "lambda", "instance_id": "i-1", "hourly_usd": 1.29}
+        if started is not None:
+            remote["started_ts"] = started
+        status = _status(
+            run_id="r-leg", created_at=created, updated_at=now - 7200, finished_at=now - 7200,
+            remote=remote,
+        )
+        assert reconcile.reconcile_run(status, now=now) is True
+        assert captured["start"] == created, started  # NOT 0.0 / the 1970 epoch
+
+
 def test_reconcile_uses_finished_at_not_deploy_bumped_updated_at_for_instance(monkeypatch):
     """A Lambda/Hyperstack run deployed AFTER completion has updated_at moved to the deploy time;
     reconciliation must pass the FROZEN training-teardown (finished_at) as the instance run_end,

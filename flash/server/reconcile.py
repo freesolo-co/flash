@@ -105,10 +105,11 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     later cycle (within the window) retries once the provider invoice settles."""
     now = time.time() if now is None else now
     remote = status.remote or {}
-    # ``is not None`` (not truthiness) so a launch at the epoch (started_ts == 0.0) is honored
-    # rather than falling back to created_at.
-    started_ts = remote.get("started_ts")
-    start = float(started_ts if started_ts is not None else status.created_at)
+    # Truthiness (`or`), NOT `is not None`: this started_ts comes from a persisted provider handle
+    # whose from_dict coerces a MISSING started_ts to 0.0 (see Lambda/HyperstackJobHandle.from_dict),
+    # so 0.0 means "unknown launch", not a 1970 epoch launch. Billing the flat $/hr from 0.0 would
+    # massively inflate realized cost, so fall back to created_at when started_ts is falsey/missing.
+    start = float(remote.get("started_ts") or status.created_at)
     # The run's true terminal time (~teardown / billing stop); see _terminal_ts for why this is
     # the frozen finished_at rather than the mutable updated_at (which deploy/heartbeat move past
     # teardown and would make the instance providers' flat $/hr bill until that later event).
