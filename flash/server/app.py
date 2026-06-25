@@ -164,29 +164,38 @@ async def _reap_idle_endpoints_loop() -> None:
             _log.debug("idle-endpoint reaper sweep failed; retrying next cycle", exc_info=True)
 
 
+# Run states that may still OWN a live, billing training instance, so their provider instances must
+# be PROTECTED from the orphan sweep. Deliberately EXCLUDES ``deployed``: a run only reaches
+# ``deployed`` after it went ``done`` (the seed loop's ``finally`` already tore every training
+# instance down), so a deployed run owns no training worker — keeping it in the protection set would
+# instead SHIELD a genuine leaked instance under its prefix from the sweep (the very thing the sweep
+# exists to reap). Terminal states are excluded for the same reason.
+_INSTANCE_OWNING_STATES = frozenset({"queued", "provisioning", "running"})
+
+
 def _active_run_ids() -> set[str]:
-    """Run ids of every NON-terminal run — the set whose provider instances must be PROTECTED from
-    the periodic orphan sweep below. The instance providers' ``sweep_orphans`` re-derives each
-    instance-label prefix from a run id via ``run_label_prefix``, so it wants raw run ids (unlike
-    ``_protected_train_endpoint_names``, which yields RunPod endpoint *names*).
+    """Run ids of every run that may still own a live training instance — the set whose provider
+    instances must be PROTECTED from the periodic orphan sweep below. The instance providers'
+    ``sweep_orphans`` re-derives each instance-label prefix from a run id via ``run_label_prefix``,
+    so it wants raw run ids (unlike ``_protected_train_endpoint_names``, which yields RunPod endpoint
+    *names*).
 
-    Why this is a safe protection set with no idle grace: a run's status is flipped to a non-terminal
-    state BEFORE its first instance is ever launched (``_run_seed_loop`` writes ``running`` ahead of
-    ``_submit_seed_supervised``), and the launched instance is torn down BEFORE the run can reach a
-    terminal state (the provider lifecycle's ``finally``). So a billed instance exists ONLY while its
-    run is in this set — ownership is a deterministic name->run mapping, not the noisy idle signal the
-    RunPod reaper must grace. (Startup recovery in ``recover_runs`` deliberately uses a NARROWER set —
-    only handle-backed/resume runs — because it is simultaneously RESUBMITTING handle-less runs and
-    must reap their stale half-rented instances; in-lifetime we instead protect every live run.)"""
-    from flash.runner import TERMINAL_STATES
-
+    Why this is a safe protection set with no idle grace: a run's status is flipped to an
+    instance-owning state BEFORE its first instance is ever launched (``_run_seed_loop`` writes
+    ``running`` ahead of ``_submit_seed_supervised``), and the launched instance is torn down BEFORE
+    the run can leave these states for ``done``/``deployed``/terminal (the provider lifecycle's
+    ``finally``). So a billed instance exists ONLY while its run is in this set — ownership is a
+    deterministic name->run mapping, not the noisy idle signal the RunPod reaper must grace.
+    (Startup recovery in ``recover_runs`` deliberately uses a NARROWER set — only handle-backed/resume
+    runs — because it is simultaneously RESUBMITTING handle-less runs and must reap their stale
+    half-rented instances; in-lifetime we instead protect every instance-owning run.)"""
     ids: set[str] = set()
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
         except FileNotFoundError:
             continue
-        if status.state not in TERMINAL_STATES:
+        if status.state in _INSTANCE_OWNING_STATES:
             ids.add(status.run_id)
     return ids
 
@@ -198,11 +207,28 @@ def _sweep_orphan_instances_once() -> int:
     serverless endpoints carry no standing per-run billing and are handled by the idle reaper)."""
     from flash.providers import configured_providers
 
-    active = _active_run_ids()
     torn = 0
     for prov in configured_providers():
-        with contextlib.suppress(Exception):  # one provider's API blip must not skip the others
-            torn += len(prov.sweep_orphans(active_labels=active))
+        # Re-read the active set immediately before EACH provider sweep and UNION it with the set
+        # captured after, so a run submitted DURING this sweep (its instance now visible to the
+        # provider's list call, but its run id absent from a once-captured snapshot) is protected
+        # rather than mis-reaped as an orphan mid-training. The instance APIs expose no creation
+        # timestamp here, so a fresh re-snapshot — not an age grace — closes the launch race.
+        active = _active_run_ids()
+        try:
+            deleted = prov.sweep_orphans(active_labels=active | _active_run_ids())
+        except Exception:
+            # One provider's API blip / outage must not skip the others — and must NOT be silent
+            # (the loop docstring promises failures are logged + retried next cycle), so a
+            # persistent failure (bad creds, signature mismatch) is visible instead of looking
+            # like a healthy sweep reaping nothing.
+            _log.warning(
+                "instance orphan sweep failed for provider %r; retrying next cycle",
+                getattr(prov, "name", prov),
+                exc_info=True,
+            )
+            continue
+        torn += len(deleted)
     return torn
 
 

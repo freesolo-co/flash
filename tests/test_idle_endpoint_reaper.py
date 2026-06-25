@@ -98,13 +98,20 @@ class _FakeProvider:
 
 
 def test_active_run_ids_covers_live_runs_only(monkeypatch):
-    rows = [{"run_id": r} for r in ("flash-run", "flash-prov", "flash-done", "flash-failed")]
+    rows = [
+        {"run_id": r}
+        for r in ("flash-run", "flash-prov", "flash-done", "flash-failed", "flash-deployed")
+    ]
     statuses = {
         "flash-run": RunStatus(run_id="flash-run", state="running", spec={}),
         # provisioning: no handle yet, but its instance may already be launching -> must be protected
         "flash-prov": RunStatus(run_id="flash-prov", state="provisioning", spec={}),
         "flash-done": RunStatus(run_id="flash-done", state="done", spec={}),
         "flash-failed": RunStatus(run_id="flash-failed", state="failed", spec={}),
+        # deployed: reachable only from `done`, so the seed loop's finally already tore the training
+        # instance down -> the run owns no training worker and must NOT be protected (else a leaked
+        # instance under its prefix would be shielded from the sweep forever).
+        "flash-deployed": RunStatus(run_id="flash-deployed", state="deployed", spec={}),
     }
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
     monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
