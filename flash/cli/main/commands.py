@@ -32,6 +32,7 @@ from flash.runner import TERMINAL_STATES, new_run_id
 from flash.schema import ConfigError, spec_from_file
 
 from . import render
+from .training_doc import TRAINING_MD
 
 logger = get_logger("flash.cli.main")
 
@@ -271,16 +272,24 @@ def cmd_env_setup(args) -> int:
             "# GPU and the HF artifact repo are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting class across providers, and each run gets its own artifact repo.\n"
         )
+    # TRAINING.md is the playbook for the AI agent driving these runs: how to design the
+    # reward, what to read, and how to decide a run actually improved (not just finished).
+    training = Path("TRAINING.md")
+    if not training.exists():
+        # Explicit UTF-8: TRAINING_MD has non-ASCII (em dashes, ·, √, ≥, ≈), which would
+        # raise UnicodeEncodeError under a non-UTF-8 locale with write_text's default.
+        training.write_text(TRAINING_MD, encoding="utf-8")
+    scaffolded = [
+        "environment.py",
+        "datasets/train.jsonl",
+        "configs/rl.toml",
+        "configs/sft.toml",
+        "TRAINING.md",
+    ]
     if render.styled():
-        print(
-            render.env_setup(
-                ["environment.py", "datasets/train.jsonl", "configs/rl.toml", "configs/sft.toml"]
-            )
-        )
+        print(render.env_setup(scaffolded))
         return 0
-    print(
-        "ensured environment.py, datasets/train.jsonl, configs/, configs/rl.toml, configs/sft.toml"
-    )
+    print(f"ensured {', '.join(scaffolded)}")
     return 0
 
 
