@@ -104,7 +104,38 @@ def model_is_gdn_hybrid(model_id: str) -> bool:
         return False
 
 
-def gdn_packing_available() -> bool:
+def _gdn_forward_threads_reset_kwargs(model_id: str | None) -> bool:
+    """Does THIS model's GatedDeltaNet forward actually thread cu_seq_lens_q AND seq_idx? Different GDN
+    families live in different modeling modules (qwen3_5 -> modeling_qwen3_5.Qwen3_5GatedDeltaNet, a
+    future qwen3_6 -> modeling_qwen3_6.Qwen3_6GatedDeltaNet), so resolve the ACTUAL arch from the
+    model's config and probe ITS DeltaNet class — a hardcoded qwen3_5 probe would wrongly pass for an
+    arch that drops the kwargs (or whose layer hard-codes seq_idx=None on an older transformers).
+    Falls back to qwen3_5 when no model_id is given. Safe-False on any failure."""
+    try:
+        import importlib
+        import inspect
+
+        model_type = "qwen3_5"
+        if model_id:
+            from transformers import AutoConfig
+
+            cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+            model_type = getattr(cfg, "model_type", None) or model_type
+        mod = importlib.import_module(f"transformers.models.{model_type}.modeling_{model_type}")
+        gdn_cls = next(
+            (c for n, c in vars(mod).items()
+             if isinstance(c, type) and n.endswith("GatedDeltaNet")),
+            None,
+        )
+        if gdn_cls is None:
+            return False
+        fwd = inspect.getsource(gdn_cls.forward)
+        return ("cu_seq_lens_q" in fwd) and ("seq_idx" in fwd)
+    except Exception:
+        return False
+
+
+def gdn_packing_available(model_id: str | None = None) -> bool:
     """True only when BOTH varlen kernels a GatedDeltaNet hybrid needs to pack boundary-correctly are
     importable: ``flash-linear-attention`` (resets the DeltaNet recurrence via ``cu_seqlens`` — the
     pure-torch fallback IGNORES it) AND ``causal_conv1d`` (resets the short causal conv via
@@ -122,7 +153,6 @@ def gdn_packing_available() -> bool:
     guard failing -> packing stays off (the model trains unpacked, safely)."""
     try:
         import importlib
-        import inspect
 
         from transformers.utils.import_utils import (
             is_causal_conv1d_available,
@@ -132,10 +162,7 @@ def gdn_packing_available() -> bool:
         if not (is_flash_linear_attention_available() and is_causal_conv1d_available()):
             return False
         importlib.import_module("causal_conv1d")  # (a) fail a built-but-broken wheel here, not at load
-        from transformers.models.qwen3_5 import modeling_qwen3_5 as _m  # (b) version/API gate
-
-        fwd = inspect.getsource(_m.Qwen3_5GatedDeltaNet.forward)
-        if not (("cu_seq_lens_q" in fwd) and ("seq_idx" in fwd)):
+        if not _gdn_forward_threads_reset_kwargs(model_id):  # (b) version/API gate, per ACTUAL arch
             return False
         # (c) RUN the conv kernel on the LIVE GPU: a causal_conv1d wheel compiled WITHOUT this device's
         # arch imports fine but raises "CUDA error: no kernel image is available for execution on the

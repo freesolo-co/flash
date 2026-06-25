@@ -159,6 +159,16 @@ def test_gdn_hybrid_false_for_pure_and_sliding(monkeypatch):
     assert model_is_gdn_hybrid("any/sliding") is False  # sliding != linear_attention
 
 
+def test_gdn_forward_probe_resolves_actual_arch():
+    # The version/API probe resolves the model's ACTUAL DeltaNet class (not a hardcoded qwen3_5), so
+    # it stays correct for a future qwen3_6 module. With no model_id it falls back to qwen3_5, whose
+    # installed forward threads both reset kwargs -> True; a bogus arch -> safe-False.
+    pytest.importorskip("transformers")
+    from flash.engine.worker.packing import _gdn_forward_threads_reset_kwargs
+
+    assert _gdn_forward_threads_reset_kwargs(None) is True
+
+
 def test_gdn_packing_available_false_when_either_kernel_missing(monkeypatch):
     # Safety-critical: if EITHER find_spec probe is False the gate short-circuits to False BEFORE the
     # heavy real-import / source-API checks — a missing kernel must NEVER enable packing (it would

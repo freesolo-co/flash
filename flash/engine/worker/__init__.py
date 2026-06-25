@@ -966,10 +966,11 @@ def run_sft():
             "the cu_seqlens/seq_idx varlen collator handles its packing when both kernels are present."
         )
     else:
-        print(
-            "[sft] packing SKIPPED: flash_attn not importable (best-effort image build failed) "
-            "— no boundary-correct attn backend, falling back to SDPA without packing."
-        )
+        # FA2 bfd packing not enabled here — either flash_attn isn't importable, or it is but the arch
+        # isn't bfd-safe (e.g. sliding-window). This is NOT the final word: the SDPA block-diagonal /
+        # GDN-varlen block below may still turn packing on for a pure-attention or GDN-hybrid model.
+        _bfd_why = "flash_attn not importable" if not _fa_ok else "arch not bfd-safe under FA2 varlen"
+        print(f"[sft] TRL bfd (FA2) packing not used ({_bfd_why}); the SDPA-mask path decides packing below.")
     # Liger fused CE/RMSNorm/RoPE kernels, gated by model size (_memory_mode). The fused linear
     # cross-entropy is the big large-vocab (Qwen3.5 ~248k) memory/throughput win.
     if liger_on(_memory_mode(model_id, sft_max_len)):
@@ -1060,7 +1061,7 @@ def run_sft():
             f"pd={_pd_pack} ga={cfg_kwargs['gradient_accumulation_steps']} (effective batch kept "
             f"~{effective_batch} ex); no flash-attn / no flex_attention"
         )
-    elif not cfg_kwargs.get("packing") and _gdn and gdn_packing_available() and _mask_pack_ok:
+    elif not cfg_kwargs.get("packing") and _gdn and gdn_packing_available(model_id) and _mask_pack_ok:
         # GatedDeltaNet hybrid (Qwen3.5/3.6, flash's flagship tier): the 4D block-diagonal mask makes
         # the FULL-attention layers boundary-correct, and the linear-attention (DeltaNet) layers reset
         # their recurrence + causal conv at example boundaries via cu_seq_lens_q (fla kernel) + seq_idx
