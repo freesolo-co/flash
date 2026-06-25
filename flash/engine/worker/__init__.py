@@ -113,6 +113,7 @@ from flash.engine.worker.lora import (
     assert_adapter_delta_nonzero,
     assert_adapter_load_clean,
     assert_lora_applied,
+    disable_liger_grpo_torch_compile,
     is_vl_checkpoint,
     lora_exclude_modules,
     model_quant,
@@ -513,6 +514,7 @@ __all__ = [
     # grpo batching / no-op guards
     "build_grpo_prompt_dataset",
     "compute_grpo_batching",
+    "disable_liger_grpo_torch_compile",
     # hf artifact channel
     "error_artifact_name",
     "finalize_alloc_conf_for_sleep",

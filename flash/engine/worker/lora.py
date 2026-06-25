@@ -289,6 +289,34 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
     return True
 
 
+def disable_liger_grpo_torch_compile(trainer) -> bool:
+    """Run liger's fused GRPO loss EAGER — drop only its ``torch.compile``, keep the memory path.
+
+    ``LigerFusedLinearGRPOLoss`` wraps ONLY the loss math
+    (``fused_linear_ppo._compute_loss_from_logps``) in ``torch.compile`` (gated by its ``compiled``
+    flag, default True); the memory-efficient part — the chunked custom-autograd ``chunk_forward``
+    that never materializes the fp32 ``[batch, seq, ~248k vocab]`` logits — ALWAYS runs eager. On
+    torch 2.10 that ``torch.compile`` is BROKEN: its SHAPE_ENV guards are keyed on the per-call tensor
+    dims and guard generation trips a torch bug (``symbol_to_source`` IndexError surfaced as
+    ``InternalTorchDynamoError`` — "list index out of range" at ``symbolic_shapes.issue_guard``) that
+    crashes the FIRST GRPO step on EVERY path (single-turn, multi-turn, tool). It fires during
+    guard-build (after tracing), so neither the multi-turn ``suppress_errors=True`` nor the mask-aware
+    path's ``_dynamo.disable`` catches it.
+
+    Setting ``compiled=False`` makes liger skip the ``torch.compile`` wrapper entirely while KEEPING
+    the chunked memory path — so the 248k-vocab fp32-logit OOM fix (the whole reason
+    ``use_liger_kernel`` stays on for GRPO) is fully retained; only the loss-math JIT is dropped, and
+    its eager overhead is negligible at these tiny per-token GEMMs. Call this BEFORE
+    ``patch_grpo_mask_aware_lm_head`` (which replaces ``liger_grpo_loss`` with a closure) so it lands
+    on the live ``LigerFusedLinearGRPOLoss`` instance. No-op (returns False) when the loss isn't
+    present, predates the ``compiled`` flag, or already has it off. Returns True if it flipped it."""
+    loss = getattr(trainer, "liger_grpo_loss", None)
+    if loss is None or not getattr(loss, "compiled", False):
+        return False
+    loss.compiled = False
+    return True
+
+
 # --------------------------------------------------------------------------------------------
 # Warm-start (init_from_adapter) SFT-adapter key remap for VL checkpoints.
 #
