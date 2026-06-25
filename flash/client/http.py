@@ -1,6 +1,6 @@
 """Stdlib HTTP client for the Flash control plane (no extra dependencies).
 
-Every CLI/MCP operation maps to one method here. Server errors (FastAPI's
+Every CLI operation maps to one method here. Server errors (FastAPI's
 ``{"detail": ...}``) surface as ``ApiError`` with the server's message; connection
 problems surface as ``ClientError`` with an actionable hint.
 """

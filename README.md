@@ -36,7 +36,6 @@ The allocator picks the cheapest validated RunPod GPU class that fits the run.
   and ready-to-run configs to start from
 - `flash/serve/`, `flash/server/` — adapter serving and the FastAPI control
   plane (run operator-side via the separate `flash-server` command)
-- `flash/mcp/` — stdio MCP bridge for coding agents
 - `Dockerfile` — the control-plane image (used by the repo docker-compose)
 - `tests/` — pytest suite (CPU-only; offline-by-default, no GPU/network)
 

@@ -89,7 +89,7 @@ def test_thinking_unknown_capability_warns_but_allows(monkeypatch, capsys):
     spec = spec_from_dict(_raw(model="acme/tiny-1b", thinking=True))
     assert spec.thinking is True
     captured = capsys.readouterr()
-    # Warning goes to stderr (stdout is reserved for the MCP server's JSON protocol).
+    # Warning goes to stderr (stdout is reserved for machine-readable output).
     assert "warning" in captured.err
     assert "warning" not in captured.out
 

@@ -80,32 +80,6 @@ def test_orchestrator_dry_run(monkeypatch):
         assert runner.get_status("dry").spec["model"] == "Qwen/Qwen3.5-4B"
 
 
-def test_mcp_handler_dry_run(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmp:
-        import flash.mcp.server as mcp
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        importlib.reload(mcp)
-        result = mcp.handle(
-            {
-                "tool": "create_training_run",
-                "args": {
-                    "run_id": "mcp-dry",
-                    "model": "Qwen/Qwen3.5-4B",
-                    "algorithm": "grpo",
-                    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-                    "train": {"steps": 1, "seeds": [0], "hf_repo": "owner/runs"},
-                    "gpu": {"type": "RTX 5090"},
-                    "dry_run": True,
-                },
-            }
-        )
-        assert result["state"] == "dry_run"
-
-
 def test_cli_train_dry_run():
     with tempfile.TemporaryDirectory() as tmp:
         config = os.path.join(tmp, "run.toml")
