@@ -75,24 +75,28 @@ def test_network_volume_gb_tolerant_of_bad_values():
 # ---------------------------------------------------------------------------
 # jobs.weight_cache_* — the volume fleet + endpoint kwargs (fully managed, no knobs)
 # ---------------------------------------------------------------------------
-def test_weight_cache_datacenters_is_all_storage_dcs():
+def test_weight_cache_datacenters_excludes_volume_incapable():
+    # DataCenter.all() includes DCs RunPod does NOT back with network volumes (live-found: US-MO-1);
+    # creating a volume there 500s the whole deploy, so the fleet must exclude them.
     from runpod_flash.core.resources.datacenter import DataCenter
 
     from flash.providers.runpod import jobs
 
     dcs = jobs.weight_cache_datacenters()
-    assert set(dcs) == set(DataCenter.all())  # exactly the SDK's storage-capable DC set
+    vals = {d.value for d in dcs}
     assert len(set(dcs)) == len(dcs)  # all distinct
+    assert vals == {d.value for d in DataCenter.all()} - jobs._VOLUME_INCAPABLE_DATACENTERS
+    assert "US-MO-1" not in vals  # the known volume-incapable DC is dropped
+    assert not (vals & jobs._VOLUME_INCAPABLE_DATACENTERS)
 
 
 def test_weight_cache_datacenters_ignores_removed_env_knob(monkeypatch):
     # Regression: the FLASH_WEIGHT_CACHE_DATACENTERS knob is GONE — the fleet is fixed/managed.
-    from runpod_flash.core.resources.datacenter import DataCenter
-
     from flash.providers.runpod import jobs
 
+    baseline = len(jobs.weight_cache_datacenters())
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DATACENTERS", "US-CA-2")
-    assert len(jobs.weight_cache_datacenters()) == len(DataCenter.all())  # env ignored
+    assert len(jobs.weight_cache_datacenters()) == baseline  # env ignored
 
 
 def test_weight_cache_volumes_distinct_name_per_dc():

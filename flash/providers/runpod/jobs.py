@@ -113,16 +113,26 @@ def stall_kwargs(on_last_gpu: bool = False) -> dict:
     }
 
 
+# RunPod DCs in the SDK's ``DataCenter.all()`` enum that do NOT support network volumes. LIVE-FOUND:
+# the SDK enum is NOT the network-volume DC set (that assumption was wrong) — creating a volume in one
+# of these 500s the WHOLE deploy ("data center ... does not support network volumes"), so eager runs
+# would always fall back to cold and the cache would never work. The SDK exposes no volume-capability
+# flag, so we maintain the exclusion here. (If RunPod drops volume support in another DC, that deploy
+# 500s -> the lifecycle no_capacity/poll_error cache-drop falls back to a cold cross-region run, so a
+# stale list degrades gracefully rather than wedging — but add the DC here to restore its cache.)
+_VOLUME_INCAPABLE_DATACENTERS = frozenset({"US-MO-1"})
+
+
 def weight_cache_datacenters() -> list:
-    """EVERY storage-capable RunPod DC — both the set the endpoint is ALLOWED across (so a run can
-    land wherever there's capacity) AND the set we attach a VOLUME in (eager: a per-DC volume exists
-    in every region). Derived from ``DataCenter.all()`` (the SDK enum is exactly the network-volume /
-    S3 datacenters), so a SDK upgrade that adds a storage region is picked up automatically — the next
-    deploy creates-or-attaches its volume too.
+    """Every VOLUME-CAPABLE RunPod DC — both the set the endpoint is allowed across AND the set we
+    attach a per-DC volume in (eager: a volume in every region a run can land in, so any landing is
+    warm). ``DataCenter.all()`` minus ``_VOLUME_INCAPABLE_DATACENTERS`` (the enum includes DCs RunPod
+    no longer backs with network volumes — see that constant). A SDK upgrade that adds a storage region
+    is picked up automatically; one that adds a volume-less region must be excluded above.
     """
     from runpod_flash.core.resources.datacenter import DataCenter
 
-    return list(DataCenter.all())
+    return [dc for dc in DataCenter.all() if dc.value not in _VOLUME_INCAPABLE_DATACENTERS]
 
 
 def weight_cache_volume_name(base: str, dc) -> str:
