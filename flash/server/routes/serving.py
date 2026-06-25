@@ -110,6 +110,27 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         # a /cancel (NOT serialized by the deploy lock) that terminalized the run can't be
         # silently overwritten by the deployment record.
         prev_state = status.state
+        # Attribute the adapter to the RUN's owning org so serving can authorize external chat
+        # by org. Prefer the org persisted WITH the run — billing_context for user runs,
+        # platform_context for internal/operator runs (see submit path) — over the caller's key,
+        # so an operator deploy still lands on the run's owner. Each context is isinstance-guarded
+        # against a non-dict legacy value (mirrors flash/server/billing.py / checkpoints.py).
+        def _run_org(*contexts) -> str:
+            for ctx in contexts:
+                if isinstance(ctx, dict):
+                    org = str(ctx.get("org_id") or "").strip()
+                    if org:
+                        return org
+            return ""
+
+        deploy_org_id = (
+            _run_org(
+                getattr(status, "billing_context", None),
+                getattr(status, "platform_context", None),
+            )
+            or str(key.get("org_id") or "").strip()
+            or None
+        )
         try:
             dep = _app.deploy_adapter(
                 run_id=run_id,
@@ -120,6 +141,7 @@ def deploy(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 dry_run=dry_run,
                 # a run trained with thinking serves with thinking (per-run parity)
                 thinking=spec.thinking,
+                org_id=deploy_org_id,
             )
         except ServingError as exc:
             # The serving backend rejected the registration or was unreachable. This is an
