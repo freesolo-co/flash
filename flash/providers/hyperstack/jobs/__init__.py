@@ -116,6 +116,7 @@ def launch_and_submit(
     runtime_secrets: dict | None = None,
     mode: str | None = None,
     models: list | None = None,
+    ignore_sick: bool = False,
 ) -> HyperstackJobHandle:
     """Launch the first region that accepts the job; walk regions on a stock rejection, refresh once.
 
@@ -176,7 +177,9 @@ def launch_and_submit(
         if not candidates and not refreshed:
             refreshed = True
             candidates = [
-                c for c in usable_instances(gpu, force=True) if c.region not in tried_regions
+                c
+                for c in usable_instances(gpu, force=True, ignore_sick=ignore_sick)
+                if c.region not in tried_regions
             ]
 
     while candidates:
@@ -753,8 +756,17 @@ def submit_run_hyperstack(
             f"submit_run_hyperstack needs a concrete gpu class, got {spec.gpu.type!r}"
         )
     instances = usable_instances(spec.gpu.type)
+    # Mirror allocate()'s last-resort relaxation at the LAUNCH boundary: allocate() may have picked
+    # this class with every fitting region merely quarantined (not out of stock), so a healthy-only
+    # fetch here would be empty and hard-fail the run at submit -- turning the bounded-demotion
+    # quarantine into a kill switch. Fall back to the quarantined regions (a still-sick region just
+    # host_faults + the run retries/escapes) and keep the in-launch region walk consistent (ignore_sick).
+    relaxed = not instances
+    if relaxed:
+        instances = usable_instances(spec.gpu.type, ignore_sick=True)
     handle = launch_and_submit(
-        spec, seed, instances, attempt=attempt, log=log, runtime_secrets=runtime_secrets
+        spec, seed, instances, attempt=attempt, log=log,
+        runtime_secrets=runtime_secrets, ignore_sick=relaxed,
     )
     try:
         if on_handle is not None:

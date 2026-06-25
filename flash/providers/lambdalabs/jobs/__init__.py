@@ -150,6 +150,7 @@ def launch_and_submit(
     runtime_secrets: dict | None = None,
     mode: str | None = None,
     models: list | None = None,
+    ignore_sick: bool = False,
 ) -> LambdaJobHandle:
     """Launch the first region that accepts the job; walk regions on a capacity rejection.
 
@@ -300,7 +301,9 @@ def launch_and_submit(
                 # Force a fresh capacity fetch (the allocation cache is ~45s stale) so the refresh
                 # can discover regions that freed up since the walk started.
                 candidates = [
-                    c for c in usable_instances(inst.gpu, force=True) if c.region not in tried_regions
+                    c
+                    for c in usable_instances(inst.gpu, force=True, ignore_sick=ignore_sick)
+                    if c.region not in tried_regions
                 ]
             continue
         say(
@@ -817,8 +820,17 @@ def submit_run_lambda(
             f"submit_run_lambda needs a concrete gpu class, got {spec.gpu.type!r}"
         )
     instances = usable_instances(spec.gpu.type)
+    # Mirror allocate()'s last-resort relaxation at the LAUNCH boundary: allocate() may have picked
+    # this class with every fitting region merely quarantined (not out of capacity), so a healthy-only
+    # fetch here would be empty and hard-fail the run at submit -- turning the bounded-demotion
+    # quarantine into a kill switch. Fall back to the quarantined regions (a still-sick region just
+    # host_faults + the run retries/escapes) and keep the in-launch region walk consistent (ignore_sick).
+    relaxed = not instances
+    if relaxed:
+        instances = usable_instances(spec.gpu.type, ignore_sick=True)
     handle = launch_and_submit(
-        spec, seed, instances, attempt=attempt, log=log, runtime_secrets=runtime_secrets
+        spec, seed, instances, attempt=attempt, log=log,
+        runtime_secrets=runtime_secrets, ignore_sick=relaxed,
     )
     # The instance is billing the MOMENT launch_and_submit returns; the teardown ``finally`` must
     # guard EVERYTHING after that point — including ``on_handle`` (persisting the handle can itself

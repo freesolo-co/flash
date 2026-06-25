@@ -136,7 +136,7 @@ def test_launch_raises_when_no_stock(monkeypatch):
     monkeypatch.setattr(
         hs_api, "launch_vm", lambda **k: (_ for _ in ()).throw(hs_api.HyperstackApiError("POST /core/virtual-machines -> HTTP 400: no stock"))
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [])
     with pytest.raises(hs_api.HyperstackApiError, match="no stock"):
         jobs.launch_and_submit(_spec(), seed=0, instances=[_inst()], attempt=0)
     with pytest.raises(hs_api.HyperstackApiError, match="no Hyperstack stock"):
@@ -353,7 +353,7 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
     refresh_calls = []
     monkeypatch.setattr(
         jobs, "usable_instances",
-        lambda gpu, force=False: refresh_calls.append(force) or [_inst(region="ELSEWHERE-9")],
+        lambda gpu, force=False, ignore_sick=False: refresh_calls.append(force) or [_inst(region="ELSEWHERE-9")],
     )
 
     with pytest.raises(hs_api.HyperstackApiError):
@@ -1036,7 +1036,7 @@ def _wire_runner(monkeypatch, poll_outcome):
 
     deleted = []
     monkeypatch.setattr(hs_api, "delete_vm", lambda vid: deleted.append(vid) or True)
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst()])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: _handle())
 
     def fake_poll(*a, **k):
@@ -1083,6 +1083,42 @@ def test_runner_deletes_when_handle_persist_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="status store unreachable"):
         jobs.submit_run_hyperstack(_spec(), seed=0, on_handle=boom)
     assert deleted == ["vm-9999"]
+
+
+def test_submit_falls_back_to_quarantined_region_when_healthy_empty(monkeypatch):
+    """allocate() can pick a class whose every fitting region is quarantined; submit must mirror that
+    last-resort relaxation rather than re-fetching a healthy-only (empty) region list and hard-failing
+    at launch -- which would turn the bounded-demotion quarantine into a submit-time kill switch. When
+    the healthy usable_instances() is empty, submit re-fetches with ignore_sick=True and passes it
+    through to launch_and_submit so the in-launch region walk stays consistent."""
+    from flash.providers.base import PollResult
+    from flash.providers.hyperstack import api as hs_api
+    from flash.providers.hyperstack import jobs
+
+    monkeypatch.setattr(hs_api, "delete_vm", lambda vid: True)
+
+    seen_ignore_sick = []
+
+    def fake_usable(gpu, force=False, ignore_sick=False):
+        seen_ignore_sick.append(ignore_sick)
+        return [_inst()] if ignore_sick else []  # healthy view empty; relaxed recovers the region
+
+    captured = {}
+
+    def fake_launch(spec, seed, instances, **k):
+        captured["instances"] = instances
+        captured["ignore_sick"] = k.get("ignore_sick")
+        return _handle()
+
+    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
+    monkeypatch.setattr(jobs, "launch_and_submit", fake_launch)
+    monkeypatch.setattr(jobs, "poll_hs_job", lambda *a, **k: PollResult(True, metrics={"a": 1}))
+
+    res = jobs.submit_run_hyperstack(_spec(), seed=0)
+    assert res.ok
+    assert seen_ignore_sick == [False, True]  # healthy pass first (empty), then the relaxed fallback
+    assert captured["instances"]  # launch got the recovered quarantined candidate, not an empty list
+    assert captured["ignore_sick"] is True  # propagated so the in-launch walk relaxes too
 
 
 def test_submit_rejects_policy_word_gpu():

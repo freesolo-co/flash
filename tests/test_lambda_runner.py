@@ -233,7 +233,7 @@ def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
         return "i-7"
 
     monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst(region="us-fresh-1")])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [_inst(region="us-fresh-1")])
     h = jobs.launch_and_submit(_spec(), seed=0, instances=[_inst(region="us-east-1")], attempt=0)
     assert created == ["us-fresh-1"]
     assert h.instance_id == "i-7"
@@ -249,7 +249,7 @@ def test_launch_raises_when_no_capacity(monkeypatch):
         "launch_instance",
         lambda **k: (_ for _ in ()).throw(lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")),
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [])
     with pytest.raises(lambda_api.LambdaApiError, match="no capacity"):
         jobs.launch_and_submit(_spec(), seed=0, instances=[_inst()], attempt=0)
     with pytest.raises(lambda_api.LambdaApiError, match="no Lambda capacity"):
@@ -441,7 +441,7 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
     refresh_calls = []
     monkeypatch.setattr(
         jobs, "usable_instances",
-        lambda gpu, force=False: refresh_calls.append(force) or [_inst(region="us-fresh-9")],
+        lambda gpu, force=False, ignore_sick=False: refresh_calls.append(force) or [_inst(region="us-fresh-9")],
     )
 
     with pytest.raises(lambda_api.LambdaApiError):
@@ -888,7 +888,7 @@ def test_submit_quarantines_region_on_host_fault(monkeypatch):
 
     health.clear()
     handle = _handle()  # region us-east-1
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst()])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: handle)
     monkeypatch.setattr(
         jobs,
@@ -1409,7 +1409,7 @@ def _wire_runner(monkeypatch, poll_outcome):
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.append(list(ids)) or True
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False: [_inst()])
+    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, ignore_sick=False: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: _handle())
 
     def fake_poll(*a, **k):
@@ -1459,6 +1459,42 @@ def test_runner_terminates_when_handle_persist_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="status store unreachable"):
         jobs.submit_run_lambda(_spec(), seed=0, on_handle=boom)
     assert terminated == [["i-9999"]]
+
+
+def test_submit_falls_back_to_quarantined_region_when_healthy_empty(monkeypatch):
+    """allocate() can pick a class whose every fitting region is quarantined; submit must mirror that
+    last-resort relaxation rather than re-fetching a healthy-only (empty) region list and hard-failing
+    at launch -- which would turn the bounded-demotion quarantine into a submit-time kill switch. When
+    the healthy usable_instances() is empty, submit re-fetches with ignore_sick=True and passes it
+    through to launch_and_submit so the in-launch region walk stays consistent."""
+    from flash.providers.base import PollResult
+    from flash.providers.lambdalabs import api as lambda_api
+    from flash.providers.lambdalabs import jobs
+
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: True)
+
+    seen_ignore_sick = []
+
+    def fake_usable(gpu, force=False, ignore_sick=False):
+        seen_ignore_sick.append(ignore_sick)
+        return [_inst()] if ignore_sick else []  # healthy view empty; relaxed recovers the region
+
+    captured = {}
+
+    def fake_launch(spec, seed, instances, **k):
+        captured["instances"] = instances
+        captured["ignore_sick"] = k.get("ignore_sick")
+        return _handle()
+
+    monkeypatch.setattr(jobs, "usable_instances", fake_usable)
+    monkeypatch.setattr(jobs, "launch_and_submit", fake_launch)
+    monkeypatch.setattr(jobs, "poll_lambda_job", lambda *a, **k: PollResult(True, metrics={"a": 1}))
+
+    res = jobs.submit_run_lambda(_spec(), seed=0)
+    assert res.ok
+    assert seen_ignore_sick == [False, True]  # healthy pass first (empty), then the relaxed fallback
+    assert captured["instances"]  # launch got the recovered quarantined candidate, not an empty list
+    assert captured["ignore_sick"] is True  # propagated so the in-launch walk relaxes too
 
 
 def test_submit_rejects_policy_word_gpu():
