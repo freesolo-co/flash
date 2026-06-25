@@ -269,7 +269,20 @@ def patch_grpo_mask_aware_lm_head(trainer) -> bool:
         ratio = kwargs.get("vllm_is_ratio")
         if ratio is not None and ratio.dim() == 2 and ratio.size(1) == full_t:
             gk["vllm_is_ratio"] = _gather(ratio, idx, tprime)
-        return orig(**gk)
+        # The gathered tensors have shape (B, tprime) where tprime varies per micro-batch
+        # (it is the max unmasked-position count across the batch). torch.compile inside
+        # liger_kernel's compiled_compute_loss builds SHAPE_ENV guards keyed on static tensor
+        # dimensions; when tprime changes between calls, guard recompilation hits a
+        # symbol_to_source IndexError (InternalTorchDynamoError). Running the gathered call
+        # without torch.compile is still faster than the unmasked path: the gather already
+        # eliminated the masked FLOPs; eager overhead is negligible at 0.8B scale.
+        import torch._dynamo as _dynamo
+
+        _disabled_orig = getattr(masked_liger_loss, "_flash_disabled_orig", None)
+        if _disabled_orig is None:
+            _disabled_orig = _dynamo.disable(orig)
+            masked_liger_loss._flash_disabled_orig = _disabled_orig
+        return _disabled_orig(**gk)
 
     masked_liger_loss._flash_mask_aware = True  # sentinel for the idempotency check above
     trainer.liger_grpo_loss = masked_liger_loss

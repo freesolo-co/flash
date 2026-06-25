@@ -7,8 +7,10 @@ name: flash worker image
 # operator env override honored by BOTH training (providers/runpod/{jobs,train}.py) and serving
 # (flash/serve/deploy.py).
 #
-# Manual trigger (the build is heavy: vllm + the full training stack; flash-attn installs from
-# the prebuilt FLASH_ATTN_SPEC wheel, with a bounded source build only as fallback).
+# Triggered automatically on flash/** changes (worker training code is baked in; skipping a
+# rebuild leaves GPU workers running stale code) and manually for Dockerfile/dep changes.
+# The build is heavy (vllm + full training stack + flash-attn wheel) but Docker layer caching
+# means only the flash COPY+install layer reruns on pure Python changes (~minutes, not hours).
 
 on:
   workflow_dispatch:
@@ -28,6 +30,8 @@ on:
     paths:
       - Dockerfile.worker
       - .github/workflows/worker-image.yml
+      - flash/**
+      - pyproject.toml
 
 permissions:
   contents: read
