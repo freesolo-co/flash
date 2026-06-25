@@ -235,7 +235,8 @@ def _train_body(input_data: dict) -> dict:
     if input_data.get("mode") == "preload":
         overrides = {k: str(v) for k, v in (input_data.get("env") or {}).items()}
         os.environ.update(overrides)
-        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        # NB: HF_HUB_ENABLE_HF_TRANSFER is NOT set here — the worker image already exports it
+        # (Dockerfile.worker ENV), same as the training path relies on (see deps.py).
         tok = overrides.get("HF_TOKEN")
         # CRITICAL: huggingface_hub froze HF_HUB_CACHE from HF_HOME at IMPORT time (the
         # `from huggingface_hub import snapshot_download` above, before this branch), so the

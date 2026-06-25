@@ -96,14 +96,12 @@ def _preload_one_dc(
             spec=None,
             endpoint_kwargs=endpoint_kwargs,
         )
+        # HF_HUB_ENABLE_HF_TRANSFER is exported by the worker image (Dockerfile.worker ENV), so it is
+        # not passed here — only HF_HOME (the per-region mount) and the token need overriding.
         payload = {
             "mode": "preload",
             "models": models,
-            "env": {
-                "HF_HOME": _HF_HOME,
-                "HF_HUB_ENABLE_HF_TRANSFER": "1",
-                **({"HF_TOKEN": token} if token else {}),
-            },
+            "env": {"HF_HOME": _HF_HOME, **({"HF_TOKEN": token} if token else {})},
         }
         job_id = runpod_api.submit_job(endpoint_id, build_function_input(payload))
         logger.info("preload %s: job %s submitted (%d models)", dc_id, job_id, len(models))
