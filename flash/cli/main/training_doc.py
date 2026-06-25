@@ -26,6 +26,139 @@ actually produced, and decide — honestly — whether the model got better.
 
 ---
 
+## Using Flash
+
+Flash is a **managed** training service with a thin CLI/client. You author an
+environment (the task + its reward), publish it, and submit SFT or GRPO runs from a
+TOML config. Flash allocates the cheapest fitting GPU across providers, runs the job,
+streams logs back, and serves the result. You never handle provider credentials or a
+GPU — you authenticate once with a freesolo API key, and everything below is a `flash`
+CLI command.
+
+### Install & authenticate
+
+```bash
+pip install freesolo-flash          # installs the `flash` CLI (import name is also `flash`)
+flash login --api-key fslo_...       # or: export FREESOLO_API_KEY=fslo_...  (create a key at https://freesolo.co)
+flash whoami                         # confirm the identity behind your key
+flash models                         # supported base models (and which support `thinking`)
+flash gpus                           # managed GPU classes with live $/hr
+```
+
+### The project layout (`flash env setup` created this)
+
+```text
+environment.py          # the task: how to prompt the model and how to score it
+datasets/train.jsonl    # training rows, one JSON object per line: {"input": ..., "output": ...}
+configs/rl.toml         # a GRPO (RL) run config
+configs/sft.toml        # an SFT run config
+TRAINING.md             # this file
+```
+
+### 1. Author the environment
+
+`environment.py` defines the task. A single-turn env subclasses
+`EnvironmentSingleTurn`, turns a row into a prompt, and scores the model's response
+with a `RewardResult` (see *Reward design* below). `load_environment()` is the entry
+point Flash calls:
+
+```python
+from freesolo.datasets.types import TaskExample
+from freesolo.environments import EnvironmentSingleTurn, RewardResult
+
+class MyEnv(EnvironmentSingleTurn):
+    dataset = load_jsonl("datasets/train.jsonl")   # rows -> TaskExample(input=..., output=...)
+
+    def build_prompt_messages(self, example: TaskExample, prompt_text: str):
+        return [{"role": "user", "content": example.input}]
+
+    def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
+        expected = str(example.output or "").strip()
+        score = 1.0 if expected and expected in response_text else 0.0
+        return RewardResult(score=score, threshold=1.0)
+
+def load_environment(**kwargs) -> MyEnv:
+    return MyEnv()
+```
+
+For tool use, dialogue, or games, subclass `EnvironmentMultiTurn` instead and drive the
+conversation across turns. The reward is the same `RewardResult` contract either way.
+
+### 2. Publish the environment
+
+A managed run references a **published** environment by id — so push your folder first:
+
+```bash
+flash env push --name my-env .       # uploads this project; prints an env id like "your-org/my-env"
+flash env list                       # installed envs + local sources you can push
+flash env install your-org/their-env # record an env someone else published, to train against it
+```
+
+Paste the returned id into `[environment] id` in **both** configs. Re-push after any
+edit to `environment.py` or `datasets/` so the managed run uses your change.
+
+### 3. Configure the run (TOML)
+
+```toml
+model = "Qwen/Qwen3.5-4B"   # see `flash models`
+algorithm = "grpo"          # "grpo" (RL) or "sft"
+# thinking = true           # opt-in reasoning mode, for models that support it
+
+[environment]
+id = "your-org/my-env"      # the id printed by `flash env push`
+# secrets = ["SERPAPI_API_KEY"]   # only the NAMES of env vars your environment reads;
+                                   # values are pulled from your shell/.env at submit time,
+                                   # never stored in the spec
+
+[train]
+steps = 150                 # GRPO is step-driven; SFT is epoch-driven (epochs = N)
+lora_rank = 32
+lora_alpha = 64
+seeds = [0]
+```
+
+GPU and the HF artifact repo are **fully managed** — there is no GPU knob; the allocator
+picks the cheapest class that fits, and each run gets its own artifact repo. Compose or
+tweak configs without editing files: `--config extra.toml` (deep-merge) and
+`--set key=value` (e.g. `--set train.steps=300`).
+
+### 4. Submit
+
+```bash
+flash train configs/rl.toml --dry-run   # validate the config locally — no GPU, no charge
+flash train configs/rl.toml --cost      # pre-flight USD estimate, then exit
+flash train configs/rl.toml             # submit and follow logs (Ctrl-C detaches)
+flash train configs/rl.toml --background  # submit and return immediately
+```
+
+### 5. Monitor
+
+```bash
+flash status <run-id>            # state + accrued cost
+flash status <run-id> --logs     # reward/loss trend + rollout samples + any traceback
+flash status <run-id> --follow   # stream a live run to completion
+flash runs                       # all your runs and their state/cost
+flash cancel <run-id>            # stop a run
+```
+
+### 6. Deploy & chat
+
+```bash
+flash checkpoints <run-id>       # deployable per-step RL checkpoints
+flash deploy <run-id>            # serve the trained adapter (--step N for an intermediate checkpoint)
+flash chat <run-id> -m "hello"   # chat with the deployed adapter
+flash deployments                # active serving endpoints
+flash undeploy <run-id>          # tear the endpoint down
+```
+
+> Flash also ships an **MCP bridge** (`flash` as an MCP server) so a coding agent can
+> drive these same commands as tools.
+
+The rest of this file is about doing the above *well* — designing a reward that teaches,
+and deciding honestly whether a run improved.
+
+---
+
 ## The loop
 
 Work in tight, attributable iterations. Each one is a hypothesis:
